@@ -6,7 +6,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from backend.ai.actions import KIND_EXECUTABLE, parse_command_intent
 from backend.ai.tools.base import PermissionLevel, ToolResult
 from backend.ai.tools.context import ToolContext
 from backend.ai.tools.delete import DeleteTool
@@ -78,18 +77,6 @@ async def test_current_request_is_anchor_and_is_deleted_when_in_range():
     assert client.deleted == [10, 9]
     assert 10 in client.deleted
     assert 8 not in client.deleted
-
-
-def test_direct_semantic_delete_is_structured_and_provider_independent():
-    result = parse_command_intent("پیام هام راجب اسکریپت رو پاک کن", has_reply=False)
-
-    assert result.kind == KIND_EXECUTABLE
-    assert result.mode == "filtered"
-    assert result.query == "اسکریپت"
-    assert result.tool_calls == [{
-        "name": "delete",
-        "arguments": {"mode": "filtered", "query": "اسکریپت"},
-    }]
 
 
 @pytest.mark.asyncio

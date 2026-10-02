@@ -22,12 +22,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from backend.ai.actions import (
-    KIND_CONVERSATIONAL,
-    KIND_EXECUTABLE,
-    parse_action_text,
-    parse_command_intent,
-)
+from backend.ai.actions import KIND_EXECUTABLE, parse_action_text
 from backend.services import delete_service
 
 
@@ -96,27 +91,6 @@ def _tg(client) -> object:
 # ── 1/2/5. Intent recognition + action resolution (Persian/English) ──────────
 
 
-@pytest.mark.parametrize(
-    "text,has_reply,expected_tool,expected_count",
-    [
-        ("این پیام رو پاک کن", True, "delete_replied", None),
-        ("آخرین پیامم رو پاک کن", False, "delete", 1),
-        ("۵ پیام آخر خودم رو پاک کن", False, "delete", 5),
-        ("ده پیام آخر رو پاک کن", False, "delete", 10),
-        ("پنج پیام آخر رو پاک کن", False, "delete", 5),
-        ("delete last 10 messages", False, "delete", 10),
-        ("delete this message", True, "delete_replied", None),
-    ],
-)
-def test_delete_intent_recognized(text, has_reply, expected_tool, expected_count):
-    r = parse_command_intent(text, has_reply=has_reply)
-    assert r.kind == KIND_EXECUTABLE
-    assert r.action == "delete_messages"
-    assert [t["name"] for t in r.tool_calls] == [expected_tool]
-    if expected_count is not None:
-        assert r.tool_calls[0]["arguments"]["count"] == expected_count
-
-
 def test_delete_action_resolves_from_structured_json():
     r = parse_action_text('{"action": "delete_messages", "target": "recent_messages", "count": 5}')
     assert r.kind == KIND_EXECUTABLE
@@ -129,45 +103,7 @@ def test_delete_action_resolves_replied():
     assert r.tool_calls == [{"name": "delete_replied", "arguments": {}}]
 
 
-def test_ambiguous_delete_clarifies_not_executes():
-    r = parse_command_intent("پاک کن", has_reply=False)
-    assert r.kind != KIND_EXECUTABLE
-
-
 # ── Semantic deletes must reach the AI, never be hijacked ─────────────────────
-
-
-@pytest.mark.parametrize(
-    "text",
-    [
-        "پیام‌های مربوط به دعوای اخیر رو پاک کن",
-        "پیام‌های مربوط به دعوای دیروز رو حذف کن",
-        "هرچی از بحث قبلیمون مونده رو پاک کن",
-        "پیام‌های مربوط به بحث پروژه رو پاک کن",
-        "پیام‌هایی که درباره فلان موضوع بودن رو حذف کن",
-        "delete messages about the argument",
-        "delete messages related to the argument",
-        "پیام‌های دعوای اخیر رو پاک کن",
-    ],
-)
-def test_semantic_delete_is_not_hijacked_into_last_message(text):
-    """A topic/context delete must not collapse into last-message deletion.
-
-    Direct topic predicates use the existing bounded local selector; explicit
-    search/list workflows remain on the provider-backed semantic path.
-    """
-    r = parse_command_intent(text, has_reply=False)
-    assert r.kind == KIND_EXECUTABLE, (text, r.kind, r.action)
-    assert r.action == "delete_messages"
-    assert r.mode == "filtered"
-    assert r.tool_calls[0]["name"] == "delete"
-
-
-def test_deterministic_last_message_still_parses():
-    """'آخرین پیامم رو پاک کن' stays deterministic (no topic reference)."""
-    r = parse_command_intent("آخرین پیامم رو پاک کن", has_reply=False)
-    assert r.kind == KIND_EXECUTABLE
-    assert r.tool_calls == [{"name": "delete", "arguments": {"count": 1}}]
 
 
 # ── Ownership boundary: self-only deletion at the executor ───────────────────
@@ -413,30 +349,6 @@ def _mock_executor(results):
 
 
 @pytest.mark.asyncio
-async def test_fast_path_executes_last_message_without_provider():
-    """'آخرین پیامم رو پاک کن' must execute deterministically even when every
-    provider is down — it is a scope-free positional delete."""
-    from backend.ai.session.request import AIRequest
-
-    mock_te = _mock_executor([
-        ("delete", True, "Deleted 1 outgoing message(s).", {"count": 1}),
-    ])
-    provider = _FakeProvider()
-    d = _make_dispatcher(mock_te, provider)
-
-    result = await d.dispatch(AIRequest(
-        session_id="s1", message_id=1, owner_id=123,
-        user_message="آخرین پیامم رو پاک کن", chat_id=456,
-    ))
-
-    assert result.success is True
-    assert result.metadata["finish_state"] == "local_fast_path"
-    tool_calls = mock_te.execute_calls.call_args.args[0]
-    assert tool_calls == [{"name": "delete", "arguments": {"count": 1}}]
-    assert provider.calls == 0
-
-
-@pytest.mark.asyncio
 async def test_fast_path_skips_semantic_delete_to_provider():
     """A topic/context delete must reach the AI (never a fast-path delete)."""
     from backend.ai.session.request import AIRequest
@@ -452,86 +364,11 @@ async def test_fast_path_skips_semantic_delete_to_provider():
         user_message="پیام‌های مربوط به دعوای اخیر رو پیدا کن و حذفشون کن", chat_id=456,
     ))
 
-    assert result.metadata.get("finish_state") != "local_fast_path"
+    assert result.metadata.get("finish_state") != "local_boundary"
     assert provider.calls >= 1
 
 
 # ── End-to-end: real fast path + real tools + real chokepoint ────────────────
-
-
-@pytest.mark.asyncio
-async def test_end_to_end_fast_path_delete_reaches_telegram_executor():
-    """The full deterministic pipeline — parse → fast path → real DeleteTool →
-    delete_service chokepoint → client.delete_messages — deletes ONLY the
-    self-owned messages. The result metadata must classify as a silent delete
-    (never a Telegram confirmation)."""
-    from backend.ai.engine.dispatcher import Dispatcher
-    from backend.ai.engine.hooks import NOOP_HOOKS
-    from backend.ai.engine.metrics import EngineMetrics
-    from backend.ai.providers.manager.manager import ProviderManager
-    from backend.ai.session.request import AIRequest
-    from backend.ai.tools.context import ToolContext
-    from backend.ai.tools.executor import ToolExecutor
-    from backend.ai.tools.registry import create_default_registry
-
-    client = FakeChatClient({
-        5: FakeMsg(5, True, 111),    # self-owned
-        4: FakeMsg(4, False, 222),   # other participant
-        3: FakeMsg(3, True, 111),    # self-owned
-        2: FakeMsg(2, False, 222),   # other participant
-        1: FakeMsg(1, True, 111),    # self-owned
-    })
-    ctx = ToolContext(telegram=None, owner_id=111, tz_str="UTC", client=client, extra={})
-    registry = create_default_registry(ctx)
-    executor = ToolExecutor(registry, ctx)
-
-    pm = ProviderManager()
-    provider = _FakeProvider()
-    pm.register_provider(provider)
-    pm.switch_provider(provider.name)
-    pm._fallback_chain = []
-
-    mock_conv = MagicMock()
-    mock_sess = MagicMock()
-    mock_sess.session_id = "s"
-    mock_sess.owner_id = 111
-    mock_sess.active_provider = provider.name
-    mock_conv.get_session.return_value = mock_sess
-    mock_conv.restore_history = AsyncMock()
-    mock_conv.get_history.return_value = []
-
-    mock_pb = MagicMock()
-    pp = MagicMock()
-    pp.system_prompt = "sys"
-    pp.runtime_context = ""
-    pp.conversation_context = ""
-    pp.tool_context = ""
-    pp.user_input = "do it"
-    pp.estimated_tokens.estimated_input_tokens = 50
-    pp.estimated_tokens.prompt_size_chars = 100
-    mock_pb.build.return_value = pp
-
-    d = Dispatcher(
-        mock_conv, mock_pb, pm, NOOP_HOOKS, EngineMetrics(),
-        tool_registry=registry, tool_executor=executor,
-    )
-
-    result = await d.dispatch(AIRequest(
-        session_id="s1", message_id=1, owner_id=111,
-        user_message="پنج پیام آخر رو پاک کن", chat_id=-100,
-    ))
-
-    assert result.success is True
-    assert result.metadata["finish_state"] == "local_fast_path"
-    # The current request is self-owned and inside the requested last-N range;
-    # only self-owned/Nova messages reach the Telegram delete API.
-    assert sorted(client.deleted) == [1, 3, 5]
-    # The execution result classifies as a silent delete — no confirmation
-    # message is ever produced for a successful delete round.
-    from backend.bot.handlers.ai_unified import _is_silent_delete
-    assert _is_silent_delete(result) is True
-    # The provider was never called — fully deterministic execution.
-    assert provider.calls == 0
 
 
 @pytest.mark.asyncio

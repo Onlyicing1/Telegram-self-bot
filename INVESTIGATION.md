@@ -1,11 +1,24 @@
 # Forensic Runtime Investigation — Why an Immediate Multi-Action Request Still Becomes `create_task`
 
-> **Status:** investigation only. No production code, no test, no schema, and no
-> provider contract was modified. This document reports what the current source
-> proves; it does **not** claim the runtime issue is fixed.
+> **Status: SUPERSEDED by Stage 5.** The investigation below remains the
+> accurate forensic record of the defect at HEAD `62dadfe`. The architectural
+> cause it identified — `_is_scheduling_intent()` deciding intent from
+> unanchored natural-language keywords before the provider is consulted — has
+> since been **removed entirely**, along with the whole deterministic
+> intent-routing layer (`parse_command_intent`, the local fast path, the
+> deterministic task candidate, the natural-language completeness gate, and the
+> keyword overrides in `tools/save.py` and `semantic_delete.py`).
 >
-> This file **completely replaces** the previous investigation content. It
-> describes the repository as inspected now, not a historical narrative.
+> There is no deterministic intent router left in the decision path; the AI is
+> the only component that interprets intent, and `ToolRegistry` →
+> `ToolExecutor` → service validates and executes its structured decision.
+> See `IMPLEMENTATION_REPORT.md` for the current architecture, the regex audit,
+> and the test results. Nothing below was rewritten to pretend the defect never
+> existed — it is the evidence the Stage 5 correction was based on.
+>
+> Original status note: this was an investigation-only document. At HEAD
+> `62dadfe` no production code, test, schema or provider contract had been
+> modified by it, and it did not claim the runtime issue was fixed.
 
 ---
 

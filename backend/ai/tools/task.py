@@ -165,14 +165,6 @@ class CreateTaskTool(Tool):
             unbind(bind_token)
 
     async def _execute(self, context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
-        from backend.ai.actions import (
-            _text_has_clock_anchor,
-            _FA_NUMBER_WORDS,
-            _TIME_UNITS,
-            _is_event_intent,
-            _is_scheduling_intent,
-            _tokenize,
-        )
         from backend.ai.task_interpreter import TaskInterpreter, TaskUnsupportedError
         from backend.ai.task_creation import TaskCreationService, TaskSemanticCompletenessError
 
@@ -184,50 +176,18 @@ class CreateTaskTool(Tool):
         if len(request) > MAX_REQUEST_CHARS:
             return ToolResult(success=False, message="Task request is too long.")
 
-        # Deterministic completeness gate — runs BEFORE any provider call and
-        # reuses the existing conservative scheduling vocabulary (no second
-        # parser, no phrase list). A request that expresses no schedule at all
-        # is structurally incomplete: the provider must never fill the missing
-        # schedule/content parameters for it, so it is routed to the EXISTING
-        # Taskloom creation wizard through the same structured signal the
-        # delivery layer already consumes.
-        words = _tokenize(request)
-        # The clock anchor is the shared token-based detector — the same
-        # helper the deterministic command parser uses, so the gate and the
-        # parser can never disagree about what proves a clock (and no regex
-        # participates in command/intent detection, §24.10.2).
-        clock_anchor = _text_has_clock_anchor(request)
-        has_schedule_expression = (
-            _is_scheduling_intent(words, require_action_verb=False)
-            or clock_anchor
-        )
-        if not has_schedule_expression and _is_event_intent(request, words):
-            has_schedule_expression = True
-        # A bare number+unit pair ("5 دقیقه", "in 2 hours") also proves a
-        # schedule was expressed even without an interval intro word — the
-        # completeness proof the interval branch of _is_scheduling_intent
-        # cannot cover (it requires هر/every/plan vocabulary).
-        if not has_schedule_expression:
-            for i, token in enumerate(words):
-                if (token.isdigit() or token in _FA_NUMBER_WORDS) and i + 1 < len(words) and words[i + 1] in _TIME_UNITS:
-                    has_schedule_expression = True
-                    break
-        if not has_schedule_expression:
-            logger.info(
-                "AI_TASK_TRACE stage=create_task_incomplete reason=no_schedule_expression "
-                "routed_to=taskloom_wizard",
-            )
-            return ToolResult(
-                success=False,
-                message=(
-                    "I need a few structured choices for this task — "
-                    "pick them in the creation form below."
-                ),
-                data={
-                    "open_taskloom_wizard": True,
-                    "wizard_reason": "incomplete_request",
-                },
-            )
+        # NO natural-language gate runs here. Deciding whether the owner asked
+        # for a durable task, or whether this request expresses a schedule, is
+        # the MODEL's job — it already answered by emitting this tool call.
+        # Re-deriving that from keywords was the parallel semantic interpreter
+        # this tool no longer owns.
+        #
+        # Completeness is instead judged on the AI's own structured proposal:
+        # ``TaskSemanticCompletenessError`` below is raised by the interpreter /
+        # candidate validator when the structured task definition is genuinely
+        # incomplete, and that path routes to the EXISTING Taskloom wizard.
+        # Task validation is therefore never weakened — it moved from keyword
+        # detection to validating the AI's structured candidate.
 
         owner_id = getattr(context, "owner_id", 0)
         if not isinstance(owner_id, int) or owner_id <= 0:
@@ -330,85 +290,80 @@ class CreateTaskTool(Tool):
         _trace("create_task_validation_start")
         tz_str = getattr(context, "tz_str", "UTC") or "UTC"
         provider_manager = extra.get("provider_manager")
-        deterministic_candidate = extra.get("deterministic_task_candidate")
-        if deterministic_candidate is not None:
-            _trace("create_task_validation_end", success=True, mode="deterministic")
-            candidate = deterministic_candidate
-        else:
-            _trace("create_task_validation_end", success=True, mode="nl_interpretation")
-            if provider_manager is None:
-                try:
-                    from backend.ai.engine.engine import get_engine
-                    provider_manager = get_engine().provider_manager
-                except Exception:
-                    provider_manager = None
-            if provider_manager is None:
-                return _fail(
-                    "create_task_provider_resolution", "provider_manager_unavailable",
-                    RuntimeError("provider manager is unavailable"),
-                )
-
-            _trace(
-                "create_task_interpretation_start", mode="provider",
-                request_len=len(request),
-                proactive_authorized="true" if proactive_authorized else "false",
-            )
+        _trace("create_task_validation_end", success=True, mode="nl_interpretation")
+        if provider_manager is None:
             try:
-                candidate = await asyncio.wait_for(
-                    TaskInterpreter(provider_manager).interpret(
-                        request, timezone=tz_str, request_id=request_id,
-                        proactive_authorized=proactive_authorized,
-                    ),
-                    timeout=INTERPRET_TIMEOUT_SECONDS,
-                )
-            except asyncio.CancelledError:
-                raise
-            except asyncio.TimeoutError as exc:
-                logger.warning(
-                    "AI_TASK_TRACE request_id=%s stage=interpretation_failed category=timeout "
-                    "exception=TimeoutError all_providers_exhausted=false",
-                    request_id,
-                )
-                return _fail("create_task_interpretation", "timeout", exc)
-            except TaskUnsupportedError as exc:
-                # Semantically clear but unrepresentable capability. The
-                # owner's intent is unambiguously a TASK, so the natural-
-                # language path refuses honestly AND asks the delivery layer
-                # to open the EXISTING Taskloom creation wizard: the same
-                # structured choices converge on the same TaskCandidate and
-                # the same TaskCreationService, so no capability that the
-                # scheduler/tool layer truly cannot run is ever fabricated
-                # here, and no second creation path is introduced.
-                logger.warning(
-                    "AI_TASK_TRACE request_id=%s stage=create_task_failed "
-                    "failed_stage=create_task_interpretation category=unsupported_capability "
-                    "capability=%s elapsed_ms=%s persisted=false",
-                    request_id, exc.capability,
-                    int((time.perf_counter() - started) * 1000),
-                )
-                capability = " ".join(str(exc.capability).split())[:120]
-                return ToolResult(
-                    success=False,
-                    message=(
-                        f"I understood your request, but {exc.capability} is not "
-                        "supported yet, so I did not create the task."
-                    ),
-                    data={
-                        "open_taskloom_wizard": True,
-                        "wizard_reason": "unsupported_capability",
-                        "capability": capability,
-                    },
-                )
-            except Exception as exc:  # noqa: BLE001
-                category = _classify_interpretation_failure(exc)
-                logger.warning(
-                    "AI_TASK_TRACE request_id=%s stage=interpretation_failed category=%s "
-                    "exception=%s detail=%s all_providers_exhausted=%s",
-                    request_id, category,
-                    type(exc).__name__, str(exc)[:200],
-                    "category=all_providers_failed" in str(exc),
-                )
-                return _fail("create_task_interpretation", category, exc)
+                from backend.ai.engine.engine import get_engine
+                provider_manager = get_engine().provider_manager
+            except Exception:
+                provider_manager = None
+        if provider_manager is None:
+            return _fail(
+                "create_task_provider_resolution", "provider_manager_unavailable",
+                RuntimeError("provider manager is unavailable"),
+            )
+
+        _trace(
+            "create_task_interpretation_start", mode="provider",
+            request_len=len(request),
+            proactive_authorized="true" if proactive_authorized else "false",
+        )
+        try:
+            candidate = await asyncio.wait_for(
+                TaskInterpreter(provider_manager).interpret(
+                    request, timezone=tz_str, request_id=request_id,
+                    proactive_authorized=proactive_authorized,
+                ),
+                timeout=INTERPRET_TIMEOUT_SECONDS,
+            )
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError as exc:
+            logger.warning(
+                "AI_TASK_TRACE request_id=%s stage=interpretation_failed category=timeout "
+                "exception=TimeoutError all_providers_exhausted=false",
+                request_id,
+            )
+            return _fail("create_task_interpretation", "timeout", exc)
+        except TaskUnsupportedError as exc:
+            # Semantically clear but unrepresentable capability. The
+            # owner's intent is unambiguously a TASK, so the natural-
+            # language path refuses honestly AND asks the delivery layer
+            # to open the EXISTING Taskloom creation wizard: the same
+            # structured choices converge on the same TaskCandidate and
+            # the same TaskCreationService, so no capability that the
+            # scheduler/tool layer truly cannot run is ever fabricated
+            # here, and no second creation path is introduced.
+            logger.warning(
+                "AI_TASK_TRACE request_id=%s stage=create_task_failed "
+                "failed_stage=create_task_interpretation category=unsupported_capability "
+                "capability=%s elapsed_ms=%s persisted=false",
+                request_id, exc.capability,
+                int((time.perf_counter() - started) * 1000),
+            )
+            capability = " ".join(str(exc.capability).split())[:120]
+            return ToolResult(
+                success=False,
+                message=(
+                    f"I understood your request, but {exc.capability} is not "
+                    "supported yet, so I did not create the task."
+                ),
+                data={
+                    "open_taskloom_wizard": True,
+                    "wizard_reason": "unsupported_capability",
+                    "capability": capability,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            category = _classify_interpretation_failure(exc)
+            logger.warning(
+                "AI_TASK_TRACE request_id=%s stage=interpretation_failed category=%s "
+                "exception=%s detail=%s all_providers_exhausted=%s",
+                request_id, category,
+                type(exc).__name__, str(exc)[:200],
+                "category=all_providers_failed" in str(exc),
+            )
+            return _fail("create_task_interpretation", category, exc)
 
         # Resolve destination: the model may express a chat_name (never a
         # numeric chat_id). Resolve it against the authenticated Self Bot's
@@ -598,38 +553,6 @@ class CreateTaskTool(Tool):
                     source_present=bool(policy.source),
                     length_constrained=policy.max_length is not None or policy.exact_length is not None,
                 )
-
-        # Deterministic profile-fidelity gate: a request that explicitly asks
-        # to change the Telegram bio must persist the canonical REGISTERED bio
-        # tool, never the message-write action the semantic layer misclassified
-        # (live: a scheduled bio update persisted as send_message). The
-        # semantic interpreter stays the source of the action — this only
-        # repairs the known message-write misclassification, and only for a
-        # request that both names the bio and asks to change it. A request that
-        # genuinely sends a message is untouched.
-        if isinstance(candidate, dict):
-            from backend.ai.actions import (
-                _has_bio_change_intent,
-                _has_bio_mention,
-                _tokenize,
-                _write_text_present,
-            )
-            words = _tokenize(request)
-            if words and _has_bio_mention(words) and (
-                _has_bio_change_intent(words) or _write_text_present(words)
-            ):
-                actions = candidate.get("actions")
-                repaired = 0
-                if isinstance(actions, list):
-                    for action in actions:
-                        if isinstance(action, dict) and action.get("name") == "send_message":
-                            action["name"] = "bio_set_text"
-                            repaired += 1
-                if repaired:
-                    _trace(
-                        "create_task_bio_action_gate", applied=True,
-                        action="bio_set_text", repaired=repaired,
-                    )
 
         _trace(
             "create_task_normalized", schedule_type=candidate.get("schedule_type"),

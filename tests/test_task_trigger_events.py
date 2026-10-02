@@ -26,7 +26,6 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from backend.ai.actions import parse_command_intent
 from backend.ai.chat_resolution import resolve_chat_name, resolve_sender_name
 from backend.ai.database.task_repository import InMemoryTaskRepository
 from backend.ai.scheduling import ScheduleError, next_occurrence, parse_schedule
@@ -576,28 +575,6 @@ def test_interval_schedule_semantics():
 
 
 # ── Task creation intent: no regex growth, no false positives ───────────────
-
-
-def test_conversational_requests_never_become_tasks():
-    # None of these may route to the create_task tool: only explicit
-    # automation intent creates a durable task.
-    for text in (
-        "What time is it?",
-        "Tell me about tomorrow.",
-        "John messaged me.",
-        "Send this message.",
-        "What tasks do I have?",
-    ):
-        result = parse_command_intent(text, has_reply=False)
-        assert result.action != "create_task", text
-
-
-def test_equivalent_phrasings_route_to_same_registered_create_task_tool():
-    for text in ("every 3 minutes write hello", "هر ۳ دقیقه بنویس سلام"):
-        result = parse_command_intent(text, has_reply=False)
-        assert result.action == "create_task"
-        assert result.kind == "executable"
-        assert result.tool_calls == [{"name": "create_task", "arguments": {"request": text}}]
 
 
 # ── Presentation ────────────────────────────────────────────────────────────

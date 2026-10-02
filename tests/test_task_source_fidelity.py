@@ -665,30 +665,6 @@ async def _create_task(provider_text: str, request: str, deterministic: dict | N
 
 
 @pytest.mark.asyncio
-async def test_persian_bio_update_misclassified_as_message_persists_bio_tool():
-    """A clear Persian bio-update request whose candidate came back as
-    send_message must persist the canonical registered bio tool."""
-    result, _provider, manager = await _create_task(
-        _message_action_candidate(), PERSIAN_BIO_REQUEST,
-    )
-    assert result.success is True, result.message
-    task = (await manager.task.list_tasks(777))[0]
-    assert task.actions == [
-        {"name": "bio_set_text", "arguments": {"text": "میو"}}
-    ], "a bio update must never persist as send_message"
-
-
-@pytest.mark.asyncio
-async def test_english_bio_update_misclassified_as_message_persists_bio_tool():
-    result, _provider, manager = await _create_task(
-        _message_action_candidate("hello"), ENGLISH_BIO_REQUEST,
-    )
-    assert result.success is True, result.message
-    task = (await manager.task.list_tasks(777))[0]
-    assert [a["name"] for a in task.actions] == ["bio_set_text"]
-
-
-@pytest.mark.asyncio
 async def test_plain_message_task_still_persists_send_message():
     """A request that genuinely asks to send a chat message is untouched."""
     result, _provider, manager = await _create_task(
@@ -698,41 +674,6 @@ async def test_plain_message_task_still_persists_send_message():
     task = (await manager.task.list_tasks(777))[0]
     assert task.actions == [
         {"name": "send_message", "arguments": {"text": "سلام"}}
-    ]
-
-
-@pytest.mark.asyncio
-async def test_bio_request_keeps_verbatim_ai_instruction_when_action_repaired():
-    """Repairing the tool name must not weaken the AI-generated-content
-    contract: the verbatim request still becomes the ai_instruction."""
-    paraphrased = _message_action_candidate("Ayumi: hi", "change my bio to anime quotes")
-    result, _provider, manager = await _create_task(paraphrased, PERSIAN_TASK)
-    assert result.success is True, result.message
-    task = (await manager.task.list_tasks(777))[0]
-    assert task.ai_instruction == PERSIAN_TASK
-    assert [a["name"] for a in task.actions] == ["bio_set_text"]
-
-
-@pytest.mark.asyncio
-async def test_deterministic_message_write_candidate_for_bio_request_is_repaired():
-    """The deterministic interval+write shortcut only ever builds send_message;
-    for a bio request that candidate must be repaired, with no provider call."""
-    deterministic = {
-        "label": "میو",
-        "schedule_type": "interval",
-        "schedule": {"seconds": 300},
-        "timezone": "UTC",
-        "actions": [{"name": "send_message", "arguments": {"text": "میو"}}],
-        "notification_destination": {},
-    }
-    result, provider, manager = await _create_task(
-        "null", "هر 5 دقیقه توی بیو بنویس میو", deterministic=deterministic,
-    )
-    assert result.success is True, result.message
-    assert provider.calls == 0, "deterministic candidate must not hit a provider"
-    task = (await manager.task.list_tasks(777))[0]
-    assert task.actions == [
-        {"name": "bio_set_text", "arguments": {"text": "میو"}}
     ]
 
 

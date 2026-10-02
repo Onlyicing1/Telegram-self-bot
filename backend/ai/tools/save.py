@@ -15,12 +15,6 @@ from backend.ai.tools.context import ToolContext
 logger = logging.getLogger(__name__)
 
 
-def _request_text(context: ToolContext) -> str:
-    """The owner's own request text for this turn (trusted runtime context)."""
-    extra = context.extra or {}
-    return str(extra.get("request_text") or "")
-
-
 def _save_metadata(
     context: ToolContext, arguments: dict[str, Any]
 ) -> tuple["SaveMetadata | None", str]:
@@ -32,11 +26,12 @@ def _save_metadata(
     the tag/name limits are the shared ``save_service`` rules; this adapter
     never re-implements them.
 
-    An explicit decline in the OWNER's own words is authoritative: it forces an
-    empty tag list, so a model proposal can never re-add tags the owner asked
-    not to have.
+    Whether the owner wants tags at all is the MODEL's decision: it reads the
+    whole request and proposes ``tags`` accordingly. This layer only enforces
+    the shared bounds/whitespace/dedupe rules, so an explicit "no tags" request
+    is honoured because the AI called the tool with an empty list — never
+    because a keyword was matched in the raw message.
     """
-    from backend.ai.actions import explicit_no_tags_requested
     from backend.services.save_service import SaveMetadata
 
     try:
@@ -45,8 +40,6 @@ def _save_metadata(
         )
     except ValueError as exc:
         return None, str(exc)
-    if explicit_no_tags_requested(_request_text(context)):
-        metadata = SaveMetadata.from_raw(metadata.display_name, ())
     return metadata, ""
 
 

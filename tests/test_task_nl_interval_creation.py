@@ -28,11 +28,6 @@ from unittest.mock import patch
 
 import pytest
 
-from backend.ai.actions import (
-    KIND_CONVERSATIONAL,
-    KIND_EXECUTABLE,
-    parse_command_intent,
-)
 from backend.ai.preparation_policy import (
     PreparationPolicyError,
     derive_policy,
@@ -192,36 +187,6 @@ async def test_live_request_2_multiline_creates_five_minute_bio_task():
 # ═══════════ Part B — interval phrasing equivalence (semantic routing) ═══════════
 
 
-@pytest.mark.parametrize("phrase", INTERVAL_PHRASINGS)
-def test_interval_phrasing_routes_to_create_task(phrase):
-    """Every equivalent phrasing reaches the semantic task boundary — the
-    interpreter, not a phrase table, resolves the exact seconds."""
-    result = parse_command_intent(phrase, has_reply=True)
-    assert result.kind == KIND_EXECUTABLE, phrase
-    assert result.action == "create_task", phrase
-
-
-def test_exact_live_requests_route_to_create_task():
-    for request in (LIVE_REQUEST_1, LIVE_REQUEST_2):
-        result = parse_command_intent(request, has_reply=True)
-        assert result.kind == KIND_EXECUTABLE
-        assert result.action == "create_task"
-
-
-def test_interval_without_intro_stays_semantic_not_rejected():
-    # "پنج دقیقه یکبار" (no هر/every intro) has no deterministic marker; it
-    # must NOT be force-routed — it stays conversational so the provider can
-    # still interpret it semantically. Never a hard rejection.
-    result = parse_command_intent("پنج دقیقه یکبار بیو رو عوض کن", has_reply=True)
-    assert result.kind == KIND_CONVERSATIONAL
-
-
-def test_plain_conversational_text_does_not_create_a_task():
-    result = parse_command_intent("سلام خوبی امروز چیکار کردی", has_reply=True)
-    assert result.kind == KIND_CONVERSATIONAL
-    assert result.action == ""
-
-
 # ═══════════ Part C — deterministic tolerance of model-emitted shapes ═══════════
 
 
@@ -311,11 +276,9 @@ async def test_ambiguous_request_still_returns_honest_failure():
             _tool_context(pm), {"request": "یه وقتایی یه یادآوری بفرست"}
         )
     assert result.success is False
-    # The completeness gate fires before the provider: an ambiguous phrase
-    # expresses no schedule, so the wizard signal is returned instead of the
-    # (now unreachable) interpretation rejection text.
+    # The MODEL refuses an ambiguous phrase (NULL RULE) instead of inventing a
+    # schedule, and the refusal surfaces the EXISTING Taskloom wizard.
     assert result.data.get("open_taskloom_wizard") is True
-    assert result.data.get("wizard_reason") == "incomplete_request"
     tasks = await manager.task.list_tasks(777)
     assert tasks == []
 

@@ -161,33 +161,34 @@ async def test_fully_representable_request_still_creates_directly():
 
 
 @pytest.mark.asyncio
-async def test_live_underspecified_request_never_creates_and_signals_the_wizard():
-    """THE live reproduction: "یه تسک برای بیو بساز" carries no schedule
-    expression, so the provider must never be asked (and never fill one in).
-    The existing Taskloom wizard is surfaced with the structured signal."""
-    pm = _provider_manager(_good_candidate())  # model WOULD fill the schedule
+async def test_underspecified_request_is_refused_by_the_model_and_signals_the_wizard():
+    """An underspecified request never becomes a task.
+
+    There is no longer a keyword gate that decides the request is incomplete
+    BEFORE the provider: the interpreter's NULL RULE does ("return JSON null
+    only when the message has no recognizable schedule; never invent one").
+    Scripting the model's refusal proves the contract still ends in the
+    EXISTING Taskloom wizard and that nothing is persisted."""
+    pm = _provider_manager("null")  # the model's refusal signal
     result, manager = await _create(pm, "یه تسک برای بیو بساز")
     assert result.success is False
     assert result.data.get("open_taskloom_wizard") is True
-    assert result.data.get("wizard_reason") == "incomplete_request"
     assert await manager.task.list_tasks(OWNER) == []
 
 
 @pytest.mark.asyncio
-async def test_invented_schedule_for_underspecified_request_is_never_persisted():
-    """Even a schema-valid candidate with an invented interval cannot become a
-    task when the owner's request expressed no schedule: the gate runs BEFORE
-    the provider, so the invented schedule is never persisted."""
-    pm = _provider_manager(_good_candidate())
+async def test_a_refused_underspecified_request_persists_nothing_even_with_a_candidate():
+    """A refused interpretation cannot be replaced by a fabricated candidate:
+    the null refusal is terminal, so no schedule is ever invented locally."""
+    pm = _provider_manager("null")
     result, manager = await _create(pm, "update my bio please")
     assert result.success is False
-    assert result.data.get("open_taskloom_wizard") is True
     assert await manager.task.list_tasks(OWNER) == []
 
 
 @pytest.mark.asyncio
 async def test_english_underspecified_request_signals_the_wizard():
-    pm = _provider_manager(_good_candidate())
+    pm = _provider_manager("null")
     result, manager = await _create(pm, "make a task for my bio")
     assert result.success is False
     assert result.data.get("open_taskloom_wizard") is True

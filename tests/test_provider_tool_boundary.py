@@ -1,20 +1,16 @@
 """
-Focused tests for the dispatcher's LOCAL deterministic fast path.
+Every request crosses the provider boundary and converges on ONE executor.
 
-This is the production reliability guarantee: high-confidence command
-intents (status queries, last-N delete, save/delete by reply) execute
-through the SAME ToolExecutor WITHOUT a provider round, so they keep
-working when every AI provider is rate-limited, misconfigured, or down.
+There is no local deterministic fast path any more: the model interprets
+intent and emits a structured tool call, and the dispatcher validates it and
+runs it through the SAME ToolExecutor. These tests drive the real
+Dispatcher + real ProviderManager (with a scripted provider) and pin the two
+properties that matter now:
 
-These tests prove the parse → fast-path → executor boundary against a REAL
-ProviderManager (with a fake provider), not just the action parser alone:
-
-- a status command executes its tool and returns the REAL result without
-  ever calling the provider;
-- a conversational request still goes through the provider unchanged;
-- a destructive last-N delete executes exactly once via the fast path;
-- a semantic request still reaches the provider (it is not a high-
-  confidence command).
+- a conversational request reaches the provider and its structured proposal is
+  executed through the single ToolExecutor boundary;
+- a request the model proposes a destructive tool for still goes through the
+  executor exactly once, never around it.
 """
 from __future__ import annotations
 
@@ -117,73 +113,6 @@ def _mock_executor(results):
 
 
 @pytest.mark.asyncio
-async def test_username_status_runs_fast_path_without_provider():
-    mock_te = _mock_executor([
-        ("account_show", True, "👤 First Name: Ali", {"first_name": "Ali"}),
-    ])
-    provider = _FakeProvider("test")
-    d, provider = _make_dispatcher(mock_te, provider)
-
-    result = await d.dispatch(AIRequest(
-        session_id="s1", message_id=1, owner_id=123,
-        user_message="وضعیت یوزرنیمم رو بگو", chat_id=456,
-    ))
-
-    assert result.success is True
-    assert result.metadata["finish_state"] == "local_fast_path"
-    # Casual Persian "یوزرنیم" resolves to the account FIRST NAME.
-    assert "First Name: Ali" in result.response
-    tool_calls = mock_te.execute_calls.call_args.args[0]
-    assert tool_calls == [{"name": "account_show", "arguments": {"fields": ["first_name"]}}]
-    assert mock_te.execute_calls.await_count == 1
-    # The provider was NEVER called — the fast path is provider-independent.
-    assert provider.calls == 0
-
-
-@pytest.mark.asyncio
-async def test_bio_retrieval_runs_fast_path_without_provider():
-    mock_te = _mock_executor([
-        ("get_bio", True, "📝 Bio: همیشه بهروز", {"bio": "همیشه بهروز"}),
-    ])
-    provider = _FakeProvider("test")
-    d, provider = _make_dispatcher(mock_te, provider)
-
-    result = await d.dispatch(AIRequest(
-        session_id="s1", message_id=1, owner_id=123,
-        user_message="بیوم الان چیه؟", chat_id=456,
-    ))
-
-    assert result.success is True
-    assert result.metadata["finish_state"] == "local_fast_path"
-    assert "همیشه بهروز" in result.response
-    tool_calls = mock_te.execute_calls.call_args.args[0]
-    assert tool_calls == [{"name": "get_bio", "arguments": {}}]
-    assert mock_te.execute_calls.await_count == 1
-    # Provider-independent: the real Telegram bio is read without any AI call.
-    assert provider.calls == 0
-
-
-@pytest.mark.asyncio
-async def test_delete_last_n_runs_fast_path_exactly_once():
-    mock_te = _mock_executor([
-        ("delete", True, "Deleted 3 outgoing message(s).", {"count": 3}),
-    ])
-    provider = _FakeProvider("test")
-    d, provider = _make_dispatcher(mock_te, provider)
-
-    result = await d.dispatch(AIRequest(
-        session_id="s1", message_id=1, owner_id=123,
-        user_message="سه پیام آخر رو پاک کن", chat_id=456,
-    ))
-
-    assert result.success is True
-    assert mock_te.execute_calls.await_count == 1
-    tool_calls = mock_te.execute_calls.call_args.args[0]
-    assert tool_calls == [{"name": "delete", "arguments": {"count": 3}}]
-    assert provider.calls == 0
-
-
-@pytest.mark.asyncio
 async def test_conversational_request_still_uses_provider():
     provider = _FakeProvider("test", [
         ProviderResponse(
@@ -216,8 +145,8 @@ async def test_conversational_request_still_uses_provider():
 
 @pytest.mark.asyncio
 async def test_semantic_delete_still_uses_provider():
-    """A semantic request is NOT a high-confidence command — it must still
-    reach the AI so the model can reason over real chat history."""
+    """A semantic request reaches the AI so the model can reason over real
+    chat history and propose the structured delete arguments itself."""
     provider = _FakeProvider("test", [
         ProviderResponse(
             text="", provider_name="test", success=True, usage={},

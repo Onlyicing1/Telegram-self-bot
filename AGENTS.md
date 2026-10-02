@@ -204,9 +204,15 @@ handler. It fires on every outgoing non-dot message and supports:
 3. **Reply-to-AI** — replying to a known AI message with plain text activates
    the AI with that text (continuation).
 
-The trigger/reply handler resolves the intent into **native tool calls**
-(save, delete, search, ...) and executes them through the shared service
-layer — it is an execution interface, never just a text response.
+The AI is the **only** component that interprets natural-language intent.
+The model decides whether a request is immediate or durable, whether it is a
+save / search / tagging / task request, and which tool applies; it emits a
+**native tool call** (or a JSON action object). Local code never reads the
+owner's message to choose a capability: there is no command parser, no
+recurrence/cadence detector, and no provider-free fast path. Deterministic code
+validates that proposal (`validate_action` / `resolve_tool_calls`), bounds it,
+and executes it through `ToolRegistry` → `ToolExecutor` → the shared service
+layer — an execution interface, never just a text response.
 
 ### Glass UI (primary interface)
 
@@ -314,6 +320,13 @@ error.
   env `YDC_API_KEY`) is a retrieval capability, not a chat LLM — it is
   never selected as a reasoning engine and serves results only through
   the `web_search` tool (`backend/ai/tools/websearch.py`).
+- **Intent boundary**: natural-language intent is decided by the AI alone.
+  Immediate workflow vs durable task is a prompt-contract distinction
+  (`backend/ai/prompt/template.py`), not a keyword detector — `weekly`,
+  `monthly`, `هر`, `هفتگی` and similar words carry no routing power on their
+  own. What remains deterministic is validation, authorization, bounds and
+  execution (`ToolRegistry`, `ToolExecutor`, `validate_action`, the task
+  candidate contract, the content policy).
 - **Tools**: stateless wrappers over services (`save`, `retrieve`, `delete`,
   `bio_*`, `username_*`, `organize_*`, `settings_*`, …). The `ToolExecutor`
   is the sole component that calls `tool.execute()`. The owner's message IS

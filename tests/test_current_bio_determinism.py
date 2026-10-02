@@ -23,85 +23,12 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from backend.ai.actions import parse_command_intent
 
 ENGINE_STATE = "NatN. disalle"        # Bio Engine last_bio — must NEVER appear
 REAL_BIO = "I am I. Nothing more."    # authoritative full_user.about
 
 
 # ── 1. Deterministic resolution (no provider decision needed) ──
-
-
-@pytest.mark.parametrize(
-    "text",
-    [
-        "بیو رو نشونم بده",
-        "بیو رو نشون بده",
-        "بیومو نشون بده",
-        "بیوم رو نشون بده",
-        "بیوم چیه",
-        "بیوم چیه؟",
-        "بیو الانم چیه",
-        "بیو الانم چیه؟",
-        "بیوی فعلیم چیه",
-        "بیوی فعلیم رو بگو",
-        "بیوی فعلیم رو نشون بده",
-        "بیو اکانتم رو بگو",
-        "بیو اکانتم رو نشون بده",
-        "متن بیوم چیه",
-        "متن بیوی فعلی من چیه",
-        "بیو فعلیمو بگو",
-        "بیو فعلیمو نشون بده",
-        "بیو الان من چیه",
-        "بیو الانم",
-        "بیوم الان",
-        "بیو فعلیم",
-        "what is my bio?",
-        "what's my bio?",
-        "show my bio",
-        "show me my bio",
-        "tell me my bio",
-        "what is my current bio?",
-        "show my current bio",
-        "my current bio",
-        "current bio",
-        "bio now",
-    ],
-)
-def test_current_bio_requests_resolve_deterministically(text):
-    r = parse_command_intent(text, has_reply=False)
-    assert r.kind == "executable", f"{text!r} fell off the deterministic path"
-    assert r.tool_calls == [{"name": "get_bio", "arguments": {}}]
-
-
-@pytest.mark.parametrize(
-    "text",
-    [
-        "وضعیت موتور بیو چیه؟",
-        "bio engine status",
-        "template بیوم چیه؟",
-        "mood بیو چیه؟",
-    ],
-)
-def test_explicit_engine_queries_stay_distinct_from_production_path(text):
-    # Engine/configuration questions must never leak the engine's last_bio as
-    # the CURRENT Telegram bio — the production request path is get_bio and
-    # only get_bio. bio_show remains a separate registered tool for engine
-    # state; the natural-language bio branch itself has always resolved bio
-    # mentions to the real Telegram bio (source-verified behavior).
-    from backend.ai.actions import parse_command_intent
-
-    r = parse_command_intent(text, has_reply=False)
-    assert r.kind == "executable"
-    assert r.tool_calls[0]["name"] == "get_bio"
-
-
-def test_non_bio_show_forms_do_not_regress():
-    # The fused show-form matcher must not swallow other intents.
-    r = parse_command_intent("پیام آخر رو نشونم بده", has_reply=False)
-    assert r.tool_calls[0]["name"] == "list_recent_messages"
-    r = parse_command_intent("سیوها رو نشونم بده", has_reply=False)
-    assert r.tool_calls[0]["name"] == "list_saves"
 
 
 # ── 2-3. Real chain: tool result is authoritative and verbatim ──
@@ -141,112 +68,6 @@ async def test_bio_engine_state_never_reaches_current_bio_result():
     assert result.data == {"bio": REAL_BIO}
     assert ENGINE_STATE not in result.message
     assert ENGINE_STATE not in (result.data or {}).get("bio", "")
-
-
-@pytest.mark.asyncio
-async def test_get_bio_result_is_delivered_verbatim_without_provider_round():
-    """End-to-end through the REAL Dispatcher fast path with a REAL executor.
-
-    A provider that would stylize/hallucinate must NEVER be consulted: the
-    deterministic fast path executes get_bio and returns the tool result.
-    """
-    from backend.ai.engine.dispatcher import Dispatcher
-    from backend.ai.engine.hooks import NOOP_HOOKS
-    from backend.ai.engine.metrics import EngineMetrics
-    from backend.ai.providers.base.capabilities import ProviderCapabilities
-    from backend.ai.providers.base.config import ProviderConfig
-    from backend.ai.providers.base.contract import BaseProvider, ProviderResponse
-    from backend.ai.providers.manager.manager import ProviderManager
-    from backend.ai.session.request import AIRequest
-    from backend.ai.tools.bio import BioGetTool
-    from backend.ai.tools.executor import ToolExecutor
-    from backend.ai.tools.registry import ToolRegistry, create_default_registry
-
-    class StylizingProvider(BaseProvider):
-        """Would emit the production symptom if it were ever consulted."""
-
-        def __init__(self) -> None:
-            super().__init__(ProviderConfig(provider_name="stylizer", enabled=True, default_model="m"))
-            self.calls = 0
-
-        @property
-        def name(self) -> str:
-            return "stylizer"
-
-        @property
-        def capabilities(self) -> ProviderCapabilities:
-            return ProviderCapabilities(supports_tools=True, supports_function_call=True)
-
-        async def chat(self, messages, **kwargs):
-            self.calls += 1
-            return ProviderResponse(
-                text=f"𝓝atN. disalle — {ENGINE_STATE}",  # the symptom
-                provider_name=self.name,
-                success=True,
-            )
-
-        def initialize(self) -> None:
-            return None
-
-        def shutdown(self) -> None:
-            return None
-
-        def count_tokens(self, text: str) -> int:
-            return max(1, len(text) // 4)
-
-        def health(self) -> dict[str, Any]:
-            return {"healthy": True}
-
-    telegram = _fake_telegram_api(bio=REAL_BIO)
-    ctx = _real_bio_tool_context(telegram)
-    registry = create_default_registry(ctx)
-    executor = ToolExecutor(registry, ctx)
-    provider = StylizingProvider()
-
-    pm = ProviderManager()
-    pm.register_provider(provider)
-    pm.switch_provider(provider.name)
-    pm._fallback_chain = []
-
-    mock_conv = MagicMock()
-    mock_sess = MagicMock()
-    mock_sess.session_id = "s"
-    mock_sess.owner_id = 777
-    mock_sess.active_provider = provider.name
-    mock_conv.get_session.return_value = mock_sess
-    mock_conv.restore_history = AsyncMock()
-    mock_conv.get_history.return_value = []
-
-    mock_pb = MagicMock()
-    pp = MagicMock()
-    pp.system_prompt = "sys"
-    pp.runtime_context = ""
-    pp.conversation_context = ""
-    pp.tool_context = ""
-    pp.user_input = "بیو رو نشونم بده"
-    pp.estimated_tokens.estimated_input_tokens = 50
-    pp.estimated_tokens.prompt_size_chars = 100
-    mock_pb.build.return_value = pp
-
-    d = Dispatcher(mock_conv, mock_pb, pm, NOOP_HOOKS, EngineMetrics(), tool_executor=executor)
-
-    result = await d.dispatch(AIRequest(
-        session_id="s1", message_id=1, owner_id=777,
-        user_message="بیو رو نشونم بده", chat_id=456,
-    ))
-
-    assert result.success is True
-    assert REAL_BIO in result.response
-    assert ENGINE_STATE not in result.response
-    # No mathematical-alphanumeric Unicode may touch the bio value.
-    assert "𝓝" not in result.response
-    # The provider was never consulted — deterministic execution only.
-    assert provider.calls == 0
-    # The result came from the real tool execution (one round, real tool).
-    assert result.metadata.get("tool_call_count") == 1
-    tool_results = result.metadata.get("tool_results") or []
-    assert tool_results and tool_results[0]["tool_name"] == "get_bio"
-    assert tool_results[0]["data"]["bio"] == REAL_BIO
 
 
 @pytest.mark.asyncio

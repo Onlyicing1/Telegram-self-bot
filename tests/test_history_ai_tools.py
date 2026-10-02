@@ -932,36 +932,6 @@ async def test_summary_result_remains_deliverable_through_the_delivery_path():
 # ── 5. Routing: analysis requests reach the provider ──
 
 
-def test_history_analysis_requests_are_not_routed_to_the_review_listing():
-    from backend.ai.actions import KIND_CONVERSATIONAL, parse_command_intent
-
-    for text in (
-        "خلاصه ۳۰ پیام آخر رو بده",
-        "ترجمه ۱۰ پیام آخر",
-        "summarize the last 500 messages",
-        "translate the last 100 messages to English",
-    ):
-        result = parse_command_intent(text, has_reply=False)
-        assert result.kind == KIND_CONVERSATIONAL, text
-        assert result.action != "list_recent_messages", text
-
-
-def test_review_requests_still_resolve_deterministically():
-    from backend.ai.actions import parse_command_intent
-
-    for text, count in (("ده پیام آخر رو بررسی کن", 10), ("last 10 messages", 10)):
-        result = parse_command_intent(text, has_reply=False)
-        assert result.action == "list_recent_messages", text
-        assert result.count == count, text
-
-
-def test_analysis_routing_does_not_divert_delete_or_save_commands():
-    from backend.ai.actions import parse_command_intent
-
-    result = parse_command_intent("پیام‌های خلاصه رو پاک کن", has_reply=False)
-    assert result.action == "delete_messages"
-
-
 # ── 6. Rate-limit protection: pacing, capacity, envelope ──
 
 

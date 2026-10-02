@@ -32,13 +32,9 @@ from telethon.tl.types import DocumentAttributeFilename, MessageMediaDocument
 
 from backend.ai.actions import (
     ALLOWED_FIELDS,
-    KIND_CONVERSATIONAL,
     KIND_EXECUTABLE,
     KIND_INVALID,
-    explicit_no_tags_requested,
     parse_action_text,
-    parse_command_intent,
-    save_metadata_requested,
     validate_action,
 )
 from backend.ai.tools.context import ToolContext
@@ -274,43 +270,6 @@ def test_save_code_is_still_not_model_controlled_by_the_metadata_path():
 # ── 3. the deterministic fast path must not drop metadata ──
 
 
-def test_the_fast_path_defers_when_a_name_is_asked_for():
-    r = parse_command_intent("اینو به اسم برنامه دانشگاه سیو کن", has_reply=True)
-    assert r.kind == KIND_CONVERSATIONAL
-    r_en = parse_command_intent("save this as University Schedule", has_reply=True)
-    assert r_en.kind == KIND_CONVERSATIONAL
-
-
-def test_the_fast_path_defers_when_tags_are_asked_for():
-    for text in ("اینو با تگ دانشگاه سیو کن", "save this and tag it university"):
-        assert parse_command_intent(text, has_reply=True).kind == KIND_CONVERSATIONAL
-
-
-def test_the_fast_path_defers_when_the_owner_declines_tags():
-    r = parse_command_intent("save this without tags", has_reply=True)
-    assert r.kind == KIND_CONVERSATIONAL
-
-
-def test_the_fast_path_still_resolves_a_plain_save():
-    for text in ("اینو سیو کن", "save this"):
-        r = parse_command_intent(text, has_reply=True)
-        assert r.kind == KIND_EXECUTABLE
-        assert r.tool_calls == [{"name": "save", "arguments": {}}]
-
-
-def test_as_idioms_are_not_names():
-    assert not save_metadata_requested("save this as well")
-    assert not save_metadata_requested("save this as usual")
-    assert save_metadata_requested("save this as University Schedule")
-
-
-def test_no_tags_vocabulary():
-    for text in ("save this without tags", "save this, no tags", "dont tag this",
-                 "بدون تگ سیو کن", "تگ نزن"):
-        assert explicit_no_tags_requested(text), text
-    assert not explicit_no_tags_requested("save this with tags university")
-
-
 # ── 4. execution: arguments → SaveMetadata → execute_save → saved_items ──
 
 
@@ -365,19 +324,6 @@ async def test_save_tool_without_metadata_is_unchanged():
     row = await _saved_row(result.message)
     assert row.get("display_name") is None
     assert row["tags"] == []  # no invented hashtags, no invented name
-
-
-@pytest.mark.asyncio
-async def test_the_owner_declining_tags_beats_a_model_proposal():
-    client = WiringClient()
-    ctx = _ai_context(client, "save this without tags")
-    # The model proposes tags anyway; the owner's own words are authoritative.
-    result = await SaveTool(ctx).execute(ctx, {"tags": ["invented", "extra"]})
-
-    assert result.success is True
-    row = await _saved_row(result.message)
-    assert row["tags"] == []
-    assert row.get("display_name") is None
 
 
 @pytest.mark.asyncio

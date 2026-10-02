@@ -30,20 +30,13 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from backend.ai.actions import (
-    KIND_CLARIFY,
-    KIND_EXECUTABLE,
-    KIND_INVALID,
-    parse_action_text,
-    parse_command_intent,
-)
+from backend.ai.actions import KIND_EXECUTABLE, KIND_INVALID, parse_action_text
 from backend.ai.semantic_delete import (
     build_matcher,
     build_matcher_from_dict,
     count_words,
     english_word_count,
     normalize_text,
-    parse_structural_predicate,
     spec_from_dict,
     tokenize,
     total_word_count,
@@ -144,40 +137,9 @@ def test_word_counts_mixed_persian_english():
     assert total_word_count("I have 2 cats 🐈") == 3
 
 
-# ── Structural predicate parsing (unit) ─────────────────────────────────────
-
-@pytest.mark.parametrize(
-    "text,expected",
-    [
-        ("دو کلمه‌ای", {"word_count": 2}),
-        ("دوکلمهای", {"word_count": 2}),
-        ("سه کلمه ای", {"word_count": 3}),
-        ("دو کلمه‌ای انگلیسی", {"english_word_count": 2}),
-        ("انگلیسی دو کلمه‌ای", {"english_word_count": 2}),
-        ("2-word English", {"english_word_count": 2}),
-        ("two-word English", {"english_word_count": 2}),
-        ("three words English", {"english_word_count": 3}),
-        ("exact 3-word English messages", {"english_word_count": 3}),
-        ("دو کلمه فارسی", {"word_count": 2}),
-    ],
-)
-def test_parse_structural_predicate_forms(text, expected):
-    spec = parse_structural_predicate(text)
-    assert spec is not None, text
-    assert spec.to_dict() == expected, text
-
-
-def test_parse_structural_predicate_none_for_other_requests():
-    for text in ("پیام‌های مربوط به فوتبال", "delete the last 5 messages",
-                 "سلام", "پیام‌های آخر"):
-        assert parse_structural_predicate(text) is None, text
-
-
-def test_parse_structural_predicate_ambiguous_large_count_is_none():
-    # 150 words is not a clearly defined predicate → caller must clarify.
-    assert parse_structural_predicate("پیام‌های صد و پنجاه کلمه‌ای") is None
-    # In-range compounds still parse (بیست و پنج = 25).
-    assert parse_structural_predicate("بیست و پنج کلمه‌ای").word_count == 25
+# ── Structural predicate VALIDATION (unit) ────────────────────────────────
+# The predicate is a structured argument the MODEL proposes; local code only
+# validates its shape and applies it to already-fetched message text.
 
 
 def test_spec_from_dict_validation():
@@ -236,142 +198,6 @@ def test_matcher_query_and_word_count_are_anded():
     assert matcher("فوتبال hello world") is True
     assert matcher("فوتبال hello world foo") is False
     assert matcher("تنیس hello world") is False
-
-
-# ── Deterministic intent parsing (integration with parse_command_intent) ───
-
-def test_persian_two_word_english_predicate_is_not_deletion_count():
-    """The core regression: 'دو کلمه‌ای' must be a word count, never count=2."""
-    r = parse_command_intent("پاک کن پیام‌های دو کلمه‌ای انگلیسی رو", has_reply=False)
-    assert r.kind == KIND_EXECUTABLE
-    assert r.action == "delete_messages"
-    assert r.count is None
-    assert r.mode == "filtered"
-    assert r.tool_calls == [{
-        "name": "delete",
-        "arguments": {"mode": "filtered", "semantic": {"english_word_count": 2}},
-    }]
-
-
-def test_persian_exact_two_english_words_alt_wording():
-    r = parse_command_intent(
-        "پیام‌هایی که دقیقاً دو کلمه انگلیسی دارن رو پاک کن", has_reply=False
-    )
-    assert r.kind == KIND_EXECUTABLE
-    assert r.tool_calls == [{
-        "name": "delete",
-        "arguments": {"mode": "filtered", "semantic": {"english_word_count": 2}},
-    }]
-
-
-def test_persian_two_word_any_language():
-    r = parse_command_intent("پاک کن پیام‌های دو کلمه‌ای رو", has_reply=False)
-    assert r.kind == KIND_EXECUTABLE
-    assert r.tool_calls == [{
-        "name": "delete",
-        "arguments": {"mode": "filtered", "semantic": {"word_count": 2}},
-    }]
-
-
-def test_english_exact_n_word_predicate():
-    r = parse_command_intent("delete my exact 3-word English messages", has_reply=False)
-    assert r.kind == KIND_EXECUTABLE
-    assert r.count is None
-    assert r.tool_calls == [{
-        "name": "delete",
-        "arguments": {"mode": "filtered", "semantic": {"english_word_count": 3}},
-    }]
-
-
-def test_count_plus_structural_predicate():
-    r = parse_command_intent("پاک کن ۱۰ پیام دو کلمه‌ای انگلیسی", has_reply=False)
-    assert r.kind == KIND_EXECUTABLE
-    assert r.count == 10
-    assert r.tool_calls == [{
-        "name": "delete",
-        "arguments": {
-            "mode": "filtered",
-            "semantic": {"english_word_count": 2},
-            "count": 10,
-        },
-    }]
-
-
-def test_time_plus_structural_predicate():
-    r = parse_command_intent("پیام‌های دو کلمه‌ای انگلیسی امروز رو پاک کن", has_reply=False)
-    assert r.kind == KIND_EXECUTABLE
-    assert r.mode == "filtered"
-    assert r.after_time == "today"
-    assert r.tool_calls == [{
-        "name": "delete",
-        "arguments": {
-            "mode": "filtered",
-            "semantic": {"english_word_count": 2},
-            "after_time": "today",
-        },
-    }]
-
-
-def test_boundary_plus_structural_predicate():
-    r = parse_command_intent(
-        "تا این پیام پیام‌های دو کلمه‌ای انگلیسی رو پاک کن", has_reply=False
-    )
-    assert r.kind == KIND_EXECUTABLE
-    assert r.mode == "until_message"
-    assert r.tool_calls == [{
-        "name": "delete",
-        "arguments": {"mode": "until_message", "semantic": {"english_word_count": 2}},
-    }]
-
-
-def test_topic_plus_structural_predicate():
-    r = parse_command_intent(
-        "پیام‌های دو کلمه‌ای انگلیسی مربوط به فوتبال رو پاک کن", has_reply=False
-    )
-    assert r.kind == KIND_EXECUTABLE
-    assert r.tool_calls == [{
-        "name": "delete",
-        "arguments": {
-            "mode": "filtered",
-            "semantic": {"query": "فوتبال", "english_word_count": 2},
-        },
-    }]
-
-
-def test_topic_only_request_keeps_plain_query_path():
-    r = parse_command_intent("پیام‌های مربوط به فوتبال رو پاک کن", has_reply=False)
-    assert r.kind == KIND_EXECUTABLE
-    assert r.mode == "filtered"
-    assert r.query == "فوتبال"
-    assert r.tool_calls == [{
-        "name": "delete",
-        "arguments": {"mode": "filtered", "query": "فوتبال"},
-    }]
-
-
-def test_ambiguous_semantic_request_never_guesses_a_range():
-    for text in ("پاک کن", "پیام‌ها رو پاک کن", "delete messages"):
-        r = parse_command_intent(text, has_reply=False)
-        assert r.kind != KIND_EXECUTABLE, text
-        assert r.tool_calls == [], text
-
-
-def test_structural_delete_accepts_remove_wording():
-    """'حذف کن' is the same delete imperative as 'پاک کن' for structural rules."""
-    r = parse_command_intent("پیام‌های دو کلمه‌ای انگلیسی رو حذف کن", has_reply=False)
-    assert r.kind == KIND_EXECUTABLE
-    assert r.tool_calls == [{
-        "name": "delete",
-        "arguments": {"mode": "filtered", "semantic": {"english_word_count": 2}},
-    }]
-
-
-def test_positional_count_after_word_marker_still_parses():
-    """'۵ پیام آخر' is a positional count even when a word marker follows later."""
-    r = parse_command_intent("پاک کن ۵ پیام دو کلمه‌ای انگلیسی", has_reply=False)
-    assert r.kind == KIND_EXECUTABLE
-    assert r.count == 5
-    assert r.tool_calls[0]["arguments"]["count"] == 5
 
 
 # ── Structured JSON action path (provider fallback) ─────────────────────────
@@ -662,75 +488,3 @@ class _FakeProvider:
 
     def health(self):
         return {"healthy": True}
-
-
-def _make_dispatcher(mock_te, provider):
-    from backend.ai.engine.dispatcher import Dispatcher
-    from backend.ai.engine.hooks import NOOP_HOOKS
-    from backend.ai.engine.metrics import EngineMetrics
-    from backend.ai.providers.manager.manager import ProviderManager
-    from backend.ai.session.request import AIRequest
-
-    pm = ProviderManager()
-    pm.register_provider(provider)
-    pm.switch_provider(provider.name)
-    pm._fallback_chain = []
-
-    mock_conv = MagicMock()
-    mock_sess = MagicMock()
-    mock_sess.session_id = "s"
-    mock_sess.owner_id = 123
-    mock_sess.active_provider = provider.name
-    mock_conv.get_session.return_value = mock_sess
-    mock_conv.restore_history = AsyncMock()
-    mock_conv.get_history.return_value = []
-
-    mock_pb = MagicMock()
-    pp = MagicMock()
-    pp.system_prompt = "sys"
-    pp.runtime_context = ""
-    pp.conversation_context = ""
-    pp.tool_context = ""
-    pp.user_input = "do it"
-    pp.estimated_tokens.estimated_input_tokens = 50
-    pp.estimated_tokens.prompt_size_chars = 100
-    mock_pb.build.return_value = pp
-
-    return Dispatcher(mock_conv, mock_pb, pm, NOOP_HOOKS, EngineMetrics(), tool_executor=mock_te)
-
-
-@pytest.mark.asyncio
-async def test_semantic_delete_runs_fast_path_without_provider():
-    from backend.ai.session.request import AIRequest
-    from backend.ai.tools.executor import ToolExecutionResult
-
-    mock_te = MagicMock()
-    mock_te.execute_calls = AsyncMock(return_value=[
-        ToolExecutionResult(tool_name="delete", success=True,
-                            message="Deleted 2 outgoing message(s).", data={"count": 2}),
-    ])
-    c = MagicMock()
-    c.extra = {}
-    c.telegram = None
-    c.tz_str = "UTC"
-    c.client = None
-    mock_te._context = c
-
-    provider = _FakeProvider()
-    d = _make_dispatcher(mock_te, provider)
-
-    result = await d.dispatch(AIRequest(
-        session_id="s1", message_id=1, owner_id=123,
-        user_message="پاک کن پیام‌های دو کلمه‌ای انگلیسی رو", chat_id=456,
-    ))
-
-    assert result.success is True
-    assert result.metadata["finish_state"] == "local_fast_path"
-    tool_calls = mock_te.execute_calls.call_args.args[0]
-    assert tool_calls == [{
-        "name": "delete",
-        "arguments": {"mode": "filtered", "semantic": {"english_word_count": 2}},
-    }]
-    # Provider-independent: deterministic structural predicates never depend
-    # on a provider being available.
-    assert provider.calls == 0

@@ -19,6 +19,14 @@ The dispatcher measures wall-clock latency for the whole run, invokes
 hooks at each lifecycle point, and records metrics. It owns no state
 of its own beyond what is injected (conversation manager, prompt
 builder, provider manager, hooks, metrics).
+
+Intent boundary: no step here reads the owner's message to decide WHAT to do.
+There is no local command parser, no keyword/cadence detector and no
+provider-free fast path that turns user text into a tool call. The AI
+interprets intent; the dispatcher validates what the AI proposed, resolves it
+through the existing ``ToolRegistry``/``ToolExecutor``, and records the result.
+The only pre-provider steps are the confirmation round-trip and the isolated
+media boundary, neither of which routes natural-language intent.
 """
 from __future__ import annotations
 
@@ -30,7 +38,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from typing import Any
 
-from backend.ai.actions import parse_action_text, parse_command_intent
+from backend.ai.actions import parse_action_text
 from backend.ai.confirmation import (
     CONFIRMATION_ALREADY_PENDING_TEXT,
     PendingConfirmationStore,
@@ -407,26 +415,6 @@ class Dispatcher:
             if confirmation is not None:
                 return confirmation
 
-        # ── Local deterministic fast path (BEFORE any provider round) ──
-        # High-confidence command and scheduling intents (including durable
-        # Taskloom creation) resolve WITHOUT a provider round. This keeps
-        # recurring requests independent of provider tool selection.
-        # Other command intents (status queries, last-N delete / review,
-        # save/delete by reply, save-by-link) resolve WITHOUT a
-        # provider round. This keeps deterministic operations working even
-        # when every AI provider is down, rate-limited, or misconfigured —
-        # the reason "وضعیت یوزرنیمم رو بگو" must not depend on Groq, and
-        # "هر 1 دقیقه ..." must not depend on provider tool selection.
-        # It is NOT a keyword command parser replacing the AI: only the
-        # narrow, high-confidence command vocabulary resolves here; every
-        # conversational and semantic request continues to the provider.
-        if tools_allowed and self._tool_executor is not None:
-            fast = await self._try_local_fast_path(
-                request, rid, status_callback, start, metadata,
-            )
-            if fast is not None:
-                return fast
-
         # ── Deterministic media request (BEFORE any prompt construction) ──
         # A media target is resolved from the runtime's own identifiers — the
         # replied-to message, or the triggering message itself — so WHICH media
@@ -657,8 +645,8 @@ class Dispatcher:
             response = self._apply_structured_action(response, request, rid)
             structured_action = bool(response.tool_calls)
 
-            # Recovery: the model returned prose that neither the deterministic
-            # command parser nor the JSON action parser resolved into an action.
+            # Recovery: the model returned prose that the JSON action parser
+            # could not resolve into an action.
             # Exactly ONE bounded retry asks the model to emit a structured
             # action. No tool has run yet, so a destructive save/delete can
             # never double-execute. If the retry still yields prose, the
@@ -1254,19 +1242,6 @@ class Dispatcher:
         except Exception as exc:  # noqa: BLE001
             logger.warning("AI usage persistence schedule failed: %r", exc)
 
-    @staticmethod
-    def _reply_text(request: AIRequest) -> str:
-        """Trusted replied-to message text for deterministic target resolution.
-
-        Sourced from the runtime's own reply metadata (never model output) and
-        consumed ONLY by ``parse_command_intent`` — it is never added to the
-        AI request, the prompt, or any model-visible field.
-        """
-        ctx = request.reply_context
-        if ctx is None or not ctx.exists:
-            return ""
-        return ctx.text_preview or ""
-
     def _build_tool_context(self, request: AIRequest) -> ToolContext:
         """Build a per-request ToolContext from the executor's base context.
 
@@ -1297,18 +1272,6 @@ class Dispatcher:
         # Looking up the process-global engine from inside a tool can route a
         # request through a stale/unconfigured provider mesh.
         extra["provider_manager"] = self._provider_manager
-        if request.user_message:
-            deterministic = parse_command_intent(
-                request.user_message,
-                has_reply=bool(request.reply_context and request.reply_context.exists),
-                reply_text=self._reply_text(request),
-            )
-            if deterministic.action == "create_task" and deterministic.kind == "executable":
-                candidate = self._build_deterministic_task_candidate(
-                    request, deterministic.schedule_text,
-                )
-                if candidate is not None:
-                    extra["deterministic_task_candidate"] = candidate
         if request.reply_context and request.reply_context.exists:
             extra["reply_msg"] = {
                 "message_id": request.reply_context.message_id,
@@ -1327,55 +1290,6 @@ class Dispatcher:
             client=base.client,
             extra=extra,
         )
-
-    @staticmethod
-    def _build_deterministic_task_candidate(request: AIRequest, schedule_text: str) -> dict[str, Any] | None:
-        """Build a narrow interval/write candidate from a high-confidence request."""
-        from backend.ai.actions import _parse_number, _tokenize, _TIME_UNITS
-
-        words = _tokenize(schedule_text)
-        interval_index = next(
-            (i for i, word in enumerate(words) if word in {"هر", "every", "each"}),
-            None,
-        )
-        if interval_index is None:
-            return None
-        unit_index = next(
-            (
-                i for i in range(interval_index + 1, min(len(words), interval_index + 6))
-                if words[i] in _TIME_UNITS
-            ),
-            None,
-        )
-        if unit_index is None:
-            return None
-        number = _parse_number(words, unit_index - 1) or 1
-        unit_seconds = {
-            "ثانیه": 1, "second": 1, "seconds": 1, "sec": 1, "secs": 1,
-            "دقیقه": 60, "دقیقه‌ای": 60, "دقیق": 60,
-            "minute": 60, "minutes": 60, "min": 60, "mins": 60,
-            "ساعت": 3600, "hour": 3600, "hours": 3600, "hr": 3600, "hrs": 3600,
-        }.get(words[unit_index], 0)
-        if unit_seconds <= 0:
-            return None
-        marker = next(
-            (i for i, word in enumerate(words) if word in {"بنویس", "نویس", "write", "writing"}),
-            None,
-        )
-        if marker is None or marker + 1 >= len(words):
-            return None
-        text = " ".join(words[marker + 1:]).strip()
-        if not text:
-            return None
-        return {
-            "label": text[:256],
-            "schedule_type": "interval",
-            "schedule": {"seconds": number * unit_seconds},
-            "timezone": request.timezone or "UTC",
-            "actions": [{"name": "send_message", "arguments": {"text": text}}],
-            "notification_destination": {},
-        }
-
     def _gate_confirmation_results(
         self,
         request: AIRequest,
@@ -1517,167 +1431,6 @@ class Dispatcher:
             action=er.tool_name, kind="confirmed", target="",
         )
 
-    async def _try_local_fast_path(
-        self,
-        request: AIRequest,
-        rid: str,
-        status_callback: Callable[[str], Awaitable[None]] | None,
-        start: float,
-        metadata: dict[str, Any],
-    ) -> EngineResult | None:
-        """Deterministic fast path for high-confidence command intents.
-
-        Runs BEFORE any provider round. Only the narrow, high-confidence
-        command vocabulary resolves here (status queries, last-N delete /
-        review, save/delete by reply, save-by-link); the AI still handles
-        every conversational and semantic request. Returns None when the
-        intent is conversational so the caller continues to the provider.
-
-        This is the reliability guarantee that deterministic operations
-        work even when every provider is rate-limited, misconfigured, or
-        down — and it proves (via AI_EXEC_TRACE) that the live Telegram
-        request reaches the real tool executor, not just a unit test.
-        """
-        if not getattr(request, "allow_tools", True):
-            return None
-
-        has_reply = bool(request.reply_context and request.reply_context.exists)
-        result = parse_command_intent(
-            request.user_message, has_reply=has_reply, reply_text=self._reply_text(request)
-        )
-
-        if result.kind == "conversational":
-            return None
-
-        logger.info(
-            "AI_EXEC_TRACE request_id=%s stage=intent_resolved intent=%s kind=%s",
-            rid or "-", result.action or "none", result.kind,
-        )
-
-        # Unsupported is a deterministic safety outcome — return it directly
-        # without spending a provider round.
-        if result.kind == "unsupported":
-            message = f"❌ Unsupported action: {result.action}"
-            return self._build_fast_path_result(
-                request, rid, start, metadata, success=True, text=message,
-                action=result.action, kind=result.kind, target=result.target,
-            )
-
-        # Clarify is fast-pathed ONLY for save (a deterministic "reply to the
-        # message" prompt). Delete clarification is left to the AI because the
-        # deterministic parser cannot distinguish "delete the last message"
-        # from a semantic request like "پیام‌های مربوط به X رو پاک کن".
-        if result.kind == "clarify":
-            if result.action in ("save", "deep_save", "save_link"):
-                message = result.reason or "Could you clarify what you'd like me to do?"
-                return self._build_fast_path_result(
-                    request, rid, start, metadata, success=True, text=message,
-                    action=result.action, kind=result.kind, target=result.target,
-                )
-            return None
-
-        if result.kind != "executable" or not result.tool_calls:
-            return None
-
-        # Destructive delete is fast-pathed ONLY when the target is
-        # unambiguous and deterministic: an explicit message ID, an explicit
-        # multi-message count, the replied-to message, or the explicit last
-        # message ("آخرین پیامم رو پاک کن"). Semantic deletes ("مربوط به X",
-        # "دعوای اخیر") never resolve to last_message here — the deterministic
-        # parser yields them to the AI (see _is_semantic_delete in actions.py).
-        if result.action == "delete_messages":
-            logger.info(
-                "DELETE_INTENT request_id=%s target=%s count=%s",
-                rid or "-", result.target or "none",
-                result.count if result.count is not None else "-",
-            )
-            logger.info(
-                "DELETE_ACTION_RESOLVED request_id=%s action=delete_messages tools=%s",
-                rid or "-", [tc.get("name") for tc in result.tool_calls],
-            )
-            logger.info(
-                "DELETE_TARGET_RESOLVED request_id=%s target=%s count=%s",
-                rid or "-", result.target or "none",
-                result.count if result.count is not None else "-",
-            )
-            safe_delete = (
-                result.target in ("message_id", "replied_message", "current_message")
-                or (
-                    result.target == "recent_messages"
-                    and result.count is not None
-                    and result.count >= 2
-                )
-                or (result.target == "last_message" and result.count == 1)
-                or result.mode in {"all", "until_time", "until_message", "filtered"}
-            )
-            if not safe_delete:
-                logger.info(
-                    "AI_EXEC_TRACE request_id=%s stage=fast_path_skipped reason=ambiguous_delete",
-                    rid or "-",
-                )
-                return None
-
-        # Execute the resolved tools through the SAME ToolExecutor used by
-        # the provider tool loop — one canonical execution path.
-        per_request_ctx = self._build_tool_context(request)
-        tool_names = [tc.get("name", "") for tc in result.tool_calls]
-        logger.info(
-            "AI_EXEC_TRACE request_id=%s stage=tool_selected tools=%s",
-            rid or "-", tool_names,
-        )
-        logger.info(
-            "AI_EXEC_TRACE request_id=%s stage=tool_execute tools=%s",
-            rid or "-", tool_names,
-        )
-        try:
-            exec_results = await self._tool_executor.execute_calls(
-                result.tool_calls,
-                owner_id=request.owner_id,
-                session_id=request.session_id,
-                status_callback=status_callback,
-                context_override=per_request_ctx,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "AI_EXEC_TRACE request_id=%s stage=tool_execute error=%s", rid or "-", exc
-            )
-            exec_results = []
-
-        all_tool_results = [er.as_dict() for er in exec_results]
-        for er in exec_results:
-            logger.info(
-                "AI_EXEC_TRACE request_id=%s stage=tool_result tool=%s success=%s message=%s",
-                rid or "-", er.tool_name, er.success,
-                (er.message or er.error or "no message").replace("\n", " ")[:160],
-            )
-            if er.needs_confirmation:
-                continue
-            self._conversation.add_tool_result(
-                owner_id=request.owner_id,
-                tool_name=er.tool_name,
-                result=f"{'✅' if er.success else '❌'} {er.message or er.error or 'no message'}",
-            )
-        metadata["tool_results"] = all_tool_results
-        metadata["stages"].append("local_fast_path_tool_execution")
-
-        # A deterministic command resolving to a permission-gated tool (no
-        # registered command does today) would surface the same pending
-        # owner approval instead of pretending the action ran.
-        confirmation_text = self._gate_confirmation_results(
-            request, result.tool_calls, exec_results,
-        )
-        if confirmation_text is not None:
-            metadata["confirmation_pending"] = True
-            summary = confirmation_text
-        else:
-            summary = self._summarize_tool_results(all_tool_results) or "Action completed."
-        self._conversation.add_assistant_message(owner_id=request.owner_id, content=summary)
-
-        return self._build_fast_path_result(
-            request, rid, start, metadata, success=True, text=summary,
-            action=result.action, kind=result.kind, target=result.target,
-        )
-
     def _telegram_source(self) -> Any:
         """The Telegram source the media boundary reads through (facade first)."""
         executor = self._tool_executor
@@ -1721,10 +1474,8 @@ class Dispatcher:
     ) -> EngineResult | None:
         """Answer an owner media request through the controlled media boundary.
 
-        Runs AFTER the deterministic command fast path (so "delete this" on a
-        media reply still deletes the message, and save/preview/retrieve keep
-        their precedence) and BEFORE any prompt/context construction: the
-        answer comes from ``services/media_ai_service``'s own two-input message
+        Runs BEFORE any prompt/context construction: the answer comes from
+        ``services/media_ai_service``'s own two-input message
         list (the owner's authored request + the normalized media text), so no
         reply context, Telegram window, AI session history or memory can reach
         the model for a media request.
@@ -1877,10 +1628,10 @@ class Dispatcher:
         model: str = "deterministic",
         fallback_used: bool = False,
     ) -> EngineResult:
-        """Build the EngineResult for a locally-resolved fast-path intent."""
+        """Build the EngineResult for a locally-resolved, non-provider intent."""
         latency = time.perf_counter() - start
         meta = dict(metadata)
-        meta["finish_state"] = "local_fast_path"
+        meta["finish_state"] = "local_boundary"
         meta["token_source"] = "unavailable"
         meta["retry_count"] = 0
         meta["fallback_used"] = fallback_used
@@ -1931,15 +1682,14 @@ class Dispatcher:
         request: AIRequest,
         rid: str = "",
     ) -> ProviderResponse:
-        """Bridge prose/JSON model output into the existing tool executor.
+        """Bridge the model's structured JSON output into the existing executor.
 
-        When the provider did not emit a native tool call, the deterministic
-        command parser runs FIRST over the original user message — the model's
-        prose is never trusted to decide execution or permissions. Only when
-        the deterministic parser finds nothing is the model's own JSON output
-        parsed. Either way the result is validated locally, resolved into
-        concrete tool calls for the SAME ToolExecutor, and clarification /
-        rejection outcomes become a deterministic text response.
+        When the provider did not emit a native tool call, its own JSON action
+        object is parsed, validated locally, and resolved into concrete tool
+        calls for the SAME ToolExecutor. The owner's raw message is never
+        re-read here: local code validates what the AI proposed, it does not
+        decide what the owner meant. Clarification / rejection outcomes become
+        a deterministic text response.
         """
         text = (response.text or "").strip()
         if not text:
@@ -1947,17 +1697,10 @@ class Dispatcher:
 
         logger.info("AI_ACTION_PARSE_START id=%s", rid or "-")
 
-        # Deterministic command intent is authoritative for the command
-        # vocabulary. It resolves targets from the reply context — it never
-        # depends on the model emitting JSON or a native tool call.
-        has_reply = bool(request.reply_context and request.reply_context.exists)
-        result = parse_command_intent(
-            request.user_message, has_reply=has_reply, reply_text=self._reply_text(request)
-        )
-
-        if result.kind == "conversational":
-            # No deterministic command match — try the model's own JSON output.
-            result = parse_action_text(text)
+        # The MODEL's structured output is the only input here. There is no
+        # deterministic pre-pass over the owner's message: local code validates
+        # and resolves what the AI already proposed, and never decides intent.
+        result = parse_action_text(text)
 
         if result.kind == "conversational":
             logger.info(

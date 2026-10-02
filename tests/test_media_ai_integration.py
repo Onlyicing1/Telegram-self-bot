@@ -552,24 +552,6 @@ async def test_resolution_precedes_the_provider_call_and_needs_no_provider_reaso
     assert order == ["resolve", "download", "provider"]
 
 
-@pytest.mark.asyncio
-async def test_the_fast_path_keeps_its_precedence_over_the_media_route():
-    provider = _ScriptedProvider("SUMMARY")
-    client = _TrapClient()
-    dispatcher, _ = _dispatcher(_manager(provider), client)
-
-    result = await dispatcher.dispatch(_request(
-        user_message="آخرین پیامم رو پاک کن",
-        reply_context=_reply_context(),
-    ))
-
-    # A deterministic command still resolves deterministically (no provider round).
-    assert result.success is True
-    assert result.metadata["finish_state"] == "local_fast_path"
-    assert result.metadata["ai_action"]["action"] == "delete_messages"
-    assert provider.prompts == []
-
-
 # ── 4. Unsupported media, failures, honesty ──
 
 

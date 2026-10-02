@@ -1,11 +1,17 @@
-"""No-regex command/tool routing — behavior pins.
+"""Regex audit — no natural-language intent routing remains.
 
-Pins the §24.10 implementation (INVESTIGATION.md): command and intent
-detection is decided on TOKENS (equality, set membership, digit adjacency),
-never on regex, while every execution still converges on the single
-ToolRegistry → ToolExecutor boundary. Structured (native or JSON) proposals
-keep working; prose mentioning a tool name, keyword strings, and malformed or
-unknown requests never execute anything.
+The goal of this audit is NOT "zero regex in the repository". It is:
+
+    zero regex (and zero keyword/token vocabulary) that reads a natural-language
+    user message and chooses a tool or an action.
+
+Every remaining regex is classified here as TECHNICAL: fixed-format artifact
+matching, JSON extraction, protocol/transport parsing, or a deterministic
+validation applied to an argument the AI already selected. None of them can
+turn an owner message into ``create_task``, ``save``, ``search`` or a tag call.
+
+Structured proposals (native tool calls and the model's JSON action object)
+keep working, and malformed/unknown requests still execute nothing.
 """
 from __future__ import annotations
 
@@ -16,129 +22,102 @@ import pytest
 from backend.ai import actions
 from backend.ai.actions import (
     parse_action_text,
-    parse_command_intent,
     resolve_tool_calls,
     validate_action,
-    _FA_CLOCK_WORDS,
-    _EN_CLOCK_WORDS,
-    _has_future_clock_request,
-    _text_has_clock_anchor,
-    _tokenize,
 )
+from backend.ai.tools.context import ToolContext
 from backend.ai.tools.executor import ToolExecutor
 from backend.ai.tools.registry import create_default_registry
-from backend.ai.tools.context import ToolContext
 
-# ── 1. Clock-anchor detection is token-based ────────────────────────────────
+DECISION_PATH_MODULES = [
+    "backend/ai/actions.py",
+    "backend/ai/engine/dispatcher.py",
+    "backend/ai/tools/task.py",
+    "backend/ai/tools/save.py",
+    "backend/ai/proactive.py",
+]
 
+RETIRED_SYMBOLS = (
+    "parse_command_intent",
+    "_is_scheduling_intent",
+    "_is_event_intent",
+    "_has_future_clock_request",
+    "_try_local_fast_path",
+    "_build_deterministic_task_candidate",
+    "deterministic_task_candidate",
+    "local_fast_path",
+    "explicit_no_tags_requested",
+    "save_metadata_requested",
+)
 
-class TestTokenClockAnchorDetection:
-    def test_source_has_no_clock_intent_regex(self):
-        src = (Path("backend/ai/actions.py")).read_text(encoding="utf-8")
-        for retired in (r"\d{1,2}:\d{2}", r"ساعت\s*\d", r"\bat\s+\d{1,2}\b"):
-            assert retired not in src
-
-    @pytest.mark.parametrize(
-        "text",
-        [
-            "فردا ساعت 15:35 کارها را جمع کن",
-            "tomorrow at 5 water the plants",
-            "فردا at 5 pm stretch",
-            "فردا ساعت 9:05 یادم بنداز",
-        ],
-    )
-    def test_future_clock_anchors_detect(self, text):
-        assert _text_has_clock_anchor(text)
-        assert _has_future_clock_request(text, _tokenize(text))
-
-    @pytest.mark.parametrize(
-        "text",
-        [
-            "پروژه ساعت‌ها طول کشید",
-            "atmosphere was nice yesterday",
-            "دیروز کجا بودم",
-        ],
-    )
-    def test_non_clock_text_does_not_false_positive(self, text):
-        assert not _text_has_clock_anchor(text)
-
-    @pytest.mark.parametrize(
-        "text",
-        [
-            "ساعت ۹ دیروز کجا بودم",
-            "جلسه تا ساعت ۶",
-        ],
-    )
-    def test_past_or_same_day_clock_is_never_a_future_schedule(self, text):
-        # The anchor exists, but without a future day marker the future
-        # gate keeps the request on its command path (old behavior parity).
-        assert _has_future_clock_request(text, _tokenize(text)) is False
-
-    def test_fanum_and_nonlatin_punct_survive(self):
-        assert _text_has_clock_anchor("فردا ساعت ۱۵٫۳۵")
-        assert _text_has_clock_anchor("tomorrow at «7» sharp")
-
-    def test_number_unit_pairs_are_not_clock_anchors(self):
-        assert not _text_has_clock_anchor("هر 5 دقیقه")
-        assert not _text_has_clock_anchor("every 10 minutes remind me")
+RETIRED_VOCABULARY = (
+    "_FA_RECUR_WORDS",
+    "_EN_RECUR_WORDS",
+    "_FA_ACTION_VERBS",
+    "_EN_ACTION_VERBS",
+    "_INTERVAL_INTRO",
+    "_FA_PLAN_WORDS",
+    "_EN_PLAN_WORDS",
+    "_FA_EVENT_MARKERS",
+    "_EN_EVENT_WORDS",
+    "_DELETE_STEMS",
+    "_SAVE_STEMS",
+    "_SEND_STEMS",
+    "_EN_SAVE",
+    "_EN_DELETE",
+    "_EN_SEND",
+    "_EN_META_FRAME_WORDS",
+    "_SAVE_TAG_MARKERS",
+    "_SAVE_NAME_MARKERS",
+)
 
 
-# ── 2. create_task completeness gate uses the shared token detector ────────
+# ── 1. The AI decision path contains no natural-language intent routing ─────
 
 
-def _gate(request: str):
-    from tests.test_task_semantic_completeness import (
-        _context,
-        _manager,
-        _Provider,
-    )
-    from backend.ai.tools.task import CreateTaskTool
+class TestNoSemanticIntentRoutingRemains:
+    """No module may re-derive an intent from the owner's raw message."""
 
-    provider = _Provider("null")
-    manager = _manager(provider)
-    return (
-        CreateTaskTool(_context(manager)).execute(
-            _context(manager), {"request": request}
-        ),
-        provider,
-    )
+    @pytest.mark.parametrize("module", DECISION_PATH_MODULES)
+    def test_no_command_parser_symbol_exists(self, module):
+        src = Path(module).read_text(encoding="utf-8")
+        for retired in RETIRED_SYMBOLS:
+            assert retired not in src, f"{module} still references {retired}"
 
+    @pytest.mark.parametrize("module", DECISION_PATH_MODULES)
+    def test_no_recurrence_or_action_vocabulary_remains(self, module):
+        src = Path(module).read_text(encoding="utf-8")
+        for retired in RETIRED_VOCABULARY:
+            assert retired not in src, f"{module} still defines {retired}"
 
-class TestCompletenessGateTokenBased:
-    def test_gate_has_no_inline_regex(self):
-        src = (Path("backend/ai/tools/task.py")).read_text(encoding="utf-8")
-        assert "_re.search" not in src
-        assert r"\d{1,2}:\d{2}" not in src
+    def test_cadence_words_have_no_routing_power_anywhere(self):
+        """The exact production failure: "هفتگی" as a topic, not a schedule."""
+        for name in dir(actions):
+            assert not name.startswith("_FA_RECUR"), name
+            assert not name.startswith("_EN_RECUR"), name
+        assert not hasattr(actions, "parse_command_intent")
 
-    @pytest.mark.asyncio
-    async def test_incomplete_request_routes_to_wizard(self):
-        coro, provider = _gate("hello there friend")
-        result = await coro
-        assert result.success is False
-        assert result.data["open_taskloom_wizard"] is True
-        assert result.data["wizard_reason"] == "incomplete_request"
-        # The gate decided with ZERO provider involvement: no schedule
-        # expression was token-provable, so nothing reached the model.
-        assert provider.calls == 0
+    def test_dispatcher_module_states_the_intent_boundary(self):
+        src = Path("backend/ai/engine/dispatcher.py").read_text(encoding="utf-8")
+        assert "no step here reads the owner's message to decide WHAT to do" in src
 
-    @pytest.mark.asyncio
-    async def test_clock_anchor_completes_the_request(self):
-        coro, provider = _gate("tomorrow at 5 write something nice for me")
-        result = await coro
-        assert result.success is False
-        # The GATE released it to the interpreter (one provider round); the
-        # fake-null interpretation is what declined, never the gate.
-        assert provider.calls == 1
-        assert result.data.get("wizard_reason") != "incomplete_request"
+    def test_create_task_tool_has_no_natural_language_pre_gate(self):
+        src = Path("backend/ai/tools/task.py").read_text(encoding="utf-8")
+        assert "NO natural-language gate runs here" in src
 
 
-# ── 3. One save-code shape contract ─────────────────────────────────────────
+# ── 2. Remaining regexes are technical, not semantic ───────────────────────
 
 
-class TestSaveCodeConsolidation:
-    def test_shape_contract_is_adjacent_to_token_classifiers(self):
-        src = (Path("backend/ai/actions.py")).read_text(encoding="utf-8")
-        assert "re.compile" in src  # shape regexes remain (§24.8)
+class TestRemainingRegexesAreTechnical:
+    def test_actions_module_keeps_no_persian_english_keyword_alternation(self):
+        src = Path("backend/ai/actions.py").read_text(encoding="utf-8")
+        assert "_FA_" not in src
+        assert "_EN_" not in src
+
+    def test_save_code_shape_contract_still_validates(self):
+        src = Path("backend/ai/actions.py").read_text(encoding="utf-8")
+        assert "re.compile" in src  # shape regexes remain
         assert "invalid 'save_code'" in src  # validator texts unchanged
 
     def test_validate_save_code_action_rejects_non_codes(self):
@@ -148,32 +127,39 @@ class TestSaveCodeConsolidation:
         assert result.kind == actions.KIND_INVALID
         assert "Invalid 'save_code'" in (result.error or "")
 
+    def test_telegram_url_parsing_is_technical(self):
+        assert actions._extract_telegram_link("t.me/durov") == "t.me/durov"
+        assert actions._extract_telegram_link("no link here") is None
 
-# ── 4. `Menu` is exact-equality routing (no regex anywhere) ─────────────────
+
+# ── 3. `Menu` is exact-equality routing ────────────────────────────────────
 
 
 class TestMenuEqualityRouting:
     def test_misc_registers_no_telethon_pattern(self):
-        src = (Path("backend/bot/handlers/misc.py")).read_text(encoding="utf-8")
+        src = Path("backend/bot/handlers/misc.py").read_text(encoding="utf-8")
         assert "pattern=" not in src
         assert '!= "Menu"' in src
 
     def test_only_the_exact_word_matches(self):
-        # Mirror of the handler guard: raw text must equal the literal word.
         candidates = {"Menu": True, " menu": False, "menu ": False,
                       "MENU": False, "Menü": False}
         for text, expected in candidates.items():
             assert (text == "Menu") is expected
 
 
-# ── 5. Hallucinated / malformed / unknown tool invocation is rejected ───────
+# ── 4. Hallucinated / malformed / unknown tool invocation is rejected ───────
 
 
 class TestHallucinatedToolInvocationRejected:
-    def test_prose_naming_a_tool_does_not_execute_it(self):
-        result = parse_command_intent(
-            "I want to know what the todo_add tool does", has_reply=False
-        )
+    def test_prose_naming_a_tool_produces_no_action(self):
+        """Prose that merely mentions a tool yields no structured action.
+
+        Execution requires a STRUCTURED proposal from the AI; a sentence that
+        happens to contain a tool name is not one.
+        """
+        result = parse_action_text("I want to know what the todo_add tool does")
+        assert result.kind == actions.KIND_CONVERSATIONAL
         assert resolve_tool_calls(result) == []
 
     def test_unknown_tool_name_is_rejected_by_the_registry(self):
@@ -219,28 +205,23 @@ class TestHallucinatedToolInvocationRejected:
         assert resolve_tool_calls(result) == []
 
 
-# ── 6. Valid structured proposal and Todo creation still work ───────────────
+# ── 5. Valid structured proposal and Todo creation still work ──────────────
 
 
-class TestTodoCreationStillWorks:
+class TestStructuredProposalStillWorks:
     def test_valid_structured_tool_call_still_resolves(self):
         parsed = parse_action_text(
             '```json\n{"action": "todo_add", "title": "buy milk"}\n```'
         )
-        validated = parsed if parsed.kind == actions.KIND_EXECUTABLE else validate_action(
-            {"action": "todo_add", "title": "buy milk"}
+        validated = (
+            parsed if parsed.kind == actions.KIND_EXECUTABLE
+            else validate_action({"action": "todo_add", "title": "buy milk"})
         )
         calls = resolve_tool_calls(validated)
         assert calls and calls[0]["name"] == "todo_add"
 
-    def test_deterministic_command_paths_unchanged(self):
-        # Save/delete/send vocabulary: the deterministic parser still emits
-        # existing-registry tool calls through the SAME executor boundary.
-        from backend.ai.actions import parse_structural_predicate
-        from backend.ai import semantic_delete
-
-        assert semantic_delete.parse_structural_predicate is not None
-        r = parse_command_intent("delete 3 messages", has_reply=False)
-        calls = resolve_tool_calls(r)
-        assert calls and calls[0]["name"] == "delete"
-        assert calls[0]["arguments"]["count"] == 3
+    def test_create_task_is_still_available_to_the_ai(self):
+        registry = create_default_registry(ToolContext(
+            telegram=None, owner_id=7, tz_str="UTC", client=None, extra={}
+        ))
+        assert registry.get("create_task") is not None

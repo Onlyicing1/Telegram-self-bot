@@ -9,48 +9,10 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from backend.ai.actions import (
-    KIND_CLARIFY,
-    KIND_CONVERSATIONAL,
-    KIND_EXECUTABLE,
-    KIND_INVALID,
-    KIND_UNSUPPORTED,
-    parse_action_text,
-    parse_command_intent,
-)
+from backend.ai.actions import KIND_EXECUTABLE, KIND_INVALID, parse_action_text
 
 
 # ── Action schema: save-by-link + explicit message ID ──
-
-
-def test_deterministic_save_by_link_persian():
-    r = parse_command_intent("این لینک رو سیو کن https://t.me/somechannel/42", has_reply=False)
-    assert r.kind == KIND_EXECUTABLE
-    assert r.action == "save_link"
-    assert r.tool_calls == [{"name": "save_by_link", "arguments": {"link": "https://t.me/somechannel/42"}}]
-
-
-def test_deterministic_save_by_link_english():
-    r = parse_command_intent("save this link https://t.me/c/3080318802/99", has_reply=False)
-    assert r.kind == KIND_EXECUTABLE
-    assert r.action == "save_link"
-    assert r.tool_calls == [{"name": "save_by_link", "arguments": {"link": "https://t.me/c/3080318802/99"}}]
-
-
-def test_deterministic_link_url_preserved_verbatim():
-    r = parse_command_intent("این لینک رو سیو کن https://t.me/SomeChannel/12345", has_reply=False)
-    assert r.tool_calls == [{"name": "save_by_link", "arguments": {"link": "https://t.me/SomeChannel/12345"}}]
-
-
-def test_deterministic_explicit_message_id_delete():
-    r = parse_command_intent("پیام با ID 123 رو پاک کن", has_reply=False)
-    assert r.kind == KIND_EXECUTABLE
-    assert r.tool_calls == [{"name": "delete_message_by_id", "arguments": {"message_id": 123}}]
-
-
-def test_deterministic_pure_negation_is_not_delete():
-    r = parse_command_intent("پاکش نکن", has_reply=True)
-    assert r.kind == KIND_CONVERSATIONAL
 
 
 def test_json_save_link():
@@ -86,44 +48,6 @@ def test_unknown_field_still_rejected():
 
 
 # ── Deterministic "review last N messages" → real Telegram history ──
-
-
-def test_deterministic_review_last_n_persian_word_number():
-    r = parse_command_intent("ده پیام آخر رو بررسی کن", has_reply=False)
-    assert r.kind == KIND_EXECUTABLE
-    assert r.action == "list_recent_messages"
-    assert r.count == 10
-    assert r.tool_calls == [{"name": "list_recent_messages", "arguments": {"limit": 10}}]
-
-
-def test_deterministic_review_last_n_persian_digits():
-    r = parse_command_intent("آخرین ۱۰ پیام این چت چی بودن؟", has_reply=False)
-    assert r.kind == KIND_EXECUTABLE
-    assert r.tool_calls == [{"name": "list_recent_messages", "arguments": {"limit": 10}}]
-
-
-def test_deterministic_review_last_n_compound_word_number():
-    r = parse_command_intent("بیست و پنج پیام آخر رو ببین", has_reply=False)
-    assert r.kind == KIND_EXECUTABLE
-    assert r.tool_calls == [{"name": "list_recent_messages", "arguments": {"limit": 25}}]
-
-
-def test_deterministic_recent_messages_no_count_defaults():
-    r = parse_command_intent("پیام‌های اخیر این چت رو نشون بده", has_reply=False)
-    assert r.kind == KIND_EXECUTABLE
-    assert r.action == "list_recent_messages"
-    assert r.tool_calls == [{"name": "list_recent_messages", "arguments": {}}]
-
-
-def test_deterministic_delete_persian_word_number():
-    r = parse_command_intent("ده پیام آخر رو پاک کن", has_reply=False)
-    assert r.kind == KIND_EXECUTABLE
-    assert r.tool_calls == [{"name": "delete", "arguments": {"count": 10}}]
-
-
-def test_deterministic_question_about_this_message_is_not_list():
-    r = parse_command_intent("این پیام چیه؟", has_reply=True)
-    assert r.kind == KIND_CONVERSATIONAL
 
 
 # ── SaveByLinkTool ──

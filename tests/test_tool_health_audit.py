@@ -347,17 +347,27 @@ async def test_executor_chain_resolves_and_executes_tool(tool_name):
 
 @pytest.mark.asyncio
 async def test_executor_create_task_persists_through_real_repository():
+    """Executor -> create_task -> interpreter -> creation service -> repository.
+
+    The task DEFINITION is now produced by the model (there is no
+    provider-free deterministic candidate any more), so the fake provider
+    returns the candidate and the rest of the chain is real.
+    """
+    import contextlib
+    import json
+
+    from tests.test_task_semantic_completeness import _Provider, _manager
+
     api = FakeTelegramAPI()
     registry, ctx, executor = make_registry(api)
-    ctx.extra["deterministic_task_candidate"] = {
+    ctx.extra["provider_manager"] = _manager(_Provider(json.dumps({
         "label": "hello",
         "schedule_type": "interval",
         "schedule": {"seconds": 60},
         "timezone": "UTC",
         "actions": [{"name": "send_message", "arguments": {"text": "hello"}}],
         "notification_destination": {},
-    }
-    import contextlib
+    })))
 
     with contextlib.ExitStack() as stack:
         for p in _service_patches():

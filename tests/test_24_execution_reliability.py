@@ -19,7 +19,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from backend.ai.actions import KIND_EXECUTABLE, parse_command_intent
+from backend.ai.actions import KIND_EXECUTABLE
 from backend.ai.providers.base.capabilities import ProviderCapabilities
 from backend.ai.providers.base.config import ProviderConfig
 from backend.ai.providers.base.contract import BaseProvider, ProviderResponse
@@ -233,46 +233,6 @@ def test_account_show_registered_in_default_registry():
 #    qualifiers (@ / واقعی / تلگرام / telegram) = real @username ──
 
 
-@pytest.mark.parametrize(
-    "text",
-    [
-        "وضعیت یوزرنیمم رو بگو",
-        "یوزرنیمم چیه؟",
-        "وضعیت یوزرنیم رو بگو",
-        "اسم اکانتم چیه؟",
-        "وضعیت اسم اکانتم رو بگو",
-        "نام اکانتم رو نشون بده",
-        "what is my account name?",
-        "what is my first name?",
-        "show my first name",
-    ],
-)
-def test_account_name_intent_resolves_to_account_show(text):
-    r = parse_command_intent(text, has_reply=False)
-    assert r.kind == KIND_EXECUTABLE
-    # Casual Persian "یوزرنیم"/"username" and account-name requests resolve
-    # to the account FIRST NAME — minimal output, never phone/ID/@username.
-    assert r.tool_calls == [{"name": "account_show", "arguments": {"fields": ["first_name"]}}]
-
-
-@pytest.mark.parametrize(
-    "text",
-    [
-        "یوزرنیم واقعی تلگرامم رو بگو",
-        "username تلگرامم رو بگو",
-        "@username من چیه؟",
-        "what is my Telegram username?",
-        "show my @username",
-    ],
-)
-def test_real_telegram_username_intent_resolves_to_username(text):
-    r = parse_command_intent(text, has_reply=False)
-    assert r.kind == KIND_EXECUTABLE
-    # Explicit qualifiers (@ / واقعی / تلگرام / telegram) select the REAL
-    # Telegram @username handle.
-    assert r.tool_calls == [{"name": "account_show", "arguments": {"fields": ["username"]}}]
-
-
 @pytest.mark.asyncio
 async def test_account_show_never_exposes_phone_or_id_for_identity_requests():
     from backend.ai.tools.account import AccountShowTool
@@ -331,9 +291,6 @@ def test_account_status_json_action_fields_are_validated():
     assert r.kind == KIND_INVALID
     r = parse_action_text('{"action": "bio_status", "fields": ["first_name"]}')
     assert r.kind == KIND_INVALID
-
-
-
 
 
 # ── Clean error humanization ──

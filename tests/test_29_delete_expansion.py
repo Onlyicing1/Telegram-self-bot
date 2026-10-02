@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from backend.ai.actions import KIND_EXECUTABLE, parse_command_intent, parse_action_text
+from backend.ai.actions import KIND_EXECUTABLE, parse_action_text
 from backend.ai.tools.context import ToolContext
 from backend.ai.tools.delete import DeleteTool
 from backend.ai.tools.semantic import DeleteMessagesByIdsTool, ListRecentMessagesTool
@@ -203,27 +203,6 @@ async def test_semantic_history_includes_current_request():
     )
     assert result.success is True
     assert [item["id"] for item in result.data["messages"]] == [109, 110]
-
-
-def test_expanded_persian_and_english_intents_resolve_to_delete_scopes():
-    cases = [
-        ("همه پیام‌های خودم رو پاک کن", "all"),
-        ("delete all my messages", "all"),
-        ("تا ساعت ۶ همه پیام‌هام رو پاک کن", "until_time"),
-        ("delete my messages until 18", "until_time"),
-    ]
-    for text, mode in cases:
-        result = parse_command_intent(text, has_reply=False)
-        assert result.kind == KIND_EXECUTABLE
-        assert result.mode == mode
-        assert result.tool_calls[0]["arguments"]["mode"] == mode
-
-
-def test_boundary_intent_uses_existing_reply_boundary_tool():
-    result = parse_command_intent("تا این پیام هرچی پیام خودم هست پاک کن", has_reply=True)
-    assert result.kind == KIND_EXECUTABLE
-    assert result.mode == "until_message"
-    assert result.tool_calls == [{"name": "delete", "arguments": {"mode": "until_message"}}]
 
 
 def test_structured_delete_scope_is_validated_and_exposed():

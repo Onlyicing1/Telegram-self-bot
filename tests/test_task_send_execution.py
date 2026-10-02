@@ -29,7 +29,6 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from backend.ai.actions import KIND_CONVERSATIONAL, KIND_UNSUPPORTED, parse_command_intent
 from backend.ai.database.task_repository import InMemoryTaskRepository
 from backend.ai.providers.base.capabilities import ProviderCapabilities
 from backend.ai.providers.base.config import ProviderConfig
@@ -331,14 +330,3 @@ async def test_send_failure_reaches_retry_boundary_then_terminal_failure():
 
 
 # ── Ordinary AI behavior is NOT diverted into the task system ──
-
-
-def test_ordinary_conversation_is_not_scheduled():
-    r = parse_command_intent("درباره آب و هوا برایم توضیح بده", has_reply=True)
-    assert r.kind == KIND_CONVERSATIONAL
-
-
-def test_immediate_send_is_not_a_scheduled_task():
-    r = parse_command_intent("اینو برای علی بفرست", has_reply=True)
-    assert r.kind == KIND_UNSUPPORTED
-    assert r.action == "send"

@@ -4,8 +4,9 @@ The live symptom — the multi-line Persian bio-task request answered with the
 generic "safe, unambiguous schedule" message — was diagnosed as follows
 (source-traced on `6087d2e`):
 
-- Routing: `parse_command_intent` deterministically routes the EXACT request
-  to `create_task` passing the FULL multi-line text (proven below).
+- Routing: the MODEL routes the EXACT request to `create_task`, passing the
+  FULL multi-line text as the `request` argument. No local parser selects the
+  tool; it only validates the proposal.
 - Deterministic chain: a compliant candidate for the exact request creates
   the task (proven in test_task_semantic_triggers).
 - Therefore the generic rejection is produced only when the interpreter
@@ -31,7 +32,6 @@ from unittest.mock import patch
 
 import pytest
 
-from backend.ai.actions import ActionParseResult, KIND_CONVERSATIONAL, KIND_EXECUTABLE, parse_command_intent
 from backend.ai.task_interpreter import (
     TaskInterpretationError,
     TaskInterpreter,
@@ -67,67 +67,6 @@ async def _interpret(response_text: str):
 
 
 # ═══════════════════════ 1. ROUTING (possibility E / request-string #8) ═══════════════════════
-
-
-def test_exact_request_routes_deterministically_to_create_task_with_full_text():
-    """The exact multi-line request must reach create_task with the FULL
-    text intact — never a fragment, never a rewritten line."""
-    result: ActionParseResult = parse_command_intent(LIVE_PERSIAN_REQUEST)
-    assert result.kind == KIND_EXECUTABLE
-    assert result.action == "create_task"
-    assert result.schedule_text == LIVE_PERSIAN_REQUEST  # multi-line preserved
-
-
-def test_persian_word_variant_routes_to_create_task():
-    result = parse_command_intent("هر پنج دقیقه بیو رو با یه دیالوگ رندوم از آیانامی ری عوض کن")
-    assert result.kind == KIND_EXECUTABLE
-    assert result.action == "create_task"
-
-
-def test_ascii_digit_variant_routes_to_create_task():
-    result = parse_command_intent("هر 5 دقیقه\nبیو رو آپدیت کن\nیه دیالوگ از آیانامی ری")
-    assert result.kind == KIND_EXECUTABLE
-    assert result.action == "create_task"
-
-
-def test_english_equivalent_routes_to_create_task_with_full_text():
-    """The English equivalent of the live request must reach create_task
-    with the FULL text — never be captured as a bio READ (the historical
-    get_bio hijack: 'my' in the read vocabulary matched 'change my bio …')."""
-    request = (
-        "Every 5 minutes, change my bio to a random Rei Ayanami dialogue. "
-        "It must be under 60 characters."
-    )
-    result = parse_command_intent(request)
-    assert result.kind == KIND_EXECUTABLE
-    assert result.action == "create_task"
-    assert result.schedule_text == request
-
-
-def test_bio_change_without_schedule_is_never_captured_as_bio_read():
-    """'change my bio to X' (no schedule) must NOT answer with the current
-    bio: the read branch is blocked for write intents and the request stays
-    conversational (the provider path owns the write semantically)."""
-    for text in (
-        "change my bio to something nice",
-        "بیو رو عوض کن",
-        "بیو رو تغییر بده",
-        "update my bio please",
-    ):
-        result = parse_command_intent(text)
-        assert result.action != "get_bio", text
-        assert result.action != "bio_status", text
-        assert result.kind == KIND_CONVERSATIONAL, text
-
-
-def test_bio_read_queries_still_resolve_deterministically():
-    for text in ("what is my bio?", "بیوم الان چیه؟", "show me my bio", "وضعیت بایو چیه"):
-        result = parse_command_intent(text)
-        assert result.action == "get_bio", text
-
-
-def test_chit_chat_never_routes_to_create_task():
-    assert parse_command_intent("سلام خوبی؟").kind == KIND_CONVERSATIONAL
 
 
 # ═══════════════════════ 2. RESPONSE-SHAPE CLASSIFICATION (possibilities B/D) ═══════════════════════

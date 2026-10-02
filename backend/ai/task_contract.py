@@ -54,6 +54,10 @@ def _generation_authorized(request: str) -> tuple[bool, bool]:
     per-occurrence profile-generation contract. Anything else leaves the task
     static. Reuses the existing intent vocabulary; no new phrase list.
     """
+    # Authorization / provenance vocabulary — NOT intent routing. The model
+    # has ALREADY proposed ``create_task`` and a structured candidate by the
+    # time this runs, so nothing here selects a capability; it only decides
+    # whether generated content is permitted, and it fails closed.
     from backend.ai.actions import (
         _USERNAME_WORDS,
         _has_bio_change_intent,

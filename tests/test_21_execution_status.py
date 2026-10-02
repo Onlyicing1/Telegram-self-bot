@@ -8,107 +8,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from backend.ai.actions import (
-    KIND_CONVERSATIONAL,
-    KIND_EXECUTABLE,
-    KIND_INVALID,
-    parse_action_text,
-    parse_command_intent,
-)
+from backend.ai.actions import KIND_EXECUTABLE, KIND_INVALID, parse_action_text
 
 
 # ── Deterministic status/query intents (list saves / db / username / bio) ──
-
-
-@pytest.mark.parametrize(
-    "text, tool_name",
-    [
-        ("چه چیزایی سیو دارم؟", "list_saves"),
-        ("چه چیزایی سیو شدن؟", "list_saves"),
-        ("لیست سیوها رو بده", "list_saves"),
-        ("وضعیت سیوها چیه؟", "list_saves"),
-        ("چه چیزایی ذخیره دارم", "list_saves"),
-        ("list my saved items", "list_saves"),
-        ("show my saves", "list_saves"),
-        ("saved items", "list_saves"),
-    ],
-)
-def test_deterministic_list_saved_items(text, tool_name):
-    r = parse_command_intent(text, has_reply=False)
-    assert r.kind == KIND_EXECUTABLE
-    assert r.tool_calls == [{"name": tool_name, "arguments": {}}]
-
-
-def test_deterministic_database_stats_persian():
-    r = parse_command_intent("وضعیت دیتابیس چیه؟", has_reply=False)
-    assert r.kind == KIND_EXECUTABLE
-    assert r.tool_calls == [{"name": "database_stats", "arguments": {}}]
-
-
-def test_deterministic_database_stats_english():
-    r = parse_command_intent("database status", has_reply=False)
-    assert r.kind == KIND_EXECUTABLE
-    assert r.tool_calls == [{"name": "database_stats", "arguments": {}}]
-
-
-def test_deterministic_username_status():
-    # Casual Persian "یوزرنیم" means the account FIRST NAME in this project
-    # (the username engine updates first_name) — not the Telegram @username.
-    r = parse_command_intent("وضعیت یوزرنیم رو بگو", has_reply=False)
-    assert r.kind == KIND_EXECUTABLE
-    assert r.tool_calls == [{"name": "account_show", "arguments": {"fields": ["first_name"]}}]
-
-
-@pytest.mark.parametrize(
-    "text",
-    [
-        "بیوم الان چیه؟",
-        "بیو اکانتم رو بگو",
-        "متن بیوی فعلی من چیه؟",
-        "وضعیت بیوم رو بگو",
-        "وضعیت بایو چیه",
-        "بیوی فعلیم",
-        "بیو الانم",
-        "my bio",
-        "what is my bio?",
-        "current bio",
-        "bio now",
-        "show my bio",
-    ],
-)
-def test_deterministic_bio_retrieval(text):
-    # Bio retrieval must deterministically resolve to get_bio (the REAL
-    # Telegram bio) — never account identity, username, or bio-set tools.
-    r = parse_command_intent(text, has_reply=False)
-    assert r.kind == KIND_EXECUTABLE
-    assert r.tool_calls == [{"name": "get_bio", "arguments": {}}]
-
-
-def test_bio_retrieval_not_misrouted_to_account_or_update():
-    # "بیو اکانتم رو بگو" is a BIO request even though it mentions the
-    # account — it must never resolve to account_show.
-    r = parse_command_intent("بیو اکانتم رو بگو", has_reply=False)
-    assert r.tool_calls == [{"name": "get_bio", "arguments": {}}]
-    # A bio CHANGE request is not a read: no get_bio call.
-    r = parse_command_intent("بیوم رو آپدیت کن", has_reply=False)
-    assert r.tool_calls != [{"name": "get_bio", "arguments": {}}]
-
-
-def test_deterministic_status_does_not_shadow_save_or_delete():
-    # "اینو سیو کن" is a save command, not a list-saves query.
-    r = parse_command_intent("اینو سیو کن", has_reply=True)
-    assert r.kind == KIND_EXECUTABLE
-    assert r.tool_calls == [{"name": "save", "arguments": {}}]
-    # "اینو پاک کن" is a delete command, not a status query.
-    r = parse_command_intent("اینو پاک کن", has_reply=True)
-    assert r.kind == KIND_EXECUTABLE
-    assert r.tool_calls == [{"name": "delete_replied", "arguments": {}}]
-
-
-def test_deterministic_question_about_save_stays_conversational():
-    # "what does save mean?" must not become a list-saves tool call.
-    r = parse_command_intent("what does save mean?", has_reply=False)
-    assert r.kind == KIND_CONVERSATIONAL
 
 
 # ── JSON action schema for status actions ──

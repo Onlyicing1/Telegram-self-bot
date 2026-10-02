@@ -6,7 +6,6 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from backend.ai.actions import KIND_EXECUTABLE, parse_command_intent
 from backend.ai.chat_resolution import format_clarification_options, resolve_chat_name
 from backend.ai.database.task_repository import InMemoryTaskRepository
 from backend.ai.task_execution import TaskExecutionCoordinator
@@ -16,26 +15,6 @@ from backend.ai.tools.message import SendMessageTool
 
 
 OWNER = 777
-
-
-def test_persian_interval_variants_are_scheduled():
-    variants = [
-        "هر 1 دقیقه یک بار برای من بنویس سلام",
-        "هر یک دقیقه برای من بنویس سلام",
-        "هر 5 دقیقه بنویس hello",
-        "هر ده دقیقه یک پیام بفرست",
-    ]
-    for text in variants:
-        result = parse_command_intent(text, has_reply=False)
-        assert result.kind == KIND_EXECUTABLE
-        assert result.action == "create_task"
-
-
-def test_english_interval_variants_are_scheduled():
-    for text in ("every minute write hello", "every 5 minutes write hello", "every hour remind me"):
-        result = parse_command_intent(text, has_reply=False)
-        assert result.kind == KIND_EXECUTABLE
-        assert result.action == "create_task"
 
 
 @pytest.mark.asyncio

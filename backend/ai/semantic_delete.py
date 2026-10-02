@@ -1,21 +1,24 @@
 """
-Deterministic semantic predicates for Delete.
+Deterministic predicate MATCHING for Delete.
 
-Pure, stateless text normalization + structural predicate parsing for
-natural Persian/English Delete requests. This module deliberately does NOT
-contain:
+Pure, stateless text normalization and word counting. This module deliberately
+does NOT contain:
 
   - embeddings / vector search / an external semantic service;
   - provider calls or model autonomy;
-  - Telegram access, ownership checks, or deletion.
+  - Telegram access, ownership checks, or deletion;
+  - any interpretation of the OWNER'S request.
 
-It only answers two questions deterministically:
+It never decides that a request is a delete, or what it should match. The
+model chooses the capability and proposes the predicate as a STRUCTURED
+argument (``{"query": ..., "word_count": ...}``); this module validates that
+argument (``spec_from_dict``) and answers one question about already-fetched
+message text: does this message satisfy the proposed predicate after
+deterministic normalization/tokenization (``build_matcher``)?
 
-  1. ``parse_structural_predicate(text)`` — does the request contain a
-     clearly defined structural predicate (exact N words / exact N English
-     words), and what is it?
-  2. ``build_matcher(spec)`` — given a predicate, does a *message text*
-     satisfy it after deterministic normalization/tokenization?
+The natural-language parser that used to read "دو کلمه انگلیسی" out of the
+owner's message and build the predicate itself is gone — that was semantic
+intent routing competing with the model.
 
 ``normalize_text`` is the matching form: Persian/Arabic character variants
 are folded to Persian, digits are normalized, Arabic diacritics are
@@ -81,42 +84,11 @@ _EN_WORD_RE = re.compile(r"^[a-z]+$")
 _FA_LETTER_RE = re.compile(r"[\u0621-\u06ff]")
 _HAS_LETTER_RE = re.compile(r"[a-z\u0621-\u06ff]")
 
-# Persian number words (same vocabulary as the action parser).
-_FA_NUMBER_WORDS = {
-    "یک": 1, "دو": 2, "سه": 3, "چهار": 4, "پنج": 5, "شش": 6, "هفت": 7,
-    "هشت": 8, "نه": 9, "ده": 10, "یازده": 11, "دوازده": 12, "سیزده": 13,
-    "چهارده": 14, "پانزده": 15, "شانزده": 16, "هفده": 17, "هجده": 18,
-    "نوزده": 19, "بیست": 20, "سی": 30, "چهل": 40, "پنجاه": 50, "شصت": 60,
-    "هفتاد": 70, "هشتاد": 80, "نود": 90, "صد": 100, "دویست": 200,
-    "سیصد": 300, "چهارصد": 400, "پانصد": 500,
-}
-
-# English number words used inside structural predicates ("two-word",
-# "three words"). Limited to the common range; digits are the primary form.
-_EN_NUMBER_WORDS = {
-    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
-    "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11,
-    "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15,
-    "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19,
-    "twenty": 20,
-}
-
-_NUMBER_WORDS = {**_FA_NUMBER_WORDS, **_EN_NUMBER_WORDS}
-
-# A structural predicate word-count must be sane: messages with more than
-# 100 lexical words are effectively essays, and requesting them is
-# ambiguous enough to warrant a controlled clarification instead of a guess.
+# A predicate word-count must be sane: messages with more than 100 lexical
+# words are effectively essays, and matching them is ambiguous enough to
+# warrant refusing the predicate rather than guessing. This is a BOUNDS check
+# on a value the model already proposed.
 _MAX_WORD_COUNT = 100
-
-# Token-level "word" markers for the number + word adjacency pattern. The
-# Persian marker check also accepts any token starting with "کلمه"/"واژه"
-# (کلمه‌ای, کلمهی, واژه‌ها after ZWNJ separation).
-_WORD_MARKERS = ("word", "words", "واژه")
-_COMPOUND_EN_RE = re.compile(r"^(\d+)(word|words)$")
-_COMPOUND_FA_RE = re.compile(r"^(.+?)(کلمه)(ای|ی)?$")
-
-_LANG_ENGLISH_TOKENS = ("english", "انگلیسی")
-_LANG_PERSIAN_TOKENS = ("persian", "فارسی")
 
 # Allowed keys in the serialized predicate (tool argument / structured
 # action). Anything else is rejected so the model can never smuggle an
@@ -212,95 +184,6 @@ class StructuralPredicate:
         if self.english_word_count is not None:
             out["english_word_count"] = self.english_word_count
         return out
-
-
-def _number_value(tok: str) -> int | None:
-    """ASCII/Persian digit string or a Persian/English number word → int."""
-    if tok.isdigit():
-        try:
-            return int(tok)
-        except ValueError:
-            return None
-    return _NUMBER_WORDS.get(tok)
-
-
-def _compound_number_value(tokens: list[str], idx: int) -> int | None:
-    """Resolve a Persian compound number ending at ``idx`` ("بیست و پنج")."""
-    total = _number_value(tokens[idx])
-    if total is None:
-        return None
-    j = idx - 1
-    while j - 1 >= 0 and tokens[j] == "و" and _number_value(tokens[j - 1]) is not None:
-        total += _number_value(tokens[j - 1])
-        j -= 2
-    return total
-
-
-def _is_word_marker(tok: str) -> bool:
-    return tok in _WORD_MARKERS or tok.startswith("کلمه") or tok.startswith("واژه")
-
-
-def _detect_language(tokens: list[str]) -> str:
-    for tok in tokens:
-        if tok in _LANG_ENGLISH_TOKENS or tok.startswith("انگلیسی"):
-            return "english"
-        if tok in _LANG_PERSIAN_TOKENS or tok.startswith("فارسی"):
-            return "persian"
-    return ""
-
-
-def parse_structural_predicate(text: str) -> StructuralPredicate | None:
-    """Extract an exact N-word / N-English-word predicate from a request.
-
-    Recognized forms (Persian and English, digits or number words):
-
-      - ``دو کلمه‌ای`` / ``دوکلمهای`` / ``2-word`` / ``two word`` /
-        ``three words`` (number immediately before a word marker)
-      - ``دقیقاً دو کلمه انگلیسی`` (number + word marker anywhere)
-
-    Returns ``None`` when the request does not contain a clearly defined
-    word-count predicate, so callers keep their existing behavior. The
-    number must be 1..``_MAX_WORD_COUNT``; anything else is deliberately
-    ambiguous and returns ``None`` (never a guessed range).
-    """
-    if not isinstance(text, str) or not text.strip():
-        return None
-
-    tokens = tokenize(text)
-    word_count: int | None = None
-
-    # Adjacency pattern: NUMBER immediately before a word marker.
-    for i, tok in enumerate(tokens):
-        if i == 0:
-            continue
-        if not _is_word_marker(tok):
-            continue
-        n = _compound_number_value(tokens, i - 1)
-        if n is not None:
-            word_count = n
-            break
-
-    # Compound tokens: ``دوکلمهای`` (no ZWNJ/space), ``3word``, ...
-    if word_count is None:
-        for tok in tokens:
-            m = _COMPOUND_EN_RE.match(tok)
-            if m:
-                word_count = int(m.group(1))
-                break
-            m = _COMPOUND_FA_RE.match(tok)
-            if m:
-                n = _number_value(m.group(1))
-                if n is not None:
-                    word_count = n
-                    break
-
-    if word_count is None or not (1 <= word_count <= _MAX_WORD_COUNT):
-        return None
-
-    lang = _detect_language(tokens)
-    if lang == "english":
-        return StructuralPredicate(english_word_count=word_count)
-    return StructuralPredicate(word_count=word_count)
 
 
 def spec_from_dict(raw: Any) -> StructuralPredicate | None:

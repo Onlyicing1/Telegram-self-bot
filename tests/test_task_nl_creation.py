@@ -39,10 +39,7 @@ import pytest
 from backend.ai.actions import (
     ACTION_NAMES,
     EXECUTABLE_ACTION_NAMES,
-    KIND_CONVERSATIONAL,
     KIND_EXECUTABLE,
-    KIND_UNSUPPORTED,
-    parse_command_intent,
     validate_action,
 )
 from backend.ai.providers.base.capabilities import ProviderCapabilities
@@ -67,77 +64,6 @@ _DELETE_CANDIDATE = (
 
 
 # ── Deterministic routing tests ──
-
-
-def test_interval_request_routes_to_create_task():
-    r = parse_command_intent(INTERVAL_REQUEST, has_reply=True)
-    assert r.kind == KIND_EXECUTABLE
-    assert r.action == "create_task"
-    assert r.tool_calls == [
-        {"name": "create_task", "arguments": {"request": INTERVAL_REQUEST}}
-    ]
-
-
-def test_scheduled_destructive_request_routes_to_create_task():
-    r = parse_command_intent(SCHEDULED_DELETE_REQUEST, has_reply=True)
-    assert r.kind == KIND_EXECUTABLE
-    assert r.action == "create_task"
-    assert [tc["name"] for tc in r.tool_calls] == ["create_task"]
-
-
-def test_endless_send_still_unsupported_when_not_scheduled():
-    # A bare "send" imperative (no schedule marker) is NOT a task request.
-    r = parse_command_intent("اینو برای علی بفرست", has_reply=True)
-    assert r.kind == KIND_UNSUPPORTED
-    assert r.action == "send"
-
-
-def test_historical_delete_is_not_interpreted_as_scheduling():
-    # "delete yesterday's 9am messages" is a historical delete, NOT a task.
-    r = parse_command_intent("پیام های ساعت ۹ دیروز رو پاک کن", has_reply=False)
-    assert r.action == "delete_messages"
-    assert r.kind == KIND_EXECUTABLE
-
-
-def test_event_automation_not_diverted_by_send_vocabulary():
-    # Live evidence: "وقتی X پیام داد، با ابزار ارسال پیام جواب بده …" matched
-    # the send vocabulary and returned "Unsupported action: send" (or was
-    # miscreated as an interval task). It must stay conversational so the
-    # provider decides task-ness semantically with the registered tools.
-    r = parse_command_intent(
-        "وقتی Bs Abolfazl بهم پیام داد، از ابزار ثبت/ذخیره مورد مربوطه استفاده کن",
-        has_reply=True,
-    )
-    assert r.kind == KIND_CONVERSATIONAL
-    assert r.action != "send"
-
-
-def test_future_clock_request_not_diverted_by_send_vocabulary():
-    # Live evidence: "فردا ساعت 15:35 لیست تسک‌هام رو بگیر و نتیجه‌ش رو برام
-    # بفرست" returned "Unsupported action: send" because بفرست matched the
-    # send branch. A future-anchored clock request is never an immediate send.
-    r = parse_command_intent(
-        "فردا ساعت 15:35 لیست تسک‌هام رو بگیر و نتیجه‌ش رو برام بفرست",
-        has_reply=True,
-    )
-    assert r.kind == KIND_CONVERSATIONAL
-    assert r.action != "send"
-
-
-def test_bounded_future_delete_stays_on_delete_path():
-    # "تا فردا ساعت ۶ … پاک کن" is a bounded delete (delete UNTIL tomorrow
-    # 6 o'clock), not a scheduled automation — clock + future marker inside
-    # an explicit delete command keeps the deterministic delete behavior.
-    r = parse_command_intent("تا فردا ساعت ۶ همه پیام هام رو پاک کن", has_reply=False)
-    assert r.kind == KIND_EXECUTABLE
-    assert r.action == "delete_messages"
-
-
-def test_english_when_automation_not_diverted():
-    r = parse_command_intent(
-        "when John sends me a message reply using the send tool", has_reply=True
-    )
-    assert r.kind == KIND_CONVERSATIONAL
 
 
 def test_create_task_is_recognized_action():
@@ -479,34 +405,6 @@ def _make_dispatcher(provider: _FakeProvider, manager):
         tool_registry=registry,
         tool_executor=executor,
     ), registry, executor
-
-
-@pytest.mark.asyncio
-async def test_dispatcher_routes_schedule_local_fast_path_and_creates_task():
-    from backend.ai.database import manager as dbm
-
-    manager = dbm.RepositoryManager(supabase_available=False)
-    pm = ProviderManager()
-    provider = _FakeProvider("fake", _INTERVAL_CANDIDATE)
-    provider._provider_pm = pm
-    pm.register_provider(provider)
-    pm.switch_provider("fake")
-    pm._fallback_chain = []
-
-    with patch.object(dbm, "get_repository_manager", return_value=manager):
-        d, _registry, _executor = _make_dispatcher(provider, manager)
-        result = await d.dispatch(AIRequest(
-            session_id="s1", message_id=1, owner_id=777,
-            user_message=INTERVAL_REQUEST, chat_id=-1001, timezone="UTC",
-        ))
-
-    # the scheduling request resolved deterministically, not via the tool loop
-    assert result.success is True
-    assert result.metadata["finish_state"] == "local_fast_path"
-    # The high-confidence interval/write request is resolved locally, so task
-    # creation does not burn a provider round.
-    assert provider.calls == 0
-    assert len(await manager.task.list_tasks(777)) == 1
 
 
 # ── AI_TASK_TRACE lifecycle observability ──
