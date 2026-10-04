@@ -20,6 +20,29 @@ logger = logging.getLogger(__name__)
 _GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
 
 
+def _to_gemini_schema(value: Any) -> Any:
+    """Recursively convert schema ``type`` values to Gemini's Type spelling.
+
+    Gemini's function-declaration schema uses its own enum spelling (STRING /
+    INTEGER / NUMBER / BOOLEAN / ARRAY / OBJECT, ...). The conversion must
+    cover nested ``properties`` and ``items`` too — uppercasing only the top
+    level left array/nested schemas in lowercase, so a correct nested schema
+    could be rejected or ignored. Everything else (required, enum, minimum,
+    maximum, description, default, items) is preserved verbatim.
+    """
+    if isinstance(value, dict):
+        converted: dict[str, Any] = {}
+        for key, item in value.items():
+            if key == "type" and isinstance(item, str):
+                converted[key] = item.upper()
+            else:
+                converted[key] = _to_gemini_schema(item)
+        return converted
+    if isinstance(value, list):
+        return [_to_gemini_schema(item) for item in value]
+    return value
+
+
 class GeminiProvider(BaseProvider):
     PROVIDER_NAME = "gemini"
     PROVIDER_VERSION = "1.0.0"
@@ -60,13 +83,19 @@ class GeminiProvider(BaseProvider):
         model = resolve_model(self.name, kwargs.get("model") or self._config.default_model)
         url = f"{_GEMINI_BASE}/models/{model}:generateContent?key={self._config.api_key}"
 
-        system_text = ""
+        # Gemini takes ONE systemInstruction; the dispatcher may legitimately
+        # send several system messages (merged rules, runtime context,
+        # conversation state, tool contract). Every section must be preserved
+        # in order — assigning per message kept only the last one, silently
+        # dropping the rules/output contract for every Gemini-routed request.
+        system_parts: list[str] = []
         contents: list[dict[str, Any]] = []
         for msg in messages:
             role = msg.get("role", "user")
             content = msg.get("content", "")
             if role == "system":
-                system_text = content
+                if isinstance(content, str) and content:
+                    system_parts.append(content)
             elif role == "tool":
                 tool_name = msg.get("name", "")
                 try:
@@ -106,6 +135,7 @@ class GeminiProvider(BaseProvider):
         # caller requests it and the capability is declared.
         if kwargs.get("response_format") and self.capabilities.supports_json:
             payload["generationConfig"]["responseMimeType"] = "application/json"
+        system_text = "\n\n".join(system_parts)
         if system_text:
             payload["systemInstruction"] = {"parts": [{"text": system_text}]}
 
@@ -120,10 +150,7 @@ class GeminiProvider(BaseProvider):
                     "description": fn.get("description", ""),
                 }
                 if isinstance(params, dict) and params:
-                    params_copy = dict(params)
-                    if params_copy.get("type") == "object":
-                        params_copy["type"] = "OBJECT"
-                    decl["parameters"] = params_copy
+                    decl["parameters"] = _to_gemini_schema(params)
                 declarations.append(decl)
             payload["tools"] = [{"functionDeclarations": declarations}]
 

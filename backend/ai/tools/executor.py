@@ -167,14 +167,18 @@ class ToolExecutor:
 
         for i, call in enumerate(tool_calls):
             if i >= MAX_TOOLS_PER_TURN:
+                # ONE bounded failure per skipped call, never one for the whole
+                # overflow: the continuation protocol requires a tool response
+                # for EVERY assistant tool_call id, so results stay aligned
+                # 1:1 with the call list (index i is the skipped call i).
                 logger.warning("ToolExecutor: hit max %d tools per turn, skipping remaining", MAX_TOOLS_PER_TURN)
                 results.append(ToolExecutionResult(
-                    tool_name="(overflow)",
+                    tool_name=str(call.get("name", "") or call.get("tool", "") or "(unknown)"),
                     success=False,
                     message="Tool call limit reached for this turn.",
                     error="max_tools_exceeded",
                 ))
-                break
+                continue
 
             tool_name = call.get("name", "") or call.get("tool", "")
             if status_callback and tool_name:

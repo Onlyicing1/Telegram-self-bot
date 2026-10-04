@@ -226,6 +226,17 @@ class TaskTransitionTool(Tool):
         return ("action", "action_status")
 
     @property
+    def provider_required_arguments(self) -> tuple[str, ...]:
+        """Provider schema requires only the target status.
+
+        The execution/durability contract also needs task_id+expected_version
+        OR a title reference (``query``); a flat JSON-Schema ``required`` list
+        cannot express that disjunction, so the addressing fields stay
+        optional in the schema and the description names both valid shapes.
+        """
+        return ("action",)
+
+    @property
     def description(self) -> str:
         return (
             "Change a task's status: pause, resume (set active), complete, "
@@ -438,6 +449,16 @@ class TaskDeleteTool(Tool):
     @property
     def required_arguments(self) -> tuple[str, ...]:
         return ("task_id", "expected_version")
+
+    @property
+    def provider_required_arguments(self) -> tuple[str, ...]:
+        """Provider schema requires no single argument.
+
+        Deletion is addressed by task_id+expected_version OR by a title
+        reference (``query``); neither alternative is mandatory for every
+        valid call, and a flat ``required`` list cannot express the choice.
+        """
+        return ()
 
     @property
     def description(self) -> str:

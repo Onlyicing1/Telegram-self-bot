@@ -98,28 +98,32 @@ class PromptBuilder:
     ) -> PromptPackage:
         """Assemble an immutable ``PromptPackage`` from a conversation context.
 
-        Enforces the token budget: if the estimated total exceeds the
-        configured max, history entries are trimmed from the oldest
-        until the budget is satisfied. The system rules, user message,
-        and output instructions are always preserved.
+        Budget policy: conversation history has its OWN bounded budget
+        (``DEFAULT_MAX_HISTORY_TOKENS``); the oldest entries are trimmed until
+        the remaining history fits it. The whole-prompt estimate is still
+        computed and reported, but it never evicts history: system
+        instructions, the tool contract and the current request are
+        never-evictable categories (§26.2), and the 55-tool contract alone can
+        exceed the whole-prompt ceiling — treating that as "trim history"
+        erased every prior turn on every request and made multi-turn
+        references and corrections unanswerable.
+
+        The system rules, the current user message, the tool contract, reply
+        context and the Telegram surrounding window are always preserved.
 
         Args:
             context: The ``ConversationContext`` produced by the Conversation Layer.
             tool_block: Already-rendered available-tool schema text for this
                 request (empty when tools are disabled or the registry is
                 empty). It is rendered INTO the tool section BEFORE the budget
-                is computed, so the schemas are counted and can push history
-                out through the normal trimming path.
+                is computed, so the schemas are counted in the reported
+                estimate.
 
         Returns:
             A frozen ``PromptPackage`` with all sections in fixed order.
         """
         sections = self._render_sections(context, tool_block)
-        budget = compute_budget(sections, language=context.language)
-
-        if not budget.within_budget:
-            sections = self._trim_to_budget(context, sections)
-
+        sections, history_meta = self._trim_history_to_budget(context, sections)
         budget = compute_budget(sections, language=context.language)
 
         package = PromptPackage(
@@ -135,6 +139,7 @@ class PromptBuilder:
                 "session_id": context.session_id,
                 "state": context.state.value,
                 "built_at": datetime.now(timezone.utc).isoformat(),
+                **history_meta,
             },
             estimated_tokens=budget,
             sections=sections,
@@ -324,16 +329,29 @@ class PromptBuilder:
         else:
             lines.append("Reply: None")
 
-        if ctx.history:
-            lines.append(f"[History] ({len(ctx.history)} entries)")
-            for i, entry in enumerate(ctx.history):
-                label = entry.role
-                if entry.tool_name:
-                    label += f" ({entry.tool_name})"
-                lines.append(f"  {i + 1}. [{label}] {entry.content}")
+        history_block = self._render_history_block(ctx.history)
+        if history_block:
+            lines.append(history_block)
         else:
             lines.append("History: None")
 
+        return "\n".join(lines)
+
+    @staticmethod
+    def _render_history_block(history: list[Any]) -> str:
+        """Render the ``[History]`` block (empty string when there is none).
+
+        Kept as its own renderer so the history budget is computed over
+        exactly the content that will be delivered.
+        """
+        if not history:
+            return ""
+        lines = [f"[History] ({len(history)} entries)"]
+        for i, entry in enumerate(history):
+            label = entry.role
+            if entry.tool_name:
+                label += f" ({entry.tool_name})"
+            lines.append(f"  {i + 1}. [{label}] {entry.content}")
         return "\n".join(lines)
 
     def _render_tool_metadata(self, ctx: ConversationContext, tool_block: str = "") -> str:
@@ -368,47 +386,44 @@ class PromptBuilder:
             return f"[Tool Results]\n{ctx.tool.last_tool_result}"
         return ""
 
-    def _trim_to_budget(
+    def _trim_history_to_budget(
         self,
         ctx: ConversationContext,
         sections: dict[PromptSection, str],
-    ) -> dict[PromptSection, str]:
-        """Trim history entries until the prompt fits within the token budget.
+    ) -> tuple[dict[PromptSection, str], dict[str, Any]]:
+        """Trim oldest history entries until the history block fits ITS budget.
 
-        Preserves system rules, platform constraints, runtime rules,
-        user message, and output instructions. Only the conversation
-        state section (which contains history) is trimmed.
+        Only the conversation-state HISTORY block is capped. Reply context,
+        the Telegram surrounding window, the current request, memory and the
+        tool contract are never touched. Oldest-first preserves the most
+        recent turns, which is what corrections and follow-ups ("do that
+        again", "I meant the other one") depend on.
+
+        Returns the sections plus the history budget facts for metadata.
         """
-        from backend.ai.prompt.budget import compute_budget, DEFAULT_MAX_TOTAL_TOKENS
+        from dataclasses import replace as _replace
+
+        from backend.ai.prompt.budget import DEFAULT_MAX_HISTORY_TOKENS, estimate_tokens
 
         history = list(ctx.history)
-        while history and not compute_budget(sections, language=ctx.language).within_budget:
-            history.pop(0)
-            trimmed_ctx = ConversationContext(
-                session_id=ctx.session_id,
-                owner_id=ctx.owner_id,
-                chat_id=ctx.chat_id,
-                message_id=ctx.message_id,
-                state=ctx.state,
-                current_menu=ctx.current_menu,
-                current_panel=ctx.current_panel,
-                current_category=ctx.current_category,
-                current_flow=ctx.current_flow,
-                pending_action=ctx.pending_action,
-                language=ctx.language,
-                timezone=ctx.timezone,
-                current_time=ctx.current_time,
-                user_text=ctx.user_text,
-                reply=ctx.reply,
-                tool=ctx.tool,
-                settings=ctx.settings,
-                runtime=ctx.runtime,
-                history=history,
-                memory=ctx.memory,
-                preferences=ctx.preferences,
-                telegram_chat=ctx.telegram_chat,
-                created_at=ctx.created_at,
+        trimmed = 0
+        while history and (
+            estimate_tokens(
+                self._render_history_block(history), ctx.language
             )
-            sections[PromptSection.CONVERSATION_STATE] = self._render_conversation_state(trimmed_ctx)
-
-        return sections
+            > DEFAULT_MAX_HISTORY_TOKENS
+        ):
+            history.pop(0)
+            trimmed += 1
+        if trimmed:
+            sections[PromptSection.CONVERSATION_STATE] = self._render_conversation_state(
+                _replace(ctx, history=history)
+            )
+        return sections, {
+            "history_entries": len(history),
+            "history_trimmed": trimmed,
+            "history_tokens": estimate_tokens(
+                self._render_history_block(history), ctx.language
+            ),
+            "history_budget_tokens": DEFAULT_MAX_HISTORY_TOKENS,
+        }

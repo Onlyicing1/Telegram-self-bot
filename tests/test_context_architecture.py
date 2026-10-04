@@ -554,21 +554,29 @@ def _history_rows(section: str) -> int:
     return len(re.findall(r"^\s+\d+\. \[", section, flags=re.MULTILINE))
 
 
-def test_tool_block_consumes_budget_and_history_is_trimmed_to_fit():
+def test_tool_block_never_evicts_history_and_estimate_still_counts_it():
+    """A tool catalog cannot erase conversation history.
+
+    History is bounded by its OWN budget; the whole-prompt ceiling is a
+    diagnostic that never-evictable content (instructions + tool contract)
+    may legitimately exceed. The estimate still counts the tool block.
+    """
     ctx = _context_with_history(entries=20, chars_each=3000)
     tool_block = "[Available Tools]\n" + ("  - tool_x(string) — does a thing [safe]\n" * 120)
 
     without = PromptBuilder().build(ctx)
     with_block = PromptBuilder().build(ctx, tool_block=tool_block)
 
-    assert without.estimated_tokens.within_budget is True
-    assert with_block.estimated_tokens.within_budget is True
-
     rows_without = _history_rows(without.sections[PromptSection.CONVERSATION_STATE])
     rows_with = _history_rows(with_block.sections[PromptSection.CONVERSATION_STATE])
-    assert rows_with < rows_without, "schemas must push history out through the budget"
+    # The tool contract is never-evictable: it cannot push history out.
+    # History is bounded by ITS OWN budget, identically with and without it.
+    assert rows_with == rows_without
+    assert rows_with > 0
+    assert with_block.metadata["history_trimmed"] > 0  # its own cap trimmed the huge history
+    assert with_block.metadata["history_tokens"] <= with_block.metadata["history_budget_tokens"]
 
-    # The critical sections survive: schemas, the request, the output rules.
+    # The estimate still covers the block, and the critical sections survive.
     assert tool_block in with_block.sections[PromptSection.TOOL_METADATA]
     assert with_block.sections[PromptSection.USER_MESSAGE] == "hi"
     assert with_block.sections[PromptSection.OUTPUT_INSTRUCTIONS]

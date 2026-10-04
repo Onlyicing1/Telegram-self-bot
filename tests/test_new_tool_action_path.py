@@ -37,11 +37,31 @@ def test_prompt_output_contract_advertises_new_actions():
         assert name in OUTPUT_INSTRUCTIONS_TEMPLATE
 
 
-def test_action_nudge_advertises_task_and_retrieve_actions():
-    from backend.ai.engine.dispatcher import _ENFORCE_ACTION_NUDGE
+def test_action_nudge_is_tool_agnostic_and_requests_a_structured_action():
+    """The bounded recovery nudge must not advertise a fixed tool subset.
 
-    assert "task" in _ENFORCE_ACTION_NUDGE
-    assert "retrieve a saved item" in _ENFORCE_ACTION_NUDGE
+    It previously enumerated a few actions, so a capability the model had
+    never been nudged toward stayed unanswered. It now points at ANY
+    available tool; the demand stays capability-neutral while still asking
+    for a native tool call / JSON action instead of prose.
+    """
+    import re
+
+    from backend.ai.engine.dispatcher import _ENFORCE_ACTION_NUDGE
+    from backend.ai.tools.context import ToolContext
+    from backend.ai.tools.registry import create_default_registry
+
+    assert "any available tool" in _ENFORCE_ACTION_NUDGE
+    assert "native tool call" in _ENFORCE_ACTION_NUDGE
+    registry = create_default_registry(
+        ToolContext(telegram=None, owner_id=1, tz_str="UTC")
+    )
+    enumerated = [
+        schema["name"]
+        for schema in registry.list_schemas()
+        if re.search(rf"\b{re.escape(schema['name'])}\b", _ENFORCE_ACTION_NUDGE)
+    ]
+    assert enumerated == []
 
 
 # ── task_list ────────────────────────────────────────────────────────────────

@@ -166,6 +166,21 @@ the existing service layer and return a ``ToolResult``.
         ...
 
     @property
+    def provider_required_arguments(self) -> tuple[str, ...]:
+        """Argument names the PROVIDER schema marks required (optional).
+
+        Defaults to ``required_arguments``. A tool whose ``execute()`` accepts
+        ALTERNATIVE argument shapes overrides this to name only what every
+        valid call must carry: a flat JSON-Schema ``required`` list cannot
+        express a disjunction ("address by id+version OR by title
+        reference"), and advertising one alternative as mandatory misdirects
+        the model into supplying the other shape's fields. The tool's own
+        validation still accepts every valid shape — this declaration only
+        shapes what the provider schema reports.
+        """
+        ...
+
+    @property
     def required_any_arguments(self) -> tuple[str, ...]:
         """Argument names of which at least ONE must be present (optional).
 
@@ -234,6 +249,23 @@ def declared_required_arguments(tool: Tool) -> tuple[str, ...]:
 def declared_any_arguments(tool: Tool) -> tuple[str, ...]:
     """The alternative argument names ``tool`` declares (at least one)."""
     declared = getattr(tool, "required_any_arguments", ()) or ()
+    return tuple(str(name) for name in declared)
+
+
+def declared_provider_required_arguments(tool: Tool) -> tuple[str, ...]:
+    """The argument names the PROVIDER schema marks required for ``tool``.
+
+    Reads ``provider_required_arguments`` when the tool declares it, else the
+    tool's execution contract (``required_arguments``). The provider schema
+    must be built from this declaration and NEVER inferred from the presence
+    or absence of a ``default``: a default is a JSON-Schema annotation, not a
+    statement of requiredness, and optional parameters advertised as required
+    made the model fabricate placeholders for metadata its instructions
+    forbade it to invent.
+    """
+    declared = getattr(tool, "provider_required_arguments", None)
+    if declared is None:
+        return declared_required_arguments(tool)
     return tuple(str(name) for name in declared)
 
 

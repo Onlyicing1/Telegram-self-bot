@@ -15,6 +15,12 @@ Budget caps from AI_MASTER_DESIGN.md §28.6:
   - Tool result injection: ≤ 1,500 tokens
   - Total prompt per turn:  ≤ 8,500 tokens
   - Max output per turn:   ≤ 1,000 tokens
+
+Category relationship: the total ceiling is a diagnostic over the whole
+prompt, not the trim trigger. Never-evictable content (system instructions,
+tool contract, current request) may legitimately push the total past the
+ceiling — the 55-tool contract alone does — so trimming is bounded by the
+trimmable category's own cap (``DEFAULT_MAX_HISTORY_TOKENS`` for history).
 """
 from __future__ import annotations
 
@@ -29,6 +35,14 @@ DEFAULT_MAX_SYSTEM_TOKENS = 2000
 DEFAULT_MAX_CONTEXT_TOKENS = 4000
 DEFAULT_MAX_MEMORY_TOKENS = 1000
 DEFAULT_MAX_TOOL_RESULT_TOKENS = 1500
+
+# Conversation-history category budget. History is the only FIFO-trimmable
+# category: system instructions, the tool contract and the current request
+# are never-evictable (§26.2) and the 55-tool contract alone can already
+# exceed the whole-prompt ceiling, so history must be bounded against its
+# OWN cap — never against the total. This matches the documented
+# ``history_budget`` default (4000).
+DEFAULT_MAX_HISTORY_TOKENS = 4000
 
 
 @dataclass(frozen=True)
