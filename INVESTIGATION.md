@@ -1,772 +1,798 @@
-# Forensic Runtime Investigation — Why an Immediate Multi-Action Request Still Becomes `create_task`
+# Investigation
 
-> **Status: SUPERSEDED by Stage 5.** The investigation below remains the
-> accurate forensic record of the defect at HEAD `62dadfe`. The architectural
-> cause it identified — `_is_scheduling_intent()` deciding intent from
-> unanchored natural-language keywords before the provider is consulted — has
-> since been **removed entirely**, along with the whole deterministic
-> intent-routing layer (`parse_command_intent`, the local fast path, the
-> deterministic task candidate, the natural-language completeness gate, and the
-> keyword overrides in `tools/save.py` and `semantic_delete.py`).
->
-> There is no deterministic intent router left in the decision path; the AI is
-> the only component that interprets intent, and `ToolRegistry` →
-> `ToolExecutor` → service validates and executes its structured decision.
-> See `IMPLEMENTATION_REPORT.md` for the current architecture, the regex audit,
-> and the test results. Nothing below was rewritten to pretend the defect never
-> existed — it is the evidence the Stage 5 correction was based on.
->
-> Original status note: this was an investigation-only document. At HEAD
-> `62dadfe` no production code, test, schema or provider contract had been
-> modified by it, and it did not claim the runtime issue was fixed.
+## Status
 
----
+**Investigation only — no implementation performed.**
 
-## 1. Investigation title
+- **Stage completed: Investigation only**
+- **Next stage: Stage 6** — derived from the current `IMPLEMENTATION_REPORT.md`,
+  which states at the top: *“Stage completed: Stage 5”* / *“Next stage:
+  Stage 6”* (Stage 5 = commit `eb4d852`, the removal of the deterministic
+  semantic router). The report defines the number; this investigation only
+  recommends what Stage 6 should contain.
 
-**Root-cause analysis of the `"Creating task..."` misroute of a Persian immediate
-multi-action workflow: `_is_scheduling_intent()` treats an attributive cadence
-noun as a schedule, and `parse_command_intent()` therefore hard-selects
-`create_task` before any prompt, provider, or authorization stage is reached.**
+This document replaces the previous `INVESTIGATION.md` completely. It is a
+read-only audit of the **current** `main`; it changes no production code, no
+test, no migration, no prompt, and no tool definition. Nothing was executed
+against live Telegram or live Supabase.
+
+> Note on the investigation baseline: at the start of this audit the workspace
+> was at `c69df41`, while `origin/main` had already advanced to `eb4d852`
+> (Stage 5). The workspace was fast-forwarded to `eb4d852` (tree was clean)
+> and **all findings below were re-verified against the post-Stage-5 code**;
+> findings from the earlier revision were re-tested, not carried over.
 
 ---
 
-## 2. Repository / branch / HEAD inspected
+## Repository State
 
-| Field | Value |
+| Item | Value |
 |---|---|
-| Repository | `Onlyicing1/Telegram-self-bot` |
-| Worktree | `/home/daytona/codebase/.m14` (branch worktree) |
-| Branch | `m14-stt` |
-| HEAD inspected | `916536cabd58fd0418465ff41e58205beec3269f` |
-| `origin/main` at inspection | `916536cabd58fd0418465ff41e58205beec3269f` (identical) |
-| Working tree at inspection | clean |
-| Recent commits | `916536c` (intent-routing boundary fix) ← `c69df41` ← `4c7a4c7` (bounded proactive multi-action planning) ← `614db2d` ← `6bec694` (regex tool routing removed) ← `c402284` |
-
-The `916536c` commit is the commit that added the intent-routing regression
-suite (`tests/test_intent_routing_boundary.py`, 51 tests) and the
-"Immediate workflows vs durable tasks" prompt contract. This investigation
-explains why that suite is green while production still misroutes.
-
-**Investigation method.** Source reading plus three throwaway, read-only probe
-scripts executed against the current checkout and then deleted. The probes
-imported the real modules and constructed the real `Dispatcher`,
-`ToolRegistry`, `ToolExecutor`, and `CreateTaskTool`. They made no network call,
-no Telegram call, and no Supabase write. Their verbatim output is quoted
-throughout as evidence.
+| Repository | `Onlyicing1/Telegram-self-bot` (remote `origin`) |
+| Branch | `main` |
+| Local HEAD | `eb4d85220aa0f73265b3e18e14a50ba05f0065d0` — `refactor(ai): make the AI the sole interpreter of natural-language intent` |
+| Remote HEAD (`origin/main`) | `eb4d85220aa0f73265b3e18e14a50ba05f0065d0` (equal; verified with `git fetch origin` + `git rev-parse origin/main` + `git merge-base --is-ancestor` → exit 0) |
+| Working tree | clean except the pre-existing untracked nested repository `telegram-self-bot/` (never staged) |
+| Commits since the previous audit baseline | `916536c` `fix(ai): separate immediate workflows from durable tasks at the routing boundary`; `62dadfe` `docs: forensic investigation of create_task misroute of immediate workflows`; `eb4d852` `refactor(ai): make the AI the sole interpreter of natural-language intent` (Stage 5) |
+| Files this task writes | `INVESTIGATION.md` only |
 
 ---
 
-## 3. Problem statement
+## Investigation Scope
 
-Automated intent-routing tests assert that an immediate multi-action request
-must **not** become a durable `create_task` request. Production disagrees: the
-real Telegram runtime displayed `"Creating task..."` for
+Primary question: **why does the AI currently fail to understand user requests
+and, as a consequence, fail to select and use the right tools?**
+
+The audit traces the complete decision path against the current source:
 
 ```
-اول یه سرچ بزن و پنج انیمه برتر در حال پخش جدید رو پیدا کن، بعد نتیجه رو سیو کن، و بعد تگ بزن انیمه های هفتگی
+USER NATURAL LANGUAGE
+  → ai_unified activation / AIRequest construction
+  → ContextBuilder → PromptBuilder (system/developer instructions)
+  → ProviderManager → provider/model input
+  → model reasoning / native tool-call decision
+  → tool selection + arguments
+  → ToolRegistry → ToolExecutor → existing service/tool
+  → tool result
+  → AI continuation / final response
 ```
 
-("First run a search and find the five best currently-airing new anime, then
-save the result, then tag the weekly anime.")
+It answers questions A–J of the brief, separated as: (A) context/input
+sufficiency, (B) hidden semantic routing, (C) system-prompt instruction audit,
+(D) tool definitions, (E) provider tool contract, (F) execution loop, (G)
+argument construction/validation, (H) diagnostic request matrix, (I) model
+failure vs system failure, (J) ranked root causes.
 
-That request expresses **no** schedule, cadence, interval, or recurrence. The
-investigation must explain how `create_task` is nevertheless selected while the
-regression suite passes.
+Method: every claim was read from the current tree and, where measurement was
+possible, executed in-process as read-only introspection (tool registry dump,
+prompt-package build, parser probes, budget simulation). No source file was
+modified. No live Telegram/Supabase verification was attempted.
 
 ---
 
-## 4. Observed production behavior
+## Current AI Decision Flow
 
-The user-visible symptom is the status text `Creating task...`, which in
-production is the rendered form of the string
-`"🗓 Creating task..."` (`backend/ai/tools/executor.py:76`,
-`_STATUS_LABELS["create_task"]`).
+Current HEAD is **post-Stage-5**: the deterministic semantic router
+(`parse_command_intent`, the dispatcher fast path, the deterministic task
+candidate, the create_task natural-language completeness gate, the save tag
+override, the semantic-delete structural predicate) is **gone**. The decision
+path is now:
 
-This exact reproduction was driven through the real dispatch spine in this
-workspace — real `Dispatcher`, real `create_default_registry`, real
-`ToolExecutor`, real `CreateTaskTool`, with only `CreateTaskTool.execute`
-stubbed at the task-service boundary and a provider that **raises** if it is
-ever consulted:
+1. **Activation — `backend/bot/handlers/ai_unified.py`** (`register()` at
+   symbol `ai_unified_handler`). Fires on every `outgoing=True` message.
+   - `.`-prefixed messages are skipped; `Menu` is a separate exact-equality
+     handler in `misc.py`.
+   - The configured trigger word (`match_trigger`, case-insensitive first
+     word) or a reply to a known AI message activates the AI.
+   - The trigger is stripped; the remaining text becomes `request.user_message`.
+     A replied-to message is **context** (`ReplyContext`), never the user
+     message. A one-shot Telegram surrounding window is fetched
+     (`_load_telegram_chat_context`) and threaded via `AIRequest`.
+   - `AIRequest` (`backend/ai/session/request.py`) carries `user_message`,
+     `reply_context`, `telegram_context`, `request_media_type`,
+     `timeout_s = 240.0` (`_AI_EXECUTE_TIMEOUT`).
+2. **Dispatch — `backend/ai/engine/dispatcher.py::Dispatcher.dispatch`
+   (line 213).** Before any prompt/provider work, two local boundaries run:
+   - `_try_consume_confirmation` (owner approval for a previously blocked
+     ADMIN_ONLY/CONFIRMATION_REQUIRED call);
+   - `_try_media_analysis` (deterministic media target resolution from runtime
+     identifiers; fully context-isolated).
+3. **Prompt build** — `_build_context` + `_build_tool_definitions` +
+   `_render_tool_schemas` + `PromptBuilder.build` produce one `PromptPackage`;
+   `_build_messages` (line 1922) turns it into **four `system` messages + one
+   `user` message**.
+4. **Provider round** — `ProviderManager.chat` selects a (provider, model)
+   candidate (active first, then score, then fallback/model pool) and calls the
+   adapter; `tools` (OpenAI format) and `tool_choice="auto"` travel on every
+   round.
+5. **Structured decision** — a native `tool_calls` response goes straight to
+   the executor; otherwise `_apply_structured_action` (line 1679) parses and
+   validates the **model’s own JSON** (`parse_action_text` →
+   `validate_action` → `resolve_tool_calls`). No local code re-reads the owner
+   message to decide intent.
+6. **Tool execution** — `ToolExecutor.execute_calls` is the sole caller of
+   `tool.execute()`; registry lookup, permission gate, timeouts, malformed
+   argument rejection (`backend/ai/tools/executor.py`).
+7. **Feedback / continuation** — `_build_continuation_messages` (line 1937)
+   replays the assistant tool call and JSON tool results, and the loop
+   (max `MAX_TOOL_ROUNDS = 3`, line 67; max `MAX_TOOLS_PER_TURN = 5`) lets the
+   model consume results and call more tools.
+8. **Final result** — `EngineResult` → delivery; `ReplyResolver` registers the
+   AI answer for future reply-to-AI activation.
 
-```
-A. EXACT PRODUCTION STRING THROUGH THE REAL DISPATCH SPINE
-  PRODUCTION string
-      provider calls      : 0
-      finish_state        : local_fast_path
-      ai_action           : {'action': 'create_task', 'kind': 'executable', 'target': 'schedule'}
-      CreateTaskTool.execute calls : [{}]
-      status labels sent  : ['🗓 Creating task...']
-      'Creating task...' shown to owner : True
-      stages              : ['conversation_runtime', 'local_fast_path_tool_execution']
-```
-
-Three facts follow directly and are not inferential:
-
-1. `provider calls: 0` — **no LLM was consulted.**
-2. `finish_state: local_fast_path`, and the stage list contains
-   `local_fast_path_tool_execution` but **not** `prompt_builder`,
-   `provider_manager`, or `provider`.
-3. The status label `🗓 Creating task...` is emitted by the real executor for
-   the real registered `create_task` tool.
-
-The same probe run against **the paraphrase the regression suite actually
-asserts on** (`"اول سرچ کن، بعد نتیجه رو سیو کن، بعد تگ بزن."`) behaves
-completely differently:
-
-```
-B. THE PARAPHRASE THE REGRESSION SUITE ACTUALLY ASSERTS ON
-  suite paraphrase
-      provider calls      : 2
-      finish_state        : provider_failure
-      ai_action           : None
-      CreateTaskTool.execute calls : []
-      status labels sent  : []
-      'Creating task...' shown to owner : False
-      stages              : ['conversation_runtime', 'prompt_builder', 'provider_manager', 'provider', 'conversation_update']
-```
-
-(`provider_failure` here is only the probe's exploding provider standing in for
-a real model; the meaningful part is that the request reached the provider
-stages and never entered the local fast path.)
-
-The **only** difference between the two strings is the trailing token
-`هفتگی` ("weekly") in the owner's phrase `انیمه های هفتگی` — the *weekly anime*,
-i.e. a descriptive attribute of the content, not a cadence request.
+The only remaining places where deterministic code reads natural language are
+**authorization / provenance gates**, never capability selection (see
+Semantic Routing Audit).
 
 ---
 
-## 5. Expected semantic behavior
+## Context/Input Audit
 
-For the observed message the correct behavior is an **immediate workflow**:
-run the web search now, save the result now, update the saved item's tags now —
-three consecutive real tool calls in this turn.
+### What the model actually receives (measured on current HEAD)
 
-It must **not** produce a durable/scheduled task, because the message contains
-no recurrence, interval, anchor time, or event trigger. The discriminating
-signal is *where the cadence word sits grammatically*: `هفتگی` modifies the noun
-`انیمه های` (the anime), whereas in a durable request the same word would
-modify the **action** ("`هفتگی` این کار را انجام بده").
+`_build_messages` (dispatcher line 1922) sends, in order:
 
-A second, independent expectation applies to the capability-mention class:
-"I was thinking about using the save feature for my notes" must not execute
-`save`; only an explicit imperative ("Save this.") may.
-
----
-
-## 6. Exact runtime call path
-
-The observed production request traverses these layers, in this order:
-
-```
-Telegram outgoing message
-  └─ bot/router.py register_all()  →  bot/handlers/ai_unified.py  (canonical AI activation)
-       └─ builds AIRequest (ai_unified.py:~720-737)
-            └─ engine.execute(request, status_callback=_status_callback)   (ai_unified.py:752-754)
-                 └─ Dispatcher.dispatch()                                   (engine/dispatcher.py:205)
-                      ├─ conversation runtime                              (stage conversation_runtime)
-                      ├─ _try_local_fast_path(request, ...)                 (dispatcher.py:423-428 → :1520)
-                      │    └─ parse_command_intent(user_message, ...)       (actions.py:2718)
-                      │         └─ _is_scheduling_intent(words)             (actions.py:2745 → :2653)
-                      │              └─ any(w in _FA_RECUR_WORDS ...)      (actions.py:2674)  ← ROOT CAUSE
-                      │         └─ returns ActionParseResult(
-                      │                kind=KIND_EXECUTABLE,
-                      │                action="create_task",
-                      │                target="schedule",
-                      │                tool_calls=[{"name":"create_task", ...}])   (actions.py:2746-2753)
-                      │    └─ kind != conversational → does not return None
-                      │    └─ kind == "executable" and tool_calls present   (dispatcher.py:1579)
-                      │    └─ NOT delete_messages → no ambiguity guard
-                      │    └─ _build_tool_context(request)                  (dispatcher.py:1622 → :1270)
-                      │         └─ parse_command_intent AGAIN              (dispatcher.py:1301)
-                      │         └─ deterministic_task_candidate = None
-                      │              (no "هر/every/each" + time-unit + write marker → :1332-1372)
-                      │    └─ ToolExecutor.execute_calls(tool_calls, ...)   (dispatcher.py:1633 → tools/executor.py:148)
-                      │         └─ status_callback("🗓 Creating task...")  (executor.py:180-185)
-                      │              └─ ai_unified._status_callback        (ai_unified.py:740-745)
-                      │                   └─ event.edit(format_status(...))   ← the observed text
-                      │         └─ CreateTaskTool.execute(...)             (tools/task.py:147)
-                      │              └─ completeness gate reuses
-                      │                 _is_scheduling_intent(..., require_action_verb=False)
-                      │                 → True again                        (tools/task.py:200-203)
-                      │              └─ no deterministic candidate → mode="nl_interpretation"
-                      │              └─ TaskInterpreter → TaskCreationService → TaskRepository
-                      └─ returns _build_fast_path_result(finish_state="local_fast_path")
-                           ── prompt build, provider, structured-JSON fallback,
-                              proactive planner and the tool loop are NEVER entered
-```
-
-The prompt contract added in `916536c` ("Immediate workflows vs durable
-tasks", `backend/ai/prompt/template.py:85`) is **never rendered for this
-request**, because `_try_local_fast_path` returns before
-`_stage("PROMPT_BUILD")` at `dispatcher.py:447`.
-
----
-
-## 7. Relevant files and responsibilities
-
-| File | Responsibility | Relevance |
-|---|---|---|
-| `backend/bot/handlers/ai_unified.py` | Canonical Telegram AI activation; builds `AIRequest`; owns `_status_callback` (`:740-745`) which edits the Telegram message with the executor's status label; Taskloom wizard bridge for incomplete `create_task` results (`:138-153`, `:775-795`) | Renders the observed text; never inspects intent |
-| `backend/ai/engine/dispatcher.py` | The single dispatch spine. `dispatch()` `:205`; local fast path call `:423-428`; `_try_local_fast_path` `:1520`; `_build_tool_context` `:1270-1330`; `_apply_structured_action` `:1928`; provider+tool loop `:753` (`MAX_TOOL_ROUNDS = 3`, `:59`) | Owns the ordering that makes the boundary authoritative |
-| `backend/ai/actions.py` | Deterministic intent boundary. `_FA_RECUR_WORDS` `:2551`; `_EN_RECUR_WORDS` `:2555`; `_FA_ACTION_VERBS` `:2570`; `_is_scheduling_intent` `:2653` (unanchored membership test `:2674`); `parse_command_intent` `:2718`; scheduling→`create_task` branch `:2745-2753`; `validate_action` `:317`; `resolve_tool_calls` `:1456` (`create_task` at `:1486`); `parse_action_text` `:1689` | **Sole origin of the misroute** |
-| `backend/ai/proactive.py` | Fail-closed per-request proactive authorization phrase detector (`_AUTHORIZATION_PHRASES` `:44`; `has_proactive_authorization`) | Not involved in this request (returns `False`) |
-| `backend/ai/tools/task.py` | `CreateTaskTool` (`name` `:101`); description `:108-115`; deterministic completeness gate reusing `_is_scheduling_intent` `:200-203`; `deterministic_task_candidate` consumption `:333` | Downstream **amplifier**: the same false positive passes the tool's own completeness gate |
-| `backend/ai/tools/executor.py` | Sole caller of `tool.execute()`; `_STATUS_LABELS` `:60-103` (`"create_task": "🗓 Creating task..."` `:76`); `execute_calls` `:148`; `MAX_TOOLS_PER_TURN = 5` | Emits the observed label; no create_task-specific veto |
-| `backend/ai/tools/registry.py` | `create_default_registry` builds the one registry; `create_task` is always advertised to the provider | Makes the provider a live second entry point |
-| `backend/ai/prompt/template.py` | System rules incl. "Immediate workflows vs durable tasks" (`:85`), runtime rules (`:113`, `:116`), output rule 3 (`:127`) | Correct contract, **not consulted** on this path |
-| `backend/ai/task_interpreter.py`, `task_creation.py`, `task_contract.py` | Durable task boundary: interpret NL → `TaskCandidate` → persist. `create_task` is forbidden inside a task's `actions` (`task_interpreter.py:171`) | Correct; recursion guard unrelated to this case |
-| `backend/ai/media.py`, `backend/ai/session/request.py` | Media classification; request dataclass | Not involved |
-| `tests/test_intent_routing_boundary.py` | 51-test intent-routing boundary suite added in `916536c` | **The suite under scrutiny — see §14/§15** |
-| `tests/test_task_nl_creation.py` | Positive `create_task` routing tests + full `Dispatcher.dispatch` coverage | Closest existing coverage of the branch that fires |
-| `tests/test_proactive_action_chains.py` | Real `TaskInterpreter`→`TaskCreationService`→`InMemoryTaskRepository`; real `Dispatcher`→`ToolExecutor`; `ScriptedProvider` | Proves the executor *can run* a chain — not that routing *chooses* correctly |
-| `tests/test_25_fast_path.py` | Real `Dispatcher` + real `ProviderManager` (fake provider) + mocked executor; asserts `provider.calls == 0` on the fast path | Proves the fast path is provider-independent — the very mechanism that caused this |
-| `IMPLEMENTATION_REPORT.md` | Prior delivery report (1025 lines) | Read; not modified by this investigation |
-| `INVESTIGATION.md` | This document | Replaced completely |
-
----
-
-## 8. Immediate-vs-durable decision points
-
-There are **two** places in the current implementation where this distinction
-is made, and only the first is reachable for the observed request.
-
-**Decision point 1 — deterministic, pre-provider (the one that fired).**
-`_is_scheduling_intent()` in `backend/ai/actions.py:2653`, called from
-`parse_command_intent()` at `:2745`. Its decisive test is:
-
-```python
-# backend/ai/actions.py:2674
-if any(w in _FA_RECUR_WORDS or w in _EN_RECUR_WORDS for w in words):
-    return True
-```
-
-This is a **whole-message, position-independent token membership test**. It
-asks "does the cadence vocabulary appear anywhere?" — not "does the cadence word
-govern this action?". It is gated only by `_has_action_verb(words)`
-(`:2672`), which the immediate verbs in the request itself satisfy.
-
-**Decision point 2 — model-driven, provider round (never reached).**
-The prompt contract in `backend/ai/prompt/template.py:85` tells the model to
-separate the two concepts and to "NEVER turn an immediate workflow into
-`create_task`". This is a *semantic* decision delegated to the provider. It is
-rendered only at `dispatcher.py:447` (`PROMPT_BUILD`), i.e. only when the
-fast path returned `None`.
-
-**Verdict on authority.** For this request, decision point 1 is final and
-decision point 2 never runs. The distinction is therefore **deterministic, not
-model-driven**, on the observed path — and it is deterministic in the wrong
-place, with a test that cannot tell "weekly anime" from "every week".
-
----
-
-## 9. `create_task` entry points
-
-Five distinct, real entry points exist. Only the first produced the observed
-behavior; all five terminate at the same `ToolExecutor`.
-
-| # | Entry point | Location | Reachable for the observed request? |
+| # | Message | Content | Measured size |
 |---|---|---|---|
-| 1 | **Deterministic fast path** — `parse_command_intent` scheduling branch returns a literal `create_task` tool call, executed before any provider round | `actions.py:2745-2753` → `dispatcher.py:1624` | **YES — this is the observed path** (proven: `provider.calls: 0`) |
-| 2 | **Structured JSON fallback** — when the deterministic parser returns `conversational`, the model's own JSON object is parsed and validated | `dispatcher.py:1954-1960` (`_apply_structured_action`) → `parse_action_text` `actions.py:1689` → `validate_action:317` → `resolve_tool_calls:1486` | No — gated behind a `conversational` verdict, which entry point 1 suppressed |
-| 3 | **Provider native tool call** — `create_task` is in the registry and advertised in the tool schemas sent to the provider | `tools/registry.py` `create_default_registry` → `dispatcher.py` `_render_tool_schemas` → `executor.py:148` | No — no provider round occurred |
-| 4 | **Proactive planner** — `PROACTIVE_AUTHORIZED_RULES` inserted when authorized | `dispatcher.py:503`, `proactive.py:44` | No — `has_proactive_authorization` returns `False` for this message; also unreachable behind the fast path |
-| 5 | **Task-scope planning** — `TaskInterpreter` proactive expansion inside a task's actions | `task_interpreter.py:171` | No — `create_task` is explicitly forbidden inside a task's `actions` |
+| 1 | `system` | merged: `SYSTEM_RULES` + `PLATFORM_CONSTRAINTS` + `RUNTIME_RULES` + `[Memory]` + `[Preferences]` + `OUTPUT_INSTRUCTIONS` (builder `_merge_system`) | 21,730 chars of base templates |
+| 2 | `system` | `[Runtime Context]` (menu/panel/timezone/language/current time/provider/model/counters) | ~230 chars |
+| 3 | `system` | `[Conversation State]` (state/flow, Telegram surrounding block, reply context, **History**) | variable; **History is stripped — see below** |
+| 4 | `system` | `[Tool Context]` + `[Available Tools]` schema text block | 15,166 chars (55 tools) |
+| 5 | `user` | the owner’s request (trigger stripped; labeled `[Current Request]` only when a Telegram surrounding block exists) | the raw text, intact |
 
-Entry points 2–5 are **not** needed to explain the symptom. Entry point 1 alone
-is sufficient and is proven sufficient by direct execution.
+In addition, the **native tool definitions** travel out-of-band on every
+provider call: OpenAI-format JSON generated by `Dispatcher._build_tool_definitions`
+(line 1851) — measured **37,175 chars** for the 55 tools. The model therefore
+sees the tool surface **twice** (text block + native schemas).
 
----
+### Where information is added / transformed / lost
 
-## 10. Provider / native-tool path
+- **Added:** trigger-stripped user text; reply metadata and (for known AI
+  replies) full AI content; bounded Telegram window (≤10 messages, ≤200 chars
+  each, ≤1500 chars total, provenance-marked AI messages removed); memory
+  blocks; preferences; runtime and tool context; tool schemas.
+- **Transformed:** the request is only trigger-stripped — otherwise intact.
+  Reply content is never promoted into the user message. Provider adapters
+  translate the tool list (Gemini → `functionDeclarations`).
+- **Lost — conversation history (systemic).** `PromptBuilder.build`
+  (`backend/ai/prompt/builder.py`) computes `compute_budget`; when the estimated
+  total exceeds `DEFAULT_MAX_TOTAL_TOKENS = 8500` (`prompt/budget.py` line 26)
+  it calls `_trim_to_budget`, which pops history entries **oldest-first until
+  the estimate fits**. With the production tool block, the static prompt alone
+  already exceeds the ceiling, so **every history entry is removed on every
+  request** and `[History]` is never rendered.
+  - Measured: base prompt = **9,349 estimated tokens** (English heuristic) with
+    **zero** history, vs the 8,500 ceiling → `within_budget=False`.
+  - Measured: with 20 history entries of realistic Persian turns, the rendered
+    `[Conversation State]` contains **0** history rows and no `[History]`
+    label (same result for 0, 2, 5 and 20 entries).
+  - The existing test `tests/test_context_architecture.py` pins trimming with a
+    **synthetic ~7.2k-char** tool block (which stays within budget); it does not
+    exercise the real 15.2k-char/55-tool block, so the production behavior is
+    untested and unpinned.
+- **Lost — Gemini system messages (provider-conditional).** `_build_messages`
+  emits **four** `system` messages. The Gemini adapter
+  (`backend/ai/providers/gemini.py`, lines 63–69) iterates messages and
+  assigns `system_text = content` for each `role == "system"` — **the last one
+  wins**. Gemini therefore receives only message #4 (`[Tool Context]` + tool
+  schemas) as `systemInstruction`; the merged rules/platform/runtime/memory/
+  output instructions, runtime context, conversation state, reply context and
+  history are silently dropped. OpenAI-compatible providers pass all messages
+  through unchanged.
+- **Duplicated:** the full tool surface appears as prose (15,166 chars) and as
+  native schemas (37,175 chars).
 
-`create_task` is registered in `create_default_registry()` and its schema is
-therefore always part of the tool block rendered at `dispatcher.py:455`
-(`self._render_tool_schemas(self._tool_registry.list_schemas())`). The tool
-description itself is well-scoped (`tools/task.py:108-115`: "a natural-language
-request describing an interval, daily/weekly cadence, or one-time time").
+### Does the request reach the model intact?
 
-The provider tool loop (`dispatcher.py:753`, `MAX_TOOL_ROUNDS = 3`) executes
-whatever the model emits through the same `ToolExecutor.execute_calls`, subject
-only to `MAX_TOOLS_PER_TURN = 5` and the permission gate. **There is no
-code-level check anywhere in the dispatcher or executor that a `create_task`
-call is warranted.** A `grep` for `create_task` across
-`backend/ai/engine/dispatcher.py` returns only two hits, both of which *build*
-task context (`:1289` comment, `:1306` candidate construction) — never a veto.
-In the executor, the only hit is the status label at `:76`.
-
-Consequence: on any path where the provider *is* reached, the prompt contract is
-the **sole** barrier between an immediate workflow and a durable task, and it is
-unenforced in code.
-
----
-
-## 11. Structured JSON fallback path
-
-`_apply_structured_action` (`dispatcher.py:1928`) runs the deterministic parser
-**first** and only falls through to the model's own JSON when the deterministic
-result is `conversational`:
-
-```python
-# backend/ai/engine/dispatcher.py:1954-1960
-result = parse_command_intent(request.user_message, ...)
-if result.kind == "conversational":
-    result = parse_action_text(text)
-```
-
-The fallback is independently capable of producing `create_task`, because
-`"create_task"` is present in both `ACTION_NAMES` (`actions.py:38`) and
-`EXECUTABLE_ACTION_NAMES` (`actions.py:75`), and `validate_action`
-(`actions.py:317`) returns `KIND_EXECUTABLE` for it. Proven by probe:
-
-```
-C. STRUCTURED JSON FALLBACK (parse_action_text) - entry point 2
-  'create_task' in ACTION_NAMES          : True
-  'create_task' in EXECUTABLE_ACTION_NAMES: True
-  provider prose/JSON  : {"action": "create_task", "request": "اول یه سرچ بزن ..."}
-  parsed kind          : executable
-  parsed action        : create_task
-  resolved tool_calls  : [{'name': 'create_task', 'arguments': {'request': 'اول یه سرچ بزن ...'}}]
-```
-
-So a model that emits a native `create_task` **and** a model that emits
-`{"action": "create_task", ...}` are both accepted. On the observed request
-this path is dormant purely because entry point 1 already claimed the turn.
+Yes — for a single-turn request the owner’s text is delivered byte-for-byte
+(only the trigger is removed). The losses are structural: **conversation
+history never arrives** (all providers), and **the entire instruction layer is
+dropped for Gemini-routed requests**.
 
 ---
 
-## 12. Proactive planner path
+## Semantic Routing Audit
 
-`has_proactive_authorization()` (`proactive.py:44`) is a fail-closed,
-token-phrase detector whose vocabulary is limited to explicit
-initiative-authorization phrases ("هر کاری لازمه", "خودت تصمیم بگیر",
-"as you see fit", …). Probed for the observed message:
+**Finding: no hidden semantic router remains in the decision path. Stage 5 is
+true in the current code, not only in the documentation.**
 
-```
-B. PROACTIVE AUTHORIZATION
-  has_proactive_authorization: False
-```
+Removed and confirmed absent from current source (grep over `backend/` returns
+no hits):
 
-and for every case string tested, including the durable variant, it is `False`.
+- `parse_command_intent`, `_is_scheduling_intent`, `_parse_status_intent`,
+  `_is_event_intent`, `_has_future_clock_request`, `_extract_count`,
+  `_is_semantic_delete`, `_extract_semantic_query`, `_parse_number`,
+  `_is_history_analysis_intent` and the cadence/action vocabularies in
+  `backend/ai/actions.py`;
+- `_try_local_fast_path`, `_build_deterministic_task_candidate`, `_reply_text`
+  and the `parse_command_intent` pre-pass in `backend/ai/engine/dispatcher.py`;
+- the natural-language completeness gate and profile-fidelity override in
+  `backend/ai/tools/task.py`;
+- the `explicit_no_tags_requested` keyword override in `backend/ai/tools/save.py`;
+- `parse_structural_predicate` and its number-word vocabulary in
+  `backend/ai/semantic_delete.py`.
 
-The planner is doubly inapplicable here:
+What remains deterministic in the decision path is **technical validation /
+authorization**, and it cannot choose a capability:
 
-1. It is evaluated at `dispatcher.py:503`, **after** the fast path already
-   returned — it is structurally unreachable on this path.
-2. Even when authorized, `PROACTIVE_AUTHORIZED_RULES` is a *bounded
-   extra-work* contract, and it explicitly carries
-   `"never call create_task repeatedly"` (asserted by
-   `test_proactive_rules_bound_extra_work_and_do_not_enable_task_storage`).
+| Location | What it reads | Why it is not routing |
+|---|---|---|
+| `backend/ai/actions.py` | `validate_action`, `resolve_tool_calls`, `parse_action_text`, `extract_json_object`, `_TELEGRAM_LINK_RE`, `_SAVE_CODE_RE` | validates/parses **the model’s own output** or fixed artifact shapes |
+| `backend/ai/proactive.py::has_proactive_authorization` | the owner’s message | per-request **permission gate** for extra work; fail-closed; consumed after the model proposes an action |
+| `backend/ai/task_contract.py::ground_ai_instruction` / `_generation_authorized` (uses `actions.py` helpers `_tokenize`, `_write_text_present`, `_has_bio_mention`, `_has_bio_change_intent`, `_USERNAME_WORDS`) | the owner’s message | **provenance**: decides whether generated content is authorized for an already-proposed `create_task`; drops ungrounded instructions |
+| `backend/ai/confirmation.py::is_explicit_confirmation` | the message | exact full-message match against a tiny phrase set to consume a **previously created** pending approval |
+| `backend/ai/config_store.py::match_trigger` | the first word | literal trigger-word activation |
+| `backend/ai/semantic_delete.py` | text of already-fetched messages | applies the **AI-chosen** predicate (`spec_from_dict`, `build_matcher*`) |
 
-The proactive path therefore **cannot** be the cause.
+Evidence of absence is additionally pinned by tests, all passing on this HEAD
+(51 passed): `tests/test_semantic_intent_boundary.py` (no local selection;
+every request reaches the provider; `create_task` still offered),
+`tests/test_regex_routing_removal.py` (no retired router symbol/vocabulary),
+`tests/test_intent_routing_boundary.py`, `tests/test_provider_tool_boundary.py`.
 
----
+**Conclusion:** there is no equivalent semantic router elsewhere that can
+override the AI. The AI is the sole interpreter of natural-language intent on
+this HEAD. Consequently, every misunderstanding is now attributable to the
+input context, the instruction layer, the tool/provider contract, the model’s
+own decision, or the execution/feedback loop — not to deterministic
+interception.
 
-## 13. Authorization path
-
-Two authorization mechanisms exist, and neither converted this request:
-
-**Proactive authorization** — `has_proactive_authorization` → `False` (above);
-surfaced as `extra["proactive_authorized"]` at `dispatcher.py:1291` and as a
-conditional system message at `dispatcher.py:503-515`. It is purely additive
-(permits bounded extra work); it never reclassifies an intent as durable.
-
-**Tool permission level** — `CreateTaskTool.permission_level` is
-`PermissionLevel.READ_WRITE` (`tools/task.py:129`), and `safe` is `True`
-(`:136`). `ToolExecutor.execute_calls` (`executor.py:148`) therefore runs the
-call with **no** `needs_confirmation` gate. The comment in the source states the
-design premise: "The owner's message IS the authorization in this single-owner
-self-bot."
-
-**Deterministic task candidate** — `_build_tool_context` re-runs
-`parse_command_intent` at `dispatcher.py:1301` and, when the verdict is
-`create_task`/`executable`, tries to synthesize a provider-free interval
-candidate (`dispatcher.py:1332-1372`). For the observed message this returns
-`None` (no `هر`/`every`/`each` + time-unit + write marker), so
-`extra["deterministic_task_candidate"]` is unset and `CreateTaskTool` proceeds
-in `nl_interpretation` mode (`tools/task.py:333-340`) — i.e. it calls the
-provider to interpret the anime request as a durable task.
-
-**Authorization conclusion:** no permission layer can convert an immediate
-workflow into a durable task, and none did. The misclassification happened
-strictly upstream, in the intent vocabulary.
+Handler surface (checked): outgoing-message handlers are `ai_unified`
+(trigger/reply-to-AI), `misc` (literal `Menu`), and dot-command handlers
+(`.task`, etc., skipped by `ai_unified`); `task_events` only resolves owner
+**replies to parked task questions**. None reads free-form NL to choose a tool.
 
 ---
 
-## 14. Test coverage analysis
+## System Prompt / Instruction Audit
 
-The green suite that motivated this investigation is
-`tests/test_intent_routing_boundary.py` (51 tests, added in `916536c`). Its own
-module docstring states its scope honestly:
+The current `backend/ai/prompt/template.py` (all four templates are merged into
+one system message; `OUTPUT_INSTRUCTIONS` is part of it) is substantially
+better than the pre-Stage-5 prompt: it now contains an explicit
+**immediate-vs-durable** policy, an ordered multi-action policy, and a
+"talking about a capability is not using it" rule. Measured sizes: `SYSTEM_RULES`
+10,436 / `PLATFORM` 707 / `RUNTIME` 2,088 / `OUTPUT` 8,499 chars.
 
-> "These tests exercise the DECISION BOUNDARY (what the local parser resolves,
-> and what the prompt contract tells the model the tool surface means). They
-> never inject a correct tool call and assert the executor runs it."
+What is explicitly instructed (verified in the current templates):
 
-Audit of the layers each relevant test actually touches:
+- understand the goal and call the matching tool: *“when the owner requests an
+  action, you must call the matching tool and report its REAL result”*;
+- immediate vs durable: *“An IMMEDIATE WORKFLOW is work the owner wants done NOW …
+  A DURABLE TASK is work … done LATER, again, or at a time … NEVER turn an
+  immediate workflow into create_task …”*; it names the production example
+  (`search → save → tag`) and says to call `web_search`, `save`,
+  `update_save_tags` in order in this turn;
+- multi-action order: *“emit them as consecutive tool calls IN THIS TURN, in the
+  owner’s order, and use each real tool result before deciding the next call”*;
+- use results to continue / never fabricate success: *“After a tool call, report
+  its REAL result”*, *“Tool results are AUTHORITATIVE data”*;
+- prefer tools over prose for executable commands: *“output ONLY the tool call”*;
+- clarification only when genuinely ambiguous;
+- capability mention ≠ execution request;
+- destructive-target resolution rules (reply / last N / explicit ID);
+- saved-item name/tags/version rules.
 
-| Test / suite | Layer under test | Provider | Real `Dispatcher` | Real registry | Real executor | `create_task` reachable | Could pass while production misroutes? |
-|---|---|---|---|---|---|---|---|
-| `test_intent_routing_boundary.py::test_immediate_multi_action_is_not_routed_to_create_task` (`:152`) | `parse_command_intent` only | n/a | no | no | no | yes (asserts absence) | **YES** |
-| `::test_immediate_workflow_tags_make_the_parser_yield_to_the_model` (`:165`) | `parse_command_intent` + `save_metadata_requested` + `has_proactive_authorization` | n/a | no | no | no | yes (asserts absence) | **YES** |
-| `::test_immediate_request_is_not_a_scheduling_intent` (`:246`) | `_is_scheduling_intent` **directly** | n/a | no | no | no | yes (asserts `False`) | **YES** |
-| `::test_durable_weekly_request_is_left_to_the_provider_not_invented_locally` (`:219`) | `_is_scheduling_intent` + `parse_command_intent` | n/a | no | no | no | yes (asserts `False`) | **YES** |
-| `::test_prompt_contract_separates_immediate_workflow_from_durable_task` (`:180`) | string presence in `template.py` | n/a | no | no | no | no | **YES** — asserts a string exists, not that it is rendered |
-| `::test_the_whole_tool_surface_still_terminates_at_one_registry` (`:275`) | `create_default_registry` lookup | n/a | no | yes | no | yes (presence only) | partially |
-| `test_task_nl_creation.py::test_interval_request_routes_to_create_task` (`:72`) | `parse_command_intent` **positive** branch | n/a | no | no | no | **yes, asserted `True`** | No — genuinely covers the firing branch |
-| `test_task_nl_creation.py` full-dispatcher tests | real `Dispatcher.dispatch` | fake provider | **yes** | yes | yes | yes | partially |
-| `test_25_fast_path.py` | real `Dispatcher` + real `ProviderManager`; mocked executor | fake | **yes** | no | no (MagicMock) | n/a | No — but it *proves* the fast path runs with `provider.calls == 0` |
-| `test_proactive_action_chains.py` (24 tests) | real `TaskInterpreter`→`TaskCreationService`→`InMemoryTaskRepository`; real `Dispatcher`→`ToolExecutor` | `ScriptedProvider` | **yes** | **yes** | **yes** | yes | **YES** — the model's choice is scripted, so routing is never tested |
+Gaps and conflicts found (current text):
 
-Directly answering Q10/Q11/Q12:
-
-- **Q10 — Are tests covering the actual production path?** Partially. Several
-  suites use the real `Dispatcher`, real registry and real executor, but the
-  intent-routing suite that carries the "must not become `create_task`" claim
-  exercises only `parse_command_intent` in isolation, with no dispatcher, no
-  registry, and no executor.
-- **Q11 — Does any test reproduce the natural-language request while mocking
-  only the provider boundary?** **No.** The exact production string appears
-  nowhere in the repository. The suite's `IMMEDIATE_MULTI_ACTION` list
-  (`:144-147`) contains only two paraphrases:
-  - `"این رو سیو کن و بعد تگش کن."`
-  - `"اول سرچ کن، بعد نتیجه رو سیو کن، بعد تگ بزن."`
-
-  Both omit `هفتگی`. The docstring of
-  `test_immediate_workflow_tags_make_the_parser_yield_to_the_model` (`:167-170`)
-  asserts *"This is the exact path the anime request took"* while passing the
-  second paraphrase — the anime request is named but never reproduced.
-- **Q12 — Does any such test prove `create_task` cannot be selected later?**
-  **No.** Nothing asserts anything about entry points 2–5, and nothing drives
-  the full `dispatch()` with an attributive-cadence input. The suite's own
-  framing ("what the local parser resolves") is narrower than the claim the
-  suite is being used to support.
-
----
-
-## 15. False-confidence / coverage gaps
-
-**Gap 1 — the decisive function has no positive test, and its only two direct
-assertions are negative.** A repository-wide search shows `_is_scheduling_intent`
-is asserted in exactly two places, both in
-`tests/test_intent_routing_boundary.py` (`:229` and `:249`), and **both assert
-`False`**. The function that caused this incident is never asserted `True` in
-that suite, and the two strings it is checked against contain no cadence token
-at all. A function whose only assertions are "returns False for these inputs
-that obviously have no cadence word" cannot detect "returns True for an
-immediate input that happens to contain a cadence word used attributively."
-
-**Gap 2 — the suite's own docstring documents the dormancy assumption as if it
-were safety.** `test_durable_weekly_request_is_left_to_the_provider_not_invented_locally`
-(`:219-233`) states that `_is_scheduling_intent` "fails closed here" and
-therefore cannot invent a schedule. The probe shows this reasoning is inverted:
-the function is *over*-permissive, not fail-closed. The test's conclusion (that
-the durable request is not resolved locally) is correct for its input, but the
-stated mechanism is not the safety property it appears to be — the same
-function is what made the immediate request durable.
-
-**Gap 3 — prompt-contract tests assert strings, not behavior.** Three tests
-(`:180`, `:193`, `:200`) assert that specific sentences exist in
-`template.py`. They prove the contract was *written*. They cannot prove the
-contract is *rendered*, and on the observed path it is not rendered at all.
-
-**Gap 4 — "the executor can execute an action chain" is treated as routing
-coverage.** `test_proactive_action_chains.py` uses the real
-`TaskInterpreter`, `TaskCreationService`, `InMemoryTaskRepository`,
-`Dispatcher` and `ToolExecutor`, and its own docstring claims "Nothing is faked
-except the provider response itself." That is accurate and still
-insufficient: with a `ScriptedProvider`, the model *chose* `create_task` in the
-script. The test proves the downstream machinery works **given** a task
-selection. It says nothing about **whether** an incoming Persian sentence
-selects one. These are not equivalent claims, and only the first is tested.
-
-**Gap 5 — no adversarial-cadence test class exists.** No test anywhere in
-`tests/` uses `هفتگی` in an intent-routing assertion. The only `هفتگی`
-occurrences in the suite are unrelated
-(`test_task_semantic_triggers.py:201` — a duration-mapping fixture;
-`test_save_v2_resolution.py:301-324` — save-item display-name fixtures). The
-entire class "cadence word used as a content attribute" is untested.
-
-**Gap 6 — no end-to-end assertion on the status label.** Nothing asserts that
-the executor's `create_task` status label is reachable, or unreachable, for a
-given intent class. The observable that actually appeared in Telegram
-(`"🗓 Creating task..."`) has no test in any form.
-
-**Gap 7 — the positive-branch suite only uses genuinely-scheduled strings.**
-`test_task_nl_creation.py:72-85` correctly asserts
-`parse_command_intent` → `create_task` for
-`"برنامه ریزی کن هر ۱ ساعت همه پیام های این چت رو پاک کن"` and its interval
-sibling. Those inputs really are schedules. No test pairs a *true positive* and
-a *look-alike false positive* to pin down the boundary between them — which is
-exactly the distinction that failed.
-
-### The second reported problem: capability/topic mentions
-
-At the deterministic boundary, capability mentions are currently handled
-correctly. Probed:
-
-```
-CAPABILITY mention (no execution)   kind='conversational'
-  "داشتم فکر می‌کردم از قابلیت ذخیره برای یادداشت‌هام استفاده کنم"
-CAPABILITY mention EN (no execution) kind='conversational'
-  "I was thinking about using the save feature for my notes"
-PLAIN immediate save  "این رو سیو کن"        kind='clarify' action='save'
-PLAIN immediate save EN "Save this."         kind='clarify' action='save'
-```
-
-So the *only* current enforcement of "a capability mention is not an
-executable request" is:
-
-1. the deterministic parser abstaining, and
-2. the prompt's output rule 3 (`template.py:127`, asserted at
-   `test_output_instructions_forbid_storing_work_the_owner_wanted_now`).
-
-**There is no code-level mechanism anywhere that converts a capability mention
-into an executable tool call — and equally, there is no code-level mechanism
-that forbids it.** Once a request is `conversational`, the model is free to
-emit `save` or `create_task` as a native tool call (entry point 3) or as a JSON
-action (entry point 2), and the executor will run either with no re-check
-(`save` and `create_task` are both `READ_WRITE`, `safe`, and the single-owner
-premise treats the owner's message as the authorization). The defense for this
-class is prompt-only, exactly like the defense for immediate-vs-durable on the
-provider path.
-
-Note the compounding risk: because `_is_scheduling_intent` is also the
-completeness gate *inside* `CreateTaskTool` (`tools/task.py:200-203`), a
-capability mention that happened to contain a cadence word would pass that gate
-as well — the two layers are self-consistent because they share the same
-over-permissive function, and neither can catch the other.
+1. **Capability enumeration is incomplete and biased.** The “You may: …” list
+   names save/delete/list/search/database/bio/username/account only. `web_search`,
+   `translate_history`, `summarize_history`, `send_message`, `memory_*`,
+   `organize_*`, `ask_owner` and `text_to_speech` are not in that list (some are
+   covered elsewhere — web search only by one example sentence and the tool
+   description; translation/summarization nowhere in the rules). A model that
+   weighs the explicit capability summary over 55 tool descriptions can underuse
+   these.
+2. **The JSON fallback contract is narrower than the real tool set.** OUTPUT
+   rule 8 enumerates 30 actions and ends with `…`; it omits `web_search`,
+   `create_task`, `translate_history`/`summarize_history`, `send`, and the
+   memory tools. `_ENFORCE_ACTION_NUDGE` (dispatcher line 120) repeats a similar
+   narrow subset (“save, delete, list/search saved items, retrieve, database,
+   bio/username, task list/inspect/transition, message review”). For providers
+   without native tool calling, those capabilities cannot be expressed through
+   the documented fallback at all.
+3. **No explicit current-information policy.** The only guidance to use
+   `web_search` is the tool description and the one immediate-workflow example.
+   Rule 7 (*“If you don’t know something … say so — do not guess”*) and rule 4
+   (*“If no tool is needed, respond with a natural language answer”*) can both
+   read as permission to answer from training data or refuse, rather than
+   search, for current-fact questions.
+4. **Implicit tool need is still under-served.** RUNTIME_RULES says *“Execute an
+   action only when the owner explicitly requests it in this turn”*. The new
+   immediate-workflow bullet softens this for explicit multi-action requests,
+   but nothing states the converse rule: when the answer depends on data a tool
+   can fetch, use the tool even if the owner only asked a question.
+5. **Correction handling is not instructed.** Nothing tells the model to
+   reconsider its previous approach when the owner corrects it (e.g. *“اگر
+   میخواستم خودم سرچ کنم بهت میگفتم”*). Combined with lost history (P0-2 below),
+   a correction that is not a reply to the AI message has no anchor.
+6. **“Tell me how” vs “do it for me”** is handled only for specific command
+   families (save/delete) and the capability-tuning rule; a general distinction
+   is absent.
+7. Minor: rule 2’s “under 500 characters” competes with multi-step reporting;
+   `[Available Tools]` (dispatcher `_render_tool_schemas`) renders parameter
+   names and types but **not requiredness**, while the native schemas carry a
+   (defective — see P0-1) `required` list.
 
 ---
 
-## 16. Root cause
+## Tool Inventory and Contract Audit
 
-**Conclusively established from source and from direct execution of the real
-components.**
+Current registry: **55 tools** (`create_default_registry`, `backend/ai/tools/registry.py`
+line 107; count pinned by `tests/test_capability_exposure_tools.py`). All tools
+are thin wrappers returning `ToolResult(success, message, data)`; failures are
+derived from service `❌/⚠️/🚫` prefixes (`tools/base.py`).
 
-**Root cause.** `_is_scheduling_intent()` decides "this message requests a
-schedule" with a position-independent membership test over the whole message's
-token list:
+Inventory (name — permission — notable parameters / declarations; “required*”
+= the `required` list the **provider schema** actually carries, see P0-1):
 
-```python
-# backend/ai/actions.py:2674
-if any(w in _FA_RECUR_WORDS or w in _EN_RECUR_WORDS for w in words):
-    return True
-```
+| Tool | Perm | Params / notes |
+|---|---|---|
+| `save` | read_write, long_running, requires reply | display_name, tags; description says both optional → provider `required* = [display_name, tags]` |
+| `save_by_link` | read_write, long_running | link (declared required), display_name, tags → `required* = [link, display_name, tags]` |
+| `delete` | dangerous | count(1–500), mode enum(last_n/all/until_time/until_message/filtered), until_time, after_time, boundary_id, query, semantic{query,word_count,english_word_count} → `required*` = all 7 |
+| `delete_by_id` | dangerous | message_id (actual required) |
+| `delete_replied` | dangerous, requires reply | no params |
+| `delete_message_by_id` | dangerous | message_id |
+| `delete_messages_by_ids` | dangerous | message_ids[] |
+| `list_recent_messages` | read_only | limit(1–100, default 50) → `required* = [limit]` |
+| `bio_set_template` / `bio_set_text` / `bio_set_mood` / `bio_on` / `bio_off` | read_write | template / text / mood |
+| `bio_show` / `get_bio` | read_only | no params |
+| `username_set_template` / `username_set_text` / `username_set_mood` / `username_on` / `username_off` | read_write | template / text / mood |
+| `username_show` | read_only | no params |
+| `search` | read_only | query (required) |
+| `list_saves` | read_only | limit(1–50, default 10) |
+| `database_stats` | read_only | no params |
+| `account_show` | read_only | fields[] enum(first_name,last_name,full_name,username) → `required* = [fields]` |
+| `settings_get` | read_only | key (required) |
+| `settings_set` | **admin_only** (confirmation) | key, value |
+| `organize_list` / `organize_clean` | read_only / dangerous | no params |
+| `web_search` | read_only | query, count(1–100, default 10), freshness enum(day/week/month/year), include_domains[] → `required* = [query, freshness, include_domains]` |
+| `create_task` | read_write | single `request` string; a **second provider round** interprets it (`TaskInterpreter.interpret`) |
+| `task_list` | read_only | status enum(active/paused/completed), default null → no `required` key (pinned) |
+| `task_inspect` | read_only | task_id (required) |
+| `task_transition` | read_write | task_id, action enum(active/paused/completed), expected_version, query, complete_steps → `required* = [task_id, action, expected_version, query, complete_steps]` |
+| `task_delete` | read_write | task_id, expected_version, query → `required* = [task_id, expected_version, query]` |
+| `todo_add` | read_write | title, steps[] → `required* = [title, steps]` |
+| `todo_find` | read_only | query |
+| `todo_edit` | read_write | title, task_id, expected_version, query |
+| `todo_step_add` | read_write | title or steps, task_id or query |
+| `todo_step_list` | read_only | task_id or query |
+| `todo_step_transition` | read_write | action enum(completed/active), step or step_query, task_id or query |
+| `todo_step_edit` | read_write | title, step or step_query, task_id or query |
+| `todo_step_delete` | read_write | step or step_query, task_id or query |
+| `retrieve_save` | read_write | save_code or query (exactly one match; multi-match asks) |
+| `preview_save` / `delete_save` | read_only / dangerous | save_code |
+| `rename_save` | read_write | save_code or query; display_name and/or file_name (file_name re-uploads) |
+| `update_save_tags` | read_write | save_code or query; tags[]; mode enum(add/replace/remove) |
+| `translate_history` | read_only, long_running | count(1–1000, default 100), language, instruction → `required* = [language, instruction]` |
+| `summarize_history` | read_only, long_running | count, instruction → `required* = [instruction]` |
+| `send_message` | read_write | text(1–4096), font enum(23 fonts) → to Saved Messages only |
+| `ask_owner` | read_write | question(1–512); durable-chain question |
+| `text_to_speech` | read_write, long_running | text(1–1000) — subsystem is reported frozen/deferred |
+| `memory_store` | read_write | content, tier enum(long/permanent), category enum, importance |
+| `memory_list` | read_only | tier, query, limit |
 
-`"هفتگی"` ("weekly") is a member of `_FA_RECUR_WORDS` (`actions.py:2551-2554`).
-In the observed message the token sequence is
-`… انیمه های هفتگی` — `هفتگی` is an **attributive adjective describing the
-anime**, not a recurrence instruction. The test cannot distinguish the two
-because it never looks at where the word sits or what it modifies. The
-co-occurring action-verb requirement at `:2672` is satisfied by the request's
-own immediate verbs (`بزن` in "تگ بزن" and `سیو` are both in `_FA_ACTION_VERBS`,
-`actions.py:2570-2575`).
+**Overlap / ambiguity risks (tool-definition level):**
 
-**The exact state transition responsible.** `parse_command_intent` moves from
-"examining the message" to a hard, provider-independent commitment at
-`actions.py:2745-2753`: it returns
-`ActionParseResult(kind=KIND_EXECUTABLE, action="create_task",
-target="schedule", tool_calls=[{"name": "create_task", …}])`. Proven by probe:
+- **Delete family has five tools** (`delete`, `delete_by_id`, `delete_replied`,
+  `delete_message_by_id`, `delete_messages_by_ids`) plus `delete_save`. The
+  mega `delete` tool carries 7 parameters with terse semantics; a model choosing
+  among “delete by id”, “delete one by id”, “delete replied”, “delete ids” and
+  “delete with mode” has multiple plausible candidates for the same phrase.
+- **Save family:** `save` vs `save_by_link` overlap on “save this” when the
+  target is a link; the reply requirement of `save` is only in the description.
+- **Retrieve/saved-item:** `search` (query over saved items), `list_saves`,
+  `retrieve_save` (save_code **or** query), `preview_save`, `rename_save`,
+  `update_save_tags` — four tools accept either code or query with multi-match
+  clarification built in.
+- **Task addressing:** `task_transition` / `task_delete` / `todo_edit` accept
+  id+`expected_version` **or** `query`; `todo_step_*` accept `step` or
+  `step_query` — the tool text explains this, but the provider schema marks all
+  alternatives as required (P0-1), which directly contradicts the alternatives.
+- **`create_task` has one opaque `request` argument.** Intent is resolved in a
+  second provider call; the caller must already know a schedule exists. There is
+  no schema-level help for what a durable vs immediate request looks like — that
+  now lives only in the system prompt.
+- **Hidden rules inferable only from implementation:** `save` needs a replied
+  message; `web_search` requires the `you` retrieval provider to be configured
+  (`YDC_API_KEY`) or returns `⚠️ Web search failed`; `update_save_tags` needs a
+  saved item; `task_transition` needs the current version; `settings_set` is
+  confirmation-gated; `text_to_speech` targets a frozen subsystem.
 
-```
-A. DETERMINISTIC INTENT BOUNDARY (parse_command_intent)
-  kind      : executable
-  action    : create_task
-  tool_calls: ['create_task']
-```
-
-and the isolating A/B, which removes that single token and nothing else:
-
-```
-  PRODUCTION (observed)                        kind='executable' action='create_task' target='schedule'
-  PRODUCTION minus 'hafti'                     kind='conversational'
-  PRODUCTION, 'hafti' -> 'mahane' (monthly)   kind='executable' action='create_task' target='schedule'
-  'قیمت هفتگی رو بگو'  ("tell me the weekly price")   scheduling=True  boundary=executable
-  'این هفته انیمه ها رو بگو' ("tell me this week's anime") scheduling=False boundary=conversational
-```
-
-The last two lines show the false positive is general, not specific to anime:
-*any* sentence containing `هفتگی` plus an action verb is misread as a schedule,
-while the genuinely temporal `این هفته` is correctly not.
-
-**The component that emits the observed message.** `ToolExecutor.execute_calls`
-(`executor.py:148`) iterates the single `create_task` call, looks up
-`_STATUS_LABELS["create_task"] = "🗓 Creating task..."` (`:76`) and awaits
-`status_callback(label)` (`:180-185`). In production that callback is
-`ai_unified._status_callback` (`ai_unified.py:740-745`), which calls
-`event.edit(format_status(display_prompt, status, show_question))` — the exact
-text the owner saw.
-
-**Why no later stage could save it (Q15).** The intent boundary is **not
-bypassed, overwritten, or ignored — it is the final authority, and it is the
-component that made the error.** `_try_local_fast_path` is called at
-`dispatcher.py:423-428`, *before* prompt construction, and returns a
-non-`None` `EngineResult`, which `dispatch()` returns immediately at `:426-427`.
-Concretely, on this request:
-
-- the prompt contract in `template.py:85` is **not rendered** (no
-  `PROMPT_BUILD` stage — `_stage("PROMPT_BUILD")` at `dispatcher.py:447` is
-  never reached);
-- the provider is **not called** (`provider calls: 0`);
-- the structured JSON fallback is **not reached** (it is behind a
-  `conversational` verdict);
-- the proactive planner is **not reached** and would have been `False` anyway;
-- no authorization layer re-checks the classification.
-
-The prompt-based immediate-vs-durable rule added in `916536c` is therefore
-**not connected** to the decision for this class of input. It governs only
-messages the deterministic boundary abstains on. The fix committed in `916536c`
-improved the contract and added a paraphrase-level regression test; it did not
-touch — and could not have touched — the function that actually decided this
-request's fate.
-
-**Not claimed.** This investigation does not claim to have observed the live
-Telegram server; the reproduction is a local execution of the current source
-through the real dispatcher, registry and executor. It does not claim any
-provider behavior in production beyond the fact that no provider round occurs
-on this path (which is a property of the code path, not of the model). It does
-not claim the issue is fixed.
-
----
-
-## 17. Proposed remediation options
-
-Documentation only — **none of these was implemented.**
-
-**Option A — Require the cadence word to govern the action (narrowest,
-recommended).** Tighten `_is_scheduling_intent` so the bare-membership branch
-at `actions.py:2674` no longer decides on its own. Minimal, evidence-backed
-shape: require a cadence token to be in a scheduling *position* — adjacent to an
-interval intro (`هر` + time unit), or paired with a plan/explicit-schedule
-marker — rather than anywhere in the message. This is the same adjacency
-discipline the module already uses for the clock anchor
-(`_has_future_clock_request`, `actions.py:2620-2633`) and would stay
-token-based, consistent with the no-regex-in-routing rule. Expected effect on
-the observed request: `_is_scheduling_intent` → `False`,
-`parse_command_intent` → `conversational`, request reaches the provider, and
-the `template.py:85` contract becomes the governing rule as designed.
-
-**Option B — Require multi-step ordering words to be treated as order, never as
-schedule.** The `اول / بعد / و بعد` sequence in the message is a strong
-immediate-workflow marker. A rule that sequencing words veto the bare cadence
-branch would fix this class specifically. Narrower than A, but more
-special-purpose and easier to overfit to this one message.
-
-**Option C — Model-driven decision for the whole class.** Drop the deterministic
-scheduling branch from `parse_command_intent` entirely and let the provider +
-prompt contract decide. This is architecturally the cleanest split, but it
-regresses the documented reliability guarantee that recurring requests work
-without any provider round (`dispatcher.py:410-419`) — and durable task creation
-would then depend on every provider being healthy. Not recommended alone.
-
-**Option D — Add a code-level guard on the provider path.** Independently of
-A/B/C, a bounded post-model check in the tool loop rejecting a `create_task`
-call whose originating message has no *anchored* schedule expression would make
-the immediate-vs-durable distinction enforced in code rather than by prompt
-wording. It would also close the capability-mention gap documented in §15.
-Higher surface area; must not become a second intent system.
-
-**Option E — Test-only remediation (necessary regardless).** Add a regression
-class to `tests/test_intent_routing_boundary.py` that (a) uses the exact
-production string, (b) pairs each true positive with an attributive look-alike
-false positive, (c) asserts `_is_scheduling_intent` in **both** directions, and
-(d) drives the real `Dispatcher` with a provider that fails the test if called,
-asserting the tool loop is entered. Without (d) the suite can stay green
-through any prompt-only change.
-
-**Recommended sequencing:** A + E together, then re-evaluate D independently.
+Error/result behavior is consistent (message text for the model; `success`
+derived from service prefixes). Result formats are bounded by the services; the
+dispatcher passes `{tool, success, message, data, error}` to the model.
 
 ---
 
-## 18. Explicitly rejected approaches
+## Provider Tool-Calling Contract
 
-| Rejected | Why |
-|---|---|
-| Adding regex-based command/intent routing | Directly contradicts the recorded architectural decision (`6bec694` "remove regex based tool command routing"); the module documents that no regex participates in command/intent routing. Rejected by the project's own rules. |
-| Removing existing routing | Explicitly forbidden by the investigation's no-fix rule, and it would regress the provider-independent fast path. |
-| A second dispatcher / executor / planner / permission system | Violates the single-recovery-authority and single-executor rules. The dispatcher and `ToolExecutor` are correct here; the defect is in a vocabulary predicate. |
-| Changing the provider contract or tool schemas | Would not affect the observed path — no provider is called. |
-| Database / Supabase changes | No schema or persistence defect is implicated. The misroute happens before any repository call. |
-| Weakening `CreateTaskTool`'s completeness gate | The gate is not the origin; it shares the same predicate. Relaxing or tightening it alone changes nothing. |
-| Adding a global "always ask before creating a task" confirmation | `create_task` is intentionally `READ_WRITE`/`safe` under the single-owner premise; a blanket gate would be a new permission system and would break the documented direct-creation path. |
-| Rewriting `parse_command_intent`'s scheduling branch wholesale | The branch is correct for genuine schedules (`test_task_nl_creation.py` proves the positive case). The defect is the *looseness* of one predicate, not the branch's existence. |
-| Treating this as a provider/prompt-tuning problem | The provider is never called on this path. Prompt wording cannot influence a turn that ends before prompt construction. |
+**Serialization.** `Dispatcher._build_tool_definitions` (line 1851) wraps each
+registry schema as
+`{"type":"function","function":{name, description, parameters:{type:object, properties}}}`.
+The registry’s `parameters` is a flat `{param: descriptor}` map. The `required`
+list is **inferred**: *every parameter whose descriptor lacks a `default` key is
+declared required* (line 1861–1870).
+
+**Defect (measured on current HEAD):** **40 of 55 tools** receive a nonempty
+`required` list, and for many of them the list names genuinely optional
+parameters. Examples:
+
+| Tool | Provider `required` (current) | Actually |
+|---|---|---|
+| `save` | `[display_name, tags]` | both optional; the prompt *forbids inventing* them |
+| `save_by_link` | `[link, display_name, tags]` | display_name/tags optional |
+| `web_search` | `[query, freshness, include_domains]` | freshness/include_domains optional |
+| `delete` | `[count, mode, until_time, after_time, boundary_id, query, semantic]` | alternative/optional scope params |
+| `list_recent_messages` | `[limit]` | optional (default 50) |
+| `account_show` | `[fields]` | optional (defaults first_name+username) |
+| `task_transition` | `[task_id, action, expected_version, query, complete_steps]` | `query` is an ALTERNATIVE to id+version |
+| `task_delete` | `[task_id, expected_version, query]` | `query` alternative |
+| `todo_step_list` | `[task_id, query]` | either/or |
+| `translate_history` | `[language, instruction]` | both optional; count defaulted |
+| `memory_list` | `[tier, query, limit]` | all optional |
+
+The text tool block (`[Available Tools]`) does **not** state requiredness, so the
+model’s only requiredness signal is the wrong list. Contradiction example: the
+system prompt says *“NEVER invent a name or a tag”* while the provider schema
+marks `display_name` and `tags` required for `save` — the model must either
+violate the prompt, pass empty placeholders, or avoid the tool.
+
+**Provider coverage.** Every chat-capable provider is an `OpenAICompatProvider`
+subclass (`openai`, `groq`, `cerebras`, `mistral`, `openrouter`, `nvidia`,
+`sambanova`, `siliconflow`, `fireworks`, `zai`, `nararouter`, `cohere`): the
+`tools` array and `tool_choice="auto"` are forwarded verbatim; tool calls are
+parsed natively (malformed JSON arguments are flagged, never silently `{}`).
+Gemini translates to `functionDeclarations` and preserves name/description/
+parameters **including the same defective `required`**. `you` is a web-search
+retrieval capability (`CAPABILITY_KIND="web_search"`), excluded from chat
+routing; `dummy` never serves production. No tool is silently omitted: the
+dispatcher logs `AI_TOOL_AVAILABILITY tools=55`.
+
+**System-message collapse (Gemini).** As described in the Context/Input Audit:
+`gemini.py` keeps only the **last** system message as `systemInstruction`. This
+is a provider-contract/context defect independent of the required-fields defect;
+for Gemini-routed requests the model receives the tool schemas but **none of the
+rules or output contract**.
 
 ---
 
-## 19. Files that must NOT be changed during the eventual fix
+## Tool Execution Loop
 
-Unless the eventual fix produces evidence that one of these is genuinely
-implicated, remediation should be confined to:
+Verified on current HEAD (`dispatcher.dispatch`, lines 213+, and the round loop):
 
-- `backend/ai/actions.py` — specifically `_is_scheduling_intent` (`:2653-2699`)
-  and its vocabulary at `:2551-2568`.
-- `tests/test_intent_routing_boundary.py` — extend, do not weaken or delete.
+1. **Receive** — provider adapters return `tool_calls` with `id`, `name`,
+   `arguments` (dict; malformed JSON flagged). Gemini function calls are
+   normalized to the same shape (id often empty).
+2. **Validate** — `ToolExecutor._execute_single`: missing name, malformed
+   arguments, non-object arguments, and unknown tools produce structured
+   failures (`missing_name`, `malformed_arguments`, `not_found`). Permission
+   levels: READ_ONLY/READ_WRITE/DANGEROUS execute; ADMIN_ONLY/
+   CONFIRMATION_REQUIRED return `needs_confirmation` and the dispatcher raises
+   a bounded pending approval.
+3. **Resolve + execute** — registry lookup then `tool.execute()` (the executor is
+   the sole caller); generic timeout 10 s, `long_running=True` exempt; tool
+   history recorded.
+4. **Feed back** — results are recorded in conversation history and, for native
+   rounds, converted to `role: "tool"` messages carrying
+   `{"tool","success","message","data","error"}` plus the assistant’s
+   `tool_calls` replay. The model may then call more tools.
+5. **Terminate** — loop bound `MAX_TOOL_ROUNDS = 3` (each round ≤
+   `MAX_TOOLS_PER_TURN = 5`), with:
+   - *verbatim read authority*: a round executing ONLY `get_bio`, `task_list`,
+     `translate_history`, `summarize_history`, `preview_save` returns the tool
+     text exactly and skips the continuation round (`_VERBATIM_READ_TOOLS`);
+     `task_list`/`task_inspect` get one deferred continuation because they can
+     feed a CAS mutation;
+   - *structured-action short-circuit*: when the model emitted JSON (not a
+     native call), the tool result becomes the final text via
+     `_summarize_tool_results` — there is **no model continuation round**;
+   - *salvage at limit*: tool calls from the final continuation are executed
+     once without another provider round (never re-executed).
+6. **Final result** — if tools ran and no text was produced, the real-result
+   summary is delivered (never a fabricated success).
 
-The following must **not** be touched:
-
-- `backend/ai/prompt/template.py` — the immediate-vs-durable contract is
-  already correct; the defect is that it is not consulted.
-- `backend/ai/tools/executor.py` — `_STATUS_LABELS` and `execute_calls` behaved
-  exactly as designed.
-- `backend/ai/tools/registry.py` and `backend/ai/tools/task.py` — the
-  `create_task` tool, its description, its permission level and its recursion
-  guard are all sound.
-- `backend/ai/proactive.py` — fail-closed and correct; it was never the cause.
-- `backend/ai/task_interpreter.py`, `task_creation.py`, `task_contract.py`,
-  `backend/ai/database/**` — the durable-task boundary and persistence are not
-  implicated.
-- `backend/runtime/supervisor.py` and the rest of `backend/runtime/**` — the
-  single recovery authority is out of scope.
-- `backend/bot/handlers/ai_unified.py` — the handler only renders what the
-  engine reports; it makes no intent decision.
-- Provider implementations under `backend/ai/providers/**` — never reached.
-- `IMPLEMENTATION_REPORT.md` — historical delivery record, not a source of truth
-  for this defect.
+**Multi-step support:** genuinely supported for native tool calling within the
+bounds — the model can chain tools across up to 3 execution rounds and consume
+each result. The loop is NOT a one-tool-only design. Its limits: complex
+immediate workflows needing >15 calls cannot complete; the JSON path cannot
+phrase a final answer from results; read-only verbatim tools intentionally skip
+the model on their round. Rounds are not persisted across requests.
 
 ---
 
-## 20. Exact next implementation target
+## Tool Result Feedback Loop
 
-**Target function:** `_is_scheduling_intent()` in
-`backend/ai/actions.py:2653`, and specifically the unanchored membership test
-at `backend/ai/actions.py:2674`:
+- Native round → `_build_continuation_messages` builds:
+  `assistant` (content + `tool_calls` with JSON-string arguments, ids preserved)
+  followed by one `role: "tool"` message per execution carrying
+  `tool_call_id`, `name`, and a JSON object with `success`, `message`, `data`,
+  `error`. The next provider round receives the full accumulated message list
+  plus the same `tools` array.
+- The result payload is not truncated by the dispatcher; bound comes from the
+  tools/services (e.g. web search formats at most 8 results; history tools
+  return large text but are delivered verbatim).
+- Results **are** recorded to conversation history (`add_tool_result`) and
+  `all_tool_results` is attached to result metadata/telemetry.
+- Results are **not** re-fed to the model in two cases by design: the
+  structured-action path (deterministic summary is final) and verbatim read
+  tools (anti-paraphrase guarantee). The salvage-at-limit round also executes
+  without a synthesis round.
+- Tool-result → plain-user-text conversion happens only in the deterministic
+  summary path (`_summarize_tool_results`, and `_render_message_list` for
+  message listings).
+- Cross-request feedback: tool results enter conversation history, but that
+  history is stripped from the prompt by the budget (P0-2), so the model does
+  not actually see earlier turns on the next request.
 
-```python
-if any(w in _FA_RECUR_WORDS or w in _EN_RECUR_WORDS for w in words):
-    return True
-```
+---
 
-**Target test file:** `tests/test_intent_routing_boundary.py`.
+## Argument Construction / Validation
 
-**First implementation step.** Make the bare-cadence branch at `actions.py:2674`
-conditional on the cadence token actually governing the action, using the
-module's existing token-adjacency discipline (the pattern already applied by
-`_has_future_clock_request`, `actions.py:2620-2633`) — no regex, no new parser,
-no new vocabulary module, and no change to the surrounding `parse_command_intent`
-branch structure.
+- **Provider side:** OpenAI-compatible adapters `json.loads` the arguments
+  string; on failure they set `malformed_arguments` + `arguments_error` instead
+  of substituting `{}`. Gemini passes the arguments dict through.
+- **Executor side:** `_execute_single` rejects missing names, malformed
+  arguments, non-object arguments and unregistered tools with structured
+  errors; it does **not** enforce the schema `required` list (tools validate
+  themselves), so the wrong `required` list (P0-1) misleads without causing an
+  executor rejection by itself.
+- **Tool side (examples):** `web_search` coerces `count` and drops invalid
+  `freshness`; `delete` enforces count bounds and mode semantics; `save`
+  validates/trims/dedupes name and tags; task/todo tools require ids+versions or
+  unique query matches and refuse ambiguity (returning candidates); saved-item
+  management refuses multi-match and asks. These are deterministic **validation**
+  failures, not model mistakes.
+- **JSON path:** `validate_action` (actions.py) enforces known action names,
+  field allowlists, count bounds and target scopes; `resolve_tool_calls` maps to
+  concrete tool calls. Anything unknown fails closed (invalid/unsupported/
+  clarify).
+- Separation guidance: when a failure is a schema-shaped argument object that
+  violates documented semantics, the cause is model-side (or schema-side for
+  the required list); when the executor/tool returns a bounded validation
+  message (invalid id, stale version, ambiguous match), the cause is
+  execution/validation-level and the model is expected to recover — provided
+  the result reaches it (see feedback-loop exceptions).
 
-**First test step, before any production edit.** Add to
-`tests/test_intent_routing_boundary.py`:
+---
 
-1. the exact production string as a parametrized case, expected
-   `KIND_CONVERSATIONAL` with no `tool_calls`;
-2. attributive look-alikes (`قیمت هفتگی رو بگو`, `اسم انیمه های هفتگی رو بگو`)
-   expected `conversational`;
-3. retained true positives (`هر ۱ ساعت …`, `هر پنج دقیقه …`, `برنامه ریزی کن …`)
-   expected `executable` / `create_task` — proving the fix does not weaken the
-   durable path;
-4. `_is_scheduling_intent` asserted in **both** directions;
-5. one end-to-end `Dispatcher.dispatch` case with a provider that fails the test
-   if it is called, asserting the request reaches the provider stages — so the
-   test can no longer pass while production short-circuits.
+## Diagnostic Request Matrix
 
-**Definition of done for that change:** the new cases pass; the existing
-boundary suite, `test_task_nl_creation.py`, `test_task_nl_interval_creation.py`,
-`test_25_fast_path.py`, `test_proactive_action_chains.py` and the full suite stay
-green; the production string reaches the provider instead of the local fast
-path; and the durable examples still route to `create_task`.
+Measured against current HEAD: with Stage 5, **none of these classes is
+intercepted locally** — every one reaches the model (subject to trigger
+activation). The failure analysis below is therefore about what the model is
+given and what the runtime will accept.
 
-**Explicitly not part of this task:** the code change itself. This document is
-the investigation result only.
+| # | Request class (example) | Ideal behavior | What the current system makes possible | Likely failure level |
+|---|---|---|---|---|
+| A | Direct factual/current: `قسمت بعدی وان پیس کی میاد؟` | `web_search` then answer with sources | Tool is registered and described; prompt mentions web search only via one example; rule 7 can justify “I don’t know”; no explicit current-info policy | Prompt/instruction (B) → model decision (E); tool is available |
+| B | Explicit tool: `وب سرچ بزن و تاریخ قسمت بعدی وان پیس رو پیدا کن.` | call `web_search` with a good query, then synthesize | Reaches model; schema says freshness/include_domains **required** (P0-1); result flows back normally | Tool-definition/provider-schema (C/D), then execution loop works |
+| C | Implicit tool need (same as A) | same as A | same as A | same as A |
+| D | Multi-step immediate: `اول سرچ کن، پنج مورد برتر رو پیدا کن، بعد ذخیره‌شون کن و تگ بزن.` | web_search → save/send results → tag | Prompt now explicitly supports this pattern; loop bounds allow ≤3 rounds ×5 calls; “save” requires a replied message and tagging requires a stored item, so the literal chain is only partly achievable (web results are not Telegram messages) | Combination: prompt now good; service-capability + loop bound (G); required-args defect adds friction |
+| E | Explicit durable: `هر هفته این کار رو انجام بده.` | reference the previous turn’s work, call `create_task` with the full context, interpreter produces a weekly candidate | Reaches model; create_task available; **history is stripped**, so “این کار” has no referent unless the request is a reply to the AI message; interpreter returns null/asks rather than inventing | Context construction (A) + model decision (E) |
+| F | Capability question: `چه ابزارهایی برای ذخیره کردن داری؟` | explain capabilities, call no tool | Stage 5 fixed the old hijack; prompt now says talking about a capability → answer in words, no tool; tool list is in-context | Works as designed; only the incomplete “You may” list may narrow the answer |
+| G | Explicit save: `این رو ذخیره کن.` | `save` (deep save) of the replied-to message | Model must choose among `save`/`save_by_link`; `save` schema marks display_name+tags required though prompt forbids inventing them; reply context provided | Provider-schema defect (D) + model decision (E) |
+| H | Clarification: `اون رو انجام بده.` | ask one clarifying question | Reaches model; no local interception; history stripped means “اون” has no referent unless reply | Context construction (A) |
+| I | Correction: `اگر میخواستم خودم سرچ کنم بهت میگفتم.` | recognize the correction and redo with `web_search` | Reaches model; no instruction about corrections; if it is not a reply to the AI message, history is stripped → the earlier answer is invisible | Context construction (A) + prompt (B) |
+| J | Multi-turn continuation: AI asked a question, owner supplies the value | use the prior turn, call the tool | Reaches model; standalone continuation loses history (P0-2); reply-to-AI continuation keeps the prior AI message text via `ReplyContext.ai_content` | Context construction (A) |
+
+Cross-cutting: request classes that depend on prior turns (E, H, I, J) fail
+deterministically on the **stripped history**, regardless of model quality;
+request classes that depend on the tool contract (B, G, and parts of D) are
+distorted for **40/55 tools** by the required-fields defect; classes restricted
+to Gemini lose the instruction layer entirely.
+
+---
+
+## Root Causes
+
+### P0
+
+**P0-1 — Provider tool-schema requiredness is inferred, not declared; 40/55
+tools advertise wrong `required` lists.**
+
+- Location: `backend/ai/engine/dispatcher.py::Dispatcher._build_tool_definitions`
+  (line 1851; the inference at lines 1861–1870: *“Params without a `default`
+  are treated as required”*). Registry metadata (`parameters`) has no
+  per-parameter required flag; only `required_arguments` /
+  `required_any_arguments` exist at the tool level and are not the source of the
+  schema `required` list.
+- Evidence (measured on current HEAD): 40 tools carry a nonempty `required`;
+  `save → [display_name, tags]`, `web_search → [query, freshness,
+  include_domains]`, `delete → [count, mode, until_time, after_time,
+  boundary_id, query, semantic]`, `task_transition → [task_id, action,
+  expected_version, query, complete_steps]`, `translate_history → [language,
+  instruction]`, `memory_list → [tier, query, limit]`. The text block omits
+  requiredness entirely.
+- Affected classes: G (save), B (web search), D (save/tag chain), plus every
+  tool where optional parameters are described as optional in the prompt but
+  required in the schema — i.e. the majority of the 55-tool surface.
+- Why it causes wrong behavior: the model is told it must supply parameters the
+  prompt forbids inventing (names/tags), or must supply mutually exclusive
+  alternatives (task id **or** query); it responds by fabricating placeholders,
+  omitting the tool, or picking a different tool with a simpler-looking schema.
+  Provider-side schema ≠ tool-side semantics.
+- Side: contract-side (application → provider serialization). Fixing it is a
+  single change that improves every tool that carries optional parameters.
+- Multi-tool: yes — one fix, all 40 affected tools.
+
+**P0-2 — Conversation history never reaches the model; the static prompt
+already exceeds the token budget.**
+
+- Location: `backend/ai/prompt/builder.py::PromptBuilder.build` +
+  `_trim_to_budget` (line 371) against `backend/ai/prompt/budget.py`
+  (`DEFAULT_MAX_TOTAL_TOKENS = 8500`, line 26); tool block added by the
+  dispatcher before budgeting.
+- Evidence (measured): base prompt with the real 55-tool block =
+  **9,349 estimated tokens** > 8,500 with **zero** history; with 20 realistic
+  Persian history entries the rendered `[Conversation State]` contains **0**
+  history rows. `_trim_to_budget` pops history until it fits; since the base
+  never fits, it removes everything. The pinned test
+  (`tests/test_context_architecture.py`) uses a synthetic smaller block and so
+  never exercises the production case.
+- Affected classes: E, H, I, J (multi-turn references), plus any correction or
+  follow-up that is not a Telegram reply to the AI message; also weakens
+  multi-step request D’s ability to reference earlier results across turns.
+- Why it causes wrong behavior: the model is asked to interpret pronouns and
+  follow-ups (“این کار”, “اون”, “ادامه بده”) with no prior context, so it
+  guesses, asks to restate, or answers without the earlier facts. This looks
+  like “the AI doesn’t understand”, but the data was removed before the
+  provider call.
+- Side: context construction. One fix (budget/serialization policy) restores
+  context for every request.
+- Multi-tool: yes — conversation context underpins all tool decisions that
+  reference earlier turns.
+
+### P1
+
+**P1-1 — Gemini drops every system message except the last.**
+
+- Location: `backend/ai/providers/gemini.py` lines 63–69 (`system_text =
+  content` per system role) and 109–110 (`systemInstruction` set once), versus
+  `dispatcher._build_messages` which emits four system messages.
+- Evidence: code path is unambiguous; OpenAI-compatible providers are
+  unaffected. Consequence: for Gemini-routed requests the model sees only
+  `[Tool Context]` + tool schemas as system instructions — no rules, no
+  output contract, no reply context, no memory/preferences.
+- Affected classes: all, when the active/fallback provider is Gemini.
+- Side: provider contract. Fix = merge/forward system messages
+  (provider-specific), not an architecture change.
+- Multi-tool: yes — restores the entire instruction layer for that provider.
+
+**P1-2 — Instruction coverage gaps: capability list, JSON fallback schema,
+current-info policy, correction handling.**
+
+- Location: `backend/ai/prompt/template.py` (`SYSTEM_RULES_TEMPLATE` “You may”
+  list; `OUTPUT_INSTRUCTIONS_TEMPLATE` rule 8 schema + `_ENFORCE_ACTION_NUDGE`
+  at `dispatcher.py` line 120).
+- Evidence: the fallback JSON schema enumerates 30 actions and omits
+  `web_search`, `create_task`, `translate_history`/`summarize_history`,
+  `send_message`, and the memory tools; the nudge repeats the same subset; no
+  rule says “when the answer depends on current facts, use `web_search`”; no
+  rule covers honoring a user’s correction.
+- Affected classes: A/B/C (search policy), I (corrections), and
+  non-native-tool-calling providers for every omitted capability.
+- Side: prompt-side. Multi-tool: yes for the capability/gap items.
+
+**P1-3 — Multi-step execution is intentionally bounded, and two paths skip the
+model’s synthesis round.**
+
+- Location: `dispatcher.py` `MAX_TOOL_ROUNDS = 3` (line 67), structured-action
+  short-circuit (`response = replace(response, tool_calls=[], text="")` after
+  execution), `_VERBATIM_READ_TOOLS` (line 87), salvage-at-limit.
+- Evidence: the loop executes at most 3 tool rounds × 5 calls; JSON-emitting
+  models get a deterministic summary (`_summarize_tool_results`) instead of a
+  final model answer; verbatim read tools deliberately bypass continuation;
+  a continuation provider failure still yields the real-result summary.
+- Affected classes: D (complex immediate workflows), any request needing >15
+  calls or needing the model to articulate a multi-step outcome.
+- Side: runtime (bounds by design; the JSON-path exception is the sharpest edge
+  for providers without native tool calling). Multi-tool: partially.
+
+### P2
+
+**P2-1 — Tool overlap and ambiguous surfaces.**
+Five delete tools + `delete_save`; `save` vs `save_by_link`; `search` vs
+`list_saves` vs `retrieve_save`; task/todo tools with id+version **or** query;
+`todo_step_*` with step **or** step_query; the 7-parameter `delete`
+mega-tool. The prompt disambiguates some cases, but selection still depends on
+the model inferring distinctions that are only clear from the descriptions
+(and the descriptions are contradicted by the `required` lists, P0-1).
+
+**P2-2 — Every request now requires a provider round (Stage 5 consequence).**
+Removing the fast path intentionally removed the “works with every provider
+down” guarantee for explicit commands; a provider outage now degrades every
+request, including simple saves. This is a documented trade-off, not a
+comprehension defect, but it widens the observable failure surface.
+
+**P2-3 — Two authorization vocabularies still read the raw message.**
+`has_proactive_authorization` and `ground_ai_instruction`/
+`_generation_authorized` inspect owner text. They are fail-closed permission
+gates that run only after the model proposes an action and cannot select a
+capability; they are correctly outside the routing boundary but are worth
+naming as the remaining NL-reading code in the decision path.
+
+### P3
+
+- **P3-1 — Prompt duplication/bloat:** the tool surface is sent twice
+  (15,166-char text block + 37,175-char native JSON), and the base system
+  templates alone are ~21.7k chars; this is what pushes the prompt over budget
+  (P0-2) and leaves little room for context.
+- **P3-2 — Text tool block lacks requiredness and parameter semantics**
+  (`name(type)` only), while the native schemas carry the (wrong) required
+  list; the two representations can disagree.
+- **P3-3 — Presentation/guidance constraints:** the 500-character output
+  guideline can conflict with reporting multi-step results; `[Available Tools]`
+  badges (`safe` / `needs-confirm` / `destructive-on-explicit-request`) are
+  coarse.
+- **P3-4 — Trigger edge:** `match_trigger` matches the first word
+  case-insensitively but does not strip punctuation (`Nova:` does not
+  activate); `Menu` is exact-equality. Cosmetic, but a real activation miss.
+
+---
+
+## Evidence
+
+All locations are in the current tree at HEAD `eb4d85220aa0f73265b3e18e14a50ba05f0065d0`.
+
+| # | Claim | Evidence (current source + measurement) |
+|---|---|---|
+| E1 | Stage 5 removed the deterministic router | No hits for `parse_command_intent`, `_try_local_fast_path`, `_build_deterministic_task_candidate`, `deterministic_task_candidate`, `parse_structural_predicate` in `backend/`; `backend/ai/actions.py` now 1,821 lines (was 3,148); `dispatcher.py` now 2,193 (was 2,450). Boundary pinned by `tests/test_semantic_intent_boundary.py`, `tests/test_regex_routing_removal.py`, `tests/test_intent_routing_boundary.py`, `tests/test_provider_tool_boundary.py` — **51 passed** when run during this audit. |
+| E2 | Every request reaches the provider (no local selection) | `Dispatcher.dispatch` (line 213): only confirmation consumption and the media boundary run before `PROMPT_BUILD`; no fast path. `_apply_structured_action` (line 1679) parses **only** the model’s JSON. |
+| E3 | Remaining NL readers are authorization/provenance only | `backend/ai/proactive.py::has_proactive_authorization` (line 122); `backend/ai/task_contract.py::_generation_authorized` (line 48) + `ground_ai_instruction` (line 78); `backend/ai/confirmation.py::is_explicit_confirmation` (line 214); `backend/ai/config_store.py::match_trigger`. |
+| E4 | Required-fields defect | `dispatcher.py::_build_tool_definitions` line 1851; inference at 1861–1870; measured 40/55 tools with a nonempty `required`; examples in P0-1. `tests/test_capability_exposure_tools.py` only pins `task_list` having no `required`. |
+| E5 | History stripped every request | `prompt/builder.py::_trim_to_budget` line 371; `prompt/budget.py` line 26 (`8500`). Measured build: est. input **9,349 tokens** with zero history (`within_budget=False`); 20 Persian entries → **0** rendered history rows; tool block **15,166 chars**. |
+| E6 | Gemini system collapse | `gemini.py` lines 63–69, 109–110 vs `dispatcher._build_messages` line 1922 (four system messages). |
+| E7 | Prompt composition and duplication | Templates: SYSTEM_RULES 10,436 / PLATFORM 707 / RUNTIME 2,088 / OUTPUT 8,499 chars; native tool JSON 37,175 chars for 55 tools (measured via `_build_tool_definitions`). |
+| E8 | JSON fallback/nudge coverage | `OUTPUT_INSTRUCTIONS_TEMPLATE` rule 8 action list (no `web_search`, `create_task`, `send`, translate/summarize, memory); `_ENFORCE_ACTION_NUDGE` at `dispatcher.py` line 120. |
+| E9 | Execution loop and bounds | `MAX_TOOL_ROUNDS = 3` (`dispatcher.py` line 67); `MAX_TOOLS_PER_TURN = 5` (`tools/executor.py` line 50); verbatim set line 87; structured-action short-circuit and salvage in `dispatch`; `_build_continuation_messages` line 1937. |
+| E10 | create_task path | `tools/task.py`: `TaskInterpreter.interpret` call, `TaskUnsupportedError` → wizard signal (`open_taskloom_wizard`), `TaskSemanticCompletenessError` → bounded failure; no NL completeness gate (removed). `task_interpreter.py::interpret` line 468 runs a second provider call with `tools=[]` and the candidate schema. |
+| E11 | Repository state | `git fetch origin`; `git rev-parse HEAD` = `git rev-parse origin/main` = `eb4d852…`; `git merge-base --is-ancestor HEAD origin/main` exit 0; `git status --short` shows only `?? telegram-self-bot/`. |
+| E12 | Tool inventory | Registry dump (55 tools, permissions, parameters, declared required/any/consumable) executed read-only against `create_default_registry`. |
+| E13 | No live verification | No Telegram message or SQL statement was issued during this audit; measurements are in-process introspection. The full test suite was not re-run in this audit (the four new boundary suites were: 51 passed); `IMPLEMENTATION_REPORT.md` records 5,126 passed / 26 skipped at Stage 5. |
+
+---
+
+## Recommended Next Implementation Stage
+
+**Next stage: Stage 6** (as stated by the current `IMPLEMENTATION_REPORT.md`;
+Stage 5 is the completed “sole interpreter” refactor). This is a recommendation
+only — nothing below is implemented by this investigation.
+
+The smallest highest-leverage scope for Stage 6, in impact order, preserving
+every architectural constraint (AI as sole intent interpreter; no second
+router; ToolRegistry as the allowlist; ToolExecutor as the sole execution
+authority; ProviderManager and RuntimeSupervisor unchanged):
+
+1. **Fix the provider tool contract (P0-1).** Make the schema `required` list
+   come from declared tool semantics instead of “absence of a `default`”, so
+   optional/alternative parameters (`save.display_name/tags`,
+   `web_search.freshness/include_domains`, `delete.*`, `task_transition.query`,
+   `translate_history.*`, …) stop being advertised as mandatory. This is a
+   contract/serialization fix; no tool behavior changes.
+2. **Stop the conversation-history eviction (P0-2).** Re-derive the prompt
+   budget policy so the static system prompt + tool block cannot consume the
+   entire ceiling (e.g. budget the tool block and history separately, raise the
+   ceiling, or trim the duplicated tool surface). Desired invariant: a bounded
+   number of recent turns always reaches the model; the existing trim behavior
+   may remain as a last resort.
+3. **Forward all system messages on Gemini (P1-1).** Merge/forward the four
+   system messages into Gemini’s `systemInstruction` (or one combined system
+   message), so Gemini-routed requests receive the instruction layer the other
+   providers receive.
+4. **Close the instruction gaps (P1-2).** Add a current-information policy
+   (“answer from `web_search` when the answer depends on current facts”), align
+   the JSON fallback schema and the recovery nudge with the real capability
+   surface (or state explicitly that they cover only the listed commands), and
+   add a correction-handling rule. No keyword routing — this is prompt text
+   only.
+
+Verification for the stage should include: schema-level assertions for a
+representative set of optional/alternative tools; a prompt-build test using the
+**real** 55-tool block asserting history survives; a Gemini message-mapping
+test asserting every system section reaches `systemInstruction`; and a live
+behavior check on the diagnostic matrix classes (A/B/D/E/I/J) against a real
+provider, which this audit could not perform.
+
+**Stage completed: Investigation only**
+**Next stage: Stage 6**
