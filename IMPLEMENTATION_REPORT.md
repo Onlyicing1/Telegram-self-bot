@@ -13,15 +13,25 @@
 
 ---
 
-**Stage completed: Stage 6**
+**Stage completed: Stage 6** (the last implementation stage recorded here)
 
-**Next stage: Stage 7**
+**Next stage: Stage 7 — planned, not started.**
 
 *Derivation (not guessed):* the previous report closed **Stage 5** (removal of
 the deterministic semantic router) and named Stage 6 as next. This report is
 Stage 6: the coordinated repair of the AI → tools contract, context delivery
 and tool-use decision policy, driven by the findings recorded in
 `INVESTIGATION.md`.
+
+> **Planning deliverable (2026-10-04) — roadmap reconstruction, no
+> implementation.** The remaining project roadmap was reconstructed from the
+> current source and design evidence and is now recorded in `ROADMAP.md`
+> (Stages 7–13, each with objective, prerequisites, tasks, files, constraints,
+> tests, Definition of Done and dependencies). That task wrote documentation
+> only: it created `ROADMAP.md`, replaced `INVESTIGATION.md` with the roadmap
+> investigation, and added this note. **Stage 7 and Stage 8 are planned, not
+> completed**, and no production code, test, migration or
+> `DATABASE_ARCHITECTURE.md` content was modified.
 
 ---
 
