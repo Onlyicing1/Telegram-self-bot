@@ -7,10 +7,11 @@
 > completely replaced with the next feature's roadmap. It never accumulates
 > multiple unrelated features.
 >
-> **Status of this document:** DESIGN / ROADMAP ONLY. Nothing in this feature
-> has been implemented. No application code, no tests, no migrations, and no
-> database schema changes were made to deliver this roadmap. Everything below
-> marked PLANNED is a design commitment, not completed work.
+> **Status of this document:** CURRENT-FEATURE ROADMAP + IMPLEMENTATION STATUS.
+> Phase 0's code slice (entity-aware serialization §22 + send-only Bot bridge
+> §17) is IMPLEMENTED and unit-TESTED (no live Telegram). Everything else
+> below remains PLANNED. Database schema is untouched (schema work is manual,
+> §29).
 
 ---
 
@@ -54,9 +55,11 @@ Status: **PLANNED**.
 
 ## 2. Current Status
 
-**Overall feature status: PLANNED — nothing implemented.**
+**Overall feature status: IN PROGRESS — Phase 0 partially implemented
+(entity-aware serialization + send-only Bot bridge); no end-to-end
+replacement flow yet.**
 
-The repository currently contains **no** emoji-substitution, premium-emoji
+The repository originally contained **no** emoji-substitution, premium-emoji
 library, or reaction feature (verified by grep across `backend/` and `tests/`
 for `reaction`, `custom_emoji`, `MessageReactions`, `ReactRequest` — zero
 functional hits; the only "emoji" mentions are unrelated tokenization/
@@ -64,6 +67,11 @@ character-width logic in `backend/ai/preparation_policy.py`,
 `backend/ai/semantic_delete.py`, `backend/ai/tools/delivery.py`,
 `backend/helper/font_style.py`, `backend/bot/handlers/ai.py`,
 `backend/ai/confirmation.py`).
+
+The only feature code now present is the Phase 0 slice:
+`backend/telegram_api/_helpers.py` (entity-aware serialization),
+`backend/telegram_api/bridge.py` (send-only bridge), and
+`tests/test_bridge_delivery.py`.
 
 - [ ] Premium emoji library
 - [ ] Collection import
@@ -206,11 +214,12 @@ RuntimeSupervisor (backend/runtime/supervisor.py) — single recovery authority
   exceptions normalized to `TelegramAPIError`/`TelegramTimeoutError`
   (`backend/telegram_api/exceptions.py`).
 - `backend/telegram_api/_helpers.py::serialize_message` — message → plain
-  dict. **Gap:** it serializes `id/chat_id/sender_id/text/date/has_media/
-  reply_to_msg_id/out` and **drops entities entirely**. The §22 invariant
-  requires an entity-aware representation before any reconstruction logic is
-  written.
-- No reaction or custom-emoji wrapper exists in `backend/telegram_api/`.
+  dict. **Gap closed in the Phase 0 slice:** it now also serializes the
+  `entities` list (UTF-16 offsets/lengths + payload) and adds the
+  dict→TL rebuild helpers (§22).
+- The send-only Bot bridge (`backend/telegram_api/bridge.py`) now exists
+  (§17); no reaction or custom-emoji wrapper exists yet in
+  `backend/telegram_api/`.
 
 ### 5.5 Telethon dependency (verified in venv, telethon 1.34.0)
 
@@ -583,14 +592,15 @@ Consequences and open options (decision required, §34):
 
 Bridge requirements:
 
-- [ ] Bridge sender = existing helper bot client (`backend/helper/client.py`) or a dedicated second bot token (config; §29)
-- [ ] Bridge has NO update loop, NO handler registration (send-only by default)
-- [ ] Bounded-timeout send path consistent with `backend/telegram_api` conventions (`guarded_await`, normalized exceptions)
-- [ ] Rate/flood handling (Telethon `flood_sleep_threshold` already configured on helper; verify adequacy)
-- [ ] Destination resolution identical to the original message's chat (§18)
+- [x] Bridge sender = the existing helper bot client (`backend/helper/client.py`) — implemented in `backend/telegram_api/bridge.py`; no dedicated second bot token added (§34-C default honored)
+- [x] Bridge has NO update loop, NO handler registration (send-only by construction)
+- [x] Bounded-timeout send path consistent with `backend/telegram_api` conventions (`guarded_await`, normalized exceptions) — unit-tested
+- [ ] Rate/flood handling (Telethon `flood_sleep_threshold` already configured on helper; verify adequacy under real replacement traffic)
+- [x] Destination resolution identical to the original message's chat (§18) — peer resolved through the SELF client, unit-tested; live delivery NOT verified
 
-Status: **PLANNED — capability constraint documented; bridge capability
-decision pending (§34)**.
+Status: **IN PROGRESS — send-only bridge module IMPLEMENTED and unit-TESTED
+(`backend/telegram_api/bridge.py`, `tests/test_bridge_delivery.py`); live
+delivery NOT verified; capability decision (§34-D) still OPEN.**
 
 ---
 
@@ -644,15 +654,16 @@ Status: **PLANNED**.
 
 ## 22. Formatting/Entity Preservation
 
-The current `backend/telegram_api/_helpers.py::serialize_message` **drops
-entities**. Prerequisite work:
+The `backend/telegram_api/_helpers.py::serialize_message` entity gap
+(described in §5.4) was the prerequisite for this invariant. Status:
 
-- [ ] Entity-aware message representation (raw text + `MessageEntity` list, incl. `MessageEntityCustomEmoji` and UTF-16 code-unit offsets — Telegram entity offsets are UTF-16 based, which matters because emoji occupy two units)
+- [x] Entity-aware message representation — IMPLEMENTED in `backend/telegram_api/_helpers.py`: `serialize_message` now emits an `entities` list (UTF-16 offsets/lengths as Telegram sent them, plus url / document_id / user_id / language payload), `utf16_length` / `utf16_offset` / `utf16_index_at` helpers, and `dict_entities_to_tl` (dict → TL rebuild for sending; unknown types and missing payloads raise, never silently dropped). Pinned by `tests/test_bridge_delivery.py`
 - [ ] Transformer operates on (text, entities) tuples; produces new (text, entities) with correct UTF-16 offsets after span replacement
 - [ ] Unit tests with mixed scripts (emoji + Persian + Latin) pinning offset correctness — see §30
 - [ ] Existing `font_style.py` already solves UTF-16-width issues for the Glass UI font (see `backend/helper/font_style.py`); reuse its analysis where applicable rather than duplicating
 
-Status: **PLANNED — known serialization gap documented**.
+Status: **IN PROGRESS — serialization prerequisite IMPLEMENTED + TESTED; the
+transformer itself remains PLANNED.**
 
 ---
 
@@ -776,6 +787,7 @@ Follows existing test conventions (`tests/`, pytest, real Dispatcher/
 registry/executor patterns like `tests/test_provider_tool_boundary.py` and
 `tests/test_semantic_intent_boundary.py`; no live Telegram in tests):
 
+- [x] **Phase 0 slice (done):** `tests/test_bridge_delivery.py` — 22 tests pinning UTF-16 helpers (incl. mid-surrogate `ValueError`), entity serialization round-trip, dict→TL rebuild (incl. fail-closed unknown/missing payload and mention-name resolution through the target client), bridge same-destination send via the helper bot, send-failure honesty, empty-message refusal, unavailable-bot error, timeout normalization. Full suite at this commit: **5180 passed, 26 skipped** (baseline at the merged remote state: 5158 passed — no regressions).
 - [ ] Transformer unit tests: emoji-only rewrite; entity offsets (UTF-16) preserved/recomputed correctly across mapped spans; mixed-script cases (emoji + Persian + Latin); unmapped passthrough; multi-emoji single-pass (§20/§21/§22)
 - [ ] Reconstruction flow tests: fake self-client + fake bridge client; assert delete called only after prepared send succeeds; same-destination assertion; reply-to propagation (§15/§18)
 - [ ] Authorization tests: non-owner-authored message never processed; incoming events never processed (§19)
@@ -814,7 +826,7 @@ Status: **PLANNED**.
 Phase order (each phase independently verifiable; nothing is complete until
 its checkboxes AND validation pass):
 
-- [ ] **Phase 0 — Prerequisites:** entity-aware serialization (§22 gap in `_helpers.py`); decision on bridge capability (§34-D); confirm mapping persistence shape (§34-E)
+- [ ] **Phase 0 — Prerequisites:** entity-aware serialization (§22 gap in `_helpers.py`) — **DONE + TESTED**; decision on bridge capability (§34-D) — still OPEN (owner); confirm mapping persistence shape (§34-E) — still OPEN (owner)
 - [ ] **Phase 1 — Library & Import:** domain model (§7), library storage, Saved Messages collection import (§8, §9), import report panel
 - [ ] **Phase 2 — Categories & Mappings:** category CRUD, mapping editor, uniqueness + conflict UI (§10–§12), 2×5 pagination (§25)
 - [ ] **Phase 3 — State & Toggle:** replacement toggle, active category (global default + per-chat override) (§13, §14, §29)
@@ -880,24 +892,25 @@ Status: **OPEN — awaiting confirmation**.
 
 ## 35. Not Implemented Yet
 
-**Nothing in this feature is implemented.** Explicit current truth:
+Current truth after the Phase 0 code slice:
 
-- No emoji library, category, or mapping code exists.
-- No collection import exists.
-- No replacement toggle, transformer, reconstructor, or bot bridge exists.
-- No reaction code exists.
-- No schema/tables for this feature exist (and none were created — schema
-  changes are manual and were explicitly out of scope for this roadmap).
-- No tests for this feature exist.
-- `DATABASE_ARCHITECTURE.md`, all application code, and all tests are
-  unchanged by this roadmap task (only this `ROADMAP.md` was added).
+- Entity-aware serialization + UTF-16 helpers + dict→TL entity rebuild —
+  IMPLEMENTED (`backend/telegram_api/_helpers.py`), TESTED.
+- Send-only Bot bridge module — IMPLEMENTED (`backend/telegram_api/bridge.py`),
+  unit-TESTED; **live Telegram delivery NOT verified**.
+- Still NOT implemented: no emoji library, category, or mapping code; no
+  collection import; no replacement toggle, transformer, or reconstructor; no
+  reaction code; no schema/tables for this feature (none created — schema
+  changes are manual); no §34 decisions resolved.
 
-Every checkbox in this document reflects design intent, not completion.
-Implementation begins at Phase 0 (§32) after the §34 decisions are confirmed.
+Phase 0 completion still requires the owner decisions §34-D (bridge
+capability) and §34-E (persistence shape). Implementation continues at
+Phase 1 (§32) once those are confirmed.
 
 ---
 
 *Roadmap established from repository investigation at commit `eb4d852`
-(branch `main` worktree, Telethon 1.34.0 verified in the active venv).
-Document will be reset and replaced when the Emoji & Reaction feature
-completes.*
+(branch `main` worktree, Telethon 1.34.0 verified in the active venv);
+Phase 0 code slice landed on top of the merged `0c60363` state (see
+`IMPLEMENTATION_REPORT.md`). Document will be reset and replaced when the
+Emoji & Reaction feature completes.*
