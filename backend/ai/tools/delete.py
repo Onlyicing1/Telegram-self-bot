@@ -45,11 +45,16 @@ class DeleteTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Delete self-owned messages in the current chat. Use count for the "
-            "last N self messages, mode=all for all self messages, mode=until_time "
-            "for a time range, mode=until_message for a message boundary, or "
-            "semantic for a deterministic content predicate (exact word count, "
-            "exact English word count, or a normalized topic filter). "
+            "Delete self-owned messages in the current chat by scope. Use count for "
+            "the last N self messages, mode=all for all self messages, "
+            "mode=until_time for a time range, mode=until_message for a message "
+            "boundary, or semantic for a deterministic content predicate (exact "
+            "word count, exact English word count, or a normalized topic filter). "
+            "This tool deletes a SCOPE, never a single named target: for exactly "
+            "ONE specific message use delete_message_by_id; for everything from an "
+            "ID onward use delete_by_id; for the replied-to message use "
+            "delete_replied. Saved items are not Telegram messages — use "
+            "delete_save for those. "
             "The active request is eligible when it falls inside the requested scope; "
             "for an anchor request it is the boundary, not a permission bypass."
         )

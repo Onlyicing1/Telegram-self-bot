@@ -388,6 +388,17 @@ class TodoStepTransitionTool(Tool):
         return "todo_step_transition"
 
     @property
+    def provider_required_arguments(self) -> tuple[str, ...]:
+        """Provider schema requires only the target step status.
+
+        The step and its parent todo are addressed with alternative shapes
+        (number or words; id or title reference); a flat ``required`` list
+        cannot express those choices, so only ``action`` is mandatory for
+        every valid call.
+        """
+        return ("action",)
+
+    @property
     def description(self) -> str:
         return (
             "Mark ONE step of a Todo completed (action 'completed') or return it "

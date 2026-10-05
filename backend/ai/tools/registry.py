@@ -23,7 +23,13 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from backend.ai.tools.base import PermissionLevel, Tool, ToolResult
+from backend.ai.tools.base import (
+    PermissionLevel,
+    Tool,
+    ToolResult,
+    declared_any_arguments,
+    declared_provider_required_arguments,
+)
 from backend.ai.tools.context import ToolContext
 
 logger = logging.getLogger(__name__)
@@ -82,10 +88,13 @@ class ToolRegistry:
         return list(self._tools.keys())
 
     def list_schemas(self) -> list[dict[str, Any]]:
-        """Return compact tool schemas for the Prompt Builder.
+        """Return compact tool schemas for the Prompt Builder and providers.
 
         Each entry contains: name, description, parameters,
-        permission_level, safe, return_type.
+        permission_level, safe, return_type, plus the tool-DECLARED
+        requiredness (``required`` / ``required_any``). The provider
+        serializer consumes ``required`` verbatim — requiredness comes from
+        the Tool contract, never from a parameter's ``default``.
         """
         return [
             {
@@ -95,6 +104,8 @@ class ToolRegistry:
                 "permission_level": t.permission_level.value,
                 "safe": t.safe,
                 "return_type": t.return_type,
+                "required": list(declared_provider_required_arguments(t)),
+                "required_any": list(declared_any_arguments(t)),
             }
             for t in self._tools.values()
         ]

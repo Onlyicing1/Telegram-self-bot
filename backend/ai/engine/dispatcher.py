@@ -118,12 +118,10 @@ _TRUNCATED_FINISH_TOKENS = ("MAX_TOKENS", "LENGTH", "TRUNCATED")
 # altering conversation history. Any action still passes through the local
 # parser + validator before execution, so the nudge never weakens safety.
 _ENFORCE_ACTION_NUDGE = (
-    "If the user's request requires an action (save, delete, list/search saved "
-    "items, retrieve a saved item, database status, bio/username status, task "
-    "list/inspect/transition, or reviewing recent Telegram messages), respond "
-    "with ONLY a native tool call or a single JSON action object — no prose, "
-    "no questions, no permission explanations. If the request is purely "
-    "conversational, answer normally."
+    "If the user's request asks you to do something that any available tool "
+    "can perform, respond with ONLY a native tool call or a single JSON "
+    "action object — no prose, no questions, no permission explanations. "
+    "If the request is purely conversational, answer normally."
 )
 
 
@@ -1852,11 +1850,14 @@ class Dispatcher:
         """Build native OpenAI-format tool definitions from the registry.
 
         The registry's ``list_schemas()`` returns a flat ``parameters``
-        dict (param name → JSON-schema-ish descriptor). Providers need a
-        full function-calling schema, so we wrap it as
-        ``{"type": "object", "properties": {...}}``. Params without a
-        ``default`` are treated as required so providers surface them to
-        the model.
+        dict (param name → JSON-schema-ish descriptor) plus the tool-DECLARED
+        requiredness. Providers need a full function-calling schema, so we
+        wrap it as ``{"type": "object", "properties": {...}}`` and take the
+        ``required`` list from the declaration. Requiredness is NEVER inferred
+        from the absence of a ``default``: that heuristic advertised optional
+        parameters (and the alternatives of an either/or contract) as
+        mandatory for 40 of the 55 tools, contradicting the tools' own
+        semantics and their prompt.
         """
         if not self._tool_registry or self._tool_registry.is_empty():
             return []
@@ -1871,8 +1872,8 @@ class Dispatcher:
                 else:
                     properties = raw_params
                     required = [
-                        name for name, info in raw_params.items()
-                        if isinstance(info, dict) and "default" not in info
+                        name for name in (schema.get("required") or [])
+                        if name in properties
                     ]
             else:
                 properties = {}
@@ -1892,12 +1893,18 @@ class Dispatcher:
         return definitions
 
     def _render_tool_schemas(self, schemas: list[dict[str, Any]]) -> str:
-        """Render tool schemas into a compact text block for the prompt."""
+        """Render tool schemas into a compact text block for the prompt.
+
+        Required parameters are marked with ``*`` from the SAME declared
+        requiredness the native schemas carry, so the two representations of
+        the tool contract cannot disagree.
+        """
         if not schemas:
             return ""
-        lines = ["[Available Tools]"]
+        lines = ["[Available Tools] (name* = required)"]
         for s in schemas:
             params = s.get("parameters", {})
+            required = set(s.get("required") or [])
             param_str = ""
             if isinstance(params, dict):
                 props = params.get("properties", {})
@@ -1905,7 +1912,8 @@ class Dispatcher:
                     parts = []
                     for pname, pinfo in props.items():
                         ptype = pinfo.get("type", "any") if isinstance(pinfo, dict) else "any"
-                        parts.append(f"{pname}({ptype})")
+                        mark = "*" if pname in required else ""
+                        parts.append(f"{pname}{mark}({ptype})")
                     param_str = ", ".join(parts)
             level = s.get("permission_level", "")
             if level in ("admin_only", "confirmation_required"):
@@ -1958,15 +1966,33 @@ class Dispatcher:
             ]
         messages.append(assistant_msg)
 
-        for tc, er in zip(response.tool_calls, exec_results, strict=False):
-            tool_name = tc.get("name", er.tool_name)
-            content = json.dumps({
-                "tool": tool_name,
-                "success": er.success,
-                "message": er.message,
-                "data": er.data,
-                "error": er.error,
-            })
+        # EVERY assistant tool call gets exactly one tool response, in order:
+        # a provider that receives an assistant turn with tool_calls whose
+        # ids are not all answered can reject the continuation outright. The
+        # executor already returns one result per call (including a bounded
+        # failure for a call beyond MAX_TOOLS_PER_TURN); the index fallback
+        # below keeps the protocol complete even if a result list is ever
+        # shorter than the call list.
+        results_by_index = {index: er for index, er in enumerate(exec_results)}
+        for index, tc in enumerate(response.tool_calls):
+            er = results_by_index.get(index)
+            tool_name = tc.get("name", "") or (er.tool_name if er is not None else "")
+            if er is not None:
+                content = json.dumps({
+                    "tool": tool_name,
+                    "success": er.success,
+                    "message": er.message,
+                    "data": er.data,
+                    "error": er.error,
+                })
+            else:
+                content = json.dumps({
+                    "tool": tool_name,
+                    "success": False,
+                    "message": "Tool call was not executed.",
+                    "data": {},
+                    "error": "not_executed",
+                })
             messages.append({
                 "role": "tool",
                 "tool_call_id": tc.get("id", ""),

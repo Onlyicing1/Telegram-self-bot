@@ -397,17 +397,39 @@ def test_build_tool_definitions_uses_openai_format():
     assert fn["parameters"]["type"] == "object"
 
 
-def test_build_tool_definitions_marks_required_params():
+def test_build_tool_definitions_marks_declared_required_params():
+    """Requiredness comes from the tool declaration, never from a default.
+
+    A parameter without a ``default`` is NOT required unless the tool
+    declares it: the old inference advertised optional parameters as
+    mandatory for 40 of 55 registered tools.
+    """
     from backend.ai.engine.dispatcher import Dispatcher
     from backend.ai.tools.base import PermissionLevel, ToolResult
     from backend.ai.tools.registry import ToolRegistry
 
-    class DeleteTool:
-        name = "delete"
-        description = "Delete last N"
-        parameters = {"count": {"type": "integer", "minimum": 1, "maximum": 500}}
-        permission_level = PermissionLevel.DANGEROUS
-        safe = False
+    class SearchTool:
+        name = "search"
+        description = "Search saved items"
+        parameters = {
+            "query": {"type": "string"},
+            "limit": {"type": "integer"},
+        }
+        required_arguments = ("query",)
+        permission_level = PermissionLevel.READ_ONLY
+        safe = True
+        return_type = "text"
+        long_running = False
+
+        async def execute(self, ctx, args):
+            return ToolResult(success=True, message="ok")
+
+    class OptionalTool:
+        name = "optional"
+        description = "Every parameter is optional"
+        parameters = {"target": {"type": "string"}}
+        permission_level = PermissionLevel.READ_ONLY
+        safe = True
         return_type = "text"
         long_running = False
 
@@ -415,13 +437,16 @@ def test_build_tool_definitions_marks_required_params():
             return ToolResult(success=True, message="ok")
 
     registry = ToolRegistry()
-    registry.register(DeleteTool())
+    registry.register(SearchTool())
+    registry.register(OptionalTool())
 
     d = Dispatcher.__new__(Dispatcher)
     d._tool_registry = registry
-    definitions = d._build_tool_definitions()
+    definitions = {x["function"]["name"]: x["function"] for x in d._build_tool_definitions()}
 
-    assert definitions[0]["function"]["parameters"]["required"] == ["count"]
+    assert definitions["search"]["parameters"]["required"] == ["query"]
+    # No declared requiredness (and no default) must NOT become required.
+    assert "required" not in definitions["optional"]["parameters"]
 
 
 @pytest.mark.asyncio
