@@ -327,7 +327,12 @@ def test_the_emoji_module_adds_no_second_infrastructure():
         "create_task",
         "immortal_create_task",
         "forward_messages",
+        # No direct event registration of ANY kind: every panel/action must
+        # be reachable only through the existing owner-gated callback router.
         "events.NewMessage",
+        "events.CallbackQuery",
+        "@client.on",
+        "client.on(",
         "asyncio.Lock",
     ):
         assert forbidden not in source, forbidden
