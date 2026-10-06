@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 
 _client = None
 _available = False
-_fallback: dict = {"saved_items": [], "bio_state": {}, "bot_logs": [], "username_state": {}}
+_fallback: dict = {"saved_items": [], "bio_state": {}, "bot_logs": [], "username_state": {}, "emoji_library": []}
 _save_code_lock = asyncio.Lock()
 _initialised = False
 
@@ -1047,6 +1047,154 @@ async def update_username_state(owner_id: int, updates: dict) -> None:
         await _run_sync(_update_username_state_sync, owner_id, updates)
     except Exception as exc:
         logger.error("[SAVE_DB] update_username_state FAILED: %s", exc)
+
+
+# ── emoji_library (Emoji & Reaction Phase 1) ──
+
+#: Hard bound on the document-id read used for import deduplication. The
+#: manual schema's UNIQUE (owner_id, document_id) index is the backstop for
+#: libraries beyond this bound.
+_EMOJI_MAX_ROWS = 5000
+
+
+def _list_emoji_document_ids_sync(owner_id: int) -> list[int] | None:
+    db = get_db()
+    if db is None:
+        return [
+            int(row["document_id"])
+            for row in _fallback["emoji_library"]
+            if row.get("owner_id") == owner_id
+            and isinstance(row.get("document_id"), int)
+            and not isinstance(row.get("document_id"), bool)
+        ]
+    try:
+        result = (
+            db.table("emoji_library")
+            .select("document_id")
+            .eq("owner_id", owner_id)
+            .limit(_EMOJI_MAX_ROWS)
+            .execute()
+        )
+        return [
+            int(row["document_id"])
+            for row in (result.data or [])
+            if row.get("document_id") is not None
+        ]
+    except Exception as exc:
+        logger.error("[EMOJI_DB] list_emoji_document_ids FAILED: %s", exc)
+        record_event("database", "select emoji_library", 0, "ERROR", str(exc))
+        return None
+
+
+async def list_emoji_document_ids(owner_id: int) -> list[int] | None:
+    """Document ids in the owner's emoji library, for import deduplication.
+
+    Returns None ONLY when Supabase is configured but the durable read
+    fails: callers must fail closed instead of deduplicating against an
+    empty in-memory list (config_store DEGRADED_READ contract). When no
+    Supabase is configured the fallback list is the authoritative store.
+    """
+    try:
+        return await _run_sync(_list_emoji_document_ids_sync, owner_id)
+    except Exception as exc:
+        logger.error("[EMOJI_DB] list_emoji_document_ids FAILED: %s", exc)
+        return None
+
+
+def _insert_emoji_entry_sync(data: dict) -> dict | None:
+    row = dict(data)
+    if row.get("created_at") is None:
+        row["created_at"] = datetime.now(timezone.utc).isoformat()
+    db = get_db()
+    if db is None:
+        store = _fallback["emoji_library"]
+        for existing in store:
+            if (
+                existing.get("owner_id") == row.get("owner_id")
+                and existing.get("document_id") == row.get("document_id")
+            ):
+                logger.warning(
+                    "[EMOJI_DB] insert_emoji_entry: duplicate document_id=%s — refused.",
+                    row.get("document_id"),
+                )
+                return None
+        row["id"] = len(store) + 1
+        store.append(row)
+        return row
+    try:
+        result = db.table("emoji_library").insert(row).execute()
+        inserted = result.data[0] if result.data else None
+        if inserted is None:
+            logger.error(
+                "[EMOJI_DB] insert_emoji_entry ERROR: insert() returned no data."
+            )
+            record_event(
+                "database", "insert emoji_library", 0, "ERROR",
+                "insert returned no data",
+            )
+            return None
+        record_event("database", "insert emoji_library", 0, "SUCCESS")
+        return inserted
+    except Exception as exc:
+        logger.error("[EMOJI_DB] insert_emoji_entry ERROR: %s", exc, exc_info=True)
+        record_event("database", "insert emoji_library", 0, "ERROR", str(exc))
+        return None
+
+
+async def insert_emoji_entry(data: dict) -> dict | None:
+    """Insert one emoji_library row. Returns the stored row, or None on
+    failure (and None when the fallback already holds the same
+    owner/document entry). Never raises. The Supabase path relies on the
+    manual UNIQUE (owner_id, document_id) index as its duplicate backstop;
+    the service-level import lock keeps classification deterministic.
+    """
+    try:
+        return await _run_sync(_insert_emoji_entry_sync, data)
+    except Exception as exc:
+        logger.error("[EMOJI_DB] insert_emoji_entry FAILED: %s", exc)
+        record_event("database", "insert emoji_library", 0, "ERROR", str(exc))
+        return None
+
+
+def _list_emoji_entries_sync(owner_id: int, limit: int, offset: int) -> tuple[list, int]:
+    db = get_db()
+    if db:
+        try:
+            result = (
+                db.table("emoji_library")
+                .select("*")
+                .eq("owner_id", owner_id)
+                .order("created_at", desc=True)
+                .range(offset, offset + limit - 1)
+                .execute()
+            )
+            count_res = (
+                db.table("emoji_library")
+                .select("id", count="exact")
+                .eq("owner_id", owner_id)
+                .execute()
+            )
+            return result.data or [], count_res.count or 0
+        except Exception as exc:
+            logger.error("[EMOJI_DB] list_emoji_entries FAILED: %s", exc)
+    items = [e for e in _fallback["emoji_library"] if e.get("owner_id") == owner_id]
+    total = len(items)
+    items = sorted(
+        items,
+        key=lambda r: (r.get("created_at") or "", r.get("id") or 0),
+        reverse=True,
+    )
+    return items[offset:offset + limit], total
+
+
+async def list_emoji_entries(owner_id: int, limit: int = 50, offset: int = 0) -> tuple[list, int]:
+    """List the owner's emoji-library entries newest-first as (rows, total)."""
+    try:
+        return await _run_sync(_list_emoji_entries_sync, owner_id, limit, offset)
+    except Exception as exc:
+        logger.error("[EMOJI_DB] list_emoji_entries FAILED: %s", exc)
+        items = [e for e in _fallback["emoji_library"] if e.get("owner_id") == owner_id]
+        return items[offset:offset + limit], len(items)
 
 
 # ── bot_logs: reads/cleanup ──

@@ -9,9 +9,12 @@
 >
 > **Status of this document:** CURRENT-FEATURE ROADMAP + IMPLEMENTATION STATUS.
 > Phase 0's code slice (entity-aware serialization §22 + send-only Bot bridge
-> §17) is IMPLEMENTED and unit-TESTED (no live Telegram). Everything else
-> below remains PLANNED. Database schema is untouched (schema work is manual,
-> §29).
+> §17) and Phase 1's code slice (Emoji Library + bounded, deterministic Saved
+> Messages import — §7 library-entry shape, §8 storage/dedup, §9
+> message-level import) are IMPLEMENTED and unit-TESTED (no live Telegram).
+> Everything else below remains PLANNED. Schema files are untouched: the
+> `emoji_library` table is MANUAL-ONLY and has not been executed anywhere
+> (§29; exact schema in `IMPLEMENTATION_REPORT.md`).
 
 ---
 
@@ -55,9 +58,10 @@ Status: **PLANNED**.
 
 ## 2. Current Status
 
-**Overall feature status: IN PROGRESS — Phase 0 partially implemented
-(entity-aware serialization + send-only Bot bridge); no end-to-end
-replacement flow yet.**
+**Overall feature status: IN PROGRESS — Phase 0 (entity-aware serialization
++ send-only Bot bridge) and Phase 1 (Emoji Library + deterministic Saved
+Messages import) implemented and unit-tested; no end-to-end replacement flow
+yet.**
 
 The repository originally contained **no** emoji-substitution, premium-emoji
 library, or reaction feature (verified by grep across `backend/` and `tests/`
@@ -68,13 +72,15 @@ character-width logic in `backend/ai/preparation_policy.py`,
 `backend/helper/font_style.py`, `backend/bot/handlers/ai.py`,
 `backend/ai/confirmation.py`).
 
-The only feature code now present is the Phase 0 slice:
-`backend/telegram_api/_helpers.py` (entity-aware serialization),
-`backend/telegram_api/bridge.py` (send-only bridge), and
-`tests/test_bridge_delivery.py`.
+The feature code now present is the Phase 0 slice (`backend/telegram_api/
+_helpers.py`, `backend/telegram_api/bridge.py`, `tests/test_bridge_delivery.py`)
+and the Phase 1 slice (`backend/services/emoji_library_service.py`, the
+`emoji_library` functions in `backend/db/client.py`,
+`tests/test_emoji_library_import.py`). Neither slice has been verified
+against live Telegram.
 
-- [ ] Premium emoji library
-- [ ] Collection import
+- [x] Premium emoji library — storage + deduplication (IMPLEMENTED, TESTED; browser panel still open)
+- [x] Collection import — bounded entity-based Saved Messages scan (IMPLEMENTED, TESTED; set enumeration + report panel still open)
 - [ ] Category management
 - [ ] Mapping UI
 - [ ] Conflict handling
@@ -241,7 +247,9 @@ No new Telegram library is required.
 
 - `backend/db/client.py` — Supabase singleton with in-memory fallback; tables
   currently used by code: `saved_items`, `bio_state`, `username_state`,
-  `bot_logs`; `get_next_save_code()` is atomic; heavy calls run via
+  `bot_logs`, `emoji_library` (Phase 1 — its dedup read returns `None` on a
+  failed durable read so the importer can fail closed instead of deduping
+  against RAM); `get_next_save_code()` is atomic; heavy calls run via
   `asyncio.to_thread` with bounded timeouts; the bot never crashes on DB
   errors.
 - `backend/ai/config_store.py` — `ai_config` table; documented degradation
@@ -250,8 +258,12 @@ No new Telegram library is required.
 - `backend/services/settings_service.py` + `backend/services/
   panel_settings_repository.py` — validated settings keys persisted as a
   single `panel_settings` row (`key="global"`), cached in-process.
-- **No emoji/reaction table or schema exists.** Schema design is §7; SQL is
-  explicitly out of scope for this task (manual Supabase work later).
+- **No emoji/reaction table exists in any database.** Phase 1 code reads and
+  writes an `emoji_library` table through the pattern above with the
+  in-memory fallback covering development; the physical table is
+  MANUAL-ONLY (exact schema in `IMPLEMENTATION_REPORT.md`, never executed
+  here). Categories/mappings schema remains §7; SQL is explicitly out of
+  scope for this task (manual Supabase work later).
 
 ### 5.7 Guard rails that apply to this feature
 
@@ -363,16 +375,27 @@ The three distinct concerns that must not be conflated:
 3. **Custom composition** — the Custom category references existing
    mappings/library entries; it must not duplicate definitions.
 
-Schema/SQL and `DATABASE_ARCHITECTURE.md` remain untouched by this roadmap.
+Phase 1 persisted shape (IMPLEMENTED + TESTED): table `emoji_library` with
+`owner_id`, `document_id`, `alt_text`, `source` ("imported"),
+`source_msg_id`, `created_at`, and `UNIQUE (owner_id, document_id)` — the
+MANUAL-ONLY schema is documented in `IMPLEMENTATION_REPORT.md` and was never
+executed. `set_id`/`set_short_name` are NOT persisted: they are not available
+from message entities and set resolution (§9) is still open — nothing is
+fabricated.
 
-Status: **PLANNED**.
+Schema/SQL files and `DATABASE_ARCHITECTURE.md` remain untouched by this
+roadmap.
+
+Status: **IN PROGRESS — the library-entry half of this model is IMPLEMENTED
+and TESTED (Phase 1); categories, mappings, and runtime state remain
+PLANNED.**
 
 ---
 
 ## 8. Premium Emoji Library
 
-- [ ] Library storage (entries keyed by `document_id`, with set + alt text)
-- [ ] Deduplication on import (same `document_id` re-import is a no-op or update, never a duplicate)
+- [x] Library storage (entries keyed by `(owner_id, document_id)` with alt text + provenance; set info deferred to §9 set resolution)
+- [x] Deduplication on import (same `document_id` re-import is a counted no-op — never stored twice)
 - [ ] Library browser panel (Glass UI, 2×5 pagination over entries)
 - [ ] Library is the single source of emoji definitions; categories only reference it
 - [ ] Library deletion semantics (what happens to mappings referencing a deleted entry — must be defined, see §34)
@@ -381,34 +404,59 @@ Unknown — requires implementation/investigation: whether alt text is
 sufficient fallback when a viewer lacks the emoji set (Telegram behavior
 suggests yes for custom emoji the viewer cannot render; verify live).
 
-Status: **PLANNED**.
+Status: **IN PROGRESS — storage + deduplication IMPLEMENTED/TESTED (Phase 1);
+browser panel and deletion semantics still PLANNED.**
 
 ---
 
 ## 9. Collection/Set Import Flow
 
-- [ ] Detect a premium/custom emoji sent by the owner **to Saved Messages** (self-client outgoing event, owner-only)
-- [ ] Resolve the emoji's **sticker set / collection** (Telegram API: fetch the set by the document's `DocumentAttributeCustomEmoji` reference)
+Implemented — message-level import (Phase 1,
+`backend/services/emoji_library_service.py`, TESTED):
+
+- [x] Collect custom-emoji records from the owner's **Saved Messages**
+  through the self-client facade (`iter_messages("me", …)`, newest-first,
+  exclusive `max_id` cursor, explicit scan/page/record/entity bounds) — an
+  explicit deterministic import; no event listener, no "last message"
+  inference
+- [x] Recognize **entities, not text**: only `MessageEntityCustomEmoji`
+  counts; plain Unicode emoji and unrelated entity types are never imported
+- [x] Preserve `document_id` + the exact Unicode alt text of each span
+  (Phase 0 UTF-16 helpers; corrupt spans fail closed as malformed)
+- [x] Insert extracted emojis into the library idempotently
+  (`(owner_id, document_id)` dedup; repeat import = counted no-op)
+- [x] Honest import report as a service return value (counts, bounds, storage
+  mode, error — a collection failure persists NOTHING)
+- [x] Failure paths: message without a custom-emoji entity → skipped;
+  malformed entity → counted, not stored; Telegram/timeout error → fail
+  closed before any write; durable library read failure → abort before any
+  scan
+
+Still NOT implemented (this section remains open):
+
+- [ ] Resolve the emoji's **sticker set / collection** (Telegram API:
+  `messages.GetCustomEmojiDocuments` / `DocumentAttributeCustomEmoji`)
 - [ ] Enumerate all documents in the set and extract their `document_id`s + alt text
-- [ ] Insert extracted emojis into the library (idempotent)
-- [ ] Import report panel (collection name, count, library size)
-- [ ] Failure paths: message has no custom-emoji attribute; set fetch fails; set is unavailable/premium-gated
+- [ ] Import report panel (Glass UI; the report dict exists, no panel yet)
+- [ ] Live-Telegram execution of the import (never run live)
 
 Constraints documented now:
 
 - Import must reuse the Deep-Save-adjacent pattern of reading the owner's
   Saved Messages traffic from the **self-client** (the bot cannot see the
-  owner's Saved Messages).
+  owner's Saved Messages). — honored by Phase 1.
 - Telegram may gate set enumeration for non-premium accounts; the owner's
   account owns the emojis in the intended usage, but the code path must fail
-  closed with an honest report, not partial silent imports.
+  closed with an honest report, not partial silent imports. — honored by
+  Phase 1 (fail-closed reports; no partial silent imports).
 
 Unknown — requires implementation/investigation: exact Telethon call chain
 for set enumeration (`messages.GetStickerSetRequest` vs
 `account.GetStickerSetRequest`) and whether premium-only sets enumerate
 without Premium on the querying account.
 
-Status: **PLANNED**.
+Status: **IN PROGRESS — message-level import IMPLEMENTED/TESTED; set
+resolution/enumeration, the report panel, and live validation REMAIN.**
 
 ---
 
@@ -772,7 +820,8 @@ Status: **PLANNED**.
 Follows existing patterns (no schema invented here; actual SQL manual, later):
 
 - [ ] Toggle + active category + bridge config persisted via the settings pattern (`settings_service.py` / `panel_settings_repository.py` style: validated keys, single-row persistence, in-process cache) — exact table(s) decided with the schema work
-- [ ] Library/categories/mappings persisted via the `db/client.py` Supabase-or-in-memory-fallback pattern (new tables; creation is manual/out of scope here)
+- [x] Library persisted via the `db/client.py` Supabase-or-in-memory-fallback pattern (Phase 1: `emoji_library` functions; a failed durable dedup read returns `None` so import fails closed — RAM is never silently presented as durable; physical table MANUAL-ONLY, schema in `IMPLEMENTATION_REPORT.md`)
+- [ ] Categories/mappings persisted via the same pattern (new tables; creation is manual/out of scope here)
 - [ ] Durable-vs-fallback labeling follows the `config_store.py` contract (`DEGRADED_READ_KEY` / `SESSION_ONLY_KEY`) so a restart can never present RAM state as DB state
 - [ ] New env vars (if any, e.g. a dedicated bridge bot token) follow `config.py` optional-var conventions; default must keep the feature disabled/inert
 - [ ] Feature flag default: Emoji Replacement OFF on first boot
@@ -788,6 +837,7 @@ registry/executor patterns like `tests/test_provider_tool_boundary.py` and
 `tests/test_semantic_intent_boundary.py`; no live Telegram in tests):
 
 - [x] **Phase 0 slice (done):** `tests/test_bridge_delivery.py` — 22 tests pinning UTF-16 helpers (incl. mid-surrogate `ValueError`), entity serialization round-trip, dict→TL rebuild (incl. fail-closed unknown/missing payload and mention-name resolution through the target client), bridge same-destination send via the helper bot, send-failure honesty, empty-message refusal, unavailable-bot error, timeout normalization. Full suite at this commit: **5180 passed, 26 skipped** (baseline at the merged remote state: 5158 passed — no regressions).
+- [x] **Phase 1 slice (done):** `tests/test_emoji_library_import.py` — 50 tests pinning extraction from the Phase 0 serialized representation (valid records, UTF-16 alt preservation incl. Persian/supplementary text, plain-Unicode + unrelated-entity exclusion, malformed document-id/offset/span fail-closed, entity processing bound), import semantics (first import, repeat idempotency, in-scan + durable dedup, call-by-call deterministic `max_id` pagination, scan/record/entity bounds, empty history, inaccessible entries), failure honesty (collection error, page timeout, durable-read abort before scan, insert-failure counts, completeness invariant), persistence (in-memory fallback + faked Supabase path, uniqueness, pagination), context isolation (AST import audit — no `backend.ai`), architecture constraints (no second client/loop/scheduler/executor, no forwarding, exact signature), and a Phase 0 serialization round-trip. Full suite at this commit: **5230 passed, 26 skipped** (Phase 0 baseline 5180 + 50 new — no regressions).
 - [ ] Transformer unit tests: emoji-only rewrite; entity offsets (UTF-16) preserved/recomputed correctly across mapped spans; mixed-script cases (emoji + Persian + Latin); unmapped passthrough; multi-emoji single-pass (§20/§21/§22)
 - [ ] Reconstruction flow tests: fake self-client + fake bridge client; assert delete called only after prepared send succeeds; same-destination assertion; reply-to propagation (§15/§18)
 - [ ] Authorization tests: non-owner-authored message never processed; incoming events never processed (§19)
@@ -795,13 +845,13 @@ registry/executor patterns like `tests/test_provider_tool_boundary.py` and
 - [ ] Mapping service tests: uniqueness enforcement; conflict detection returns current+new visuals data; replace only on explicit confirm (§11/§12)
 - [ ] Category resolution tests: override > default > none (§13)
 - [ ] Toggle tests: OFF ⇒ zero Telegram calls (§14)
-- [ ] Import tests: set enumeration mocked; idempotent re-import; failure paths honest (§9)
+- [ ] Import tests: set enumeration mocked (§9) — NOT yet (set enumeration itself is unimplemented); message-level import, idempotent re-import, and honest failure paths are already covered by the Phase 1 slice above
 - [ ] Pagination tests: 10-per-page slicing; page clamp; callback round-trip (§25)
 - [ ] Custom composition tests: references not duplicates; propagation semantics per §26 decision
 - [ ] Reaction wrapper tests: bounded timeout, exception normalization, payload correctness (§27)
-- [ ] Full-suite gate: existing 5126-test suite must stay green (baseline at commit `eb4d852`)
+- [ ] Full-suite gate: keep the whole suite green on every slice (latest run at the Phase 1 commit: **5230 passed, 26 skipped**)
 
-Status: **PLANNED**.
+Status: **IN PROGRESS — Phase 0 + Phase 1 slices done; the rest remains PLANNED.**
 
 ---
 
@@ -810,7 +860,7 @@ Status: **PLANNED**.
 Beyond unit tests — verification against real behavior before IMPLEMENTED
 can become TESTED/VERIFIED:
 
-- [ ] Compile check (`compileall`) + full test suite green
+- [x] Compile check (`compileall`/`py_compile`) + full test suite green — at the Phase 1 commit: `py_compile` clean on all changed modules, **5230 passed, 26 skipped**
 - [ ] Live Telegram validation checklist (manual, owner's environment): import a real collection via Saved Messages; map 2 emojis; verify replacement in a private chat, a group, and Saved Messages; verify text/entities/media/caption/reply preservation visually; verify unmapped emoji untouched; verify loop does not occur; verify toggle-OFF leaves everything untouched
 - [ ] Bridge capability verification: confirm which custom-emoji send mode actually works with the owner's bot setup (Fragment username vs alt-text fallback) — record the outcome in §17
 - [ ] Failure-mode validation: revoke bot send permission in a chat and verify the original message survives (send-first ordering)
@@ -827,7 +877,7 @@ Phase order (each phase independently verifiable; nothing is complete until
 its checkboxes AND validation pass):
 
 - [ ] **Phase 0 — Prerequisites:** entity-aware serialization (§22 gap in `_helpers.py`) — **DONE + TESTED**; decision on bridge capability (§34-D) — still OPEN (owner); confirm mapping persistence shape (§34-E) — still OPEN (owner)
-- [ ] **Phase 1 — Library & Import:** domain model (§7), library storage, Saved Messages collection import (§8, §9), import report panel
+- [ ] **Phase 1 — Library & Import:** domain model (§7 library-entry shape), library storage (dedup on `(owner_id, document_id)`), bounded entity-based Saved Messages collection import (§8, §9 message-level), honest import report — **IMPLEMENTED + TESTED**; REMAINING: set resolution/enumeration (§9), Glass UI import report panel, live validation
 - [ ] **Phase 2 — Categories & Mappings:** category CRUD, mapping editor, uniqueness + conflict UI (§10–§12), 2×5 pagination (§25)
 - [ ] **Phase 3 — State & Toggle:** replacement toggle, active category (global default + per-chat override) (§13, §14, §29)
 - [ ] **Phase 4 — Reconstruction:** transformer (entity-safe), reconstructor with send-first ordering, bot bridge send path, same-destination + reply preservation (§15–§23), loop prevention (§24)
@@ -892,20 +942,26 @@ Status: **OPEN — awaiting confirmation**.
 
 ## 35. Not Implemented Yet
 
-Current truth after the Phase 0 code slice:
+Current truth after the Phase 0 and Phase 1 code slices:
 
 - Entity-aware serialization + UTF-16 helpers + dict→TL entity rebuild —
   IMPLEMENTED (`backend/telegram_api/_helpers.py`), TESTED.
 - Send-only Bot bridge module — IMPLEMENTED (`backend/telegram_api/bridge.py`),
   unit-TESTED; **live Telegram delivery NOT verified**.
-- Still NOT implemented: no emoji library, category, or mapping code; no
-  collection import; no replacement toggle, transformer, or reconstructor; no
-  reaction code; no schema/tables for this feature (none created — schema
-  changes are manual); no §34 decisions resolved.
+- Emoji Library + deterministic Saved Messages import — IMPLEMENTED
+  (`backend/services/emoji_library_service.py` + `emoji_library` functions
+  in `backend/db/client.py`), TESTED (50 tests); **live Telegram import NOT
+  verified**; the physical `emoji_library` table does NOT exist anywhere yet
+  (MANUAL-ONLY schema documented in `IMPLEMENTATION_REPORT.md` — nothing
+  executed).
+- Still NOT implemented: sticker-set resolution/enumeration, library browser
+  panel, import report panel, categories, mappings, replacement toggle,
+  transformer, reconstructor, reaction code; no live schema/tables applied;
+  no §34 decisions resolved.
 
-Phase 0 completion still requires the owner decisions §34-D (bridge
-capability) and §34-E (persistence shape). Implementation continues at
-Phase 1 (§32) once those are confirmed.
+Phase 0's remainder still needs the owner decisions §34-D (bridge
+capability) and §34-E (persistence shape). Phase 1's remainder (set
+enumeration + report panel) and Phase 2 (§32) are next.
 
 ---
 
