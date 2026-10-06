@@ -2,130 +2,197 @@
 
 > **Scope:** this report describes the work performed in the current change
 > set only. It is rewritten (not appended) each time; historical narrative
-> lives in git history. Nothing here claims live-Telegram verification —
-> see §6/§7 for exactly what was and was not verified.
+> lives in git history. Nothing here claims live-Telegram or live-Supabase
+> verification — see §12 for exactly what was and was not verified.
 
-**Feature: Emoji & Reaction — Phase 1 (Library & Import) code slice
-completed.**
+**Feature: Emoji & Reaction — Phase 1 COMPLETE (Library & Import, including
+the Phase 1 remainder).**
 
-**Current phase: Phase 1 — Library & Import (message-level slice
-IMPLEMENTED + TESTED).**
-**Next: Phase 1 remainder (sticker-set resolution/enumeration + Glass UI
-import report panel, ROADMAP §9), then Phase 2 — Categories & Mappings
-(§32). Phase 0 owner decisions §34-D/§34-E remain OPEN.**
+**Current phase: Phase 1 — Library & Import IMPLEMENTED + TESTED in full.**
+**Next: Phase 2 — Categories & Mappings (ROADMAP §32). Phase 0 owner
+decisions §34-D/§34-E remain OPEN.**
 
-Phase 1 of the current-feature roadmap (`ROADMAP.md` §32) lists the domain
-model (§7), library storage, the Saved Messages collection import (§8/§9),
-and an import report panel. This change set delivers the library storage,
-the deterministic message-level import, and the honest report **as a service
-return value**; set enumeration and the Glass UI panel are explicitly NOT
-implemented here (§5/§6).
+The Phase 1 message-level slice (library storage, deterministic bounded
+Saved Messages import, honest report as a service return value) was
+delivered in the previous commit. This change set completes Phase 1 by
+delivering (a) sticker-set resolution/enumeration for the imported custom
+emojis and (b) the Glass UI import/report panel plus the 2×5 library
+browser. Phase 2 categories/mappings are explicitly NOT implemented.
 
 ---
 
 ## 1. What was implemented
 
-### 1.1 Extraction — Phase 0 representation reused, no second one
-(`backend/services/emoji_library_service.py`, new)
+### 1.1 Set-enumeration facade (`backend/telegram_api/custom_emoji.py`, new)
 
-- `extract_custom_emoji_records(message)` is a pure function over the
-  Phase 0 serialized message dict (`serialize_message` output). It
-  recognizes **entities, not text**: only `MessageEntityCustomEmoji`
-  entities produce records. Plain Unicode emoji (no such entity) and
-  unrelated entity types (bold, text-url, …) are silently ignored — they
-  are neither imported nor counted as malformed.
-- A record is `{document_id, alt_text, source_msg_id, source}`:
-  - `document_id` — the Telegram custom-emoji/document identity, validated
-    (int or digit-string, positive; bools/floats/missing rejected),
-  - `alt_text` — the exact Unicode text span the entity covers, resolved
-    from UTF-16 offsets through Phase 0 `utf16_index_at` (fail closed:
-    out-of-range and mid-surrogate spans are malformed, never clamped),
-  - `source_msg_id` — the Saved Messages message that carried it (None when
-    the message id is absent/invalid),
-  - `source` — always `"imported"` (ROADMAP §7).
-- Malformed payloads (missing/invalid document id, negative/zero/non-int
-  offsets, spans outside the text, custom-emoji entities on empty text) are
-  skipped and counted honestly. Per-message entity processing is bounded at
-  `MAX_ENTITIES_PER_MESSAGE = 100` with an honest `hit_entity_limit` flag.
-- **No sticker-set metadata is persisted**: it is not available from a
-  message entity, and nothing is fabricated (ROADMAP §9 set resolution
-  remains open).
+Typed, bounded wrappers over the two Telegram TL requests enrichment needs
+— same conventions as `backend/telegram_api/messages.py` (short bounded
+calls through `guarded_await`, exceptions normalized to
+`TelegramAPIError`/`TelegramTimeoutError`, plain-dict results; callers never
+touch Telethon objects):
 
-### 1.2 Import — bounded, deterministic, fail-closed
-(`import_from_saved_messages(client, owner_id, …)`)
+- `get_custom_emoji_documents(client, document_ids)` — resolves custom-emoji
+  document ids into `[{document_id, alt, set}]` via
+  `messages.GetCustomEmojiDocumentsRequest`. One document per id Telegram
+  actually returned **with a `DocumentAttributeCustomEmoji` attribute**;
+  anything else is honestly absent. `alt` is the attribute's Unicode
+  fallback text (whatever Telegram provides); `set` is the REAL
+  Telegram-provided set identity (`{"kind": "id", "id", "access_hash"}` or
+  `{"kind": "short_name", "short_name"}`) decoded from the attribute's
+  `stickerset` field, or `None` when the document carries no usable
+  identity. Invalid/foreign ids are dropped; the request is clamped at
+  `MAX_DOCUMENTS_PER_CALL = 100` ids.
+- `get_sticker_set(client, set_ref)` — fetches ONE sticker/custom-emoji set
+  with its full member list via `messages.GetStickerSetRequest(stickerset,
+  hash=0)` (hash=0 forces the full list instead of a not-modified stub).
+  Returns `{set_id, access_hash, title, short_name, count, members}` where
+  each member is `{document_id, alt}` — only documents carrying a
+  custom-emoji attribute appear as members (a sticker set requested by
+  mistake contributes no fake emoji records). Unusable identities raise
+  `TelegramAPIError`; failures/timeout normalize like every facade call.
 
-- Scans **Saved Messages (`"me"`)** through the existing facade
-  `backend.telegram_api.messages.iter_messages` (the self client is passed
-  in by the caller — no second client), newest-first, paged with an
-  exclusive `max_id` cursor that must strictly decrease (deterministic,
-  no offset drift, no re-reads). Each page fetch is wrapped in
-  `rpc_await` with a bounded timeout.
-- **Collect-then-persist**: a Telegram error or page timeout aborts with an
-  honest report and persists NOTHING. An unreadable durable library (failed
-  Supabase dedup read) aborts BEFORE any scan. A collection failure never
-  produces a partial silent import.
-- **Deduplication** happens against (a) the durable library (read once,
-  fail-closed) and (b) the current scan — both at classification time, so
-  the record budget counts only genuinely new entries. Persistence then
-  inserts each candidate; per-insert outcomes are reported as
-  `imported`/`failed`.
-- One module-level `asyncio.Lock` serializes imports so dedup decisions
-  stay deterministic under concurrency (same pattern as
-  `get_next_save_code`).
-- The returned report always carries: `ok`, `error`, `storage`
-  (`supabase`/`memory`), `pages`, `scanned_messages`,
-  `custom_emoji_seen`, `malformed_entities`, `imported`, `duplicates`,
-  `failed`, `library_total`, `end_reached`, `hit_scan_limit`,
-  `hit_record_limit`, `hit_entity_limit`. For a completed import the
-  invariant `custom_emoji_seen == imported + duplicates + failed` holds.
+**Honesty contract:** a document Telegram did not return, a document
+without a custom-emoji attribute, and a document without a usable set
+identity are all reported as absent/`set: None` — nothing about set
+membership is ever inferred, guessed, or fabricated here.
 
-### 1.3 Persistence — existing db/client.py pattern, no second DB layer
-(`backend/db/client.py`)
+### 1.2 Bounded enrichment stage in the importer
+(`backend/services/emoji_library_service.py` extended)
 
-- `_fallback` gains `emoji_library` (in-memory fallback store).
-- `list_emoji_document_ids(owner_id)` — dedup read; returns **`None`
-  (never `[]`) when Supabase is configured but the durable read fails**, so
-  the importer can fail closed instead of deduping against RAM (the
-  `config_store` degraded-read spirit, without inventing new keys). When no
-  Supabase is configured the fallback list is the authoritative store. The
-  read is bounded at `_EMOJI_MAX_ROWS = 5000`.
-- `insert_emoji_entry(row)` — same shape as `insert_save`: fallback path
-  refuses duplicates, Supabase path inserts, every failure is logged +
-  `record_event`'d and returns `None`; never raises.
-- `list_emoji_entries(owner_id, limit, offset)` — newest-first
-  `(rows, total)` listing for tests and the future browser panel, mirroring
-  `list_saves`.
-- No SQL executed, no migration added, no live table touched.
+`import_from_saved_messages(client, owner_id, *, max_messages, page_size,
+max_records, max_set_records, page_timeout)` grew ONE optional bounded
+parameter (`max_set_records`, default 500, hard cap 2000) and one
+BEST-EFFORT enrichment stage between the scan and persistence:
+
+1. **Document resolution** — each newly collected candidate `document_id`
+   is resolved once, in `MAX_DOC_RESOLVE_BATCH = 50`-sized chunks, at most
+   `MAX_DOC_RESOLVE_CALLS = 10` chunks per import (≤500 documents), against
+   the SAME bounded RPC timeout as the scan.
+2. **Identity grouping** — resolved documents are grouped by their real
+   set identity in first-appearance order of the scan; at most
+   `MAX_SETS_PER_IMPORT = 20` unique sets per import are kept (excess is
+   counted as `hit_set_limit`).
+3. **Set enumeration** — each unique set is enumerated exactly once, one
+   RPC each; at most `MAX_SET_MEMBERS_PER_SET = 200` members are processed
+   per set. A member is classified exactly once: already in the scan
+   candidates, the durable library, or seen as another member ⇒
+   `set_duplicates` (counted, never stored twice); new members become
+   library records up to the `set_record_limit` budget.
+
+Set members persist through the SAME `db_client.insert_emoji_entry` path
+with the same `(owner_id, document_id)` deduplication. Their row shape
+identifies their origin honestly: `source_msg_id = None` (no message
+carried them) and `alt_text` is Telegram's own alt for the member document.
+**No schema change and no new column is required or made:** set identity is
+used transiently to resolve members; `set_id`/`set_short_name` remain
+unpersisted exactly as before.
+
+**Failure semantics (enrichment is best-effort by contract):** a set-stage
+failure is counted and reported (`set_error` + `degraded`) and NEVER aborts
+the import — the message-level records the scan successfully collected
+still persist. The four stages are distinguishable in the report:
+document-resolution failure, set resolution failure (non-dict set info /
+`SET_NOT_FOUND`), set enumeration failure, and set-member persistence
+failure (`set_failed`, which DOES make `ok=False` since it means the
+library is missing rows the report claims). Report keys added: `degraded`,
+`set_error`, `documents_resolved`, `unresolved_documents`,
+`documents_without_set`, `sets_resolved`, `set_members_seen`,
+`set_members_malformed`, `set_imported`, `set_duplicates`, `set_failed`,
+`hit_set_limit`, `hit_set_member_limit`. For a fully successful import the
+invariant `custom_emoji_seen + set_members_seen == imported + duplicates +
+failed + set_imported + set_duplicates + set_failed` holds.
+
+**Existing importer guarantees are untouched and re-pinned by tests:**
+newest-first scan, exclusive strictly-decreasing `max_id` cursor, bounded
+scan/page/record/entity budgets, bounded per-page RPC timeout, import lock
+for deterministic dedup, collect-then-persist fail-closed (a Telegram or
+durable-read failure persists NOTHING), honest per-insert outcomes. The
+enrichment stage runs INSIDE the same import lock, after the scan and
+before any write.
+
+### 1.3 Glass UI panels (`backend/bot/handlers/emoji.py`, new) + wiring
+
+Standard panel machinery only — `register_panel`/`register_action` from
+`backend.helper.panels`, the `InlinePanelBuilder` button conventions, the
+`panel:*`/`action:*` callback routing (owner-authorized by the existing
+callback router's `is_owner` gate), and the existing page/`truncate_
+callback_data` prior art. No new UI framework, no `events.NewMessage`
+handler, no second loop, no scheduler, no forwarding.
+
+- **`😀 Emoji` panel** (parent `menu`; the mother menu in
+  `backend/bot/handlers/misc.py` gains the `😀 Emoji` row) — shows the
+  library total (honest `unknown` on a failed read; empty-state text when
+  zero) with two actions: `⬇ Import from Saved Messages` and
+  `📚 Library`.
+- **Import action (`action:emoji_import`)** — runs the REAL bounded service
+  (`import_from_saved_messages`) with the self client from
+  `backend.helper.inline_engine.get_self_client()` and the owner from
+  `get_owner_id()`. Missing-client/owner and unexpected crashes fail
+  honestly (`! …`). The report body is rendered STRAIGHT from the service
+  result: `✓ Import complete`, or `✗ …` with the exact failure/error
+  string, or `◌ …` degradation (set enumeration error, unresolved
+  documents, setless documents, budget flags) — never a disguised success.
+  Counters shown are the user-facing ones (scanned/seen/bad, imported/
+  duplicates/failed, sets resolved/members imported/duplicates/failed,
+  library total, end-of-Saved-Messages, and nudges to re-run when a scan
+  or record budget stopped the run). No developer internals, stack traces,
+  or raw RPC names leak. The panel offers `↻ Import again` and `📚 Library`.
+- **`📚 Library` browser** (`panel:emoji_library`, parent `emoji`) — 2×5
+  grid (10 entries/page, two buttons per row) over
+  `db_client.list_emoji_entries`, newest-first, with a clamp-safe
+  `[◀] [page/pages] [▶]` pager row. Each entry button opens
+  **`panel:emoji_entry:<page>:<idx>`** — a compact detail (alt text,
+  document id, origin — `Saved Messages #id` or `Set scan` — and added
+  date), failing honestly (`Entry not found`) on a stale index after
+  library changes. The browser displays ONLY what the rows actually
+  contain; no set/category metadata is displayed or implied (it is not
+  persisted).
+
+`backend/bot/router.py` registers the module (`emoji.register`) alongside
+the other handlers — registration isolation unchanged (a module crash
+during registration cannot take down the rest).
+
+### 1.4 The previous Phase 1 slice (unchanged here)
+
+`extract_custom_emoji_records` (entity-based recognition from the Phase 0
+serialized representation, UTF-16 span resolution, bounded per-message
+entity processing) and the original import semantics/bounds/persistence
+(`backend/db/client.py` `emoji_library` helpers) are documented in the
+previous report and are only referenced here; the only service signature
+change is the added optional `max_set_records` budget.
+
+---
 
 ## 2. Files changed
 
 | File | Change |
 |---|---|
-| `backend/services/emoji_library_service.py` | NEW — extraction (`extract_custom_emoji_records`) + bounded import (`import_from_saved_messages`) + report contract |
-| `backend/db/client.py` | `emoji_library` added to `_fallback`; NEW `list_emoji_document_ids` / `insert_emoji_entry` / `list_emoji_entries` (+ `_sync` helpers, `record_event`, watchdog-dispatched via `_run_sync`) |
-| `tests/test_emoji_library_import.py` | NEW — 50 focused tests (§4) |
-| `ROADMAP.md` | Current-state updates: header, §2, §5.6, §7, §8, §9, §29, §30, §31, §32, §35 — implemented slices marked, later phases explicitly left unimplemented |
-| `IMPLEMENTATION_REPORT.md` | This rewrite |
+| `backend/telegram_api/custom_emoji.py` | NEW — document + sticker-set resolution facade (§1.1) |
+| `backend/services/emoji_library_service.py` | bounded best-effort enrichment stage (`_enumerate_sets`, set-member persistence, `set_*`/`degraded` report keys, `max_set_records` budget) |
+| `backend/bot/handlers/emoji.py` | NEW — `😀 Emoji` panel, import action, `📚 Library` 2×5 browser, entry detail (§1.3) |
+| `backend/bot/router.py` | register the `emoji` handler module |
+| `backend/bot/handlers/misc.py` | mother menu gains the `😀 Emoji` row |
+| `tests/test_emoji_set_enumeration.py` | NEW — 27 focused tests (§10) |
+| `tests/test_emoji_ui.py` | NEW — 18 focused tests (§10) |
+| `tests/test_emoji_library_import.py` | signature-pinning test updated for the `max_set_records` parameter |
+| `ROADMAP.md` | current-state updates (header, §2, §5.4/§5.6, §7, §8, §9, §25, §30, §31, §32, §35) |
+| `IMPLEMENTATION_REPORT.md` | this rewrite |
 
-No other file was touched: no handler/router registration, no tool
-registry entry, no Glass UI panel, no AI module, no schema/SQL file, no
-`DATABASE_ARCHITECTURE.md`, no `AGENTS.md`, no bridge/`_helpers.py`
-changes (Phase 0 untouched and still green).
+Intentionally untouched: `DATABASE_ARCHITECTURE.md`, `AGENTS.md`,
+`INVESTIGATION.md`, `supabase/` (no migration), `backend/db/client.py`,
+`backend/telegram_api/_helpers.py`/`bridge.py`/`messages.py`/`api.py`
+(Phase 0 untouched), every `backend/ai/*` module, `backend/helper/*`, the
+web dashboard, and everything outside this feature. **No SQL executed; no
+live DB touched.**
 
-## 3. Library / import data model (MANUAL-ONLY schema — never executed)
+---
 
-Persisted row (all fields actually available from the import path):
+## 3. Data model (MANUAL-ONLY schema — unchanged from Phase 1)
 
-| Column | Type | Meaning |
-|---|---|---|
-| `id` | bigserial PK | row id (house style) |
-| `owner_id` | bigint NOT NULL | library owner |
-| `document_id` | bigint NOT NULL | Telegram custom-emoji document id — the dedup identity |
-| `alt_text` | text NOT NULL DEFAULT `''` | exact Unicode alt span from the carrying message |
-| `source` | text NOT NULL DEFAULT `'imported'` | §7 source (future: `'manual'`) |
-| `source_msg_id` | bigint NULL | Saved Messages message that carried it |
-| `created_at` | timestamptz NOT NULL DEFAULT `now()` | first-import time |
-| — | `UNIQUE (owner_id, document_id)` | dedup backstop for the Supabase path |
+The physical `emoji_library` schema is EXACTLY the Phase 1 one (owner_id,
+document_id, alt_text, source, source_msg_id, created_at,
+`UNIQUE (owner_id, document_id)`) — documented, never executed by this
+repository, and unchanged in this change set:
 
 ```sql
 -- MANUAL-ONLY — documented, NEVER executed by this repository.
@@ -142,122 +209,217 @@ CREATE TABLE IF NOT EXISTS emoji_library (
 -- RLS per house style (service-role writes, SELECT-only policies) — owner action required.
 ```
 
-`set_id`/`set_short_name` are intentionally absent — not available from
-message entities; deferred to §9 set resolution. Categories, mappings, and
-runtime state (§7) are later phases and have no shape here.
+DELIBERATE: `set_id`/`set_short_name` are still NOT persisted. Enumeration
+needs the set identity only transiently (to fetch members); once members
+are resolved, the library's granularity — one row per emoji document — is
+sufficient, and inventing set columns now would be speculative schema
+expansion ahead of Phase 2's category/mapping design. Set provenance is
+implicit: members imported through set enumeration carry `source_msg_id =
+NULL` + Telegram's own alt (surfaced honestly as `Set scan` in the UI).
 
-## 4. Import semantics and bounds
+---
+
+## 4. Enrichment semantics and bounds
 
 | Case | Behavior |
 |---|---|
-| First import | scan → validate → persist new records; report counts + `library_total` |
-| Repeated import | every occurrence counts as `duplicates`; `imported = 0`; rows unchanged (idempotent) |
-| Same emoji in several messages (one run) | first occurrence (newest-first scan) wins; later ones counted `duplicates` |
-| Malformed/incomplete entity | skipped + `malformed_entities`; never stored |
-| Message without entities / without custom emoji | scanned, contributes nothing, no error |
-| Ordinary Unicode emoji | no custom-emoji entity → never imported |
-| Inaccessible/deleted content | deleted messages simply aren't returned; empty/attribute-less messages serialize to no-op records without crashing |
-| Telegram API error / page timeout | `ok=False`, `error` set, **nothing persisted** (fail closed) |
-| Durable library read failure | abort **before any scan**, `library_total=None`, zero RPCs to Telegram |
-| Insert failure | per-row `failed` count, `ok=False`; no silent RAM fallback while Supabase is configured |
-| Pagination boundary | newest-first, exclusive `max_id` cursor; empty or short page ⇒ `end_reached=True`; cursor must strictly decrease (defensive stop) |
-| Scan budget exhausted | `hit_scan_limit=True` (end not confirmed) |
-| Record budget exhausted | `hit_record_limit=True`, collection stops |
-| Entity budget | >100 entities on one message ⇒ first 100 processed, `hit_entity_limit=True` |
+| Candidate emoji resolves with a set identity | its set is resolved once and members enter the library (dedup) |
+| Several candidates share one set | resolved/enumerated ONCE; the result reused for all of them |
+| Candidate document Telegram does not return | `unresolved_documents` + `degraded`; never guessed |
+| Document without custom-emoji attribute | excluded by the facade; counted unresolved |
+| Document without usable set identity | `documents_without_set` + `degraded`; never fabricated |
+| Set RPC rejected (e.g. `SET_ID_INVALID`, permissions) | enumeration for that import stops, `set_error` + `degraded`; already-resolved sets keep their members |
+| Set info missing | same as a set failure (honest, fail-closed) |
+| Member persistence failure | `set_failed` count; `ok=False` |
+| Set-member budget(s) exhausted | `hit_set_limit` / `hit_set_member_limit` + `degraded` |
+| Import with no new candidates | enrichment doesn't run at all (zero extra RPCs) |
+| Message-scan failure | enrichment never runs; NOTHING persists (existing fail-closed contract) |
 
-Bounds (caller values clamped to the hard caps):
+Bounds (callers clamped to the hard caps — enrichment-specific rows bold):
 
 | Bound | Default | Hard cap |
 |---|---|---|
-| messages scanned per import | 200 | 2000 |
-| page size | 50 | 200 |
-| new records per import | 500 | 5000 |
-| entities processed per message | 100 | — |
-| page fetch timeout | 15 s | 0.01–120 s |
-| durable dedup read | — | 5000 rows |
+| **documents resolved per import** | **all candidates** | **500 (10 chunks × 50)** |
+| **document ids per resolution RPC** | — | **50 (service) / 100 (facade hard guard)** |
+| **unique sets enumerated per import** | — | **20** |
+| **members processed per set** | — | **200** |
+| **new set-member records per import** | 500 | 2000 |
+| messages scanned / page size / records / entities / timeout | (unchanged Phase 1 bounds) | (unchanged) |
 
-Context isolation: the service imports nothing from `backend.ai` (verified
-by an AST import-audit test); no chat history, quoted-message context,
-conversation state, or interpretation is consulted. Architecture: no second
-client/loop/scheduler/executor, no forwarding path, no new router — pinned
-by source- and signature-level tests.
+No unbounded Telegram pagination exists anywhere in the path; every RPC is
+wrapped in the same bounded timeout as the scan and normalized
+(`asyncio.CancelledError` always re-raised).
 
-## 5. Tests executed and actual results
+---
 
-All commands run with the project venv (`/home/daytona/codebase/.venv`),
-exit statuses captured:
+## 5. UI behavior (Glass UI)
 
-1. `py_compile` on the three changed/added files → clean.
-2. `pytest tests/test_emoji_library_import.py -q` → **50 passed** (0.49s).
-   Coverage: valid record creation + exact Unicode alt preservation
-   (Persian/supplementary-plane spans), document-id validation, plain
-   Unicode + unrelated-entity exclusion, malformed payload fail-closed
-   (missing/bool/float/zero/negative id, bad offsets, out-of-range and
-   mid-surrogate spans, empty text), entity processing bound, Phase 0
-   serialization round-trip, first import + persistence (fallback path),
-   repeat-import idempotency, in-scan + durable dedup, deterministic
-   `max_id` pagination asserted call-by-call, scan/record/entity bounds +
-   clamping, empty history, inaccessible entries, collection API failure /
-   timeout / durable-read-abort / insert-failure honesty (incl. the
-   completeness invariant), faked-Supabase persistence path + exact insert
-   payload, fallback uniqueness + listing pagination, context isolation
-   (AST import audit), and architecture constraints (no second
-   client/loop/scheduler/executor, no forwarding, exact signature).
-3. `pytest tests/test_bridge_delivery.py tests/test_12_save_engine.py
-   tests/test_save_v2_telegram_sync.py
-   tests/test_telegram_chat_context.py -q` → **118 passed** (0.54s)
-   (Phase 0 regression + regression around the touched db/client surface).
-4. `pytest tests/ -q` from the worktree root → **5230 passed, 26 skipped**
-   (118.88s) = Phase 0 baseline 5180 + 50 new tests — no regressions.
-   (Note: the suite must run with the worktree root as cwd — its
-   source-inspection tests resolve `backend/…` paths relative to cwd.)
+| Surface | Behavior |
+|---|---|
+| Mother menu | new `😀 Emoji` row → `panel:emoji` |
+| `😀 Emoji` panel | library total (or honest `unknown`/empty text) + `⬇ Import` + `📚 Library` |
+| Import tap | runs the real bounded service; panel edits in place to the honest report (success `✓` / failed `✗` with reason / degraded `◌` with counters), then `↻ Import again` / `📚 Library` |
+| `📚 Library` | 2×5 browser, 10/page, clamp-safe ◀/page/pages/▶ pager, empty-state honest |
+| Entry tap | detail: alt text, document id, origin (`Saved Messages #id` / `Set scan`), added date; stale index ⇒ `Entry not found` honestly |
 
-## 6. Limitations / intentionally untouched / deferred
+Owner-only by the existing callback router (`is_owner` gate on every
+callback); no keyword/regex routing is involved — activation is a panel
+button only.
 
-- **No live Telegram verification** (import included): everything is faked
-  at the consumed Telethon surface (`iter_messages` async generator, real
-  `MessageEntityCustomEmoji` objects flowing through Phase 0
-  `serialize_message`). Saved Messages behavior, rate limits, and real
-  entity shapes are unverified live (ROADMAP §31 checklist remains open).
-- **No Supabase/live-DB verification**: no SQL executed, no migration
-  added, no live table touched — the `emoji_library` table does not exist
-  anywhere yet. Until the owner applies the §3 manual-only schema, a
-  configured Supabase will report `failed` inserts honestly (in-memory
-  fallback covers development when Supabase is not configured).
-- Sticker-set resolution/enumeration (§9), library browser panel, Glass UI
-  import report panel, categories/mappings/toggle/transformer/
-  reconstructor/reactions — NOT implemented (later phases).
-- No tool-registry entry and no handler wiring: the service is a dormant
-  extension point invoked by tests today (same posture as Phase 0's
-  bridge); AI never performs raw Telegram RPCs, and no command router was
-  added.
-- Supabase-path dedup relies on service-side classification under the
-  import lock plus the manual `UNIQUE (owner_id, document_id)` index as
-  backstop; libraries beyond the 5000-row dedup read depend on that index.
-- §34 owner decisions D (bridge capability) and E (mapping persistence
-  shape) remain OPEN; no decision was resolved silently.
-- **Intentionally untouched:** `DATABASE_ARCHITECTURE.md`, `AGENTS.md`,
-  `INVESTIGATION.md`, `supabase/migrations/`, `backend/telegram_api/*`
-  (Phase 0), `backend/bot/router.py` + all handlers, every `backend/ai/*`
-  module, and the outer repository checkout outside this worktree.
+---
 
-## 7. Git status
+## 6. Architecture / context isolation
 
-- Single commit on top of `ddfbb1a` in this worktree (branch `m14-stt`
-  tracking `origin/main`), containing exactly the five files in §2 —
-  inspected via `git status`/`git diff` before staging; no unrelated or
-  pre-existing changes included.
-- Delivered by pushing to `origin/main`; local HEAD verified equal to
-  `origin/main` and the working tree verified clean after the push (exact
-  SHAs recorded in the delivery report accompanying this change).
-- Verification before commit: focused tests (§4.2–4.3), full suite
-  (§4.4), `py_compile` (§4.1), `git diff --check` — all clean.
+- The service stays deterministic and context-isolated: no `backend.ai`
+  import (AST-audited in the Phase 1 tests, still green), no chat history,
+  no reply text, no sender info, no conversational inference, no AI.
+- No second Telegram API abstraction: the facade extends the existing
+  `backend/telegram_api` conventions; the UI reuses the self client from
+  `inline_engine` and the existing panel/callback machinery.
+- No second client, update loop, scheduler, executor, or repository was
+  added (asserted by source-level tests for BOTH new modules; the Glass UI
+  test file grep-scans `backend/bot/handlers/emoji.py` for forbidden
+  constructs — `TelegramClient`, `create_task`, `events.NewMessage`,
+  `forward_messages`, …).
+- Telegram RPCs bounded everywhere (facade guard + per-call timeout).
 
-## 8. Current phase / next phase
+---
 
-- **Current:** Phase 1 — Library & Import — message-level slice
-  IMPLEMENTED + TESTED (library storage, deterministic bounded import,
-  honest report, 50 focused tests + full suite green).
-- **Next:** Phase 1 remainder — sticker-set resolution/enumeration and the
-  Glass UI import report panel (ROADMAP §9), owner decisions §34-D/§34-E,
-  then Phase 2 — Categories & Mappings (§32).
+## 7. What was intentionally NOT implemented (later phases)
+
+Phase 2+ per ROADMAP §32: category CRUD, mapping editor/uniqueness/conflict
+UI, active category + replacement toggle, transformer/reconstructor/loop
+prevention, custom category composition, the reaction subsystem, §34-D/§34-E
+owner decisions. No replacement of messages happens in this change set; no
+AI tools were registered; no `set_id`/`set_short_name` persistence; no
+library deletion UI (deletion semantics are a §34-level decision).
+
+---
+
+## 8. Tests added (this change set)
+
+### 8.1 `tests/test_emoji_set_enumeration.py` — 27 tests
+
+Offline, at the REAL TL surface (`client(request)` + real
+`DocumentAttributeCustomEmoji` / `InputStickerSetID` / `InputStickerSetShortName`):
+
+- **Facade (11):** document resolution with id-based and short-name set
+  identities; absent document honestly missing; attribute-less document not
+  a custom emoji; unusable set identity ⇒ `set: None`; invalid-id dropping +
+  `MAX_DOCUMENTS_PER_CALL` clamping (single RPC asserted); API-error and
+  timeout normalization; set-member dict shape; unusable/unparseable set
+  reference rejection; set failure normalization.
+- **Service enrichment (10):** members collected as library records
+  (correct row shape incl. `source_msg_id=None`); one chunked resolution +
+  one enumeration for a shared set; duplicate classification (repeated
+  member / library hit / scan candidate); unresolved + setless counting;
+  enumeration failure reported-not-raised with partial results kept;
+  document-resolution failure stops cleanly; ≤ `MAX_SETS_PER_IMPORT` sets
+  with `hit_set_limit`; ≤ `MAX_SET_MEMBERS_PER_SET` per set; set-record
+  budget with its own flag; first-appearance-order determinism across runs.
+- **Import integration (6):** full run persists scan records + deduplicated
+  set members and satisfies the report invariant; repeat-run dedup
+  (including that no new candidates ⇒ no enrichment RPCs at all); degraded
+  report on enumeration failure while the scan record still persists;
+  degraded on unresolved documents; insert-failure visibility
+  (`ok=False`, `failed`/`set_failed` counts) against a failing faked
+  Supabase; scan failure still aborts before any persistence.
+
+### 8.2 `tests/test_emoji_ui.py` — 18 tests
+
+Offline, panels driven directly (no Telegram):
+
+- **Registration/menu (3):** panels `emoji`/`emoji_library`/`emoji_entry` +
+  `action:emoji_import` registered; mother menu carries `panel:emoji`;
+  every library-button callback ≤64 bytes.
+- **Main panel (2):** counters + actions; empty state offers the import.
+- **Library browser (5):** first page = exactly 10 entry buttons in a 2×5
+  grid + correct pager; second page shows the remainder + `page 2/2`;
+  out-of-range page clamps; empty state honest; missing alt text falls
+  back to `·`.
+- **Entry detail (3):** shows only what the row has (alt, id, Received-from
+  origin, date); set members honestly marked `Set scan`; stale index ⇒
+  `not found`.
+- **Import action + honesty (5):** success path runs the REAL service
+  (self-client faked at the TL boundary; a set member imported and counted
+  `+1`); degraded rendering (`◌` + enumeration failure text) is NOT a
+  success; missing self client fails honestly; report renderer covers
+  failure (`✗` + reason) and budget states (re-run nudge); source scan
+  proves no second client/loop/scheduler/forwarding in the UI module.
+
+### 8.3 Regression coverage
+
+`tests/test_emoji_library_import.py` (50) stays green — only its
+signature-pinning test was updated for the added optional `max_set_records`
+parameter (the importer guarantees it pins are unchanged). Phase 0
+(`tests/test_bridge_delivery.py`, 22) untouched and green.
+
+---
+
+## 9. Commands executed and actual results
+
+All commands run from the worktree root (`/home/daytona/codebase`) with the
+project venv; exit statuses captured:
+
+1. `py_compile` on all changed/added Python files (facade, service, handler,
+   router, misc, three test files) → **clean**.
+2. `pytest tests/test_emoji_library_import.py tests/test_emoji_set_enumeration.py
+   tests/test_emoji_ui.py tests/test_bridge_delivery.py -q` → **117 passed**
+   (0.50s) — Phase 1 focused + Phase 0 regression.
+3. `pytest tests/ -q` (full suite, worktree root as cwd) → **5275 passed,
+   26 skipped** (119.97s) = Phase 1 baseline 5230 + 45 new tests — no
+   regressions.
+4. `git diff --check` → clean.
+
+## 10. What was NOT tested / NOT verified
+
+- **Live Telegram verification: NOT performed.** Saved Messages scans, real
+  `GetCustomEmojiDocumentsRequest`/`GetStickerSetRequest` responses,
+  premium-set gating, flood/rate behavior, entity shapes on real sets, and
+  the inline Glass UI rendering are unverified live (ROADMAP §31 checklist
+  remains open; ROADMAP §33 blocker 3 stays open).
+- **Live Supabase verification: NOT performed.** No SQL executed, no
+  migration added, no live table touched. The `emoji_library` physical
+  table still does not exist anywhere; until the owner applies the §3
+  manual-only schema, a configured Supabase reports insert failures
+  honestly (set members included).
+- Mocks/fakes sit at the consumed Telethon surface (`client(request)` TL
+  boundary with real TL types, `client.iter_messages` async generator) —
+  by design, per the no-live-Telegram-tests requirement.
+
+## 11. Limitations / honest notes
+
+- Enrichment is BEST-EFFORT by contract: a Telegram-side set failure never
+  blocks the message-level import (the report distinguishes the two, and
+  `ok` stays truthful — only persistence failures and import aborts make it
+  `False`).
+- ≤500 candidate documents, ≤20 unique sets and ≤200 members per set are
+  per-import bounds (deliberately small, deterministic, and cheap);
+  larger collections arrive across repeated imports (the panel says so).
+- Set identity relies on REAL Telegram-provided `stickerset` references;
+  documents that genuinely lack one are counted, not fabricated.
+- The library browser shows alt text/id/origin/date only — set/category
+  metadata is not persisted (§3) and is therefore not shown (never
+  pretended).
+- The import panel reports counts and budgets in user-facing wording; raw
+  RPC names never surface (the report line keeps the service's one-line
+  failure reason, which is already plain-language).
+- Owners of large libraries will re-run Import to page through budgets;
+  auto-chaining budgets is deliberately deferred to keep behavior bounded
+  and predictable.
+
+## 12. Verification summary (explicit)
+
+- Automated verification: §9 (all green).
+- Live Telegram verification: **NOT performed.**
+- Live Supabase verification: **NOT performed.**
+
+## 13. Current phase / next phase
+
+- **Current:** Phase 1 — Library & Import — COMPLETE: message-level slice
+  (previous commit) + set resolution/enumeration + Glass UI import/report
+  panels + 2×5 library browser (this commit); 45 new tests; full suite
+  5275 passed, 26 skipped.
+- **Next:** Phase 2 — Categories & Mappings (ROADMAP §32), pending nothing
+  from Phase 1 except live validation, which remains the owner's §31
+  checklist. Phase 0 owner decisions §34-D/§34-E stay OPEN.
