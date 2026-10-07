@@ -33,6 +33,16 @@ _SIMPLE_ENTITY_TYPES = (
     "MessageEntitySpoiler", "MessageEntityBlockquote",
 )
 
+#: Every entity type the dict representation can carry through this layer.
+#: This is the authoritative support set: consumers that must fail closed on
+#: an entity they cannot rebuild (the Emoji & Reaction transformer, ROADMAP
+#: §22) check against it instead of guessing, and :func:`dict_entities_to_tl`
+#: refuses anything outside it.
+SUPPORTED_ENTITY_TYPES = frozenset(_SIMPLE_ENTITY_TYPES) | frozenset({
+    "MessageEntityTextUrl", "MessageEntityPre",
+    "MessageEntityCustomEmoji", "MessageEntityMentionName",
+})
+
 
 def utf16_length(text: str) -> int:
     """Length of ``text`` in UTF-16 code units — the unit Telegram uses for
@@ -205,6 +215,8 @@ async def dict_entities_to_tl(client: Any, entities: list[dict[str, Any]] | None
         etype = ent.get("type")
         offset = ent.get("offset", 0)
         length = ent.get("length", 0)
+        if etype not in SUPPORTED_ENTITY_TYPES:
+            raise TelegramAPIError(f"unknown entity type: {etype!r} ({ent})")
         if etype in simple:
             result.append(simple[etype](offset, length))
         elif etype == "MessageEntityTextUrl":

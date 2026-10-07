@@ -20,6 +20,7 @@ from backend.bot.handlers import (
     ai_stt_settings,
     ai_tts_settings,
     emoji,
+    emoji_replacement,
     tasks,
     taskloom,
     task_events,
@@ -104,6 +105,10 @@ def register_all(client, owner_id: int, tz_str: str):
         ("taskloom", lambda: taskloom.register(client, owner_id, tz_str)),
         ("task_events", lambda: task_events.register(client, owner_id, tz_str)),
         ("todo", lambda: todo.register(client, owner_id, tz_str)),
+        # The replacement pipeline runs LAST: every existing handler keeps its
+        # first claim on the owner's message, and only then is the message
+        # reconstructed (delivered + deleted) as the documented Phase 4 step.
+        ("emoji_replacement", lambda: emoji_replacement.register(client, owner_id)),
     ]
 
     for name, fn in handlers:

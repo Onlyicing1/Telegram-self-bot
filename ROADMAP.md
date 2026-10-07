@@ -15,11 +15,16 @@
 > the 2×5 library browser), Phase 2 (Categories & Mappings — §10 CRUD,
 > §11 mapping model + uniqueness, §12 conflict UI, §25 2×5 pagination), and
 > Phase 3 (State & Toggle — §13 active-category state, §14 replacement
-> toggle, §29 persistence + first-boot OFF) are IMPLEMENTED and unit-TESTED
-> (no live Telegram). Everything else below remains PLANNED. Schema files
-> are untouched: the `emoji_library`, `emoji_categories`, `emoji_mappings`,
-> `emoji_state` and `emoji_chat_overrides` tables are MANUAL-ONLY and have
-> not been executed anywhere (§29; exact schema in
+> toggle, §29 persistence + first-boot OFF), and Phase 4 (Reconstruction —
+> §15–§24: deterministic entity-safe transformer, send-first reconstruction
+> through the existing helper-bot bridge, same destination + reply
+> preservation, structural loop prevention) are IMPLEMENTED and unit-TESTED
+> (no live Telegram). Custom category (§26), reactions (§27), media/caption
+> reconstruction (§23) and the remaining validation items below remain
+> PLANNED. Schema files are untouched: the `emoji_library`,
+> `emoji_categories`, `emoji_mappings`, `emoji_state` and
+> `emoji_chat_overrides` tables are MANUAL-ONLY and have not been executed
+> anywhere; Phase 4 added NO table (§29; exact schema in
 > `IMPLEMENTATION_REPORT.md`).
 
 ---
@@ -67,9 +72,14 @@ Status: **PLANNED**.
 **Overall feature status: IN PROGRESS — Phase 0 (entity-aware serialization
 + send-only Bot bridge), Phase 1 (Emoji Library + deterministic Saved
 Messages import), Phase 2 (Categories & Mappings: CRUD, mapping editor,
-uniqueness, conflict UI, 2×5 pagination), and Phase 3 (State & Toggle:
+uniqueness, conflict UI, 2×5 pagination), Phase 3 (State & Toggle:
 replacement toggle, global default + per-chat override, resolution
-boundary) implemented and unit-tested; no end-to-end replacement flow yet.**
+boundary), and Phase 4 (Reconstruction: entity-safe transformation,
+send-first bridge delivery, same destination + reply preservation,
+structural loop prevention) implemented and unit-tested. The replacement
+pipeline now exists end to end for TEXT-only owner messages; media/caption
+reconstruction, custom composition, reactions and all live validation
+remain open.**
 
 The repository originally contained **no** emoji-substitution, premium-emoji
 library, or reaction feature (verified by grep across `backend/` and `tests/`
@@ -91,8 +101,15 @@ facade `backend/telegram_api/custom_emoji.py`, the Glass UI panels
 (`backend/services/emoji_category_service.py`, the `emoji_categories` /
 `emoji_mappings` functions in `backend/db/client.py`, the category/mapping
 panels in `backend/bot/handlers/emoji.py`, and the two test suites
-`tests/test_emoji_category_service.py`, `tests/test_emoji_ui_phase2.py`).
-No part of the feature has been verified against live Telegram.
+`tests/test_emoji_category_service.py`, `tests/test_emoji_ui_phase2.py`),
+the Phase 3 slice (`backend/services/emoji_state_service.py`, the
+`emoji_state` / `emoji_chat_overrides` functions in `backend/db/client.py`,
+the Replacement panels, `tests/test_emoji_state_phase3.py`), and the Phase 4
+slice (`backend/services/emoji_transformer.py`,
+`backend/services/emoji_replacement_service.py`,
+`backend/bot/handlers/emoji_replacement.py` registered through
+`backend/bot/router.py`, `tests/test_emoji_replacement_phase4.py`). No part
+of the feature has been verified against live Telegram.
 
 - [x] Premium emoji library — storage + deduplication (IMPLEMENTED, TESTED) + library browser panel (IMPLEMENTED, TESTED)
 - [x] Collection import — bounded entity-based Saved Messages scan + bounded set resolution/enumeration + Glass UI import/report panels (IMPLEMENTED, TESTED)
@@ -100,13 +117,13 @@ No part of the feature has been verified against live Telegram.
 - [x] Mapping UI — editor flow + list/edit/delete + 2×5 pagination (Phase 2, IMPLEMENTED, TESTED)
 - [x] Conflict handling — never-silent-overwrite + conflict panel with explicit Replace/Cancel (Phase 2, IMPLEMENTED, TESTED)
 - [x] Replacement toggle + active-category state (global default + per-chat override) + resolution boundary (Phase 3, IMPLEMENTED, TESTED)
-- [ ] Message reconstruction
-- [ ] Entity preservation
-- [ ] Bot bridge
-- [ ] Loop prevention
+- [x] Message reconstruction (Phase 4, IMPLEMENTED, TESTED — text-only messages; send-first ordering; media/caption reconstruction NOT implemented, such messages are left untouched)
+- [x] Entity preservation (Phase 4 transformer: UTF-16 rebasing, covering entities preserved, partial overlap/unknown type/unresolvable offsets fail closed — TESTED)
+- [x] Bot bridge (Phase 0 send-only module + Phase 4 delivery through it; live delivery NOT verified)
+- [x] Loop prevention (Phase 4: outgoing-only handler + bridge sender id + inline-bot origin + bounded in-memory registries — TESTED)
 - [ ] Custom category
 - [ ] Reactions
-- [x] Tests — offline suites at 5417 passed / 26 skipped (live verification NOT run)
+- [x] Tests — offline suites at 5490 passed / 26 skipped (live verification NOT run)
 - [ ] Documentation
 - [ ] Final verification
 
@@ -144,7 +161,9 @@ In scope for this feature:
 
 Out of scope: §4.
 
-Status: **PLANNED**.
+Status: **IN PROGRESS — items 1–10 are IMPLEMENTED + TESTED offline except
+Custom composition (item 10) and media/caption reconstruction (§23); item 11
+(reactions) is PLANNED.**
 
 ---
 
@@ -297,23 +316,25 @@ Status: **INVESTIGATED — VERIFIED against the current tree**.
 
 ## 6. Proposed Feature Architecture
 
-New modules (names are proposals; final names at implementation):
+Modules (the package names below were PROPOSALS; the implementation followed
+the established `backend/services/` convention instead of a new package, and
+`reactions.py` / `backend/ai/tools/emoji.py` do not exist — reactions are
+Phase 6 and no AI tool is planned for MVP):
 
 ```
-backend/emoji/                     # new feature package
-├── library.py                     # premium emoji library (library ownership)
-├── categories.py                  # category model + active-category state
-├── mappings.py                    # mapping model + conflict detection
-├── importer.py                    # Saved Messages collection import
-├── transformer.py                 # emoji-only transformation (entity-safe)
-├── reconstructor.py               # delete-original + bot-bridge delivery
-└── reactions.py                   # reaction subsystem (separate)
+IMPLEMENTED (actual paths):
+backend/services/emoji_library_service.py      # Saved Messages import + set enumeration
+backend/services/emoji_category_service.py     # categories & mappings
+backend/services/emoji_state_service.py        # toggle + active category + resolution
+backend/services/emoji_transformer.py          # emoji-only transformation (entity-safe, PURE)
+backend/services/emoji_replacement_service.py  # reconstruction: resolve → transform → send → delete
+backend/bot/handlers/emoji.py                  # Glass UI panels (library/categories/mappings/replacement)
+backend/bot/handlers/emoji_replacement.py      # the single outgoing replacement handler
+backend/telegram_api/bridge.py                 # send-only helper-bot delivery (§17)
+backend/telegram_api/_helpers.py               # entity serialization + UTF-16 helpers (§22)
 
-backend/services/emoji_service.py  # business logic facade (handlers/tools call this)
-backend/telegram_api/reactions.py  # typed SendReactionRequest wrapper
-backend/telegram_api/entities.py   # extend entity-aware serialization (§22 gap)
-backend/bot/handlers/emoji.py      # Glass UI panels (library/categories/mappings/toggle)
-backend/ai/tools/emoji.py          # optional AI-facing tools (ToolRegistry only)
+PLANNED:
+backend/telegram_api/reactions.py              # typed SendReactionRequest wrapper (§27, Phase 6)
 ```
 
 Flow (panel-driven MVP; AI optional and only via existing ToolRegistry):
@@ -343,10 +364,13 @@ Explicit constraint compliance:
 - One scheduler remains (`backend/profile/scheduler.py`); this feature adds
   none.
 - No keyword/regex intent routing: activation is explicit (panel toggle +
-  active category), and message detection is structural (emoji codepoint →
-  mapping lookup), not linguistic.
+  active category), and message detection is structural (exact mapping-key
+  match — the owner's own configured table), not linguistic.
 
-Status: **PLANNED**.
+Status: **IMPLEMENTED + TESTED (offline).** Phase 4 kept the flow above
+exactly: one outgoing handler on the existing self-client update path, the
+Phase 3 resolution boundary, a pure transformer, the existing send-only
+bridge, and the bridge bot's sender id for loop prevention.
 
 ---
 
@@ -414,7 +438,10 @@ Schema/SQL files and `DATABASE_ARCHITECTURE.md` remain untouched by this
 roadmap.
 
 Status: **IN PROGRESS — library entries + categories + mappings + runtime
-state IMPLEMENTED and TESTED offline (runtime state = Phase 3).**
+state IMPLEMENTED and TESTED offline (runtime state = Phase 3). Phase 4
+added no stored concept: the effective category's mappings are resolved at
+message time (reference → library entry), and reconstruction keeps nothing
+durable — the loop-prevention registries are bounded in-memory maps.**
 
 ---
 
@@ -613,19 +640,21 @@ owner sends outgoing message with emoji
           → loop guard marks/recognizes the bot's message (§24)
 ```
 
-- [ ] Handler wiring: outgoing-only self-client handler (extend router registration; no new update loop)
-- [ ] Determination of "has mapped emoji" BEFORE any destructive step (delete only after the new content is fully prepared)
-- [ ] Atomic-ish sequencing with honest failure reporting (§28): if the bot send fails, the original must NOT be deleted first — send-then-delete or optimistic ordering with rollback semantics must be decided (§34)
-- [ ] New message must carry the transformed entities (§17/§22)
-- [ ] Reply threading: new message must reply to the same target the original replied to, where the destination permits (§23)
+- [x] Handler wiring: outgoing-only self-client handler (`backend/bot/handlers/emoji_replacement.py`, registered LAST through `backend/bot/router.py`; no new update loop)
+- [x] Determination of "has mapped emoji" BEFORE any destructive step — the transformation runs first, and nothing is sent or deleted when no mapped emoji is present (`STATUS_NO_EMOJI`)
+- [x] Sequencing with honest failure reporting (§28): the new message is delivered FIRST and the original is deleted only afterwards (`STATUS_REPLACED` / `STATUS_REPLACED_UNDELETED` / `STATUS_FAILED`; a failed send leaves the original untouched)
+- [x] New message carries the transformed entities (§17/§22) — rebuilt into TL entities by the bridge
+- [x] Reply threading: the new message replies to the same target the original replied to when that target exists
 
-Ordering decision needed (§34): **send-new-first then delete-original**
-(fails safe — worst case is a duplicated message) vs **delete-then-send**
-(worst case is message loss). Default proposal: send-first, then delete;
-on send failure, leave the original untouched and report the error to the
-owner.
+Ordering (implemented default proposal, §34-B still OPEN for owner
+confirmation): **send-new-first then delete-original**. A failed delivery
+leaves the original untouched and logs an honest outcome; a failed deletion
+after a successful delivery is reported as an honest duplicate
+(`replaced_undeleted`) — never a clean success, never a lost message.
 
-Status: **PLANNED**.
+Status: **IMPLEMENTED + TESTED (offline, text-only).** Live reconstruction
+was NOT verified. Media/caption reconstruction (§23) is NOT implemented —
+a media message is left untouched.
 
 ---
 
@@ -633,32 +662,33 @@ Status: **PLANNED**.
 
 Strict product invariant: **ONLY emojis may change.**
 
-Must be preserved as faithfully as Telegram allows:
+- [x] Ordinary text (byte-identical outside replaced emoji spans — the transformer copies every untouched slice verbatim)
+- [x] Text order and whitespace (replacements are in-place span rewrites, left to right)
+- [x] All Telegram entities the dict representation supports: bold, italic, underline, strikethrough, spoiler, code, pre, blockquote, text links, mentions, mention-name, and custom-emoji entities already present in the original (the transformer fails closed on any type outside the supported set)
+- [x] Entity offsets recomputed in UTF-16 units **only** by the span delta, never by naive re-chunking (pinned by mixed-script tests)
+- [ ] Captions (media captions carry their own entities — same rules apply) — NOT implemented: media messages are skipped entirely (§23)
+- [x] Media is never rewritten — a media message is left untouched (§23)
+- [x] Reply information (the new message replies to the original's reply target when present, §18)
+- [x] No generic text rewrite; no global string replace (§4) — only exact mapping-key spans change
 
-- [ ] Ordinary text (byte-identical outside replaced emoji spans)
-- [ ] Text order and whitespace (replacements are in-place span rewrites)
-- [ ] All Telegram entities: bold, italic, underline, strikethrough, spoiler, code, pre, blockquote, text links, text mentions, custom-emoji entities already present in the original
-- [ ] Entity offsets recomputed **only** where a replacement changes span length, never by naive re-chunking
-- [ ] Captions (media captions carry their own entities — same rules apply)
-- [ ] Media (message media untouched; transformation is text/entity-layer only)
-- [ ] Reply information (new message replies to the original's reply target where possible, §23)
-- [ ] No generic text rewrite; no global string replace (§4)
+Implementation stance (as implemented): the transformer operates on the
+parsed entity list (`text` + serialized `entities`) as the source of truth
+(`backend/services/emoji_transformer.py`, pure and Telegram-free); a naive
+`str.replace` on message text is nowhere in the code because it would
+corrupt entity offsets.
 
-Implementation stance: operate on the parsed entity list (`text` +
-`entities`) as the source of truth; a naive `str.replace` on message text is
-expressly forbidden as the final architecture because it corrupts entity
-offsets.
-
-Known Telegram-level limits to be documented at implementation (not silently
-dropped):
+Known Telegram-level limits (documented, not silently dropped):
 
 - Custom emoji entities (`MessageEntityCustomEmoji`) require the sender to
-  have the right to use them (§28 capability constraint).
+  have the right to use them (§28 capability constraint, §34-D). The bridge
+  sends the transformed entities as-is; a server rejection becomes an honest
+  failure and the original stays untouched — there is NO alt-text fallback
+  and no entitlement probing.
 - Some properties are not transferable across a delete+re-send at all
   (e.g. exact original timestamp, message id, service metadata) — listed in
   §23 rather than silently changed.
 
-Status: **PLANNED**.
+Status: **IMPLEMENTED + TESTED (offline).**
 
 ---
 
@@ -682,69 +712,81 @@ Consequences and open options (decision required, §34):
    through some mechanism, can carry premium emoji is **Unknown — requires
    implementation/investigation**. No path may be assumed.
 3. **Graceful degradation** — if the bridge bot lacks the capability, the
-   reconstructor must fall back to sending the emoji's **alt text** (a normal
-   glyph) instead of silently dropping or erroring; the owner must be able
-   to see which mode is active.
+   reconstructor could fall back to sending the emoji's **alt text** (a
+   normal glyph). **NOT implemented in Phase 4:** the reconstruction attempt
+   surfaces a server rejection as an honest failure and leaves the original
+   untouched; no fallback content is ever fabricated and no entitlement is
+   probed. Choosing a degradation mode remains an owner decision (§34-D).
 
 Bridge requirements:
 
 - [x] Bridge sender = the existing helper bot client (`backend/helper/client.py`) — implemented in `backend/telegram_api/bridge.py`; no dedicated second bot token added (§34-C default honored)
 - [x] Bridge has NO update loop, NO handler registration (send-only by construction)
 - [x] Bounded-timeout send path consistent with `backend/telegram_api` conventions (`guarded_await`, normalized exceptions) — unit-tested
-- [ ] Rate/flood handling (Telethon `flood_sleep_threshold` already configured on helper; verify adequacy under real replacement traffic)
+- [ ] Rate/flood handling (Telethon `flood_sleep_threshold` already configured on helper; verify adequacy under real replacement traffic) — open; a flood/rate rejection currently surfaces as an honest failed reconstruction, and owner-visible surfacing of it is NOT implemented
 - [x] Destination resolution identical to the original message's chat (§18) — peer resolved through the SELF client, unit-tested; live delivery NOT verified
+- [x] The reconstruction service delivers through this bridge as its ONLY delivery path (`send_reconstructed`), and treats a rejection as an honest failure
 
 Status: **IN PROGRESS — send-only bridge module IMPLEMENTED and unit-TESTED
-(`backend/telegram_api/bridge.py`, `tests/test_bridge_delivery.py`); live
-delivery NOT verified; capability decision (§34-D) still OPEN.**
+(`backend/telegram_api/bridge.py`, `tests/test_bridge_delivery.py`) and now
+USED by the Phase 4 reconstruction service; live delivery NOT verified;
+capability decision (§34-D) still OPEN.**
 
 ---
 
 ## 18. Same-Destination Delivery
 
-- [ ] New message is sent to the exact chat the original lived in (peer id preserved from the outgoing event)
-- [ ] Destination types must be enumerated at implementation: private chats, groups, supergroups, channels (owner-posted), Saved Messages itself — Unknown — requires implementation/investigation for bot send-permission differences per type (e.g. bot must be a member; channels need post rights)
-- [ ] Reply-to preserved: new message replies to the original's `reply_to_msg_id` when present (and when the bot can reply in that chat)
-- [ ] Media messages: bot re-sends media with caption entities transformed (§23) — mechanism (re-upload via bot vs URL/file handoff) decided at implementation
-- [ ] Silent/notification behavior decided at implementation (default: normal send, no silent flag)
+- [x] New message is sent to the exact chat the original lived in (the chat id from the outgoing event is handed straight to the bridge, which resolves the peer through the self client)
+- [ ] Destination types must be enumerated at implementation: private chats, groups, supergroups, channels (owner-posted), Saved Messages itself — Unknown — requires implementation/investigation for bot send-permission differences per type (e.g. bot must be a member; channels need post rights). A missing permission surfaces as an honest `STATUS_FAILED`, and the original survives
+- [x] Reply-to preserved: the new message replies to the original's `reply_to_msg_id` when present
+- [ ] Media messages: bot re-sends media with caption entities transformed (§23) — NOT implemented; media messages are left untouched
+- [x] Silent/notification behavior: normal send, no silent flag
 
-Status: **PLANNED**.
+Status: **IN PROGRESS — text-only same-destination delivery + reply
+preservation IMPLEMENTED + TESTED (offline); destination-type permissions
+and media remain open; live delivery NOT verified.**
 
 ---
 
 ## 19. User-Authored-Message Authorization Boundary
 
-- [ ] Replacement processes ONLY messages authored by the owner (`msg.out is True` on the self-client, matching the existing outgoing-only handler pattern in `backend/bot/handlers/ai_unified.py` + `is_owner`)
-- [ ] Messages from other users are never transformed, deleted, or touched
-- [ ] The bot bridge sends only to destinations where the owner authored the original message; it never initiates sends on its own
-- [ ] Owner-only configuration surface (all panels behind `is_owner`)
+- [x] Replacement processes ONLY messages authored by the owner (`is_owner` gate in the handler + `out is True` and `sender_id == owner_id` re-proven in the service before any work)
+- [x] Messages from other users are never transformed, deleted, or touched (any other author — including the bridge bot — is a skip with no side effect; pinned by tests)
+- [x] The bot bridge sends only to destinations where the owner authored the original message; it never initiates sends on its own
+- [x] Owner-only configuration surface (all panels behind `is_owner`)
 
 Note: deletion of the original is possible because the self-client deletes
 its own message; bot accounts cannot delete other accounts' messages — this
-aligns naturally with the boundary above.
+aligns naturally with the boundary above, and Phase 4 deletes through the
+existing self-client Telegram facade only.
 
-Status: **PLANNED**.
+Messages authored by the owner but sent THROUGH an inline bot (the Glass UI
+panel machinery, `via_bot_id` set) and messages the owner is typing into a
+panel input flow are structurally excluded — the UI machinery is not
+content.
+
+Status: **IMPLEMENTED + TESTED (offline).**
 
 ---
 
 ## 20. Multi-Emoji Replacement
 
-- [ ] All mapped simple emojis in one message are transformed in the SAME reconstruction (one delete + one send, never N sends)
-- [ ] Example contract: `🫪 hello 🗣️ 👋` with 🫪→X and 🗣️→Y mapped ⇒ X hello Y 👋 (👋 untouched if unmapped)
-- [ ] Overlapping/adjacent emoji handling defined at implementation (codepoint spans are disjoint by construction; verify with combined sequences/ZWJ emojis — Unknown — requires implementation/investigation for grapheme-cluster vs codepoint spans)
-- [ ] Same simple emoji appearing multiple times maps consistently in one message
+- [x] All mapped simple emojis in one message are transformed in the SAME reconstruction (one delete + one send, never N sends)
+- [x] Example contract: `🫪 hello 🗣️ 👋` with 🫪→X and 🗣️→Y mapped ⇒ X hello Y 👋 (👋 untouched if unmapped) — pinned by tests
+- [x] Overlapping/adjacent handling: spans are disjoint by construction — the LONGEST mapping key wins at each position and the scan continues after it, so ZWJ / combined sequences are handled as the owner's exact key; the replacement count is bounded (`MAX_REPLACEMENTS`, fail closed beyond it)
+- [x] Same simple emoji appearing multiple times maps consistently in one message
 
-Status: **PLANNED**.
+Status: **IMPLEMENTED + TESTED (offline).**
 
 ---
 
 ## 21. Unmapped Emoji Behavior
 
-- [ ] Unmapped emojis (any emoji not in the active category's mapping table) pass through byte-identical, including their entity spans
-- [ ] No logging/telemetry requirement to record unmapped emojis (keep behavior silent by default)
-- [ ] Mixed mapped+unmapped in one message handled per §20
+- [x] Unmapped emojis (any emoji not in the active category's mapping table) pass through byte-identical, including their entity spans
+- [x] No per-emoji logging/telemetry; behaviour stays silent (the pipeline logs one structured outcome per processed message)
+- [x] Mixed mapped+unmapped in one message handled per §20
 
-Status: **PLANNED**.
+Status: **IMPLEMENTED + TESTED (offline).**
 
 ---
 
@@ -754,24 +796,25 @@ The `backend/telegram_api/_helpers.py::serialize_message` entity gap
 (described in §5.4) was the prerequisite for this invariant. Status:
 
 - [x] Entity-aware message representation — IMPLEMENTED in `backend/telegram_api/_helpers.py`: `serialize_message` now emits an `entities` list (UTF-16 offsets/lengths as Telegram sent them, plus url / document_id / user_id / language payload), `utf16_length` / `utf16_offset` / `utf16_index_at` helpers, and `dict_entities_to_tl` (dict → TL rebuild for sending; unknown types and missing payloads raise, never silently dropped). Pinned by `tests/test_bridge_delivery.py`
-- [ ] Transformer operates on (text, entities) tuples; produces new (text, entities) with correct UTF-16 offsets after span replacement
-- [ ] Unit tests with mixed scripts (emoji + Persian + Latin) pinning offset correctness — see §30
-- [ ] Existing `font_style.py` already solves UTF-16-width issues for the Glass UI font (see `backend/helper/font_style.py`); reuse its analysis where applicable rather than duplicating
+- [x] Transformer operates on (text, entities); produces new (text, entities) with correct UTF-16 offsets after span replacement (`backend/services/emoji_transformer.py`)
+- [x] Unit tests with mixed scripts (emoji + Persian + Latin) pinning offset correctness — see §30
+- [x] `SUPPORTED_ENTITY_TYPES` (`backend/telegram_api/_helpers.py`) is the single source of truth for what can be rebuilt; the transformer fails closed on anything outside it instead of guessing
+- [x] Existing `font_style.py` analysis (UTF-16 width handling for the Glass UI font) was not duplicated — the transformer reuses the Phase 0 UTF-16 helpers
 
-Status: **IN PROGRESS — serialization prerequisite IMPLEMENTED + TESTED; the
-transformer itself remains PLANNED.**
+Status: **IMPLEMENTED + TESTED (offline).**
 
 ---
 
 ## 23. Media/Caption Handling
 
-- [ ] Text-only messages: covered by §15–§22
-- [ ] Media + caption: transform caption entities; media itself re-sent unchanged by the bridge (mechanism TBD at implementation: bot re-upload from downloaded buffer — reusing the Deep-Save download/upload machinery pattern in `backend/services/save_service.py` — vs. passing a Telegram file reference; Unknown — requires implementation/investigation for cross-account file reference reuse)
-- [ ] Media without caption: replacement applies only if the message contains transformable text — none ⇒ message untouched (no point reconstructing)
+- [x] Text-only messages: covered by §15–§22
+- [ ] Media + caption: transform caption entities; media itself re-sent unchanged by the bridge (mechanism TBD: bot re-upload from downloaded buffer — reusing the Deep-Save download/upload machinery pattern in `backend/services/save_service.py` — vs. passing a Telegram file reference; Unknown — requires implementation/investigation for cross-account file reference reuse). **NOT implemented: a media message (with or without caption) is left untouched (fail closed).**
+- [ ] Media without caption: replacement applies only if the message contains transformable text — none ⇒ message untouched (no point reconstructing) — trivially satisfied today because media never enters the pipeline
 - [ ] Properties NOT preservable through delete+bot-re-send (documented limitation, not silent): original timestamp, original message id, service-side metadata (e.g. via-inline-bot origin), possibly view counts in channels; the roadmap records this so the product decision is explicit
-- [ ] Reply threading preservation where the destination permits (§18)
+- [x] Reply threading preservation where the destination permits (§18)
 
-Status: **PLANNED**.
+Status: **IN PROGRESS — the text path is IMPLEMENTED + TESTED (offline);
+media and captions are explicitly NOT reconstructed (fail closed).**
 
 ---
 
@@ -780,13 +823,15 @@ Status: **PLANNED**.
 First-class requirement: the bot's replacement message must never be
 reprocessed.
 
-- [ ] Marking strategy decided and implemented (candidates: prefix/sentinel marker entity, message metadata, or — preferred — structural recognition: the bridge's own messages are recognizable by sender_id == helper bot id in the destination chat; the self-client handler must skip messages whose sender is the bridge bot)
-- [ ] Sender-based suppression: `sender_id == helper.get_bot_id()` ⇒ never processed (mirrors how the codebase already distinguishes helper/self identities)
-- [ ] Marker/sentinel option evaluated against visibility cost (a visible marker would leak the mechanism to other chat members — likely unacceptable; structural sender check preferred)
-- [ ] Loop test in the test plan (§30): bot message must not trigger a second reconstruction
-- [ ] Also covers the self-client's own echo of the bot's message (it arrives as an incoming event for the self-client — not outgoing — so the outgoing-only handler structurally ignores it; keep this as an asserted invariant)
+- [x] Marking strategy decided and implemented: structural only — outgoing-only handler + `sender_id == helper.get_bot_id()` suppression + inline-bot origin exclusion + bounded in-memory registries of the messages this pipeline produced / already reconstructed
+- [x] Sender-based suppression: `sender_id == helper.get_bot_id()` ⇒ never processed (checked before anything else in the service)
+- [x] Marker/sentinel option rejected: no visible marker is ever added to a message (the mechanism never leaks to chat members)
+- [x] Loop test in the test plan (§30): a reconstructed message must not trigger a second reconstruction — pinned by tests (sender id, recorded id, duplicate original)
+- [x] Also covers the self-client's own echo of the bot's message (it arrives as an incoming event for the self-client — not outgoing — so the outgoing-only handler structurally ignores it; asserted as an invariant)
+- [x] The registries are bounded (`GUARD_MAX` entries, `GUARD_TTL_S` TTL) and in-memory only — no durable loop state, no second listener
 
-Status: **PLANNED**.
+Status: **IMPLEMENTED + TESTED (offline); §24-G owner confirmation still
+OPEN.**
 
 ---
 
@@ -853,13 +898,15 @@ Capability constraints (documented, not ignored):
 
 Failure-handling requirements:
 
-- [ ] Send-first-then-delete ordering (§15 proposal) so a bot-send failure never destroys the original
-- [ ] Every Telegram/DB call bounded and normalized (existing `guarded_await` + `TelegramAPIError` conventions)
-- [ ] Honest result strings (no fake success) — mirrors `execute_save` honesty rules
-- [ ] Flood/rate errors surfaced to the owner; no silent drops
-- [ ] DB unavailability: feature state follows the established in-memory-fallback degradation contract (`AGENTS.md` §8) with visible degradation labeling where state is displayed
+- [x] Send-first-then-delete ordering (§15 proposal) so a bot-send failure never destroys the original
+- [x] Every Telegram/DB call bounded and normalized (existing `guarded_await` + `TelegramAPIError` conventions — the bridge and the delete facade are the only Telegram calls this pipeline makes)
+- [x] Honest result strings (no fake success) — mirrors `execute_save` honesty rules; every outcome is a status (`skipped_*` / `replaced` / `replaced_undeleted` / `failed`) with an error reason when it is not a clean success
+- [ ] Flood/rate errors surfaced to the owner; no silent drops — a rejected delivery becomes an honest `failed` outcome, but OWNER-VISIBLE surfacing is NOT implemented (no new notification surface in this phase; a structured log line is all that exists)
+- [x] DB unavailability: feature state follows the established in-memory-fallback degradation contract (`AGENTS.md` §8); a failed mapping read/incomplete listing fails the message closed instead of replacing part of it
+- [x] No fabricated success ever: when nothing was replaced the pipeline reports a `skipped_*` outcome and produces no side effect
 
-Status: **PLANNED**.
+Status: **IN PROGRESS — the §15/§28 failure semantics are IMPLEMENTED + TESTED
+(offline); owner-visible failure surfacing remains open.**
 
 ---
 
@@ -871,10 +918,12 @@ Follows existing patterns (no schema invented here; actual SQL manual, later):
 - [x] Library persisted via the `db/client.py` Supabase-or-in-memory-fallback pattern (Phase 1: `emoji_library` functions; a failed durable dedup read returns `None` so import fails closed — RAM is never silently presented as durable; physical table MANUAL-ONLY, schema in `IMPLEMENTATION_REPORT.md`)
 - [x] Categories/mappings persisted via the same pattern (Phase 2: dedicated `emoji_categories` / `emoji_mappings` tables following the identical Supabase-or-fallback sync pattern SAME as the library; my durable-write failure paths report None/-1/False so the service can fail closed and the UI shows honest unknown/degraded states; creation of the physical tables is manual/out of scope here)
 - [x] Durable-vs-fallback behavior stays honest (Phase 3: a failed durable write reports False and the UI renders nothing-changed; a failed read reports unset so replacement fail-closes OFF; no RAM state is ever presented as durable) — full `config_store`-style labeling keys remain unused
-- [ ] New env vars (if any, e.g. a dedicated bridge bot token) follow `config.py` optional-var conventions; default must keep the feature disabled/inert
-- [x] Feature flag default: Emoji Replacement OFF on first boot (Phase 3; pinned by tests)
+- [x] New env vars: NONE added in Phase 4 — the bridge keeps reusing the existing optional helper bot (`BOT_TOKEN`), and the pipeline is inert unless the owner turns the toggle ON and a category resolves (no new config surface, no new table)
+- [x] Feature flag default: Emoji Replacement OFF on first boot (Phase 3; pinned by tests; Phase 4 consumes the same boundary)
 
-Status: **IN PROGRESS — Phase 3 state persistence IMPLEMENTED/TESTED; bridge config + env vars remain with later phases.**
+Status: **IN PROGRESS — Phase 3 state persistence + Phase 4 (no new
+persistence) IMPLEMENTED/TESTED; a dedicated bridge token remains a §34-C
+owner option.**
 
 ---
 
@@ -887,11 +936,11 @@ registry/executor patterns like `tests/test_provider_tool_boundary.py` and
 - [x] **Phase 0 slice (done):** `tests/test_bridge_delivery.py` — 22 tests pinning UTF-16 helpers (incl. mid-surrogate `ValueError`), entity serialization round-trip, dict→TL rebuild (incl. fail-closed unknown/missing payload and mention-name resolution through the target client), bridge same-destination send via the helper bot, send-failure honesty, empty-message refusal, unavailable-bot error, timeout normalization. Full suite at this commit: **5180 passed, 26 skipped** (baseline at the merged remote state: 5158 passed — no regressions).
 - [x] **Phase 1 slice (done):** `tests/test_emoji_library_import.py` — 50 tests pinning extraction from the Phase 0 serialized representation (valid records, UTF-16 alt preservation incl. Persian/supplementary text, plain-Unicode + unrelated-entity exclusion, malformed document-id/offset/span fail-closed, entity processing bound), import semantics (first import, repeat idempotency, in-scan + durable dedup, call-by-call deterministic `max_id` pagination, scan/record/entity bounds, empty history, inaccessible entries), failure honesty (collection error, page timeout, durable-read abort before scan, insert-failure counts, completeness invariant), persistence (in-memory fallback + faked Supabase path, uniqueness, pagination), context isolation (AST import audit — no `backend.ai`), architecture constraints (no second client/loop/scheduler/executor, no forwarding, exact signature), and a Phase 0 serialization round-trip.
 - [x] **Phase 1 remainder (done):** `tests/test_emoji_set_enumeration.py` — 27 tests pinning the facade (`{document_id, alt, set}` resolution through REAL Telethon TL types incl. id/short-name identities, honest absence/setless/unattributed documents, invalid-id dropping + per-call clamping, error/timeout normalization, set-member dict shape, unusable-identity rejection) and the service enrichment (chunked one-batch resolution, one enumeration per shared set, duplicate classification vs scan/library/members, unresolved/setless counters, failed-vs-clean stages, ≤20-set and ≤200-member bounds, set-record budget, first-appearance-order determinism, and the full-import integration: scan records + deduplicated set members persisted, repeat-run dedup incl. the no-new-candidates path, degraded report on enumeration failure, unresolved documents, insert-failure visibility, and fail-closed scan abort). `tests/test_emoji_ui.py` — 18 tests pinning the Glass UI (registration, mother-menu link, bounded callback data, main-panel counters, 2×5 browser + second page + page clamp + empty/alt-fallback honesty, entry detail incl. honest set-scan marking and stale-index failure, import action over the REAL service with success/degraded/no-client honesty, report renderer failure/budget lines, and a no-second-infrastructure source scan).
-- [ ] Transformer unit tests: emoji-only rewrite; entity offsets (UTF-16) preserved/recomputed correctly across mapped spans; mixed-script cases (emoji + Persian + Latin); unmapped passthrough; multi-emoji single-pass (§20/§21/§22)
-- [ ] Reconstruction flow tests: fake self-client + fake bridge client; assert delete called only after prepared send succeeds; same-destination assertion; reply-to propagation (§15/§18)
-- [ ] Authorization tests: non-owner-authored message never processed; incoming events never processed (§19)
-- [ ] Loop-prevention tests: bot-sender message never reprocessed (§24)
-- [ ] Mapping service tests: uniqueness enforcement; conflict detection returns current+new visuals data; replace only on explicit confirm (§11/§12)
+- [x] Transformer unit tests: emoji-only rewrite; entity offsets (UTF-16) preserved/recomputed correctly across mapped spans; mixed-script cases (emoji + Persian + Latin); unmapped passthrough; multi-emoji single-pass (§20/§21/§22) — `tests/test_emoji_replacement_phase4.py`
+- [x] Reconstruction flow tests: fake self-client + fake bridge client; assert the original is deleted only after the delivery succeeds (and never when it fails); same-destination assertion; reply-to propagation (§15/§18) — same suite
+- [x] Authorization tests: non-owner-authored message never processed; incoming events never processed; inline-bot-origin and bridge-bot-authored messages never processed (§19) — same suite
+- [x] Loop-prevention tests: bot-sender message never reprocessed; a recorded reconstruction cannot re-enter; an original is never reconstructed twice (§24) — same suite
+- [x] Mapping service tests: uniqueness enforcement; conflict detection returns current+new visuals data; replace only on explicit confirm (§11/§12)
 - [x] **Phase 3 slice (done):** `tests/test_emoji_state_phase3.py` — 46 tests pinning the state layer (first-boot default OFF; toggle ON/OFF persist-and-load through the db abstraction; flip semantics; invalid-owner refusal; global default set/nonexistent-rejected/foreign-rejected/cleared; per-chat override set/cleared/nonexistent-rejected/foreign-rejected/per-chat independence; resolution order override > global > none; fallback after clear; no-state → none; OFF ⇒ no resolution despite categories; global used in other chats and for unknown chats; deleted global AND override category fail closed; owner isolation on every read/write; degraded write → False + state unchanged, degraded read → unset/OFF; UI registration, main-panel state line, full-state + effective rendering, no fabricated target chat + per-chat actions withheld without one, honest OFF effective-none, toggle/choose/clear actions mutate only their intended scope, foreign-category choose rejected, owner-scoped picker, empty-library prompt, ≤64-byte callback bounds, engine-owner scoping; architecture: AST import audit (no `backend.ai`), no second client/loop/scheduler/executor/forwarding/events.NewMessage, no Phase 4 surface (transform/reconstruct/delete_original/bridge_send), Telegram-free resolution)
 - [x] Category resolution tests: override > default > none (§13)
 - [x] Toggle tests: OFF ⇒ no replacement at the resolution boundary (§14; the zero-Telegram-calls form is completed with Phase 4's outgoing handler)
@@ -900,9 +949,10 @@ registry/executor patterns like `tests/test_provider_tool_boundary.py` and
 - [x] Pagination tests: 10-per-page slicing, page clamp, callback-data bound, second-page remainder (§25 library browser — plus Phase 2: categories grid, mappings list, picker, in `tests/test_emoji_ui_phase2.py`)
 - [ ] Custom composition tests: references not duplicates; propagation semantics per §26 decision
 - [ ] Reaction wrapper tests: bounded timeout, exception normalization, payload correctness (§27)
-- [x] Full-suite gate: keep the whole suite green on every slice (latest run at this commit: **5417 passed, 26 skipped** — Phase 2 baseline 5371 + 46 new)
+- [x] **Phase 4 slice (done):** `tests/test_emoji_replacement_phase4.py` — 73 tests pinning the transformer (single/multiple mapped spans, same-key consistency, unmapped passthrough, ordinary text untouched, no mappings ⇒ no change, determinism, longest-key-wins on a ZWJ sequence, replacement bound, caller inputs never mutated), entity safety (covering bold preserved and recomputed in UTF-16 units for longer/shorter alt text, mixed Persian/Latin offset shifts, entity payload preservation, existing custom-emoji entities never rewritten, partial-overlap / unsupported-type / out-of-range / mid-surrogate / empty-text fail-closed cases, unusable mapping entries dropped), the resolution boundary (only `resolve_effective_category` is called; OFF / no category / deleted category ⇒ no side effect; the service never re-implements resolution), reconstruction (global default and per-chat override driving delivery, same destination, reply preserved and absent, custom-emoji + bold entities reaching the bridge, media skipped, unsafe combinations skipped), failure honesty (bridge unavailable, delivery rejection with exactly ONE attempt — no alt-text retry —, delete failure ⇒ `replaced_undeleted`, no message id returned, incomplete mapping listing), the owner boundary (foreign author, non-outgoing, invalid owner, inline-bot origin, bridge-bot author, pending panel input with a different chat still processed, empty text, unusable ids), loop prevention (a reconstructed message cannot re-enter, registry blocks the owner identity, no double reconstruction, bounded registries, TTL expiry, in-memory only), the handler (exactly one outgoing listener, non-owner ignored, owner message passed through with `via_bot_id`, service errors swallowed, cancellation re-raised, the router registers it last) and architecture (AST import audit — no `backend.ai`, no scheduler/supervisor/task-guard/executor/inline-engine imports; no `TelegramClient`/`create_task`/`immortal_create_task`/`forward_messages`/`asyncio.Lock`; no `events.` in the service or transformer; no regex/keyword routing; no Phase 5/6 surface; deletion through the existing facade; one end-to-end path with the real serializer + transformer + bridge + delete).
+- [x] Full-suite gate: keep the whole suite green on every slice (latest run at this commit: **5490 passed, 26 skipped** — Phase 3 baseline 5417 + 73 new)
 
-Status: **IN PROGRESS — Phases 0–3 done (offline); the rest remains PLANNED.**
+Status: **IN PROGRESS — Phases 0–4 done (offline); the rest remains PLANNED.**
 
 ---
 
@@ -911,14 +961,16 @@ Status: **IN PROGRESS — Phases 0–3 done (offline); the rest remains PLANNED.
 Beyond unit tests — verification against real behavior before IMPLEMENTED
 can become TESTED/VERIFIED:
 
-- [x] Compile check (`compileall`/`py_compile`) + full test suite green — at this commit: `py_compile` clean on all changed modules, **5417 passed, 26 skipped**
-- [ ] Live Telegram validation checklist (manual, owner's environment): import a real collection via Saved Messages (incl. set enumeration through real TL RPCs); map 2 emojis; verify replacement in a private chat, a group, and Saved Messages; verify text/entities/media/caption/reply preservation visually; verify unmapped emoji untouched; verify loop does not occur; verify toggle-OFF leaves everything untouched
+- [x] Compile check (`compileall`/`py_compile`) + full test suite green — at this commit: `py_compile` clean on all changed modules, **5490 passed, 26 skipped**
+- [ ] Live Telegram validation checklist (manual, owner's environment): import a real collection via Saved Messages (incl. set enumeration through real TL RPCs); map 2 emojis; verify replacement in a private chat, a group, and Saved Messages; verify text/entities/reply preservation visually (media/caption preservation is out of scope — media messages are skipped); verify unmapped emoji untouched; verify loop does not occur; verify toggle-OFF leaves everything untouched
 - [ ] Bridge capability verification: confirm which custom-emoji send mode actually works with the owner's bot setup (Fragment username vs alt-text fallback) — record the outcome in §17
 - [ ] Failure-mode validation: revoke bot send permission in a chat and verify the original message survives (send-first ordering)
 - [ ] No architectural drift audit: grep-style confirmation that no second executor/scheduler/update loop and no keyword/regex routing were introduced
-- [ ] Documentation consistency: `AGENTS.md`/`IMPLEMENTATION_REPORT.md` updated only when the feature actually lands (not by this roadmap task)
+- [ ] Documentation consistency: `AGENTS.md`/`IMPLEMENTATION_REPORT.md` updated only when the feature actually lands (not by this roadmap task) — `IMPLEMENTATION_REPORT.md` is rewritten per phase; `AGENTS.md` intentionally untouched by this phase
 
-Status: **PLANNED**.
+Status: **IN PROGRESS — the offline half (compile + full suite + py_compile +
+`git diff --check` + the no-drift audit) is green; every live-Telegram item
+above is still NOT verified.**
 
 ---
 
@@ -931,12 +983,12 @@ its checkboxes AND validation pass):
 - [x] **Phase 1 — Library & Import:** domain model (§7 library-entry shape), library storage (dedup on `(owner_id, document_id)`), bounded entity-based Saved Messages collection import (§8, §9 message-level), honest import report, sticker-set resolution/enumeration (§9), Glass UI import/report + library-browser panels, 2×5 library pagination (§25) — **IMPLEMENTED + TESTED**; REMAINING: live validation only
 - [x] **Phase 2 — Categories & Mappings:** category CRUD (create/list/rename/delete with mapping counts), mapping editor (simple-emoji input → 2×5 library picker), uniqueness at service + db layers, conflict UI (current-vs-new visuals, explicit Replace/Cancel), per-category mapping list/edit/delete with 2×5 pagination, delete-category cascade — **IMPLEMENTED + TESTED (offline)**; REMAINING: live validation only
 - [x] **Phase 3 — State & Toggle:** replacement toggle, active category (global default + per-chat override), deterministic resolution boundary, `emoji_state`/`emoji_chat_overrides` persistence, Glass UI state panel (§13, §14, §29) — **IMPLEMENTED + TESTED (offline)**; REMAINING: live validation only
-- [ ] **Phase 4 — Reconstruction:** transformer (entity-safe), reconstructor with send-first ordering, bot bridge send path, same-destination + reply preservation (§15–§23), loop prevention (§24)
+- [x] **Phase 4 — Reconstruction:** transformer (entity-safe), reconstruction service with send-first ordering, bot bridge send path, same-destination + reply preservation (§15–§22, §24), loop prevention (§24) — **IMPLEMENTED + TESTED (offline)**; REMAINING: live validation, media/caption reconstruction (§23), owner-visible failure surfacing (§28), owner confirmations (§34-B/§34-D/§34-G)
 - [ ] **Phase 5 — Custom Category:** composition UI + reference semantics (§26)
 - [ ] **Phase 6 — Reactions:** `telegram_api/reactions.py` wrapper, reaction service, Glass UI react action (§27)
 - [ ] **Phase 7 — Hardening:** error/capability handling completion (§28), test plan completion (§30), validation checklist execution (§31), documentation updates (`AGENTS.md`, `IMPLEMENTATION_REPORT.md`) in the landing commit(s)
 
-Status: **IN PROGRESS — Phase 0 (code half) + Phases 1–3 done offline; live validation and Phases 4–7 remain PLANNED.**
+Status: **IN PROGRESS — Phase 0 (code half) + Phases 1–4 done offline; live validation and Phases 5–7 remain PLANNED.**
 
 ---
 
@@ -952,12 +1004,18 @@ Dependencies (already present — verified):
 
 Blockers / risks:
 
-1. **Bridge capability (BLOCKED pending decision):** bot custom-emoji sending
-   requires a Fragment-purchased additional username (verified Bot API
-   constraint). Until the owner decides (§34-D), Phase 4's premium-visual
-   delivery mode is BLOCKED; alt-text fallback is the unblocked fallback.
+1. **Bridge capability (owner decision still required):** bot custom-emoji
+   sending requires a Fragment-purchased additional username (verified Bot
+   API constraint). Phase 4 implements the delivery BOUNDARY: the
+   transformed entities are sent through the existing bridge, a server
+   rejection is an honest `failed` outcome, and the original message is
+   never deleted. Whether the premium visual ever lands therefore still
+   depends on the owner's §34-D decision; alt-text degradation is NOT
+   implemented.
 2. **Destination permissions (investigation needed):** bot send rights per
-   chat type — Unknown — requires implementation/investigation.
+   chat type — Unknown — requires implementation/investigation. A missing
+   permission now surfaces as an honest failed reconstruction (the original
+   survives); no per-type pre-flight check exists.
 3. **Set enumeration without Premium (investigation needed):** whether
    collection import works on a non-premium querying session for
    premium-gated sets — Unknown — requires implementation/investigation.
@@ -967,11 +1025,14 @@ Blockers / risks:
    the documented unique indexes — until the owner applies the manual
    schema, a configured Supabase reports write failures honestly and the
    feature runs on the in-memory fallback (same contract Phase 1
-   established for `emoji_library`).
+   established for `emoji_library`). Phase 4 added NO table.
 5. **Cross-account media re-send mechanism** (§23) — Unknown — requires
-   implementation/investigation.
+   implementation/investigation. Phase 4 skips media messages entirely
+   (fail closed), so nothing depends on this yet.
 
-Status: **PLANNED — dependencies verified; blockers documented**.
+Status: **IN PROGRESS — dependencies verified; blockers documented; the
+Phase 4 path runs today only for text messages the bridge bot is allowed to
+send in.**
 
 ---
 
@@ -980,12 +1041,12 @@ Status: **PLANNED — dependencies verified; blockers documented**.
 | # | Decision | Options | Default proposal | Owner input needed |
 |---|---|---|---|---|
 | A | **Active category scope** | global-only / per-chat-only / global default + per-chat override | global default + per-chat override (§13, derived from existing settings/target-context architecture) | **IMPLEMENTED at Phase 3 (default proposal, as documented):** global default + per-chat override with the override as an override, never a second authority. Owner confirmation still OPEN — reverting would change only the service/UI surface, not the db pattern |
-| B | **Reconstruction ordering** | send-new-then-delete / delete-then-send | send-first (never lose the original; worst case temporary duplicate) (§15) | Confirm |
-| C | **Bridge bot identity** | reuse helper bot (`BOT_TOKEN`) / dedicated second bot token | reuse helper bot; env override for a dedicated token (§17/§29) | Confirm |
-| D | **Premium-visual delivery mode** | Fragment-purchased additional username for the bridge bot / alt-text fallback only / investigate other TL paths | design for both: attempt custom-emoji entities, degrade to alt text; Fragment purchase is the owner's cost/ownership decision (§17/§28) | Required — capability + budget decision |
+| B | **Reconstruction ordering** | send-new-then-delete / delete-then-send | send-first (never lose the original; worst case temporary duplicate) (§15) | **IMPLEMENTED at Phase 4 (default proposal):** delivery happens first; the original is deleted only after it succeeds, and a failed delete is reported as `replaced_undeleted`. Owner confirmation still OPEN — switching to delete-then-send would change only the service's ordering |
+| C | **Bridge bot identity** | reuse helper bot (`BOT_TOKEN`) / dedicated second bot token | reuse helper bot; env override for a dedicated token (§17/§29) | **IMPLEMENTED at Phase 4 (default proposal):** the reconstruction service delivers through the existing `backend/telegram_api/bridge.py` (helper bot) and no new env var/token was introduced. Owner confirmation still OPEN |
+| D | **Premium-visual delivery mode** | Fragment-purchased additional username for the bridge bot / alt-text fallback only / investigate other TL paths | design for both: attempt custom-emoji entities, degrade to alt text; Fragment purchase is the owner's cost/ownership decision (§17/§28) | **PARTIALLY ADDRESSED at Phase 4:** the boundary exists — custom-emoji entities go through the bridge as-is and a rejection becomes an honest `failed` outcome with the original untouched. The alt-text degradation was deliberately NOT implemented (no fabricated content, no entitlement probing), so the delivery mode itself STILL REQUIRES the owner's decision |
 | E | **Mapping persistence shape** | new dedicated tables / extend an existing generic store | dedicated tables following `db/client.py` patterns (§7/§29); schema work is manual and out of scope here | **PARTIALLY RESOLVED at Phase 2 (implementation, not owner sign-off):** Phase 2 was implemented against the default proposal — dedicated `emoji_categories` / `emoji_mappings` tables following the `db/client.py` pattern. The owner never confirmed this decision; the status stands as “default proposal implemented, awaiting confirmation”. If the owner later chooses differently, the db-layer functions are the only churn surface (the service/UI contract stays). Physical schema is MANUAL-ONLY, documented in `IMPLEMENTATION_REPORT.md`, never executed |
 | F | **Custom composition semantics** | live-reference (follows source category changes) / snapshot-on-compose | snapshot-on-compose with explicit refresh action (§26) | Confirm |
-| G | **Loop-prevention mechanism** | sender-id structural check / visible sentinel marker / both | sender-id check (invisible to other chat members) (§24) | Confirm |
+| G | **Loop-prevention mechanism** | sender-id structural check / visible sentinel marker / both | sender-id check (invisible to other chat members) (§24) | **IMPLEMENTED at Phase 4 (default proposal):** structural only — outgoing-only handler, bridge sender-id suppression, inline-bot-origin exclusion, bounded in-memory registries; NO visible marker was added. Owner confirmation still OPEN | |
 | H | **Conflict UI wording** | exact button/panel labels | decided at implementation (§12) | **RESOLVED at Phase 2 implementation:** panel “Mapping Conflict”, buttons **Replace** / **Cancel** (was listed Optional) |
 | I | **Notification behavior of replacement messages** | normal / silent | normal (§18) | Optional |
 
@@ -998,7 +1059,7 @@ Status: **OPEN — awaiting confirmation**.
 
 ## 35. Not Implemented Yet
 
-Current truth after the Phase 0, Phase 1, and Phase 2 code slices:
+Current truth after the Phase 0–4 code slices:
 
 - Entity-aware serialization + UTF-16 helpers + dict→TL entity rebuild —
   IMPLEMENTED (`backend/telegram_api/_helpers.py`), TESTED.
@@ -1029,9 +1090,19 @@ Current truth after the Phase 0, Phase 1, and Phase 2 code slices:
   tests); **live Telegram NOT exercised**; the physical tables do NOT
   exist anywhere yet (MANUAL-ONLY schema documented in
   `IMPLEMENTATION_REPORT.md` — nothing executed).
-- Still NOT implemented: transformer, reconstructor, reaction code; no
-  live schema/tables applied; §34-D and the owner sign-offs on §34-A
-  (Phase 3 scope, implemented as documented) and §34-E remain open.
+- Reconstruction (Phase 4) — IMPLEMENTED
+  (`backend/services/emoji_transformer.py`,
+  `backend/services/emoji_replacement_service.py`, the outgoing handler
+  `backend/bot/handlers/emoji_replacement.py` registered through
+  `backend/bot/router.py`), TESTED (73 tests); **live Telegram NOT
+  exercised**; a media message is left untouched and a delivery rejection
+  leaves the original in place.
+- Still NOT implemented: media/caption reconstruction (§23), custom
+  composition (§26), reactions (§27), owner-visible failure surfacing
+  (§28), flood/rate adequacy validation (§17), destination-type permission
+  handling (§18); no live schema/tables applied; §34-D and the owner
+  sign-offs on §34-A (Phase 3 scope, implemented as documented), §34-B,
+  §34-C, §34-E and §34-G remain open.
 
 ---
 

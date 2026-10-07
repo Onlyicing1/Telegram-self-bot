@@ -18,8 +18,10 @@ Pins the Phase 3 contracts:
   7. Glass UI: the Replacement panel exposes toggle/default/override/
      effective state and actions; actions mutate only the intended state;
      the panel requires a real target chat for per-chat state and never
-     fabricates one; callbacks stay owner-scoped and bounded; no Phase 4
-     behavior (no transformer/reconstruction/Telegram side effects) exists.
+     fabricates one; callbacks stay owner-scoped and bounded. Phase 4's
+     transformer/reconstruction now exist in their own modules (see
+     ``tests/test_emoji_replacement_phase4.py``); the Phase 3 state service
+     and this UI surface must stay free of execution logic.
   8. Architecture: no second client/loop/scheduler/executor, no
      ``backend.ai`` import, no keyword routing in the new surface.
 
@@ -516,18 +518,23 @@ def test_no_second_infrastructure_and_no_ai_import():
             assert forbidden not in source, (module_path, forbidden)
 
 
-def test_no_phase4_behavior_exists():
+def test_phase3_surface_keeps_no_execution_logic():
+    """Phase 4 (transformer + reconstruction + loop prevention) lives in its
+    own modules; the Phase 3 state service and the emoji UI must never grow
+    transformation, delivery, deletion, or loop-prevention logic."""
     import re
     from pathlib import Path
 
     emoji_source = Path(emoji.__file__).read_text()
     state_source = Path(state_service.__file__).read_text()
     for source in (emoji_source, state_source):
-        # No transformer/reconstruction/loop-prevention surface.
-        assert "transform" not in source.lower() or "transformation" not in source.lower()
+        assert "transform" not in source.lower()
         assert not re.search(r"\breconstruct", source, re.IGNORECASE)
         assert not re.search(r"\bdelete_original\b", source, re.IGNORECASE)
         assert not re.search(r"\bbridge_send\b", source, re.IGNORECASE)
+        assert "emoji_transformer" not in source
+        assert "emoji_replacement_service" not in source
+        assert "send_reconstructed" not in source
 
 
 def test_state_service_resolves_without_telegram():
