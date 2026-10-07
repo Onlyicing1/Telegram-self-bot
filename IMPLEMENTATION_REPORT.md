@@ -452,34 +452,40 @@ self-client boundary (the TL-request surface) and the in-memory fallback.
 
 ## 13. Delivery metadata
 
-A commit cannot contain its own SHA. The Phase 6 implementation commit is
-recorded here by its subject line; its exact SHA (and the SHA of the
-documentation-only delivery-metadata commit that carries this section) live in
-the repository's git history.
+A commit cannot contain its own SHA. `831c03e` is the Phase 6 implementation
+commit; this documentation-only commit records its delivery metadata (its own
+SHA lives in the git history, not in this file).
 
 | Field | Value |
 |---|---|
 | Branch | `main` |
 | Base commit (before this phase) | `1f5a36d` — docs(emoji): fix the tab escaping artifact in the Phase 5 delivery section |
-| Phase 6 commit | `feat(emoji): implement Phase 6 — reactions (typed SendReactionRequest wrapper, reaction service, Glass UI react action)` |
+| Phase 6 commit | `831c03e` — `feat(emoji): implement Phase 6 — reactions (typed SendReactionRequest wrapper, reaction service, Glass UI react action)` |
 | Commit contents | the 6 intended files only (`backend/bot/handlers/emoji.py`, `backend/services/reaction_service.py`, `backend/telegram_api/reactions.py`, `tests/test_reaction_phase6.py`, `IMPLEMENTATION_REPORT.md`, `ROADMAP.md`) |
-| Push result | recorded in §14 after the delivery check |
-| Remote main HEAD after the Phase 6 push | recorded in §14 (local `HEAD` == `origin/main` == `refs/heads/main` required) |
-| Final worktree state | recorded in §14 |
+| Push result | `1f5a36d..831c03e  main -> main` (fast-forward, exit 0) |
+| Remote main HEAD after the Phase 6 push | `831c03ec80e0b5025c2f2edecf5644f559bdfe03` (verified with `git fetch origin main` + `git rev-parse origin/main` + `git ls-remote origin refs/heads/main`) |
+| Final worktree state | clean — see §14 |
 
 ---
 
 ## 14. Push verification (recorded after delivery)
 
-The verification commands and their exact results are recorded here by the
-documentation-only commit that follows the Phase 6 implementation commit:
+Run from the repository root on branch `main`, immediately after the Phase 6
+implementation commit:
 
+- `git push origin main` → `1f5a36d..831c03e  main -> main` (exit 0)
 - `git fetch origin main` → fetched `main` into `FETCH_HEAD` (exit 0)
-- `git push origin main` → fast-forward to the Phase 6 commit (exit 0)
-- `git rev-parse HEAD` == `git rev-parse origin/main` (same commit)
-- `git ls-remote origin refs/heads/main` → the same commit (SHA + TAB +
-  `refs/heads/main`)
-- `git status --short` → empty (clean worktree, no untracked leftovers)
+- `git rev-parse HEAD` → `831c03ec80e0b5025c2f2edecf5644f559bdfe03`
+- `git rev-parse origin/main` → `831c03ec80e0b5025c2f2edecf5644f559bdfe03`
+- `git ls-remote origin refs/heads/main` →
+  `831c03ec80e0b5025c2f2edecf5644f559bdfe03` + TAB + `refs/heads/main`
+  (the same commit)
+- `git merge-base --is-ancestor HEAD origin/main` → exit 0
+- `git status --short` → empty before the delivery-metadata commit itself; the
+  only change after it is this document (no code, no tests)
 
-If any of these lines disagrees with the repository's live state, the live
-state is authoritative and this section must be corrected.
+Local `HEAD`, the fetched `origin/main` and the live remote `refs/heads/main`
+are the same commit — the Phase 6 changes exist on the remote, not only
+locally. No rebase, no force-push and no history rewrite was used. If any line
+here disagrees with a fresh check, the fresh remote state is authoritative and
+this section must be corrected.
