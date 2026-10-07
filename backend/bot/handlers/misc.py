@@ -76,6 +76,7 @@ def _build_menu_buttons() -> list:
     )
     builder.add_row("📋 Todo", "panel:todo")
     builder.add_row("🧠 AI", "panel:ai")
+    builder.add_row("😀 Emoji", "panel:emoji")
     return builder.build()
 
 

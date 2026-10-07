@@ -793,6 +793,7 @@ def test_no_second_client_loop_scheduler_or_forwarding():
         "max_messages",
         "page_size",
         "max_records",
+        "max_set_records",
         "page_timeout",
         "set_timeout",
         "resolve_sets",

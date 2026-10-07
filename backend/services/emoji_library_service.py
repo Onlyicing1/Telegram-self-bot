@@ -1,53 +1,72 @@
 """
-Emoji Library service — Phase 1 remainder (set resolution/enumeration) of
-Emoji & Reaction.
+Emoji Library service — Phase 1 (Library & Import) of Emoji & Reaction.
 
-Extends the Phase 1 message-level import with sticker-set resolution and
-enumeration through the EXISTING self-client facade. For each newly imported
-custom-emoji document, resolves its owning sticker set via
-``messages.GetCustomEmojiDocuments`` + ``messages.GetStickerSet``, enumerates
-the set's members, and enriches the import report with real Telegram-provided
-set metadata.
+Collects custom-emoji records from the owner's Saved Messages through the
+EXISTING self-client message boundary (``backend.telegram_api.messages``),
+validates them against the Phase 0 entity representation (``serialize_message``
+dicts), and persists them idempotently through the existing
+``backend/db/client.py`` Supabase-or-in-memory-fallback pattern.
 
-Contracts (ROADMAP §9 remainder):
+Contracts (ROADMAP §7/§8/§9):
 
-* Set resolution is best-effort enrichment on top of the existing
-  message-level import. The import remains fail-closed for collection and
-  persistence; set-resolution failures degrade the report honestly without
-  hiding behind a generic "success".
-* Each unique document is resolved once. Each unique sticker set is
-  enumerated once and reused for every document that belongs to it.
-* Bounded: per-document resolution RPCs, per-set enumeration RPCs, total
-  library records, and RPC timeouts are all explicitly bounded.
-* No fabricated metadata: if a document/set cannot be resolved, the report
-  says so honestly. No set_id, short_name, or membership is invented.
-* The physical emoji_library schema is unchanged in this phase — set metadata
-  is exposed through the import report and service internals only. Persisting
-  set metadata is a later (manual schema) concern; see
-  IMPLEMENTATION_REPORT.md §3 for the documented manual-only schema note.
+* Entity-based recognition only: a record exists iff the message carries a
+  ``MessageEntityCustomEmoji`` entity with a valid positive ``document_id``
+  and a span that resolves inside the message text (Phase 0 ``utf16_index_at``
+  — fail closed). Plain Unicode emoji carry no such entity and are never
+  imported; unrelated entity types are ignored, not counted as malformed.
+* One library entry per ``(owner_id, document_id)``: repeated imports and the
+  same emoji appearing in several Saved Messages are counted as duplicates,
+  never stored twice.
+* Bounded and deterministic: explicit scan/page/record/entity bounds (caller
+  values are clamped to hard caps), newest-first pagination through an
+  exclusive ``max_id`` cursor that must strictly decrease, and one bounded
+  fetch timeout per page (``rpc_await``).
+* Fail closed: an unreadable durable library or a Telegram collection error
+  aborts the import BEFORE anything is persisted, with an honest report; a
+  completed scan persists every collected record and reports each insert
+  outcome (``imported`` / ``failed``).
+* Set enrichment (Phase 1 remainder, ROADMAP §9) is explicitly BEST-EFFORT
+  and bounded: each newly collected ``document_id`` is resolved once through
+  the existing self client (``messages.GetCustomEmojiDocumentsRequest``,
+  chunked), the real Telegram-provided sticker-set identity from the
+  document's ``DocumentAttributeCustomEmoji`` is used to enumerate each
+  unique set exactly once (``messages.GetStickerSetRequest``), and the set's
+  member documents (``document_id`` + the attribute's Unicode ``alt``) are
+  added to the same library through the same deduplication — so importing
+  one emoji from a collection imports the collection. Nothing is ever
+  fabricated: an unresolvable document, a document without a set identity,
+  or a failed/rejected set enumeration is counted and reported (``degraded``
+  + ``set_error`` + the ``set_*`` counters) while the message-level records
+  that DID resolve still persist; a set failure never aborts the import and
+  never invents metadata. Set-enumerated members carry no message origin:
+  their ``source_msg_id`` is ``None`` and their alt text is Telegram's own.
 
-Context isolation: nothing from ``backend.ai`` is imported. The service
-remains deterministic aside from the bounded Telegram RPCs it makes.
+Context isolation: nothing from ``backend.ai`` is imported here — no chat
+history, no quoted-message context, no conversation state, no AI
+interpretation. The Saved Messages scan plus this service's explicit bounds
+are the whole input.
 
 No second client, loop, scheduler, or executor is created: the self client is
-passed in by the caller, and the existing module-level ``asyncio.Lock``
-serializes imports.
+passed in by the caller, and one module-level ``asyncio.Lock`` serializes
+concurrent imports so deduplication decisions stay deterministic.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any
+from datetime import datetime, timezone
+from typing import Any, NamedTuple
 
 from backend.db import client as db_client
 from backend.helper.rpc_timeout import rpc_await
 from backend.telegram_api._helpers import utf16_index_at
+from backend.telegram_api.custom_emoji import (
+    get_custom_emoji_documents as _facade_get_custom_emoji_documents,
+    get_sticker_set as _facade_get_sticker_set,
+)
 from backend.telegram_api.messages import iter_messages as _facade_iter_messages
-from telethon.tl import types
-from telethon.tl.functions.messages import GetCustomEmojiDocumentsRequest, GetStickerSetRequest
 
 logger = logging.getLogger(__name__)
-
 
 CUSTOM_EMOJI_ENTITY = "MessageEntityCustomEmoji"
 SAVED_MESSAGES_CHAT = "me"
@@ -55,29 +74,31 @@ SAVED_MESSAGES_CHAT = "me"
 DEFAULT_MAX_MESSAGES = 200
 DEFAULT_PAGE_SIZE = 50
 DEFAULT_MAX_RECORDS = 500
+DEFAULT_MAX_SET_RECORDS = 500
 DEFAULT_PAGE_TIMEOUT_S = 15.0
-DEFAULT_SET_TIMEOUT_S = 15.0
 
 HARD_MAX_MESSAGES = 2000
 HARD_MAX_PAGE_SIZE = 200
 HARD_MAX_RECORDS = 5000
+HARD_MAX_SET_RECORDS = 2000
 MAX_ENTITIES_PER_MESSAGE = 100
 
-# Bounds for set resolution/enumeration.
-_MAX_SET_RESOLUTION_RPCS = 200        # total per import
-_MAX_SET_ENUMERATION_RPCS = 50        # total per import
-_MAX_LIBRARY_TOTAL = 5000             # mirror the dedup-read bound
+# Set-enrichment bounds (ROADMAP §9): every stage is explicitly capped and
+# deterministic — unique documents are resolved once (chunked RPCs), each
+# unique set is enumerated exactly once, and set members are accepted up to
+# explicit budgets. Nothing here paginates Telegram without a bound.
+MAX_DOC_RESOLVE_BATCH = 50    # document ids per resolution RPC
+MAX_DOC_RESOLVE_CALLS = 10    # ⇒ at most 500 documents resolved per import
+MAX_SETS_PER_IMPORT = 20      # unique sets enumerated per import
+MAX_SET_MEMBERS_PER_SET = 200 # members processed per set
 
 _import_lock = asyncio.Lock()
 
 
-class ExtractionResult:
-    __slots__ = ("records", "malformed", "entity_limit_hit")
-
-    def __init__(self, records: list[dict[str, Any]], malformed: int, entity_limit_hit: bool) -> None:
-        self.records = records
-        self.malformed = malformed
-        self.entity_limit_hit = entity_limit_hit
+class ExtractionResult(NamedTuple):
+    records: list[dict[str, Any]]
+    malformed: int
+    entity_limit_hit: bool
 
 
 def extract_custom_emoji_records(message: dict[str, Any]) -> ExtractionResult:
@@ -85,11 +106,11 @@ def extract_custom_emoji_records(message: dict[str, Any]) -> ExtractionResult:
 
     Returns ``({document_id, alt_text, source_msg_id, source}, malformed,
     entity_limit_hit)`` where ``alt_text`` is the exact Unicode text span the
-    entity covers (UTF-16 offsets resolved through ``utf16_index_at``). Invalid
-    payloads — missing/non-integer/non-positive document id, bad offsets, a span
-    outside the text — are skipped and counted as malformed: fail closed, never
-    fabricate. Non-custom-emoji entities and plain Unicode emoji are ignored
-    silently.
+    entity covers (UTF-16 offsets resolved through Phase 0
+    ``utf16_index_at``). Invalid payloads — missing/non-integer/non-positive
+    document id, bad offsets, a span outside the text — are skipped and
+    counted as malformed: fail closed, never fabricate. Non-custom-emoji
+    entities and plain Unicode emoji are ignored silently.
     """
     entities = message.get("entities") or []
     if not isinstance(entities, list):
@@ -175,165 +196,199 @@ def _bounded_float(value: Any, default: float, lo: float, hi: float) -> float:
     return max(lo, min(number, hi))
 
 
-async def _resolve_document_set(
-    client: Any,
-    document_id: int,
-    *,
-    timeout_s: float,
-    resolved_docs: set[int],
-    resolved_sets: dict[int, dict[str, Any]],
-    set_members: dict[int, dict[str, Any]],
-) -> dict[str, Any] | None:
-    """Resolve a single custom-emoji document's owning sticker set.
+def _set_identity_key(set_ref: Any) -> tuple[Any, ...] | None:
+    """A hashable identity for ONE Telegram-provided set reference.
 
-    Returns a dict with ``set_id``, ``set_short_name``, ``set_title``,
-    ``stickerset_access_hash``, and ``document_alt_text``, or ``None`` when
-    resolution fails for any reason. Side effects: populates
-    ``resolved_docs``, ``resolved_sets``, and ``set_members`` so subsequent
-    lookups of the same document or same set are free.
-
-    Bounded: the caller must enforce total RPC caps.
+    Two documents belong to the same enumerated set iff their identity keys
+    are equal — so a set encountered through several imported emojis is
+    resolved (and enumerated) exactly once. Anything Telegram did not
+    provide as a real id/short-name identity yields ``None``.
     """
-    if document_id in resolved_docs:
-        cached = resolved_sets.get(document_id)
-        if cached is not None:
-            return cached
+    if not isinstance(set_ref, dict):
         return None
-
-    try:
-        documents = await rpc_await(
-            client(GetCustomEmojiDocumentsRequest([document_id])),
-            timeout=timeout_s,
-            label=f"emoji_set.resolve_documents[{document_id}]",
-        )  # noqa: E501
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        logger.warning(
-            "[EMOJI_SET] document resolution failed for document_id=%s", document_id
-        )
-        resolved_docs.add(document_id)
+    kind = set_ref.get("kind")
+    if kind == "id":
+        set_id = set_ref.get("id")
+        access_hash = set_ref.get("access_hash")
+        if (
+            isinstance(set_id, int)
+            and not isinstance(set_id, bool)
+            and isinstance(access_hash, int)
+            and not isinstance(access_hash, bool)
+        ):
+            return ("id", set_id, access_hash)
         return None
-
-    if not documents:
-        resolved_docs.add(document_id)
+    if kind == "short_name":
+        short_name = set_ref.get("short_name")
+        if isinstance(short_name, str) and short_name.strip():
+            return ("short_name", short_name.strip())
         return None
+    return None
 
-    doc = documents[0]
-    doc_id = getattr(doc, "id", None)
-    if doc_id is None:
-        resolved_docs.add(document_id)
-        return None
 
-    attributes = getattr(doc, "attributes", []) or []
-    custom_emoji_attr = None
-    for attr in attributes:
-        if isinstance(attr, types.DocumentAttributeCustomEmoji):
-            custom_emoji_attr = attr
-            break
+async def _enumerate_sets(
+    client: Any,
+    candidates: dict[int, dict[str, Any]],
+    existing: set[int],
+    timeout_s: float,
+    set_record_limit: int,
+) -> dict[str, Any]:
+    """Resolve the collected documents and enumerate their real sets.
 
-    if custom_emoji_attr is None:
-        resolved_docs.add(document_id)
-        return None
+    BEST-EFFORT by contract: every failure here is counted and reported, and
+    the caller still persists the message-level records that the scan
+    collected. Nothing is fabricated — a document Telegram did not return,
+    a document without a custom-emoji attribute, and a document without a
+    usable set identity all count as "set unknown" rather than becoming
+    invented metadata.
 
-    stickerset = custom_emoji_attr.stickerset
-    set_id = getattr(stickerset, "id", None)
-    access_hash = getattr(stickerset, "access_hash", None)
-    if set_id is None or access_hash is None:
-        resolved_docs.add(document_id)
-        return None
+    Stages, each explicitly bounded and deterministic:
 
-    alt_text = getattr(doc, "title", None) or ""
-    if not alt_text:
-        alt_text = getattr(custom_emoji_attr, "alt", "") or ""
+    1. Resolve candidate document ids in ``MAX_DOC_RESOLVE_BATCH``-sized
+       chunks, at most ``MAX_DOC_RESOLVE_CALLS`` chunks per import, against
+       the same bounded timeout as the scan.
+    2. Group the resolved documents by their Telegram-provided set identity
+       (first-appearance order of the candidates) and enumerate at most
+       ``MAX_SETS_PER_IMPORT`` unique sets, one RPC each.
+    3. Classify each enumerated member once: duplicates (already in the
+       scan candidates, the durable library, or seen as another member)
+       are counted, new members become library records up to
+       ``set_record_limit`` and ``MAX_SET_MEMBERS_PER_SET`` per set.
+    """
+    result: dict[str, Any] = {
+        "error": None,
+        "documents_resolved": 0,
+        "unresolved_documents": 0,
+        "documents_without_set": 0,
+        "sets_resolved": 0,
+        "set_members_seen": 0,
+        "set_members_malformed": 0,
+        "set_duplicates": 0,
+        "hit_set_limit": False,
+        "hit_set_member_limit": False,
+        "set_candidates": {},
+    }
+    if not candidates:
+        return result
 
-    set_key = (int(set_id), int(access_hash))
-    if set_key in set_members:
-        members = set_members[set_key]
-    else:
+    # 1. Resolve each unique candidate document once (chunked, bounded).
+    doc_ids = list(candidates)[: MAX_DOC_RESOLVE_BATCH * MAX_DOC_RESOLVE_CALLS]
+    resolved: dict[int, dict[str, Any]] = {}
+    for start in range(0, len(doc_ids), MAX_DOC_RESOLVE_BATCH):
+        chunk = doc_ids[start:start + MAX_DOC_RESOLVE_BATCH]
         try:
-            set_result = await rpc_await(
-                client(
-                    GetStickerSetRequest(
-                        types.InputStickerSetID(int(set_id), int(access_hash)),
-                        hash=0,
-                    )
-                ),
+            documents = await rpc_await(
+                _facade_get_custom_emoji_documents(client, chunk),
                 timeout=timeout_s,
-                label=f"emoji_set.enumerate[{set_key}]",
+                label="emoji_import.get_custom_emoji_documents",
             )
         except asyncio.CancelledError:
             raise
-        except Exception:
-            logger.warning(
-                "[EMOJI_SET] set enumeration failed for set_id=%s", set_id
+        except Exception as exc:
+            result["error"] = (
+                f"custom emoji document resolution failed: {str(exc) or type(exc).__name__}"
             )
-            resolved_docs.add(document_id)
-            return None
+            break
+        for entry in documents or []:
+            if isinstance(entry, dict) and isinstance(entry.get("document_id"), int):
+                resolved[entry["document_id"]] = entry
 
-        if set_result is None:
-            resolved_docs.add(document_id)
-            return None
+    # 2. Group by the real Telegram set identity, first-appearance order.
+    set_refs: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+    seen_identities: set[tuple[Any, ...]] = set()
+    for doc_id in doc_ids:
+        entry = resolved.get(doc_id)
+        if entry is None:
+            result["unresolved_documents"] += 1
+            continue
+        result["documents_resolved"] += 1
+        identity = _set_identity_key(entry.get("set"))
+        if identity is None:
+            result["documents_without_set"] += 1
+            continue
+        if identity in seen_identities:
+            continue
+        if len(set_refs) >= MAX_SETS_PER_IMPORT:
+            result["hit_set_limit"] = True
+            break
+        seen_identities.add(identity)
+        set_refs.append((identity, entry["set"]))
 
-        if set_result is not None and not hasattr(set_result, "hash"):
-            # Telethon can return a variant without membership documents.
-            resolved_docs.add(document_id)
-            return None
+    # 3. Enumerate each unique set exactly once and classify its members.
+    set_candidates: dict[int, dict[str, Any]] = result["set_candidates"]
+    for _, set_ref in set_refs:
+        try:
+            set_info = await rpc_await(
+                _facade_get_sticker_set(client, set_ref),
+                timeout=timeout_s,
+                label="emoji_import.get_sticker_set",
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            result["error"] = (
+                f"sticker set enumeration failed: {str(exc) or type(exc).__name__}"
+            )
+            break
+        if not isinstance(set_info, dict):
+            result["error"] = "sticker set enumeration returned no set information"
+            break
+        result["sets_resolved"] += 1
+        processed = 0
+        for member in set_info.get("members") or []:
+            if processed >= MAX_SET_MEMBERS_PER_SET:
+                result["hit_set_member_limit"] = True
+                break
+            processed += 1
+            if not isinstance(member, dict):
+                result["set_members_malformed"] += 1
+                continue
+            member_id = member.get("document_id")
+            if (
+                not isinstance(member_id, int)
+                or isinstance(member_id, bool)
+                or member_id <= 0
+            ):
+                result["set_members_malformed"] += 1
+                continue
+            alt = member.get("alt")
+            result["set_members_seen"] += 1
+            if member_id in set_candidates or member_id in candidates or member_id in existing:
+                result["set_duplicates"] += 1
+                continue
+            if len(set_candidates) >= set_record_limit:
+                result["hit_set_member_limit"] = True
+                break
+            set_candidates[member_id] = {
+                "document_id": member_id,
+                "alt_text": alt if isinstance(alt, str) else "",
+                "source_msg_id": None,
+                "source": "imported",
+            }
+        if len(set_candidates) >= set_record_limit:
+            result["hit_set_member_limit"] = True
+            break
 
-        set_result = set_result
+    return result
 
-        members = {}
-        set_title = getattr(set_result, "title", "") or ""
-        set_short_name = getattr(set_result, "short_name", "") or ""
-        set_stickerset_id = getattr(set_result, "id", set_id)
-        set_access_hash = getattr(set_result, "access_hash", access_hash)
 
-        docs = getattr(set_result, "documents", None)
-        if docs:
-            for d in docs:
-                d_id = getattr(d, "id", None)
-                if d_id is None:
-                    continue
-                dalt = ""
-                for a in (getattr(d, "attributes", []) or []):
-                    if isinstance(a, types.DocumentAttributeCustomEmoji):
-                        dalt = getattr(a, "alt", "") or ""
-                        break
-                    if isinstance(a, types.DocumentAttributeSticker):
-                        dalt = getattr(a, "alt", "") or ""
-                        break
-                if not dalt:
-                    dalt = getattr(d, "title", "") or ""
-                members[int(d_id)] = dalt
-        else:
-            count = getattr(set_result, "count", 0) or 0
-            if count:
-                logger.warning(
-                    "[EMOJI_SET] set_id=%s has count=%s but no documents — "
-                    "enumeration incomplete",
-                    set_id,
-                    count,
-                )
-
-        set_members[set_key] = members
-
-        resolved_set_info = {
-            "set_id": int(set_stickerset_id),
-            "set_short_name": set_short_name,
-            "set_title": set_title,
-            "stickerset_access_hash": int(set_access_hash),
-            "stickerset_id": int(set_id),
-            "stickerset_access_hash_raw": int(access_hash),
-        }
-        resolved_sets[set_key] = resolved_set_info
-
-    member_alt = members.get(int(doc_id), "")
-    info = dict(resolved_sets[set_key])
-    info["document_alt_text"] = member_alt or alt_text
-    info["document_id"] = int(doc_id)
-    resolved_sets[document_id] = info
-    resolved_docs.add(document_id)
-    return info
+def _empty_set_report() -> dict[str, Any]:
+    """The zero-value set-enrichment section of the import report."""
+    return {
+        "degraded": False,
+        "set_error": None,
+        "documents_resolved": 0,
+        "unresolved_documents": 0,
+        "documents_without_set": 0,
+        "sets_resolved": 0,
+        "set_members_seen": 0,
+        "set_members_malformed": 0,
+        "set_imported": 0,
+        "set_duplicates": 0,
+        "set_failed": 0,
+        "hit_set_limit": False,
+        "hit_set_member_limit": False,
+    }
 
 
 async def import_from_saved_messages(
@@ -343,51 +398,80 @@ async def import_from_saved_messages(
     max_messages: int | None = None,
     page_size: int | None = None,
     max_records: int | None = None,
+    max_set_records: int | None = None,
     page_timeout: float | None = None,
-    set_timeout: float | None = None,
-    resolve_sets: bool = True,
 ) -> dict[str, Any]:
     """Deterministic, bounded import of custom emoji from Saved Messages.
-    Extends the Phase 1 message-level import with optional sticker-set
-    resolution/enumeration. When ``resolve_sets`` is true, each newly imported
-    document is resolved through the self-client to discover its owning sticker
-    set and enumerate the set's members. The returned report carries the same
-    Phase 1 counters plus set-resolution/enumeration results.
 
-    The ``set_timeout`` controls the bounded timeout for both document
-    resolution (``GetCustomEmojiDocuments``) and set enumeration
-    (``GetStickerSet``) RPCs. Set resolution is best-effort: if it fails or
-    times out for a document, that document is still imported (with whatever
-    alt_text was extracted at message-entity time) and the report reflects the
-    degradation honestly.
+    Scans the owner's Saved Messages newest-first through the passed self
+    client, extracts validated custom-emoji records (deduplicated within the
+    scan and against the durable library), resolves the collected documents'
+    real sticker sets (best-effort, bounded — see the module docstring), then
+    persists the new records. The returned report is always honest:
 
-    The returned report always carries:
+    ``ok``             True iff the message-level import did not fail
+                       (``error is None``, ``failed == 0``, ``set_failed
+                       == 0``). Set-enumeration degradation is reported
+                       separately through ``degraded``/``set_error`` and
+                       never disguises itself as full success.
+    ``error``          collection/abortion failure, or None.
+    ``storage``        ``"supabase"`` or ``"memory"`` (configured backend).
+    ``pages``          successful page fetches.
+    ``scanned_messages`` messages actually examined.
+    ``custom_emoji_seen`` valid custom-emoji entity occurrences encountered.
+    ``malformed_entities`` invalid custom-emoji entities skipped.
+    ``imported``       new library rows persisted from the message scan.
+    ``duplicates``     valid occurrences not imported because the document id
+                       was already seen in this scan or already in the library.
+    ``failed``         persistence attempts for scan records that failed.
+    ``library_total``  library size for the owner after the run, or None when
+                       the library could not be read.
+    ``end_reached``    the scan confirmed the end of Saved Messages.
+    ``hit_scan_limit`` stopped because the scan budget ran out (end not
+                       confirmed).
+    ``hit_record_limit`` stopped because the new-record budget ran out.
+    ``hit_entity_limit`` at least one message carried more entities than the
+                       per-message processing bound.
+    ``degraded``       the set enrichment could not complete fully while the
+                       message-level import itself succeeded.
+    ``set_error``      the first document/set resolution or enumeration
+                       failure, or None.
+    ``documents_resolved`` candidate documents Telegram resolved with a
+                       custom-emoji attribute.
+    ``unresolved_documents`` candidate documents Telegram did not resolve (or
+                       that fell outside the resolution bound).
+    ``documents_without_set`` resolved documents without a usable Telegram
+                       set identity.
+    ``sets_resolved``  unique sets successfully enumerated.
+    ``set_members_seen`` valid set members classified.
+    ``set_members_malformed`` enumerated members that were not usable custom
+                       emoji documents.
+    ``set_imported``   new library rows persisted from set enumeration.
+    ``set_duplicates`` set members already covered by the scan candidates or
+                       the durable library.
+    ``set_failed``     persistence attempts for set members that failed.
+    ``hit_set_limit``  more unique sets were detected than the enumeration
+                       bound allows.
+    ``hit_set_member_limit`` a set's member bound or the set record budget
+                       stopped the enumeration stage.
 
-    Phase 1 counters: ``ok``, ``error``, ``storage``, ``pages``,
-    ``scanned_messages``, ``custom_emoji_seen``, ``malformed_entities``,
-    ``imported``, ``duplicates``, ``failed``, ``library_total``,
-    ``end_reached``, ``hit_scan_limit``, ``hit_record_limit``,
-    ``hit_entity_limit``.
-
-    Set-resolution counters (only when ``resolve_sets`` is true):
-    ``sets_requested``, ``sets_resolved``, ``sets_failed``,
-    ``set_members_seen``, ``set_members_imported``, ``set_members_duplicates``,
-    ``set_members_failed``, ``set_resolution_error``.
-
-    For a completed import (``error is None``) the invariant
-    ``custom_emoji_seen == imported + duplicates + failed`` holds. On a
-    collection failure nothing is persisted (fail closed).
+    For a fully successful import (``error is None``, ``set_error is None``,
+    no limit flags) the invariant ``custom_emoji_seen + set_members_seen ==
+    imported + duplicates + failed + set_imported + set_duplicates +
+    set_failed`` holds. On a collection failure nothing is persisted (fail
+    closed) and the observed counters describe the partial scan only.
     """
     scan_limit = _bounded(max_messages, DEFAULT_MAX_MESSAGES, 1, HARD_MAX_MESSAGES)
     size_limit = _bounded(page_size, DEFAULT_PAGE_SIZE, 1, HARD_MAX_PAGE_SIZE)
     record_limit = _bounded(max_records, DEFAULT_MAX_RECORDS, 1, HARD_MAX_RECORDS)
-    timeout_s = _bounded_float(page_timeout, DEFAULT_PAGE_TIMEOUT_S, 0.01, 120.0)
-    set_timeout_s = _bounded_float(
-        set_timeout, DEFAULT_SET_TIMEOUT_S, 0.01, 120.0
+    set_record_limit = _bounded(
+        max_set_records, DEFAULT_MAX_SET_RECORDS, 0, HARD_MAX_SET_RECORDS
     )
+    timeout_s = _bounded_float(page_timeout, DEFAULT_PAGE_TIMEOUT_S, 0.01, 120.0)
 
     async with _import_lock:
         storage = "supabase" if db_client.get_db() else "memory"
+        set_report = _empty_set_report()
         existing = await db_client.list_emoji_document_ids(owner_id)
         if existing is None:
             logger.error("[EMOJI_IMPORT] library read failed — aborting before any scan")
@@ -407,16 +491,8 @@ async def import_from_saved_messages(
                 "hit_scan_limit": False,
                 "hit_record_limit": False,
                 "hit_entity_limit": False,
-                "sets_requested": 0,
-                "sets_resolved": 0,
-                "sets_failed": 0,
-                "set_members_seen": 0,
-                "set_members_imported": 0,
-                "set_members_duplicates": 0,
-                "set_members_failed": 0,
-                "set_resolution_error": None,
+                **set_report,
             }
-
         existing_set = set(existing)
 
         candidates: dict[int, dict[str, Any]] = {}
@@ -517,59 +593,21 @@ async def import_from_saved_messages(
                 "hit_scan_limit": hit_scan_limit,
                 "hit_record_limit": hit_record_limit,
                 "hit_entity_limit": hit_entity_limit,
-                "sets_requested": 0,
-                "sets_resolved": 0,
-                "sets_failed": 0,
-                "set_members_seen": 0,
-                "set_members_imported": 0,
-                "set_members_duplicates": 0,
-                "set_members_failed": 0,
-                "set_resolution_error": None,
+                **set_report,
             }
 
-        # ── Set resolution / enumeration (best-effort enrichment) ──
-        sets_requested = 0
-        sets_resolved = 0
-        sets_failed = 0
-        set_members_seen = 0
-        set_members_imported = 0
-        set_members_duplicates = 0
-        set_members_failed = 0
-        set_resolution_error: str | None = None
-        resolved_docs: set[int] = set()
-        resolved_sets: dict[int | tuple[int, int], dict[str, Any]] = {}
-        set_members: dict[tuple[int, int], dict[int, str]] = {}
+        # Set enrichment (best-effort): runs after the scan, before any
+        # persistence — the whole run stays collect-then-persist, and a set
+        # failure is reported (``degraded``/``set_error``) without aborting
+        # the message-level records the scan collected.
+        enrichment = await _enumerate_sets(
+            client, candidates, existing_set, timeout_s, set_record_limit
+        )
+        set_candidates: dict[int, dict[str, Any]] = enrichment["set_candidates"]
 
-        if resolve_sets:
-            doc_ids_to_resolve = list(candidates.keys())
-            for doc_id in doc_ids_to_resolve:
-                if sets_requested >= _MAX_SET_RESOLUTION_RPCS:
-                    set_resolution_error = (
-                        "set resolution RPC cap reached — "
-                        f"{sets_requested} resolutions attempted"
-                    )
-                    break
-                sets_requested += 1
-                info = await _resolve_document_set(
-                    client,
-                    doc_id,
-                    timeout_s=set_timeout_s,
-                    resolved_docs=resolved_docs,
-                    resolved_sets=resolved_sets,
-                    set_members=set_members,
-                )
-                if info is None:
-                    sets_failed += 1
-                    continue
-                sets_resolved += 1
-
-            for members in set_members.values():
-                set_members_seen += len(members)
-
-        # ── Persist ──
         imported = 0
         failed = 0
-        now_iso = _now_iso()
+        now_iso = datetime.now(timezone.utc).isoformat()
         for doc_id, record in candidates.items():
             row = dict(record)
             row["owner_id"] = owner_id
@@ -582,20 +620,46 @@ async def import_from_saved_messages(
                 imported += 1
                 existing_set.add(doc_id)
 
-        # Count set-member outcomes for the report.
-        if resolve_sets:
-            for doc_id in candidates:
-                info = resolved_sets.get(doc_id)
-                if info is None or not info.get("stickerset_id"):
-                    set_members_failed += 1
-                else:
-                    set_members_imported += 1
-            set_members_duplicates = max(
-                0, seen - set_members_imported - set_members_failed
-            )
+        set_imported = 0
+        set_failed = 0
+        for doc_id, record in set_candidates.items():
+            row = dict(record)
+            row["owner_id"] = owner_id
+            row["created_at"] = now_iso
+            stored = await db_client.insert_emoji_entry(row)
+            if stored is None:
+                set_failed += 1
+                logger.error(
+                    "[EMOJI_IMPORT] set member persist failed document_id=%s", doc_id
+                )
+            else:
+                set_imported += 1
+                existing_set.add(doc_id)
+
+        set_report = {
+            "degraded": bool(
+                enrichment["error"]
+                or enrichment["unresolved_documents"]
+                or enrichment["documents_without_set"]
+                or enrichment["hit_set_limit"]
+                or enrichment["hit_set_member_limit"]
+            ),
+            "set_error": enrichment["error"],
+            "documents_resolved": enrichment["documents_resolved"],
+            "unresolved_documents": enrichment["unresolved_documents"],
+            "documents_without_set": enrichment["documents_without_set"],
+            "sets_resolved": enrichment["sets_resolved"],
+            "set_members_seen": enrichment["set_members_seen"],
+            "set_members_malformed": enrichment["set_members_malformed"],
+            "set_imported": set_imported,
+            "set_duplicates": enrichment["set_duplicates"],
+            "set_failed": set_failed,
+            "hit_set_limit": enrichment["hit_set_limit"],
+            "hit_set_member_limit": enrichment["hit_set_member_limit"],
+        }
 
         return {
-            "ok": failed == 0,
+            "ok": failed == 0 and set_failed == 0,
             "error": None,
             "storage": storage,
             "pages": pages,
@@ -610,26 +674,5 @@ async def import_from_saved_messages(
             "hit_scan_limit": hit_scan_limit,
             "hit_record_limit": hit_record_limit,
             "hit_entity_limit": hit_entity_limit,
-            "sets_requested": sets_requested,
-            "sets_resolved": sets_resolved,
-            "sets_failed": sets_failed,
-            "set_members_seen": set_members_seen,
-            "set_members_imported": set_members_imported,
-            "set_members_duplicates": set_members_duplicates,
-            "set_members_failed": set_members_failed,
-            "set_resolution_error": set_resolution_error,
+            **set_report,
         }
-
-
-def _now_iso() -> str:
-    from datetime import datetime, timezone
-
-    return datetime.now(timezone.utc).isoformat()
-
-
-# Re-export the Phase 1 names for tests.
-__all__ = [
-    "extract_custom_emoji_records",
-    "import_from_saved_messages",
-    "ExtractionResult",
-]
