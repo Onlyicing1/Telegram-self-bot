@@ -1423,6 +1423,56 @@ async def update_emoji_category(
         return None
 
 
+def _set_emoji_category_sources_sync(
+    owner_id: int, category_id: int, source_ids: list,
+) -> bool:
+    now = datetime.now(timezone.utc).isoformat()
+    db = get_db()
+    if db is None:
+        for row in _fallback["emoji_categories"]:
+            if row.get("owner_id") == owner_id and row.get("id") == category_id:
+                row["source_category_ids"] = list(source_ids)
+                row["updated_at"] = now
+                return True
+        return False
+    try:
+        result = (
+            db.table("emoji_categories")
+            .update({"source_category_ids": list(source_ids), "updated_at": now})
+            .eq("owner_id", owner_id)
+            .eq("id", category_id)
+            .execute()
+        )
+        return bool(result.data)
+    except Exception as exc:
+        logger.error("[EMOJI_DB] set_emoji_category_sources ERROR: %s", exc, exc_info=True)
+        record_event("database", "update emoji_categories", 0, "ERROR", str(exc))
+        return False
+
+
+async def set_emoji_category_sources(
+    owner_id: int, category_id: int, source_ids: list,
+) -> bool:
+    """Persist one category's composition source list (ROADMAP §26).
+
+    Only ever called for a Custom Category — ordinary categories are never
+    written with this field, so Phase 2 behavior is untouched. False on
+    failure or a missing row: the ``source_category_ids`` column is
+    MANUAL-ONLY (IMPLEMENTATION_REPORT.md), so a Supabase without the
+    documented change reports an honest failure instead of silently dropping
+    the composition. Never raises.
+    """
+    if not isinstance(source_ids, list):
+        return False
+    try:
+        return await _run_sync(
+            _set_emoji_category_sources_sync, owner_id, category_id, source_ids,
+        )
+    except Exception as exc:
+        logger.error("[EMOJI_DB] set_emoji_category_sources FAILED: %s", exc)
+        return False
+
+
 def _delete_emoji_category_sync(owner_id: int, category_id: int) -> bool:
     db = get_db()
     if db is None:

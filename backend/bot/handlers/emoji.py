@@ -68,6 +68,8 @@ _MAPPING_PANEL = "emoji_map"
 _PICKER_PANEL = "emoji_pick"
 _REPLACEMENT_PANEL = "emoji_replacement"
 _STATE_SCOPE_PICKER_PANEL = "emoji_state_scope"
+_COMPOSE_PANEL = "emoji_compose"
+_SOURCE_PICKER_PANEL = "emoji_sources"
 
 
 async def _emoji_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
@@ -357,6 +359,10 @@ async def _render_categories(
                     break
                 row = rows[j]
                 name = _truncate(str(row.get("name") or "?"))
+                if cat_service.is_custom_category(row):
+                    # the 🧩 marker is rendered from the explicit row TYPE,
+                    # never inferred from the name (ROADMAP §26)
+                    name = f"🧩 {name}"
                 label = f"{name} · {_count_label(counts, row.get('id'))}"
                 pair.append((label, f"panel:{_CATEGORY_PANEL}:{page}:{j}"))
             builder.add_buttons(*pair)
@@ -367,6 +373,7 @@ async def _render_categories(
                 ("▶", f"panel:{_CATEGORIES_PANEL}:{page + 1}"),
             )
     builder.add_row("＋ New category", "action:emoji_cat_new")
+    builder.add_row("🧩 New custom category", "action:emoji_cat_new_custom")
     return "Categories", "\n".join(lines), builder.build()
 
 
@@ -388,8 +395,10 @@ async def _category_page_handler(event, extra: str) -> tuple[str, str, list] | N
         )
     cid = row.get("id")
     count_label = _count_label(counts, cid)
+    custom = cat_service.is_custom_category(row)
+    sources = cat_service.category_sources(row) if custom else []
     lines = [
-        f"🗂 **{row.get('name') or '?'}**",
+        f"{'🧩' if custom else '🗂'} **{row.get('name') or '?'}**",
         "",
         (
             f"{count_label} mapping(s)"
@@ -397,8 +406,21 @@ async def _category_page_handler(event, extra: str) -> tuple[str, str, list] | N
             else "_Mapping count unknown — storage read failed._"
         ),
     ]
+    if custom:
+        lines.append(
+            f"Composed snapshot — {len(sources)} source(s), in precedence order."
+        )
+        lines.append(
+            "_Add sources below, then Compose. The snapshot never follows "
+            "source edits until you Refresh it._"
+            if not sources
+            else "_Source edits do not move the snapshot until you Refresh it._"
+        )
     builder = InlinePanelBuilder()
     builder.add_row("🗺 Mappings", f"panel:{_MAPPINGS_PANEL}:{cid}:0")
+    if custom:
+        builder.add_row("🧩 Compose / sources", f"panel:{_COMPOSE_PANEL}:{cid}")
+        builder.add_row("🔄 Refresh snapshot", f"action:emoji_refresh:{cid}")
     builder.add_row("✏️ Rename", f"action:emoji_cat_rename:{cid}")
     builder.add_row("🗑 Delete", f"action:emoji_cat_del:{cid}")
     return "Category", "\n".join(lines), builder.build()
@@ -433,6 +455,52 @@ async def _category_create_input_handler(
             "New Category",
             _category_error_text(result.get("error"), result.get("category")),
             "action:emoji_cat_new",
+        )
+    await _edit_inline(inline_chat_id, inline_msg_id, title, body, buttons)
+    await _delete_owner_message(chat_id, msg_id)
+
+
+async def _cat_new_custom_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    """Create a Custom Category (§26): explicit type metadata, empty until
+    the owner composes it from source categories."""
+    owner = get_owner_id()
+    prompt = (
+        "**New Custom Category**\n\nSend the name as your next message.\n\n"
+        "The category starts empty — you pick its source categories next."
+    )
+    set_pending(
+        owner, _MAIN_PANEL, _custom_category_create_input_handler,
+        chat_id, prompt,
+        inline_chat_id=chat_id or 0, inline_msg_id=0,
+    )
+    builder = InlinePanelBuilder()
+    builder.add_row("← Back", f"panel:{_CATEGORIES_PANEL}")
+    return (
+        "New Custom Category",
+        "Send the category name as your next message.",
+        builder.build(),
+    )
+
+
+async def _custom_category_create_input_handler(
+    text, chat_id, msg_id, inline_chat_id, inline_msg_id,
+):
+    from backend.helper.inline_engine import _owner_id
+
+    owner = _owner_id
+    result = await cat_service.create_category(owner, text, is_custom=True)
+    category = result.get("category") or {}
+    if result.get("ok") and isinstance(category.get("id"), int):
+        _set_draft(owner, kind="compose", category_id=category["id"], source_ids=[])
+        title, body, buttons = await _render_compose(
+            owner, category["id"],
+            notice="✓ Custom category created — add its source categories.",
+        )
+    else:
+        title, body, buttons = _error_panel(
+            "New Custom Category",
+            _category_error_text(result.get("error"), category),
+            "action:emoji_cat_new_custom",
         )
     await _edit_inline(inline_chat_id, inline_msg_id, title, body, buttons)
     await _delete_owner_message(chat_id, msg_id)
@@ -534,6 +602,11 @@ async def _cat_del_action(event, extra: str, chat_id: int) -> tuple[str, str, li
         f"{count_text} mapping(s) will be removed with it.\n"
         "Library entries are NOT deleted."
     )
+    if cat_service.is_custom_category(category):
+        body += (
+            "\n\n_🧩 Composed category: its snapshot mappings are removed; "
+            "the source categories themselves are untouched._"
+        )
     builder = InlinePanelBuilder()
     builder.add_row("🗑 Delete", "action:emoji_cat_delgo")
     builder.add_row("✗ Cancel", f"panel:{_CATEGORIES_PANEL}:0")
@@ -602,12 +675,14 @@ async def _render_mappings(
     page_count = _page_count(total)
     wid = intw(cid)
     builder = InlinePanelBuilder()
+    custom = cat_service.is_custom_category(category)
     if notice:
         lines: list[str] = [notice, "", f"🗺 **{category.get('name')}** — {total}"]
     elif not rows:
         lines = [
             f"🗺 **{category.get('name')}** — {total}", "",
-            "_No mappings yet. Add one below._",
+            "_No mappings yet — compose it from sources._" if custom
+            else "_No mappings yet. Add one below._",
         ]
     else:
         lines = [
@@ -615,32 +690,42 @@ async def _render_mappings(
             "",
             "_simple → premium:_",
         ]
-        for j, row in enumerate(rows):
-            entry = await cat_service._resolve_library_entry(
-                owner, row.get("document_id")
-            )
-            entry_row = entry if isinstance(entry, dict) else None
-            simple = str(row.get("simple_emoji") or "·")
-            lines.append(
-                f"{simple} → {_entry_visual(entry_row)}"
-                + ("" if entry_row is not None else " _[entry missing]_")
-            )
-            builder.add_row(
-                f"{simple} → {_truncate(_entry_visual(entry_row))}",
-                f"panel:{_MAPPING_PANEL}:{page}:{j}:{wid}",
-            )
-        if page_count > 1:
-            prev_data = (
-                f"panel:{_MAPPINGS_PANEL}::{page - 1}:{wid}"
-                if page
-                else f"panel:{_MAPPINGS_PANEL}::0:{wid}"
-            )
-            builder.add_buttons(
-                ("◀", prev_data),
-                (f"{page + 1}/{page_count}", f"panel:{_MAPPINGS_PANEL}::{page}:{wid}"),
-                ("▶", f"panel:{_MAPPINGS_PANEL}::{page + 1}:{wid}"),
-            )
-    builder.add_row("＋ Add mapping", f"action:emoji_map_new:{wid}")
+    if custom:
+        lines.extend([
+            "",
+            "_🧩 Composed category — this set is a snapshot of its sources; "
+            "Refresh rebuilds it._",
+        ])
+    for j, row in enumerate(rows):
+        entry = await cat_service._resolve_library_entry(
+            owner, row.get("document_id")
+        )
+        entry_row = entry if isinstance(entry, dict) else None
+        simple = str(row.get("simple_emoji") or "·")
+        lines.append(
+            f"{simple} → {_entry_visual(entry_row)}"
+            + ("" if entry_row is not None else " _[entry missing]_")
+        )
+        builder.add_row(
+            f"{simple} → {_truncate(_entry_visual(entry_row))}",
+            f"panel:{_MAPPING_PANEL}:{page}:{j}:{wid}",
+        )
+    if page_count > 1:
+        prev_data = (
+            f"panel:{_MAPPINGS_PANEL}::{page - 1}:{wid}"
+            if page
+            else f"panel:{_MAPPINGS_PANEL}::0:{wid}"
+        )
+        builder.add_buttons(
+            ("◀", prev_data),
+            (f"{page + 1}/{page_count}", f"panel:{_MAPPINGS_PANEL}::{page}:{wid}"),
+            ("▶", f"panel:{_MAPPINGS_PANEL}::{page + 1}:{wid}"),
+        )
+    if custom:
+        builder.add_row("🧩 Compose / sources", f"panel:{_COMPOSE_PANEL}:{cid}")
+        builder.add_row("🔄 Refresh snapshot", f"action:emoji_refresh:{cid}")
+    else:
+        builder.add_row("＋ Add mapping", f"action:emoji_map_new:{wid}")
     return "Mappings", "\n".join(lines), builder.build()
 
 
@@ -670,6 +755,14 @@ async def _mapping_page_handler(event, extra: str) -> tuple[str, str, list] | No
     if entry_row is None:
         lines.append("_Library entry no longer exists._")
     builder = InlinePanelBuilder()
+    category = await cat_service.get_category(get_owner_id(), cid)
+    if cat_service.is_custom_category(category):
+        lines.append(
+            "_🧩 Composed category — manual mapping edits are disabled; "
+            "compose its sources and Refresh instead._"
+        )
+        builder.add_row("🧩 Compose / sources", f"panel:{_COMPOSE_PANEL}:{cid}")
+        return "Mapping", "\n".join(lines), builder.build()
     builder.add_row("✏️ Change", f"action:emoji_map_edit:{row.get('simple_emoji')}:{wid}")
     builder.add_row("🗑 Remove", f"action:emoji_map_del:{row.get('simple_emoji')}:{wid}")
     return "Mapping", "\n".join(lines), builder.build()
@@ -691,6 +784,16 @@ async def _map_new_action(event, extra: str, chat_id: int) -> tuple[str, str, li
         return _error_panel(
             "Add Mapping", "Category not found — it may have been deleted.",
             f"panel:{_CATEGORIES_PANEL}",
+        )
+    if cat_service.is_custom_category(category):
+        # Snapshot coherence (§26): a composed category is edited by
+        # composing its sources, never by hand-written mappings that a
+        # Refresh would silently discard.
+        return _error_panel(
+            "Add Mapping",
+            "This is a composed category — add sources and Compose/Refresh "
+            "instead. Manual mapping edits are disabled.",
+            f"panel:{_COMPOSE_PANEL}:{cid}",
         )
     _set_draft(owner, kind="map_emoji", category_id=cid)
     prompt = (
@@ -929,6 +1032,14 @@ async def _map_edit_action(event, extra: str, chat_id: int) -> tuple[str, str, l
             "Change Mapping", "Mapping not found — it may have been deleted.",
             f"panel:{_MAPPINGS_PANEL}::0:{wid}",
         )
+    category = await cat_service.get_category(owner, cid)
+    if cat_service.is_custom_category(category):
+        return _error_panel(
+            "Change Mapping",
+            "This is a composed category — change its sources and Refresh "
+            "instead. Manual mapping edits are disabled.",
+            f"panel:{_COMPOSE_PANEL}:{cid}",
+        )
     _set_draft(
         owner, kind="map_library", category_id=cid, simple_emoji=emoji,
     )
@@ -948,6 +1059,14 @@ async def _map_del_action(event, extra: str, chat_id: int) -> tuple[str, str, li
             "Remove Mapping", "Category not found — it may have been deleted.",
             f"panel:{_CATEGORIES_PANEL}",
         )
+    category = await cat_service.get_category(owner, cid)
+    if cat_service.is_custom_category(category):
+        return _error_panel(
+            "Remove Mapping",
+            "This is a composed category — change its sources and Refresh "
+            "instead. Manual mapping edits are disabled.",
+            f"panel:{_COMPOSE_PANEL}:{cid}",
+        )
     result = await cat_service.delete_mapping(owner, cid, emoji)
     if result.get("ok"):
         return await _render_mappings(
@@ -961,6 +1080,465 @@ async def _map_del_action(event, extra: str, chat_id: int) -> tuple[str, str, li
     return _error_panel(
         "Remove Mapping", "Invalid emoji key.", f"panel:{_MAPPINGS_PANEL}::0:{wid}",
     )
+
+
+# ── composition UI (Phase 5, ROADMAP §26) ─────────────────────────────────
+
+
+def _compose_draft_sources(owner: int, cid: int) -> list[int] | None:
+    """The in-progress source selection for ONE custom category, or None when
+    no compose flow is armed (the panel then shows the PERSISTED sources)."""
+    draft = _get_draft(owner)
+    if not draft or draft.get("kind") != "compose" or draft.get("category_id") != cid:
+        return None
+    return [sid for sid in (draft.get("source_ids") or []) if isinstance(sid, int)]
+
+
+async def _source_candidates(
+    owner: int, cid: int, page: int,
+) -> tuple[list[dict[str, Any]], int, int]:
+    """Owner-scoped candidate sources for one page (2×5 grid), newest-first —
+    the same ordering the categories panel uses. The composed category itself
+    is excluded so it can never be its own source; already-selected sources
+    stay VISIBLE (marked) so grid positions never shift under the owner."""
+    rows, total, _counts = await cat_service.list_categories(
+        owner, limit=_PAGE_SIZE, offset=0,
+    )
+    page_count = max(1, (total + _PAGE_SIZE - 1) // _PAGE_SIZE)
+    page = max(0, min(page, page_count - 1))
+    if page:
+        rows, _total, _counts = await cat_service.list_categories(
+            owner, limit=_PAGE_SIZE, offset=page * _PAGE_SIZE,
+        )
+    return [row for row in rows if row.get("id") != cid], page, total
+
+
+async def _render_compose(
+    owner: int, cid: int, notice: str | None = None,
+) -> tuple[str, str, list]:
+    """The composition panel for ONE Custom Category.
+
+    Sources are rendered in PRECEDENCE ORDER — the first source wins every
+    shared simple emoji — from the in-progress draft when a flow is armed,
+    otherwise from the persisted composition. Nothing here decides a
+    composition: the service does, and the snapshot is never live.
+    """
+    category = await cat_service.get_category(owner, cid) if isinstance(cid, int) and cid > 0 else None
+    if category is None or not cat_service.is_custom_category(category):
+        return _error_panel(
+            "Compose", "Custom category not found — it may have been deleted.",
+            f"panel:{_CATEGORIES_PANEL}",
+        )
+    source_ids = _compose_draft_sources(owner, cid)
+    if source_ids is None:
+        source_ids = cat_service.category_sources(category)
+
+    names: dict[int, str] = {}
+    rows, _total, _counts = await cat_service.list_categories(
+        owner, limit=_PAGE_SIZE, offset=0,
+    )
+    for row in rows:
+        names[row.get("id")] = str(row.get("name") or "?")
+    for sid in source_ids:
+        if sid not in names:
+            row = await cat_service.get_category(owner, sid)
+            names[sid] = str((row or {}).get("name") or f"#{sid}") if row else f"#{sid} (missing)"
+
+    count = await cat_service.category_mapping_count(owner, cid)
+    lines = [
+        f"🧩 **{category.get('name') or '?'}**",
+        "",
+        f"Snapshot: {count if count is not None else '?'} mapping(s)",
+        "",
+        "_Sources (order = precedence — the first source wins a shared emoji):_",
+    ]
+    if not source_ids:
+        lines.append("_No sources yet._")
+    else:
+        for i, sid in enumerate(source_ids, start=1):
+            lines.append(f"{i}. {names[sid]}")
+    if notice:
+        lines.append("")
+        lines.append(notice)
+
+    builder = InlinePanelBuilder()
+    builder.add_row("➕ Add source", f"action:emoji_compose_add:{cid}")
+    for sid in source_ids:
+        builder.add_row(
+            _truncate(f"✖ Remove {names[sid]}"),
+            f"action:emoji_compose_rm:{cid}:{sid}",
+        )
+    builder.add_row("✅ Compose snapshot", f"action:emoji_compose_apply:{cid}")
+    builder.add_row("🔄 Refresh from sources", f"action:emoji_refresh:{cid}")
+    builder.add_row("🗺 Mappings", f"panel:{_MAPPINGS_PANEL}:{cid}:0")
+    builder.add_row("← Back", f"panel:{_CATEGORIES_PANEL}")
+    return "Compose", "\n".join(lines), builder.build()
+
+
+async def _render_source_picker(
+    owner: int, cid: int, page: int, notice: str | None = None,
+) -> tuple[str, str, list]:
+    category = await cat_service.get_category(owner, cid) if isinstance(cid, int) and cid > 0 else None
+    if category is None or not cat_service.is_custom_category(category):
+        return _error_panel(
+            "Add Source", "Custom category not found — it may have been deleted.",
+            f"panel:{_CATEGORIES_PANEL}",
+        )
+    candidates, page, total = await _source_candidates(owner, cid, page)
+    selected = _compose_draft_sources(owner, cid)
+    if selected is None:
+        selected = cat_service.category_sources(category)
+    if total <= 1 or not candidates:
+        return _error_panel(
+            "Add Source", "No other categories exist to use as sources.",
+            f"panel:{_COMPOSE_PANEL}:{cid}",
+        )
+
+    builder = InlinePanelBuilder()
+    lines = [
+        f"➕ **Add source** — page {page + 1}/{_page_count(total)}",
+        "",
+        "_Tap a category to append it as the next source._",
+    ]
+    if notice:
+        lines.extend(["", notice])
+    for i in range(0, len(candidates), 2):
+        pair = []
+        for j in (i, i + 1):
+            if j >= len(candidates):
+                break
+            row = candidates[j]
+            name = _truncate(str(row.get("name") or "?"), 18)
+            if cat_service.is_custom_category(row):
+                name = f"🧩 {name}"
+            if row.get("id") in selected:
+                name = f"✓ {name}"
+            pair.append((name, f"action:emoji_compose_add:{cid}:{page}:{j}"))
+        builder.add_buttons(*pair)
+    page_count = _page_count(total)
+    if page_count > 1:
+        builder.add_buttons(
+            ("◀", f"panel:{_SOURCE_PICKER_PANEL}:{cid}:{max(0, page - 1)}"),
+            (f"{page + 1}/{page_count}", f"panel:{_SOURCE_PICKER_PANEL}:{cid}:{page}"),
+            ("▶", f"panel:{_SOURCE_PICKER_PANEL}:{cid}:{page + 1}"),
+        )
+    builder.add_row("✅ Compose now", f"action:emoji_compose_apply:{cid}")
+    builder.add_row("← Back", f"panel:{_COMPOSE_PANEL}:{cid}")
+    return "Add Source", "\n".join(lines), builder.build()
+
+
+def _render_compose_conflicts(
+    cid: int, result: dict[str, Any], op: str,
+) -> tuple[str, str, list]:
+    """Explicit conflict resolution (§26): the reported precedence is the
+    owner's source order, and nothing is written until it is confirmed."""
+    conflicts = result.get("conflicts") or []
+    lines = [
+        "⚠️ **Composition conflicts**",
+        "",
+        "More than one source defines the same simple emoji. Precedence is the "
+        "source order — the FIRST source wins:",
+        "",
+    ]
+    for record in conflicts[:8]:
+        kept = record.get("kept") or {}
+        dropped = record.get("dropped") or []
+        lines.append(
+            f"{record.get('simple_emoji')} → source `#{kept.get('source_id')}` "
+            f"(doc #{kept.get('document_id')}) · dropped "
+            + ", ".join(f"`#{d.get('source_id')}`" for d in dropped)
+        )
+    if len(conflicts) > 8:
+        lines.append(f"… and {len(conflicts) - 8} more")
+    lines.extend(["", "_Nothing has been written yet._"])
+
+    builder = InlinePanelBuilder()
+    builder.add_row(
+        "✅ Confirm (first source wins)",
+        f"action:emoji_compose_confirm:{op}:{cid}",
+    )
+    builder.add_row("✗ Cancel", f"panel:{_COMPOSE_PANEL}:{cid}")
+    return "Composition Conflicts", "\n".join(lines), builder.build()
+
+
+async def _render_composition_result(
+    owner: int, cid: int, result: dict[str, Any], *, op: str,
+) -> tuple[str, str, list]:
+    """Render one composition/refresh outcome honestly — success, conflicts,
+    or the exact reason nothing changed."""
+    if result.get("ok"):
+        _clear_draft(owner)
+        parts = [
+            f"✓ {'Composed' if op == 'compose' else 'Refreshed'} — "
+            f"{len(result.get('mappings') or [])} mapping(s) from "
+            f"{len(result.get('sources') or [])} source(s)."
+        ]
+        if result.get("conflicts"):
+            parts.append(
+                f"{len(result['conflicts'])} conflict(s) resolved by source order."
+            )
+        if result.get("removed_sources"):
+            parts.append(
+                "Dropped missing source(s): "
+                + ", ".join(f"#{sid}" for sid in result["removed_sources"])
+                + "."
+            )
+        if result.get("empty_sources"):
+            parts.append(f"{len(result['empty_sources'])} source(s) had no mappings.")
+        if result.get("unresolvable"):
+            parts.append(
+                f"{result['unresolvable']} mapping(s) reference a missing item "
+                "— kept and shown as unavailable."
+            )
+        return await _render_compose(owner, cid, notice=" ".join(parts))
+
+    error = result.get("error")
+    if error == cat_service.E_CONFLICT:
+        return _render_compose_conflicts(cid, result, op)
+    if error == cat_service.E_MAPPING_LIST_INCOMPLETE:
+        return _error_panel(
+            "Compose",
+            "A source's mappings could not be read completely — nothing was changed.",
+            f"panel:{_COMPOSE_PANEL}:{cid}",
+        )
+    if error == cat_service.E_SNAPSHOT_INCOMPLETE:
+        return _error_panel(
+            "Compose",
+            f"Snapshot updated but {len(result.get('stale') or [])} old mapping(s) "
+            "could not be removed — Refresh again before relying on it.",
+            f"panel:{_COMPOSE_PANEL}:{cid}",
+        )
+    if error == cat_service.E_STORAGE:
+        return _error_panel(
+            "Compose", "Storage failed — the previous snapshot is unchanged.",
+            f"panel:{_COMPOSE_PANEL}:{cid}",
+        )
+    if error == cat_service.E_SOURCE_MISSING:
+        missing = ", ".join(f"#{sid}" for sid in (result.get("missing_sources") or []))
+        return _error_panel(
+            "Compose",
+            f"Source category not found ({missing or '?'}) — nothing was changed.",
+            f"panel:{_COMPOSE_PANEL}:{cid}",
+        )
+    if error == cat_service.E_SOURCE_CYCLE:
+        return _error_panel(
+            "Compose",
+            "That would create a circular composition — rejected. Nothing was changed.",
+            f"panel:{_COMPOSE_PANEL}:{cid}",
+        )
+    if error == cat_service.E_SOURCE_SELF:
+        return _error_panel(
+            "Compose", "A category cannot compose itself — nothing was changed.",
+            f"panel:{_COMPOSE_PANEL}:{cid}",
+        )
+    if error == cat_service.E_SOURCE_DUPLICATE:
+        return _error_panel(
+            "Compose",
+            "The same source category is selected twice — nothing was changed.",
+            f"panel:{_COMPOSE_PANEL}:{cid}",
+        )
+    if error == cat_service.E_TOO_MANY_SOURCES:
+        return _error_panel(
+            "Compose",
+            f"At most {cat_service.MAX_SOURCE_CATEGORIES} source categories.",
+            f"panel:{_COMPOSE_PANEL}:{cid}",
+        )
+    if error == cat_service.E_NO_SOURCES:
+        return _error_panel(
+            "Compose", "No sources selected — add at least one source first.",
+            f"panel:{_COMPOSE_PANEL}:{cid}",
+        )
+    if error == cat_service.E_NOT_CUSTOM:
+        return _error_panel(
+            "Compose", "This category is not a composed (custom) category.",
+            f"panel:{_CATEGORIES_PANEL}",
+        )
+    if error == cat_service.E_NOT_FOUND:
+        return _error_panel(
+            "Compose", "Custom category not found — it may have been deleted.",
+            f"panel:{_CATEGORIES_PANEL}",
+        )
+    return _error_panel(
+        "Compose", "Composition failed — nothing was changed.",
+        f"panel:{_COMPOSE_PANEL}:{cid}",
+    )
+
+
+async def _compose_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
+    owner = get_owner_id()
+    if not owner:
+        return _error_panel("Compose", "Owner is not set.", f"panel:{_MAIN_PANEL}")
+    try:
+        cid = int(extra.split(":")[0])
+    except (TypeError, ValueError, IndexError):
+        cid = 0
+    return await _render_compose(owner, cid)
+
+
+async def _source_picker_handler(event, extra: str) -> tuple[str, str, list] | None:
+    owner = get_owner_id()
+    if not owner:
+        return _error_panel("Add Source", "Owner is not set.", f"panel:{_MAIN_PANEL}")
+    cid_s, _, page_s = extra.partition(":")
+    try:
+        cid = int(cid_s)
+        page = max(0, int(page_s or 0))
+    except (TypeError, ValueError):
+        return _error_panel(
+            "Add Source", "Flow out of date — start again.", f"panel:{_CATEGORIES_PANEL}"
+        )
+    return await _render_source_picker(owner, cid, page)
+
+
+async def _compose_add_action(event, extra: str, chat_id: int):
+    """`extra: <wid>` opens the picker; ``<wid>:<page>:<idx>`` appends ONE
+    owner-scoped source. Every id is re-validated against the owner — the
+    callback payload is never authorization."""
+    owner = get_owner_id()
+    parts = str(extra).split(":")
+    try:
+        cid = int(parts[0])
+    except (TypeError, ValueError, IndexError):
+        return _error_panel(
+            "Add Source", "Flow out of date — start again.", f"panel:{_CATEGORIES_PANEL}"
+        )
+    category = await cat_service.get_category(owner, cid)
+    if category is None or not cat_service.is_custom_category(category):
+        return _error_panel(
+            "Add Source", "Custom category not found — it may have been deleted.",
+            f"panel:{_CATEGORIES_PANEL}",
+        )
+    if len(parts) == 1:
+        if _compose_draft_sources(owner, cid) is None:
+            _set_draft(owner, kind="compose", category_id=cid, source_ids=[])
+        return await _render_source_picker(owner, cid, 0)
+    try:
+        page, idx = int(parts[1]), int(parts[2])
+    except (TypeError, ValueError, IndexError):
+        return _error_panel(
+            "Add Source", "Flow out of date — start again.",
+            f"panel:{_COMPOSE_PANEL}:{cid}",
+        )
+    candidates, page, _total = await _source_candidates(owner, cid, page)
+    picked = candidates[idx] if 0 <= idx < len(candidates) else None
+    if picked is None:
+        return _error_panel(
+            "Add Source", "List changed — pick again.",
+            f"panel:{_SOURCE_PICKER_PANEL}:{cid}:{page}",
+        )
+    selected = _compose_draft_sources(owner, cid)
+    if selected is None:
+        # no flow armed yet: start from the persisted composition
+        selected = cat_service.category_sources(category)
+    source_id = picked.get("id")
+    name = _truncate(str(picked.get("name") or "?"))
+    if source_id in selected:
+        return await _render_source_picker(
+            owner, cid, page,
+            notice=f"“{name}” is already a source (it keeps its precedence position).",
+        )
+    if len(selected) >= cat_service.MAX_SOURCE_CATEGORIES:
+        return await _render_source_picker(
+            owner, cid, page,
+            notice=f"At most {cat_service.MAX_SOURCE_CATEGORIES} sources.",
+        )
+    selected.append(source_id)
+    _set_draft(owner, kind="compose", category_id=cid, source_ids=selected)
+    return await _render_compose(
+        owner, cid, notice=f"✓ Added “{name}” as source #{len(selected)}.",
+    )
+
+
+async def _compose_rm_action(event, extra: str, chat_id: int):
+    """`extra: <wid>:<source_id>`` — remove one source from the draft."""
+    owner = get_owner_id()
+    wid, _, sid_s = str(extra).partition(":")
+    try:
+        cid, source_id = int(wid), int(sid_s)
+    except (TypeError, ValueError):
+        return _error_panel(
+            "Compose", "Flow out of date — start again.", f"panel:{_CATEGORIES_PANEL}"
+        )
+    category = await cat_service.get_category(owner, cid)
+    if category is None or not cat_service.is_custom_category(category):
+        return _error_panel(
+            "Compose", "Custom category not found — it may have been deleted.",
+            f"panel:{_CATEGORIES_PANEL}",
+        )
+    selected = _compose_draft_sources(owner, cid)
+    if selected is None:
+        selected = cat_service.category_sources(category)
+    if source_id not in selected:
+        return await _render_compose(
+            owner, cid, notice="Source not in this composition — nothing changed.",
+        )
+    selected = [sid for sid in selected if sid != source_id]
+    _set_draft(owner, kind="compose", category_id=cid, source_ids=selected)
+    return await _render_compose(
+        owner, cid, notice=f"✖ Source `#{source_id}` removed from the selection.",
+    )
+
+
+async def _compose_apply_action(event, extra: str, chat_id: int):
+    """Run the composition from the armed draft — the service decides; the
+    UI only renders its report."""
+    owner = get_owner_id()
+    try:
+        cid = int(str(extra).split(":")[0])
+    except (TypeError, ValueError, IndexError):
+        return _error_panel(
+            "Compose", "Flow out of date — start again.", f"panel:{_CATEGORIES_PANEL}"
+        )
+    selected = _compose_draft_sources(owner, cid)
+    if selected is None:
+        return _error_panel(
+            "Compose", "Flow out of date — open the category again.",
+            f"panel:{_COMPOSE_PANEL}:{cid}",
+        )
+    result = await cat_service.compose_category(owner, cid, selected)
+    return await _render_composition_result(owner, cid, result, op="compose")
+
+
+async def _refresh_action(event, extra: str, chat_id: int):
+    """Explicit Refresh: rebuild the snapshot from the PERSISTED sources."""
+    owner = get_owner_id()
+    try:
+        cid = int(str(extra).split(":")[0])
+    except (TypeError, ValueError, IndexError):
+        return _error_panel(
+            "Refresh", "Flow out of date — start again.", f"panel:{_CATEGORIES_PANEL}"
+        )
+    result = await cat_service.refresh_category(owner, cid)
+    return await _render_composition_result(owner, cid, result, op="refresh")
+
+
+async def _compose_confirm_action(event, extra: str, chat_id: int):
+    """The ONLY path that turns reported conflicts into stored precedence."""
+    owner = get_owner_id()
+    op, _, wid = str(extra).partition(":")
+    try:
+        cid = int(wid)
+    except (TypeError, ValueError):
+        return _error_panel(
+            "Compose", "Flow out of date — start again.", f"panel:{_CATEGORIES_PANEL}"
+        )
+    if op == "refresh":
+        result = await cat_service.refresh_category(owner, cid, confirm_conflicts=True)
+    elif op == "compose":
+        selected = _compose_draft_sources(owner, cid)
+        if selected is None:
+            return _error_panel(
+                "Compose", "Flow out of date — open the category again.",
+                f"panel:{_COMPOSE_PANEL}:{cid}",
+            )
+        result = await cat_service.compose_category(
+            owner, cid, selected, confirm_conflicts=True,
+        )
+    else:
+        return _error_panel(
+            "Compose", "Flow out of date — start again.", f"panel:{_CATEGORIES_PANEL}"
+        )
+    return await _render_composition_result(owner, cid, result, op=op)
 
 
 # ── registration ──────────────────────────────────────────────────────────
@@ -1305,6 +1883,14 @@ def register(client, owner_id: int) -> None:
         _STATE_SCOPE_PICKER_PANEL, _state_scope_picker_handler,
         parent=_REPLACEMENT_PANEL, title="Pick Category",
     )
+    register_panel(
+        _COMPOSE_PANEL, _compose_panel_handler,
+        parent=_CATEGORY_PANEL, title="Compose",
+    )
+    register_panel(
+        _SOURCE_PICKER_PANEL, _source_picker_handler,
+        parent=_COMPOSE_PANEL, title="Add Source",
+    )
     register_action("emoji_import", _import_action)
     register_action("emoji_state_toggle", _state_toggle_action)
     register_action("emoji_state_global_pick", _state_global_pick_action)
@@ -1312,6 +1898,13 @@ def register(client, owner_id: int) -> None:
     register_action("emoji_state_choose", _state_choose_action)
     register_action("emoji_state_clear", _state_clear_action)
     register_action("emoji_cat_new", _cat_new_action)
+    register_action("emoji_cat_new_custom", _cat_new_custom_action)
+    register_action("emoji_compose", _compose_panel_handler)
+    register_action("emoji_compose_add", _compose_add_action)
+    register_action("emoji_compose_rm", _compose_rm_action)
+    register_action("emoji_compose_apply", _compose_apply_action)
+    register_action("emoji_compose_confirm", _compose_confirm_action)
+    register_action("emoji_refresh", _refresh_action)
     register_action("emoji_cat_rename", _cat_rename_action)
     register_action("emoji_cat_del", _cat_del_action)
     register_action("emoji_cat_delgo", _cat_delgo_action)
