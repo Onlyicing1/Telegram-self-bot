@@ -322,24 +322,29 @@ resolve paths relative to cwd):
 
 ## 11. Delivery metadata
 
-- **Branch:** `m14-stt` (the workspace branch that tracks `origin/main`).
-- **Implementation commit:** `bd20382` was the Phase 3 commit; this Phase 4
-  change set is committed on top of it (see the `git log` entry
-  `feat(emoji): implement Phase 4 — reconstruction …`).
-- **Push result / remote HEAD / worktree state:** recorded in §12 below,
-  filled from the verification run that followed the push (the delivery
-  metadata cannot contain its own commit hash).
+- **Branch:** `m14-stt` — the workspace branch that tracks `origin/main`
+  (pushed as `m14-stt:main`).
+- **Implementation commit (Phase 4 code + docs):**
+  `5258773726d9e35bd65778cb661d45e5db35acfc` —
+  `feat(emoji): implement Phase 4 — reconstruction (entity-safe transform,
+  send-first bridge delivery, loop prevention)` (9 files, +2283/−452).
+- **Parent:** `bd20382` (Phase 3).
+- **Earlier commits referenced by this report:** Phase 0 `b6614ef`/`78b22fd`,
+  Phase 1 `ba5a3b5`/`8a5d23d`, Phase 2 `3b0e476`, Phase 3 `bd20382`.
 
 ## 12. Push verification (recorded after delivery)
 
 | Check | Result |
 |---|---|
-| `git push origin m14-stt:main` | recorded in the finalization commit (see below) |
-| `git fetch origin main` + `git rev-parse HEAD origin/main` | recorded in the finalization commit |
-| `git ls-remote origin refs/heads/main` | recorded in the finalization commit |
-| Final working tree | recorded in the finalization commit |
+| `git push origin m14-stt:main` | **success** — `bd20382..5258773  m14-stt -> main` |
+| `git fetch origin main` + `git rev-parse HEAD origin/main` | both `5258773726d9e35bd65778cb661d45e5db35acfc` (identical) |
+| `git ls-remote origin refs/heads/main` | `5258773726d9e35bd65778cb661d45e5db35acfc  refs/heads/main` |
+| Working tree after the push | clean — no modified or untracked files |
 
-> The Phase 4 implementation commit and a tiny follow-up documentation commit
-> exist because a commit cannot embed its own SHA; the follow-up changes only
-> this section and the report's phase-status line, and both commits belong to
-> the same request.
+> The implementation could not embed its own SHA, so one tiny follow-up
+> **documentation** commit records the values above (this section only; same
+> request, same branch, no code change). Its SHA and the resulting remote
+> `main` HEAD are pushed and verified with the identical procedure, printed
+> in the owner-facing summary, and visible in `git log` / `git ls-remote`.
+> Until that follow-up, the remote `main` HEAD recorded above is
+> `5258773`; afterwards it is the follow-up commit itself.
