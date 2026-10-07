@@ -36,7 +36,15 @@ logger = logging.getLogger(__name__)
 
 _client = None
 _available = False
-_fallback: dict = {"saved_items": [], "bio_state": {}, "bot_logs": [], "username_state": {}, "emoji_library": []}
+_fallback: dict = {
+    "saved_items": [],
+    "bio_state": {},
+    "bot_logs": [],
+    "username_state": {},
+    "emoji_library": [],
+    "emoji_categories": [],
+    "emoji_mappings": [],
+}
 _save_code_lock = asyncio.Lock()
 _initialised = False
 
@@ -1195,6 +1203,632 @@ async def list_emoji_entries(owner_id: int, limit: int = 50, offset: int = 0) ->
         logger.error("[EMOJI_DB] list_emoji_entries FAILED: %s", exc)
         items = [e for e in _fallback["emoji_library"] if e.get("owner_id") == owner_id]
         return items[offset:offset + limit], len(items)
+
+
+# ── emoji_categories (Emoji & Reaction Phase 2) ──
+
+def _insert_emoji_category_sync(data: dict) -> dict | None:
+    row = dict(data)
+    now = datetime.now(timezone.utc).isoformat()
+    if row.get("created_at") is None:
+        row["created_at"] = now
+    if row.get("updated_at") is None:
+        row["updated_at"] = now
+    db = get_db()
+    if db is None:
+        store = _fallback["emoji_categories"]
+        for existing in store:
+            if (
+                existing.get("owner_id") == row.get("owner_id")
+                and existing.get("name") == row.get("name")
+            ):
+                logger.warning(
+                    "[EMOJI_DB] insert_emoji_category: duplicate name=%r — refused.",
+                    row.get("name"),
+                )
+                return None
+        row["id"] = len(store) + 1
+        store.append(row)
+        return row
+    try:
+        result = db.table("emoji_categories").insert(row).execute()
+        inserted = result.data[0] if result.data else None
+        if inserted is None:
+            logger.error(
+                "[EMOJI_DB] insert_emoji_category ERROR: insert() returned no data."
+            )
+            record_event(
+                "database", "insert emoji_categories", 0, "ERROR",
+                "insert returned no data",
+            )
+            return None
+        record_event("database", "insert emoji_categories", 0, "SUCCESS")
+        return inserted
+    except Exception as exc:
+        logger.error("[EMOJI_DB] insert_emoji_category ERROR: %s", exc, exc_info=True)
+        record_event("database", "insert emoji_categories", 0, "ERROR", str(exc))
+        return None
+
+
+async def insert_emoji_category(data: dict) -> dict | None:
+    """Insert one emoji_categories row. Returns the stored row, or None on
+    failure (and None when the owner already has a category with the same
+    name — the manual UNIQUE (owner_id, name) index is the durable backstop).
+    Never raises.
+    """
+    try:
+        return await _run_sync(_insert_emoji_category_sync, data)
+    except Exception as exc:
+        logger.error("[EMOJI_DB] insert_emoji_category FAILED: %s", exc)
+        record_event("database", "insert emoji_categories", 0, "ERROR", str(exc))
+        return None
+
+
+def _get_emoji_category_sync(owner_id: int, category_id: int) -> dict | None:
+    db = get_db()
+    if db is None:
+        for row in _fallback["emoji_categories"]:
+            if row.get("owner_id") == owner_id and row.get("id") == category_id:
+                return row
+        return None
+    try:
+        result = (
+            db.table("emoji_categories")
+            .select("*")
+            .eq("owner_id", owner_id)
+            .eq("id", category_id)
+            .limit(1)
+            .execute()
+        )
+        return result.data[0] if result.data else None
+    except Exception as exc:
+        logger.error("[EMOJI_DB] get_emoji_category FAILED: %s", exc)
+        return None
+
+
+async def get_emoji_category(owner_id: int, category_id: int) -> dict | None:
+    """One owner-scoped category row, or None when missing/unreadable."""
+    try:
+        return await _run_sync(_get_emoji_category_sync, owner_id, category_id)
+    except Exception as exc:
+        logger.error("[EMOJI_DB] get_emoji_category FAILED: %s", exc)
+        return None
+
+
+def _get_emoji_category_by_name_sync(owner_id: int, name: str) -> dict | None:
+    db = get_db()
+    if db is None:
+        for row in _fallback["emoji_categories"]:
+            if row.get("owner_id") == owner_id and row.get("name") == name:
+                return row
+        return None
+    try:
+        result = (
+            db.table("emoji_categories")
+            .select("*")
+            .eq("owner_id", owner_id)
+            .eq("name", name)
+            .limit(1)
+            .execute()
+        )
+        return result.data[0] if result.data else None
+    except Exception as exc:
+        logger.error("[EMOJI_DB] get_emoji_category_by_name FAILED: %s", exc)
+        return None
+
+
+async def get_emoji_category_by_name(owner_id: int, name: str) -> dict | None:
+    """One owner-scoped category by exact name, or None when missing."""
+    try:
+        return await _run_sync(_get_emoji_category_by_name_sync, owner_id, name)
+    except Exception as exc:
+        logger.error("[EMOJI_DB] get_emoji_category_by_name FAILED: %s", exc)
+        return None
+
+
+def _list_emoji_categories_sync(
+    owner_id: int, limit: int, offset: int,
+) -> tuple[list, int]:
+    db = get_db()
+    if db:
+        try:
+            result = (
+                db.table("emoji_categories")
+                .select("*")
+                .eq("owner_id", owner_id)
+                .order("created_at", desc=True)
+                .range(offset, offset + limit - 1)
+                .execute()
+            )
+            count_res = (
+                db.table("emoji_categories")
+                .select("id", count="exact")
+                .eq("owner_id", owner_id)
+                .execute()
+            )
+            return result.data or [], count_res.count or 0
+        except Exception as exc:
+            logger.error("[EMOJI_DB] list_emoji_categories FAILED: %s", exc)
+    items = [c for c in _fallback["emoji_categories"] if c.get("owner_id") == owner_id]
+    total = len(items)
+    items = sorted(
+        items,
+        key=lambda r: (r.get("created_at") or "", r.get("id") or 0),
+        reverse=True,
+    )
+    return items[offset:offset + limit], total
+
+
+async def list_emoji_categories(
+    owner_id: int, limit: int = 50, offset: int = 0,
+) -> tuple[list, int]:
+    """List the owner's categories newest-first as (rows, total)."""
+    try:
+        return await _run_sync(_list_emoji_categories_sync, owner_id, limit, offset)
+    except Exception as exc:
+        logger.error("[EMOJI_DB] list_emoji_categories FAILED: %s", exc)
+        items = [c for c in _fallback["emoji_categories"] if c.get("owner_id") == owner_id]
+        return items[offset:offset + limit], len(items)
+
+
+def _update_emoji_category_sync(
+    owner_id: int, category_id: int, name: str,
+) -> dict | None:
+    now = datetime.now(timezone.utc).isoformat()
+    db = get_db()
+    if db is None:
+        for existing in _fallback["emoji_categories"]:
+            if (
+                existing.get("owner_id") == owner_id
+                and existing.get("id") != category_id
+                and existing.get("name") == name
+            ):
+                logger.warning(
+                    "[EMOJI_DB] update_emoji_category: name=%r already used — refused.",
+                    name,
+                )
+                return None
+        for row in _fallback["emoji_categories"]:
+            if row.get("owner_id") == owner_id and row.get("id") == category_id:
+                row["name"] = name
+                row["updated_at"] = now
+                return row
+        return None
+    try:
+        result = (
+            db.table("emoji_categories")
+            .update({"name": name, "updated_at": now})
+            .eq("owner_id", owner_id)
+            .eq("id", category_id)
+            .execute()
+        )
+        return result.data[0] if result.data else None
+    except Exception as exc:
+        logger.error("[EMOJI_DB] update_emoji_category ERROR: %s", exc, exc_info=True)
+        record_event("database", "update emoji_categories", 0, "ERROR", str(exc))
+        return None
+
+
+async def update_emoji_category(
+    owner_id: int, category_id: int, name: str,
+) -> dict | None:
+    """Rename one owner-scoped category. None on failure, a missing row, or
+    when another category of the same owner already holds the new name."""
+    try:
+        return await _run_sync(_update_emoji_category_sync, owner_id, category_id, name)
+    except Exception as exc:
+        logger.error("[EMOJI_DB] update_emoji_category FAILED: %s", exc)
+        return None
+
+
+def _delete_emoji_category_sync(owner_id: int, category_id: int) -> bool:
+    db = get_db()
+    if db is None:
+        store = _fallback["emoji_categories"]
+        before = len(store)
+        _fallback["emoji_categories"] = [
+            c for c in store
+            if not (c.get("owner_id") == owner_id and c.get("id") == category_id)
+        ]
+        return len(_fallback["emoji_categories"]) < before
+    try:
+        result = (
+            db.table("emoji_categories")
+            .delete()
+            .eq("owner_id", owner_id)
+            .eq("id", category_id)
+            .execute()
+        )
+        return bool(result.data)
+    except Exception as exc:
+        logger.error("[EMOJI_DB] delete_emoji_category ERROR: %s", exc, exc_info=True)
+        record_event("database", "delete emoji_categories", 0, "ERROR", str(exc))
+        return False
+
+
+async def delete_emoji_category(owner_id: int, category_id: int) -> bool:
+    """Delete one owner-scoped category row. False on failure/missing.
+    Callers remove the category's mappings FIRST — this helper never
+    touches them (the service owns the deletion order)."""
+    try:
+        return await _run_sync(_delete_emoji_category_sync, owner_id, category_id)
+    except Exception as exc:
+        logger.error("[EMOJI_DB] delete_emoji_category FAILED: %s", exc)
+        return False
+
+
+# ── emoji_mappings (Emoji & Reaction Phase 2) ──
+
+#: Hard bound on the read used for per-category mapping counts (UI display).
+#: The manual UNIQUE (owner_id, category_id, simple_emoji) index is the
+#: durability backstop beyond this bound.
+_EMOJI_MAPPINGS_MAX_ROWS = 5000
+
+
+def _get_emoji_entry_sync(owner_id: int, document_id: int) -> dict | None:
+    db = get_db()
+    if db is None:
+        for row in _fallback["emoji_library"]:
+            if (
+                row.get("owner_id") == owner_id
+                and row.get("document_id") == document_id
+            ):
+                return row
+        return None
+    try:
+        result = (
+            db.table("emoji_library")
+            .select("*")
+            .eq("owner_id", owner_id)
+            .eq("document_id", document_id)
+            .limit(1)
+            .execute()
+        )
+        return result.data[0] if result.data else None
+    except Exception as exc:
+        logger.error("[EMOJI_DB] get_emoji_entry FAILED: %s", exc)
+        return None
+
+
+async def get_emoji_entry(owner_id: int, document_id: int) -> dict | None:
+    """One owner-scoped emoji_library row by document id, or None when
+    missing/unreadable. Mappings must resolve their premium emoji through
+    this lookup — the library stays the single source of definitions."""
+    try:
+        return await _run_sync(_get_emoji_entry_sync, owner_id, document_id)
+    except Exception as exc:
+        logger.error("[EMOJI_DB] get_emoji_entry FAILED: %s", exc)
+        return None
+
+
+def _insert_emoji_mapping_sync(data: dict) -> dict | None:
+    row = dict(data)
+    now = datetime.now(timezone.utc).isoformat()
+    if row.get("created_at") is None:
+        row["created_at"] = now
+    if row.get("updated_at") is None:
+        row["updated_at"] = now
+    db = get_db()
+    if db is None:
+        store = _fallback["emoji_mappings"]
+        for existing in store:
+            if (
+                existing.get("owner_id") == row.get("owner_id")
+                and existing.get("category_id") == row.get("category_id")
+                and existing.get("simple_emoji") == row.get("simple_emoji")
+            ):
+                logger.warning(
+                    "[EMOJI_DB] insert_emoji_mapping: duplicate (category=%s, emoji) — refused.",
+                    row.get("category_id"),
+                )
+                return None
+        row["id"] = len(store) + 1
+        store.append(row)
+        return row
+    try:
+        result = db.table("emoji_mappings").insert(row).execute()
+        inserted = result.data[0] if result.data else None
+        if inserted is None:
+            logger.error(
+                "[EMOJI_DB] insert_emoji_mapping ERROR: insert() returned no data."
+            )
+            record_event(
+                "database", "insert emoji_mappings", 0, "ERROR",
+                "insert returned no data",
+            )
+            return None
+        record_event("database", "insert emoji_mappings", 0, "SUCCESS")
+        return inserted
+    except Exception as exc:
+        logger.error("[EMOJI_DB] insert_emoji_mapping ERROR: %s", exc, exc_info=True)
+        record_event("database", "insert emoji_mappings", 0, "ERROR", str(exc))
+        return None
+
+
+async def insert_emoji_mapping(data: dict) -> dict | None:
+    """Insert one emoji_mappings row. Returns the stored row, or None on
+    failure (and None when the category already defines the same simple
+    emoji — the manual UNIQUE (owner_id, category_id, simple_emoji) index is
+    the durable backstop). Never raises. Callers must check for an existing
+    mapping FIRST and route through the conflict path — this helper never
+    overwrites."""
+    try:
+        return await _run_sync(_insert_emoji_mapping_sync, data)
+    except Exception as exc:
+        logger.error("[EMOJI_DB] insert_emoji_mapping FAILED: %s", exc)
+        record_event("database", "insert emoji_mappings", 0, "ERROR", str(exc))
+        return None
+
+
+def _get_emoji_mapping_sync(
+    owner_id: int, category_id: int, simple_emoji: str,
+) -> dict | None:
+    db = get_db()
+    if db is None:
+        for row in _fallback["emoji_mappings"]:
+            if (
+                row.get("owner_id") == owner_id
+                and row.get("category_id") == category_id
+                and row.get("simple_emoji") == simple_emoji
+            ):
+                return row
+        return None
+    try:
+        result = (
+            db.table("emoji_mappings")
+            .select("*")
+            .eq("owner_id", owner_id)
+            .eq("category_id", category_id)
+            .eq("simple_emoji", simple_emoji)
+            .limit(1)
+            .execute()
+        )
+        return result.data[0] if result.data else None
+    except Exception as exc:
+        logger.error("[EMOJI_DB] get_emoji_mapping FAILED: %s", exc)
+        return None
+
+
+async def get_emoji_mapping(
+    owner_id: int, category_id: int, simple_emoji: str,
+) -> dict | None:
+    """One owner-scoped mapping by (category, simple emoji), or None."""
+    try:
+        return await _run_sync(
+            _get_emoji_mapping_sync, owner_id, category_id, simple_emoji,
+        )
+    except Exception as exc:
+        logger.error("[EMOJI_DB] get_emoji_mapping FAILED: %s", exc)
+        return None
+
+
+def _list_emoji_mappings_sync(
+    owner_id: int, category_id: int, limit: int, offset: int,
+) -> tuple[list, int]:
+    db = get_db()
+    if db:
+        try:
+            result = (
+                db.table("emoji_mappings")
+                .select("*")
+                .eq("owner_id", owner_id)
+                .eq("category_id", category_id)
+                .order("created_at", desc=True)
+                .range(offset, offset + limit - 1)
+                .execute()
+            )
+            count_res = (
+                db.table("emoji_mappings")
+                .select("id", count="exact")
+                .eq("owner_id", owner_id)
+                .eq("category_id", category_id)
+                .execute()
+            )
+            return result.data or [], count_res.count or 0
+        except Exception as exc:
+            logger.error("[EMOJI_DB] list_emoji_mappings FAILED: %s", exc)
+    items = [
+        m for m in _fallback["emoji_mappings"]
+        if m.get("owner_id") == owner_id and m.get("category_id") == category_id
+    ]
+    total = len(items)
+    items = sorted(
+        items,
+        key=lambda r: (r.get("created_at") or "", r.get("id") or 0),
+        reverse=True,
+    )
+    return items[offset:offset + limit], total
+
+
+async def list_emoji_mappings(
+    owner_id: int, category_id: int, limit: int = 50, offset: int = 0,
+) -> tuple[list, int]:
+    """List one category's mappings newest-first as (rows, total)."""
+    try:
+        return await _run_sync(
+            _list_emoji_mappings_sync, owner_id, category_id, limit, offset,
+        )
+    except Exception as exc:
+        logger.error("[EMOJI_DB] list_emoji_mappings FAILED: %s", exc)
+        items = [
+            m for m in _fallback["emoji_mappings"]
+            if m.get("owner_id") == owner_id and m.get("category_id") == category_id
+        ]
+        return items[offset:offset + limit], len(items)
+
+
+def _update_emoji_mapping_sync(
+    owner_id: int, category_id: int, simple_emoji: str, document_id: int,
+) -> dict | None:
+    now = datetime.now(timezone.utc).isoformat()
+    db = get_db()
+    if db is None:
+        for row in _fallback["emoji_mappings"]:
+            if (
+                row.get("owner_id") == owner_id
+                and row.get("category_id") == category_id
+                and row.get("simple_emoji") == simple_emoji
+            ):
+                row["document_id"] = document_id
+                row["updated_at"] = now
+                return row
+        return None
+    try:
+        result = (
+            db.table("emoji_mappings")
+            .update({"document_id": document_id, "updated_at": now})
+            .eq("owner_id", owner_id)
+            .eq("category_id", category_id)
+            .eq("simple_emoji", simple_emoji)
+            .execute()
+        )
+        return result.data[0] if result.data else None
+    except Exception as exc:
+        logger.error("[EMOJI_DB] update_emoji_mapping ERROR: %s", exc, exc_info=True)
+        record_event("database", "update emoji_mappings", 0, "ERROR", str(exc))
+        return None
+
+
+async def update_emoji_mapping(
+    owner_id: int, category_id: int, simple_emoji: str, document_id: int,
+) -> dict | None:
+    """Point an EXISTING mapping at a new library document. None on failure
+    or when the mapping no longer exists — never an upsert, so a stale
+    conflict panel cannot resurrect a deleted mapping."""
+    try:
+        return await _run_sync(
+            _update_emoji_mapping_sync, owner_id, category_id, simple_emoji, document_id,
+        )
+    except Exception as exc:
+        logger.error("[EMOJI_DB] update_emoji_mapping FAILED: %s", exc)
+        return None
+
+
+def _delete_emoji_mapping_sync(
+    owner_id: int, category_id: int, simple_emoji: str,
+) -> bool:
+    db = get_db()
+    if db is None:
+        store = _fallback["emoji_mappings"]
+        before = len(store)
+        _fallback["emoji_mappings"] = [
+            m for m in store
+            if not (
+                m.get("owner_id") == owner_id
+                and m.get("category_id") == category_id
+                and m.get("simple_emoji") == simple_emoji
+            )
+        ]
+        return len(_fallback["emoji_mappings"]) < before
+    try:
+        result = (
+            db.table("emoji_mappings")
+            .delete()
+            .eq("owner_id", owner_id)
+            .eq("category_id", category_id)
+            .eq("simple_emoji", simple_emoji)
+            .execute()
+        )
+        return bool(result.data)
+    except Exception as exc:
+        logger.error("[EMOJI_DB] delete_emoji_mapping ERROR: %s", exc, exc_info=True)
+        record_event("database", "delete emoji_mappings", 0, "ERROR", str(exc))
+        return False
+
+
+async def delete_emoji_mapping(
+    owner_id: int, category_id: int, simple_emoji: str,
+) -> bool:
+    """Delete one owner-scoped mapping. False on failure/missing."""
+    try:
+        return await _run_sync(
+            _delete_emoji_mapping_sync, owner_id, category_id, simple_emoji,
+        )
+    except Exception as exc:
+        logger.error("[EMOJI_DB] delete_emoji_mapping FAILED: %s", exc)
+        return False
+
+
+def _delete_emoji_mappings_for_category_sync(
+    owner_id: int, category_id: int,
+) -> int:
+    """Remove every mapping of one category. -1 signals a failed durable
+    write so the caller can abort the category deletion instead of leaving
+    a silently half-deleted state."""
+    db = get_db()
+    if db is None:
+        store = _fallback["emoji_mappings"]
+        before = len(store)
+        _fallback["emoji_mappings"] = [
+            m for m in store
+            if not (m.get("owner_id") == owner_id and m.get("category_id") == category_id)
+        ]
+        return before - len(_fallback["emoji_mappings"])
+    try:
+        result = (
+            db.table("emoji_mappings")
+            .delete()
+            .eq("owner_id", owner_id)
+            .eq("category_id", category_id)
+            .execute()
+        )
+        return len(result.data) if result.data else 0
+    except Exception as exc:
+        logger.error(
+            "[EMOJI_DB] delete_emoji_mappings_for_category ERROR: %s", exc,
+            exc_info=True,
+        )
+        record_event("database", "delete emoji_mappings", 0, "ERROR", str(exc))
+        return -1
+
+
+async def delete_emoji_mappings_for_category(owner_id: int, category_id: int) -> int:
+    try:
+        return await _run_sync(_delete_emoji_mappings_for_category_sync, owner_id, category_id)
+    except Exception as exc:
+        logger.error("[EMOJI_DB] delete_emoji_mappings_for_category FAILED: %s", exc)
+        return -1
+
+
+def _count_emoji_mappings_by_category_sync(owner_id: int) -> dict[int, int] | None:
+    """Mapping count per category id for one owner, or None when a durable
+    read fails (the caller must show an unknown-count state, not 0)."""
+    db = get_db()
+    if db is None:
+        counts: dict[int, int] = {}
+        for row in _fallback["emoji_mappings"]:
+            if row.get("owner_id") != owner_id:
+                continue
+            cid = row.get("category_id")
+            if isinstance(cid, int) and not isinstance(cid, bool):
+                counts[cid] = counts.get(cid, 0) + 1
+        return counts
+    try:
+        result = (
+            db.table("emoji_mappings")
+            .select("category_id")
+            .eq("owner_id", owner_id)
+            .limit(_EMOJI_MAPPINGS_MAX_ROWS)
+            .execute()
+        )
+        counts = {}
+        for row in result.data or []:
+            cid = row.get("category_id")
+            if isinstance(cid, int) and not isinstance(cid, bool):
+                counts[cid] = counts.get(cid, 0) + 1
+        return counts
+    except Exception as exc:
+        logger.error("[EMOJI_DB] count_emoji_mappings_by_category FAILED: %s", exc)
+        record_event("database", "select emoji_mappings", 0, "ERROR", str(exc))
+        return None
+
+
+async def count_emoji_mappings_by_category(owner_id: int) -> dict[int, int] | None:
+    try:
+        return await _run_sync(_count_emoji_mappings_by_category_sync, owner_id)
+    except Exception as exc:
+        logger.error("[EMOJI_DB] count_emoji_mappings_by_category FAILED: %s", exc)
+        return None
 
 
 # ── bot_logs: reads/cleanup ──

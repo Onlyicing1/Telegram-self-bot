@@ -3,423 +3,319 @@
 > **Scope:** this report describes the work performed in the current change
 > set only. It is rewritten (not appended) each time; historical narrative
 > lives in git history. Nothing here claims live-Telegram or live-Supabase
-> verification — see §12 for exactly what was and was not verified.
+> verification — see §10/§12 for exactly what was and was not verified.
 
-**Feature: Emoji & Reaction — Phase 1 COMPLETE (Library & Import, including
-the Phase 1 remainder).**
+**Feature: Emoji & Reaction — Phase 2 COMPLETE (Categories & Mappings).**
 
-**Current phase: Phase 1 — Library & Import IMPLEMENTED + TESTED in full.**
-**Next: Phase 2 — Categories & Mappings (ROADMAP §32). Phase 0 owner
-decisions §34-D/§34-E remain OPEN.**
+**Current phase: Phase 2 — Categories & Mappings IMPLEMENTED + TESTED
+(offline only).**
+**Next: Phase 3 — State & Toggle (ROADMAP §32). Live validation of Phases
+0–2 remains the owner's §31 checklist; §34-D stays OPEN, §34-E is
+implemented against its default proposal with owner sign-off still OPEN.**
 
-The Phase 1 message-level slice (library storage, deterministic bounded
-Saved Messages import, honest report as a service return value) was
-delivered in the previous commit. This change set completes Phase 1 by
-delivering (a) sticker-set resolution/enumeration for the imported custom
-emojis and (b) the Glass UI import/report panel plus the 2×5 library
-browser. Phase 2 categories/mappings are explicitly NOT implemented.
+This change set delivers ONLY Phase 2 on top of the Phase 0 + Phase 1
+state: category CRUD, the mapping editor, per-category mapping uniqueness,
+the duplicate/conflict UI, and 2×5 pagination for the new lists. Phase 1
+(library, import, set enumeration, library browser) is reused as-is — not
+refactored. Phases 3+ (replacement toggle, active category, transformer,
+reconstruction, Custom composition, reactions, AI tools) are explicitly
+NOT implemented.
 
 ---
 
 ## 1. What was implemented
 
-### 1.1 Set-enumeration facade (`backend/telegram_api/custom_emoji.py`, new)
+### 1.1 Persistence layer (`backend/db/client.py` extended)
 
-Typed, bounded wrappers over the two Telegram TL requests enrichment needs
-— same conventions as `backend/telegram_api/messages.py` (short bounded
-calls through `guarded_await`, exceptions normalized to
-`TelegramAPIError`/`TelegramTimeoutError`, plain-dict results; callers never
-touch Telethon objects):
+New dedicated tables following the exact Phase 1 `emoji_library` pattern
+(Supabase-or-in-memory-fallback sync helpers, `_run_sync` dispatch, honest
+`record_event` telemetry, never raising):
 
-- `get_custom_emoji_documents(client, document_ids)` — resolves custom-emoji
-  document ids into `[{document_id, alt, set}]` via
-  `messages.GetCustomEmojiDocumentsRequest`. One document per id Telegram
-  actually returned **with a `DocumentAttributeCustomEmoji` attribute**;
-  anything else is honestly absent. `alt` is the attribute's Unicode
-  fallback text (whatever Telegram provides); `set` is the REAL
-  Telegram-provided set identity (`{"kind": "id", "id", "access_hash"}` or
-  `{"kind": "short_name", "short_name"}`) decoded from the attribute's
-  `stickerset` field, or `None` when the document carries no usable
-  identity. Invalid/foreign ids are dropped; the request is clamped at
-  `MAX_DOCUMENTS_PER_CALL = 100` ids.
-- `get_sticker_set(client, set_ref)` — fetches ONE sticker/custom-emoji set
-  with its full member list via `messages.GetStickerSetRequest(stickerset,
-  hash=0)` (hash=0 forces the full list instead of a not-modified stub).
-  Returns `{set_id, access_hash, title, short_name, count, members}` where
-  each member is `{document_id, alt}` — only documents carrying a
-  custom-emoji attribute appear as members (a sticker set requested by
-  mistake contributes no fake emoji records). Unusable identities raise
-  `TelegramAPIError`; failures/timeout normalize like every facade call.
+- **Categories** — `insert_emoji_category` (duplicate `(owner_id, name)`
+  refused → `None`; durable UNIQUE index is the backstop),
+  `get_emoji_category`, `get_emoji_category_by_name`,
+  `list_emoji_categories` (newest-first, `(rows, total)`),
+  `update_emoji_category` (rename; refuses to take a sibling's name; no
+  upsert), `delete_emoji_category` (row-only; callers own the mapping
+  cascade order).
+- **Mappings** — `get_emoji_entry` (single owner-scoped library lookup —
+  mappings resolve their premium emoji through this, never a copy),
+  `insert_emoji_mapping` (duplicate `(owner_id, category_id, simple_emoji)`
+  refused → `None`, never an overwrite), `get_emoji_mapping`,
+  `list_emoji_mappings` (newest-first per category), `update_emoji_mapping`
+  (only when the row still exists — a stale panel cannot resurrect a
+  deleted mapping), `delete_emoji_mapping`,
+  `delete_emoji_mappings_for_category` (`-1` signals a failed durable write
+  so the caller aborts instead of half-deleting),
+  `count_emoji_mappings_by_category` (`None` on durable-read failure — the
+  UI must show an unknown-count state, not a fabricated 0).
+- `_fallback` gained the `emoji_categories` / `emoji_mappings` stores so
+  the no-Supabase mode is fully functional (same contract as Phase 1).
 
-**Honesty contract:** a document Telegram did not return, a document
-without a custom-emoji attribute, and a document without a usable set
-identity are all reported as absent/`set: None` — nothing about set
-membership is ever inferred, guessed, or fabricated here.
+### 1.2 Service layer (`backend/services/emoji_category_service.py`, new)
 
-### 1.2 Bounded enrichment stage in the importer
-(`backend/services/emoji_library_service.py` extended)
+The business-logic boundary the UI drives — deterministic, fail closed,
+zero AI involvement (`backend.ai` is not imported):
 
-`import_from_saved_messages(client, owner_id, *, max_messages, page_size,
-max_records, max_set_records, page_timeout)` grew ONE optional bounded
-parameter (`max_set_records`, default 500, hard cap 2000) and one
-BEST-EFFORT enrichment stage between the scan and persistence:
+- Category: `create_category`, `list_categories` (rows + total +
+  per-category mapping counts, counts `None` on durable-read failure),
+  `get_category`, `category_mapping_count`, `rename_category`,
+  `delete_category`.
+- Mapping: `create_mapping`, `list_mappings`, `get_mapping`,
+  `replace_mapping`, `delete_mapping`.
+- Validation helpers `clean_category_name` / `clean_simple_emoji`
+  (single-line, non-empty after strip, ≤64 / ≤32 characters — structural
+  validation only; no invented emoji semantics).
 
-1. **Document resolution** — each newly collected candidate `document_id`
-   is resolved once, in `MAX_DOC_RESOLVE_BATCH = 50`-sized chunks, at most
-   `MAX_DOC_RESOLVE_CALLS = 10` chunks per import (≤500 documents), against
-   the SAME bounded RPC timeout as the scan.
-2. **Identity grouping** — resolved documents are grouped by their real
-   set identity in first-appearance order of the scan; at most
-   `MAX_SETS_PER_IMPORT = 20` unique sets per import are kept (excess is
-   counted as `hit_set_limit`).
-3. **Set enumeration** — each unique set is enumerated exactly once, one
-   RPC each; at most `MAX_SET_MEMBERS_PER_SET = 200` members are processed
-   per set. A member is classified exactly once: already in the scan
-   candidates, the durable library, or seen as another member ⇒
-   `set_duplicates` (counted, never stored twice); new members become
-   library records up to the `set_record_limit` budget.
+### 1.3 Glass UI (`backend/bot/handlers/emoji.py` extended)
 
-Set members persist through the SAME `db_client.insert_emoji_entry` path
-with the same `(owner_id, document_id)` deduplication. Their row shape
-identifies their origin honestly: `source_msg_id = None` (no message
-carried them) and `alt_text` is Telegram's own alt for the member document.
-**No schema change and no new column is required or made:** set identity is
-used transiently to resolve members; `set_id`/`set_short_name` remain
-unpersisted exactly as before.
+Standard panel machinery only (registry, `InlinePanelBuilder`,
+`panel:`/`action:` callbacks, owner check in the existing callback router;
+the single `register()` call is unchanged in `router.py`):
 
-**Failure semantics (enrichment is best-effort by contract):** a set-stage
-failure is counted and reported (`set_error` + `degraded`) and NEVER aborts
-the import — the message-level records the scan successfully collected
-still persist. The four stages are distinguishable in the report:
-document-resolution failure, set resolution failure (non-dict set info /
-`SET_NOT_FOUND`), set enumeration failure, and set-member persistence
-failure (`set_failed`, which DOES make `ok=False` since it means the
-library is missing rows the report claims). Report keys added: `degraded`,
-`set_error`, `documents_resolved`, `unresolved_documents`,
-`documents_without_set`, `sets_resolved`, `set_members_seen`,
-`set_members_malformed`, `set_imported`, `set_duplicates`, `set_failed`,
-`hit_set_limit`, `hit_set_member_limit`. For a fully successful import the
-invariant `custom_emoji_seen + set_members_seen == imported + duplicates +
-failed + set_imported + set_duplicates + set_failed` holds.
-
-**Existing importer guarantees are untouched and re-pinned by tests:**
-newest-first scan, exclusive strictly-decreasing `max_id` cursor, bounded
-scan/page/record/entity budgets, bounded per-page RPC timeout, import lock
-for deterministic dedup, collect-then-persist fail-closed (a Telegram or
-durable-read failure persists NOTHING), honest per-insert outcomes. The
-enrichment stage runs INSIDE the same import lock, after the scan and
-before any write.
-
-### 1.3 Glass UI panels (`backend/bot/handlers/emoji.py`, new) + wiring
-
-Standard panel machinery only — `register_panel`/`register_action` from
-`backend.helper.panels`, the `InlinePanelBuilder` button conventions, the
-`panel:*`/`action:*` callback routing (owner-authorized by the existing
-callback router's `is_owner` gate), and the existing page/`truncate_
-callback_data` prior art. No new UI framework, no `events.NewMessage`
-handler, no second loop, no scheduler, no forwarding.
-
-- **`😀 Emoji` panel** (parent `menu`; the mother menu in
-  `backend/bot/handlers/misc.py` gains the `😀 Emoji` row) — shows the
-  library total (honest `unknown` on a failed read; empty-state text when
-  zero) with two actions: `⬇ Import from Saved Messages` and
-  `📚 Library`.
-- **Import action (`action:emoji_import`)** — runs the REAL bounded service
-  (`import_from_saved_messages`) with the self client from
-  `backend.helper.inline_engine.get_self_client()` and the owner from
-  `get_owner_id()`. Missing-client/owner and unexpected crashes fail
-  honestly (`! …`). The report body is rendered STRAIGHT from the service
-  result: `✓ Import complete`, or `✗ …` with the exact failure/error
-  string, or `◌ …` degradation (set enumeration error, unresolved
-  documents, setless documents, budget flags) — never a disguised success.
-  Counters shown are the user-facing ones (scanned/seen/bad, imported/
-  duplicates/failed, sets resolved/members imported/duplicates/failed,
-  library total, end-of-Saved-Messages, and nudges to re-run when a scan
-  or record budget stopped the run). No developer internals, stack traces,
-  or raw RPC names leak. The panel offers `↻ Import again` and `📚 Library`.
-- **`📚 Library` browser** (`panel:emoji_library`, parent `emoji`) — 2×5
-  grid (10 entries/page, two buttons per row) over
-  `db_client.list_emoji_entries`, newest-first, with a clamp-safe
-  `[◀] [page/pages] [▶]` pager row. Each entry button opens
-  **`panel:emoji_entry:<page>:<idx>`** — a compact detail (alt text,
-  document id, origin — `Saved Messages #id` or `Set scan` — and added
-  date), failing honestly (`Entry not found`) on a stale index after
-  library changes. The browser displays ONLY what the rows actually
-  contain; no set/category metadata is displayed or implied (it is not
-  persisted).
-
-`backend/bot/router.py` registers the module (`emoji.register`) alongside
-the other handlers — registration isolation unchanged (a module crash
-during registration cannot take down the rest).
-
-### 1.4 The previous Phase 1 slice (unchanged here)
-
-`extract_custom_emoji_records` (entity-based recognition from the Phase 0
-serialized representation, UTF-16 span resolution, bounded per-message
-entity processing) and the original import semantics/bounds/persistence
-(`backend/db/client.py` `emoji_library` helpers) are documented in the
-previous report and are only referenced here; the only service signature
-change is the added optional `max_set_records` budget.
+- Main `😀 Emoji` panel gains the **🗂 Categories** row.
+- **Categories** panel: 2×5 paged list, per-row `name · <count>` labels
+  (`?` when counts are unreadable), page clamp, `＋ New category`.
+- **Category** detail: name + live mapping count, `🗺 Mappings`,
+  `✏️ Rename`, `🗑 Delete`.
+- **Delete Category** confirmation panel: names the category, states how
+  many mappings will be removed, states that library entries are NOT
+  deleted; explicit `🗑 Delete` / `✗ Cancel`.
+- **Mappings** panel per category: 2×5 paged list of `simple → premium`
+  rows with honest `[entry missing]` marking when a referenced library
+  entry no longer exists, `＋ Add mapping`, page clamp.
+- **Mapping** detail: `simple → premium` visual, library entry id +
+  missing-entry honesty, `✏️ Change`, `🗑 Remove`.
+- **Pick Emoji** panel: the mapping editor's premium-emoji step — the
+  existing library browser shape over the owner's library with the same
+  2×5 grid and pager.
+- Mapping flows run through a per-owner **draft buffer** (the Bio-builder
+  server-side-buffer convention) with a 10-minute staleness bound: step
+  1 arms a pending input for the simple emoji (existing `input_state`
+  machinery, prompt via the existing listener contract), step 2 renders
+  the picker, and the pick action calls the service.
+- **Mapping Conflict** panel: dedicated panel rendered from the service's
+  conflict result — actual current mapping visual vs requested new visual
+  side by side, `_Nothing has been overwritten._`, buttons
+  **Replace** / **Cancel**. Replace calls `replace_mapping` (the ONLY
+  overwrite path); Cancel is a plain navigation with no write path.
 
 ---
 
-## 2. Files changed
+## 2. Exact files changed
 
 | File | Change |
 |---|---|
-| `backend/telegram_api/custom_emoji.py` | NEW — document + sticker-set resolution facade (§1.1) |
-| `backend/services/emoji_library_service.py` | bounded best-effort enrichment stage (`_enumerate_sets`, set-member persistence, `set_*`/`degraded` report keys, `max_set_records` budget) |
-| `backend/bot/handlers/emoji.py` | NEW — `😀 Emoji` panel, import action, `📚 Library` 2×5 browser, entry detail (§1.3) |
-| `backend/bot/router.py` | register the `emoji` handler module |
-| `backend/bot/handlers/misc.py` | mother menu gains the `😀 Emoji` row |
-| `tests/test_emoji_set_enumeration.py` | NEW — 27 focused tests (§10) |
-| `tests/test_emoji_ui.py` | NEW — 18 focused tests (§10) |
-| `tests/test_emoji_library_import.py` | signature-pinning test updated for the `max_set_records` parameter |
-| `ROADMAP.md` | current-state updates (header, §2, §5.4/§5.6, §7, §8, §9, §25, §30, §31, §32, §35) |
+| `backend/db/client.py` | + category/mapping db helpers + `get_emoji_entry` + 2 fallback stores (~640 lines) |
+| `backend/services/emoji_category_service.py` | NEW — Phase 2 service layer (~430 lines) |
+| `backend/bot/handlers/emoji.py` | + category/mapping/conflict panels, editor flow, draft buffer, registration (~820 lines added) |
+| `tests/test_emoji_category_service.py` | NEW — 54 service tests |
+| `tests/test_emoji_ui_phase2.py` | NEW — 42 UI/architecture tests |
+| `ROADMAP.md` | current-state rewrite for Phase 2 |
 | `IMPLEMENTATION_REPORT.md` | this rewrite |
 
-Intentionally untouched: `DATABASE_ARCHITECTURE.md`, `AGENTS.md`,
-`INVESTIGATION.md`, `supabase/` (no migration), `backend/db/client.py`,
-`backend/telegram_api/_helpers.py`/`bridge.py`/`messages.py`/`api.py`
-(Phase 0 untouched), every `backend/ai/*` module, `backend/helper/*`, the
-web dashboard, and everything outside this feature. **No SQL executed; no
-live DB touched.**
+NOT touched: `DATABASE_ARCHITECTURE.md`, `AGENTS.md`, `AI_MASTER_DESIGN.md`,
+`backend/ai/**` (except nothing), `backend/telegram_api/**` (Phase 0/1 code
+unchanged), `backend/bot/router.py` (registration call already wired),
+`backend/bot/handlers/misc.py` (mother-menu row already present),
+`supabase/migrations/**`, `render.yaml`, deployment docs, Phase 1 tests.
+No SQL executed anywhere.
 
 ---
 
-## 3. Data model (MANUAL-ONLY schema — unchanged from Phase 1)
+## 3. Category semantics (as implemented)
 
-The physical `emoji_library` schema is EXACTLY the Phase 1 one (owner_id,
-document_id, alt_text, source, source_msg_id, created_at,
-`UNIQUE (owner_id, document_id)`) — documented, never executed by this
-repository, and unchanged in this change set:
+- A category is an owner-scoped row `(id, owner_id, name, created_at,
+  updated_at)`; names are unique **per owner** (exact match after strip —
+  deterministic; no case folding, no invented normalization).
+- Validation is deterministic and fail closed: non-empty after strip,
+  single-line, ≤64 characters; anything else is rejected with an honest
+  code (`invalid_name` / `name_too_long`), never auto-corrected.
+- Duplicate name on create/rename → refused (`name_exists`), never
+  overwritten; the UI states it. The same name is allowed for a DIFFERENT
+  owner.
+- `list_categories` is newest-first and reports per-category live mapping
+  counts; when the durable count read fails the count is shown as `?` /
+  `unknown` — never a fabricated 0.
+- Deleting a category removes ALL of its mappings FIRST, then the category
+  row; a failed mapping-removal write aborts the whole deletion (fail
+  closed). A failed category-row delete after mappings were removed is
+  reported honestly (mappings gone, category remains — retry-able,
+  idempotent). Library entries are NEVER touched by category deletion.
+- No `is_custom` column, no built-in `Custom` category, no
+  active-category state — §26/§13 are later phases and nothing about them
+  was invented into the schema.
+
+## 4. Mapping semantics (as implemented)
+
+- A mapping is `(id, owner_id, category_id, simple_emoji, document_id,
+  created_at, updated_at)` — a pure REFERENCE to the library: the row
+  stores no alt text, no source, no definition (pinned by test). The
+  library remains the single source of premium-emoji definitions.
+- Creation resolves `document_id` against the owner's library via
+  `get_emoji_entry` BEFORE any write; a missing or foreign-owner entry is
+  rejected (`library_entry_not_found`). The mapping editor's picker only
+  offers the owner's own entries, and the service re-proves it.
+- Editor flow (create): category → simple emoji via existing
+  `input_state` pending-input machinery → 2×5 library picker → service
+  create. Change flow: from an existing mapping, re-opens the picker
+  seeded with the mapping's simple emoji; the pick lands on the conflict
+  path and explicit Replace performs the edit.
+- `(owner_id, category_id, simple_emoji)` is unique — enforced at the
+  service boundary BEFORE the write, with the db layer refusing
+  duplicates as the backstop (and no upsert anywhere). The same simple
+  emoji may exist in different categories; the same library document may
+  be referenced by multiple mappings (both pinned by tests).
+- Mapping deletion removes only the mapping row; the referenced library
+  entry survives (pinned by test).
+
+## 5. Conflict behavior (as implemented)
+
+- A duplicate attempt NEVER silently overwrites — service detects the
+  existing mapping before any write and returns
+  `{conflict: True, current, current_entry, new_entry}`.
+- The dedicated conflict panel shows the ACTUAL current premium emoji
+  visual and the requested new one side by side (alt glyph + document id
+  from the resolved library entries). When the CURRENT entry can no
+  longer be resolved, the panel says `unavailable` for that side — it
+  never fabricates a visual (pinned by test).
+- Buttons (§34-H wording, decided here): **Replace** /
+  **Cancel**. Replace overwrites only after this explicit confirmation,
+  and re-proves (a) the mapping still exists and (b) the new library
+  entry resolves — a stale panel fails honestly and changes nothing.
+- Cancel leaves the mapping untouched (no write path at all — pinned by
+  test). No silent overwrite path exists at any layer (pinned by tests
+  at service + db layers).
+
+---
+
+## 6. Persistence status
+
+Implemented against the EXISTING accepted contract of this feature:
+`db/client.py` Supabase-or-in-memory-fallback, exactly as Phase 1
+established for `emoji_library`. ROADMAP §34-E is still an OPEN owner
+decision; Phase 2 implements its recorded DEFAULT proposal (dedicated
+tables following `db/client.py` patterns) without claiming owner
+confirmation. The user-facing consequences:
+
+- No Supabase configured → fully functional in-memory mode (development
+  contract, same as Phase 1).
+- Supabase configured but the physical tables absent → writes fail
+  honestly (`storage_failed` → honest UI message, nothing changed) and
+  count reads report unknown counts — RAM is never silently presented as
+  durable (ROADMAP §29 degradation contract).
+
+## 7. Manual-only schema status (documented, NOT executed)
+
+The physical schema below is EXACTLY what Phase 2's db layer expects. It
+is documented for the OWNER to apply manually; this repository never
+executed it, created no migration file, and left `DATABASE_ARCHITECTURE.md`
+untouched:
 
 ```sql
 -- MANUAL-ONLY — documented, NEVER executed by this repository.
-CREATE TABLE IF NOT EXISTS emoji_library (
-  id            bigserial PRIMARY KEY,
-  owner_id      bigint      NOT NULL,
-  document_id   bigint      NOT NULL,
-  alt_text      text        NOT NULL DEFAULT '',
-  source        text        NOT NULL DEFAULT 'imported',
-  source_msg_id bigint,
-  created_at    timestamptz NOT NULL DEFAULT now(),
-  CONSTRAINT emoji_library_owner_document_key UNIQUE (owner_id, document_id)
+CREATE TABLE IF NOT EXISTS emoji_categories (
+  id         bigserial PRIMARY KEY,
+  owner_id   bigint      NOT NULL,
+  name       text        NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT emoji_categories_owner_name_key UNIQUE (owner_id, name)
+);
+
+CREATE TABLE IF NOT EXISTS emoji_mappings (
+  id           bigserial PRIMARY KEY,
+  owner_id     bigint      NOT NULL,
+  category_id  bigint      NOT NULL,
+  simple_emoji text        NOT NULL,
+  document_id  bigint      NOT NULL,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT emoji_mappings_owner_category_emoji_key
+             UNIQUE (owner_id, category_id, simple_emoji)
 );
 -- RLS per house style (service-role writes, SELECT-only policies) — owner action required.
 ```
 
-DELIBERATE: `set_id`/`set_short_name` are still NOT persisted. Enumeration
-needs the set identity only transiently (to fetch members); once members
-are resolved, the library's granularity — one row per emoji document — is
-sufficient, and inventing set columns now would be speculative schema
-expansion ahead of Phase 2's category/mapping design. Set provenance is
-implicit: members imported through set enumeration carry `source_msg_id =
-NULL` + Telegram's own alt (surfaced honestly as `Set scan` in the UI).
+DELIBERATE: no `is_custom` column (§26 is a later phase), no
+`set_id`/`set_short_name` on mappings (mappings reference the library,
+which owns provenance), no active-category columns (§13 is Phase 3).
 
 ---
 
-## 4. Enrichment semantics and bounds
+## 8. Tests actually executed and exact results
 
-| Case | Behavior |
-|---|---|
-| Candidate emoji resolves with a set identity | its set is resolved once and members enter the library (dedup) |
-| Several candidates share one set | resolved/enumerated ONCE; the result reused for all of them |
-| Candidate document Telegram does not return | `unresolved_documents` + `degraded`; never guessed |
-| Document without custom-emoji attribute | excluded by the facade; counted unresolved |
-| Document without usable set identity | `documents_without_set` + `degraded`; never fabricated |
-| Set RPC rejected (e.g. `SET_ID_INVALID`, permissions) | enumeration for that import stops, `set_error` + `degraded`; already-resolved sets keep their members |
-| Set info missing | same as a set failure (honest, fail-closed) |
-| Member persistence failure | `set_failed` count; `ok=False` |
-| Set-member budget(s) exhausted | `hit_set_limit` / `hit_set_member_limit` + `degraded` |
-| Import with no new candidates | enrichment doesn't run at all (zero extra RPCs) |
-| Message-scan failure | enrichment never runs; NOTHING persists (existing fail-closed contract) |
+Environment: repository venv (`python -m pytest`), no live Telegram, no
+live Supabase. Run from the repository root with the pre-existing untracked
+`telegram-self-bot/` mirror excluded from collection (it is not part of
+this package and duplicates test basenames — see §10).
 
-Bounds (callers clamped to the hard caps — enrichment-specific rows bold):
+1. `py_compile` on ALL changed Python files → **exit 0**.
+2. Focused Phase-2 suites:
+   `tests/test_emoji_category_service.py` → **54 passed**
+   `tests/test_emoji_ui_phase2.py` → **42 passed**
+   (combined: **96 passed**)
+3. Existing Phase-1 emoji suites: `tests/test_emoji_library_import.py`,
+   `tests/test_emoji_set_enumeration.py`, `tests/test_emoji_ui.py` →
+   **all passed (no regressions)**.
+4. Existing Phase-0 bridge suite: `tests/test_bridge_delivery.py` →
+   **all passed**.
+5. Full suite (`pytest -q --ignore=telegram-self-bot`) →
+   **5371 passed, 26 skipped in 120.33s** = Phase 1 baseline 5275 + 96 new
+   tests — no regressions.
+6. `git diff --check` → clean (exit 0).
 
-| Bound | Default | Hard cap |
-|---|---|---|
-| **documents resolved per import** | **all candidates** | **500 (10 chunks × 50)** |
-| **document ids per resolution RPC** | — | **50 (service) / 100 (facade hard guard)** |
-| **unique sets enumerated per import** | — | **20** |
-| **members processed per set** | — | **200** |
-| **new set-member records per import** | 500 | 2000 |
-| messages scanned / page size / records / entities / timeout | (unchanged Phase 1 bounds) | (unchanged) |
+## 9. What was NOT tested
 
-No unbounded Telegram pagination exists anywhere in the path; every RPC is
-wrapped in the same bounded timeout as the scan and normalized
-(`asyncio.CancelledError` always re-raised).
-
----
-
-## 5. UI behavior (Glass UI)
-
-| Surface | Behavior |
-|---|---|
-| Mother menu | new `😀 Emoji` row → `panel:emoji` |
-| `😀 Emoji` panel | library total (or honest `unknown`/empty text) + `⬇ Import` + `📚 Library` |
-| Import tap | runs the real bounded service; panel edits in place to the honest report (success `✓` / failed `✗` with reason / degraded `◌` with counters), then `↻ Import again` / `📚 Library` |
-| `📚 Library` | 2×5 browser, 10/page, clamp-safe ◀/page/pages/▶ pager, empty-state honest |
-| Entry tap | detail: alt text, document id, origin (`Saved Messages #id` / `Set scan`), added date; stale index ⇒ `Entry not found` honestly |
-
-Owner-only by the existing callback router (`is_owner` gate on every
-callback); no keyword/regex routing is involved — activation is a panel
-button only.
-
----
-
-## 6. Architecture / context isolation
-
-- The service stays deterministic and context-isolated: no `backend.ai`
-  import (AST-audited in the Phase 1 tests, still green), no chat history,
-  no reply text, no sender info, no conversational inference, no AI.
-- No second Telegram API abstraction: the facade extends the existing
-  `backend/telegram_api` conventions; the UI reuses the self client from
-  `inline_engine` and the existing panel/callback machinery.
-- No second client, update loop, scheduler, executor, or repository was
-  added (asserted by source-level tests for BOTH new modules; the Glass UI
-  test file grep-scans `backend/bot/handlers/emoji.py` for forbidden
-  constructs — `TelegramClient`, `create_task`, `events.NewMessage`,
-  `forward_messages`, …).
-- Telegram RPCs bounded everywhere (facade guard + per-call timeout).
-
----
-
-## 7. What was intentionally NOT implemented (later phases)
-
-Phase 2+ per ROADMAP §32: category CRUD, mapping editor/uniqueness/conflict
-UI, active category + replacement toggle, transformer/reconstructor/loop
-prevention, custom category composition, the reaction subsystem, §34-D/§34-E
-owner decisions. No replacement of messages happens in this change set; no
-AI tools were registered; no `set_id`/`set_short_name` persistence; no
-library deletion UI (deletion semantics are a §34-level decision).
-
----
-
-## 8. Tests added (this change set)
-
-### 8.1 `tests/test_emoji_set_enumeration.py` — 27 tests
-
-Offline, at the REAL TL surface (`client(request)` + real
-`DocumentAttributeCustomEmoji` / `InputStickerSetID` / `InputStickerSetShortName`):
-
-- **Facade (11):** document resolution with id-based and short-name set
-  identities; absent document honestly missing; attribute-less document not
-  a custom emoji; unusable set identity ⇒ `set: None`; invalid-id dropping +
-  `MAX_DOCUMENTS_PER_CALL` clamping (single RPC asserted); API-error and
-  timeout normalization; set-member dict shape; unusable/unparseable set
-  reference rejection; set failure normalization.
-- **Service enrichment (10):** members collected as library records
-  (correct row shape incl. `source_msg_id=None`); one chunked resolution +
-  one enumeration for a shared set; duplicate classification (repeated
-  member / library hit / scan candidate); unresolved + setless counting;
-  enumeration failure reported-not-raised with partial results kept;
-  document-resolution failure stops cleanly; ≤ `MAX_SETS_PER_IMPORT` sets
-  with `hit_set_limit`; ≤ `MAX_SET_MEMBERS_PER_SET` per set; set-record
-  budget with its own flag; first-appearance-order determinism across runs.
-- **Import integration (6):** full run persists scan records + deduplicated
-  set members and satisfies the report invariant; repeat-run dedup
-  (including that no new candidates ⇒ no enrichment RPCs at all); degraded
-  report on enumeration failure while the scan record still persists;
-  degraded on unresolved documents; insert-failure visibility
-  (`ok=False`, `failed`/`set_failed` counts) against a failing faked
-  Supabase; scan failure still aborts before any persistence.
-
-### 8.2 `tests/test_emoji_ui.py` — 18 tests
-
-Offline, panels driven directly (no Telegram):
-
-- **Registration/menu (3):** panels `emoji`/`emoji_library`/`emoji_entry` +
-  `action:emoji_import` registered; mother menu carries `panel:emoji`;
-  every library-button callback ≤64 bytes.
-- **Main panel (2):** counters + actions; empty state offers the import.
-- **Library browser (5):** first page = exactly 10 entry buttons in a 2×5
-  grid + correct pager; second page shows the remainder + `page 2/2`;
-  out-of-range page clamps; empty state honest; missing alt text falls
-  back to `·`.
-- **Entry detail (3):** shows only what the row has (alt, id, Received-from
-  origin, date); set members honestly marked `Set scan`; stale index ⇒
-  `not found`.
-- **Import action + honesty (5):** success path runs the REAL service
-  (self-client faked at the TL boundary; a set member imported and counted
-  `+1`); degraded rendering (`◌` + enumeration failure text) is NOT a
-  success; missing self client fails honestly; report renderer covers
-  failure (`✗` + reason) and budget states (re-run nudge); source scan
-  proves no second client/loop/scheduler/forwarding in the UI module.
-
-### 8.3 Regression coverage
-
-`tests/test_emoji_library_import.py` (50) stays green — only its
-signature-pinning test was updated for the added optional `max_set_records`
-parameter (the importer guarantees it pins are unchanged). Phase 0
-(`tests/test_bridge_delivery.py`, 22) untouched and green.
-
----
-
-## 9. Commands executed and actual results
-
-All commands run from the worktree root (`/home/daytona/codebase`) with the
-project venv; exit statuses captured:
-
-1. `py_compile` on all changed/added Python files (facade, service, handler,
-   router, misc, three test files) → **clean**.
-2. `pytest tests/test_emoji_library_import.py tests/test_emoji_set_enumeration.py
-   tests/test_emoji_ui.py tests/test_bridge_delivery.py -q` → **117 passed**
-   (0.50s) — Phase 1 focused + Phase 0 regression.
-3. `pytest tests/ -q` (full suite, worktree root as cwd) → **5275 passed,
-   26 skipped** (119.97s) = Phase 1 baseline 5230 + 45 new tests — no
-   regressions.
-4. `git diff --check` → clean.
-
-## 10. What was NOT tested / NOT verified
-
-- **Live Telegram verification: NOT performed.** Saved Messages scans, real
-  `GetCustomEmojiDocumentsRequest`/`GetStickerSetRequest` responses,
-  premium-set gating, flood/rate behavior, entity shapes on real sets, and
-  the inline Glass UI rendering are unverified live (ROADMAP §31 checklist
-  remains open; ROADMAP §33 blocker 3 stays open).
+- **Live Telegram verification: NOT performed.** The whole Phase 2 surface
+  (panel rendering inside a real inline session, pending-input timing, the
+  conflict panel's actual visual rendering of custom emoji, pagination
+  under real Telegram update flow) is unverified live. ROADMAP §31's
+  checklist remains open.
 - **Live Supabase verification: NOT performed.** No SQL executed, no
-  migration added, no live table touched. The `emoji_library` physical
-  table still does not exist anywhere; until the owner applies the §3
-  manual-only schema, a configured Supabase reports insert failures
-  honestly (set members included).
-- Mocks/fakes sit at the consumed Telethon surface (`client(request)` TL
-  boundary with real TL types, `client.iter_messages` async generator) —
-  by design, per the no-live-Telegram-tests requirement.
+  migration added, no live table touched. The physical
+  `emoji_categories` / `emoji_mappings` tables still do not exist
+  anywhere; until the owner applies §7's manual-only schema, a configured
+  Supabase reports write failures honestly.
+- The Supabase code paths are exercised only through the same
+  fake-client pattern Phase 1 used (in-memory fallback is the primary
+  test store); no real network call was made.
+- The in-panel custom-emoji RENDERING fidelity question (ROADMAP §12/§33:
+  panels render alt glyph + document id; whether real custom-emoji
+  entities can appear in panel text) remains unverified — unchanged from
+  Phase 1, still scheduled for live validation.
 
-## 11. Limitations / honest notes
+## 10. What remains intentionally unimplemented
 
-- Enrichment is BEST-EFFORT by contract: a Telegram-side set failure never
-  blocks the message-level import (the report distinguishes the two, and
-  `ok` stays truthful — only persistence failures and import aborts make it
-  `False`).
-- ≤500 candidate documents, ≤20 unique sets and ≤200 members per set are
-  per-import bounds (deliberately small, deterministic, and cheap);
-  larger collections arrive across repeated imports (the panel says so).
-- Set identity relies on REAL Telegram-provided `stickerset` references;
-  documents that genuinely lack one are counted, not fabricated.
-- The library browser shows alt text/id/origin/date only — set/category
-  metadata is not persisted (§3) and is therefore not shown (never
-  pretended).
-- The import panel reports counts and budgets in user-facing wording; raw
-  RPC names never surface (the report line keeps the service's one-line
-  failure reason, which is already plain-language).
-- Owners of large libraries will re-run Import to page through budgets;
-  auto-chaining budgets is deliberately deferred to keep behavior bounded
-  and predictable.
+- Replacement toggle + active category (Phase 3, §13/§14) — NOT
+  implemented, including no persisted toggle state.
+- Transformer, reconstructor, bot delivery, loop prevention (Phase 4,
+  §15–§24) — NOT implemented; no outgoing message is ever transformed;
+  no `forward_messages` call exists.
+- Custom category composition (Phase 5, §26) — NOT implemented; no
+  `is_custom` column exists.
+- Reactions (Phase 6, §27) — NOT implemented; zero reaction code.
+- AI tools for this feature — NOT implemented; `backend.ai` is not
+  imported by any changed module (pinned by an AST audit test).
+- §34-D (bridge capability) — still OPEN (owner).
+- §34-E owner sign-off — still OPEN; Phase 2 implements the recorded
+  default proposal only.
+- Live schema application — manual, owner-only (§7 above).
 
-## 12. Verification summary (explicit)
+## 11. Current phase status
 
-- Automated verification: §9 (all green).
-- Live Telegram verification: **NOT performed.**
-- Live Supabase verification: **NOT performed.**
+**Phase 2 — Categories & Mappings: IMPLEMENTED + TESTED (offline).**
+Category CRUD, mapping editor, uniqueness, conflict UI, and 2×5
+pagination are complete against the documented contracts; every Phase 2
+behavior is pinned by tests; the full suite is green. What "complete"
+does NOT mean here: no live Telegram or live Supabase verification has
+been performed, and no physical schema was applied.
 
-## 13. Current phase / next phase
+## 12. Next phase
 
-- **Current:** Phase 1 — Library & Import — COMPLETE: message-level slice
-  (previous commit) + set resolution/enumeration + Glass UI import/report
-  panels + 2×5 library browser (this commit); 45 new tests; full suite
-  5275 passed, 26 skipped.
-- **Next:** Phase 2 — Categories & Mappings (ROADMAP §32), pending nothing
-  from Phase 1 except live validation, which remains the owner's §31
-  checklist. Phase 0 owner decisions §34-D/§34-E stay OPEN.
+**Phase 3 — State & Toggle** (ROADMAP §32): replacement toggle +
+active category (global default + per-chat override), persisted via the
+settings pattern (§29). Nothing blocks it except the owner's live
+validation appetite; §34-A (scope decision) is its recorded open owner
+input. Alternatively, the owner may first run the §31 live-validation
+checklist over Phases 1–2 — the roadmap's phase order allows either.
