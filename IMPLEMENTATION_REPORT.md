@@ -431,9 +431,11 @@ in-memory fallback store and a fake helper-bot/self-client boundary.
 
 ## 13. Delivery metadata
 
-A commit cannot contain its own SHA, so this section records the Phase 5
-commit and the push verification; the delivery-metadata commit that carries
-these values is the only commit after it.
+A commit cannot contain its own SHA. `3901037` is the Phase 5 implementation
+commit; `644c122` is the documentation-only delivery-metadata commit that
+carries this section. One further documentation-only commit corrects a
+literal-tab escaping artifact in §14 (its SHA lives in the git history, not
+in this file, for the same reason).
 
 | Field | Value |
 |---|---|
@@ -441,8 +443,8 @@ these values is the only commit after it.
 | Phase 5 commit | `3901037` — `feat(emoji): implement Phase 5 — custom category composition (snapshot-on-compose, conflict confirmation, cycle rejection)` |
 | Commit contents | the 6 intended files only (`IMPLEMENTATION_REPORT.md`, `ROADMAP.md`, `backend/bot/handlers/emoji.py`, `backend/db/client.py`, `backend/services/emoji_category_service.py`, `tests/test_emoji_composition_phase5.py`) |
 | Push result | `6ca2db1..3901037  m14-stt -> main` (fast-forward, exit 0) |
-| Remote main HEAD | `39010378203251fa04417df98ce56912177169f9` |
-| Final worktree state | clean — verified after the delivery-metadata commit (see §14) |
+| Remote main HEAD after the Phase 5 push | `39010378203251fa04417df98ce56912177169f9` (re-verified after the documentation-only commits: `HEAD == origin/main == refs/heads/main`) |
+| Final worktree state | clean — verified after the last documentation-only commit (see §14) |
 
 ---
 
@@ -456,11 +458,15 @@ Run before the delivery-metadata commit, from the repository root on branch
 - `git rev-parse HEAD` → `39010378203251fa04417df98ce56912177169f9`
 - `git rev-parse origin/main` → `39010378203251fa04417df98ce56912177169f9`
 - `git ls-remote origin refs/heads/main` →
-  `39010378203251fa04417df98ce56912177169f9\trefs/heads/main`
+  `39010378203251fa04417df98ce56912177169f9` + TAB + `refs/heads/main`
+  (the same commit; git separates the two fields with a tab)
 
 Local `HEAD`, the fetched `origin/main` and the live remote `refs/heads/main`
 are the same commit — the Phase 5 changes exist on the remote, not only
-locally. After the delivery-metadata commit (this file's §13–§14 values only),
-`git status --short` is empty and `git log --oneline -2` lists `3901037`
-directly beneath the metadata commit, so the final worktree is clean and
-`HEAD == origin/main` still holds.
+locally. The two documentation-only commits that follow `3901037` (the
+delivery metadata and the tab-rendering fix) touch this file only and were
+pushed with `git push origin m14-stt:main`; after the last push,
+`git rev-parse HEAD == git rev-parse origin/main == git ls-remote origin
+refs/heads/main`, `git log --oneline -3` lists `3901037` third-from-top, and
+`git status --short` is empty — so the final worktree is clean and the
+delivered tree is exactly the Phase 5 state.
