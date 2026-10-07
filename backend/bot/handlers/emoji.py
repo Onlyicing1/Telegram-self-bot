@@ -40,6 +40,7 @@ from backend.helper.panels import (
 from backend.helper.input_state import set_pending
 from backend.services import emoji_category_service as cat_service
 from backend.services import emoji_state_service as state_service
+from backend.services import reaction_service
 from backend.services.emoji_library_service import import_from_saved_messages
 
 logger = logging.getLogger(__name__)
@@ -93,6 +94,7 @@ async def _emoji_panel_handler(event, extra: str) -> tuple[str, str, list] | Non
         lines.append(f"Replacement: {'✅ ON' if enabled else '❌ OFF'}")
     builder = InlinePanelBuilder()
     builder.add_row("⬇ Import from Saved Messages", "action:emoji_import")
+    builder.add_row("💬 React to a message", "action:emoji_react")
     builder.add_row("📚 Library", f"panel:{_LIBRARY_PANEL}")
     builder.add_row("🗂 Categories", f"panel:{_CATEGORIES_PANEL}")
     builder.add_row("🔁 Replacement", f"panel:{_REPLACEMENT_PANEL}")
@@ -1806,6 +1808,141 @@ async def _state_clear_action(event, extra: str, chat_id: int):
     return await _render_replacement(owner, "", notice)
 
 
+# ── reaction (Phase 6, ROADMAP §27) ───────────────────────────────────────
+#
+# ONE deterministic flow, built only from the existing machinery: the panel
+# arms the SAME pending-input reply mode Deep Save uses, the owner replies to
+# the exact message they want to react to, and the reply's own content is the
+# reaction value — a plain emoji (``ReactionEmoji``) or a premium emoji, which
+# Telegram sends as a custom-emoji entity (``ReactionCustomEmoji``). Nothing is
+# inferred: no "last message", no chat history, no keyword routing. The
+# reaction is applied by the reaction SERVICE on the self client; this UI only
+# arms the reply flow and renders the service's honest result — it owns no
+# message rewriting, no delivery and no deletion.
+
+#: Two bounded RPCs (target resolution + the reaction itself) run inside this
+#: handler; the wrapper bounds each at 30s, so this is a backstop, not the
+#: primary bound.
+_REACT_HANDLER_TIMEOUT_S = 90.0
+
+_REACT_PROMPT = (
+    "Reply to the message you want to react to,\n"
+    "sending ONLY the emoji to react with.\n"
+    "A premium emoji from your library works too."
+)
+
+
+def _reaction_from_reply(reply_msg, text: str) -> tuple[dict | None, str]:
+    """The reaction the owner's reply carries, or the reason it carries none.
+
+    A custom-emoji entity (the premium emoji the owner actually sent) wins
+    over the fallback glyph — the same one representation Telegram delivered,
+    never a substitution. Otherwise the reply's own (stripped) text IS the
+    reaction value; a missing value is reported, never guessed.
+    """
+    from telethon.tl.types import MessageEntityCustomEmoji
+
+    for entity in getattr(reply_msg, "entities", None) or []:
+        if isinstance(entity, MessageEntityCustomEmoji):
+            document_id = getattr(entity, "document_id", None)
+            if isinstance(document_id, int) and not isinstance(document_id, bool) and document_id > 0:
+                return {"kind": "custom_emoji", "document_id": document_id}, ""
+    value = (text or getattr(reply_msg, "message", None) or "").strip()
+    if not value:
+        return None, "Reply with the emoji you want to react with."
+    return {"kind": "emoji", "emoji": value}, ""
+
+
+def _render_reaction_result(result: dict, target_id: int) -> tuple[str, str, list]:
+    """Honest outcome panel: the applied reaction, or the exact failure."""
+    builder = InlinePanelBuilder()
+    builder.add_row("💬 React to another message", "action:emoji_react")
+    if result.get("ok"):
+        label = reaction_service.reaction_label(result.get("reaction"))
+        return "React", f"✓ Reacted with {label}\n\nto message `#{target_id}`", builder.build()
+    detail = result.get("detail") or "the reaction was not applied"
+    code = result.get("error") or "?"
+    return "React", f"✗ {detail}\n\n`{code}` · message `#{target_id}`", builder.build()
+
+
+async def _react_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    """Arm reply mode: the owner's next reply in this chat is the reaction."""
+    if get_self_client() is None:
+        return "React", "! Self client is not connected.", InlinePanelBuilder().build()
+    if not get_owner_id():
+        return "React", "! Owner is not set.", InlinePanelBuilder().build()
+    if not chat_id:
+        return "React", "! Could not determine the current chat. Please try again.", InlinePanelBuilder().build()
+
+    set_pending(
+        get_owner_id(), "emoji_react", _react_reply_wait_handler,
+        chat_id, _REACT_PROMPT,
+        inline_chat_id=chat_id,
+        inline_msg_id=getattr(event, "message_id", 0) or 0,
+        extra="",
+        timeout=_REACT_HANDLER_TIMEOUT_S,
+    )
+    return "React", _REACT_PROMPT, []
+
+
+async def _react_reply_wait_handler(
+    text, chat_id, msg_id, inline_chat_id, inline_msg_id,
+) -> None:
+    """Apply the reply's reaction to the reply's own reply-target.
+
+    Deterministic target resolution, mirroring Deep Save's reply mode: the
+    owner's reply message is read back, its ``reply_to_msg_id`` is the target
+    — never the owner's reply itself — and a cross-chat reply header is
+    refused rather than guessed at.
+    """
+    client = get_self_client()
+    owner = get_owner_id()
+
+    async def _finish(title: str, body: str, buttons: list) -> None:
+        await _edit_inline(inline_chat_id, inline_msg_id, title, body, buttons)
+
+    if client is None:
+        await _finish("React", "! Self client is not connected.", [])
+        return
+
+    try:
+        reply_msg = await client.get_messages(chat_id, ids=msg_id)
+    except Exception as exc:
+        logger.warning("[EMOJI_UI] react: cannot read the reply: %s", exc)
+        reply_msg = None
+    if reply_msg is None:
+        await _finish("React", "! Could not read your reply message — please try again.", [])
+        return
+
+    header = getattr(reply_msg, "reply_to", None)
+    if getattr(header, "reply_to_peer_id", None) is not None:
+        await _finish(
+            "React",
+            "! That reply targets another chat.\nReply in the same chat as the message.",
+            [],
+        )
+        return
+    target_id = getattr(reply_msg, "reply_to_msg_id", None) or getattr(header, "reply_to_msg_id", None)
+    if not isinstance(target_id, int) or isinstance(target_id, bool) or target_id <= 0:
+        await _finish(
+            "React",
+            "! Your message was not a reply.\nReply TO the message you want to react to.",
+            [],
+        )
+        return
+
+    reaction, reason = _reaction_from_reply(reply_msg, text)
+    if reaction is None:
+        await _finish("React", f"! {reason}", [])
+        return
+
+    result = await reaction_service.react_to_message(
+        client, owner, chat_id, target_id, reaction,
+    )
+    title, body, buttons = _render_reaction_result(result, target_id)
+    await _finish(title, body, buttons)
+
+
 # ── shared edit helpers (save.py input-handler convention) ─────────────────
 
 
@@ -1892,6 +2029,7 @@ def register(client, owner_id: int) -> None:
         parent=_COMPOSE_PANEL, title="Add Source",
     )
     register_action("emoji_import", _import_action)
+    register_action("emoji_react", _react_action)
     register_action("emoji_state_toggle", _state_toggle_action)
     register_action("emoji_state_global_pick", _state_global_pick_action)
     register_action("emoji_state_override_pick", _state_override_pick_action)
