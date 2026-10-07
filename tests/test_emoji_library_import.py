@@ -3,8 +3,8 @@
 Pins the Phase 1 contracts (ROADMAP §7/§8/§9, IMPLEMENTATION_REPORT):
 
   1. Entity-based extraction from the PHASE 0 serialized representation
-     (``serialize_message`` dicts): ``MessageEntityCustomEmoji`` only, with
-     UTF-16 span resolution through ``utf16_index_at`` (fail closed), exact
+     (`serialize_message` dicts): `MessageEntityCustomEmoji` only, with
+     UTF-16 span resolution through `utf16_index_at` (fail closed), exact
      Unicode alt-text preservation, and document-id validation.
   2. Plain Unicode emoji and unrelated entity types are never imported;
      messages without custom-emoji entities contribute nothing.
@@ -12,16 +12,16 @@ Pins the Phase 1 contracts (ROADMAP §7/§8/§9, IMPLEMENTATION_REPORT):
      repeat imports are counted and never stored twice, malformed payloads
      are skipped honestly, collection/timeout/persistence failures fail
      closed with an honest report, and pagination is deterministic
-     (newest-first, exclusive ``max_id`` cursor, explicit bounds).
+     (newest-first, exclusive `max_id` cursor, explicit bounds).
   4. Persistence runs through the project's existing db/client.py
      Supabase-or-in-memory-fallback pattern (no second DB layer), and the
-     import is idempotent at the ``(owner_id, document_id)`` level.
-  5. Context isolation (no ``backend.ai`` imports) and architecture
+     import is idempotent at the `(owner_id, document_id)` level.
+  5. Context isolation (no `backend.ai` imports) and architecture
      constraints (no second client/loop/scheduler/executor, no forwarding).
 
 Everything runs offline: the Telegram boundary is faked at the
-``client.iter_messages`` surface (yielding real Telethon entities that flow
-through Phase 0 ``serialize_message``) and persistence is the project's
+`client.iter_messages` surface (yielding real Telethon entities that flow
+through Phase 0 `serialize_message`) and persistence is the project's
 in-memory fallback or a faked Supabase table — no live credential.
 """
 from __future__ import annotations
@@ -110,9 +110,9 @@ def _dict_msg(msg_id: Any, text: str, entities: list) -> dict:
 
 
 class _FakeSelfClient:
-    """Fakes the Telethon self-client surface ``messages.iter_messages``
-    consumes: ``iter_messages(chat_id, **kwargs)`` returning an async
-    generator that yields newest-first and honours ``limit``/``max_id``."""
+    """Fakes the Telethon self-client surface `messages.iter_messages`
+    consumes: `iter_messages(chat_id, **kwargs)` returning an async
+    generator that yields newest-first and honours `limit`/`max_id`."""
 
     def __init__(self, messages: list, *, fail_from_call: int | None = None, delay_s: float = 0.0):
         self._messages = sorted(
@@ -372,9 +372,10 @@ def test_extract_entity_processing_bound():
     entities = []
     for i in range(150):
         entities.append(
-            {"type": "MessageEntityCustomEmoji",
-             "offset": utf16_offset(text, i * 2), "length": 2,
-             "document_id": 9000 + i}
+            {
+                "type": "MessageEntityCustomEmoji",
+                 "offset": utf16_offset(text, i * 2), "length": 2,
+                 "document_id": 9000 + i}
         )
     result = extract_custom_emoji_records(_dict_msg(1, text, entities))
     assert len(result.records) == emoji_library_service.MAX_ENTITIES_PER_MESSAGE
@@ -793,6 +794,8 @@ def test_no_second_client_loop_scheduler_or_forwarding():
         "page_size",
         "max_records",
         "page_timeout",
+        "set_timeout",
+        "resolve_sets",
     ]
 
 

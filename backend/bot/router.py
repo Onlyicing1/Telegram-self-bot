@@ -13,7 +13,7 @@ import traceback
 
 from telethon import events
 
-from backend.bot.handlers import misc, save, retrieve, delete, bio, discover, database, username, ai, ghost_seen_v2
+from backend.bot.handlers import misc, save, retrieve, delete, bio, discover, database, username, ai, ghost_seen_v2, emoji
 from backend.bot.handlers import (
     ai_unified,
     ai_credentials,
@@ -102,6 +102,7 @@ def register_all(client, owner_id: int, tz_str: str):
         ("taskloom", lambda: taskloom.register(client, owner_id, tz_str)),
         ("task_events", lambda: task_events.register(client, owner_id, tz_str)),
         ("todo", lambda: todo.register(client, owner_id, tz_str)),
+        ("emoji", lambda: emoji.register(client, owner_id)),
     ]
 
     for name, fn in handlers:
