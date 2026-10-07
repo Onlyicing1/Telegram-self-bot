@@ -12,11 +12,13 @@
 > §17), Phase 1 (Emoji Library + bounded, deterministic Saved Messages
 > import — §7 library-entry shape, §8 storage/dedup, §9 import INCLUDING
 > sticker-set resolution/enumeration, the Glass UI import/report panels and
-> the 2×5 library browser), and Phase 2 (Categories & Mappings — §10 CRUD,
-> §11 mapping model + uniqueness, §12 conflict UI, §25 2×5 pagination) are
-> IMPLEMENTED and unit-TESTED (no live Telegram). Everything else below
-> remains PLANNED. Schema files are untouched: the `emoji_library`,
-> `emoji_categories` and `emoji_mappings` tables are MANUAL-ONLY and have
+> the 2×5 library browser), Phase 2 (Categories & Mappings — §10 CRUD,
+> §11 mapping model + uniqueness, §12 conflict UI, §25 2×5 pagination), and
+> Phase 3 (State & Toggle — §13 active-category state, §14 replacement
+> toggle, §29 persistence + first-boot OFF) are IMPLEMENTED and unit-TESTED
+> (no live Telegram). Everything else below remains PLANNED. Schema files
+> are untouched: the `emoji_library`, `emoji_categories`, `emoji_mappings`,
+> `emoji_state` and `emoji_chat_overrides` tables are MANUAL-ONLY and have
 > not been executed anywhere (§29; exact schema in
 > `IMPLEMENTATION_REPORT.md`).
 
@@ -64,9 +66,10 @@ Status: **PLANNED**.
 
 **Overall feature status: IN PROGRESS — Phase 0 (entity-aware serialization
 + send-only Bot bridge), Phase 1 (Emoji Library + deterministic Saved
-Messages import), and Phase 2 (Categories & Mappings: CRUD, mapping editor,
-uniqueness, conflict UI, 2×5 pagination) implemented and unit-tested; no
-end-to-end replacement flow yet.**
+Messages import), Phase 2 (Categories & Mappings: CRUD, mapping editor,
+uniqueness, conflict UI, 2×5 pagination), and Phase 3 (State & Toggle:
+replacement toggle, global default + per-chat override, resolution
+boundary) implemented and unit-tested; no end-to-end replacement flow yet.**
 
 The repository originally contained **no** emoji-substitution, premium-emoji
 library, or reaction feature (verified by grep across `backend/` and `tests/`
@@ -96,14 +99,14 @@ No part of the feature has been verified against live Telegram.
 - [x] Category management — CRUD + deletion semantics + mapping counts (Phase 2, IMPLEMENTED, TESTED)
 - [x] Mapping UI — editor flow + list/edit/delete + 2×5 pagination (Phase 2, IMPLEMENTED, TESTED)
 - [x] Conflict handling — never-silent-overwrite + conflict panel with explicit Replace/Cancel (Phase 2, IMPLEMENTED, TESTED)
-- [ ] Replacement toggle
+- [x] Replacement toggle + active-category state (global default + per-chat override) + resolution boundary (Phase 3, IMPLEMENTED, TESTED)
 - [ ] Message reconstruction
 - [ ] Entity preservation
 - [ ] Bot bridge
 - [ ] Loop prevention
 - [ ] Custom category
 - [ ] Reactions
-- [x] Tests — offline suites at 5371 passed / 26 skipped (live verification NOT run)
+- [x] Tests — offline suites at 5417 passed / 26 skipped (live verification NOT run)
 - [ ] Documentation
 - [ ] Final verification
 
@@ -410,8 +413,8 @@ executed, no migration file created.
 Schema/SQL files and `DATABASE_ARCHITECTURE.md` remain untouched by this
 roadmap.
 
-Status: **IN PROGRESS — library entries + categories + mappings
-IMPLEMENTED and TESTED offline; runtime state remains PLANNED (Phase 3).**
+Status: **IN PROGRESS — library entries + categories + mappings + runtime
+state IMPLEMENTED and TESTED offline (runtime state = Phase 3).**
 
 ---
 
@@ -513,7 +516,7 @@ report panel IMPLEMENTED/TESTED; live validation remains open.**
 - [x] Category deletion semantics — mappings die with the category (removed BEFORE the category row, fail-closed); library entries survive
 - [x] Same simple emoji may map differently per category (allowed); within one category a simple emoji is defined **exactly once** (enforced at `db/client.py` + `emoji_category_service` before any write)
 
-Status: **IN PROGRESS — CRUD + deletion semantics + uniqueness IMPLEMENTED/TESTED (Phase 2); Custom type + active state remain PLANNED.**
+Status: **IN PROGRESS — CRUD + deletion semantics + uniqueness IMPLEMENTED/TESTED (Phase 2); Custom type remains PLANNED.**
 
 ---
 
@@ -564,29 +567,29 @@ Rationale from the codebase:
 
 Required behavior:
 
-- [ ] Global default category selectable in the Emoji panel
-- [ ] Optional per-chat override (set/clear via panel while targeting that chat through the existing target-context machinery)
-- [ ] Resolution order at message time: per-chat override → global default → no replacement
-- [ ] Documented in panel UI (which scope is in effect)
+- [x] Global default category selectable in the Emoji panel (`emoji_replacement` panel → global picker; owner-scoped, live-category-validated)
+- [x] Optional per-chat override (set/clear via panel while targeting that chat through the existing `target_context` machinery; without an armed target the panel explains and withholds the per-chat actions — never a fabricated chat id)
+- [x] Resolution order at message time: per-chat override → global default → no replacement (`emoji_state_service.resolve_effective_category`, the Phase 4 boundary; the winning category is validated against the LIVE table so a deleted category fails closed to no-replacement instead of being substituted)
+- [x] Documented in panel UI (which scope is in effect — global default, per-chat override, and the effective category are all rendered)
 
 Alternative rejected for MVP: per-chat-only (would make replacement opt-in
 per chat with no default) and strictly-global-only (conflicts with §C's
 per-category expectations for different audiences). This decision is also
 listed in §34 for confirmation.
 
-Status: **PLANNED — decision recorded, implementation pending**.
+Status: **IMPLEMENTED + TESTED (offline; §34-A owner sign-off still open).**
 
 ---
 
 ## 14. Emoji Replacement Toggle
 
-- [ ] Global `Emoji Replacement: ON/OFF` toggle (Glass UI panel + persisted setting, §29)
-- [ ] Independent from active category (toggle OFF ⇒ no processing regardless of category; toggle ON with no active category ⇒ no replacement)
-- [ ] OFF behavior contract: messages remain untouched; no deletion; no bot message; no transformation
-- [ ] Toggle state visible in the Emoji panel header and Health/Context panels (consistency with existing status surfaces)
-- [ ] Toggle is owner-controlled only (is_owner gate)
+- [x] Global `Emoji Replacement: ON/OFF` toggle (Glass UI `emoji_replacement` panel + persisted setting, §29; first-boot default OFF)
+- [x] Independent from active category (toggle OFF ⇒ no processing regardless of category; toggle ON with no active category ⇒ no replacement — both pinned by tests)
+- [x] OFF behavior contract at the resolution boundary: `resolve_effective_category` returns None whenever the toggle is OFF, so no downstream consumer can act (the actual untouched-message guarantee is completed by Phase 4's outgoing handler, which does not exist yet)
+- [x] Toggle state visible in the Emoji panel header (`Replacement: ✅ ON / ❌ OFF`) and in the Replacement panel itself; Health/Context panel surfacing remains open
+- [x] Toggle is owner-controlled only (owner-scoped service + the callback router's owner check)
 
-Status: **PLANNED**.
+Status: **IMPLEMENTED + TESTED (offline).**
 
 ---
 
@@ -864,14 +867,14 @@ Status: **PLANNED**.
 
 Follows existing patterns (no schema invented here; actual SQL manual, later):
 
-- [ ] Toggle + active category + bridge config persisted via the settings pattern (`settings_service.py` / `panel_settings_repository.py` style: validated keys, single-row persistence, in-process cache) — exact table(s) decided with the schema work
+- [x] Toggle + global default persisted (Phase 3: the single-row-per-owner `emoji_state` table following the `bio_state`/`db/client.py` pattern — validated writes, honest failure reporting, in-memory fallback; the bridge config remains open until Phase 4 decides it)
 - [x] Library persisted via the `db/client.py` Supabase-or-in-memory-fallback pattern (Phase 1: `emoji_library` functions; a failed durable dedup read returns `None` so import fails closed — RAM is never silently presented as durable; physical table MANUAL-ONLY, schema in `IMPLEMENTATION_REPORT.md`)
 - [x] Categories/mappings persisted via the same pattern (Phase 2: dedicated `emoji_categories` / `emoji_mappings` tables following the identical Supabase-or-fallback sync pattern SAME as the library; my durable-write failure paths report None/-1/False so the service can fail closed and the UI shows honest unknown/degraded states; creation of the physical tables is manual/out of scope here)
-- [ ] Durable-vs-fallback labeling follows the `config_store.py` contract (`DEGRADED_READ_KEY` / `SESSION_ONLY_KEY`) so a restart can never present RAM state as DB state — for Phase 2 surfaces the degradation is shown honestly at usage time (unknown counts, failed saves) without full config_store labeling; full labeling remains planned
+- [x] Durable-vs-fallback behavior stays honest (Phase 3: a failed durable write reports False and the UI renders nothing-changed; a failed read reports unset so replacement fail-closes OFF; no RAM state is ever presented as durable) — full `config_store`-style labeling keys remain unused
 - [ ] New env vars (if any, e.g. a dedicated bridge bot token) follow `config.py` optional-var conventions; default must keep the feature disabled/inert
-- [ ] Feature flag default: Emoji Replacement OFF on first boot
+- [x] Feature flag default: Emoji Replacement OFF on first boot (Phase 3; pinned by tests)
 
-Status: **PLANNED**.
+Status: **IN PROGRESS — Phase 3 state persistence IMPLEMENTED/TESTED; bridge config + env vars remain with later phases.**
 
 ---
 
@@ -889,16 +892,17 @@ registry/executor patterns like `tests/test_provider_tool_boundary.py` and
 - [ ] Authorization tests: non-owner-authored message never processed; incoming events never processed (§19)
 - [ ] Loop-prevention tests: bot-sender message never reprocessed (§24)
 - [ ] Mapping service tests: uniqueness enforcement; conflict detection returns current+new visuals data; replace only on explicit confirm (§11/§12)
-- [ ] Category resolution tests: override > default > none (§13)
-- [ ] Toggle tests: OFF ⇒ zero Telegram calls (§14)
+- [x] **Phase 3 slice (done):** `tests/test_emoji_state_phase3.py` — 46 tests pinning the state layer (first-boot default OFF; toggle ON/OFF persist-and-load through the db abstraction; flip semantics; invalid-owner refusal; global default set/nonexistent-rejected/foreign-rejected/cleared; per-chat override set/cleared/nonexistent-rejected/foreign-rejected/per-chat independence; resolution order override > global > none; fallback after clear; no-state → none; OFF ⇒ no resolution despite categories; global used in other chats and for unknown chats; deleted global AND override category fail closed; owner isolation on every read/write; degraded write → False + state unchanged, degraded read → unset/OFF; UI registration, main-panel state line, full-state + effective rendering, no fabricated target chat + per-chat actions withheld without one, honest OFF effective-none, toggle/choose/clear actions mutate only their intended scope, foreign-category choose rejected, owner-scoped picker, empty-library prompt, ≤64-byte callback bounds, engine-owner scoping; architecture: AST import audit (no `backend.ai`), no second client/loop/scheduler/executor/forwarding/events.NewMessage, no Phase 4 surface (transform/reconstruct/delete_original/bridge_send), Telegram-free resolution)
+- [x] Category resolution tests: override > default > none (§13)
+- [x] Toggle tests: OFF ⇒ no replacement at the resolution boundary (§14; the zero-Telegram-calls form is completed with Phase 4's outgoing handler)
 - [x] Import tests: set enumeration covered offline at the fake TL boundary (facade + service + full-import integration — see the Phase 1 remainder line above; live Telegram remains untested)
 - [x] **Phase 2 slice (done):** `tests/test_emoji_category_service.py` — 54 tests pinning the service layer (category validation incl. strip/empty/newline/length, create/list-with-counts/rename/delete, duplicate-name refusal, same-name-across-owners, owner isolation on every category/mapping operation, mapping creation with owner-scoped library resolution, reference-only storage, missing/foreign library rejection, list/edit/delete mappings, same-emoji-different-categories, same-document-multiple-mappings, conflict result carrying current+current_entry+new_entry, unresolvable current entry reported not fabricated, db-layer uniqueness backstops, pagination slicing). `tests/test_emoji_ui_phase2.py` — 42 tests pinning the Glass UI (8 panels + 10 actions registration, mother-menu Categories row, categories 2×5 grid with mapping counts + page clamp, mapping-count unknown-state honesty, category detail with stale/delete failure honesty, mappings list with visuals + pagination + remainder page, mapping detail incl. honest missing-entry marking, the add-mapping draft/input/picker flow, stale draft + stale index + deleted-entry picker failures, the conflict panel (current/new visuals, nothing-overwritten, explicit Replace re-proves state, Cancel keeps, replace-without-draft refused, replace-after-mapping-deleted honest, unresolvable-current-visual honest), edit/delete flows, delete-category flow incl. confirm-without-draft, owner isolation at the UI, ≤64-byte callback bounds across all new panels, and the architecture pins: no `backend.ai` import, no `events.NewMessage`, no `create_task`, no forwarding). At this commit: **5371 passed, 26 skipped** (Phase 1 baseline 5275 + 96 new).
 - [x] Pagination tests: 10-per-page slicing, page clamp, callback-data bound, second-page remainder (§25 library browser — plus Phase 2: categories grid, mappings list, picker, in `tests/test_emoji_ui_phase2.py`)
 - [ ] Custom composition tests: references not duplicates; propagation semantics per §26 decision
 - [ ] Reaction wrapper tests: bounded timeout, exception normalization, payload correctness (§27)
-- [x] Full-suite gate: keep the whole suite green on every slice (latest run at this commit: **5371 passed, 26 skipped** — Phase 1 baseline 5275 + 96 new)
+- [x] Full-suite gate: keep the whole suite green on every slice (latest run at this commit: **5417 passed, 26 skipped** — Phase 2 baseline 5371 + 46 new)
 
-Status: **IN PROGRESS — Phase 0 + Phase 1 (incl. remainder) + Phase 2 done; the rest remains PLANNED.**
+Status: **IN PROGRESS — Phases 0–3 done (offline); the rest remains PLANNED.**
 
 ---
 
@@ -907,7 +911,7 @@ Status: **IN PROGRESS — Phase 0 + Phase 1 (incl. remainder) + Phase 2 done; th
 Beyond unit tests — verification against real behavior before IMPLEMENTED
 can become TESTED/VERIFIED:
 
-- [x] Compile check (`compileall`/`py_compile`) + full test suite green — at this commit: `py_compile` clean on all changed modules, **5371 passed, 26 skipped**
+- [x] Compile check (`compileall`/`py_compile`) + full test suite green — at this commit: `py_compile` clean on all changed modules, **5417 passed, 26 skipped**
 - [ ] Live Telegram validation checklist (manual, owner's environment): import a real collection via Saved Messages (incl. set enumeration through real TL RPCs); map 2 emojis; verify replacement in a private chat, a group, and Saved Messages; verify text/entities/media/caption/reply preservation visually; verify unmapped emoji untouched; verify loop does not occur; verify toggle-OFF leaves everything untouched
 - [ ] Bridge capability verification: confirm which custom-emoji send mode actually works with the owner's bot setup (Fragment username vs alt-text fallback) — record the outcome in §17
 - [ ] Failure-mode validation: revoke bot send permission in a chat and verify the original message survives (send-first ordering)
@@ -926,13 +930,13 @@ its checkboxes AND validation pass):
 - [ ] **Phase 0 — Prerequisites:** entity-aware serialization (§22 gap in `_helpers.py`) — **DONE + TESTED**; decision on bridge capability (§34-D) — still OPEN (owner); mapping persistence shape (§34-E) — implemented against the default proposal in Phase 2, owner sign-off still OPEN
 - [x] **Phase 1 — Library & Import:** domain model (§7 library-entry shape), library storage (dedup on `(owner_id, document_id)`), bounded entity-based Saved Messages collection import (§8, §9 message-level), honest import report, sticker-set resolution/enumeration (§9), Glass UI import/report + library-browser panels, 2×5 library pagination (§25) — **IMPLEMENTED + TESTED**; REMAINING: live validation only
 - [x] **Phase 2 — Categories & Mappings:** category CRUD (create/list/rename/delete with mapping counts), mapping editor (simple-emoji input → 2×5 library picker), uniqueness at service + db layers, conflict UI (current-vs-new visuals, explicit Replace/Cancel), per-category mapping list/edit/delete with 2×5 pagination, delete-category cascade — **IMPLEMENTED + TESTED (offline)**; REMAINING: live validation only
-- [ ] **Phase 3 — State & Toggle:** replacement toggle, active category (global default + per-chat override) (§13, §14, §29)
+- [x] **Phase 3 — State & Toggle:** replacement toggle, active category (global default + per-chat override), deterministic resolution boundary, `emoji_state`/`emoji_chat_overrides` persistence, Glass UI state panel (§13, §14, §29) — **IMPLEMENTED + TESTED (offline)**; REMAINING: live validation only
 - [ ] **Phase 4 — Reconstruction:** transformer (entity-safe), reconstructor with send-first ordering, bot bridge send path, same-destination + reply preservation (§15–§23), loop prevention (§24)
 - [ ] **Phase 5 — Custom Category:** composition UI + reference semantics (§26)
 - [ ] **Phase 6 — Reactions:** `telegram_api/reactions.py` wrapper, reaction service, Glass UI react action (§27)
 - [ ] **Phase 7 — Hardening:** error/capability handling completion (§28), test plan completion (§30), validation checklist execution (§31), documentation updates (`AGENTS.md`, `IMPLEMENTATION_REPORT.md`) in the landing commit(s)
 
-Status: **IN PROGRESS — Phase 0 (code half) + Phase 1 + Phase 2 done offline; live validation and Phases 3–7 remain PLANNED.**
+Status: **IN PROGRESS — Phase 0 (code half) + Phases 1–3 done offline; live validation and Phases 4–7 remain PLANNED.**
 
 ---
 
@@ -975,7 +979,7 @@ Status: **PLANNED — dependencies verified; blockers documented**.
 
 | # | Decision | Options | Default proposal | Owner input needed |
 |---|---|---|---|---|
-| A | **Active category scope** | global-only / per-chat-only / global default + per-chat override | global default + per-chat override (§13, derived from existing settings/target-context architecture) | Confirm or override |
+| A | **Active category scope** | global-only / per-chat-only / global default + per-chat override | global default + per-chat override (§13, derived from existing settings/target-context architecture) | **IMPLEMENTED at Phase 3 (default proposal, as documented):** global default + per-chat override with the override as an override, never a second authority. Owner confirmation still OPEN — reverting would change only the service/UI surface, not the db pattern |
 | B | **Reconstruction ordering** | send-new-then-delete / delete-then-send | send-first (never lose the original; worst case temporary duplicate) (§15) | Confirm |
 | C | **Bridge bot identity** | reuse helper bot (`BOT_TOKEN`) / dedicated second bot token | reuse helper bot; env override for a dedicated token (§17/§29) | Confirm |
 | D | **Premium-visual delivery mode** | Fragment-purchased additional username for the bridge bot / alt-text fallback only / investigate other TL paths | design for both: attempt custom-emoji entities, degrade to alt text; Fragment purchase is the owner's cost/ownership decision (§17/§28) | Required — capability + budget decision |
@@ -1018,9 +1022,16 @@ Current truth after the Phase 0, Phase 1, and Phase 2 code slices:
   **live Telegram NOT exercised**; the physical tables do NOT exist anywhere
   yet (MANUAL-ONLY schema documented in `IMPLEMENTATION_REPORT.md` — nothing
   executed).
-- Still NOT implemented: replacement toggle, active category, transformer,
-  reconstructor, reaction code; no live schema/tables applied; §34-D and the
-  owner sign-off on §34-E remain open.
+- Replacement state & toggle (Phase 3) — IMPLEMENTED
+  (`backend/services/emoji_state_service.py` + the `emoji_state` /
+  `emoji_chat_overrides` functions in `backend/db/client.py` + the
+  Replacement panels in `backend/bot/handlers/emoji.py`), TESTED (46
+  tests); **live Telegram NOT exercised**; the physical tables do NOT
+  exist anywhere yet (MANUAL-ONLY schema documented in
+  `IMPLEMENTATION_REPORT.md` — nothing executed).
+- Still NOT implemented: transformer, reconstructor, reaction code; no
+  live schema/tables applied; §34-D and the owner sign-offs on §34-A
+  (Phase 3 scope, implemented as documented) and §34-E remain open.
 
 ---
 

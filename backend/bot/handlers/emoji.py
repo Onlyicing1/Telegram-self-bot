@@ -39,6 +39,7 @@ from backend.helper.panels import (
 )
 from backend.helper.input_state import set_pending
 from backend.services import emoji_category_service as cat_service
+from backend.services import emoji_state_service as state_service
 from backend.services.emoji_library_service import import_from_saved_messages
 
 logger = logging.getLogger(__name__)
@@ -65,6 +66,8 @@ _CATEGORY_PANEL = "emoji_cat"
 _MAPPINGS_PANEL = "emoji_mappings"
 _MAPPING_PANEL = "emoji_map"
 _PICKER_PANEL = "emoji_pick"
+_REPLACEMENT_PANEL = "emoji_replacement"
+_STATE_SCOPE_PICKER_PANEL = "emoji_state_scope"
 
 
 async def _emoji_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
@@ -82,10 +85,15 @@ async def _emoji_panel_handler(event, extra: str) -> tuple[str, str, list] | Non
         lines.append("_Empty — run Import to scan Saved Messages._")
     else:
         lines.append(f"{total} custom emoji")
+    if owner:
+        enabled = await state_service.replacement_enabled(owner)
+        lines.append("")
+        lines.append(f"Replacement: {'✅ ON' if enabled else '❌ OFF'}")
     builder = InlinePanelBuilder()
     builder.add_row("⬇ Import from Saved Messages", "action:emoji_import")
     builder.add_row("📚 Library", f"panel:{_LIBRARY_PANEL}")
     builder.add_row("🗂 Categories", f"panel:{_CATEGORIES_PANEL}")
+    builder.add_row("🔁 Replacement", f"panel:{_REPLACEMENT_PANEL}")
     return "Emoji", "\n".join(lines), builder.build()
 
 
@@ -958,6 +966,268 @@ async def _map_del_action(event, extra: str, chat_id: int) -> tuple[str, str, li
 # ── registration ──────────────────────────────────────────────────────────
 
 
+# ── replacement state (Phase 3, ROADMAP §13/§14) ───────────────────────────
+
+
+def _category_name_of(rows: list[dict[str, Any]], category_id: int | None) -> str | None:
+    if category_id is None:
+        return None
+    for row in rows:
+        if row.get("id") == category_id:
+            return str(row.get("name") or f"#{category_id}")
+    return None
+
+
+async def _render_replacement(
+    owner: int, extra: str = "", notice: str | None = None,
+) -> tuple[str, str, list]:
+    """The Replacement panel: toggle state, global default, the per-chat
+    override for the CURRENT target chat (when one is armed), the effective
+    resolved category for that chat, and the owner actions.
+
+    ``extra`` carries ``<pick_scope>:<chat_id>`` while a category-picker flow
+    is armed (pick_scope: ``global`` | ``override``); ``chat_id`` is 0 when
+    no target chat is armed.
+    """
+    from backend.helper.target_context import get_target
+
+    pick_scope, _, chat_s = extra.partition(":")
+    try:
+        target_chat = int(chat_s) if chat_s else 0
+    except (TypeError, ValueError):
+        target_chat = 0
+
+    enabled = await state_service.replacement_enabled(owner)
+    default_id = await state_service.get_global_default_category(owner)
+
+    rows, _total, _counts = await cat_service.list_categories(
+        owner, limit=_PAGE_SIZE, offset=0,
+    )
+
+    # Target chat: only a REAL armed target-context chat — never fabricated.
+    if not target_chat:
+        ctx = get_target(owner)
+        if ctx is not None and ctx.kind == "reply" and ctx.reply_chat_id:
+            target_chat = ctx.reply_chat_id
+
+    lines = [f"Replacement: {'✅ ON' if enabled else '❌ OFF'}", ""]
+
+    default_name = _category_name_of(rows, default_id)
+    lines.append(
+        f"Global default: {default_name if default_name else '_none_'}"
+    )
+
+    if target_chat:
+        override_id = await state_service.get_chat_override(owner, target_chat)
+        override_name = _category_name_of(rows, override_id)
+        lines.append(
+            f"Override for chat `{target_chat}`: "
+            f"{override_name if override_name else '_none_'}"
+        )
+        effective_id = await state_service.resolve_effective_category(
+            owner, target_chat,
+        )
+        effective_name = _category_name_of(rows, effective_id)
+        if not enabled:
+            effective_text = "_none — replacement is OFF_"
+        elif effective_name:
+            effective_text = effective_name
+        else:
+            effective_text = "_none — no category resolves_"
+        lines.append(f"Effective here: {effective_text}")
+    else:
+        lines.append("Override: _no target chat — reply to a message in the "
+                     "chat you want to target, then open this panel._")
+
+    if notice:
+        lines.append("")
+        lines.append(notice)
+
+    builder = InlinePanelBuilder()
+    builder.add_row(
+        "🔘 Turn OFF" if enabled else "🔘 Turn ON",
+        "action:emoji_state_toggle",
+    )
+    builder.add_row("🌐 Set global default", "action:emoji_state_global_pick")
+    if target_chat:
+        seed = f"override:{target_chat}"
+        builder.add_row(
+            "📍 Set chat override", f"action:emoji_state_override_pick:{target_chat}"
+        )
+        builder.add_row("✖ Clear chat override", f"action:emoji_state_clear:{target_chat}")
+    builder.add_row("🗂 Manage categories", f"panel:{_CATEGORIES_PANEL}")
+    builder.add_row("← Back", f"panel:{_MAIN_PANEL}")
+    return "Emoji Replacement", "\n".join(lines), builder.build()
+
+
+async def _replacement_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
+    owner = get_owner_id()
+    if not owner:
+        return _error_panel("Emoji Replacement", "Owner is not set.", f"panel:{_MAIN_PANEL}")
+    return await _render_replacement(owner, extra or "")
+
+
+async def _state_global_pick_action(event, extra: str, chat_id: int):
+    owner = get_owner_id()
+    _set_draft(owner, kind="state_pick", scope="global", target_chat=0)
+    return await _render_state_picker(owner, "global:0:0")
+
+
+async def _state_override_pick_action(event, extra: str, chat_id: int):
+    owner = get_owner_id()
+    try:
+        target_chat = int(extra)
+    except (TypeError, ValueError):
+        return _error_panel(
+            "Set Override", "No target chat — reply to a message in the chat "
+            "you want to target first.",
+            f"panel:{_REPLACEMENT_PANEL}",
+        )
+    _set_draft(owner, kind="state_pick", scope="override", target_chat=target_chat)
+    return await _render_state_picker(owner, f"override:{target_chat}:0")
+
+
+async def _render_state_picker(owner: int, extra: str) -> tuple[str, str, list]:
+    """2×5 category picker for the replacement state. extra: ``<scope>:<chat>:<page>``."""
+    scope, _, rest = extra.partition(":")
+    chat_s, _, page_s = rest.partition(":")
+    try:
+        target_chat = int(chat_s)
+        page = max(0, int(page_s or 0))
+    except (TypeError, ValueError):
+        return _error_panel(
+            "Pick Category", "Flow out of date — start again.",
+            f"panel:{_REPLACEMENT_PANEL}",
+        )
+    if scope not in ("global", "override"):
+        return _error_panel(
+            "Pick Category", "Flow out of date — start again.",
+            f"panel:{_REPLACEMENT_PANEL}",
+        )
+    rows, total, _counts = await cat_service.list_categories(
+        owner, limit=_PAGE_SIZE, offset=max(0, page) * _PAGE_SIZE,
+    )
+    if total == 0:
+        return _error_panel(
+            "Pick Category", "No categories exist yet — create one first.",
+            f"panel:{_REPLACEMENT_PANEL}",
+        )
+    page = min(page, _page_count(total) - 1)
+    if page:
+        rows, _total, _counts = await cat_service.list_categories(
+            owner, limit=_PAGE_SIZE, offset=page * _PAGE_SIZE,
+        )
+
+    title = "Set Global Default" if scope == "global" else "Set Chat Override"
+    builder = InlinePanelBuilder()
+    for i in range(0, len(rows), 2):
+        pair = []
+        for j in (i, i + 1):
+            if j >= len(rows):
+                break
+            row = rows[j]
+            pair.append(
+                (
+                    _truncate(str(row.get("name") or "?")),
+                    f"action:emoji_state_choose:{scope}:{target_chat}:{row.get('id')}",
+                )
+            )
+        builder.add_buttons(*pair)
+    page_count = _page_count(total)
+    if page_count > 1:
+        seed = f"{scope}:{target_chat}"
+        builder.add_buttons(
+            ("◀", f"panel:{_STATE_SCOPE_PICKER_PANEL}:{seed}:{page - 1}" if page else f"panel:{_STATE_SCOPE_PICKER_PANEL}:{seed}:0"),
+            (f"{page + 1}/{page_count}", f"panel:{_STATE_SCOPE_PICKER_PANEL}:{seed}:{page}"),
+            ("▶", f"panel:{_STATE_SCOPE_PICKER_PANEL}:{seed}:{page + 1}"),
+        )
+    builder.add_row("← Back", f"panel:{_REPLACEMENT_PANEL}")
+    return title, "Pick the category to activate:", builder.build()
+
+
+async def _state_scope_picker_handler(event, extra: str) -> tuple[str, str, list] | None:
+    owner = get_owner_id()
+    if not owner:
+        return _error_panel("Pick Category", "Owner is not set.", f"panel:{_MAIN_PANEL}")
+    return await _render_state_picker(owner, extra or "")
+
+
+async def _state_choose_action(event, extra: str, chat_id: int):
+    """extra: ``<scope>:<target_chat>:<category_id>`` — validate through the
+    service (owner-scoped, fail closed) and re-render the state panel."""
+    owner = get_owner_id()
+    scope, _, rest = extra.partition(":")
+    chat_s, _, cid_s = rest.partition(":")
+    try:
+        target_chat = int(chat_s)
+        cid = int(cid_s)
+    except (TypeError, ValueError):
+        return _error_panel(
+            "Pick Category", "Flow out of date — start again.",
+            f"panel:{_REPLACEMENT_PANEL}",
+        )
+    if scope == "global":
+        ok = await state_service.set_global_default_category(owner, cid)
+        notice = (
+            "✓ Global default set."
+            if ok
+            else "✗ Category not found (or storage failed) — nothing changed."
+        )
+    elif scope == "override":
+        if not target_chat:
+            return _error_panel(
+                "Set Override", "No target chat — start again.",
+                f"panel:{_REPLACEMENT_PANEL}",
+            )
+        ok = await state_service.set_chat_override(owner, target_chat, cid)
+        notice = (
+            f"✓ Override set for chat `{target_chat}`."
+            if ok
+            else "✗ Category not found (or storage failed) — nothing changed."
+        )
+    else:
+        return _error_panel(
+            "Pick Category", "Flow out of date — start again.",
+            f"panel:{_REPLACEMENT_PANEL}",
+        )
+    _clear_draft(owner)
+    return await _render_replacement(owner, "", notice)
+
+
+async def _state_toggle_action(event, extra: str, chat_id: int):
+    owner = get_owner_id()
+    new_value = await state_service.toggle_replacement(owner)
+    if new_value is False and await state_service.replacement_enabled(owner) is False:
+        # distinguish a genuine OFF result from a degraded write
+        enabled_now = await state_service.replacement_enabled(owner)
+        if enabled_now:
+            notice = "✗ Could not save the toggle — storage failed. Still OFF."
+        else:
+            notice = "🔘 Replacement is OFF."
+    else:
+        notice = f"✅ Replacement is ON." if new_value else "🔘 Replacement is OFF."
+    return await _render_replacement(owner, "", notice)
+
+
+async def _state_clear_action(event, extra: str, chat_id: int):
+    owner = get_owner_id()
+    try:
+        target_chat = int(extra)
+    except (TypeError, ValueError):
+        return _error_panel(
+            "Clear Override", "No target chat — start again.",
+            f"panel:{_REPLACEMENT_PANEL}",
+        )
+    ok = await state_service.clear_chat_override(owner, target_chat)
+    notice = (
+        f"✓ Override cleared for chat `{target_chat}` — the global default "
+        "applies again."
+        if ok
+        else "✗ Could not clear the override — storage failed. Nothing changed."
+    )
+    return await _render_replacement(owner, "", notice)
+
+
 # ── shared edit helpers (save.py input-handler convention) ─────────────────
 
 
@@ -1027,7 +1297,20 @@ def register(client, owner_id: int) -> None:
     register_panel(
         _PICKER_PANEL, _picker_page_handler, parent=_MAPPINGS_PANEL, title="Pick Emoji"
     )
+    register_panel(
+        _REPLACEMENT_PANEL, _replacement_panel_handler,
+        parent=_MAIN_PANEL, title="Replacement",
+    )
+    register_panel(
+        _STATE_SCOPE_PICKER_PANEL, _state_scope_picker_handler,
+        parent=_REPLACEMENT_PANEL, title="Pick Category",
+    )
     register_action("emoji_import", _import_action)
+    register_action("emoji_state_toggle", _state_toggle_action)
+    register_action("emoji_state_global_pick", _state_global_pick_action)
+    register_action("emoji_state_override_pick", _state_override_pick_action)
+    register_action("emoji_state_choose", _state_choose_action)
+    register_action("emoji_state_clear", _state_clear_action)
     register_action("emoji_cat_new", _cat_new_action)
     register_action("emoji_cat_rename", _cat_rename_action)
     register_action("emoji_cat_del", _cat_del_action)

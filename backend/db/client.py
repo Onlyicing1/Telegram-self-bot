@@ -44,6 +44,8 @@ _fallback: dict = {
     "emoji_library": [],
     "emoji_categories": [],
     "emoji_mappings": [],
+    "emoji_state": {},
+    "emoji_chat_overrides": [],
 }
 _save_code_lock = asyncio.Lock()
 _initialised = False
@@ -1942,3 +1944,176 @@ def _safe_row(row: dict | None) -> str:
         return repr({k: row.get(k) for k in ("id", "save_code", "owner_id")})
     except Exception:
         return "<unreprable>"
+
+
+# ── emoji_state (Emoji & Reaction Phase 3) ───────────────────────────────────
+#
+# Two stores:
+#   * ``emoji_state`` — the owner's single global row: replacement_enabled
+#     (bool, default False) and global_default_category_id (int, nullable).
+#     Single-row-per-owner persistence/cache pattern, mirroring bio_state /
+#     username_state.
+#   * ``emoji_chat_overrides`` — per-chat category overrides keyed by
+#     ``(owner_id, chat_id)``. The override is a single nullable column set
+#     on the same row shape; clearing it restores the global default at
+#     resolution time.
+#
+# Both degrade to the in-memory fallback exactly like every other store in
+# this module: a durable write failure returns False / None and is logged +
+# record_event'ed, never raised.
+
+
+def _get_emoji_state_sync(owner_id: int) -> dict | None:
+    db = get_db()
+    if db is None:
+        row = _fallback["emoji_state"].get(owner_id)
+        return dict(row) if row else None
+    try:
+        result = (
+            db.table("emoji_state")
+            .select("*")
+            .eq("owner_id", owner_id)
+            .limit(1)
+            .execute()
+        )
+        return result.data[0] if result.data else None
+    except Exception as exc:
+        logger.error("[EMOJI_DB] get_emoji_state FAILED: %s", exc)
+        return None
+
+
+async def get_emoji_state(owner_id: int) -> dict | None:
+    """The owner's global emoji-replacement state row, or None when no row
+    exists yet (callers treat every absent field as its default)."""
+    try:
+        return await _run_sync(_get_emoji_state_sync, owner_id)
+    except Exception as exc:
+        logger.error("[EMOJI_DB] get_emoji_state FAILED: %s", exc)
+        return None
+
+
+def _upsert_emoji_state_sync(owner_id: int, updates: dict) -> bool:
+    now = datetime.now(timezone.utc).isoformat()
+    payload = dict(updates)
+    payload["updated_at"] = now
+    db = get_db()
+    if db is None:
+        row = dict(_fallback["emoji_state"].get(owner_id) or {"owner_id": owner_id})
+        row.update(payload)
+        _fallback["emoji_state"][owner_id] = row
+        return True
+    try:
+        existing = (
+            db.table("emoji_state")
+            .select("owner_id")
+            .eq("owner_id", owner_id)
+            .limit(1)
+            .execute()
+        )
+        if existing.data:
+            db.table("emoji_state").update(payload).eq("owner_id", owner_id).execute()
+        else:
+            insert_payload = {"owner_id": owner_id, **payload}
+            db.table("emoji_state").insert(insert_payload).execute()
+        return True
+    except Exception as exc:
+        logger.error("[EMOJI_DB] upsert_emoji_state FAILED: %s", exc)
+        record_event("database", "upsert emoji_state", 0, "ERROR", str(exc))
+        return False
+
+
+async def upsert_emoji_state(owner_id: int, updates: dict) -> bool:
+    """Merge updates into the owner's global state row. Returns True on
+    success, False on a durable-write failure — callers report the
+    degradation honestly instead of pretending the write landed."""
+    try:
+        return await _run_sync(_upsert_emoji_state_sync, owner_id, updates)
+    except Exception as exc:
+        logger.error("[EMOJI_DB] upsert_emoji_state FAILED: %s", exc)
+        return False
+
+
+def _get_emoji_chat_override_sync(owner_id: int, chat_id: int) -> dict | None:
+    db = get_db()
+    if db is None:
+        for row in _fallback["emoji_chat_overrides"]:
+            if row.get("owner_id") == owner_id and row.get("chat_id") == chat_id:
+                return row
+        return None
+    try:
+        result = (
+            db.table("emoji_chat_overrides")
+            .select("*")
+            .eq("owner_id", owner_id)
+            .eq("chat_id", chat_id)
+            .limit(1)
+            .execute()
+        )
+        return result.data[0] if result.data else None
+    except Exception as exc:
+        logger.error("[EMOJI_DB] get_emoji_chat_override FAILED: %s", exc)
+        return None
+
+
+async def get_emoji_chat_override(owner_id: int, chat_id: int) -> dict | None:
+    """The owner's override row for one chat, or None when no override
+    exists (resolution then falls back to the global default)."""
+    try:
+        return await _run_sync(_get_emoji_chat_override_sync, owner_id, chat_id)
+    except Exception as exc:
+        logger.error("[EMOJI_DB] get_emoji_chat_override FAILED: %s", exc)
+        return None
+
+
+def _upsert_emoji_chat_override_sync(
+    owner_id: int, chat_id: int, updates: dict,
+) -> bool:
+    now = datetime.now(timezone.utc).isoformat()
+    payload = dict(updates)
+    payload["updated_at"] = now
+    db = get_db()
+    if db is None:
+        for row in _fallback["emoji_chat_overrides"]:
+            if row.get("owner_id") == owner_id and row.get("chat_id") == chat_id:
+                row.update(payload)
+                return True
+        _fallback["emoji_chat_overrides"].append(
+            {"owner_id": owner_id, "chat_id": chat_id, **payload}
+        )
+        return True
+    try:
+        existing = (
+            db.table("emoji_chat_overrides")
+            .select("owner_id")
+            .eq("owner_id", owner_id)
+            .eq("chat_id", chat_id)
+            .limit(1)
+            .execute()
+        )
+        if existing.data:
+            db.table("emoji_chat_overrides").update(payload).eq(
+                "owner_id", owner_id
+            ).eq("chat_id", chat_id).execute()
+        else:
+            insert_payload = {"owner_id": owner_id, "chat_id": chat_id, **payload}
+            db.table("emoji_chat_overrides").insert(insert_payload).execute()
+        return True
+    except Exception as exc:
+        logger.error("[EMOJI_DB] upsert_emoji_chat_override FAILED: %s", exc)
+        record_event("database", "upsert emoji_chat_overrides", 0, "ERROR", str(exc))
+        return False
+
+
+async def upsert_emoji_chat_override(
+    owner_id: int, chat_id: int, updates: dict,
+) -> bool:
+    """Merge updates into the owner's override row for one chat (creating
+    it when absent). Returns True on success, False on a durable-write
+    failure."""
+    try:
+        return await _run_sync(
+            _upsert_emoji_chat_override_sync, owner_id, chat_id, updates,
+        )
+    except Exception as exc:
+        logger.error("[EMOJI_DB] upsert_emoji_chat_override FAILED: %s", exc)
+        return False
