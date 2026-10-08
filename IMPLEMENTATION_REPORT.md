@@ -160,7 +160,7 @@ glyph.
 
 ## 7. Focused tests executed
 
-`tests/test_premium_emoji_probe.py` — **41 tests, all passing**, covering the
+`tests/test_premium_emoji_probe.py` — **43 tests, all passing**, covering the
 eight required cases plus the whole offline path:
 
 | # | Required case | Test(s) |
@@ -171,6 +171,7 @@ eight required cases plus the whole offline path:
 | 4 | Missing entities fail closed | `test_an_empty_reply_has_no_custom_emoji`, `test_a_media_only_reply_has_no_custom_emoji`, `test_a_custom_emoji_entity_with_an_unusable_id_fails_closed`, `test_a_corrupt_entity_span_yields_no_alt_text_and_still_fails_closed` |
 | 5 | A reply to the wrong message is rejected | `test_a_reply_to_a_different_message_is_rejected`, `test_a_reply_in_another_chat_is_rejected`, `test_a_non_reply_is_rejected` |
 | 6 | The exact selection message id is respected | `test_the_action_sends_the_selection_message_and_records_its_exact_id`, `test_an_unknown_selection_id_is_refused_before_any_read`, `test_the_selection_reply_is_delivered_by_the_helper_bot_end_to_end` |
+| 6b | The LIVE dispatch path reaches the probe | `test_the_real_pending_input_listener_drives_the_probe` (the real listener, armed through the real action, delivers the owner's Saved Messages reply and the selection id arrives), `test_the_listener_ignores_a_reply_in_another_chat` |
 | 7 | The helper-bot payload carries the correct entity/identifier | `test_the_payload_carries_the_real_custom_emoji_entity`, `test_the_helper_bot_sends_the_real_custom_emoji_entity`, `test_the_helper_bot_peer_can_come_from_its_own_dialog_list` |
 | 8 | The visible fallback text alone is NOT proof | `test_an_unavailable_helper_bot_reports_failure_and_sends_no_fallback`, `test_a_rejected_send_is_reported_without_any_glyph_substitution`, `test_the_success_panel_never_claims_the_premium_render_by_itself`, `test_the_failure_panel_says_the_entity_was_not_rendered` |
 
@@ -185,9 +186,9 @@ Telegram account and no Supabase call is required.
 
 | Check | Command | Result |
 |---|---|---|
-| Focused POC tests | `python -m pytest tests/test_premium_emoji_probe.py -q` | **41 passed**, exit 0 |
+| Focused POC tests | `python -m pytest tests/test_premium_emoji_probe.py -q` | **43 passed**, exit 0 |
 | Emoji/Reaction regression | `python -m pytest tests/test_emoji_ui.py tests/test_emoji_ui_phase2.py tests/test_emoji_state_phase3.py tests/test_emoji_replacement_phase4.py tests/test_emoji_composition_phase5.py tests/test_reaction_phase6.py tests/test_bridge_delivery.py tests/test_emoji_library_import.py tests/test_emoji_category_service.py tests/test_emoji_set_enumeration.py -q` | **492 passed**, exit 0 |
-| Full suite | `python -m pytest tests -q` | **5693 passed, 26 skipped**, exit 0 (119.90s) — the previous run was 5652 passed, i.e. +41 = exactly this POC's tests |
+| Full suite | `python -m pytest tests -q` | **5695 passed, 26 skipped**, exit 0 (120.69s) — the pre-POC run was 5652 passed, i.e. +43 = exactly this POC's tests |
 | Compile | `python -m py_compile` on all four changed Python files | clean |
 | Whitespace | `git diff --check` | clean |
 | Scope | `git status --short` | only the four changed files + this report |
@@ -283,7 +284,7 @@ Nothing in the request's "DO NOT TOUCH" list was modified. Explicitly:
 |---|---|
 | Repository | `Onlyicing1/Telegram-self-bot` (connected workspace remote; never hardcoded into code) |
 | Branch | `main` |
-| This pass's commit | the `feat:` commit carrying this POC (this report included) — it is the current tip of `origin/main` (`git log -1`) |
+| This pass's commits | the `feat:` commit carrying the POC (service + handler + bridge + tests + this report), then the `test:` commit adding the listener-dispatch tests; the latest is the current tip of `origin/main` (`git log -1`) |
 | Push | `git push origin main` — fast-forward only; no rebase, no force-push, no history rewrite |
 | Working tree | clean |
 

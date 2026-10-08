@@ -566,6 +566,84 @@ def test_the_selection_reply_is_delivered_by_the_helper_bot_end_to_end(monkeypat
     assert [c["entity"] for c in self_client.sent] == ["me"]
 
 
+def test_the_real_pending_input_listener_drives_the_probe(monkeypatch, bot):
+    """The LIVE dispatch path: the existing listener must reach the probe.
+
+    The pending-input machinery is the only update path this POC uses, so it
+    is pinned end to end: register the REAL listener, arm it through the real
+    action, then deliver the owner's outgoing Saved Messages reply event and
+    assert the selection id reached the handler (the listener's ``extra``
+    propagation) and the helper bot sent the real entity.
+    """
+    from backend.helper import inline_sender
+
+    self_client = _FakeSelfClient(_custom_emoji_message())
+    monkeypatch.setattr(emoji, "get_self_client", lambda: self_client)
+    recorder = _PanelRecorder()
+    monkeypatch.setattr(emoji, "_edit_inline", recorder)
+
+    _run(emoji._react_premium_action(SimpleNamespace(message_id=555), "", CHAT))
+    assert input_state.get_pending(OWNER) is not None
+
+    captured: dict[str, Any] = {}
+
+    def _on(*_args, **_kwargs):
+        def _decorator(func):
+            captured["listener"] = func
+            return func
+
+        return _decorator
+
+    client_stub = SimpleNamespace(on=_on)
+    inline_sender.register_input_listener(client_stub, OWNER)
+    listener = captured["listener"]
+
+    event = SimpleNamespace(
+        raw_text=ALT,
+        chat_id=OWNER,          # the Saved Messages chat of the selection message
+        sender_id=OWNER,
+        message=SimpleNamespace(id=REPLY),
+    )
+    _run(listener(event))
+
+    assert input_state.get_pending(OWNER) is None  # the pending input was consumed
+    assert self_client.reads == [(OWNER, REPLY)]  # the reply was read back
+    assert len(bot.calls) == 1
+    assert bot.calls[0]["formatting_entities"][0].document_id == DOC
+    assert "✓ Telegram accepted the helper bot's message" in recorder.edits[0]["body"]
+
+
+def test_the_listener_ignores_a_reply_in_another_chat(monkeypatch, bot):
+    from backend.helper import inline_sender
+
+    self_client = _FakeSelfClient(_custom_emoji_message())
+    monkeypatch.setattr(emoji, "get_self_client", lambda: self_client)
+    recorder = _PanelRecorder()
+    monkeypatch.setattr(emoji, "_edit_inline", recorder)
+    _run(emoji._react_premium_action(SimpleNamespace(message_id=555), "", CHAT))
+
+    captured: dict[str, Any] = {}
+
+    def _on(*_args, **_kwargs):
+        def _decorator(func):
+            captured["listener"] = func
+            return func
+
+        return _decorator
+
+    inline_sender.register_input_listener(SimpleNamespace(on=_on), OWNER)
+    event = SimpleNamespace(
+        raw_text=ALT, chat_id=OTHER_CHAT, sender_id=OWNER,
+        message=SimpleNamespace(id=REPLY),
+    )
+    _run(captured["listener"](event))
+
+    assert input_state.get_pending(OWNER) is not None  # still armed, nothing consumed
+    assert bot.calls == []
+    assert self_client.reads == []
+    assert recorder.edits == []
+
+
 def test_the_success_panel_never_claims_the_premium_render_by_itself(monkeypatch, bot):
     edit, _self_client = _run_reply(monkeypatch, _custom_emoji_message())
     body = edit["body"]
