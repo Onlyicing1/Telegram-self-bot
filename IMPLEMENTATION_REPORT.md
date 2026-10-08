@@ -220,13 +220,27 @@ unchanged, and the root cause is proven below.
 
 | Item | Value |
 |---|---|
+| Repository | `Onlyicing1/Telegram-self-bot` (connected workspace remote; never hardcoded into the code) |
 | Branch | `main` |
-| Commit(s) | `docs:` commit — _recorded in §12 after the push_ |
-| Push | `origin/main` (Freebuff-managed credential; no rebase, no force-push) |
-| Expected end state | local `HEAD` == `origin/main` == `git ls-remote origin refs/heads/main` |
-| Working tree | clean except any pre-existing unrelated untracked files |
+| Content commit | `6d4c389` — `docs(db): reconcile the canonical database architecture and record the Emoji & Reaction owner decisions` (6 files: the canonical document, the roadmap, the new migration, the two doc-pinning test modules, this report) |
+| Push | `git push origin main` → `22a7187..6d4c389`; no rebase, no force-push, no history rewrite |
+| Metadata commit | the follow-up `docs(db):` commit that carries this §11/§12 record — it is the current tip of `origin/main` (verify with `git log -1`) |
+| Working tree | clean |
 
 ## 12. Push verification (recorded after delivery)
 
-_Filled in immediately after the push with the verified SHAs — no claim is made
-before the remote check succeeds._
+Verified against the live remote after the push:
+
+```
+git fetch origin main
+git rev-parse HEAD            -> 6d4c389a879411a7a5b136a28b74a52789bcaae4
+git rev-parse origin/main     -> 6d4c389a879411a7a5b136a28b74a52789bcaae4
+git ls-remote origin refs/heads/main -> 6d4c389a879411a7a5b136a28b74a52789bcaae4
+git merge-base --is-ancestor HEAD origin/main -> exit 0
+git status --short            -> (empty)
+```
+
+**local `HEAD` == `origin/main` == the remote's `refs/heads/main`; tree clean.**
+The task's implementation commit is `6d4c389`; the metadata commit above it was
+pushed to `origin/main` the same way and re-verified with the same four
+commands (no rebase, no force-push).
