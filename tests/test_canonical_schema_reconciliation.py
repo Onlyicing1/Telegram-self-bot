@@ -70,9 +70,17 @@ NON_CANONICAL_TABLES = ("ai_preferences",)
 
 #: Tables created AFTER the frozen reconciliation snapshot by their own additive
 #: successor migrations. They are part of the current documented schema (§31.3
-#: parts after part 1; §15 for todo_steps) but are deliberately NOT in the
-#: canonical snapshot and must never be folded back into it.
-SUCCESSOR_TABLES = ("todo_steps",)
+#: parts after part 1; §15 for todo_steps, §32 for the Emoji & Reaction tables)
+#: but are deliberately NOT in the canonical snapshot and must never be folded
+#: back into it.
+SUCCESSOR_TABLES = (
+    "todo_steps",
+    "emoji_library",
+    "emoji_categories",
+    "emoji_mappings",
+    "emoji_state",
+    "emoji_chat_overrides",
+)
 
 # Identifiers that are SQL keywords/functions, not columns.
 _NON_COLUMN_TOKENS = {
@@ -702,8 +710,8 @@ def doc_setup_block() -> str:
 def doc_reconciliation_segment() -> str:
     """Part 1 of the setup block — the canonical snapshot, comment-stripped."""
     block = doc_setup_block()
-    start = block.index("-- ─── PART 1 of 8")
-    end = block.index("-- ─── PART 2 of 8")
+    start = block.index("-- ─── PART 1 of 9")
+    end = block.index("-- ─── PART 2 of 9")
     return block[start:end]
 
 

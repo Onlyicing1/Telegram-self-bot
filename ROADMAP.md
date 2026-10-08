@@ -33,8 +33,9 @@
 > `emoji_chat_overrides` tables plus the Phase 5 `emoji_categories`
 > `is_custom` / `source_category_ids` columns have never been applied
 > anywhere; Phase 4 added NO table, Phase 5 added NO table and Phase 6 added
-> NO table and no column (§29; the Phase 5 column additions + rollback are in
-> `IMPLEMENTATION_REPORT.md`).
+> NO table and no column (§29; the schema is documented canonically in
+> `DATABASE_ARCHITECTURE.md` §32, its rollback in §31.5, and the manual SQL is
+> §31.3 part 9).
 
 ---
 
@@ -321,9 +322,9 @@ No new Telegram library is required.
 - **No emoji/reaction table exists in any database.** Phase 1 code reads and
   writes an `emoji_library` table through the pattern above with the
   in-memory fallback covering development; the physical table is
-  MANUAL-ONLY (exact schema in `IMPLEMENTATION_REPORT.md`, never executed
-  here). Categories/mappings schema remains §7; SQL is explicitly out of
-  scope for this task (manual Supabase work later).
+  MANUAL-ONLY (exact schema now canonical in `DATABASE_ARCHITECTURE.md` §32.1,
+  never executed by the agent). Categories/mappings schema remains §7; SQL is
+  explicitly out of scope here — it is the owner's manual Supabase step.
 
 ### 5.7 Guard rails that apply to this feature
 
@@ -445,8 +446,8 @@ The three distinct concerns that must not be conflated:
 Phase 1 persisted shape (IMPLEMENTED + TESTED): table `emoji_library` with
 `owner_id`, `document_id`, `alt_text`, `source` ("imported"),
 `source_msg_id`, `created_at`, and `UNIQUE (owner_id, document_id)` — the
-MANUAL-ONLY schema is documented in `IMPLEMENTATION_REPORT.md` and was never
-executed. `set_id`/`set_short_name` remain NOT persisted: set enumeration
+MANUAL-ONLY schema is documented canonically in `DATABASE_ARCHITECTURE.md`
+§32.1 and was never executed by the agent. `set_id`/`set_short_name` remain NOT persisted: set enumeration
 enriches the library with the set's real member documents through the same
 `(owner_id, document_id)` identity, and every counter (unresolved documents,
 setless documents, degraded state) is reported honestly — nothing is
@@ -459,8 +460,10 @@ tables `emoji_categories` (`owner_id`, `name`, `created_at`, `updated_at`;
 `UNIQUE (owner_id, category_id, simple_emoji)`) — mapped mappings store a
 REFERENCE (`document_id`) only, never an emoji definition. The
 `db/client.py` layer enforces both uniqueness shapes and never upserts.
-MANUAL-ONLY schema: documented in `IMPLEMENTATION_REPORT.md`, never
-executed, no migration file created.
+MANUAL-ONLY schema: now canonical in `DATABASE_ARCHITECTURE.md` §32.2/§32.3
+(with the Phase 5 columns) and never executed by the agent; the repository
+migration `supabase/migrations/20260928000001_create_emoji_reaction_tables.sql`
+(§31.3 part 9) is the owner's manual handoff.
 
 Schema/SQL files and `DATABASE_ARCHITECTURE.md` remain untouched by this
 roadmap.
@@ -603,8 +606,22 @@ Status: **IMPLEMENTED — offline only; the visual fidelity of custom-emoji rend
 
 ## 13. Active Category Behavior
 
-**Decision (documented, derived from repository architecture): global default
-+ optional per-chat override.**
+**Owner decision (FINAL, approved 2026-10-07): the Active Category scope is
+GLOBAL-ONLY.** The effective category for replacement is determined from the
+global default (`emoji_state.global_default_category_id`) alone — there is NO
+per-chat active-category override in the approved behaviour (§34-A).
+
+**Implemented Phase 3 code (unchanged by this decision, and NOT part of the
+approved behaviour):** the resolution boundary currently walks per-chat
+override → global default → none, and the Emoji panel can set/clear a per-chat
+override for an armed target chat. That path and the `emoji_chat_overrides`
+table remain IMPLEMENTED and are documented as **implemented-but-not-approved**
+(`DATABASE_ARCHITECTURE.md` §32.6). Removing them is a separate, explicitly
+requested change covering code + documentation + migration; until then this
+section documents both truths side by side.
+
+**Original derived proposal (kept for reconstruction; superseded by the
+decision above): global default + optional per-chat override.**
 
 Rationale from the codebase:
 
@@ -623,16 +640,17 @@ Rationale from the codebase:
 Required behavior:
 
 - [x] Global default category selectable in the Emoji panel (`emoji_replacement` panel → global picker; owner-scoped, live-category-validated)
-- [x] Optional per-chat override (set/clear via panel while targeting that chat through the existing `target_context` machinery; without an armed target the panel explains and withholds the per-chat actions — never a fabricated chat id)
-- [x] Resolution order at message time: per-chat override → global default → no replacement (`emoji_state_service.resolve_effective_category`, the Phase 4 boundary; the winning category is validated against the LIVE table so a deleted category fails closed to no-replacement instead of being substituted)
+- [x] Global default category is the **approved** active category
+- [x] Optional per-chat override — **IMPLEMENTED, NOT owner-approved** (set/clear via panel while targeting that chat through the existing `target_context` machinery; without an armed target the panel explains and withholds the per-chat actions — never a fabricated chat id)
+- [x] Resolution order at message time, as currently implemented: per-chat override → global default → no replacement (`emoji_state_service.resolve_effective_category`, the Phase 4 boundary; the winning category is validated against the LIVE table so a deleted category fails closed to no-replacement instead of being substituted). The **approved** order is global default → no replacement
 - [x] Documented in panel UI (which scope is in effect — global default, per-chat override, and the effective category are all rendered)
 
-Alternative rejected for MVP: per-chat-only (would make replacement opt-in
-per chat with no default) and strictly-global-only (conflicts with §C's
-per-category expectations for different audiences). This decision is also
-listed in §34 for confirmation.
+The originally rejected alternatives (per-chat-only; strictly-global-only on
+the older per-category reasoning) are historical: the owner's FINAL decision is
+**global-only** (§34-A).
 
-Status: **IMPLEMENTED + TESTED (offline; §34-A owner sign-off still open).**
+Status: **IMPLEMENTED + TESTED (offline). Owner decision FINAL: global-only;
+the per-chat override path remains implemented-but-not-approved.**
 
 ---
 
@@ -674,8 +692,8 @@ owner sends outgoing message with emoji
 - [x] New message carries the transformed entities (§17/§22) — rebuilt into TL entities by the bridge
 - [x] Reply threading: the new message replies to the same target the original replied to when that target exists
 
-Ordering (implemented default proposal, §34-B still OPEN for owner
-confirmation): **send-new-first then delete-original**. A failed delivery
+Ordering (§34-B FINAL, owner-approved 2026-10-07): **send-new-first then
+delete-original**, exactly as implemented. A failed delivery
 leaves the original untouched and logs an honest outcome; a failed deletion
 after a successful delivery is reported as an honest duplicate
 (`replaced_undeleted`) — never a clean success, never a lost message.
@@ -758,7 +776,8 @@ Bridge requirements:
 Status: **IN PROGRESS — send-only bridge module IMPLEMENTED and unit-TESTED
 (`backend/telegram_api/bridge.py`, `tests/test_bridge_delivery.py`) and now
 USED by the Phase 4 reconstruction service; live delivery NOT verified;
-capability decision (§34-D) still OPEN.**
+capability decision (§34-D) FINAL: custom-emoji entities through this existing
+bridge, no alt-text fallback mode.**
 
 ---
 
@@ -882,14 +901,13 @@ Status: **IN PROGRESS — library, categories, mappings and picker pagination IM
 - [x] Composition stores **references** — the resulting mappings are ordinary `emoji_mappings` rows pointing at the SAME library entries (`document_id`); premium emoji definitions are never duplicated and the library count is unchanged by composition. IMPLEMENTED/TESTED
 - [x] Conflict rules inside Custom mirror §12 — one definition per simple emoji; a shared emoji is never silently overwritten, the composition is refused until the owner confirms, and the stored snapshot then holds at most one mapping per simple emoji (first source wins, documented as the owner's source order). IMPLEMENTED/TESTED
 - [x] UI: categories panel → "🧩 New custom category" (name input) → compose panel (ordered source list, add/remove, Compose, Refresh, Mappings) → 2×5 source picker marked `✓` for already-selected sources and never offering the category itself; the mapping detail of a composed category offers Compose instead of manual edits; the composition surface keeps §7's three concerns distinct. IMPLEMENTED/TESTED
-- [x] Source-category mapping changes are **snapshotted** — the default proposal (snapshot-on-compose) is the current implementation: source edits/additions/deletions do NOT move the Custom Category until the owner runs the explicit Refresh (or re-Composes), which rebuilds the snapshot atomically or not at all; a missing/deleted source is reported honestly (dropped and reported on Refresh, kept as an unreachable entry when nothing is left) and can never silently delete the existing snapshot. Manual mapping edits on a composed category are refused with guidance, so Refresh semantics never fight hand edits. §34-F owner confirmation remains OPEN.
+- [x] Source-category mapping changes are **snapshotted** — the default proposal (snapshot-on-compose) is the current implementation: source edits/additions/deletions do NOT move the Custom Category until the owner runs the explicit Refresh (or re-Composes), which rebuilds the snapshot atomically or not at all; a missing/deleted source is reported honestly (dropped and reported on Refresh, kept as an unreachable entry when nothing is left) and can never silently delete the existing snapshot. Manual mapping edits on a composed category are refused with guidance, so Refresh semantics never fight hand edits. §34-F is FINAL (owner-approved 2026-10-07): snapshot-on-compose with explicit Refresh, as implemented.
 
 Status: **IN PROGRESS — Phase 5 IMPLEMENTED + TESTED offline (80 tests in
-`tests/test_emoji_composition_phase5.py`); the §34-F decision is implemented
-as its documented default and remains an OPEN owner confirmation; live
-Telegram/Supabase validation is NOT run, and the `is_custom` /
-`source_category_ids` columns are MANUAL-ONLY (unexecuted schema documented
-in `IMPLEMENTATION_REPORT.md`).**
+`tests/test_emoji_composition_phase5.py`); §34-F is FINAL (owner-approved
+2026-10-07) as implemented; live Telegram/Supabase validation is NOT run, and
+the `is_custom` / `source_category_ids` columns are MANUAL-ONLY (unexecuted
+schema documented canonically in `DATABASE_ARCHITECTURE.md` §32.2).**
 
 ---
 
@@ -951,7 +969,7 @@ Status: **IN PROGRESS — the §15/§28 failure semantics are IMPLEMENTED + TEST
 Follows existing patterns (no schema invented here; actual SQL manual, later):
 
 - [x] Toggle + global default persisted (Phase 3: the single-row-per-owner `emoji_state` table following the `bio_state`/`db/client.py` pattern — validated writes, honest failure reporting, in-memory fallback; the bridge config remains open until Phase 4 decides it)
-- [x] Library persisted via the `db/client.py` Supabase-or-in-memory-fallback pattern (Phase 1: `emoji_library` functions; a failed durable dedup read returns `None` so import fails closed — RAM is never silently presented as durable; physical table MANUAL-ONLY, schema in `IMPLEMENTATION_REPORT.md`)
+- [x] Library persisted via the `db/client.py` Supabase-or-in-memory-fallback pattern (Phase 1: `emoji_library` functions; a failed durable dedup read returns `None` so import fails closed — RAM is never silently presented as durable; physical table MANUAL-ONLY, schema canonical in `DATABASE_ARCHITECTURE.md` §32.1)
 - [x] Categories/mappings persisted via the same pattern (Phase 2: dedicated `emoji_categories` / `emoji_mappings` tables following the identical Supabase-or-fallback sync pattern SAME as the library; my durable-write failure paths report None/-1/False so the service can fail closed and the UI shows honest unknown/degraded states; creation of the physical tables is manual/out of scope here)
 - [x] Durable-vs-fallback behavior stays honest (Phase 3: a failed durable write reports False and the UI renders nothing-changed; a failed read reports unset so replacement fail-closes OFF; no RAM state is ever presented as durable) — full `config_store`-style labeling keys remain unused
 - [x] New env vars: NONE added in Phase 4 — the bridge keeps reusing the existing optional helper bot (`BOT_TOKEN`), and the pipeline is inert unless the owner turns the toggle ON and a category resolves (no new config surface, no new table)
@@ -1017,13 +1035,13 @@ live-Telegram item above is still NOT verified.**
 Phase order (each phase independently verifiable; nothing is complete until
 its checkboxes AND validation pass):
 
-- [ ] **Phase 0 — Prerequisites:** entity-aware serialization (§22 gap in `_helpers.py`) — **DONE + TESTED**; decision on bridge capability (§34-D) — still OPEN (owner); mapping persistence shape (§34-E) — implemented against the default proposal in Phase 2, owner sign-off still OPEN
+- [ ] **Phase 0 — Prerequisites:** entity-aware serialization (§22 gap in `_helpers.py`) — **DONE + TESTED**; bridge capability (§34-D) — **FINAL**: custom-emoji entities through the existing bridge, no alt-text fallback; mapping persistence shape (§34-E) — **FINAL**: the dedicated tables, as implemented in Phase 2
 - [x] **Phase 1 — Library & Import:** domain model (§7 library-entry shape), library storage (dedup on `(owner_id, document_id)`), bounded entity-based Saved Messages collection import (§8, §9 message-level), honest import report, sticker-set resolution/enumeration (§9), Glass UI import/report + library-browser panels, 2×5 library pagination (§25) — **IMPLEMENTED + TESTED**; REMAINING: live validation only
 - [x] **Phase 2 — Categories & Mappings:** category CRUD (create/list/rename/delete with mapping counts), mapping editor (simple-emoji input → 2×5 library picker), uniqueness at service + db layers, conflict UI (current-vs-new visuals, explicit Replace/Cancel), per-category mapping list/edit/delete with 2×5 pagination, delete-category cascade — **IMPLEMENTED + TESTED (offline)**; REMAINING: live validation only
-- [x] **Phase 3 — State & Toggle:** replacement toggle, active category (global default + per-chat override), deterministic resolution boundary, `emoji_state`/`emoji_chat_overrides` persistence, Glass UI state panel (§13, §14, §29) — **IMPLEMENTED + TESTED (offline)**; REMAINING: live validation only
-- [x] **Phase 4 — Reconstruction:** transformer (entity-safe), reconstruction service with send-first ordering, bot bridge send path, same-destination + reply preservation (§15–§22, §24), loop prevention (§24) — **IMPLEMENTED + TESTED (offline)**; REMAINING: live validation, media/caption reconstruction (§23), owner-visible failure surfacing (§28), owner confirmations (§34-B/§34-D/§34-G)
-- [x] **Phase 5 — Custom Category:** explicit `is_custom` category type, snapshot-on-compose from owner-ordered sources, explicit Refresh, conflict confirmation, cycle rejection, compose panel + 2×5 source picker, disabled manual edits on composed categories (§26) — **IMPLEMENTED + TESTED (offline)**; REMAINING: live validation only, owner confirmation of §34-F
-- [x] **Phase 6 — Reactions:** `telegram_api/reactions.py` wrapper (two typed forms), reaction service (explicit validated target, owner boundary, one attempt, honest result), Glass UI `💬 React` reply-mode action (§27) — **IMPLEMENTED + TESTED (offline, 80 tests)**; REMAINING: live validation only, owner confirmation of the §34-J reaction-UX default, and reaction availability/capability pre-checks (still not implemented — Telegram's own error is surfaced honestly)
+- [x] **Phase 3 — State & Toggle:** replacement toggle, active category, deterministic resolution boundary, `emoji_state`/`emoji_chat_overrides` persistence, Glass UI state panel (§13, §14, §29) — **IMPLEMENTED + TESTED (offline)**; REMAINING: live validation only. §34-A is **FINAL: global-only** — Phase 3's per-chat override path stays implemented-but-not-approved (`DATABASE_ARCHITECTURE.md` §32.6)
+- [x] **Phase 4 — Reconstruction:** transformer (entity-safe), reconstruction service with send-first ordering, bot bridge send path, same-destination + reply preservation (§15–§22, §24), loop prevention (§24) — **IMPLEMENTED + TESTED (offline)**; REMAINING: live validation, media/caption reconstruction (§23), owner-visible failure surfacing (§28); §34-B/§34-D/§34-G are **FINAL** (approved as implemented)
+- [x] **Phase 5 — Custom Category:** explicit `is_custom` category type, snapshot-on-compose from owner-ordered sources, explicit Refresh, conflict confirmation, cycle rejection, compose panel + 2×5 source picker, disabled manual edits on composed categories (§26) — **IMPLEMENTED + TESTED (offline)**; REMAINING: live validation only; §34-F is **FINAL** (approved as implemented)
+- [x] **Phase 6 — Reactions:** `telegram_api/reactions.py` wrapper (two typed forms), reaction service (explicit validated target, owner boundary, one attempt, honest result), Glass UI `💬 React` reply-mode action (§27) — **IMPLEMENTED + TESTED (offline, 80 tests)**; REMAINING: live validation only and reaction availability/capability pre-checks (still not implemented — Telegram's own error is surfaced honestly); §34-J is **FINAL** (approved as implemented) (still not implemented — Telegram's own error is surfaced honestly)
 - [ ] **Phase 7 — Hardening:** error/capability handling completion (§28), test plan completion (§30), validation checklist execution (§31), documentation updates (`AGENTS.md`, `IMPLEMENTATION_REPORT.md`) in the landing commit(s)
 
 Status: **IN PROGRESS — Phase 0 (code half) + Phases 1–6 done offline; live
@@ -1078,25 +1096,37 @@ UI machinery.**
 
 ---
 
-## 34. Decisions That Still Require Confirmation
+## 34. Owner Decisions
 
-| # | Decision | Options | Default proposal | Owner input needed |
+The table below keeps the original options/default-proposal record and now
+carries the owner's **FINAL decisions (approved 2026-10-07)** in the last
+column. Where a decision changed the default proposal, the change is explicit —
+especially **A (Active Category scope: GLOBAL-ONLY)**.
+
+| # | Decision | Options | Default proposal | Owner decision (FINAL) |
 |---|---|---|---|---|
-| A | **Active category scope** | global-only / per-chat-only / global default + per-chat override | global default + per-chat override (§13, derived from existing settings/target-context architecture) | **IMPLEMENTED at Phase 3 (default proposal, as documented):** global default + per-chat override with the override as an override, never a second authority. Owner confirmation still OPEN — reverting would change only the service/UI surface, not the db pattern |
-| B | **Reconstruction ordering** | send-new-then-delete / delete-then-send | send-first (never lose the original; worst case temporary duplicate) (§15) | **IMPLEMENTED at Phase 4 (default proposal):** delivery happens first; the original is deleted only after it succeeds, and a failed delete is reported as `replaced_undeleted`. Owner confirmation still OPEN — switching to delete-then-send would change only the service's ordering |
-| C | **Bridge bot identity** | reuse helper bot (`BOT_TOKEN`) / dedicated second bot token | reuse helper bot; env override for a dedicated token (§17/§29) | **IMPLEMENTED at Phase 4 (default proposal):** the reconstruction service delivers through the existing `backend/telegram_api/bridge.py` (helper bot) and no new env var/token was introduced. Owner confirmation still OPEN |
-| D | **Premium-visual delivery mode** | Fragment-purchased additional username for the bridge bot / alt-text fallback only / investigate other TL paths | design for both: attempt custom-emoji entities, degrade to alt text; Fragment purchase is the owner's cost/ownership decision (§17/§28) | **PARTIALLY ADDRESSED at Phase 4:** the boundary exists — custom-emoji entities go through the bridge as-is and a rejection becomes an honest `failed` outcome with the original untouched. The alt-text degradation was deliberately NOT implemented (no fabricated content, no entitlement probing), so the delivery mode itself STILL REQUIRES the owner's decision |
-| E | **Mapping persistence shape** | new dedicated tables / extend an existing generic store | dedicated tables following `db/client.py` patterns (§7/§29); schema work is manual and out of scope here | **PARTIALLY RESOLVED at Phase 2 (implementation, not owner sign-off):** Phase 2 was implemented against the default proposal — dedicated `emoji_categories` / `emoji_mappings` tables following the `db/client.py` pattern. The owner never confirmed this decision; the status stands as “default proposal implemented, awaiting confirmation”. If the owner later chooses differently, the db-layer functions are the only churn surface (the service/UI contract stays). Physical schema is MANUAL-ONLY, documented in `IMPLEMENTATION_REPORT.md`, never executed |
-| F | **Custom composition semantics** | live-reference (follows source category changes) / snapshot-on-compose | snapshot-on-compose with explicit refresh action (§26) | **IMPLEMENTED at Phase 5 (default proposal):** composing snapshots the selected sources into concrete mappings, a source change never moves the Custom Category, and only the explicit Refresh (or a re-Compose) rebuilds it — atomically, or not at all. Owner confirmation still OPEN: switching to live references would change only the composition functions (`plan_composition`/`compose_category`/`refresh_category`), not the mapping model, the resolution boundary or the replacement pipeline |
-| G | **Loop-prevention mechanism** | sender-id structural check / visible sentinel marker / both | sender-id check (invisible to other chat members) (§24) | **IMPLEMENTED at Phase 4 (default proposal):** structural only — outgoing-only handler, bridge sender-id suppression, inline-bot-origin exclusion, bounded in-memory registries; NO visible marker was added. Owner confirmation still OPEN | |
+| A | **Active category scope** | global-only / per-chat-only / global default + per-chat override | global default + per-chat override (§13, derived from existing settings/target-context architecture) | **FINAL — GLOBAL-ONLY (owner-approved 2026-10-07).** There is NO per-chat active-category override in the approved behaviour: the effective category for replacement is determined from the global default (`emoji_state.global_default_category_id`) alone. Phase 3's override code/state (`emoji_chat_overrides`, the override step of `resolve_effective_category`) remains IMPLEMENTED and is documented as implemented-but-not-approved (`DATABASE_ARCHITECTURE.md` §32.6); changing or removing that code path is a separate, explicitly requested change covering code + documentation + migration |
+| B | **Reconstruction ordering** | send-new-then-delete / delete-then-send | send-first (never lose the original; worst case temporary duplicate) (§15) | **FINAL — send-first (owner-approved 2026-10-07), as implemented.** The reconstructed message is sent first; the original is deleted only after the send succeeds, and a failed delete is reported as `replaced_undeleted` |
+| C | **Bridge bot identity** | reuse helper bot (`BOT_TOKEN`) / dedicated second bot token | reuse helper bot; env override for a dedicated token (§17/§29) | **FINAL — the existing helper/bridge bot (owner-approved 2026-10-07), as implemented.** The reconstruction service delivers through `backend/telegram_api/bridge.py` (helper bot); no second bot identity and no new env var/token |
+| D | **Premium-visual delivery mode** | Fragment-purchased additional username for the bridge bot / alt-text fallback only / investigate other TL paths | design for both: attempt custom-emoji entities, degrade to alt text; Fragment purchase is the owner's cost/ownership decision (§17/§28) | **FINAL — custom-emoji entities through the existing bridge (owner-approved 2026-10-07), as implemented.** Entities go through the bridge as-is and a rejection becomes an honest `failed` outcome with the original untouched. The alt-text fallback is NOT an approved second delivery mode (it is not implemented), and a Fragment purchase is NOT part of the approved behaviour |
+| E | **Mapping persistence shape** | new dedicated tables / extend an existing generic store | dedicated tables following `db/client.py` patterns (§7/§29); schema work is manual and out of scope here | **FINAL — the dedicated mapping persistence model (owner-approved 2026-10-07), as implemented:** dedicated `emoji_categories` / `emoji_mappings` tables following the `db/client.py` pattern; mappings reference library definitions by `document_id` and never duplicate them. Physical schema is MANUAL-ONLY, never executed by the agent, and now documented canonically in `DATABASE_ARCHITECTURE.md` §32 (+ §31.3 part 9) |
+| F | **Custom composition semantics** | live-reference (follows source category changes) / snapshot-on-compose | snapshot-on-compose with explicit refresh action (§26) | **FINAL — snapshot-on-compose with explicit Refresh (owner-approved 2026-10-07), as implemented.** Composing snapshots the selected sources into concrete mappings, a source change never moves the Custom Category, and only the explicit Refresh (or a re-Compose) rebuilds it — atomically, or not at all |
+| G | **Loop-prevention mechanism** | sender-id structural check / visible sentinel marker / both | sender-id check (invisible to other chat members) (§24) | **FINAL — structural/invisible loop prevention (owner-approved 2026-10-07), as implemented:** outgoing-only handler, bridge sender-id suppression, inline-bot-origin exclusion, bounded in-memory registries. NO visible marker appears in user messages |
 | H | **Conflict UI wording** | exact button/panel labels | decided at implementation (§12) | **RESOLVED at Phase 2 implementation:** panel “Mapping Conflict”, buttons **Replace** / **Cancel** (was listed Optional) |
-| I | **Notification behavior of replacement messages** | normal / silent | normal (§18) | Optional |
-| J | **Reaction UX (new at Phase 6)** | reply-mode reply content as the reaction value / a library picker for the reaction value / a fixed quick-reaction set | reply-mode reply content — the smallest flow that satisfies §27 without inference | **IMPLEMENTED at Phase 6 (default proposal):** the Emoji panel's `💬 React` action arms the existing reply-mode pending input, the owner replies to the exact target message, the reply's own custom-emoji entity (else its stripped text) IS the reaction, and the target is the reply's own `reply_to_msg_id` — never a "last message" or conversational inference. Owner confirmation still OPEN: a picker or a quick-reaction set would touch only the UI section (`_react_action` / `_reaction_from_reply` / the result panel), not the wrapper, the service or any schema |
+| I | **Notification behavior of replacement messages** | normal / silent | normal (§18) | **FINAL — OPTIONAL / NON-BLOCKING (owner-approved 2026-10-07).** Whatever the current code already does stands; this decision creates NO new implementation requirement |
+| J | **Reaction UX (new at Phase 6)** | reply-mode reply content as the reaction value / a library picker for the reaction value / a fixed quick-reaction set | reply-mode reply content — the smallest flow that satisfies §27 without inference | **FINAL — the reply-mode reaction UX (owner-approved 2026-10-07), as implemented.** The Emoji panel's `💬 React` action arms the existing reply-mode pending input; the owner replies to the exact target message; the replied-to message IS the target; the reply's own custom-emoji entity (else its stripped text) determines the reaction; surrounding natural-language interpretation is NOT used; the target is never a "last message" or a conversational inference. A library picker or a fixed quick-reaction set is NOT part of the approved behaviour |
 
 No decision above may be resolved silently during implementation without
 updating this section.
 
-Status: **OPEN — awaiting confirmation**.
+Status: **CLOSED — decisions A–J approved by the owner on 2026-10-07.** The one
+implementation/approval divergence is recorded honestly instead of being
+silently papered over: decision **A** changed the default proposal to
+**global-only**, while Phase 3's per-chat override code and
+`emoji_chat_overrides` table remain implemented and documented as
+implemented-but-not-approved (`DATABASE_ARCHITECTURE.md` §32.6, §1). No code or
+schema was changed by this documentation pass to force the two into line;
+removing the override path is a separate, explicitly requested change.
 
 ---
 
@@ -1112,8 +1142,8 @@ Current truth after the Phase 0–6 code slices:
   (`backend/services/emoji_library_service.py` + `emoji_library` functions
   in `backend/db/client.py`), TESTED (50 tests); **live Telegram import NOT
   verified**; the physical `emoji_library` table does NOT exist anywhere yet
-  (MANUAL-ONLY schema documented in `IMPLEMENTATION_REPORT.md` — nothing
-  executed).
+  (MANUAL-ONLY schema documented canonically in `DATABASE_ARCHITECTURE.md`
+  §32.1 — nothing executed by the agent).
 - Sticker-set resolution/enumeration — IMPLEMENTED
   (`backend/telegram_api/custom_emoji.py` + the enrichment stage in
   `backend/services/emoji_library_service.py`), TESTED (27 tests); bounded,
@@ -1124,15 +1154,15 @@ Current truth after the Phase 0–6 code slices:
   `emoji_mappings` functions in `backend/db/client.py` + the panels in
   `backend/bot/handlers/emoji.py`), TESTED (96 tests across service + UI);
   **live Telegram NOT exercised**; the physical tables do NOT exist anywhere
-  yet (MANUAL-ONLY schema documented in `IMPLEMENTATION_REPORT.md` — nothing
-  executed).
+  yet (MANUAL-ONLY schema documented canonically in `DATABASE_ARCHITECTURE.md`
+  §32.2/§32.3 — nothing executed by the agent).
 - Replacement state & toggle (Phase 3) — IMPLEMENTED
   (`backend/services/emoji_state_service.py` + the `emoji_state` /
   `emoji_chat_overrides` functions in `backend/db/client.py` + the
   Replacement panels in `backend/bot/handlers/emoji.py`), TESTED (46
   tests); **live Telegram NOT exercised**; the physical tables do NOT
-  exist anywhere yet (MANUAL-ONLY schema documented in
-  `IMPLEMENTATION_REPORT.md` — nothing executed).
+  exist anywhere yet (MANUAL-ONLY schema documented canonically in
+  `DATABASE_ARCHITECTURE.md` §32.4/§32.6 — nothing executed by the agent).
 - Reconstruction (Phase 4) — IMPLEMENTED
   (`backend/services/emoji_transformer.py`,
   `backend/services/emoji_replacement_service.py`, the outgoing handler
@@ -1159,10 +1189,11 @@ Current truth after the Phase 0–6 code slices:
 - Still NOT implemented: media/caption reconstruction (§23),
   owner-visible failure surfacing (§28), flood/rate adequacy
   validation (§17), destination-type permission handling (§18); no live
-  schema/tables applied; §34-D and the owner sign-offs on §34-A (Phase 3
-  scope, implemented as documented), §34-B, §34-C, §34-E, §34-F (Phase 5
-  snapshot default, implemented as documented), §34-G and §34-J (Phase 6
-  reaction UX, implemented as documented) remain open.
+  schema/tables applied. Owner decisions A–J are **FINAL (approved
+  2026-10-07)**: A = **global-only** (Phase 3's per-chat override path stays
+  implemented-but-not-approved), B–G and J approved as implemented, H resolved
+  at Phase 2, I optional/non-blocking. What remains open is live validation
+  only.
 
 ---
 

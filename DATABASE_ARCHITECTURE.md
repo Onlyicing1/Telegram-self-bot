@@ -49,6 +49,7 @@
 29. [API Credential Vault (PART 1)](#29-api-credential-vault-part-1)
 30. [Canonical Schema Reconciliation & Drift Repair](#30-canonical-schema-reconciliation--drift-repair)
 31. [Canonical Database Setup — One Complete Supabase Setup Script](#31-canonical-database-setup--one-complete-supabase-setup-script)
+32. [Emoji & Reaction Persistence](#32-emoji--reaction-persistence-premiumcustom-emoji-replacement--reactions)
 
 ---
 
@@ -69,42 +70,48 @@ This section answers one operational question: **what exactly does the owner
 paste?** The answer is exactly ONE SQL script — the block in §31.3. It is the
 CURRENT canonical setup for the database the current code expects: the
 complete ordered setup, the canonical reconciliation snapshot first, then the
-seven later additive migrations, in one fenced block. There is no "step 0", no
+eight later additive migrations, in one fenced block. There is no "step 0", no
 second block to paste and no shell workflow. Open this section, copy §31.3,
 paste it into the Supabase SQL Editor as `postgres` and run it. §31.1 is the
 reconciliation audit that proves the block equals the effective final state of
-all 30 repository migrations — including the two Todo migrations
+all 31 repository migrations — including the two Todo migrations
 `20260926000001_add_todo_schedule_type.sql`,
 `20260927000001_add_todo_steps.sql` and the Taskloom question-status widening
 `20260927020000_add_waiting_answer_status.sql` (classified additive: it only
 widens the `ai_task_occurrences` status CHECK, which part 1 already re-adds in
 final form).
 
-### 31.1 Reconciliation audit — all 30 migrations, classified against the canonical script
+### 31.1 Reconciliation audit — all 31 migrations, classified against the canonical script
 
 The script in §31.3 was reconciled against **every file currently in
-`supabase/migrations/` (30 files)**, not against the list any earlier document
+`supabase/migrations/` (31 files)**, not against the list any earlier document
 carried. Each migration was classified by its **effective schema change** —
 what a fresh database must end up with after it runs — and the classification
 is pinned by `tests/test_database_setup_order.py` (statement-identity for the
-seven embedded parts) and `tests/test_canonical_schema_reconciliation.py`
+nine embedded parts) and `tests/test_canonical_schema_reconciliation.py`
 (column/constraint/seed equivalence for the snapshot).
 
-**The eight migrations whose SQL is embedded verbatim (parts 1–8 of §31.3):**
+**The nine migrations whose SQL is embedded verbatim (parts 1–9 of §31.3):**
 
 | Order | Migration | Objects it establishes | Its SQL in this document |
 |---|---|---|---|
-| 1 | `20260920000001_reconcile_canonical_schema.sql` | `pg_trgm`; all 16 canonical tables, every column re-asserted with `ADD COLUMN IF NOT EXISTS` + deterministic backfill + final default/NOT NULL binding; data-guarded constraints, indexes and identity constraints; RLS + SELECT-only `anon`/`authenticated` policies on all 16 tables; the `panel_settings('global')` and five `bot_settings` seeds; the post-`COMMIT` drift report | **§31.3, part 1 of 7** — the complete canonical reconciliation SQL, physically inside the one deployment block |
-| 2 | `20260919000001_create_api_credential_vault.sql` | `supabase_vault` extension (`WITH SCHEMA vault`); `api_credentials` metadata table (no secret column) + `idx_api_credentials_provider_order`, `idx_api_credentials_owner`, `uq_api_credentials_vault_secret`; RLS, `REVOKE`/`GRANT` and the column/table `COMMENT`s; `api_credential_pool(text, bigint)`; deprecated alias `stt_credential_pool(text, bigint)`; `NOTIFY pgrst` | **§31.3, part 2 of 7** (the object contract is also documented in §29.10) |
-| 3 | `20260919000002_credential_vault_management.sql` | `api_credential_list(bigint, text)`, `api_credential_create(bigint, text, text, text, integer, boolean)`, `api_credential_replace_secret(bigint, text, text)`, `api_credential_update(bigint, text, text, boolean, integer)`, `api_credential_delete(bigint, text)` — each `SECURITY DEFINER`, `SET search_path = ''`, `OWNER TO postgres`, `REVOKE`d from `PUBLIC`/`anon`/`authenticated`, `GRANT`ed to `service_role`, and carrying its own `COMMENT`; `NOTIFY pgrst` | **§31.3, part 3 of 7** (documented in §29.14) |
-| 4 | `20260921000001_add_saved_items_display_name.sql` | `saved_items.display_name text` (nullable, no default, no backfill); `NOTIFY pgrst`; a `SELECT`-based verification query | **§31.3, part 4 of 7** |
-| 5 | `20260922000001_add_saved_items_search_indexes.sql` | `pg_trgm` again (`IF NOT EXISTS`); `idx_saved_items_display_name_trgm` (GIN trigram on `display_name`); `idx_saved_items_tags` (GIN on `tags`); `NOTIFY pgrst`; a `SELECT`-based verification query | **§31.3, part 5 of 7** |
-| 6 | `20260923000001_add_ai_config_tts_settings.sql` | `ai_config.tts_provider text`, `ai_config.tts_model text`, `ai_config.tts_voice text` (all nullable, no default, no backfill, no CHECK — the capability registry is the authority on the tokens); `NOTIFY pgrst`; a `SELECT`-based verification query over `information_schema.columns` | **§31.3, part 6 of 7** |
-| 7 | `20260926000001_add_todo_schedule_type.sql` | `ai_tasks_schedule_type_check` re-added with `'todo'` in the enum (the basic Todo item — an unscheduled, owner-managed row); `ai_tasks_actions_count` re-added as a CONDITIONAL check so only a `'todo'` row may store 0 actions while every scheduled row keeps 1–5; `NOTIFY pgrst`. No table, no column, no index, no policy, no grant and no row change | **§31.3, part 7 of 8** (the row shape is documented in §15) |
-| 8 | `20260927000001_add_todo_steps.sql` | The ONE new object of the multi-step phase: the `todo_steps` table — the ordered steps of ONE todo (`task_id` → `ai_tasks(id)` `ON DELETE CASCADE`; denormalized `owner_id`; 1-based `position` with `UNIQUE (task_id, position)`; nonblank ≤256-char `title`; `status` CHECK `active`/`completed`; CAS `version`; `completed_at` bound to the status; timestamps) + `RLS` + SELECT-only `anon`/`authenticated` policy + `NOTIFY pgrst` + a `SELECT`-based verification query. Additive: no existing table, column, index, policy, grant or row is touched | **§31.3, part 8 of 8** (the table is documented in §15) |
+| 1 | `20260920000001_reconcile_canonical_schema.sql` | `pg_trgm`; all 16 canonical tables, every column re-asserted with `ADD COLUMN IF NOT EXISTS` + deterministic backfill + final default/NOT NULL binding; data-guarded constraints, indexes and identity constraints; RLS + SELECT-only `anon`/`authenticated` policies on all 16 tables; the `panel_settings('global')` and five `bot_settings` seeds; the post-`COMMIT` drift report | **§31.3, part 1 of 9** — the complete canonical reconciliation SQL, physically inside the one deployment block |
+| 2 | `20260919000001_create_api_credential_vault.sql` | `supabase_vault` extension (`WITH SCHEMA vault`); `api_credentials` metadata table (no secret column) + `idx_api_credentials_provider_order`, `idx_api_credentials_owner`, `uq_api_credentials_vault_secret`; RLS, `REVOKE`/`GRANT` and the column/table `COMMENT`s; `api_credential_pool(text, bigint)`; deprecated alias `stt_credential_pool(text, bigint)`; `NOTIFY pgrst` | **§31.3, part 2 of 9** (the object contract is also documented in §29.10) |
+| 3 | `20260919000002_credential_vault_management.sql` | `api_credential_list(bigint, text)`, `api_credential_create(bigint, text, text, text, integer, boolean)`, `api_credential_replace_secret(bigint, text, text)`, `api_credential_update(bigint, text, text, boolean, integer)`, `api_credential_delete(bigint, text)` — each `SECURITY DEFINER`, `SET search_path = ''`, `OWNER TO postgres`, `REVOKE`d from `PUBLIC`/`anon`/`authenticated`, `GRANT`ed to `service_role`, and carrying its own `COMMENT`; `NOTIFY pgrst` | **§31.3, part 3 of 9** (documented in §29.14) |
+| 4 | `20260921000001_add_saved_items_display_name.sql` | `saved_items.display_name text` (nullable, no default, no backfill); `NOTIFY pgrst`; a `SELECT`-based verification query | **§31.3, part 4 of 9** |
+| 5 | `20260922000001_add_saved_items_search_indexes.sql` | `pg_trgm` again (`IF NOT EXISTS`); `idx_saved_items_display_name_trgm` (GIN trigram on `display_name`); `idx_saved_items_tags` (GIN on `tags`); `NOTIFY pgrst`; a `SELECT`-based verification query | **§31.3, part 5 of 9** |
+| 6 | `20260923000001_add_ai_config_tts_settings.sql` | `ai_config.tts_provider text`, `ai_config.tts_model text`, `ai_config.tts_voice text` (all nullable, no default, no backfill, no CHECK — the capability registry is the authority on the tokens); `NOTIFY pgrst`; a `SELECT`-based verification query over `information_schema.columns` | **§31.3, part 6 of 9** |
+| 7 | `20260926000001_add_todo_schedule_type.sql` | `ai_tasks_schedule_type_check` re-added with `'todo'` in the enum (the basic Todo item — an unscheduled, owner-managed row); `ai_tasks_actions_count` re-added as a CONDITIONAL check so only a `'todo'` row may store 0 actions while every scheduled row keeps 1–5; `NOTIFY pgrst`. No table, no column, no index, no policy, no grant and no row change | **§31.3, part 7 of 9** (the row shape is documented in §15) |
+| 8 | `20260927000001_add_todo_steps.sql` | The ONE new object of the multi-step phase: the `todo_steps` table — the ordered steps of ONE todo (`task_id` → `ai_tasks(id)` `ON DELETE CASCADE`; denormalized `owner_id`; 1-based `position` with `UNIQUE (task_id, position)`; nonblank ≤256-char `title`; `status` CHECK `active`/`completed`; CAS `version`; `completed_at` bound to the status; timestamps) + `RLS` + SELECT-only `anon`/`authenticated` policy + `NOTIFY pgrst` + a `SELECT`-based verification query. Additive: no existing table, column, index, policy, grant or row is touched | **§31.3, part 8 of 9** (the table is documented in §15) |
+| 9 | `20260928000001_create_emoji_reaction_tables.sql` | The FIVE persistence tables of the Emoji & Reaction feature, in their final shape: `emoji_library` (owner-scoped premium-emoji definitions, `UNIQUE (owner_id, document_id)`, Telegram's own `alt_text`, `source`/`source_msg_id` provenance), `emoji_categories` (`UNIQUE (owner_id, name)`, the explicit `is_custom` flag and the ordered `source_category_ids` snapshot list of a Custom Category), `emoji_mappings` (`UNIQUE (owner_id, category_id, simple_emoji)` — references `document_id`, never duplicates a definition), `emoji_state` (ONE global row per owner: the `replacement_enabled` toggle defaulting to `false` — OFF on first boot — and the global default category) and `emoji_chat_overrides` (per-chat override state of the implemented-but-NOT-owner-approved override path; the approved Active Category scope is global-only, §32). Plus the three read indexes the repository actually uses, the Phase 5 columns re-asserted with `ADD COLUMN IF NOT EXISTS`, RLS + SELECT-only `anon`/`authenticated` policies on all five, table/column `COMMENT`s, `NOTIFY pgrst` and verification queries. Additive: no existing table, column, index, policy, grant or row is touched, and NO foreign key is created (the emoji references are application-level, like every other identifier relationship in this database) | **§31.3, part 9 of 9** (the tables are documented in §32) |
 
-**The other 21 migrations — the history the reconciliation snapshot already
-absorbs.** The snapshot of part 1 was audited against this entire history: its
+**The other 22 migrations — the history the reconciliation snapshot already
+absorbs.** (The table below lists 21 of them; the twenty-second,
+`20260927020000_add_waiting_answer_status.sql`, is classified in the §31 intro
+above: it only widens the `ai_task_occurrences` status CHECK that part 1
+already re-adds in its final form. It is not embedded as its own part because
+its executable SQL adds nothing to the final state.) The snapshot of part 1 was
+audited against this entire history: its
 `CREATE TABLE IF NOT EXISTS` blocks declare exactly the FINAL shape every
 historical migration converges to, its per-table `ADD COLUMN IF NOT EXISTS`
 blocks re-assert those shapes on legacy tables, and its data-guarded
@@ -149,12 +156,13 @@ migration creates them.
    (part 1), the two Vault migrations (parts 2–3), the two Save V2 migrations
    (parts 4–5), the TTS settings migration (part 6) and the Todo schedule-type
    migration (part 7) — all embedded statement-for-statement; part 8
-   (`20260927000001_add_todo_steps.sql`) was added by the multi-step phase and
-   is embedded the same way.
+   (   `20260927000001_add_todo_steps.sql`) was added by the multi-step phase and
+   part 9 (`20260928000001_create_emoji_reaction_tables.sql`) by the Emoji &
+   Reaction persistence phase; both are embedded the same way.
 2. **What was missing.** Nothing was missing from the *block* after the Part 1
    phase. What the previous §31 **prose** lacked was the audit trail: the
    earlier §31.1 listed only the seven embedded migrations and was silent on
-   the other 21 files in `supabase/migrations/`, leaving the reader unable to
+   the other 21 files that then existed in `supabase/migrations/`, leaving the reader unable to
    verify that a fresh database would end up equal to "all migrations
    applied".
 3. **What was incomplete.** The per-historical-migration classification above
@@ -165,14 +173,16 @@ migration creates them.
    five-type → six-type schedule enums) is resolved inside part 1 by design:
    the script carries the final constraint, never the obsolete one, which is
    exactly the migration-equivalence requirement.
-5. **What was added.** The §31.1 matrix row set above (21 historical
-   classifications + the eight embedded parts) and this note. The only SQL
-   added since the reconciliation audit is part 8 — the additive
-   `todo_steps` table of the multi-step phase, embedded verbatim from its
-   migration file.
+5. **What was added.** The §31.1 matrix row set above (22 historical
+   classifications + the nine embedded parts) and this note. The SQL added
+   after the reconciliation audit is additive only: part 8 — the `todo_steps`
+   table of the multi-step phase — and part 9 — the five Emoji & Reaction
+   persistence tables of the Emoji & Reaction feature (§32) — both embedded
+   verbatim from their migration files.
 6. **What was corrected.** Documentation only: the §31 intro, §31.1 and §20
-   now state the current count (30 migration files; 8 embedded parts; 16
-   canonical tables + `todo_steps`) and the reconciliation claim explicitly.
+   now state the current count (31 migration files; 9 embedded parts; 16
+   canonical tables + `todo_steps` + the five Emoji & Reaction tables) and the
+   reconciliation claim explicitly.
 7. **Todo-specific database changes.** Part 7 of §31.3 carries
    `20260926000001_add_todo_schedule_type.sql` in full:
    `ai_tasks_schedule_type_check` re-added with `'todo'` in the enum, and
@@ -189,12 +199,27 @@ migration creates them.
    `ONE COMPLETE SUPABASE SETUP SCRIPT`), self-contained for a fresh
    database: extensions, all 16 canonical tables + `api_credentials`, every
    column re-asserted, seeds, constraints, indexes, functions, RLS and
-   policies, grants, the Todo constraints and the final drift report. There
+   policies, grants, the Todo constraints, the Emoji & Reaction tables and the
+   final drift report. There
    is no second block to combine, no shell step and no placeholder.
+9. **Emoji & Reaction persistence (part 9).** Part 9 carries
+   `20260928000001_create_emoji_reaction_tables.sql`: the five tables the
+   Emoji & Reaction feature persists through (`emoji_library`,
+   `emoji_categories`, `emoji_mappings`, `emoji_state`,
+   `emoji_chat_overrides`), in their final shape — including the Phase 5
+   `emoji_categories.is_custom` / `source_category_ids` columns, re-asserted
+   with `ADD COLUMN IF NOT EXISTS` so a manually created Phase-2-shaped table
+   still converges. The owner-approved decisions of that feature (Active
+   Category scope **global-only**, send-first reconstruction, the existing
+   bridge bot, custom-emoji entities through the bridge, dedicated mapping
+   storage, snapshot-on-compose, structural loop prevention, the reply-mode
+   reaction UX) are recorded in §32 and `ROADMAP.md` §34; the per-chat override
+   table is created because the code still reads and writes it, and is
+   documented as implemented-but-not-approved rather than silently removed.
 
 ### 31.2 The order, and why it is this order (source-proven)
 
-1. **The reconciliation snapshot runs first (part 1 of 7).** It is the only thing
+1. **The reconciliation snapshot runs first (part 1 of 9).** It is the only thing
    that creates `saved_items`, `ai_config`, `panel_settings`, `bot_settings`, the
    AI tables and the two task tables, and it is where every canonical column, the
    four `ai_config` columns and the drifted `panel_settings`/`bot_settings`
@@ -259,6 +284,18 @@ migration creates them.
    the application keeps every Part 1 Todo behaviour and reports step
    operations as not-durable instead of pretending they persisted.
 
+9. **The Emoji & Reaction tables run last (part 9).** They are the newest
+   additive change: five `CREATE TABLE IF NOT EXISTS` statements (plus the
+   Phase 5 column re-assertions, three indexes, RLS, SELECT-only policies and
+   comments). They depend on nothing in the earlier parts — no canonical table
+   is referenced, and no foreign key is created (the emoji references are
+   application-level, and the code fails closed on a dangling reference) — so
+   any position after part 1 is valid; they are appended last, newest last,
+   like every LATER schema change before them (§30.11). Without part 9 the
+   Emoji & Reaction feature still starts and runs on the in-memory fallback
+   (its durable reads/writes report the failure honestly); nothing else in the
+   database is affected.
+
 > **The order is repository-proven, recorded honestly.** The requested set named
 > four files, with the canonical reconciliation first and the Save V2 search
 > indexes last. The source proves that the search-index migration depends on a
@@ -270,9 +307,10 @@ migration creates them.
 > requested sequence. The sixth file is a LATER schema change carried by its own
 > additive migration — exactly what this document's own rule requires (§30.11) — so
 > it is appended last rather than folded into the snapshot. The seventh file
-> (`20260926000001_add_todo_schedule_type.sql`, the basic Todo row) and the
-> eighth file (`20260927000001_add_todo_steps.sql`, the ordered steps of one
-> todo) are appended the same way, for the same reason.
+> (`20260926000001_add_todo_schedule_type.sql`, the basic Todo row), the eighth
+> file (`20260927000001_add_todo_steps.sql`, the ordered steps of one todo) and
+> the ninth file (`20260928000001_create_emoji_reaction_tables.sql`, the five
+> Emoji & Reaction tables) are appended the same way, for the same reason.
 
 ### 31.3 ONE COMPLETE SUPABASE SETUP SCRIPT
 
@@ -280,16 +318,17 @@ Copy the entire SQL block below and paste it into the Supabase SQL Editor as
 `postgres`. This block contains the complete ordered setup. No other SQL block in
 this document needs to be executed manually.
 
-The block is the eight migrations' executable SQL concatenated in order, with a
+The block is the nine migrations' executable SQL concatenated in order, with a
 part banner before each and the migrations' prose comments removed so the whole
 artifact is pure, runnable SQL. Every statement is verbatim from its migration,
 and `tests/test_database_setup_order.py` pins each one back to the file it came
 from. It is idempotent and additive: no row, column or existing value is rewritten
 and no Vault secret is created. On a FRESH Supabase database the block is the
 complete setup: part 1 creates every canonical table in its final shape (the
-shape the 21 pre-reconciliation migrations converge to — see §31.1) and parts
-2–8 add the Vault, Save V2, TTS and Todo objects. No placeholder, no omitted
-section and no comment form like "add the remaining tables here" appears in it.
+shape the 22 pre-reconciliation migrations converge to — see §31.1) and parts
+2–9 add the Vault, Save V2, TTS, Todo and Emoji & Reaction objects. No
+placeholder, no omitted section and no comment form like "add the remaining
+tables here" appears in it.
 
 ```sql
 -- ============================================================================
@@ -297,7 +336,7 @@ section and no comment form like "add the remaining tables here" appears in it.
 --
 -- Copy this whole block and paste it into the Supabase SQL Editor as `postgres`.
 -- It is the complete ordered setup: the canonical reconciliation snapshot first,
--- then the seven pending migrations.
+-- then the eight pending migrations.
 --
 -- Order (source-derived from supabase/migrations/):
 --   1. 20260920000001_reconcile_canonical_schema.sql     (canonical snapshot)
@@ -308,13 +347,14 @@ section and no comment form like "add the remaining tables here" appears in it.
 --   6. 20260923000001_add_ai_config_tts_settings.sql     (TTS settings)
 --   7. 20260926000001_add_todo_schedule_type.sql         (basic Todo items)
 --   8. 20260927000001_add_todo_steps.sql                 (multi-step todo steps)
+--   9. 20260928000001_create_emoji_reaction_tables.sql   (Emoji & Reaction tables)
 --
 -- Idempotent and additive: no row, column or existing value is rewritten and no
 -- Vault secret is created. Every statement is verbatim from its migration; the
 -- migrations' prose comments are removed so the artifact is pure executable SQL.
 -- ============================================================================
 
--- ─── PART 1 of 8 — 20260920000001_reconcile_canonical_schema.sql (canonical snapshot) ───
+-- ─── PART 1 of 9 — 20260920000001_reconcile_canonical_schema.sql (canonical snapshot) ───
 
 BEGIN;
 
@@ -1890,7 +1930,7 @@ LEFT JOIN information_schema.columns c
 WHERE c.column_name IS NULL
 ORDER BY 1;
 
--- ─── PART 2 of 8 — 20260919000001_create_api_credential_vault.sql (Vault PART 1) ───
+-- ─── PART 2 of 9 — 20260919000001_create_api_credential_vault.sql (Vault PART 1) ───
 
 CREATE EXTENSION IF NOT EXISTS supabase_vault WITH SCHEMA vault;
 
@@ -2013,7 +2053,7 @@ COMMENT ON FUNCTION public.stt_credential_pool(text, bigint) IS
 
 NOTIFY pgrst, 'reload schema';
 
--- ─── PART 3 of 8 — 20260919000002_credential_vault_management.sql (Vault PART 2) ───
+-- ─── PART 3 of 9 — 20260919000002_credential_vault_management.sql (Vault PART 2) ───
 
 CREATE OR REPLACE FUNCTION public.api_credential_list(
     p_owner_id bigint,
@@ -2419,7 +2459,7 @@ COMMENT ON FUNCTION public.api_credential_delete(bigint, text) IS
 
 NOTIFY pgrst, 'reload schema';
 
--- ─── PART 4 of 8 — 20260921000001_add_saved_items_display_name.sql (Save V2 column) ───
+-- ─── PART 4 of 9 — 20260921000001_add_saved_items_display_name.sql (Save V2 column) ───
 
 ALTER TABLE saved_items
     ADD COLUMN IF NOT EXISTS display_name text;
@@ -2433,7 +2473,7 @@ LEFT JOIN information_schema.columns c
 WHERE c.column_name IS NULL
 ORDER BY 1;
 
--- ─── PART 5 of 8 — 20260922000001_add_saved_items_search_indexes.sql (Save V2 indexes) ───
+-- ─── PART 5 of 9 — 20260922000001_add_saved_items_search_indexes.sql (Save V2 indexes) ───
 
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
@@ -2452,7 +2492,7 @@ LEFT JOIN pg_indexes i
 WHERE i.indexname IS NULL
 ORDER BY 1;
 
--- ─── PART 6 of 8 — 20260923000001_add_ai_config_tts_settings.sql (TTS settings) ───
+-- ─── PART 6 of 9 — 20260923000001_add_ai_config_tts_settings.sql (TTS settings) ───
 
 ALTER TABLE ai_config
     ADD COLUMN IF NOT EXISTS tts_provider text;
@@ -2467,7 +2507,7 @@ WHERE table_schema = 'public'
   AND table_name   = 'ai_config'
   AND column_name IN ('tts_provider', 'tts_model', 'tts_voice');
 
--- ─── PART 7 of 8 — 20260926000001_add_todo_schedule_type.sql (basic Todo items) ───
+-- ─── PART 7 of 9 — 20260926000001_add_todo_schedule_type.sql (basic Todo items) ───
 
 ALTER TABLE ai_tasks DROP CONSTRAINT IF EXISTS ai_tasks_schedule_type_check;
 
@@ -2484,7 +2524,7 @@ ALTER TABLE ai_tasks ADD CONSTRAINT ai_tasks_actions_count CHECK (
 NOTIFY pgrst, 'reload schema';
 
 
--- ─── PART 8 of 8 — 20260927000001_add_todo_steps.sql (multi-step todo steps) ───
+-- ─── PART 8 of 9 — 20260927000001_add_todo_steps.sql (multi-step todo steps) ───
 
 CREATE TABLE IF NOT EXISTS todo_steps (
     id           bigserial   PRIMARY KEY,
@@ -2533,6 +2573,152 @@ SELECT 'todo_steps' AS check, count(*) AS present
 FROM information_schema.tables
 WHERE table_schema = 'public'
   AND table_name   = 'todo_steps';
+
+-- ─── PART 9 of 9 — 20260928000001_create_emoji_reaction_tables.sql (Emoji & Reaction tables) ───
+
+CREATE TABLE IF NOT EXISTS emoji_library (
+    id            bigserial   PRIMARY KEY,
+    owner_id      bigint      NOT NULL,
+    document_id   bigint      NOT NULL,
+    alt_text      text        NOT NULL DEFAULT '',
+    source        text        NOT NULL DEFAULT 'imported',
+    source_msg_id bigint,
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT emoji_library_document_positive
+        CHECK (document_id > 0),
+    CONSTRAINT emoji_library_source_check
+        CHECK (source IN ('imported', 'manual')),
+    CONSTRAINT emoji_library_owner_document_key
+        UNIQUE (owner_id, document_id)
+);
+CREATE TABLE IF NOT EXISTS emoji_categories (
+    id                  bigserial   PRIMARY KEY,
+    owner_id            bigint      NOT NULL,
+    name                text        NOT NULL,
+    is_custom           boolean     NOT NULL DEFAULT false,
+    source_category_ids jsonb       NOT NULL DEFAULT '[]'::jsonb,
+    created_at          timestamptz NOT NULL DEFAULT now(),
+    updated_at          timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT emoji_categories_name_not_blank
+        CHECK (length(btrim(name)) > 0 AND length(name) <= 64),
+    CONSTRAINT emoji_categories_source_ids_array
+        CHECK (jsonb_typeof(source_category_ids) = 'array'),
+    CONSTRAINT emoji_categories_owner_name_key
+        UNIQUE (owner_id, name)
+);
+ALTER TABLE emoji_categories
+    ADD COLUMN IF NOT EXISTS is_custom boolean NOT NULL DEFAULT false;
+ALTER TABLE emoji_categories
+    ADD COLUMN IF NOT EXISTS source_category_ids jsonb NOT NULL DEFAULT '[]'::jsonb;
+CREATE TABLE IF NOT EXISTS emoji_mappings (
+    id           bigserial   PRIMARY KEY,
+    owner_id     bigint      NOT NULL,
+    category_id  bigint      NOT NULL,
+    simple_emoji text        NOT NULL,
+    document_id  bigint      NOT NULL,
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    updated_at   timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT emoji_mappings_simple_emoji_not_blank
+        CHECK (length(btrim(simple_emoji)) > 0 AND length(simple_emoji) <= 32),
+    CONSTRAINT emoji_mappings_document_positive
+        CHECK (document_id > 0),
+    CONSTRAINT emoji_mappings_owner_category_emoji_key
+        UNIQUE (owner_id, category_id, simple_emoji)
+);
+CREATE TABLE IF NOT EXISTS emoji_state (
+    owner_id                   bigint      PRIMARY KEY,
+    replacement_enabled        boolean     NOT NULL DEFAULT false,
+    global_default_category_id bigint,
+    updated_at                 timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS emoji_chat_overrides (
+    owner_id             bigint      NOT NULL,
+    chat_id              bigint      NOT NULL,
+    override_category_id bigint,
+    updated_at           timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (owner_id, chat_id)
+);
+CREATE INDEX IF NOT EXISTS idx_emoji_library_owner_created
+    ON emoji_library (owner_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_emoji_categories_owner_created
+    ON emoji_categories (owner_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_emoji_mappings_owner_category_created
+    ON emoji_mappings (owner_id, category_id, created_at DESC);
+ALTER TABLE emoji_library ENABLE ROW LEVEL SECURITY;
+ALTER TABLE emoji_categories ENABLE ROW LEVEL SECURITY;
+ALTER TABLE emoji_mappings ENABLE ROW LEVEL SECURITY;
+ALTER TABLE emoji_state ENABLE ROW LEVEL SECURITY;
+ALTER TABLE emoji_chat_overrides ENABLE ROW LEVEL SECURITY;
+GRANT SELECT ON emoji_library TO anon, authenticated;
+GRANT SELECT ON emoji_categories TO anon, authenticated;
+GRANT SELECT ON emoji_mappings TO anon, authenticated;
+GRANT SELECT ON emoji_state TO anon, authenticated;
+GRANT SELECT ON emoji_chat_overrides TO anon, authenticated;
+DROP POLICY IF EXISTS "anon_insert_emoji_library" ON emoji_library;
+DROP POLICY IF EXISTS "anon_update_emoji_library" ON emoji_library;
+DROP POLICY IF EXISTS "anon_delete_emoji_library" ON emoji_library;
+DROP POLICY IF EXISTS "anon_select_emoji_library" ON emoji_library;
+CREATE POLICY "anon_select_emoji_library" ON emoji_library FOR SELECT
+    TO anon, authenticated USING (true);
+DROP POLICY IF EXISTS "anon_insert_emoji_categories" ON emoji_categories;
+DROP POLICY IF EXISTS "anon_update_emoji_categories" ON emoji_categories;
+DROP POLICY IF EXISTS "anon_delete_emoji_categories" ON emoji_categories;
+DROP POLICY IF EXISTS "anon_select_emoji_categories" ON emoji_categories;
+CREATE POLICY "anon_select_emoji_categories" ON emoji_categories FOR SELECT
+    TO anon, authenticated USING (true);
+DROP POLICY IF EXISTS "anon_insert_emoji_mappings" ON emoji_mappings;
+DROP POLICY IF EXISTS "anon_update_emoji_mappings" ON emoji_mappings;
+DROP POLICY IF EXISTS "anon_delete_emoji_mappings" ON emoji_mappings;
+DROP POLICY IF EXISTS "anon_select_emoji_mappings" ON emoji_mappings;
+CREATE POLICY "anon_select_emoji_mappings" ON emoji_mappings FOR SELECT
+    TO anon, authenticated USING (true);
+DROP POLICY IF EXISTS "anon_insert_emoji_state" ON emoji_state;
+DROP POLICY IF EXISTS "anon_update_emoji_state" ON emoji_state;
+DROP POLICY IF EXISTS "anon_delete_emoji_state" ON emoji_state;
+DROP POLICY IF EXISTS "anon_select_emoji_state" ON emoji_state;
+CREATE POLICY "anon_select_emoji_state" ON emoji_state FOR SELECT
+    TO anon, authenticated USING (true);
+DROP POLICY IF EXISTS "anon_insert_emoji_chat_overrides" ON emoji_chat_overrides;
+DROP POLICY IF EXISTS "anon_update_emoji_chat_overrides" ON emoji_chat_overrides;
+DROP POLICY IF EXISTS "anon_delete_emoji_chat_overrides" ON emoji_chat_overrides;
+DROP POLICY IF EXISTS "anon_select_emoji_chat_overrides" ON emoji_chat_overrides;
+CREATE POLICY "anon_select_emoji_chat_overrides" ON emoji_chat_overrides FOR SELECT
+    TO anon, authenticated USING (true);
+COMMENT ON TABLE emoji_library IS
+    'The owner''s premium/custom emoji definitions (one row per Telegram custom-emoji document). UNIQUE (owner_id, document_id) is the deduplication identity; alt_text is Telegram''s own fallback text.';
+COMMENT ON COLUMN emoji_library.source IS
+    '''imported'' (the only producer today) or ''manual'' (documented, currently unproduced).';
+COMMENT ON COLUMN emoji_library.source_msg_id IS
+    'The Saved Messages message the entry was imported from; NULL for sticker-set members, which carry no message origin.';
+COMMENT ON TABLE emoji_categories IS
+    'The owner''s emoji categories. is_custom is the EXPLICIT Custom-Category flag (never inferred from the name); source_category_ids is the ordered source list of a composed Custom Category.';
+COMMENT ON COLUMN emoji_categories.is_custom IS
+    'TRUE for a Custom Category composed from other categories (Phase 5). Ordinary rows default to FALSE.';
+COMMENT ON COLUMN emoji_categories.source_category_ids IS
+    'Ordered id list of a Custom Category''s sources (snapshot-on-compose); [] for ordinary categories.';
+COMMENT ON TABLE emoji_mappings IS
+    'simple emoji → library entry, inside one category. References document_id only; premium emoji definitions are never duplicated. UNIQUE (owner_id, category_id, simple_emoji) makes a silent overwrite impossible.';
+COMMENT ON COLUMN emoji_mappings.category_id IS
+    'Application-level reference to emoji_categories.id (owner-scoped, validated by the service). Deliberately not a foreign key: dangling references fail closed in code.';
+COMMENT ON TABLE emoji_state IS
+    'ONE global replacement-state row per owner: the replacement toggle (default FALSE — the feature is OFF on first boot) and the global default category.';
+COMMENT ON COLUMN emoji_state.global_default_category_id IS
+    'The owner-approved (global-only) active category. Application-level reference; NULL means none.';
+COMMENT ON TABLE emoji_chat_overrides IS
+    'Per-chat category overrides: IMPLEMENTED state of a code path the owner did NOT approve (the approved Active Category scope is global-only). Kept additively; the approved resolution order never consults it.';
+COMMENT ON COLUMN emoji_chat_overrides.override_category_id IS
+    'The per-chat override category (application-level reference). NULL restores the global default at resolution time.';
+NOTIFY pgrst, 'reload schema';
+SELECT 'emoji tables' AS check, count(*) AS present
+FROM information_schema.tables
+WHERE table_schema = 'public'
+  AND table_name IN ('emoji_library', 'emoji_categories', 'emoji_mappings',
+                     'emoji_state', 'emoji_chat_overrides');
+SELECT 'emoji_categories.is_custom' AS check, count(*) AS present
+FROM information_schema.columns
+WHERE table_schema = 'public'
+  AND table_name   = 'emoji_categories'
+  AND column_name IN ('is_custom', 'source_category_ids');
 ```
 
 ### 31.4 Verification after the run
@@ -2547,8 +2733,11 @@ its own count query over `information_schema.columns`, its Todo schedule-type
 part ends with `NOTIFY pgrst, 'reload schema'` alone (it adds no column and no
 index, so there is nothing for it to count), and its Todo steps part ends with
 its own count query over `information_schema.tables` (zero rows would mean the
-table was not created). The functions and
-indexes can be confirmed read-only:
+table was not created). Its Emoji & Reaction part (part 9) ends with two count
+queries — one over `information_schema.tables` (all five emoji tables present)
+and one over `information_schema.columns` (the two Phase 5
+`emoji_categories` columns present). The functions, indexes and tables can be
+confirmed read-only:
 
 ```sql
 SELECT p.proname, pg_get_function_identity_arguments(p.oid) AS args
@@ -2568,8 +2757,19 @@ SELECT indexname, indexdef
                      'idx_api_credentials_owner',
                      'uq_api_credentials_vault_secret',
                      'idx_saved_items_display_name_trgm',
-                     'idx_saved_items_tags')
+                     'idx_saved_items_tags',
+                     'idx_emoji_library_owner_created',
+                     'idx_emoji_categories_owner_created',
+                     'idx_emoji_mappings_owner_category_created')
  ORDER BY 1;
+
+SELECT table_name, count(*) AS columns
+  FROM information_schema.columns
+ WHERE table_schema = 'public'
+   AND table_name IN ('emoji_library', 'emoji_categories', 'emoji_mappings',
+                      'emoji_state', 'emoji_chat_overrides')
+ GROUP BY table_name
+ ORDER BY table_name;
 ```
 
 Whether a given migration was already applied cannot be decided from this
@@ -2597,6 +2797,15 @@ repository, which is exactly why every statement in the block is idempotent.
   migration's own header). It destroys the step rows only: the Todos
   themselves are untouched and keep working, and only their step lists are
   lost. No other table, column, policy or grant is affected.
+* **The Emoji & Reaction part** — `DROP TABLE IF EXISTS` for the five tables
+  in reverse dependency order (`emoji_chat_overrides`, `emoji_state`,
+  `emoji_mappings`, `emoji_categories`, `emoji_library`; stated in the
+  migration's own header). It destroys the owner's emoji library, categories,
+  mappings and replacement state only: no existing table, column, index,
+  policy, grant or row is affected, and the feature keeps starting on the
+  in-memory fallback while its durable reads/writes report the failure
+  honestly. The five tables were never applied anywhere by this repository, so
+  this reversal has never been executed either.
 * **The reconciliation part** — §30.9. The reconciliation is additive and has no
   safe automatic rollback; the only destructive cleanup in this repository is the
   explicitly OPTIONAL, owner-gated §30.10.
@@ -2608,12 +2817,15 @@ repository, which is exactly why every statement in the block is idempotent.
 * It does not assert the live database state, and it does not change §29 or §30:
   the per-object contracts, the byte-identical snapshot copies and the
   credential-vault documentation all stay exactly as they were.
-* Its §31.1/§31.2 documentation and the part 8 embed change no runtime
+* Its §31.1/§31.2 documentation and the part 8/part 9 embeds change no runtime
   behaviour, provider, handler, service, dependency or environment variable,
   and add no configuration store and no second secret path. The ONE table the
   block's Todo steps part creates (`todo_steps`) is the documented additive
-  schema change of the multi-step phase itself (§15), not a change this
-  documentation pass introduced silently.
+  schema change of the multi-step phase itself (§15), and the five tables the
+  Emoji & Reaction part creates are the Emoji & Reaction feature's own
+  documented persistence (§32) — not changes this documentation pass
+  introduced silently. Part 9 adds no foreign key, no trigger, no function and
+  no seed row.
 * The §31.1 reconciliation matrix is documentation derived from the repository
   files (migrations, source, tests); it was verified statically — statement
   identity and semantic equivalence — and **no SQL was executed against any
@@ -2665,6 +2877,30 @@ status of every table is in [§19](#19-known-inconsistencies),
 | `ai_usage` | `20260827000003` | `SupabaseUsageRepository` + `usage_recorder` | Migration created, **pending manual application** (§13). |
 | `ai_provider_stats` | `20260827000004` | `SupabaseProviderStatsRepository` + `usage_recorder` | Migration created, **pending manual application** (§12). |
 | `ai_preferences` | none | interface + in-memory only | Specified (§14), **no producer, no migration**. |
+
+### Emoji & Reaction Tables (MANUAL-ONLY migration)
+
+The Emoji & Reaction feature (premium/custom emoji replacement + reactions,
+§32) persists through five dedicated tables created by
+`20260928000001_create_emoji_reaction_tables.sql` — part 9 of the ONE setup
+script in §31.3:
+
+| Table | Purpose | PK / identity | Code usage |
+|---|---|---|---|
+| `emoji_library` | The owner's premium-emoji definitions | `id` (bigserial); `UNIQUE (owner_id, document_id)` | `db/client.py` emoji helpers, `emoji_library_service`, `emoji_category_service`, `emoji_replacement_service`, the Emoji Glass UI |
+| `emoji_categories` | The owner's categories (ordinary + Custom) | `id` (bigserial); `UNIQUE (owner_id, name)` | `emoji_category_service`, the Emoji Glass UI |
+| `emoji_mappings` | `simple emoji → library entry`, per category | `id` (bigserial); `UNIQUE (owner_id, category_id, simple_emoji)` | `emoji_category_service`, `emoji_replacement_service`, `emoji_transformer` |
+| `emoji_state` | ONE global replacement-state row per owner | `owner_id` | `emoji_state_service`, `emoji_replacement_service` |
+| `emoji_chat_overrides` | Per-chat category overrides — **implemented, NOT owner-approved** (§32.6) | `(owner_id, chat_id)` | `emoji_state_service` (the approved behaviour is global-only) |
+
+Status: **MANUAL-ONLY — never applied anywhere.** The migration file exists and
+part 9 of §31.3 carries its SQL verbatim; until the owner runs that block, a
+configured Supabase reports honest durable-store failures and the feature runs
+on the in-memory fallback (§20). Owner decision (2026-10-07): the approved
+Active Category scope of this feature is **GLOBAL-ONLY** — the effective
+category comes from `emoji_state.global_default_category_id` alone, and the
+per-chat override path is implemented-but-not-approved (§32.6,
+`ROADMAP.md` §34).
 
 ### Access Model
 
@@ -3575,6 +3811,234 @@ Indexes are unique `uq_ai_task_occurrences_task_key (task_id, occurrence_key)`, 
 
 RLS is enabled. SELECT is granted to `anon` and `authenticated`; no public write policy is added. The task FK uses `ON DELETE RESTRICT`, preserving history. Occurrences snapshot `definition_version` and `action_snapshot`; later task edits do not rewrite history. Recommended retention is bounded terminal history (initially 90 days, subject to operations approval).
 
+## 32. Emoji & Reaction Persistence (premium/custom emoji replacement + reactions)
+
+> **Status: documented from the actual repository. The migration that creates
+> these tables is created but NOT APPLIED to Supabase — manual-only (§31.3,
+> part 9 of 9). No agent has ever executed SQL against Supabase.**
+
+The Emoji & Reaction feature — the owner's premium (custom) emoji library,
+categories (ordinary + Custom), `simple emoji → premium emoji` mappings, the
+replacement state, and the Phase 6 reaction **action** — is the feature the
+owner planned in `ROADMAP.md` §27 and approved in §34. Five dedicated tables
+carry all of its durable state. **Reactions persist nothing** (§32.7).
+
+The migration
+`supabase/migrations/20260928000001_create_emoji_reaction_tables.sql` creates
+the five tables in their FINAL shape (the two Phase 5 columns are re-asserted
+with `ADD COLUMN IF NOT EXISTS` so a manually created Phase-2-shaped
+`emoji_categories` converges too). It is forward-only and additive: it touches
+no existing table, column, index, policy, grant or row, and — like the rest of
+this database — it creates **no foreign keys**. Supabase stays manual-only; the
+application never executes schema changes.
+
+### Code map (who owns each table)
+
+| Layer | Module | Tables |
+|---|---|---|
+| DB access | `backend/db/client.py` — the `emoji_*` helper family (`list_emoji_document_ids`, `insert_emoji_entry`, `list_emoji_entries`, `get_emoji_entry`, `insert_emoji_category`, `get_emoji_category`, `get_emoji_category_by_name`, `list_emoji_categories`, `update_emoji_category`, `set_emoji_category_sources`, `delete_emoji_category`, `insert_emoji_mapping`, `get_emoji_mapping`, `list_emoji_mappings`, `update_emoji_mapping`, `delete_emoji_mapping`, `delete_emoji_mappings_for_category`, `count_emoji_mappings_by_category`, `get_emoji_state`, `upsert_emoji_state`, `get_emoji_chat_override`, `upsert_emoji_chat_override`) | all five |
+| Library service | `backend/services/emoji_library_service.py` (Saved-Messages import + real sticker-set enumeration) | `emoji_library` |
+| Category service | `backend/services/emoji_category_service.py`; `backend/services/emoji_transformer.py` is the read path that expands a category into its mappings | `emoji_categories`, `emoji_mappings`, `emoji_library` |
+| State service | `backend/services/emoji_state_service.py` (toggle, global default, per-chat override, resolution) | `emoji_state`, `emoji_chat_overrides` |
+| Replacement service | `backend/services/emoji_replacement_service.py` (reconstruct one outgoing message through the bridge) | read-only, through the services above |
+| Glass UI | `backend/bot/handlers/emoji.py`, `backend/bot/handlers/emoji_replacement.py` | through the services above |
+| Reactions (Phase 6) | `backend/services/reaction_service.py`, `backend/telegram_api/reactions.py` | **none — nothing persisted** |
+
+Every read and write is owner-scoped and goes through the backend's
+service-role client. The AI never reaches these tables: there is no AI tool
+that writes them, and the replacement/import/reaction path is deterministic
+service code. When Supabase is unconfigured or the migration has not been
+applied, every helper degrades honestly to the in-memory fallback (§20) and the
+feature reports the durable-store failure instead of pretending it persisted.
+
+### 32.1 emoji_library
+
+The owner's premium/custom emoji definitions — one row per Telegram
+custom-emoji document. The library is populated by the importer from the
+owner's Saved Messages (and by real sticker-set enumeration, whose members
+carry no message origin) and is the single source of premium-emoji identity for
+every mapping; mappings reference it and never duplicate it.
+
+| Column | Type | Nullable | Default | Meaning |
+|---|---|---|---|---|
+| `id` | `bigserial` | NO | identity | Surrogate PK |
+| `owner_id` | `bigint` | NO | — | Owning Telegram user; every query filters by it |
+| `document_id` | `bigint` | NO | — | Telegram custom-emoji document id; `> 0` (CHECK) |
+| `alt_text` | `text` | NO | `''` | Telegram's own Unicode fallback text, stored verbatim — never invented |
+| `source` | `text` | NO | `'imported'` | `imported` \| `manual` (CHECK). `imported` is the only producer today; `manual` is the documented, currently unproduced second source |
+| `source_msg_id` | `bigint` | YES | — | The Saved Messages message the entry was imported from; NULL for sticker-set members |
+| `created_at` | `timestamptz` | NO | `now()` | Durable timestamp; the browser reads newest-first |
+
+- `PRIMARY KEY (id)`.
+- `CONSTRAINT emoji_library_document_positive CHECK (document_id > 0)`.
+- `CONSTRAINT emoji_library_source_check CHECK (source IN ('imported','manual'))`.
+- `CONSTRAINT emoji_library_owner_document_key UNIQUE (owner_id, document_id)` — the deduplication identity the importer and the manual entry paths rely on, and the entry lookup; it is also the durable backstop for libraries larger than the bounded dedup read.
+- `idx_emoji_library_owner_created (owner_id, created_at DESC)` — the newest-first library browser (`list_emoji_entries`).
+
+### 32.2 emoji_categories
+
+The owner's categories: ordinary categories and the **Custom Category** type
+(Phase 5). Type is an EXPLICIT column, never inferred from the name.
+
+| Column | Type | Nullable | Default | Meaning |
+|---|---|---|---|---|
+| `id` | `bigserial` | NO | identity | Surrogate PK |
+| `owner_id` | `bigint` | NO | — | Owning Telegram user |
+| `name` | `text` | NO | — | The owner's own label: nonblank and ≤ 64 characters (`MAX_CATEGORY_NAME_LEN`) via CHECK |
+| `is_custom` | `boolean` | NO | `false` | **Phase 5**: TRUE for a composed Custom Category. Ordinary rows are inserted without this column and take the default |
+| `source_category_ids` | `jsonb` | NO | `'[]'::jsonb` | **Phase 5**: ordered id list of a Custom Category's sources (snapshot-on-compose). `[]` for ordinary categories; a CHECK keeps the column a JSON array |
+| `created_at` | `timestamptz` | NO | `now()` | Durable timestamp |
+| `updated_at` | `timestamptz` | NO | `now()` | Durable timestamp |
+
+- `PRIMARY KEY (id)`.
+- `CONSTRAINT emoji_categories_name_not_blank CHECK (length(btrim(name)) > 0 AND length(name) <= 64)`.
+- `CONSTRAINT emoji_categories_source_ids_array CHECK (jsonb_typeof(source_category_ids) = 'array')`.
+- `CONSTRAINT emoji_categories_owner_name_key UNIQUE (owner_id, name)` — the uniqueness contract the service checks against.
+- `idx_emoji_categories_owner_created (owner_id, created_at DESC)` — the categories grid (`list_emoji_categories`).
+
+**Phase 5 verification:** both `is_custom` and `source_category_ids` are
+present in the canonical SQL, with the CHECK/defaults above, and both are
+re-asserted with `ADD COLUMN IF NOT EXISTS` so a Phase-2-shaped table created
+by hand still converges to the final shape.
+
+### 32.3 emoji_mappings
+
+`simple emoji → library entry`, inside one category. A mapping references a
+library definition by `document_id`; premium emoji definitions are never
+duplicated here.
+
+| Column | Type | Nullable | Default | Meaning |
+|---|---|---|---|---|
+| `id` | `bigserial` | NO | identity | Surrogate PK |
+| `owner_id` | `bigint` | NO | — | Owning Telegram user |
+| `category_id` | `bigint` | NO | — | Application-level reference to `emoji_categories.id` (owner-scoped, validated by the service before every write) — deliberately NOT a foreign key |
+| `simple_emoji` | `text` | NO | — | The mapping KEY the owner types: nonblank and ≤ 32 characters (`MAX_SIMPLE_EMOJI_LEN`) via CHECK. Its emoji semantics are Telegram's business at replacement time |
+| `document_id` | `bigint` | NO | — | Application-level reference to a library entry; `> 0` (CHECK) |
+| `created_at` | `timestamptz` | NO | `now()` | Durable timestamp |
+| `updated_at` | `timestamptz` | NO | `now()` | Durable timestamp |
+
+- `PRIMARY KEY (id)`.
+- `CONSTRAINT emoji_mappings_simple_emoji_not_blank CHECK (length(btrim(simple_emoji)) > 0 AND length(simple_emoji) <= 32)`.
+- `CONSTRAINT emoji_mappings_document_positive CHECK (document_id > 0)`.
+- `CONSTRAINT emoji_mappings_owner_category_emoji_key UNIQUE (owner_id, category_id, simple_emoji)` — one definition per simple emoji per category: a shared emoji is never silently overwritten (the service resolves the conflict explicitly).
+- `idx_emoji_mappings_owner_category_created (owner_id, category_id, created_at DESC)` — the paged per-category mapping list and the owner-scoped per-category counts (`count_emoji_mappings_by_category`).
+
+### 32.4 emoji_state
+
+ONE global replacement-state row per owner.
+
+| Column | Type | Nullable | Default | Meaning |
+|---|---|---|---|---|
+| `owner_id` | `bigint` | NO | — | **PK** — exactly one state row per owner |
+| `replacement_enabled` | `boolean` | NO | `false` | The replacement toggle. Default `false`: the feature is OFF on first boot, and a failed write can never silently switch it ON |
+| `global_default_category_id` | `bigint` | YES | — | The **owner-approved (global-only) active category**; application-level reference, NULL means none |
+| `updated_at` | `timestamptz` | NO | `now()` | Durable timestamp |
+
+- `PRIMARY KEY (owner_id)`; no extra index — every read is a primary-key lookup.
+- Resolution is validated at read time: a category id whose category row no longer exists resolves to none (fail closed) instead of substituting another category; the toggle gates everything, so an OFF feature resolves to none regardless of any stored category.
+
+### 32.5 Access model, indexes and security
+
+All five tables: RLS enabled, `anon`/`authenticated` granted **SELECT only**, with
+a single read-only `SELECT` policy per table (`USING (true)`) matching every
+other table in this database. Every write goes through the backend's
+service-role client, which bypasses RLS; the repository filters by `owner_id`,
+so one owner can never read or mutate another owner's rows. The React dashboard
+reads through the backend API — it never touches Supabase directly.
+
+The indexes are exactly the three secondary indexes the repository's reads
+need (`emoji_library`, `emoji_categories`, `emoji_mappings`) plus primary keys;
+no speculative index exists. Table and column `COMMENT`s are part of the
+migration because these tables document their own scope (notably that the
+mapping references are application-level and that the override table is not
+part of the approved behaviour). The migration ends with `NOTIFY pgrst,
+'reload schema'` and two verification queries (table presence, and the two
+Phase 5 columns), so the owner can confirm the result immediately after running
+the block.
+
+### 32.6 emoji_chat_overrides — IMPLEMENTED, NOT owner-approved
+
+> **Approved product behaviour: the Active Category scope is GLOBAL-ONLY.**
+> There is NO per-chat active-category override in the owner-approved
+> behaviour. The effective category for replacement is determined from the
+> global default only (`emoji_state.global_default_category_id`).
+
+| Column | Type | Nullable | Default | Meaning |
+|---|---|---|---|---|
+| `owner_id` | `bigint` | NO | — | Owning Telegram user |
+| `chat_id` | `bigint` | NO | — | The chat the override applies to |
+| `override_category_id` | `bigint` | YES | — | The override category (application-level reference); NULL restores the global default at resolution time |
+| `updated_at` | `timestamptz` | NO | `now()` | Durable timestamp |
+
+- `PRIMARY KEY (owner_id, chat_id)` — at most one override row per owner/chat; no extra index (primary-key lookups only).
+
+**The distinction this chapter records, and that must not be blurred:**
+
+| | Value |
+|---|---|
+| Existing implementation (Phase 3 code, unchanged) | `resolve_effective_category` resolves per-chat override → global default → none, and `emoji_chat_overrides` is read and written by it; the Glass UI's category view can set a per-chat override |
+| Owner-approved product behaviour (2026-10-07, `ROADMAP.md` §34) | **Global-only.** The override path is not part of the approved behaviour; the approved effective category comes from the global default alone |
+
+This documentation task did **not** delete, rewrite or disable the implemented
+code path, and did **not** invent a removal migration: the table is created by
+the additive migration because the current code still reads and writes it. The
+table is therefore documented as **implemented-but-not-approved**. If the owner
+later wants the code path gone (so the implementation matches the decision),
+that is a separate, explicitly requested change covering code + documentation +
+migration — and the removal migration would then be justified by that request,
+not by this reconciliation.
+
+### 32.7 Reactions persist nothing
+
+Reactions (Phase 6, §27 of the roadmap) are an ACTION, not configuration: the
+owner enters reaction mode, replies to the target message, the replied-to
+message is the target, and the reply's content (its custom-emoji entity, else
+its stripped text) is the reaction. Execution goes self-client RPC → typed
+wrapper (`backend/telegram_api/reactions.py`) → deterministic service
+(`backend/services/reaction_service.py`) → the existing Glass UI action, with
+validation before any RPC, one attempt, and no fallback representation.
+
+Consequently the canonical schema contains **no reaction table, column or
+migration**, and the canonical SQL adds none. If a future phase gives reactions
+durable configuration, that requires its own additive migration — it must not
+be smuggled into this schema contract.
+
+### 32.8 Migration & manual-application status
+
+| Item | Value |
+|---|---|
+| Migration file | `supabase/migrations/20260928000001_create_emoji_reaction_tables.sql` |
+| Canonical location | `DATABASE_ARCHITECTURE.md` §31.3, **part 9 of 9** (verbatim; run the one block) |
+| Applied by | **The project owner, manually, in the Supabase SQL Editor** |
+| Applied by any agent | **NO — never.** No SQL was executed against Supabase; Supabase remains manual-only and its physical schema unmodified by this repository |
+| Until applied | Configured Supabase reports the missing tables; every emoji helper degrades to the in-memory fallback (§20) and the feature reports the durable-store failure honestly |
+| Reversal | Drop the five tables (see the migration's rollback block: `emoji_chat_overrides`, `emoji_state`, `emoji_mappings`, `emoji_categories`, `emoji_library`). No other object changes |
+
+### 32.9 Reconstruction knowledge this chapter intentionally preserves
+
+- The migration is a **forward-only additive successor** to the reconciliation
+  snapshot (`20260920000001_reconcile_canonical_schema.sql`), exactly like the
+  other successor migrations; the emoji tables are deliberately absent from
+  that snapshot's 16-table canonical set and are carried as a later part of the
+  same §31.3 block.
+- **No foreign keys anywhere in this subsystem**: `emoji_mappings.category_id`,
+  `emoji_mappings.document_id`, `emoji_state.global_default_category_id` and
+  `emoji_chat_overrides.override_category_id` are application-level references,
+  consistent with this database's documented model. Dangling references fail
+  closed in code rather than cascading silently at the SQL layer.
+- The CHECK constraints mirror the service's own bounds
+  (`MAX_CATEGORY_NAME_LEN = 64`, `MAX_SIMPLE_EMOJI_LEN = 32`, positive document
+  ids, the `source` domain, the JSON-array shape of `source_category_ids`), so
+  the durable layer and the service layer enforce the same contract.
+- The two Phase 5 columns are both created **and** re-asserted, so the owner can
+  run the block on a database where an earlier shape was created by hand.
+- Owner decisions (A–J of `ROADMAP.md` §34) are recorded in the migration's
+  own header comment and in §32.6 / §31.1.1; the Global-only Active Category
+  decision is stated in §1, §31.1.1, the §31.3 part 9 audit row of §31.1 and
+  §32.6.
+
+---
+
 ## 17. Relationships
 
 The task foundation and the Todo steps table are the two intentional enforced
@@ -4185,6 +4649,7 @@ migration. No code change needed.
 | 18 | `20260926000001_add_todo_schedule_type.sql` | Widens exactly two existing `ai_tasks` constraints for the basic Todo item: `ai_tasks_schedule_type_check` gains `'todo'`, and `ai_tasks_actions_count` becomes conditional so a `'todo'` row stores 0–5 actions (0 in practice) while every scheduled row keeps 1–5. No table, no column, no index, no policy, no grant, no row and no backfill; ends with `NOTIFY pgrst, 'reload schema'` | **NOT APPLIED — owner action required** (§31.3, part 7 of 7; the row shape is documented in §15). Until it runs, the legacy enum and actions count still hold: a Todo *create* is rejected by the old CHECK and the application reports that honestly, while every scheduled task keeps working unchanged |
 | 19 | `20260927000001_add_todo_steps.sql` | Creates the ONE new table of the multi-step phase: `todo_steps` — the ordered steps of ONE todo. `task_id` REFERENCES `ai_tasks(id)` `ON DELETE CASCADE` (a step can never be orphaned), denormalized `owner_id` (every repository read/write filters by it), 1-based `position` with `UNIQUE (task_id, position)` (never renumbered), nonblank ≤256-char `title`, `status` CHECK `active`/`completed` (no other state exists), CAS `version` (a stale mutation writes nothing), `completed_at` bound to the status, timestamps; RLS + SELECT-only `anon`/`authenticated`; ends with `NOTIFY pgrst` and a verification query. Additive: no existing table, column, index, policy, grant or row is touched | **NOT APPLIED — owner action required** (§31.3, part 8 of 8; the table is documented in §15). Without it the application keeps every Part 1 Todo behaviour and reports step operations as not-durable instead of pretending they persisted |
 | 20 | `20260927020000_add_waiting_answer_status.sql` | Widens exactly the `ai_task_occurrences_status_check` constraint to admit the Taskloom question-park status `waiting_answer` (durable question/answer continuation). No table, no column, no index, no policy, no grant, no row; the widened enum accepts every row the old constraint accepted; ends with `NOTIFY pgrst` | **NOT APPLIED — owner action required**. Until it runs, the repository's status validation refuses the park write (fail closed): a question chain reports the park honestly instead of pretending a question was stored, and every scheduled/waiting/branch behaviour keeps working unchanged |
+| 21 | `20260928000001_create_emoji_reaction_tables.sql` | The Emoji & Reaction feature's five persistence tables, in their final shape (§32): `emoji_library`, `emoji_categories` (with the Phase 5 `is_custom` / `source_category_ids` columns, re-asserted with `ADD COLUMN IF NOT EXISTS`), `emoji_mappings`, `emoji_state` (the toggle defaulting to `false` — OFF on first boot) and `emoji_chat_overrides`; plus three read indexes, RLS + SELECT-only `anon`/`authenticated` policies on all five, comments, `NOTIFY pgrst` and verification queries. Additive: no existing table, column, index, policy, grant or row is touched, and no foreign key is created (the emoji references are application-level). Reactions persist nothing, so they add no table | **NOT APPLIED — owner action required** (§31.3, part 9 of 9; the tables are documented in §32). Until it runs, the Emoji & Reaction feature starts and works against the in-memory fallback only: every durable read/write reports the failure honestly instead of pretending the library, categories, mappings or state persisted |
 
 > This table is not exhaustive: the `20260827…`–`20260917…` migration files
 > (`ai_config` trigger / `show_question` / STT columns, `ai_usage`,
@@ -5843,7 +6308,7 @@ SELECT credential_id, provider, label, enabled, priority, created_at
 
 ## Final Canonical Contract
 
-The canonical database consists of **16** public-schema tables: `saved_items`, `bio_state`, `username_state`, `bot_logs`, `panel_settings`, `bot_settings`, `ai_config`, `ai_sessions`, `ai_messages`, `ai_memories`, `ai_tool_history`, `ai_usage`, `ai_provider_stats`, `ai_tasks`, `ai_task_occurrences`, and the compatibility-preserved legacy table `ghost_chats`. The complete definitions, defaults, constraints, indexes, RLS policies, seeds, existing-database reconciliation and drift report are in the single SQL block in the next section — and the same text is the repository migration `supabase/migrations/20260920000001_reconcile_canonical_schema.sql` (see §30).
+The canonical database consists of **16** public-schema tables: `saved_items`, `bio_state`, `username_state`, `bot_logs`, `panel_settings`, `bot_settings`, `ai_config`, `ai_sessions`, `ai_messages`, `ai_memories`, `ai_tool_history`, `ai_usage`, `ai_provider_stats`, `ai_tasks`, `ai_task_occurrences`, and the compatibility-preserved legacy table `ghost_chats`. Six SUCCESSOR tables are added after the snapshot by their own additive migrations and are carried as later parts of the same §31.3 block: `todo_steps` (part 8, §15) and the five Emoji & Reaction tables (part 9, §32). The complete definitions, defaults, constraints, indexes, RLS policies, seeds, existing-database reconciliation and drift report are in the single SQL block in the next section — and the same text is the repository migration `supabase/migrations/20260920000001_reconcile_canonical_schema.sql` (see §30).
 
 All tables use RLS. `anon` and `authenticated` have SELECT-only policies with `USING (true)`; they have no INSERT, UPDATE, or DELETE policies. Backend writes use the service-role client. No foreign keys are required: identifier relationships are intentionally application-level.
 
@@ -6406,8 +6871,9 @@ agent.
 
 1. Open the Supabase **SQL Editor** as `postgres` and run the ONE complete setup
    script in **§31.3** — a single fenced block that begins with the canonical
-   reconciliation snapshot and continues, in order, with the seven pending
-   migrations (Vault ×2, Save V2 ×2, TTS, Todo schedule type, Todo steps). It is
+   reconciliation snapshot and continues, in order, with the eight pending
+   migrations (Vault ×2, Save V2 ×2, TTS, Todo schedule type, Todo steps,
+   Emoji & Reaction tables). It is
    one transaction-safe, re-runnable statement batch.
    (`supabase/canonical_bootstrap.sql` and the migration file remain the
    byte-identical convenience copies of the snapshot part.)
@@ -6424,9 +6890,11 @@ agent.
    `20260922000001_add_saved_items_search_indexes.sql` (the Save V2 resolver's
    two search indexes on `saved_items`, idempotent),
    `20260926000001_add_todo_schedule_type.sql` (the basic Todo row's two
-   widened constraints) and `20260927000001_add_todo_steps.sql` (the
-   `todo_steps` table of the multi-step phase) — are already parts 4, 5, 7 and
-   8 of the §31.3 block. The snapshot is never regenerated to include them,
+   widened constraints), `20260927000001_add_todo_steps.sql` (the
+   `todo_steps` table of the multi-step phase) and
+   `20260928000001_create_emoji_reaction_tables.sql` (the five Emoji &
+   Reaction tables) — are already parts 4, 5, 7, 8 and 9 of the §31.3 block.
+   The snapshot is never regenerated to include them,
    so the two byte-identical repository copies stay byte-identical.
 4. Nothing else is required: no new table to create by hand, no env var, no
    Render setting, no Supabase Vault change.

@@ -31,14 +31,16 @@ SEARCH_INDEXES = "20260922000001_add_saved_items_search_indexes.sql"
 TTS_SETTINGS = "20260923000001_add_ai_config_tts_settings.sql"
 TODO_SCHEDULE_TYPE = "20260926000001_add_todo_schedule_type.sql"
 TODO_STEPS = "20260927000001_add_todo_steps.sql"
+EMOJI_TABLES = "20260928000001_create_emoji_reaction_tables.sql"
 
 #: The order §31 documents — verified against the sources, not assumed. The TTS
-#: settings migration, the Todo schedule type and the Todo steps table are LATER
-#: additive schema changes, so they are appended last, newest last (the
-#: documented rule: a later change never edits the snapshot).
+#: settings migration, the Todo schedule type, the Todo steps table and the
+#: Emoji & Reaction tables are LATER additive schema changes, so they are
+#: appended last, newest last (the documented rule: a later change never edits
+#: the snapshot).
 DOCUMENTED_ORDER = (
     RECONCILE, VAULT_PART1, VAULT_PART2, DISPLAY_NAME, SEARCH_INDEXES, TTS_SETTINGS,
-    TODO_SCHEDULE_TYPE, TODO_STEPS,
+    TODO_SCHEDULE_TYPE, TODO_STEPS, EMOJI_TABLES,
 )
 
 #: The banner that marks the ONE complete deployment block.
@@ -249,11 +251,12 @@ def test_the_todo_schedule_type_part_is_last_and_carries_both_constraints():
     )
 
 
-def test_the_todo_steps_part_is_last_and_carries_the_whole_table():
-    """The multi-step table is the newest additive change and closes the block."""
+def test_the_todo_steps_part_carries_the_whole_table_before_the_newest_change():
+    """The multi-step table stays embedded, whole, before the newest add-on."""
     spans = _part_spans(_setup_block())
-    assert list(spans)[-1] == TODO_STEPS, (
-        "the Todo steps table is the newest additive change, so it is applied last"
+    assert TODO_STEPS in spans, "the Todo steps table must stay embedded"
+    assert list(spans).index(TODO_STEPS) < list(spans).index(EMOJI_TABLES), (
+        "the Emoji tables are newer, so they close the block after todo_steps"
     )
     part = spans[TODO_STEPS]
     for needle in (
@@ -271,6 +274,40 @@ def test_the_todo_steps_part_is_last_and_carries_the_whole_table():
     assert block_index(spans, TODO_STEPS) > block_index(spans, RECONCILE), (
         "the steps table must come after the snapshot that creates ai_tasks"
     )
+
+
+def test_the_emoji_part_is_last_and_carries_the_five_tables():
+    """The Emoji & Reaction persistence is the newest additive change: last."""
+    spans = _part_spans(_setup_block())
+    assert list(spans)[-1] == EMOJI_TABLES, (
+        "the most recent additive migration must close the block"
+    )
+    part = spans[EMOJI_TABLES]
+    for table in (
+        "emoji_library",
+        "emoji_categories",
+        "emoji_mappings",
+        "emoji_state",
+        "emoji_chat_overrides",
+    ):
+        assert f"CREATE TABLE IF NOT EXISTS {table}" in part, (
+            f"the Emoji & Reaction part is missing the {table} table"
+        )
+    for guarantee in (
+        "ADD COLUMN IF NOT EXISTS is_custom",
+        "ADD COLUMN IF NOT EXISTS source_category_ids",
+        "idx_emoji_library_owner_created",
+        "idx_emoji_categories_owner_created",
+        "idx_emoji_mappings_owner_category_created",
+        "ENABLE ROW LEVEL SECURITY",
+        "anon_select_emoji_library",
+        "anon_select_emoji_chat_overrides",
+        "NOTIFY pgrst, 'reload schema'",
+        "FROM information_schema.tables",
+        "FROM information_schema.columns",
+    ):
+        assert guarantee in part, f"the Emoji & Reaction part is missing {guarantee!r}"
+    assert "CREATE TABLE IF NOT EXISTS todo_steps" in spans[TODO_STEPS]
 
 
 def block_index(spans: dict[str, str], name: str) -> int:
@@ -336,15 +373,15 @@ def test_the_setup_block_creates_no_secret_value():
 # ─── 4. the audited order and honest reporting ───────────────────────────────
 
 def test_the_audited_order_is_recorded_in_the_audit_table():
-    """§31.1 names every embedded migration, and its PART-8 table keeps the order.
+    """§31.1 names every embedded migration, and its PART table keeps the order.
 
-    The audit now also classifies the 21 pre-reconciliation migrations, so the
-    order contract is checked against the table of the eight EMBEDDED parts
-    (the second table in §31.1), not against the whole prose.
+    The audit now also classifies the 22 pre-reconciliation migrations, so the
+    order contract is checked against the table of the nine EMBEDDED parts
+    (the first table in §31.1), not against the whole prose.
     """
     section = _section_31()
     audit = section[: section.index("### 31.2")]
-    assert "all 30 migrations" in _flat(audit) or "30 files" in audit, (
+    assert "all 31 migrations" in _flat(audit) or "31 files" in audit, (
         "the audit must state that every repository migration was classified"
     )
     embedded_table = audit[audit.index("| Order | Migration") :]
@@ -363,9 +400,10 @@ def test_the_documented_deviations_are_stated_explicitly():
     flat = _flat(_section_31())
     assert "display_name" in flat
     assert "42703" in flat, "the failure the ordering prevents must be named"
-    assert "eight migrations" in flat, "the sixth, seventh and eighth migrations must be acknowledged"
+    assert "nine migrations" in flat, "the six later migrations must be acknowledged"
     assert "add_todo_schedule_type" in flat, "the Todo schedule type must be acknowledged"
     assert "add_todo_steps" in flat, "the Todo steps table must be acknowledged"
+    assert "create_emoji_reaction_tables" in flat, "the Emoji & Reaction tables must be acknowledged"
     assert "tts_provider" in flat, "the TTS settings columns must be acknowledged"
 
 
