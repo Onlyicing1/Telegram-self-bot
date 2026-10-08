@@ -40,6 +40,7 @@ from backend.helper.panels import (
 from backend.helper.input_state import set_pending
 from backend.services import emoji_category_service as cat_service
 from backend.services import emoji_state_service as state_service
+from backend.services import premium_emoji_probe_service as probe_service
 from backend.services import reaction_service
 from backend.services.emoji_library_service import import_from_saved_messages
 
@@ -95,6 +96,7 @@ async def _emoji_panel_handler(event, extra: str) -> tuple[str, str, list] | Non
     builder = InlinePanelBuilder()
     builder.add_row("⬇ Import from Saved Messages", "action:emoji_import")
     builder.add_row("💬 React to a message", "action:emoji_react")
+    builder.add_row("💬 Set Reaction Emoji", f"action:{_PROBE_ACTION}")
     builder.add_row("📚 Library", f"panel:{_LIBRARY_PANEL}")
     builder.add_row("🗂 Categories", f"panel:{_CATEGORIES_PANEL}")
     builder.add_row("🔁 Replacement", f"panel:{_REPLACEMENT_PANEL}")
@@ -1986,6 +1988,195 @@ def from_wid(wid: str) -> int:
     return int(wid)
 
 
+# ── premium-emoji probe (POC: the helper bot renders the custom emoji) ────
+#
+# ONE bounded experiment proving the capability the Emoji & Reaction design
+# rests on and that has never been live-verified: a REAL Telegram Premium
+# custom emoji, picked by the owner as a REPLY to a deterministic Saved
+# Messages selection message, is read from its ENTITY and handed to the
+# EXISTING helper bot, which sends its OWN message carrying that entity. The
+# self client never renders the premium emoji itself, and the visible Unicode
+# glyph is never treated as the emoji.
+#
+# Nothing else changes here: no library scan, no pagination change, no
+# category/mapping change, no state, no schema, no new listener, no second
+# client and no AI. The reply is accepted only when it targets the EXACT
+# selection message recorded for this interaction.
+
+#: The ONE action that launches the probe.
+_PROBE_ACTION = "emoji_react_premium"
+
+#: Plain words only — the selection message is sent by the owner's own
+#: account, so it carries no glyph a category mapping could ever key on.
+_PROBE_PROMPT = (
+    "Reply to this message with the Premium Emoji you want to use.\n"
+    "Only a reply to THIS message is accepted."
+)
+
+#: Two bounded calls (reading the reply back + the helper bot's send) run
+#: inside this handler; the wrappers bound each, so this is a backstop.
+_PROBE_TIMEOUT_S = 90.0
+
+
+def _probe_buttons() -> list:
+    builder = InlinePanelBuilder()
+    builder.add_row("💬 Set Reaction Emoji", f"action:{_PROBE_ACTION}")
+    builder.add_row("💬 React to a message", "action:emoji_react")
+    return builder.build()
+
+
+async def _react_premium_action(event, extra: str, chat_id: int) -> tuple[str, str, list]:
+    """Send the selection message to Saved Messages and arm reply mode."""
+    client = get_self_client()
+    owner = get_owner_id()
+    if client is None:
+        return _error_panel("Set Reaction Emoji", "Self client is not connected.")
+    if not owner:
+        return _error_panel("Set Reaction Emoji", "Owner is not set.")
+
+    try:
+        selection = await client.send_message("me", _PROBE_PROMPT)
+    except Exception as exc:
+        logger.warning("[EMOJI_UI] probe: selection message not created: %s", exc)
+        return _error_panel(
+            "Set Reaction Emoji",
+            f"Could not create the Saved Messages selection message: {exc}",
+        )
+
+    selection_id = getattr(selection, "id", 0) or 0
+    selection_chat = getattr(selection, "chat_id", 0) or 0
+    if (
+        not isinstance(selection_id, int)
+        or isinstance(selection_id, bool)
+        or selection_id <= 0
+        or not selection_chat
+    ):
+        return _error_panel(
+            "Set Reaction Emoji",
+            "The selection message could not be created — nothing was armed.",
+        )
+
+    set_pending(
+        owner, _PROBE_ACTION, _react_premium_reply_handler, selection_chat,
+        _PROBE_PROMPT,
+        inline_chat_id=chat_id,
+        inline_msg_id=getattr(event, "message_id", 0) or 0,
+        extra=str(selection_id),
+        timeout=_PROBE_TIMEOUT_S,
+    )
+    logger.info(
+        "[EMOJI_UI] probe: selection message #%s sent to Saved Messages",
+        selection_id,
+    )
+    body = (
+        "A selection message was sent to **Saved Messages**.\n\n"
+        "Reply to THAT message with the Premium Emoji you want to use.\n"
+        f"Only a reply to message `#{selection_id}` is accepted.\n\n"
+        "The helper bot then displays the emoji it received."
+    )
+    return "Set Reaction Emoji", body, _probe_buttons()
+
+
+async def _react_premium_reply_handler(
+    text,
+    chat_id,
+    msg_id,
+    inline_chat_id,
+    inline_msg_id,
+    extra: str = "",
+) -> None:
+    """Resolve the EXACT selection-message reply and prove the render boundary."""
+    client = get_self_client()
+    owner = get_owner_id()
+
+    async def _finish(title: str, body: str, buttons: list) -> None:
+        await _edit_inline(inline_chat_id, inline_msg_id, title, body, buttons)
+
+    selection_id = int(extra) if isinstance(extra, str) and extra.isdigit() else 0
+    if client is None:
+        await _finish("Set Reaction Emoji", "! Self client is not connected.", [])
+        return
+    if not selection_id:
+        await _finish(
+            "Set Reaction Emoji",
+            "! The selection message is no longer known — start the action again.",
+            _probe_buttons(),
+        )
+        return
+
+    try:
+        reply = await client.get_messages(chat_id, ids=msg_id)
+    except Exception as exc:
+        logger.warning("[EMOJI_UI] probe: cannot read the reply: %s", exc)
+        reply = None
+    if reply is None:
+        await _finish(
+            "Set Reaction Emoji",
+            "! Could not read your reply message — please try again.",
+            _probe_buttons(),
+        )
+        return
+
+    header = getattr(reply, "reply_to", None)
+    if getattr(header, "reply_to_peer_id", None) is not None:
+        await _finish(
+            "Set Reaction Emoji",
+            "! That reply targets another chat.\nReply in Saved Messages.",
+            _probe_buttons(),
+        )
+        return
+
+    target_id = getattr(reply, "reply_to_msg_id", None) or getattr(
+        header, "reply_to_msg_id", None
+    )
+    if not isinstance(target_id, int) or isinstance(target_id, bool) or target_id <= 0:
+        await _finish(
+            "Set Reaction Emoji",
+            f"! Your message was not a reply.\nReply TO selection message `#{selection_id}`.",
+            _probe_buttons(),
+        )
+        return
+    if target_id != selection_id:
+        await _finish(
+            "Set Reaction Emoji",
+            f"! That reply targets message `#{target_id}`, not the selection "
+            f"message `#{selection_id}`.",
+            _probe_buttons(),
+        )
+        return
+
+    found = probe_service.inspect_message(reply)
+    if found["kind"] != probe_service.KIND_CUSTOM_EMOJI:
+        await _finish(
+            "Set Reaction Emoji", f"! {found['detail']}.", _probe_buttons()
+        )
+        return
+
+    outcome = await probe_service.deliver_proof(
+        client, owner, found["document_id"], found["alt_text"]
+    )
+    entity = outcome.get("entity") or {}
+    if outcome.get("ok"):
+        body = (
+            f"✓ Telegram accepted the helper bot's message "
+            f"`#{outcome.get('message_id')}` carrying a REAL custom-emoji "
+            f"entity for document `#{entity.get('document_id')}` "
+            f"(offset {entity.get('offset')}, length {entity.get('length')}).\n\n"
+            "That message shows the Premium emoji only if the helper bot may "
+            "use custom-emoji entities (Fragment-purchased username). A plain "
+            "glyph there is a failure, not a success."
+        )
+        await _finish("Set Reaction Emoji", body, _probe_buttons())
+        return
+
+    body = (
+        f"✗ {outcome.get('detail')}\n\n"
+        f"`{outcome.get('error')}` · the custom-emoji entity "
+        f"(document `#{found['document_id']}`) was NOT rendered by the helper bot."
+    )
+    await _finish("Set Reaction Emoji", body, _probe_buttons())
+
+
 # ── registration ──────────────────────────────────────────────────────────
 
 
@@ -2030,6 +2221,7 @@ def register(client, owner_id: int) -> None:
     )
     register_action("emoji_import", _import_action)
     register_action("emoji_react", _react_action)
+    register_action(_PROBE_ACTION, _react_premium_action)
     register_action("emoji_state_toggle", _state_toggle_action)
     register_action("emoji_state_global_pick", _state_global_pick_action)
     register_action("emoji_state_override_pick", _state_override_pick_action)

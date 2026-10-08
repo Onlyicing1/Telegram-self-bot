@@ -56,6 +56,8 @@ async def send_reconstructed(
     text: str,
     entities: list[dict[str, Any]] | None = None,
     reply_to_msg_id: int | None = None,
+    *,
+    resolved_peer: Any = None,
 ) -> dict[str, Any]:
     """Send ``text`` with pre-built ``entities`` as the helper bot.
 
@@ -64,6 +66,12 @@ async def send_reconstructed(
     (ROADMAP §18). Entities are plain dicts (the ``serialize_message``
     representation); they are rebuilt into TL objects for the bot's
     ``send_message(formatting_entities=...)``.
+
+    ``resolved_peer`` is an already-resolved input peer for a destination the
+    self client cannot express as the BOT's own peer — the private chat the
+    helper bot holds with the owner, whose access hash only the bot's session
+    has. It is opt-in and resolves nothing itself: every existing caller keeps
+    the same-destination resolution above unchanged.
 
     Raises:
         TelegramAPIError: helper bot unavailable, unknown entity type,
@@ -78,7 +86,7 @@ async def send_reconstructed(
 
     bot = helper_client.get_client()
     tl_entities = await dict_entities_to_tl(bot, entities)
-    peer = await client.get_input_entity(chat_id)
+    peer = resolved_peer if resolved_peer is not None else await client.get_input_entity(chat_id)
     try:
         msg = await guarded_await(
             bot.send_message(
