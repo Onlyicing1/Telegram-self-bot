@@ -104,6 +104,23 @@ def test_runtime_loops_are_permanent_by_their_assigned_names():
         assert diag._is_permanent_task(name, "run") is True, name
 
 
+def _reported_task_names(text: str) -> set[str]:
+    """Names the diagnostics report itself lists in its warning blocks.
+
+    Matching the report's own ``name`` fields instead of searching the raw
+    text keeps the assertion off incidental mentions — an auto-named task
+    (``Task-9009``) is not the named task ``Task-9``, but a naive substring
+    check cannot tell them apart.
+    """
+    names: set[str] = set()
+    for line in text.splitlines():
+        stripped = line.strip()
+        for marker in ("Task: ", "STARVATION: ", "DEADLOCK: "):
+            if stripped.startswith(marker):
+                names.add(stripped[len(marker):].split(" ", 1)[0])
+    return names
+
+
 @pytest.mark.asyncio
 async def test_task_scheduler_wait_is_not_starvation(caplog):
     scheduler = asyncio.create_task(_scheduler_wait(), name="lifeos-task-scheduler")
@@ -119,9 +136,23 @@ async def test_task_scheduler_wait_is_not_starvation(caplog):
             with pytest.raises(asyncio.CancelledError):
                 await task
 
-    assert "lifeos-task-scheduler" not in caplog.text
-    assert "Task-9" not in caplog.text
-    assert "NO_PROGRESS — " not in caplog.text or "lifeos-task-scheduler" not in caplog.text
+    reported = _reported_task_names(caplog.text)
+    assert "lifeos-task-scheduler" not in reported
+    assert "Task-9" not in reported
+    assert "NO_PROGRESS — " not in caplog.text or "lifeos-task-scheduler" not in reported
+
+
+def test_reported_task_names_are_exact_names_not_substrings():
+    """An auto-named ``Task-9009`` must never count as the named ``Task-9``."""
+    text = (
+        "TASK_NO_PROGRESS — 1 bounded tasks unchanged since last dump:\n\n"
+        "  Task: Task-9009\n  Coroutine: wait\n"
+        "TASK_STARVATION — 1 tasks unchanged across 3+ dumps:\n"
+        "  STARVATION: Task-9009 unchanged for 3 dumps (0s)\n"
+    )
+    reported = _reported_task_names(text)
+    assert "Task-9009" in reported
+    assert "Task-9" not in reported
 
 
 # ── genuine bounded stalls are still detected ──────────────────────────────

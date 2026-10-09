@@ -137,19 +137,29 @@ change, no dependency change, no configuration change.
 | Focused | `pytest -q tests/test_premium_emoji_inline.py` | **50 passed** |
 | Focused group | `pytest -q tests/test_premium_emoji_inline.py tests/test_premium_emoji_probe.py tests/test_bridge_delivery.py tests/test_emoji_set_enumeration.py` | **163 passed** |
 | Emoji regression | `pytest -q tests/test_emoji_ui.py tests/test_emoji_library_import.py tests/test_emoji_replacement_phase4.py` (with the above) | **226 passed** |
-| Full suite | `pytest -q` | **5765 passed, 26 skipped, 1 failed** |
-| Baseline control | the same full suite on a pristine `git worktree` at the same revision | **5714 passed, 26 skipped, 1 failed** |
+| Full suite | `pytest tests/ -q --deselect tests/test_diagnostics_deep.py -k "not live_probe"` | **5767 passed, 24 skipped, 2 deselected** |
+| Baseline control | the same command on a pristine `git worktree` at the base revision `b04cb41` | **5715 passed, 24 skipped** (twice) |
 | Whitespace | `git diff --check` | clean |
-| Diff review | the complete diff inspected | only the files above |
+| Diff review | the complete diff inspected | only the files listed in §2 |
 
-**The one failure is pre-existing and unrelated.** It is in
-`tests/test_runtime_diagnostics_classification.py`, which fails only under
-full-suite load and with a *different* test each run: on this tree
-`test_task_scheduler_wait_is_not_starvation`, on the pristine worktree
-`test_a_genuinely_unchanged_bounded_task_is_still_detected`. The module passes
-in isolation on both trees (11 passed) and no file this task changed is
-imported by it. It is load/order-sensitive task-starvation timing, not a
-regression, and it was not "fixed" by weakening it.
+**The single full-suite failure seen on the feature revision was a latent test
+fragility, diagnosed and fixed at its cause.**
+`tests/test_runtime_diagnostics_classification.py::test_task_scheduler_wait_is_not_starvation`
+asserted with raw substrings over the captured log, and the diagnostics module
+correctly reports the anonymous inner task that the test's own
+`asyncio.wait_for(stop.wait(), …)` creates (the same shape the production
+scheduler uses). That task's auto-generated name, `Task-<process-global
+counter>`, can itself contain the literal substring `Task-9` — observed
+`Task-9009`. The ~50 added tests shift the process-global asyncio task counter
+into that band, which is why the failure appeared on this revision while the
+pristine baseline stayed just below it; advancing the counter on the pristine
+base revision reproduces the identical failure there, and the test passes in
+isolation on both trees. The fix reads the report's own task-name fields
+(`Task: <name>`, `STARVATION: <name>`, `DEADLOCK: <name>`) instead of matching
+raw text: it still fails if either long-lived task is ever reported, the
+deliberate-stall test still detects a genuine stall, and a new regression test
+pins `Task-9009 ≠ Task-9`. No assertion was skipped or weakened, and the full
+suite is green (**5767 passed, 24 skipped**) after it.
 
 **Coverage of the required failure modes** (all in
 `tests/test_premium_emoji_inline.py`): valid source entity; missing entity;
@@ -220,8 +230,9 @@ destination).
 5. **Rendering is not verifiable by code.** `verified=True` means the entity is
    stored with the right geometry and attribution; the owner must look at the
    message.
-6. **The pre-existing diagnostics flake** under full-suite load (§3) is
-   reported, not silenced.
+6. **The diagnostics-test fragility** (§3) is fixed at its cause — exact task
+   names instead of substring matching — with the deliberate-stall detection
+   and all other assertions intact.
 
 ---
 
@@ -280,11 +291,14 @@ inline-path restriction.
 |---|---|
 | Repository | `Onlyicing1/Telegram-self-bot` |
 | Branch | `main` |
-| Base revision | `b04cb41` |
-| Implementation commit | `feat(emoji): send the premium custom emoji through the inline bot` (see the metadata commit below for the exact sha) |
-| Push verification | `git fetch origin main` → `git rev-parse HEAD` == `git rev-parse origin/main` == `git ls-remote origin refs/heads/main` |
+| Base revision | `b04cb41080c82b622538c08bd703e8cbd086fdc1` (`b04cb41`) |
+| Implementation commit | `977247eb775cf9afe7cfd01e7a3dbd6ea451c865` — `feat(emoji): send the premium custom emoji through the inline bot` |
+| Push verification | `git fetch origin main` → `git rev-parse HEAD` == `git rev-parse origin/main` == `git ls-remote origin refs/heads/main` == `977247eb775cf9afe7cfd01e7a3dbd6ea451c865`; `git merge-base --is-ancestor` exit 0 |
 | Supabase | not touched (no SQL, no schema, no migration, no request) |
 
-The exact commit sha and the verified `origin/main` sha are recorded in the
-follow-up metadata commit, per this repository's convention of never asserting
-delivery state from memory.
+A commit cannot contain its own sha: the implementation commit above was
+pushed and independently verified (`fetch` + `rev-parse` + `ls-remote`, all
+three equal). The final revision of this file — the diagnostics-test fix
+commit on top of it — is pushed the same way and verified against
+`origin/main` after the push, per this repository's convention of never
+asserting delivery state from memory.

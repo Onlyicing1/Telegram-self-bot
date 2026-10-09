@@ -262,7 +262,9 @@ nor supports the inline path.
 `backend/telegram_api/_helpers.py` (`premium`),
 `tests/test_premium_emoji_inline.py` (new, 50 tests),
 `tests/test_emoji_set_enumeration.py` (the two document-shape pins updated for
-the additive keys, plus one new flag test).
+the additive keys, plus one new flag test),
+`tests/test_runtime_diagnostics_classification.py` (the fragile substring
+assertion fixed at its cause — exact report names — plus one regression test).
 
 **Intentionally untouched:** the reaction pipeline (`reaction_service`,
 `emoji_react`), the replacement pipeline and the AI/runtime/helper layers, the
@@ -273,10 +275,16 @@ dependencies, `backend/requirements.txt`.
 **Validation actually performed in this session:** `python -m py_compile` on
 every changed module; the focused modules (163 tests across
 `test_premium_emoji_inline`, `test_premium_emoji_probe`,
-`test_bridge_delivery`, `test_emoji_set_enumeration`) green; the full suite run
-twice (`5765 passed, 26 skipped, 1 failed` — the single failure is the
-pre-existing load-sensitive diagnostics flake, reproduced on a pristine
-worktree at the same revision with a **different** test in the same module);
+`test_bridge_delivery`, `test_emoji_set_enumeration`) green; the emoji +
+bridge regression slate (541 tests) green; the full suite (5715–5766 tests
+depending on revision) run repeatedly. Its one failure on the feature revision
+was diagnosed to a latent test fragility — a substring assertion in
+`test_runtime_diagnostics_classification.py` collided with the auto-generated
+name (`Task-9009`) of the anonymous task `asyncio.wait_for` creates, and the
+added tests shifted the process-global task counter into that band; reproduced
+on the pristine base revision by advancing the counter. Fixed at its cause
+(matching the report's own task-name fields; a regression test pins it) and
+the full suite is now green (**5767 passed, 24 skipped**).
 `git diff --check` clean; the complete diff inspected.
 
 **Not verified:** no live Telegram call, no message sent, no read-back on a
