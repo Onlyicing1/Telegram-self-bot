@@ -300,3 +300,44 @@ async def test_bridge_wraps_timeout_as_telegram_timeout(connected_bot, monkeypat
 def test_bridge_id_and_availability_accessors(connected_bot):
     assert bridge_bot_id() == 777  # loop-prevention sender check surface
     assert bridge_available() is True
+
+
+@pytest.mark.asyncio
+async def test_bridge_conversion_trace_covers_custom_emoji_only(connected_bot, caplog):
+    """The ONE added diagnostic line, and its blast radius on other callers.
+
+    ``BRIDGE_ENTITY_CONVERTED`` is emitted only when a custom-emoji entity was
+    actually reconstructed. An unrelated formatting-only caller keeps the exact
+    behaviour it had: same peer resolution, same rebuilt entity, same result —
+    and no new output at all.
+    """
+    import logging as _logging
+
+    caplog.set_level(_logging.INFO, logger="backend.telegram_api.bridge")
+    await send_reconstructed(
+        _FakeSelfClient(), -100123, "hi 🏂",
+        entities=[{
+            "type": "MessageEntityCustomEmoji",
+            "offset": 3, "length": 2, "document_id": 42,
+        }],
+    )
+    converted = [
+        r.getMessage() for r in caplog.records
+        if "BRIDGE_ENTITY_CONVERTED" in r.getMessage()
+    ]
+    assert len(converted) == 1
+    assert "type=MessageEntityCustomEmoji" in converted[0]
+    assert "count=1" in converted[0]
+    assert "3:2:42" in converted[0]  # offset:length:document_id
+
+    caplog.clear()
+    result = await send_reconstructed(
+        _FakeSelfClient(), -100123, "hello",
+        entities=[{"type": "MessageEntityBold", "offset": 0, "length": 5}],
+    )
+    assert [
+        r.getMessage() for r in caplog.records
+        if "BRIDGE_ENTITY_CONVERTED" in r.getMessage()
+    ] == []
+    assert result == {}
+    assert type(connected_bot.calls[-1]["formatting_entities"][0]) is tl_types.MessageEntityBold

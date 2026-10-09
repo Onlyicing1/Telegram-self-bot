@@ -23,12 +23,20 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import logging
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from telethon.tl.types import MessageEntityBold, MessageEntityCustomEmoji
+from telethon.tl.types import (
+    Document,
+    DocumentAttributeCustomEmoji,
+    InputStickerSetEmpty,
+    MessageEntityBold,
+    MessageEntityCustomEmoji,
+)
 
 import backend.helper.client as helper_client
 from backend.bot.handlers import emoji
@@ -75,6 +83,17 @@ class _FakeSelfClient:
         self.send_error = send_error
         self.get_error: Exception | None = None
         self.reads: list[tuple[Any, Any]] = []
+        # The custom-emoji document resolution used ONLY on a failed read-back
+        # (the document's real alt text). Same-surface fake, no network.
+        self.documents: list[Any] = []
+        self.documents_error: Exception | None = None
+        self.document_requests: list[Any] = []
+
+    async def __call__(self, request):
+        self.document_requests.append(request)
+        if self.documents_error is not None:
+            raise self.documents_error
+        return list(self.documents)
 
     async def send_message(self, entity, text):
         if self.send_error is not None:
@@ -87,6 +106,24 @@ class _FakeSelfClient:
         if self.get_error is not None:
             raise self.get_error
         return self._reply
+
+
+def _document(document_id: int, alt: str) -> Document:
+    """A real custom-emoji document, serialized by the real typed wrapper."""
+    return Document(
+        id=document_id,
+        access_hash=1,
+        file_reference=b"",
+        date=datetime(2026, 10, 8),
+        mime_type="application/x-tgsticker",
+        size=1,
+        dc_id=2,
+        attributes=[
+            DocumentAttributeCustomEmoji(
+                alt=alt, stickerset=InputStickerSetEmpty(), free=False,
+            )
+        ],
+    )
 
 
 class _FakeBot:
@@ -103,6 +140,16 @@ class _FakeBot:
         self._dialogs = list(dialogs or [])
         self.send_error = send_error
         self.calls: list[dict[str, Any]] = []
+        # Read-back surface: by default Telegram stored exactly what the bot
+        # sent; a test can override the stored entities/text or fail the fetch.
+        self.readbacks: list[dict[str, Any]] = []
+        self.dialog_scans = 0
+        self.readback: Any = None
+        self.readback_none = False
+        self.readback_error: Exception | None = None
+        self.readback_timeout = False
+        self.readback_text: str | None = None
+        self.readback_entities: list[Any] | None = None
 
     def is_connected(self) -> bool:
         return True
@@ -114,10 +161,37 @@ class _FakeBot:
 
     def iter_dialogs(self, limit=None):
         async def _gen():
+            self.dialog_scans += 1
             for dialog in self._dialogs:
                 yield dialog
 
         return _gen()
+
+    async def get_messages(self, peer, ids=None):
+        self.readbacks.append({"peer": peer, "ids": ids})
+        if self.readback_timeout:
+            raise asyncio.TimeoutError("read-back timeout")
+        if self.readback_error is not None:
+            raise self.readback_error
+        if self.readback_none:
+            return None
+        if self.readback is not None:
+            return self.readback
+        last = self.calls[-1] if self.calls else {}
+        text = self.readback_text if self.readback_text is not None else last.get("text", "")
+        entities = (
+            self.readback_entities
+            if self.readback_entities is not None
+            else list(last.get("formatting_entities") or [])
+        )
+        return SimpleNamespace(
+            id=4321,
+            chat_id=OWNER,
+            message=text,
+            text=text,
+            entities=list(entities or []),
+            media=None,
+        )
 
     async def send_message(self, peer, text, *, formatting_entities=None, reply_to=None):
         self.calls.append({
@@ -464,8 +538,11 @@ def test_the_action_requires_a_usable_selection_message(monkeypatch):
 # ── 5. a reply to the wrong message / chat is rejected ───────────────────────
 
 
-def _run_reply(monkeypatch, reply, *, extra: str = str(SELECTION)):
-    self_client = _FakeSelfClient(reply)
+def _run_reply(monkeypatch, reply, *, extra: str = str(SELECTION), self_client=None):
+    if self_client is None:
+        self_client = _FakeSelfClient(reply)
+    elif self_client._reply is None:
+        self_client._reply = reply
     monkeypatch.setattr(emoji, "get_self_client", lambda: self_client)
     recorder = _PanelRecorder()
     monkeypatch.setattr(emoji, "_edit_inline", recorder)
@@ -656,6 +733,273 @@ def test_the_failure_panel_says_the_entity_was_not_rendered(monkeypatch, bot):
     edit, _self_client = _run_reply(monkeypatch, _custom_emoji_message())
     assert "was NOT rendered by the helper bot" in edit["body"]
     assert "E_SEND" in edit["body"]
+
+
+# ── the read-back: what Telegram ACTUALLY stored ─────────────────────────────
+#
+# The send result alone cannot separate "Telegram kept the entity" from
+# "Telegram dropped it and only the glyph travelled". Every test below drives
+# the same deliver_proof() and reads the EXACT sent message id back through the
+# helper bot's own session (faked at that surface; no live Telegram).
+
+
+def test_the_readback_targets_the_exact_sent_message_and_never_scans(bot):
+    self_client = _FakeSelfClient()
+    outcome = _run(probe.deliver_proof(self_client, OWNER, DOC, ALT))
+
+    assert outcome["ok"] is True
+    assert outcome["message_id"] == 4321
+    # exactly ONE fetch, targeting the id the send returned — no scan
+    assert bot.readbacks == [{"peer": ("bot-peer", OWNER), "ids": 4321}]
+    assert bot.dialog_scans == 0  # the peer came from the bot's own cache
+    assert self_client.document_requests == []  # nothing else was resolved
+
+
+def test_a_retained_entity_is_never_reported_as_a_rendered_emoji(bot):
+    outcome = _run(probe.deliver_proof(_FakeSelfClient(), OWNER, DOC, ALT))
+
+    readback = outcome["readback"]
+    assert readback["attempted"] is True and readback["ok"] is True
+    assert readback["entity_present"] is True
+    assert readback["document_id"] == DOC
+    assert readback["document_id_match"] is True
+    assert readback["span_match"] is True
+    assert readback["offset"] == utf16_length(probe.PROOF_PREFIX)
+    assert readback["length"] == utf16_length(ALT)
+    assert outcome["diagnosis"] == probe.ENTITY_RETAINED_RENDER_UNVERIFIED
+    assert "not a verified render" in probe.readback_summary(readback)
+
+
+def test_a_stripped_entity_is_reported_with_the_document_alt_comparison(bot):
+    bot.readback_entities = []
+    self_client = _FakeSelfClient()
+    self_client.documents = [_document(DOC, ALT)]
+    outcome = _run(probe.deliver_proof(self_client, OWNER, DOC, ALT))
+
+    assert outcome["ok"] is True  # the SEND was accepted ...
+    assert outcome["diagnosis"] == probe.ENTITY_STRIPPED_OR_MISSING
+    readback = outcome["readback"]
+    assert readback["entity_present"] is False
+    assert readback["document_alt"] == ALT
+    assert readback["document_alt_match"] is True
+    # the alt came from ONE exact-id document resolution, never a guess
+    assert len(self_client.document_requests) == 1
+    assert "WITHOUT the custom-emoji entity" in probe.readback_summary(readback)
+
+
+def test_a_stripped_entity_with_a_non_matching_alt_is_still_stripped(bot):
+    bot.readback_entities = []
+    self_client = _FakeSelfClient()
+    self_client.documents = [_document(DOC, "🏅")]
+    outcome = _run(probe.deliver_proof(self_client, OWNER, DOC, ALT))
+
+    assert outcome["diagnosis"] == probe.ENTITY_STRIPPED_OR_MISSING
+    assert outcome["readback"]["document_alt_match"] is False
+    assert "does NOT match" in probe.readback_summary(outcome["readback"])
+
+
+def test_a_failed_alt_lookup_never_changes_the_stripped_diagnosis(bot):
+    bot.readback_entities = []
+    self_client = _FakeSelfClient()
+    self_client.documents_error = RuntimeError("documents unavailable")
+    outcome = _run(probe.deliver_proof(self_client, OWNER, DOC, ALT))
+
+    assert outcome["diagnosis"] == probe.ENTITY_STRIPPED_OR_MISSING
+    assert outcome["readback"]["document_alt"] is None
+    assert "alt lookup failed" in outcome["readback"]["document_alt_error"]
+    assert "could not be resolved" in probe.readback_summary(outcome["readback"])
+
+
+def test_a_different_document_id_in_the_stored_entity_is_a_mismatch(bot):
+    bot.readback_entities = [
+        MessageEntityCustomEmoji(
+            utf16_length(probe.PROOF_PREFIX), utf16_length(ALT), DOC + 1
+        )
+    ]
+    self_client = _FakeSelfClient()
+    self_client.documents = [_document(DOC, ALT)]
+    outcome = _run(probe.deliver_proof(self_client, OWNER, DOC, ALT))
+
+    assert outcome["diagnosis"] == probe.ENTITY_MISMATCH
+    assert outcome["readback"]["document_id"] == DOC + 1
+    assert outcome["readback"]["document_id_match"] is False
+
+
+def test_an_invalid_span_in_the_stored_entity_is_a_mismatch(bot):
+    bot.readback_entities = [
+        MessageEntityCustomEmoji(
+            utf16_length(probe.PROOF_PREFIX) + 1, utf16_length(ALT), DOC
+        )
+    ]
+    outcome = _run(probe.deliver_proof(_FakeSelfClient(), OWNER, DOC, ALT))
+
+    assert outcome["diagnosis"] == probe.ENTITY_MISMATCH
+    assert outcome["readback"]["span_match"] is False
+
+
+def test_a_readback_failure_is_reported_separately_from_the_send(bot):
+    bot.readback_error = RuntimeError("CHANNEL_INVALID")
+    outcome = _run(probe.deliver_proof(_FakeSelfClient(), OWNER, DOC, ALT))
+
+    assert outcome["ok"] is True  # the send was accepted ...
+    assert outcome["error"] is None
+    assert outcome["diagnosis"] == probe.READBACK_FAILED  # ... the read-back was not
+    assert "CHANNEL_INVALID" in outcome["readback"]["error"]
+    assert len(bot.calls) == 1
+
+
+def test_a_readback_timeout_is_a_readback_failure(bot):
+    bot.readback_timeout = True
+    outcome = _run(probe.deliver_proof(_FakeSelfClient(), OWNER, DOC, ALT))
+
+    assert outcome["ok"] is True
+    assert outcome["diagnosis"] == probe.READBACK_FAILED
+    assert "timed out" in outcome["readback"]["error"]
+
+
+def test_a_readback_that_returns_no_message_is_a_readback_failure(bot):
+    bot.readback_none = True
+    outcome = _run(probe.deliver_proof(_FakeSelfClient(), OWNER, DOC, ALT))
+
+    assert outcome["ok"] is True
+    assert outcome["diagnosis"] == probe.READBACK_FAILED
+    assert "returned no message" in outcome["readback"]["error"]
+
+
+def test_a_send_that_returns_no_message_id_cannot_be_read_back(monkeypatch, bot):
+    class _NoIdBot(_FakeBot):
+        async def send_message(
+            self, peer, text, *, formatting_entities=None, reply_to=None,
+        ):
+            await super().send_message(
+                peer, text,
+                formatting_entities=formatting_entities, reply_to=reply_to,
+            )
+            return SimpleNamespace(id=0, chat_id=OWNER)
+
+    monkeypatch.setattr(helper_client, "_client", _NoIdBot())
+    outcome = _run(probe.deliver_proof(_FakeSelfClient(), OWNER, DOC, ALT))
+
+    assert outcome["ok"] is True
+    assert outcome["message_id"] is None
+    assert outcome["diagnosis"] == probe.READBACK_FAILED
+    assert "no message id" in outcome["readback"]["error"]
+
+
+def test_classify_diagnosis_covers_every_readback_state():
+    cases = (
+        ({"ok": False, "entity_present": None}, probe.READBACK_FAILED),
+        ({"ok": True, "entity_present": False}, probe.ENTITY_STRIPPED_OR_MISSING),
+        (
+            {
+                "ok": True, "entity_present": True,
+                "document_id_match": False, "span_match": True,
+            },
+            probe.ENTITY_MISMATCH,
+        ),
+        (
+            {
+                "ok": True, "entity_present": True,
+                "document_id_match": True, "span_match": False,
+            },
+            probe.ENTITY_MISMATCH,
+        ),
+        (
+            {
+                "ok": True, "entity_present": True,
+                "document_id_match": True, "span_match": True,
+            },
+            probe.ENTITY_RETAINED_RENDER_UNVERIFIED,
+        ),
+    )
+    for readback, expected in cases:
+        assert probe.classify_diagnosis(readback) == expected, readback
+
+
+def test_the_outbound_payload_is_validated_before_it_is_ever_sent(monkeypatch, bot):
+    payload = probe.build_proof_payload(DOC, ALT)
+    assert probe.validate_proof_payload(payload) == ""
+    broken = dict(payload, entity=dict(payload["entity"], length=0), entities=[])
+    assert probe.validate_proof_payload(broken)
+
+    monkeypatch.setattr(
+        probe, "build_proof_payload", lambda document_id, alt_text: broken
+    )
+    outcome = _run(probe.deliver_proof(_FakeSelfClient(), OWNER, DOC, ALT))
+
+    assert outcome["ok"] is False
+    assert outcome["diagnosis"] == probe.OUTBOUND_ENTITY_INVALID
+    assert bot.calls == []  # nothing invalid ever reaches Telegram
+
+
+def test_the_missing_source_entity_is_diagnosed_and_never_sent(monkeypatch, bot):
+    edit, self_client = _run_reply(monkeypatch, _plain_message(text="🏂"))
+
+    assert probe.SOURCE_ENTITY_MISSING in edit["body"]
+    assert "not a Premium emoji" in edit["body"]
+    assert bot.calls == []
+    assert self_client.sent == []
+
+
+def test_the_retained_panel_reports_the_readback_and_the_unverified_render(monkeypatch, bot):
+    edit, _self_client = _run_reply(monkeypatch, _custom_emoji_message())
+    body = edit["body"]
+
+    assert probe.ENTITY_RETAINED_RENDER_UNVERIFIED in body
+    assert "Read-back (the helper bot's own session)" in body
+    assert "only if the helper bot" in body
+
+
+def test_the_stripped_panel_says_the_entity_was_stripped_server_side(monkeypatch, bot):
+    bot.readback_entities = []
+    self_client = _FakeSelfClient(_custom_emoji_message())
+    self_client.documents = [_document(DOC, ALT)]
+    edit, _self_client = _run_reply(
+        monkeypatch, _custom_emoji_message(), self_client=self_client
+    )
+    body = edit["body"]
+
+    assert "✓ Telegram accepted the helper bot's message" in body
+    assert probe.ENTITY_STRIPPED_OR_MISSING in body
+    assert "stripped or ignored" in body
+
+
+def test_the_panel_reports_a_readback_failure_honestly(monkeypatch, bot):
+    bot.readback_error = RuntimeError("CHANNEL_INVALID")
+    edit, _self_client = _run_reply(monkeypatch, _custom_emoji_message())
+    body = edit["body"]
+
+    assert probe.READBACK_FAILED in body
+    assert "did not complete" in body
+
+
+def test_the_failure_panel_carries_the_send_failed_diagnosis(monkeypatch, bot):
+    bot.send_error = RuntimeError("PREMIUM_ACCOUNT_REQUIRED")
+    edit, _self_client = _run_reply(monkeypatch, _custom_emoji_message())
+
+    assert probe.SEND_FAILED in edit["body"]
+    assert "was NOT rendered by the helper bot" in edit["body"]
+
+
+def test_the_trace_reports_every_stage_and_no_secret(monkeypatch, bot, caplog):
+    caplog.set_level(logging.INFO)
+    _run_reply(monkeypatch, _custom_emoji_message())
+    text = "\n".join(record.getMessage() for record in caplog.records)
+
+    for stage in (
+        "SOURCE_ENTITY_FOUND",
+        "SOURCE_ENTITY_VALIDATED",
+        "OUTBOUND_ENTITY_BUILT",
+        "BRIDGE_ENTITY_CONVERTED",
+        "SEND_STARTED",
+        "SEND_ACCEPTED",
+        "READBACK_STARTED",
+        "READBACK_RESULT",
+        "DIAGNOSIS",
+    ):
+        assert stage in text, stage
+    assert "BOT_TOKEN" not in text
+    assert "access_hash" not in text
 
 
 # ── registration and architecture ────────────────────────────────────────────

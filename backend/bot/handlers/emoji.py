@@ -2148,7 +2148,11 @@ async def _react_premium_reply_handler(
     found = probe_service.inspect_message(reply)
     if found["kind"] != probe_service.KIND_CUSTOM_EMOJI:
         await _finish(
-            "Set Reaction Emoji", f"! {found['detail']}.", _probe_buttons()
+            "Set Reaction Emoji",
+            f"! {found['detail']}.\n\n"
+            f"Diagnosis `{probe_service.SOURCE_ENTITY_MISSING}` — nothing was "
+            "sent to the helper bot.",
+            _probe_buttons(),
         )
         return
 
@@ -2162,6 +2166,9 @@ async def _react_premium_reply_handler(
             f"`#{outcome.get('message_id')}` carrying a REAL custom-emoji "
             f"entity for document `#{entity.get('document_id')}` "
             f"(offset {entity.get('offset')}, length {entity.get('length')}).\n\n"
+            "Read-back (the helper bot's own session): "
+            f"{probe_service.readback_summary(outcome.get('readback'))}\n\n"
+            f"Diagnosis `{outcome.get('diagnosis')}`.\n\n"
             "That message shows the Premium emoji only if the helper bot may "
             "use custom-emoji entities (Fragment-purchased username). A plain "
             "glyph there is a failure, not a success."
@@ -2172,7 +2179,8 @@ async def _react_premium_reply_handler(
     body = (
         f"✗ {outcome.get('detail')}\n\n"
         f"`{outcome.get('error')}` · the custom-emoji entity "
-        f"(document `#{found['document_id']}`) was NOT rendered by the helper bot."
+        f"(document `#{found['document_id']}`) was NOT rendered by the helper bot.\n\n"
+        f"Diagnosis `{outcome.get('diagnosis')}`."
     )
     await _finish("Set Reaction Emoji", body, _probe_buttons())
 

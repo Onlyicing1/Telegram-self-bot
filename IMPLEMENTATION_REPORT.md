@@ -4,302 +4,238 @@
 > a changelog and no older report is kept below it.
 >
 > **This task changed no SQL and contacted no database.** Supabase stays
-> manual-only and the Emoji & Reaction schema is untouched.
+> manual-only, the Emoji & Reaction schema is untouched, and no migration was
+> added or edited.
 
 ---
 
 ## 1. Task / stage covered
 
-**POC — "Premium Custom Emoji: Self Bot extracts the real identity, the Helper
-Bot renders it" (2026-10-08).**
+**Premium Custom Emoji render boundary — diagnostic trace + exact-message
+read-back (2026-10-09).**
 
-A *proof of concept only*, deliberately narrow. The request was to prove ONE
-technical capability and explicitly NOT to build the Premium Emoji Library
-redesign:
+The owner reports that the POC's helper-bot message displays only the ordinary
+Unicode glyph. The decisive question — *where does the custom-emoji entity stop
+working?* — could not be answered before because the POC never looked at what
+Telegram actually stored. This task makes that observable **from the POC
+itself**, without redesigning the Emoji Library, the reaction system, the
+bridge or the runtime:
 
-> Can the Self Bot receive a real Telegram Premium/Custom Emoji from a user's
-> reply in Saved Messages, extract the REAL custom-emoji identity, and then make
-> the EXISTING HELPER TELEGRAM BOT display that same Premium Custom Emoji in a
-> bot-generated message?
+* a nine-stage structured trace of the whole send pipeline;
+* an exact-message read-back through the **helper bot's own session**;
+* one honest diagnostic outcome per run (seven defined outcomes);
+* the document-`alt` comparison that separates "our span was wrong" from
+  "the server dropped it anyway".
 
-**Result: the technical capability is IMPLEMENTED AND PROVEN OFFLINE.** The
-whole chain exists in code and is pinned by tests: a real
-`MessageEntityCustomEmoji` on the owner's reply → its real `document_id` → the
-existing helper-bot bridge → a message the HELPER BOT sends carrying a real
-`MessageEntityCustomEmoji`. **Live Telegram rendering was NOT verified** (no
-live Telegram account is available to the coding agent) — see §9 and §11.
+**Result: the instrumentation is IMPLEMENTED AND PROVEN OFFLINE.** No live
+Telegram request was made (no credentials in this workspace), so the *live*
+verdict is produced by the owner's next run — the POC now reports it
+explicitly. **No code defect was demonstrated, so none was "fixed"**; the send
+algorithm is unchanged (§10).
 
-## 2. What the POC does (end to end)
+## 2. What the POC now measures, stage by stage
 
-1. **Launch.** The Emoji panel (Glass UI) gains ONE new action:
-   `💬 Set Reaction Emoji` (`action:emoji_react_premium`). Nothing else in the
-   Emoji/Reaction UI changed.
-2. **Deterministic selection message.** The self client sends a plain-text
-   instruction message to **Saved Messages** (`client.send_message("me", …)`):
-   *"Reply to this message with the Premium Emoji you want to use. Only a reply
-   to THIS message is accepted."* The returned message's **exact** `id` and
-   `chat_id` are recorded — carried into the existing pending-input `extra`
-   slot. There is no "latest message", no history scan, no keyword matching.
-3. **Waiting.** The existing pending-input reply mode is armed (the same
-   machinery Deep Save and the Phase 6 reaction flow already use) — **no new
-   listener, no new panel, no new input registration**.
-4. **Deterministic resolution.** The owner's reply is read back and accepted
-   **only** when it is an outgoing message in that Saved Messages chat whose
-   `reply_to_msg_id` equals the recorded selection message id, and it does not
-   target another chat. Anything else is refused with an honest panel line.
-5. **Entity extraction (the source of truth).** `inspect_message()` walks the
-   message's real entities and accepts only a real
-   `MessageEntityCustomEmoji` with a usable `document_id`. The visible glyph,
-   the alt text, the caption and the message text are never used to decide
-   whether a Premium emoji was sent.
-6. **Helper-bot rendering.** `deliver_proof()` builds the bot message payload
-   and hands it to the **existing** bridge (`backend/telegram_api/bridge.py`),
-   which sends it from the **helper bot's own client** as a NEW bot message.
-   The self client never renders the Premium emoji.
+`backend/services/premium_emoji_probe_service.py` logs one structured line per
+stage (`[PREMIUM_PROBE] <STAGE> key=value …`); the conversion stage is logged by
+the bridge (`[BRIDGE] BRIDGE_ENTITY_CONVERTED …`). Nothing logged is a session
+string, token, access hash, whole message or unrelated history.
 
-## 3. Exact files changed
+| Stage | What it records |
+|---|---|
+| `SOURCE_ENTITY_FOUND` | whether the owner's reply carried a real `MessageEntityCustomEmoji` (and whether its id is usable) |
+| `SOURCE_ENTITY_VALIDATED` | that entity's `document_id`, `offset`, `length` and a bounded span |
+| `OUTBOUND_ENTITY_BUILT` | the exact outbound entity (type, id, offset, length), the text length, and `used_placeholder` |
+| `BRIDGE_ENTITY_CONVERTED` | that the dict→TL conversion produced `MessageEntityCustomEmoji` objects, with `offset:length:document_id` |
+| `SEND_STARTED` | `path=helper_bot_bridge`, `via=helper_bot_client`, the geometry and entity count |
+| `SEND_ACCEPTED` | whether Telegram accepted the send, the returned message id, or the refusal error |
+| `READBACK_STARTED` | that the read-back targets THE EXACT sent id through the helper bot's client |
+| `READBACK_RESULT` | what Telegram stored: entity present?, same `document_id`?, same offset/length/span?, stored text length |
+| `DIAGNOSIS` | the one outcome the evidence establishes (§5) |
+
+`DOCUMENT_ALT` is logged additionally when the read-back did not retain a
+matching entity.
+
+## 3. The read-back (new)
+
+After a successful send, `deliver_proof` reads the **exact** message id back
+through the helper bot's own client:
+
+* `bot.get_messages(peer, ids=<send result id>)` — no recent-messages scan, no
+  "latest message" inference, no unrelated history; `peer` is the same
+  bot-session peer the send used;
+* bounded by the project's existing watchdog convention
+  (`guarded_await`, `telegram:premium_probe:readback`, 30 s);
+* a read-back failure (error, timeout, or no message returned) is reported
+  **separately** from a send failure — `ok` stays the send fact and the
+  diagnosis becomes `READBACK_FAILED`;
+* the returned object's **raw** text (`.message`) and real `entities` are
+  inspected with the same entity-only scan used on the source;
+* when the entity was not retained and matching, the expected document is
+  resolved through the **existing** typed wrapper
+  (`telegram_api.custom_emoji.get_custom_emoji_documents`) and its `alt` is
+  compared with the span that was sent;
+* `readback` (a stable dict with every key present) and `readback_summary()`
+  carry the evidence; the Glass panel prints the summary and the diagnosis.
+
+## 4. Outbound validation (new)
+
+`validate_proof_payload(payload)` checks the payload against itself before
+anything is sent: entity type `MessageEntityCustomEmoji`, a real document id,
+usable UTF-16 `offset`/`length`, the span covering exactly the fallback text,
+and exactly one entity. A payload that fails is **never sent** and is
+classified `OUTBOUND_ENTITY_INVALID`. In every tested input the builder
+produces a valid payload (real span text and the `▪` placeholder branch alike).
+
+## 5. Diagnostic outcomes
+
+| Outcome | Meaning | What it does not claim |
+|---|---|---|
+| `SOURCE_ENTITY_MISSING` | the reply had no real custom-emoji entity (or an unusable id); nothing was sent | anything about Telegram |
+| `OUTBOUND_ENTITY_INVALID` | the payload failed its own validation; nothing was sent | rendering |
+| `SEND_FAILED` | the helper bot was unavailable, has no chat with the owner, or Telegram refused the send (its error text is in `detail`) | whether the entity would have been retained |
+| `READBACK_FAILED` | the exact-message fetch errored, timed out, or returned nothing | whether the entity was retained |
+| `ENTITY_STRIPPED_OR_MISSING` | Telegram stored the message **without** the custom-emoji entity; `document_alt` / `document_alt_match` say whether the sent span matched the document's alt | *why* it was dropped, beyond that comparison |
+| `ENTITY_MISMATCH` | an entity was stored, but with a different id or an invalid/mismatched span | rendering |
+| `ENTITY_RETAINED_RENDER_UNVERIFIED` | the entity was retained with the **expected** id and span | **that a Premium emoji was displayed** — read-back can prove retention, never display |
+
+`ENTITY_RETAINED_RENDER_UNVERIFIED` is deliberately not labelled a successful
+visual render; the panel keeps the explicit caveat ("only if the helper bot may
+use custom-emoji entities (Fragment-purchased username). A plain glyph there is
+a failure, not a success.").
+
+## 6. Exact files changed
 
 | File | Change |
 |---|---|
-| `backend/services/premium_emoji_probe_service.py` | **NEW** — the POC's deterministic layer: entity inspection, helper-bot payload building, bridge delivery, honest result codes |
-| `backend/bot/handlers/emoji.py` | Main panel button + the POC action and its reply handler (one new section, placed after the existing shared edit helpers); no existing behaviour changed |
-| `backend/telegram_api/bridge.py` | ONE optional keyword-only parameter added: `resolved_peer=` on `send_reconstructed` (an already-resolved input peer for a destination the self client cannot express as the bot's peer). Default `None` ⇒ every existing caller keeps the unchanged same-destination resolution |
-| `tests/test_premium_emoji_probe.py` | **NEW** — 41 focused offline tests |
-| `IMPLEMENTATION_REPORT.md` | This document |
+| `backend/services/premium_emoji_probe_service.py` | trace helper + stage calls; `_scan_custom_emoji`; `validate_proof_payload`; `_fetch_sent_message`; `_resolve_document_alt`; `_read_back`; `classify_diagnosis`; `readback_summary`; `_failed`/`_empty_readback` result shape |
+| `backend/bot/handlers/emoji.py` | POC panel prints the read-back summary and `Diagnosis <OUTCOME>` (and `SOURCE_ENTITY_MISSING` on a non-entity reply); the UI still holds no send logic |
+| `backend/telegram_api/bridge.py` | import + ONE conditional INFO line when a custom-emoji entity was reconstructed; default behavior, return value and exceptions for every caller are unchanged |
+| `tests/test_premium_emoji_probe.py` | +19 tests (read-back retained/stripped/mismatch, alt comparison, read-back failure/timeout/no-message/no-id, exact-id targeting, classification table, outbound validation, panel texts, full-trace stage presence) |
+| `tests/test_bridge_delivery.py` | +1 test pinning the trace's custom-emoji-only blast radius |
+| `INVESTIGATION.md` | rewritten as the canonical instrumented investigation record |
+| `IMPLEMENTATION_REPORT.md` | this current-state report |
 
-Nothing else changed: `git status --short` before the commit lists exactly these
-files (one modified module, one modified bridge, two new files, this report).
-
-Explicitly **not** changed: the Emoji Library import/scanning pipeline, sticker-set
-scanning, library pagination, the category/mapping model, the emoji replacement
-pipeline, the existing reaction behaviour, `reaction_service.py`,
+Explicitly **not** changed: the Emoji Library import/scanning pipeline, sticker
+set scanning, library pagination, categories/mappings, the Phase 3–6
+replacement/state/composition/reaction code (`emoji_replacement_service.py`,
+`emoji_state_service.py`, `emoji_transformer.py`, `reaction_service.py`),
 `backend/db/client.py`, `DATABASE_ARCHITECTURE.md`, `ROADMAP.md`, `AGENTS.md`,
 every migration, the `RuntimeSupervisor`, the dispatcher, the provider manager,
 the `ToolExecutor`, the AI architecture, media processing and the helper-bot
 client/lifecycle modules.
 
-## 4. Exact Telegram entity representation used
-
-**Telethon side (what the self client reads from the reply):**
-
-```
-telethon.tl.types.MessageEntityCustomEmoji
-    .offset        # UTF-16 code units, Telegram's entity currency
-    .length        # UTF-16 code units
-    .document_id   # the REAL Telegram custom-emoji document id
-```
-
-**Bridge side (what the helper bot sends), the project's existing serialized
-entity dict — rebuilt by `_helpers.dict_entities_to_tl` into the real TL type
-for `send_message(formatting_entities=…)`:**
-
-```python
-{
-    "type": "MessageEntityCustomEmoji",
-    "offset": <utf16 units of "Selected reaction emoji: ">,
-    "length": <utf16 units of the fallback glyph>,
-    "document_id": <the REAL document id from the reply's entity>,
-}
-```
-
-The bot's message text is `"Selected reaction emoji: <glyph>"` and the entity
-covers exactly the `<glyph>` span. The glyph is only the entity's *underlying
-text*; the rendered emoji comes from `document_id` alone. When Telegram reports
-no alt text, a plainly non-emoji placeholder (`▪`) becomes that underlying text
-so the entity always has a ≥1-unit span — `used_placeholder` records that, and
-the id is still the real one.
-
-## 5. How the Self Bot extracts the custom-emoji identity
-
-`premium_emoji_probe_service.inspect_message(message)` →
-
-* iterates `message.entities` and accepts **only** an instance of
-  `telethon.tl.types.MessageEntityCustomEmoji`;
-* requires a usable `document_id` (a positive `int`, never a bool); an entity
-  with an unusable id returns `kind = "none"` with the honest reason
-  (`"…carries a custom-emoji entity with an unusable document id"`);
-* derives the alt text **from the entity's own UTF-16 span** using the existing
-  `utf16_index_at` helper — a corrupt/out-of-range span yields `""`, never a
-  clamped guess;
-* otherwise returns `kind = "unicode"` (the reply's own visible text — *not* a
-  Premium emoji) or `kind = "none"` (empty/media-only reply), each with the
-  reason. **Nothing is inferred from the glyph, the text, the caption, a
-  filename or a filename-like field.**
-
-## 6. How the Helper Bot renders it
-
-`premium_emoji_probe_service.deliver_proof(self_client, owner_id, document_id,
-alt_text)`:
-
-1. refuses an invalid owner (`E_OWNER`) or an invalid document id
-   (`E_NO_CUSTOM_EMOJI`) **before** any Telegram call;
-2. refuses honestly when the helper bot is not connected (`E_NO_HELPER`) — with
-   **no** alt-text fallback send;
-3. resolves the destination through the **helper bot's own session** (its entity
-   cache first, then a bounded 50-dialog scan of the bot's own dialogs) — the
-   destination is the helper bot's private chat with the owner, whose access
-   hash only the bot's session has. No chat ⇒ `E_NO_BOT_CHAT` with the honest
-   instruction to open the bot and press Start;
-4. calls the existing bridge `send_reconstructed(self_client, owner_id, text,
-   entities=[…], resolved_peer=…)` — **exactly one attempt**, marked
-   `long_running`-free, no retry and no different representation;
-5. returns an honest result dict: `ok` is True only when Telegram accepted the
-   bot's send; every failure carries a stable code (`E_SEND`), the exact
-   Telegram error text, and the payload that was (or would have been) sent.
-
-The helper bot — never the self client — builds and sends the message that
-carries the custom-emoji entity.
-
-**Capability boundary (unchanged from the project's recorded, verified
-constraint — `ROADMAP.md` §17):** Telegram only lets a bot use custom-emoji
-entities if it purchased additional usernames on Fragment. The POC therefore
-does not promise rendering: it constructs the correct entity, sends it once, and
-reports Telegram's verdict as-is. A rejection surfaces as `E_SEND` with
-Telegram's own error; it is never converted into a "success" with a Unicode
-glyph.
-
-## 7. Focused tests executed
-
-`tests/test_premium_emoji_probe.py` — **43 tests, all passing**, covering the
-eight required cases plus the whole offline path:
-
-| # | Required case | Test(s) |
-|---|---|---|
-| 1 | A Telegram Custom Emoji entity is correctly recognized | `test_a_real_custom_emoji_entity_is_recognized_and_its_id_is_extracted`, `…_wins_over_the_neighbouring_text` |
-| 2 | The real custom emoji ID is extracted | `test_the_document_id_comes_from_the_entity_not_from_the_glyph`, `test_the_alt_text_is_read_from_the_entity_span_in_utf16_units` |
-| 3 | A normal Unicode emoji is NOT a Custom Emoji | `test_a_plain_unicode_emoji_is_not_a_custom_emoji`, `…_bold_entity_with_a_glyph…`, `test_a_unicode_emoji_reply_is_refused_and_never_sent_as_premium` |
-| 4 | Missing entities fail closed | `test_an_empty_reply_has_no_custom_emoji`, `test_a_media_only_reply_has_no_custom_emoji`, `test_a_custom_emoji_entity_with_an_unusable_id_fails_closed`, `test_a_corrupt_entity_span_yields_no_alt_text_and_still_fails_closed` |
-| 5 | A reply to the wrong message is rejected | `test_a_reply_to_a_different_message_is_rejected`, `test_a_reply_in_another_chat_is_rejected`, `test_a_non_reply_is_rejected` |
-| 6 | The exact selection message id is respected | `test_the_action_sends_the_selection_message_and_records_its_exact_id`, `test_an_unknown_selection_id_is_refused_before_any_read`, `test_the_selection_reply_is_delivered_by_the_helper_bot_end_to_end` |
-| 6b | The LIVE dispatch path reaches the probe | `test_the_real_pending_input_listener_drives_the_probe` (the real listener, armed through the real action, delivers the owner's Saved Messages reply and the selection id arrives), `test_the_listener_ignores_a_reply_in_another_chat` |
-| 7 | The helper-bot payload carries the correct entity/identifier | `test_the_payload_carries_the_real_custom_emoji_entity`, `test_the_helper_bot_sends_the_real_custom_emoji_entity`, `test_the_helper_bot_peer_can_come_from_its_own_dialog_list` |
-| 8 | The visible fallback text alone is NOT proof | `test_an_unavailable_helper_bot_reports_failure_and_sends_no_fallback`, `test_a_rejected_send_is_reported_without_any_glyph_substitution`, `test_the_success_panel_never_claims_the_premium_render_by_itself`, `test_the_failure_panel_says_the_entity_was_not_rendered` |
-
-Plus honest-failure tests (no self client, failed selection send, unusable
-selection id, unreadable reply), registration through the existing registry, and
-architecture pins (no second client/loop/scheduler/listener, no AI/recovery
-imports, no database/schema surface, the UI holds no send logic and the service's
-only delivery is the existing bridge). The Telegram surface is faked; no live
-Telegram account and no Supabase call is required.
-
-## 8. Test results (this pass, 2026-10-08)
+## 7. Tests executed
 
 | Check | Command | Result |
 |---|---|---|
-| Focused POC tests | `python -m pytest tests/test_premium_emoji_probe.py -q` | **43 passed**, exit 0 |
-| Emoji/Reaction regression | `python -m pytest tests/test_emoji_ui.py tests/test_emoji_ui_phase2.py tests/test_emoji_state_phase3.py tests/test_emoji_replacement_phase4.py tests/test_emoji_composition_phase5.py tests/test_reaction_phase6.py tests/test_bridge_delivery.py tests/test_emoji_library_import.py tests/test_emoji_category_service.py tests/test_emoji_set_enumeration.py -q` | **492 passed**, exit 0 |
-| Full suite | `python -m pytest tests -q` | **5695 passed, 26 skipped**, exit 0 (120.69s) — the pre-POC run was 5652 passed, i.e. +43 = exactly this POC's tests |
-| Compile | `python -m py_compile` on all four changed Python files | clean |
-| Whitespace | `git diff --check` | clean |
-| Scope | `git status --short` | only the four changed files + this report |
+| Compile | `python -m py_compile` on the four changed Python files | clean |
+| Focused POC suite | `python -m pytest tests/test_premium_emoji_probe.py -q` | **62 passed**, exit 0 (was 43) |
+| Bridge suite | `python -m pytest tests/test_bridge_delivery.py -q` | **23 passed**, exit 0 (was 22) |
+| Emoji/Reaction regression | `python -m pytest tests/test_emoji_ui.py tests/test_emoji_ui_phase2.py tests/test_emoji_state_phase3.py tests/test_emoji_replacement_phase4.py tests/test_emoji_composition_phase5.py tests/test_reaction_phase6.py tests/test_bridge_delivery.py tests/test_emoji_library_import.py tests/test_emoji_category_service.py tests/test_emoji_set_enumeration.py tests/test_premium_emoji_probe.py -q` | **555 passed**, exit 0 |
+| Full suite | `python -m pytest tests -q --ignore=telegram-self-bot` | **5715 passed, 26 skipped**, exit 0 (119.73 s) |
+| Whitespace | `git diff --check` | exit 0 |
+
+The full-suite arithmetic is exact: pre-task baseline 5695 passed + 19 new POC
+tests + 1 new bridge test = 5715. `--ignore=telegram-self-bot` excludes the
+pre-existing untracked mirror clone in the workspace (never touched); its
+`tests/conftest.py` otherwise interferes with collection.
+
+Each required test case is pinned by name: retained read-back
+(`test_a_retained_entity_is_never_reported_as_a_rendered_emoji`,
+`test_the_readback_targets_the_exact_sent_message_and_never_scans`); read-back
+with no entity and the alt comparison
+(`test_a_stripped_entity_is_reported_with_the_document_alt_comparison`,
+`test_a_stripped_entity_with_a_non_matching_alt_is_still_stripped`,
+`test_a_failed_alt_lookup_never_changes_the_stripped_diagnosis`); mismatched
+id/invalid span (`test_a_different_document_id_in_the_stored_entity_is_a_mismatch`,
+`test_an_invalid_span_in_the_stored_entity_is_a_mismatch`); send failure
+(`test_a_rejected_send_is_reported_without_any_glyph_substitution`,
+`test_the_failure_panel_carries_the_send_failed_diagnosis`); read-back failure
+and timeout (`test_a_readback_failure_is_reported_separately_from_the_send`,
+`test_a_readback_timeout_is_a_readback_failure`,
+`test_a_readback_that_returns_no_message_is_a_readback_failure`); exact-id
+targeting with no scan; classification
+(`test_classify_diagnosis_covers_every_readback_state`); and the trace
+(`test_the_trace_reports_every_stage_and_no_secret`). Unrelated bridge callers
+are pinned unchanged by
+`test_bridge_conversion_trace_covers_custom_emoji_only`.
 
 No check was skipped, weakened or suppressed; nothing is reported as passing
 that was not run.
 
-## 9. Live Telegram verification — NOT performed
+## 8. Live Telegram verification — NOT performed
 
-**Live Telegram rendering was not verified.** The coding agent has no live
-Telegram account, no `SESSION_STRING` and no `BOT_TOKEN` in this workspace, so
-no message was ever sent to Telegram and no Premium emoji was ever rendered.
-Unit tests cannot prove that Telegram renders a custom emoji, and this report
-does not claim they do.
+**Live rendering was not verified and is not claimed.** This workspace has no
+`SESSION_STRING`, no `BOT_TOKEN` and no Telegram account, so no message was
+sent and the read-back never executed against Telegram. All tests fake the
+Telegram surface at the exact calls the probe consumes and prove the pipeline,
+not the server's rendering.
 
-The owner can perform the live check in five steps:
+What the owner's next run will produce, without any further code work:
 
-1. `Menu` → **Emoji** → `💬 Set Reaction Emoji`.
-2. Open Saved Messages; the selection message is there.
-3. Reply to **that** message with a real Premium/Custom Emoji from Telegram's
-   own picker (not a copy-pasted Unicode glyph).
-4. Watch the helper bot's private chat with the owner: it receives
-   `Selected reaction emoji: …` whose emoji must be the **Premium** one.
-5. The Glass panel reports the outcome: `✓ Telegram accepted …` plus the
-   document id, or `✗` with Telegram's exact error.
+1. the same POC flow (`Menu` → Emoji → `💬 Set Reaction Emoji` → reply to the
+   selection message with a real Premium emoji from Telegram's picker);
+2. a panel line with the read-back summary and `Diagnosis <OUTCOME>`;
+3. the nine trace stages in the deployment logs;
+4. the decision: `ENTITY_RETAINED_RENDER_UNVERIFIED` with a plain glyph still
+   shown ⇒ sender eligibility / rendering limitation (owner account decision —
+   Telegram Premium for the bot owner per Bot API 9.4, or a Fragment-purchased
+   username for the bot); `ENTITY_STRIPPED_OR_MISSING` with
+   `document_alt_match=false` ⇒ the sent span did not match the document's
+   `alt` (a constructive follow-up, proven before it is touched);
+   `SEND_FAILED` ⇒ Telegram's own error text names the restriction.
 
-The test is **successful only if the bot's message shows the real Premium
-custom emoji**. A plain glyph there is a failure.
+## 9. Known limitations (honest)
 
-## 10. Known limitations (honest)
+1. **Live rendering remains unverified** (§8) — only Telegram can prove it.
+2. **Account eligibility is unresolved.** The owner has no Telegram Premium;
+   the bot's Fragment status is unknown. The Bot API 9.4 owner-Premium rule and
+   the earlier Fragment rule are documented, but which governs this exact
+   MTProto bot send is not verified. **No entitlement probing was added** (it
+   would need new credentials/privileged access).
+3. **The read-back proves retention, not display.** A client-side render
+   decision (H4) cannot be separated from a server-side entitlement gate (H1)
+   by any API read; that final step is the owner looking at the message.
+4. **No code defect was demonstrated**, so no corrective code change was made;
+   only instrumentation. If `OUTBOUND_ENTITY_INVALID` ever fires in the live
+   run, the payload validation has found the defect and it will fail closed.
+5. **The helper bot still needs a private chat with the owner** (press Start);
+   otherwise the run reports `E_NO_BOT_CHAT` / `SEND_FAILED` honestly.
+6. The existing 120 s pending-input state expiry and the 90 s handler backstop
+   are unchanged.
 
-1. **Live rendering unverified** (§9) — the one thing only Telegram can prove.
-2. **The helper bot's Fragment capability is the hard constraint.** A plain bot
-   cannot reliably use custom-emoji entities; if the helper bot has not bought
-   an additional username on Fragment, Telegram will reject the send and the POC
-   will report `E_SEND` with Telegram's own error. That is the exact technical
-   boundary, reported — **not** hidden behind a Unicode fallback.
-3. **The bot needs a private chat with the owner** (open the bot, press Start)
-   for the demo message; otherwise the POC reports `E_NO_BOT_CHAT` honestly. The
-   bot cannot post the proof into Saved Messages itself (a bot cannot write
-   there), so the demo lands in the bot's own chat with the owner.
-4. **The existing 120 s pending-input state expiry applies** (unchanged
-   contract): the owner replies within it, or launches the action again.
-5. **Transient by design:** the selected emoji is not persisted, not imported
-   into the library and not applied as a reaction — the POC proves the
-   rendering boundary only.
-6. The alt-text placeholder (`▪`) is used only when Telegram reports no alt
-   text, purely so the entity has an underlying span; it never substitutes for
-   the custom emoji identity.
-
-## 11. Success / failure statement against the request
+## 10. Success / failure statement against the request
 
 | Requirement | State |
 |---|---|
-| User can launch the POC | ✅ `💬 Set Reaction Emoji` in the Emoji panel |
-| A deterministic Saved Messages selection message is created | ✅ recorded exact `chat_id` + message `id` |
-| The user can reply to that exact message with a Premium emoji | ✅ implemented (live step owner-run) |
-| The Self Bot extracts the REAL Telegram custom-emoji identifier | ✅ from `MessageEntityCustomEmoji.document_id`, entity-only |
-| The helper bot receives the actual custom-emoji identity | ✅ one serialized entity dict → real TL entity |
-| The helper bot constructs a proper custom-emoji entity | ✅ `MessageEntityCustomEmoji(offset, length, document_id)` via the existing bridge |
-| The resulting helper-bot message is capable of rendering it | ✅ constructed and sent **once**; rendering itself needs the owner's live check + the Fragment capability |
-| Focused tests pass | ✅ 41/41 (full suite 5693 passed, 26 skipped) |
-| No unrelated architecture modified | ✅ scope table in §3 |
-| Live rendering proven | ❌ **not verified** — no live Telegram available |
+| Trace distinguishes all nine stages | ✅ `SOURCE_ENTITY_FOUND`, `SOURCE_ENTITY_VALIDATED`, `OUTBOUND_ENTITY_BUILT`, `BRIDGE_ENTITY_CONVERTED`, `SEND_STARTED`, `SEND_ACCEPTED`, `READBACK_STARTED`, `READBACK_RESULT`, `DIAGNOSIS` |
+| Structured fields, no secrets/dumps | ✅ ids/offsets/lengths/bounded spans/reason strings only; pinned by test |
+| Read-back of the exact sent message via the helper bot's client | ✅ `get_messages(peer, ids=<id>)` under `guarded_await`; no scan; pinned by test |
+| Entity type/id/offset/length/span comparison | ✅ recorded in `readback` and logged in `READBACK_RESULT` |
+| Read-back failure handled separately from send failure | ✅ `READBACK_FAILED` with `ok` (send) unchanged |
+| Diagnostic outcomes | ✅ all seven, one per run, classified by `classify_diagnosis` |
+| Payload validation before send | ✅ `validate_proof_payload`, fail-closed |
+| Document-`alt` comparison when obtainable | ✅ via the existing typed wrapper; failure is recorded, never fatal |
+| Minimal bridge change, other callers unchanged | ✅ one conditional log line; pinned by test |
+| No speculative changes (no second client/loop, no API switch, no fallback, no guessed ids, no Unicode-as-Premium) | ✅ architecture pins still pass |
+| Focused offline tests | ✅ 19 new POC tests + 1 bridge test; no credentials required |
+| `py_compile`, focused tests, bridge tests, full suite, `git diff --check` | ✅ all passed (§7) |
+| No fabricated live result | ✅ §8 states plainly that no live run was performed |
 
-Nothing in the request's "DO NOT TOUCH" list was modified. Explicitly:
-
-* **No Emoji Library import redesign was performed.** The import/scan path,
-  sticker-set scanning, pagination, categories, mappings and the replacement
-  pipeline are byte-for-byte unchanged.
-* **No Supabase schema change was performed.** No migration was added or edited,
-  no SQL was executed, no database was contacted, and
-  `DATABASE_ARCHITECTURE.md` is unchanged.
-* The existing reaction system is unchanged; the POC is an additive sibling
-  action, and it never converts a Unicode glyph into a "Premium" success.
-
-## 12. Remaining work IF the POC is accepted
-
-1. Owner runs the live check (§9) and records the outcome (especially whether
-   the helper bot's Fragment capability allows the entity).
-2. If accepted: decide the real reaction-emoji UX that builds on this proof
-   (library picker vs. this reply-mode probe) and wire the selected identity
-   into `reaction_service` — the POC deliberately does not.
-3. If the helper bot cannot use custom-emoji entities, that Fragment
-   ownership/cost decision is the owner's (ROADMAP §17/§34-D); the POC must not
-   be extended with a Unicode fallback unless that mode is explicitly approved.
-4. Optional cleanup when the capability is proven: remove the placeholder-glyph
-   path if live alt text always exists.
-
-## 13. Delivery metadata
+## 11. Delivery metadata
 
 | Item | Value |
 |---|---|
 | Repository | `Onlyicing1/Telegram-self-bot` (connected workspace remote; never hardcoded into code) |
 | Branch | `main` |
-| This pass's commits | the `feat:` commit carrying the POC (service + handler + bridge + tests + this report), then the `test:` commit adding the listener-dispatch tests; the latest is the current tip of `origin/main` (`git log -1`) |
+| Baseline before this pass | `06eeb8d` (`docs: record premium custom emoji rendering investigation`) — the workspace was fast-forwarded to `origin/main` first |
+| This pass's commit | the scoped `diag(emoji): …` commit (service + handler + bridge + tests + both documents) |
 | Push | `git push origin main` — fast-forward only; no rebase, no force-push, no history rewrite |
-| Working tree | clean |
+| Working tree | clean except the pre-existing untracked `telegram-self-bot/` mirror (never touched) |
 
-## 14. Push verification
+## 12. Push verification
 
 Verified against the live remote after the push with the four commands the task
-names:
-
-```
-git fetch origin main
-git rev-parse HEAD
-git rev-parse origin/main
-git ls-remote origin refs/heads/main
-git status --short
-```
-
-`HEAD == origin/main == ls-remote refs/heads/main` at the POC commit, working
-tree clean with no untracked task files.
+names (`git fetch origin`, `git rev-parse HEAD`, `git rev-parse origin/main`,
+`git ls-remote origin refs/heads/main`) plus `git status --short`; the result is
+recorded in the final report of this pass.

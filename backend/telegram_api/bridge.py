@@ -27,6 +27,8 @@ import asyncio
 import logging
 from typing import Any
 
+from telethon.tl.types import MessageEntityCustomEmoji
+
 from backend.helper import client as helper_client
 from backend.runtime.operation_watchdog import guarded_await
 from backend.telegram_api._helpers import dict_entities_to_tl
@@ -86,6 +88,20 @@ async def send_reconstructed(
 
     bot = helper_client.get_client()
     tl_entities = await dict_entities_to_tl(bot, entities)
+    # Diagnostic trace for the entity that the whole successful-render question
+    # hinges on. Logged only when a custom-emoji entity was actually
+    # reconstructed, so a plain (or formatting-only) send is byte-for-byte the
+    # same call as before with no extra output.
+    custom_emoji = [e for e in tl_entities if isinstance(e, MessageEntityCustomEmoji)]
+    if custom_emoji:
+        logger.info(
+            "[BRIDGE] BRIDGE_ENTITY_CONVERTED type=MessageEntityCustomEmoji "
+            "count=%d spans=%s",
+            len(custom_emoji),
+            ",".join(
+                f"{e.offset}:{e.length}:{e.document_id}" for e in custom_emoji
+            ),
+        )
     peer = resolved_peer if resolved_peer is not None else await client.get_input_entity(chat_id)
     try:
         msg = await guarded_await(
