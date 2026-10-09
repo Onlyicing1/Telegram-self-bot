@@ -45,11 +45,19 @@ what it shows (§5, §6).
   use custom emoji in messages directly sent by the bot to private, group and
   supergroup chats if the owner of the bot has a Telegram Premium
   subscription."* (source: <https://core.telegram.org/bots/api-changelog>, read
-  during the previous pass.) Our probe is exactly that case: the helper bot
-  sends a direct message into its own private chat with the owner. The
-  alternative official route — a bot that purchased additional usernames on
-  Fragment — remains valid as well (the constraint recorded in `ROADMAP.md`
-  §17/§28).
+  in the previous pass and re-read for this pass on 2026-10-09.) Our probe is
+  exactly that case: the helper bot sends a direct message into its own private
+  chat with the owner. The alternative official route — a bot that purchased
+  additional usernames on Fragment — remains valid as well (the constraint
+  recorded in `ROADMAP.md` §17/§28).
+- **The server-side trap is documented too.** The MTProto custom-emoji
+  documentation states verbatim: *"…the messageEntityCustomEmoji entity must
+  wrap exactly one regular emoji (the one contained in
+  documentAttributeCustomEmoji.alt) in the related text, otherwise the server
+  will ignore it."* (source: <https://core.telegram.org/api/custom-emoji>,
+  re-read for this pass on 2026-10-09.) That is the documented mechanism for a
+  "send succeeded but no render" outcome — and exactly what the read-back's
+  `document_alt` comparison now measures instead of assuming.
 - **Medium confidence the live failure was the sender-side entitlement gate
   rather than our pipeline.** Every local stage is proven in source and by
   tests (§4, §9) and the final request bytes carry the custom-emoji
