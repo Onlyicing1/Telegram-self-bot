@@ -1,252 +1,333 @@
-# Investigation — Remaining Project Roadmap (Reconstruction)
+# Investigation — Premium Custom Emoji rendering through the Helper Bot
 
-## Status
+Canonical record of the forensic investigation into the failed Premium
+Telegram Custom Emoji POC (the `💬 Set Reaction Emoji` probe).
 
-**Investigation and planning only — no implementation performed.**
-
-This document **replaces the previous `INVESTIGATION.md` completely** (the
-Stage-5-era forensic audit of AI request understanding). It is a read-only
-reconstruction of the authoritative remaining project roadmap from the current
-repository. It changes no production code, no test, no migration, no prompt,
-and no `DATABASE_ARCHITECTURE.md` content. Nothing was executed against live
-Telegram, a live AI provider, or live Supabase. No runtime test suite was run
-for this task; the validation performed was repository/source/diff validation.
-
-**Planning deliverables of this task:**
-
-- **`ROADMAP.md` created** — the authoritative MASTER PROJECT ROADMAP. No
-  roadmap document existed before (the only "roadmap" text in the repository is
-  `AI_MASTER_DESIGN.md` §17, the superseded design-document Phase 1–6 plan).
-  `IMPLEMENTATION_REPORT.md` recorded only *"Stage completed: Stage 6 / Next
-  stage: Stage 7"* — a number with no content — so one standing document is
-  required for two-stage-at-a-time execution.
-- **`INVESTIGATION.md` replaced** — this file.
-- **`IMPLEMENTATION_REPORT.md` annotated** with a planning-deliverable pointer;
-  it still records **Stage 6 as the last completed stage**. Stage 7 is
-  **planned, not completed**.
-
-**Baseline:** repository `Onlyicing1/Telegram-self-bot`, branch `main`, HEAD
-`a317bc8e23edce5388e264442902b27739d6acf1` = `origin/main`, working tree clean
-except the pre-existing untracked `telegram-self-bot/` (never staged).
+- Repository `Onlyicing1/Telegram-self-bot`, branch `main`, baseline HEAD
+  `5935ba1` (working tree clean when this investigation began).
+- Investigation only: **no production code was changed**, no database was
+  contacted, no SQL was executed, and **no request was sent to Telegram from
+  this workspace**.
+- This file **replaces** the previous `INVESTIGATION.md` (the roadmap
+  reconstruction), whose deliverable `ROADMAP.md` remains the authoritative
+  roadmap; the replaced content is preserved in git history.
 
 ---
 
-## Task and method
+## 1. Question under investigation
 
-**Question:** what remains before LifeOS can be considered complete, and in
-what order should that work proceed?
+Why did the Helper Bot display only the ordinary Unicode fallback glyph
+instead of the intended Premium Custom Emoji when the owner ran the POC
+(`Menu` → Emoji → `💬 Set Reaction Emoji` → reply with a premium emoji), and
+is actual Premium Custom Emoji rendering achievable through the current
+Helper Bot / API path (the existing helper bot client and its Telethon MTProto
+send), or is that path inherently incapable of it?
 
-**Evidence hierarchy used:** current source code → current architecture
-documents (`AGENTS.md`, `DATABASE_ARCHITECTURE.md`, `AI_MASTER_DESIGN.md`) →
-current `IMPLEMENTATION_REPORT.md` → the previous `INVESTIGATION.md` → tests
-and their coverage → historical documents only to reconstruct intent.
+## 2. Verdict and confidence
 
-**Method:**
+**POSSIBLE BUT ACCOUNT-DEPENDENT.**
 
-1. Verified the repository state (branch, HEAD, remote equality, tree status)
-   and confirmed no roadmap document existed.
-2. Read the current workflow documents: `IMPLEMENTATION_REPORT.md` (Stage 6),
-   the previous `INVESTIGATION.md` (Stage-5 audit), `AGENTS.md`,
-   `DATABASE_ARCHITECTURE.md` (read-only, incl. its migration-status,
-   credential-vault, reconciliation and canonical-setup sections),
-   `AI_MASTER_DESIGN.md` (its §17 roadmap and §20 future ideas), `README.md`,
-   and the two documents under `docs/` plus `we_investigation_report.md`.
-3. Mapped the implementation surface against the source: entry point, runtime,
-   handlers, services, AI engine/dispatcher/providers/registry/executor,
-   task/scheduler modules, media/STT/TTS modules, credential vault, web app,
-   migrations, deployment files, and the 204 test modules.
-4. Searched the tree for future-work markers (`TODO`, `FIXME`, `deferred`,
-   `remaining work`, `next stage`, `later phase`, `not implemented`,
-   `NOT PROVEN`, `NOT VERIFIED`, `blocked`, `planned`, `roadmap`, `phase`,
-   `stage`, `deferred capability`) and classified every finding A–G (below).
-   Marker hits that are ordinary vocabulary (e.g. `_TODO_ADD_FIELDS` field
-   sets, "future placeholder" docstrings that describe the current design)
-   were not converted into tasks.
-5. Derived the remaining stages from the *confirmed* remaining work only, and
-   wrote them into `ROADMAP.md` with objective, prerequisites, tasks, files,
-   constraints, tests, DoD, blockers and dependencies per stage.
+- **High confidence that the mechanism is feasible.** Telegram's official
+  Bot API changelog (February 9, 2026 — Bot API 9.4) states verbatim:
+  *"Allowed bots to use custom emoji in messages directly sent by the bot to
+  private, group and supergroup chats if the owner of the bot has a Telegram
+  Premium subscription."* (source: <https://core.telegram.org/bots/api-changelog>,
+  read during this investigation.) Our probe is exactly that case: the helper
+  bot sends a direct message into its own private chat with the owner. The
+  alternative official route — a bot that purchased additional usernames on
+  Fragment — remains valid as well (the constraint the implementation phase
+  recorded in `ROADMAP.md` §17/§28).
+- **Medium confidence that the live failure was the sender-side entitlement
+  gate rather than our pipeline.** The whole local pipeline — extraction, ID
+  propagation, entity conversion, and the final serialized Telegram request —
+  is proven correct down to the wire bytes (§4, §6). What could not be observed
+  from this workspace is the one layer where the failure occurred: Telegram's
+  server-side acceptance/storing/rendering decision. That decision depends on
+  the helper bot owner's account state (Telegram Premium subscription or a
+  Fragment username), which is not inspectable here and was never read back.
+- The verdict is therefore not `YES` (rendering was never observed live) and
+  not `NO` (no rejection or design flaw was proven), and not `UNKNOWN` (the
+  code path is fully proven and the governing official rule is documented).
 
-**Classification key used for every finding:** **A** COMPLETED (implemented and
-sufficiently validated) · **B** PARTIALLY IMPLEMENTED · **C** IMPLEMENTED BUT
-NOT VERIFIED · **D** REQUIRED REMAINING WORK · **E** OPTIONAL / NON-BLOCKING ·
-**F** HISTORICAL / OBSOLETE · **G** UNCERTAIN. Uncertainty was never converted
-into a task; the uncertain items live in the roadmap's §6.
+## 3. Observed behavior
 
----
+### 3.1 The owner's live observation (reported, not observed by this agent)
 
-## Repository state
+- The helper bot's message **was delivered** and the Glass panel reported the
+  send as accepted (the `✓ Telegram accepted …` path) — per the owner's
+  report; this agent did not see the panel or any network response.
+- The delivered message displayed **only the ordinary Unicode glyph** of the
+  selected emoji instead of the Premium (sticker-rendered) custom emoji.
+- The glyph seen was a real emoji glyph (the same glyph the payload carries),
+  not the `▪` placeholder — argued from the report; the exact glyph string was
+  never captured programmatically (§11, U1).
 
-| Item | Value |
-|---|---|
-| Repository | `Onlyicing1/Telegram-self-bot` (remote `origin`) |
-| Branch | `main` |
-| Local HEAD | `a317bc8e23edce5388e264442902b27739d6acf1` — `fix(ai): repair the tool contract, context budget and tool-use policy` (Stage 6) |
-| Remote HEAD (`origin/main`) | `a317bc8e23edce5388e264442902b27739d6acf1` (equal; verified with `git fetch origin` + `git rev-parse origin/main` + `git merge-base --is-ancestor` → exit 0) |
-| Working tree | clean except the pre-existing untracked nested repository `telegram-self-bot/` (never staged) |
-| Local Python used by the project venv | 3.10.12; production declares 3.11.7 (`render.yaml`) |
-| Migrations | 30 files in `supabase/migrations/`; canonical setup is ONE paste-ready block (`DATABASE_ARCHITECTURE.md` §31.3, parts 1–8); multiple individual states remain **NOT APPLIED — owner action required** |
-| Tests | 204 test modules under `tests/`; Stage 6 recorded full suite 5158 passed / 26 skipped |
-| Roadmap document before this task | none (`find`/`grep` for roadmap documents returned only `AI_MASTER_DESIGN.md` §17, superseded) |
+### 3.2 Source-level findings (verified in this workspace)
 
----
+- Extraction is **entity-only**: `inspect_message`
+  (`backend/services/premium_emoji_probe_service.py`) reads
+  `MessageEntityCustomEmoji.document_id` (rejecting non-positive/bool ids) and
+  derives `alt_text` from the entity's own UTF-16 span (`_span_text` →
+  `utf16_index_at`); the visible text is never promoted to the emoji identity.
+- The payload is `PROOF_PREFIX = "Selected reaction emoji: "` (25 UTF-16
+  units) + glyph, with exactly one entity dict `{type:
+  "MessageEntityCustomEmoji", offset: 25, length: utf16_length(glyph),
+  document_id}`; when Telegram reports no alt text, the glyph falls back to
+  `PLACEHOLDER_GLYPH = "▪"` with `used_placeholder=True`.
+- Conversion never drops the entity: `dict_entities_to_tl`
+  (`backend/telegram_api/_helpers.py`) rebuilds
+  `tl_types.MessageEntityCustomEmoji(offset, length, doc_id)`; the type is in
+  `SUPPORTED_ENTITY_TYPES` and any unknown type or missing/invalid
+  `document_id` **raises** `TelegramAPIError` — there is no discard path.
+- The sender is the **helper bot over MTProto**: `bridge.py` takes
+  `bot = helper_client.get_client()` (a Telethon bot-token client,
+  `backend/helper/client.py`) and calls
+  `bot.send_message(peer, text, formatting_entities=…)`. There is **no HTTP
+  Bot API path**: zero `api.telegram.org` references in `backend/` or `src/`,
+  and `backend/requirements.txt` contains `telethon==1.34.0` with no
+  python-telegram-bot / aiogram / pyTelegramBotAPI.
+- No parse-mode conversion can occur: Telethon 1.34
+  (`telethon/client/messages.py`, the `formatting_entities is None` branch)
+  only calls `_parse_message_text` when `formatting_entities is None`; with
+  entities supplied it builds `messages.SendMessageRequest(…,
+  entities=formatting_entities)` verbatim.
 
-## Confirmed facts (source- or document-verified)
+### 3.3 Automated test results
 
-These are the facts the roadmap is built from. "Evidence" cites where each fact
-was read; nothing in this table is carried over from an old report without
-re-verification against the current tree.
+- `tests/test_premium_emoji_probe.py` → **43 passed**, exit 0 (re-run for this
+  task, §8). These tests pin the offline path including the exact outbound
+  shape at the send boundary (`type(entity) is MessageEntityCustomEmoji`,
+  correct `document_id`, UTF-16 `offset`/`length`, exact text, the bot's own
+  peer, and that the self client sent nothing).
+- Unit tests are **not** evidence of live rendering; they fake the Telegram
+  surface by design.
 
-| # | Fact | Class | Evidence |
-|---|---|---|---|
-| 1 | Stage 5 (removal of the deterministic semantic router and fast path) is complete; the boundary is pinned by four suites | A | `eb4d852`; no hits for `parse_command_intent`/`_try_local_fast_path` in `backend/`; `tests/test_semantic_intent_boundary.py`, `test_regex_routing_removal.py`, `test_intent_routing_boundary.py`, `test_provider_tool_boundary.py` |
-| 2 | Stage 6 (tool contract, history budget, Gemini system messages, decision policy, continuation alignment) is complete and committed | A | `a317bc8`; `IMPLEMENTATION_REPORT.md`; recorded 5158 passed / 26 skipped |
-| 3 | 55 tools are registered in the live registry; provider-facing `required` is declaration-based | A | `backend/ai/tools/registry.py` (55 registered tools); `backend/ai/tools/base.py` `provider_required_arguments`; `tests/test_tool_schema_contract.py` |
-| 4 | Provider layer: 15 registry entries — 12 OpenAI-compatible chat adapters, Gemini (custom mapper), Dummy (never selected in production), `you` (web-search capability, never a chat engine) | A | `backend/ai/providers/factory.py`; `tests/test_provider_system_instruction_contract.py` |
-| 5 | `ProviderManager` owns selection/fallback/retry/cooldown; `RuntimeSupervisor` is the single recovery authority | A | `backend/ai/providers/manager/manager.py`; `backend/runtime/supervisor.py` |
-| 6 | `ToolExecutor` is the only component that calls `tool.execute()` | A | `backend/ai/tools/executor.py`; no other production caller found |
-| 7 | Durable task system complete through Part 3F (chains, waits, branches, question parks, multi-question, continuation, prepare-ahead) | A | commits `83c5abd`…`679ae09`; `backend/ai/task_*.py`; `tests/test_task_*` |
-| 8 | Ghost Seen v2 implemented (stages 1–8 + hardening) and registered in the router | A | `backend/bot/handlers/ghost_seen_v2.py`; `backend/bot/router.py`; `tests/test_52…66_ghost_seen_v2_*` |
-| 9 | Media processing implemented through the M-line (documents, OCR, STT, chunking, engines, fallback, credential pool, consensus, probe) | A | `backend/services/media_service.py`; `backend/services/stt_*.py`; `backend/services/gemini_media_engine.py`; `tests/test_media_*` |
-| 10 | Save V2 metadata/resolution/Telegram-sync complete; Deep Save never forwards (forwarding exists only in retrieval) | A | `backend/services/save_service.py`; `backend/services/retrieve_service.py` (only `forward_messages` use); `tests/test_save_v2_*` |
-| 11 | Credential Vault control plane complete in repo/tests (metadata table, resolution RPC, five management RPCs) | A (repo) | `supabase/migrations/2026091900000*`; `backend/services/credential_service.py`; `tests/test_credential_vault.py`, `test_credential_management.py` |
-| 12 | **No live provider/model verification** that a real model selects the correct tools | C | Stage 6 report §10.1 |
-| 13 | **No live Telegram run by any phase** | C | Stage 6 report §10.2; `IMPLEMENTATION_REPORT.md` at `5c47f66` §12 |
-| 14 | **No live Supabase execution by any phase**; migrations documented NOT APPLIED | C/D | `DATABASE_ARCHITECTURE.md` §20, §29, §30.11, §31 ("NOTHING has been executed") |
-| 15 | **No production-parity check** (Render / Python 3.11.7) ever performed | C | `5c47f66` §12 |
-| 16 | **No live recognition loop ever run** for OCR/STT; Persian quality unmeasured | C | `5c47f66` §10/§11; `we_investigation_report.md` (recommends a controlled 30–50 sample test over five routes) |
-| 17 | Credential Vault never applied live; **no secret ever created**; panel never exercised live | C | `DATABASE_ARCHITECTURE.md` §29.13; `5c47f66` §10 |
-| 18 | TTS frozen and hidden from the UI by owner decision (implementation retained; reactivation requirements recorded) | E (frozen) | commit `ee5967f`; `backend/bot/handlers/ai_stt_settings.py` hub diff |
-| 19 | The canonical database contract is ONE paste-ready block (§31.3, parts 1–8) covering 16 reconciled tables + `api_credentials` + `todo_steps`; owner action required | D | `DATABASE_ARCHITECTURE.md` §31.1–§31.3; `supabase/canonical_bootstrap.sql` byte-identical to `20260920000001_reconcile_canonical_schema.sql` |
-| 20 | `render.yaml` declares Python 3.11.7 and `/health` but enumerates only a subset of provider env keys (`YDC_API_KEY`, newer adapters, `GHOST_SEEN_*` absent) and has no dashboard build step; `dist/` is gitignored | D/E | `render.yaml`; `.gitignore`; `backend/ai/providers/factory.py` env maps |
-| 21 | Local/declared Python skew: 3.10.12 local vs 3.11.7 declared | D/E | `.venv/bin/python --version`; `render.yaml` |
-| 22 | Documented whole-prompt ceiling is a diagnostic, not an enforced bound; multi-model token counting is "a separate change" | B/E | Stage 6 report §10.5 |
-| 23 | The JSON fallback for providers without native tool calling is narrower than native tool calling, by design | E | Stage 6 report §10.3; prompt OUTPUT rule 8 |
-| 24 | Documentation drift: `AGENTS.md` §15 delivery table records `6bec694` (pre-Stage-5); `backend/ai/providers/__init__.py` still describes providers as NOT_IMPLEMENTED stubs; `backend/ai/stt_control_plane.py` / `stt_provider_probe.py` call the fallback/cooldown layer "a later phase" although `backend/services/stt_fallback.py` exists; stale skipped Ghost Seen v1 tests remain in `tests/test_51_execution27.py` | D (hygiene) | direct file reads |
-| 25 | Removed architecture (must not be resurrected): semantic router/fast path, forward-save, legacy dot commands, Ghost Seen v1 and its removed AI-reply flow | F | Stage 5 report; `router.py`/`misc.py`; `test_51` skip reasons; `ghost_seen_v2` current files |
-| 26 | `docs/implementation/ghost-room-ai-foundation-contract.md` is superseded: it describes `_try_local_fast_path` (removed in Stage 5) and a greenfield "Ghost Room" that was delivered as Ghost Seen v2 | F | doc text vs `backend/bot/handlers/ghost_seen_v2.py` |
-| 27 | `docs/investigations/PHASE_1_DATABASE_DISCOVERY.md` is largely superseded by the later schema reconciliation (its "missing" `ai_usage`/`ai_provider_stats` migrations now exist; canonical contract exists); its remaining questions (`ghost_chats`, `ai_preferences`, retention) are owner decisions | F/E | doc vs `supabase/migrations/`; `DATABASE_ARCHITECTURE.md` §30 |
-| 28 | Design-document "future ideas" not implemented: vision (`vision not supported`; `DEFAULT_VISION_ENABLED=False`), streaming (panels cannot stream), plugins (only `EngineHooks`), embedding search, smart routing, conversation export | E | `AI_MASTER_DESIGN.md` §18/§20; `backend/ai/providers/base/contract.py`; `backend/ai/config/defaults.py`; `backend/ai/engine/hooks.py` |
-| 29 | Taskloom's deliberate non-features (no question timeout/reminder, no dynamic replanning, no parallel/loops, no cross-task data flow, no multimodal answers) | E | `5c47f66` §11 "NOT IMPLEMENTED" list |
-| 30 | Opt-in live harnesses already exist and skip honestly without credentials (`test_live_supabase_memory.py`, STT provider probes) | support | test skip conditions read directly |
-| 31 | `AI_MASTER_DESIGN.md` §17 "Development Roadmap" is the historical design-doc plan; its Phase 1–5 capabilities were delivered in evolved form under the Glass UI architecture; Phase 6 (Plugins) was never adopted | F | design doc vs current architecture; `AGENTS.md` (no plugin subsystem) |
-| 32 | The current architecture is documented as authoritative in `AGENTS.md`, including the one-command `Menu`, no dot commands, Deep Save only, single-scheduler/executor/authority rules | A | `AGENTS.md`; cross-checked against `misc.py` (`raw_text == "Menu"`), `save_service.py` (no forward), task system |
+## 4. End-to-end data path
 
----
+Only as far as the evidence establishes (steps 1–8 proven, step 9 not
+observable from this workspace):
 
-## Derived planning (not inherited)
+1. **Launch** — `backend/bot/handlers/emoji.py`,
+   `_react_premium_action` (`action:emoji_react_premium`) sends the selection
+   prompt to Saved Messages with the **self client**, records its exact
+   `chat_id` + message `id`, and arms the existing pending-input state
+   (`set_pending`) for `_react_premium_reply_handler` (90 s handler backstop;
+   the existing pending-input expiry contract is unchanged).
+2. **Owner's reply** — the handler reads the reply with the self client
+   (`get_messages(chat_id, ids=msg_id)`), rejects replies targeting another
+   chat, non-replies, and any reply whose `reply_to_msg_id` is not the exact
+   selection message id.
+3. **ID extraction** — `inspect_message(reply)` returns
+   `{kind, document_id, alt_text, detail}`: `custom_emoji` only for a real
+   `MessageEntityCustomEmoji` with a usable `document_id`; a plain Unicode
+   emoji, media-only/empty reply, or unusable id fails closed.
+4. **Payload build** — `build_proof_payload(document_id, alt_text)` produces
+   the text, the single entity dict, `fallback_text` and `used_placeholder`
+   (§3.2).
+5. **Destination resolution** — `_resolve_bot_peer(owner_id)` resolves the
+   owner's peer **through the helper bot's own session** (entity cache first,
+   then a bounded `iter_dialogs(limit=50)`); no chat ⇒ `E_NO_BOT_CHAT` with
+   the honest instruction to press Start on the bot.
+6. **Bridge conversion** — `backend/telegram_api/bridge.py::send_reconstructed`
+   rebuilds the dict into TL entities via `dict_entities_to_tl` and calls
+   `bot.send_message(peer, text, formatting_entities=tl_entities or None,
+   reply_to=None)` inside `guarded_await` (30 s bound); Telegram rejection ⇒
+   `TelegramAPIError` ⇒ the probe reports `E_SEND` with Telegram's own error.
+7. **Client serialization** — Telethon 1.34 builds
+   `messages.SendMessageRequest(…, entities=formatting_entities)` without any
+   parse-mode pass (§3.2).
+8. **Wire bytes** — verified offline by serializing the real request object
+   (§6): the custom-emoji constructor, offset, length and document id are
+   present in the final request bytes.
+9. **Telegram server → rendering in the bot's private chat with the owner** —
+   *not observable here*: whether Telegram stored the entity, stripped it, or
+   stored it but rendered the fallback glyph was never read back (the POC
+   deliberately never fetches the sent message).
 
-The repository never defines what Stage 7+ contains. The **planning** below is
-derived by this investigation from the confirmed facts above; it is recorded in
-full — with tasks, files, constraints, tests, DoD, blockers and dependencies —
-in `ROADMAP.md` §4. It is derived, not authoritative-by-history.
+## 5. Exact failure point
 
-| Stage | Derived scope | Derived from facts |
+**Not proven to a single layer.** What is proven: the failure is **past our
+serialization** — steps 1–8 of §4 are correct in source, pinned by tests, and
+reproduced byte-exactly. The failure lives in step 9 (server-side
+acceptance/entitlement/rendering), which this workspace cannot observe.
+Competing hypotheses:
+
+| # | Hypothesis | Evidence for | Evidence against | Distinguishing evidence needed |
+|---|---|---|---|---|
+| H1 | **Sender-side entitlement gate**: the helper bot's owner has no Telegram Premium subscription and the bot has no Fragment-purchased username, so Telegram does not render (or drops) the custom-emoji entity | Official Bot API 9.4 makes rendering conditional on the owner's Premium subscription; the repo's own recorded constraint (`ROADMAP.md` §17/§28) is the Fragment rule; the owner's account state was never checked | The send was not reported as rejected (owner saw the message + `✓`) — so if it applies, it applies as **silent non-rendering**, not an error | Owner-account check (is the bot owner Premium? does the bot have a Fragment username?) + the read-back test in §9 |
+| H2 | **Server silently ignores the entity**: the official MTProto custom-emoji documentation says an entity that does not wrap exactly one regular emoji matching the document's `alt` is ignored by the server (no error) | Official doc (<https://core.telegram.org/api/custom-emoji>, read during this investigation); a silent ignore matches the observed "message arrived, glyph only" behavior | If the owner saw exactly the selected emoji's own glyph, the payload span *is* that glyph (copied from the same entity), which normally matches `alt` | Compare the sent span text against the document's `alt` on the read-back message |
+| H3 | **Placeholder branch ran** (empty `alt_text` ⇒ payload text ends in `▪`) | The branch exists and is a proven latent defect for H2's rule | The owner reported a real emoji glyph, not `▪` | The exact sent text (read-back) |
+| H4 | **Entity stored but not rendered client-side** (renderer/entitlement on the viewing account) | Matches "send accepted, glyph shown" | Cannot be separated from H1 without a read-back | Read-back shows the entity present ⇒ H1/H4 territory; absent ⇒ H2/H3 territory |
+
+No local bug has been proven, so **no code fix was made or is claimed**.
+
+## 6. Outbound request representation
+
+Established by source and by serializing the actual request object offline
+(read-only script; no credentials, no network):
+
+| Field | Value | Status |
 |---|---|---|
-| 7 — Live AI provider/model verification and repair | Run the A–J/Stage-6 diagnostic matrix against ≥2 real providers; repair contract defects; evaluate the whole-prompt budget on real models | 12, 22, 23 |
-| 8 — Live Supabase schema application and persistence verification | Apply the canonical §31.3 block (owner), verify every durable path + fallback live | 14, 19, 17 |
-| 9 — Live Telegram end-to-end verification of the core surfaces | Glass UI, Deep Save/Retrieve/Delete, profile engines, AI activation, Ghost Seen v2 on the real account | 13, 12 |
-| 10 — Live durable task system verification | Task lifecycle, chains/waits/branches/questions, restart safety on the live scheduler clock | 7, 13, 14 |
-| 11 — Live media/speech/vault verification | OCR/STT live, Persian quality benchmark, Vault secret provisioning/resolution | 16, 17 |
-| 12 — Production deployment and runtime verification (Render Free) | Boot, `/health`, self-healing, no-shell paths, parity, dashboard decision | 15, 20, 21 |
-| 13 — Deferred-capability decisions and final documentation closure | Owner decisions for §7 items; documentation truth (drift fixes) | 18, 24, 27, 28, 29 |
+| `text` | `"Selected reaction emoji: " + glyph` (prefix = 25 UTF-16 units; total = 26 chars for a 2-unit glyph) | **Established** (source + serialization) |
+| glyph in the live run | the source entity's own alt text | **Reported** (owner saw a real emoji glyph); exact string not captured |
+| entity type | `MessageEntityCustomEmoji` — TL constructor `messageEntityCustomEmoji#c8cf05f8` | **Established** |
+| `offset` | `25` (UTF-16 code units) | **Established** |
+| `length` | `utf16_length(glyph)` — `2` for a supplementary-plane emoji, `1` for a BMP glyph or the `▪` placeholder | **Formula established**; the live value was not captured |
+| `document_id` | copied from the incoming message's entity (int64) | **Mechanism established**; the live value is not persisted anywhere (the POC is transient by design) |
+| entity count | exactly 1 | **Established** |
+| `reply_to` | none | **Established** |
+| sending identity | the helper bot (Telethon bot-token client, `StringSession` + `start(bot_token=…)`) | **Established** |
+| destination peer | the bot's own private chat with the owner, resolved from the **bot's** session | **Established** |
+| API / protocol | MTProto via Telethon 1.34 — `messages.SendMessageRequest(entities=…)`; no HTTP Bot API involved | **Established** |
+| Telegram's response / stored message | — | **NOT established** (never read back; no live request from this workspace) |
 
-**Ordering logic (derived from actual dependencies, not a template):**
+Byte-level exhibit (reproduced during this task; test document id used as the
+value, arbitrary):
 
-- Stage 7 and Stage 8 are independent foundations and form the first execution
-  chunk. Stage 7 validates the primary interface (the newest work); Stage 8
-  brings the live database to the contract everything durable needs.
-- Stages 9, 10 and 11 are live-capability verifications that persist to the
-  database and travel through Telegram, so they depend on Stage 8 (and 10/11 on
-  Stage 9). Stage 10 additionally needs the `waiting_answer` widening.
-- Stage 12 verifies the verified behavior under production constraints, so it
-  follows 7–11.
-- Stage 13 closes the Definition of Done: deferred items are decided (they need
-  the evidence from 7–12) and the documentation is made truthful.
+```
+… 15c4b51c 01000000 f805cfc8 19000000 02000000 8b5118034991744b
+    ^null      ^vector count = 1  ^messageEntityCustomEmoji#c8cf05f8
+                                    ^offset = 25 (19000000 LE)
+                                              ^length = 2 (02000000 LE)
+                                                        ^document_id (int64 LE)
+```
 
-**Two-stage chunking** (`ROADMAP.md` §5.1): `Stage 7 + Stage 8`,
-`Stage 9 + Stage 10`, `Stage 11 + Stage 12`, `Stage 13`.
+The premium identity is present in the final Telegram request bytes.
 
----
+## 7. Telegram constraints and eligibility
 
-## Explicitly NOT treated as remaining work
+**Official Telegram documentation** (read during this investigation):
 
-- **Removed architecture** — the deterministic semantic router, the pre-provider
-  fast path, forward-save, dot commands, and Ghost Seen v1 (facts 25–26). None
-  is scheduled anywhere.
-- **Superseded documents** — the Ghost Room contract and the Phase-1 database
-  discovery report are historical (facts 26–27); they are kept as record and
-  revisited only for decisions, never as active requirements.
-- **Historical design intent** — `AI_MASTER_DESIGN.md` Phase 1–5 labels and its
-  §20 ideas (facts 28, 31). Optional items are isolated in `ROADMAP.md` §7.
-- **Marker noise** — `TODO`-prefixed identifiers in `backend/ai/actions.py`
-  (e.g. `_TODO_ADD_FIELDS`), "future placeholder" docstrings describing the
-  current design, and stale docstrings that contradict the source (fact 24)
-  are not capabilities; the stale docstrings are assigned to the documentation
-  closure stage, not to a feature stage.
-- **Uncertainty** — items with insufficient evidence (roadmap §6) were left
-  unresolved rather than converted into tasks.
+1. Bot API changelog, **February 9, 2026 / Bot API 9.4**
+   (<https://core.telegram.org/bots/api-changelog>): bots may use custom emoji
+   in messages **directly sent by the bot** to private, group and supergroup
+   chats **if the owner of the bot has a Telegram Premium subscription**. Our
+   probe sends exactly such a direct message.
+2. The earlier (and still-recorded) official restriction: custom-emoji
+   entities could only be used by bots that **purchased additional usernames
+   on Fragment** — recorded as verified against the Bot API documentation in
+   `ROADMAP.md` §17/§28 during implementation; the 9.4 change adds the
+   owner-Premium condition as an additional route. Which condition(s)
+   Telegram enforces for this exact send is **not established** here (§11 U3).
+3. MTProto custom-emoji documentation
+   (<https://core.telegram.org/api/custom-emoji>): the server **silently
+   ignores** a custom-emoji entity that does not wrap exactly one regular
+   emoji matching the document's `alt`. This is the documented mechanism for
+   a "send succeeded but no premium render" outcome.
 
----
+**Third-party sources** (supporting context only, not authoritative):
+python-telegram-bot discussion #3960
+(<https://github.com/python-telegram-bot/python-telegram-bot/discussions/3960>)
+and StackOverflow 79326533 on Telethon premium-emoji sending
+(<https://stackoverflow.com/questions/79326533/telethon-client-doesnt-send-premium-emojies>).
 
-## Source evidence index
+**Implementation inference** (labeled as such): the same server-side
+entitlement rules apply to a bot's MTProto sends, not only to HTTP Bot API
+calls — the entity passes through the same server; this is inferred from the
+server-side wording of the official rules, not from a documented MTProto
+statement.
 
-Primary files read/verified while producing this investigation (all at HEAD
-`a317bc8` unless noted):
+**Unverified assumptions**: none promoted to conclusions — the owner's
+Premium status, the bot's Fragment status, and Telegram's actual stored state
+for this send are all unknown (§11).
 
-- Workflow docs: `IMPLEMENTATION_REPORT.md`, `INVESTIGATION.md` (previous),
-  `AGENTS.md`, `DATABASE_ARCHITECTURE.md` (§20 migration status, §29 vault,
-  §30 reconciliation, §31 canonical setup), `AI_MASTER_DESIGN.md` (§17, §18,
-  §20), `README.md`, `docs/**`, `we_investigation_report.md`.
-- History: `git log`/`git show` for `a317bc8`, `eb4d852`, `5c47f66`, `ee5967f`,
-  the Taskloom series, the Ghost Seen v2 series, and the M-line commits.
-- Source: `backend/main.py`, `backend/config.py`, `backend/runtime/supervisor.py`,
-  `backend/bot/router.py`, `backend/bot/handlers/{misc,ai_unified,ghost_seen_v2,ai_tts_settings}.py`,
-  `backend/ai/tools/{registry,executor,base}.py`,
-  `backend/ai/providers/factory.py`, `backend/ai/providers/manager/manager.py`,
-  `backend/ai/engine/dispatcher.py`, `backend/ai/prompt/*.py`,
-  `backend/ai/task_*.py`, `backend/services/{save_service,retrieve_service,media_service,stt_fallback,tts_service,credential_service,ghost_seen_v2}.py`,
-  `backend/web/app.py`, `backend/ai/config/defaults.py`.
-- Database: `supabase/migrations/` (30 files), `supabase/canonical_bootstrap.sql`.
-- Deployment: `render.yaml`, `Procfile`, `.gitignore`, `package.json`, `src/**`.
-- Tests: the `tests/` inventory (204 modules) incl. the opt-in live skips and
-  the stale `test_51` skips.
+## 8. Tests and live verification
 
-The delivery report records the exact git/status commands used for validation;
-`git diff --check` and `git status` were run before delivery.
+Executed for this task:
 
----
+| Check | Command | Result |
+|---|---|---|
+| Focused POC suite | `.venv/bin/python -m pytest tests/test_premium_emoji_probe.py -q` | **43 passed in 0.39 s**, exit **0** |
+| Byte-level outbound exhibit | read-only Python script: `build_proof_payload` → `dict_entities_to_tl` → `SendMessageRequest` bytes | fragment `f805cfc8 19000000 02000000 <doc_id LE>` **present** (§6) |
+| Bot-API-path check | `grep -rn "api.telegram.org" backend/ src/` + `backend/requirements.txt` | **0 hits**; only `telethon==1.34.0` |
+| Whitespace | `git diff --check` | clean (run before commit) |
 
-## Unresolved questions
+Recorded from the implementation/investigation pass at HEAD `5935ba1` (not
+re-run for this documentation-only change, since no code changed):
+`pytest tests -q` → **5695 passed, 26 skipped**, exit 0
+(`IMPLEMENTATION_REPORT.md` §8). Note: `IMPLEMENTATION_REPORT.md` §11 still
+carries a stale "41/41" row from before the two listener-dispatch tests were
+added; §8 and this document's 43 are the current figures.
 
-Recorded in full in `ROADMAP.md` §6; the essentials:
+**Live verification: NOT performed.**
 
-1. Who performs live verification (the coding agent has never had live account,
-   provider, Supabase, or Render access)?
-2. Which migrations are actually applied in the live Supabase project?
-3. Is `render.yaml` the authoritative production configuration?
-4. Should the dashboard be served in production?
-5. Does the owner intend to reactivate TTS?
-6. What is the acceptance threshold for Persian STT quality?
-7. Which Taskloom extensions (if any) does the owner want?
-8. Which database cleanup items (if any) does the owner approve?
-9. Is the Python 3.10/3.11 skew to be fixed or accepted?
-10. Keep, mark superseded, or replace the historical `docs/` documents?
+- **No live Telegram request was made** from this workspace — there are no
+  credentials here (`freebuff-env list` reports no configured keys), so no
+  message was ever sent and **real custom-emoji rendering was never visually
+  verified by this agent**. The only live data point is the owner's report
+  (§3.1).
+- Unit tests fake the Telegram surface and **must not be read as proof of
+  live rendering**.
 
----
+## 9. Minimal next step
 
-## Validation performed for this investigation
+One decisive, bounded test — a **live read-back**, run on the deployment that
+holds `SESSION_STRING` and `BOT_TOKEN` (it cannot run in this workspace):
 
-- Repository state verified: branch, HEAD, `origin/main` equality, tree status.
-- Every roadmap stage traced to the confirmed facts above; every fact traced to
-  a source file, a repository document, or a git object at the current HEAD.
-- Contradiction search: removed architecture checked absent from the roadmap;
-  historical/deprecated work checked excluded; no Stage 7/8 completion claimed.
-- `git diff --check` clean; staged diff inspected; working tree inspected.
+1. Run the existing POC once: `Menu` → Emoji → `💬 Set Reaction Emoji` →
+   reply to the Saved Messages selection message with a real premium emoji
+   from Telegram's own picker. The panel reports `✓ … message #<id> carrying
+   a REAL custom-emoji entity for document #<N>`.
+2. With the **helper bot's** session, fetch that exact message
+   (`get_messages(owner_id, ids=<id>)`) and inspect `message.entities` and
+   the stored text.
 
-No runtime tests were run for this documentation-only task, and no live
-Telegram, provider, or Supabase contact was made. That is not a limitation of
-the roadmap — it is exactly the gap the roadmap schedules.
+Outcome mapping (this alone separates H1–H4):
 
----
+- **Entity present, glyph still displayed** ⇒ Telegram stored it; the gap is
+  the sender/viewer entitlement (H1/H4) ⇒ owner action, **no code change**:
+  give the bot's owner a Telegram Premium subscription (Bot API 9.4) or buy a
+  Fragment username for the bot, then re-run.
+- **Entity absent** ⇒ the server silently ignored/stripped it (H2/H3) ⇒
+  compare the stored span text with the document's `alt`; only if the
+  placeholder path (`▪`) actually ran would a minimal code follow-up be
+  justified — and it must be proven by this read-back first.
+- **`E_SEND`** ⇒ Telegram's exact error text decides the next move.
 
-End of investigation. Planning document only — no implementation.
+No redesign of the Emoji Library, reactions, or the bridge is needed or
+justified by the current evidence.
+
+## 10. Scope and files
+
+**Inspected during this investigation:** `backend/services/premium_emoji_probe_service.py`,
+`backend/bot/handlers/emoji.py` (POC section), `backend/telegram_api/bridge.py`,
+`backend/telegram_api/_helpers.py`, `backend/telegram_api/entities.py`,
+`backend/helper/client.py`, `backend/helper/input_state.py`,
+`backend/helper/inline_sender.py`, `.venv/.../telethon/client/messages.py`,
+`tests/test_premium_emoji_probe.py`, `backend/requirements.txt`,
+`IMPLEMENTATION_REPORT.md`, `ROADMAP.md` (§17/§28), plus the official Telegram
+pages cited in §7.
+
+**Files changed:**
+
+| File | When | Why |
+|---|---|---|
+| `INVESTIGATION.md` | this task (docs only) | replaced with this canonical record |
+| — production code — | — | **none**: the working tree was clean at `5935ba1` when this investigation began, and the investigation itself made no code change |
+
+**Intentionally left untouched:** the Emoji Library and its import/scan flow,
+pagination, categories and mappings; the replacement pipeline and
+`reaction_service.py` (no evidence implicates it); all Supabase/SQL and
+`DATABASE_ARCHITECTURE.md`; the AI and runtime layers; the POC panel text and
+`ROADMAP.md` §17/§28 (their Fragment-only wording predates Bot API 9.4 —
+updating it is a documentation follow-up, not part of this task).
+
+## 11. Remaining uncertainty
+
+- **U1** — The live run's exact glyph, `length`, and `document_id` were never
+  captured (the POC persists nothing), so the payload actually sent on that
+  run is known only by construction, not by record.
+- **U2** — Whether Telegram **stored** the entity, **stripped** it, or stored
+  it and rendered the fallback is unknown by design: the POC never reads the
+  sent message back. This is the core gap (§9).
+- **U3** — Which official eligibility condition governs this exact send
+  (owner Premium per Bot API 9.4, Fragment username per the earlier rule, or
+  both) is documented as requirements but not verified against our accounts;
+  the owner's account states are unknown.
+- **U4** — H1 vs H2 vs H3 vs H4 remain open hypotheses (§5); no local bug is
+  proven, and none was "fixed".
+- **U5** — The owner's report of panel success (`✓`) and message delivery was
+  not observed first-hand by this agent; no network response was inspected.
+- **U6** — The inference in §7 (server rules applying identically to MTProto
+  bot sends) is reasoned from official server-side wording, not from a
+  documented MTProto guarantee.
