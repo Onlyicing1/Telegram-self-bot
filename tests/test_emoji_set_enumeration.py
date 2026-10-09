@@ -184,8 +184,30 @@ def _emoji_message(msg_id: int, doc_id: int, emoji: str = "😀"):
 async def test_facade_resolves_custom_emoji_document_with_set_identity():
     client = _FakeTlClient(documents=[_doc(555001, "😀", SET_A)])
     result = await get_custom_emoji_documents(client, [555001])
-    assert result == [{"document_id": 555001, "alt": "😀", "set": {"kind": "id", "id": 11, "access_hash": 1100}}]
+    # ``free``/``text_color`` are the additive eligibility facts the custom-emoji
+    # path reports straight from the document attribute (absent flag → False/None).
+    assert result == [{
+        "document_id": 555001,
+        "alt": "😀",
+        "set": {"kind": "id", "id": 11, "access_hash": 1100},
+        "free": False,
+        "text_color": None,
+    }]
     assert client.docs_calls == [[555001]]
+
+
+@pytest.mark.asyncio
+@pytest.mark.asyncio
+async def test_facade_reports_the_document_free_and_text_color_flags():
+    client = _FakeTlClient(documents=[SimpleNamespace(
+        id=9101,
+        attributes=[DocumentAttributeCustomEmoji(
+            alt="😀", stickerset=SET_A, free=True, text_color=7
+        )],
+    )])
+    result = await get_custom_emoji_documents(client, [9101])
+    assert result[0]["free"] is True
+    assert result[0]["text_color"] == 7
 
 
 @pytest.mark.asyncio
@@ -214,7 +236,9 @@ async def test_facade_document_without_custom_emoji_attribute_is_not_a_custom_em
 async def test_facade_document_with_unusable_set_identity_reports_none():
     client = _FakeTlClient(documents=[_doc(8101, "y", None)])
     result = await get_custom_emoji_documents(client, [8101])
-    assert result == [{"document_id": 8101, "alt": "y", "set": None}]
+    assert result == [
+        {"document_id": 8101, "alt": "y", "set": None, "free": False, "text_color": None}
+    ]
 
 
 @pytest.mark.asyncio

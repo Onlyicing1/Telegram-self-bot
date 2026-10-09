@@ -31,7 +31,11 @@ import logging
 import time
 from typing import Any
 
-from backend.helper.inline_engine import get_owner_id, get_self_client
+from backend.helper.inline_engine import (
+    get_owner_id,
+    get_self_client,
+    register_inline_builder,
+)
 from backend.helper.panels import (
     InlinePanelBuilder,
     register_action,
@@ -40,6 +44,7 @@ from backend.helper.panels import (
 from backend.helper.input_state import set_pending
 from backend.services import emoji_category_service as cat_service
 from backend.services import emoji_state_service as state_service
+from backend.services import premium_emoji_inline_service as premium_inline_service
 from backend.services import premium_emoji_probe_service as probe_service
 from backend.services import reaction_service
 from backend.services.emoji_library_service import import_from_saved_messages
@@ -94,9 +99,10 @@ async def _emoji_panel_handler(event, extra: str) -> tuple[str, str, list] | Non
         lines.append("")
         lines.append(f"Replacement: {'✅ ON' if enabled else '❌ OFF'}")
     builder = InlinePanelBuilder()
+    builder.add_row("✨ Send Premium Emoji", f"action:{_INLINE_ACTION}")
     builder.add_row("⬇ Import from Saved Messages", "action:emoji_import")
     builder.add_row("💬 React to a message", "action:emoji_react")
-    builder.add_row("💬 Set Reaction Emoji", f"action:{_PROBE_ACTION}")
+    builder.add_row("🧪 POC · helper-bot sent emoji", f"action:{_PROBE_ACTION}")
     builder.add_row("📚 Library", f"panel:{_LIBRARY_PANEL}")
     builder.add_row("🗂 Categories", f"panel:{_CATEGORIES_PANEL}")
     builder.add_row("🔁 Replacement", f"panel:{_REPLACEMENT_PANEL}")
@@ -1988,6 +1994,297 @@ def from_wid(wid: str) -> int:
     return int(wid)
 
 
+# ── premium emoji via the inline bot (the production feature) ─────────────
+#
+# The ONE delivery path this feature uses, and the ONE entry point for it:
+# the owner replies to a deterministic Saved Messages selection message with
+# a genuine Premium custom emoji; the entity is read from that message (real
+# ``document_id`` + UTF-16 span, never the visible glyph), the HELPER BOT
+# answers the inline query with an ``InputBotInlineMessageText`` carrying
+# that entity, and the OWNER'S OWN account sends the result through
+# Telegram's real inline mechanism — so the stored message belongs to the
+# owner and carries Telegram's own ``via_bot_id`` attribution. The exact
+# stored message is then read back by id and classified honestly: a retained
+# entity is never reported as a verified render, and nothing ever falls back
+# to a Unicode glyph.
+
+#: The ONE user-facing action of the feature.
+_INLINE_ACTION = "emoji_premium_inline"
+
+#: Plain words only — the selection message is sent by the owner's own
+#: account, so it carries no glyph a category mapping could ever key on.
+_INLINE_PROMPT = (
+    "Reply to this message with the Premium Emoji you want to send through "
+    "the inline bot.\nOnly a reply to THIS message is accepted."
+)
+
+#: The whole flow (reply read + inline query + the user's send + read-back)
+#: runs inside this handler; every Telegram call it makes is bounded on its own.
+_INLINE_TIMEOUT_S = 180.0
+
+
+def _premium_inline_buttons() -> list:
+    builder = InlinePanelBuilder()
+    builder.add_row("✨ Send Premium Emoji", f"action:{_INLINE_ACTION}")
+    builder.add_row("💬 React to a message", "action:emoji_react")
+    return builder.build()
+
+
+async def _premium_inline_builder(event, extra: str) -> list:
+    """The HELPER BOT's answer: a result carrying the REAL custom-emoji entity."""
+    document_id, glyph = premium_inline_service.parse_inline_query_extra(extra)
+    if document_id is None:
+        logger.warning("[EMOJI_UI] premium inline: unusable inline query key")
+        return []
+    try:
+        return [premium_inline_service.build_inline_result(document_id, glyph)]
+    except ValueError as exc:
+        logger.warning("[EMOJI_UI] premium inline: refusing to build a result: %s", exc)
+        return []
+
+
+def _premium_inline_report(outcome: dict[str, Any]) -> str:
+    """Every fact the pipeline establishes — and none that it does not."""
+    payload = outcome.get("payload") or {}
+    entity = payload.get("entity") or {}
+    inline_result = outcome.get("inline_result") or {}
+    readback = outcome.get("readback") or {}
+    eligibility = outcome.get("eligibility") or {}
+    document = eligibility.get("document")
+
+    lines: list[str] = [premium_inline_service.outcome_summary(outcome), ""]
+    lines.append(f"Diagnosis `{outcome.get('diagnosis')}`")
+    if outcome.get("error"):
+        lines.append(f"Error `{outcome.get('error')}`")
+
+    send_path = outcome.get("send_path")
+    lines.append(
+        "Path: `" + str(send_path) + "` (your account, via the helper bot)"
+        if send_path
+        else "Path: not reached"
+    )
+    destination = outcome.get("destination_chat_id")
+    if destination:
+        lines.append(f"Destination: Saved Messages `#{destination}`")
+    message_id = outcome.get("message_id")
+    lines.append(f"Message: `#{message_id}`" if message_id else "Message: not sent")
+
+    if entity:
+        lines.append(
+            f"Expected entity: document `#{entity.get('document_id')}`"
+            f" · offset {entity.get('offset')} · length {entity.get('length')}"
+            f" · span `{payload.get('glyph')}`"
+        )
+    if inline_result.get("attempted"):
+        if inline_result.get("entity_present"):
+            lines.append(
+                "Inline result: entity KEPT by Telegram"
+                f" (document `#{inline_result.get('document_id')}`"
+                f" · offset {inline_result.get('offset')}"
+                f" · length {inline_result.get('length')})"
+            )
+        else:
+            lines.append(
+                "Inline result: entity missing ("
+                + str(inline_result.get("error") or "no custom-emoji entity in the stored result")
+                + ")"
+            )
+    if readback.get("attempted"):
+        if readback.get("ok"):
+            if readback.get("entity_present"):
+                lines.append(
+                    "Stored message: real `MessageEntityCustomEmoji`"
+                    f" (document `#{readback.get('document_id')}`"
+                    f" · offset {readback.get('offset')}"
+                    f" · length {readback.get('length')})"
+                    " · id match: " + ("yes" if readback.get("document_id_match") else "NO")
+                    + " · span match: " + ("yes" if readback.get("span_match") else "NO")
+                )
+            else:
+                lines.append(
+                    "Stored message: NO custom-emoji entity — it was stripped or ignored"
+                )
+            lines.append(
+                f"Attribution: `via_bot_id` = {readback.get('via_bot_id')!r} "
+                + (
+                    "(matches the helper bot)"
+                    if readback.get("via_bot_match")
+                    else "(does NOT match the configured helper bot id)"
+                )
+            )
+        else:
+            lines.append(f"Read-back: failed ({readback.get('error')})")
+
+    premium = eligibility.get("owner_premium")
+    premium_text = "unknown" if premium is None else ("yes" if premium else "no")
+    free = None if document is None else document.get("free")
+    free_text = (
+        "unknown"
+        if free is None
+        else ("yes (non-Premium allowed)" if free else "no (Premium-only)")
+    )
+    lines.append(
+        f"Owner Premium: {premium_text} · emoji `free`: {free_text} · "
+        f"text_color: {None if document is None else document.get('text_color')}"
+    )
+    if eligibility.get("document_error"):
+        lines.append(f"_Document facts: {eligibility['document_error']}_")
+    if eligibility.get("owner_premium_error"):
+        lines.append(f"_Premium status: {eligibility['owner_premium_error']}_")
+    if eligibility.get("glyph_source"):
+        lines.append(f"_Glyph source: {eligibility['glyph_source']}_")
+    lines.append(
+        f"_Helper bot: @{eligibility.get('helper_bot_username') or '?'}"
+        f" · id `{eligibility.get('helper_bot_id')}`_"
+    )
+    lines.append(
+        "\n_Telegram accepts this send; whether your client renders the "
+        "emoji is for you to confirm visually._"
+    )
+    return "\n".join(lines)
+
+
+async def _premium_inline_action(event, extra: str, chat_id: int) -> tuple[str, str, list]:
+    """Send the selection message to Saved Messages and arm reply mode."""
+    client = get_self_client()
+    owner = get_owner_id()
+    if client is None:
+        return _error_panel("Send Premium Emoji", "Self client is not connected.")
+    if not owner:
+        return _error_panel("Send Premium Emoji", "Owner is not set.")
+
+    try:
+        selection = await client.send_message("me", _INLINE_PROMPT)
+    except Exception as exc:
+        logger.warning("[EMOJI_UI] premium inline: selection message not created: %s", exc)
+        return _error_panel(
+            "Send Premium Emoji",
+            f"Could not create the Saved Messages selection message: {exc}",
+        )
+
+    selection_id = getattr(selection, "id", 0) or 0
+    selection_chat = getattr(selection, "chat_id", 0) or 0
+    if (
+        not isinstance(selection_id, int)
+        or isinstance(selection_id, bool)
+        or selection_id <= 0
+        or not selection_chat
+    ):
+        return _error_panel(
+            "Send Premium Emoji",
+            "The selection message could not be created — nothing was armed.",
+        )
+
+    set_pending(
+        owner, _INLINE_ACTION, _premium_inline_reply_handler, selection_chat,
+        _INLINE_PROMPT,
+        inline_chat_id=chat_id,
+        inline_msg_id=getattr(event, "message_id", 0) or 0,
+        extra=str(selection_id),
+        timeout=_INLINE_TIMEOUT_S,
+    )
+    logger.info(
+        "[EMOJI_UI] premium inline: selection message #%s sent to Saved Messages",
+        selection_id,
+    )
+    body = (
+        "A selection message was sent to **Saved Messages**.\n\n"
+        "Reply to THAT message with the Premium Emoji you want to send.\n"
+        f"Only a reply to message `#{selection_id}` is accepted.\n\n"
+        "Your own account then sends it through the inline bot, and the "
+        "stored message is read back and checked."
+    )
+    return "Send Premium Emoji", body, _premium_inline_buttons()
+
+
+async def _premium_inline_reply_handler(
+    text,
+    chat_id,
+    msg_id,
+    inline_chat_id,
+    inline_msg_id,
+    extra: str = "",
+) -> None:
+    """Resolve the EXACT selection-message reply, then run the inline send."""
+    client = get_self_client()
+    owner = get_owner_id()
+
+    async def _finish(title: str, body: str, buttons: list) -> None:
+        await _edit_inline(inline_chat_id, inline_msg_id, title, body, buttons)
+
+    selection_id = int(extra) if isinstance(extra, str) and extra.isdigit() else 0
+    if client is None:
+        await _finish("Send Premium Emoji", "! Self client is not connected.", [])
+        return
+    if not selection_id:
+        await _finish(
+            "Send Premium Emoji",
+            "! The selection message is no longer known — start the action again.",
+            _premium_inline_buttons(),
+        )
+        return
+
+    try:
+        reply = await client.get_messages(chat_id, ids=msg_id)
+    except Exception as exc:
+        logger.warning("[EMOJI_UI] premium inline: cannot read the reply: %s", exc)
+        reply = None
+    if reply is None:
+        await _finish(
+            "Send Premium Emoji",
+            "! Could not read your reply message — please try again.",
+            _premium_inline_buttons(),
+        )
+        return
+
+    header = getattr(reply, "reply_to", None)
+    if getattr(header, "reply_to_peer_id", None) is not None:
+        await _finish(
+            "Send Premium Emoji",
+            "! That reply targets another chat.\nReply in Saved Messages.",
+            _premium_inline_buttons(),
+        )
+        return
+
+    target_id = getattr(reply, "reply_to_msg_id", None) or getattr(
+        header, "reply_to_msg_id", None
+    )
+    if not isinstance(target_id, int) or isinstance(target_id, bool) or target_id <= 0:
+        await _finish(
+            "Send Premium Emoji",
+            f"! Your message was not a reply.\nReply TO selection message `#{selection_id}`.",
+            _premium_inline_buttons(),
+        )
+        return
+    if target_id != selection_id:
+        await _finish(
+            "Send Premium Emoji",
+            f"! That reply targets message `#{target_id}`, not the selection "
+            f"message `#{selection_id}`.",
+            _premium_inline_buttons(),
+        )
+        return
+
+    found = premium_inline_service.inspect_source_message(reply)
+    if found["kind"] != premium_inline_service.KIND_CUSTOM_EMOJI:
+        await _finish(
+            "Send Premium Emoji",
+            f"! {found['detail']}.\n\n"
+            f"Diagnosis `{premium_inline_service.SOURCE_ENTITY_MISSING}` — nothing "
+            "was sent.",
+            _premium_inline_buttons(),
+        )
+        return
+
+    outcome = await premium_inline_service.send_premium_emoji_via_inline(
+        client, chat_id, found["document_id"], found["span_text"], owner
+    )
+    title = "Send Premium Emoji"
+    if outcome.get("verified"):
+        title = "Send Premium Emoji ✓"
+    await _finish(title, _premium_inline_report(outcome), _premium_inline_buttons())
+
+
 # ── premium-emoji probe (POC: the helper bot renders the custom emoji) ────
 #
 # ONE bounded experiment proving the capability the Emoji & Reaction design
@@ -2229,6 +2526,10 @@ def register(client, owner_id: int) -> None:
     )
     register_action("emoji_import", _import_action)
     register_action("emoji_react", _react_action)
+    register_action(_INLINE_ACTION, _premium_inline_action)
+    register_inline_builder(
+        premium_inline_service.INLINE_QUERY_KEY, _premium_inline_builder
+    )
     register_action(_PROBE_ACTION, _react_premium_action)
     register_action("emoji_state_toggle", _state_toggle_action)
     register_action("emoji_state_global_pick", _state_global_pick_action)

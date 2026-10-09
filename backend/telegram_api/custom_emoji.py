@@ -67,13 +67,21 @@ def _sticker_set_identity(stickerset: Any) -> dict[str, Any] | None:
 
 
 def _serialize_document(document: Any) -> dict[str, Any] | None:
-    """One resolved document as ``{document_id, alt, set}``.
+    """One resolved document as ``{document_id, alt, set, free, text_color}``.
 
     ``alt`` is the custom-emoji attribute's Unicode fallback text (may be
     empty — Telegram provides what it provides). ``set`` is the owning
     set identity or ``None``. A document without a custom-emoji attribute
     is not a custom emoji: it yields ``None`` and the caller counts it
     unresolved rather than guessing.
+
+    ``free`` is Telegram's per-emoji eligibility flag
+    (``documentAttributeCustomEmoji.free`` — "whether this custom emoji can
+    be sent by non-Premium users") and ``text_color`` its colour flag; both
+    are reported exactly as Telegram sent them (``free`` false/absent →
+    ``False``, a ``text_color`` that is not an integer → ``None``). They are
+    additive keys: ``free`` is evidence, never proof that a given send path
+    will keep the entity.
     """
     document_id = getattr(document, "id", None)
     if not isinstance(document_id, int) or isinstance(document_id, bool) or document_id <= 0:
@@ -82,10 +90,17 @@ def _serialize_document(document: Any) -> dict[str, Any] | None:
         if not isinstance(attribute, DocumentAttributeCustomEmoji):
             continue
         alt = getattr(attribute, "alt", None)
+        text_color = getattr(attribute, "text_color", None)
         return {
             "document_id": document_id,
             "alt": alt if isinstance(alt, str) else "",
             "set": _sticker_set_identity(getattr(attribute, "stickerset", None)),
+            "free": bool(getattr(attribute, "free", False)),
+            "text_color": (
+                text_color
+                if isinstance(text_color, int) and not isinstance(text_color, bool)
+                else None
+            ),
         }
     return None
 

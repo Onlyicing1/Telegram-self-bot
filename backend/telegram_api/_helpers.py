@@ -121,7 +121,12 @@ def _peer_to_id(peer: Any) -> int | None:
 
 
 def serialize_user(user: Any) -> dict[str, Any]:
-    """Convert a Telethon User object to a plain dict."""
+    """Convert a Telethon User object to a plain dict.
+
+    ``premium`` is Telegram's own account flag (``User.premium``) — the
+    observed Premium status of the account this dict describes. It is
+    additive: existing consumers keep the keys they already read.
+    """
     if user is None:
         return {}
     first = getattr(user, "first_name", None) or ""
@@ -136,6 +141,7 @@ def serialize_user(user: Any) -> dict[str, Any]:
         "about": getattr(user, "about", None),
         "is_bot": getattr(user, "bot", False),
         "is_deleted": getattr(user, "deleted", False),
+        "premium": bool(getattr(user, "premium", False)),
     }
 
 

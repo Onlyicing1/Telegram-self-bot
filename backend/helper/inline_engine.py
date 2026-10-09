@@ -100,64 +100,104 @@ def get_inline_builder(query_key: str) -> InlineResultBuilder | None:
     return _builders.get(query_key)
 
 
+def inline_unavailable_reason() -> str:
+    """Why the inline query cannot be issued at all — ``""`` means it can.
+
+    The same three-way diagnosis :func:`trigger` has always logged, exposed
+    as a string so a caller that drives the two halves itself reports the
+    SAME honest reason instead of a generic failure.
+    """
+    if _helper_username:
+        return ""
+    from backend.helper import client as helper_client_mod
+    if not helper_client_mod.is_available():
+        return "the helper bot is not connected"
+    if not _helper_id:
+        return (
+            "the helper username is empty and the helper id is 0 — GetMe likely "
+            "failed during helper startup"
+        )
+    return (
+        f"the helper account has no public username (id={_helper_id}) — inline "
+        "mode requires a @username set via BotFather or Telegram settings"
+    )
+
+
+async def query_results(self_client, chat_id: int, query: str) -> tuple[Any, str]:
+    """The ``getInlineBotResults`` half of :func:`trigger`.
+
+    Returns ``(results, "")`` — the server's stored results for this query —
+    or ``(None, honest_reason)``. Exposed so a caller that must inspect what
+    Telegram actually kept in the returned result (before the user sends it)
+    drives the SAME query the panels drive, instead of a second inline path.
+    """
+    reason = inline_unavailable_reason()
+    if reason:
+        if not _helper_username:
+            logger.error("[PANEL] trigger: cannot start inline — %s", reason)
+        return None, reason
+    try:
+        results = await self_client.inline_query(_helper_username, query, entity=chat_id)
+    except Exception as exc:
+        logger.error("trigger: exception for query '%s': %s", query, exc)
+        return None, f"the inline query raised {type(exc).__name__}: {exc}"
+    if not results:
+        logger.warning("trigger: helper returned zero results for query '%s'", query)
+        return None, "the helper returned zero results for this query"
+    return results, ""
+
+
+async def click_result(self_client, chat_id: int, result) -> tuple[Any, str]:
+    """The ``sendInlineBotResult`` half of :func:`trigger`.
+
+    Sends ONE already-fetched result (the user account is the sender and
+    Telegram stamps ``via_bot_id``). Returns ``(message, "")`` or
+    ``(None, honest_reason)``.
+    """
+    try:
+        msg = await result.click(chat_id)
+    except Exception as exc:
+        logger.error("trigger: exception for click: %s", exc)
+        return None, f"the inline send raised {type(exc).__name__}: {exc}"
+    if msg is None:
+        logger.warning("trigger: click() returned None")
+        return None, "the inline send returned no message"
+    return msg, ""
+
+
 async def trigger(self_client, chat_id: int, query: str) -> tuple[bool, int, int, str]:
     """Trigger inline mode and auto-send the first result.
 
     Returns (success, chat_id, msg_id, inline_message_id).
     msg_id is 0 on failure. inline_message_id is "" when not applicable.
     """
-    if not _helper_username:
-        from backend.helper import client as helper_client_mod
-        if not helper_client_mod.is_available():
-            logger.error(
-                "[PANEL] trigger: cannot start inline — helper bot is not connected"
-            )
-        elif not _helper_id:
-            logger.error(
-                "[PANEL] trigger: helper username is empty and helper id is 0 — "
-                "GetMe likely failed during helper startup"
-            )
-        else:
-            logger.error(
-                "[PANEL] trigger: helper account has no public username (id=%s) — "
-                "inline mode requires a @username set via BotFather or Telegram settings",
-                _helper_id,
-            )
+    results, reason = await query_results(self_client, chat_id, query)
+    if results is None:
         return False, chat_id, 0, ""
-
+    msg, reason = await click_result(self_client, chat_id, results[0])
+    if msg is None:
+        return False, chat_id, 0, ""
+    msg_id = getattr(msg, "id", 0) or 0
+    msg_chat_id = getattr(msg, "chat_id", 0) or chat_id
+    inline_msg_id = getattr(msg, "inline_message_id", None) or ""
+    peer_id = None
     try:
-        results = await self_client.inline_query(_helper_username, query, entity=chat_id)
-        if not results:
-            logger.warning("trigger: helper returned zero results for query '%s'", query)
-            return False, chat_id, 0, ""
-        msg = await results[0].click(chat_id)
-        if msg is not None:
-            msg_id = getattr(msg, "id", 0) or 0
-            msg_chat_id = getattr(msg, "chat_id", 0) or chat_id
-            inline_msg_id = getattr(msg, "inline_message_id", None) or ""
-            peer_id = None
-            try:
-                peer = getattr(msg, "peer_id", None)
-                if peer is not None:
-                    peer_id = str(peer)
-            except Exception:
-                pass
-            logger.info(
-                "[PANEL] TRIGGER RESULT query='%s' click_chat_id=%s "
-                "msg_chat_id=%s msg_id=%s entity_chat_id=%s "
-                "inline_message_id=%s peer_id=%s",
-                query, chat_id,
-                msg_chat_id, msg_id, chat_id,
-                inline_msg_id, peer_id,
-            )
-            if not msg_id:
-                logger.warning("trigger: click() returned message with id=0")
-            return True, msg_chat_id, msg_id, inline_msg_id
-        logger.warning("trigger: click() returned None for query '%s'", query)
-        return False, chat_id, 0, ""
-    except Exception as exc:
-        logger.error("trigger: exception for query '%s': %s", query, exc)
-        return False, chat_id, 0, ""
+        peer = getattr(msg, "peer_id", None)
+        if peer is not None:
+            peer_id = str(peer)
+    except Exception:
+        pass
+    logger.info(
+        "[PANEL] TRIGGER RESULT query='%s' click_chat_id=%s "
+        "msg_chat_id=%s msg_id=%s entity_chat_id=%s "
+        "inline_message_id=%s peer_id=%s",
+        query, chat_id,
+        msg_chat_id, msg_id, chat_id,
+        inline_msg_id, peer_id,
+    )
+    if not msg_id:
+        logger.warning("trigger: click() returned message with id=0")
+    return True, msg_chat_id, msg_id, inline_msg_id
 
 
 def register_inline_handler(helper_client, owner_id: int) -> None:
