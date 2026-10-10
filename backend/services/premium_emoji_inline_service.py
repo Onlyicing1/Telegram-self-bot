@@ -57,6 +57,13 @@ Contracts:
   implementation defect is never confused with a Telegram-side restriction.
   A retained entity is ``…_RENDER_UNVERIFIED`` — display is the viewing
   client's decision, never this module's claim.
+* **Diagnosis goes to the LOG, never to Telegram.** One attempt emits ONE
+  structured, bounded sequence under a single correlation id
+  (:data:`ROUTE_DIAG_TAG` + ``run=<id>`` fields, closing with a
+  machine-readable ``DIAGNOSIS``). No diagnostic report, test result or
+  status message is rendered into a chat by this module; the Glass UI's own
+  response carries no diagnosis, no entity/attribution fact and no success
+  claim.
 * **No new infrastructure.** No second client, loop, scheduler, executor or
   listener; the self client and the existing helper bot are supplied by the
   caller, and the inline query/send go through
@@ -67,6 +74,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import uuid
 from typing import Any
 
 from telethon import types
@@ -146,6 +154,35 @@ def _trace(stage: str, **fields: Any) -> None:
             continue
         parts.append(f"{key}={value}")
     logger.info("[PREMIUM_INLINE] %s", " ".join(parts))
+
+
+#: The tag every stage of ONE route attempt carries, so an attempt's whole
+#: diagnostic sequence is greppable and correlatable. This is where the final
+#: diagnosis lives — it is never rendered into Telegram.
+ROUTE_DIAG_TAG = "PREMIUM_EMOJI_ROUTE_DIAG"
+
+
+def new_run_id() -> str:
+    """A short, non-sensitive correlation id for ONE route attempt."""
+    try:
+        return uuid.uuid4().hex[:12]
+    except Exception:
+        return f"run-{int(time.time() * 1000) % 100000000:08d}"
+
+
+def _route_diag(run_id: str, stage: str, **fields: Any) -> None:
+    """ONE bounded stage line of a route attempt — ids, offsets, counts only.
+
+    Never a session string, token, access hash, authorization header or message
+    body: the fields are the numbers and booleans the diagnosis needs, plus a
+    short, bounded human summary where one is useful.
+    """
+    parts = [f"run={run_id}", f"stage={stage}"]
+    for key, value in fields.items():
+        if value is None or value == "":
+            continue
+        parts.append(f"{key}={value}")
+    logger.info("[%s] %s", ROUTE_DIAG_TAG, " ".join(parts))
 
 
 def _bounded(value: Any, limit: int = 32) -> str:
@@ -465,6 +502,7 @@ def _empty_inline_evidence() -> dict[str, Any]:
         "error": None,
         "reason": None,
         "result_count": None,
+        "entity_count": None,
         "wrapper_class": "",
         "tl_class": "",
         "entity_present": None,
@@ -788,13 +826,14 @@ async def _inspect_inline_result(
         evidence["span_text"] = _span_text(
             text, expected["offset"], expected["length"]
         )
+        evidence["entity_count"] = len(getattr(send_message, "entities", None) or [])
         _trace(
             "INLINE_RESULT_INSPECTED",
             entity_present=False,
             wrapper=evidence["wrapper_class"],
             tl=evidence["tl_class"] or None,
             text_utf16_len=utf16_length(text),
-            entity_count=len(getattr(send_message, "entities", None) or []),
+            entity_count=evidence["entity_count"],
             answer_recorded=evidence["answer"].get("recorded"),
             answer_ok=evidence["answer"].get("ok"),
             answer_custom_emoji_count=evidence["answer"].get("custom_emoji_count"),
@@ -805,6 +844,7 @@ async def _inspect_inline_result(
         )
         return evidence
     evidence["entity_present"] = True
+    evidence["entity_count"] = len(getattr(send_message, "entities", None) or [])
     evidence["document_id"] = scan["document_id"]
     evidence["offset"] = scan["offset"]
     evidence["length"] = scan["length"]
@@ -939,16 +979,50 @@ async def send_premium_emoji_via_inline(
     Returns the full record: ``ok`` (Telegram accepted the user's inline send —
     a SEND fact, never a render claim), ``verified`` (the stored message
     carries the exact entity with the helper bot's own attribution),
-    ``diagnosis`` (one of this module's outcome constants), ``send_path``,
+    ``diagnosis`` (one of this module's outcome constants), ``run_id`` (the
+    correlation id of this attempt's log sequence), ``send_path``,
     ``message_id``, ``payload``, and the three evidence blocks
     (``inline_result`` / ``readback`` / ``eligibility``).
+
+    The WHOLE diagnosis is written to the application log as ONE bounded
+    sequence tagged :data:`ROUTE_DIAG_TAG` under this ``run_id`` — the caller
+    must not render it into Telegram.
     """
+    run_id = new_run_id()
+    eligibility = _empty_eligibility()
+
+    def _refuse(
+        error: str, detail: str, diagnosis: str, payload: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """A pre-send refusal, closed with this run's machine-readable verdict."""
+        failed = _failed(error, detail, diagnosis, payload)
+        failed["eligibility"] = eligibility
+        failed["run_id"] = run_id
+        _route_diag(
+            run_id,
+            "DIAGNOSIS",
+            diagnosis=diagnosis,
+            sent="no",
+            summary=_bounded(detail, 200),
+        )
+        return failed
+
     if not _is_positive_int(owner_id):
-        _trace("SEND_STARTED", started=False, reason="owner")
-        return _failed(ERROR_OWNER, "no valid owner for this operation", SOURCE_ENTITY_MISSING)
+        _route_diag(
+            run_id, "ROUTE_STARTED", route=SEND_PATH_INLINE_BOT_RESULT, reason="owner"
+        )
+        return _refuse(
+            ERROR_OWNER, "no valid owner for this operation", SOURCE_ENTITY_MISSING
+        )
     if not _is_positive_int(chat_id) or chat_id != owner_id:
-        _trace("SEND_STARTED", started=False, reason="destination")
-        return _failed(
+        _route_diag(
+            run_id,
+            "ROUTE_STARTED",
+            route=SEND_PATH_INLINE_BOT_RESULT,
+            reason="destination",
+            chat_id=chat_id if _is_positive_int(chat_id) else None,
+        )
+        return _refuse(
             ERROR_DESTINATION,
             "only your Saved Messages is a supported destination — Telegram "
             "documents the non-Premium custom-emoji allowance for the self "
@@ -956,14 +1030,18 @@ async def send_premium_emoji_via_inline(
             UNSUPPORTED_DESTINATION,
         )
     if not _is_positive_int(document_id):
-        _trace("SEND_STARTED", started=False, reason="document_id")
-        return _failed(
+        _route_diag(
+            run_id,
+            "ROUTE_STARTED",
+            route=SEND_PATH_INLINE_BOT_RESULT,
+            reason="document_id",
+        )
+        return _refuse(
             ERROR_SOURCE,
             "the source message carries no usable custom-emoji document id",
             SOURCE_ENTITY_MISSING,
         )
 
-    eligibility = _empty_eligibility()
     eligibility["helper_bot_id"] = helper_client.get_bot_id() or None
     eligibility["helper_bot_username"] = inline_engine.get_helper_username()
     premium, premium_error = await _owner_premium(self_client)
@@ -979,42 +1057,67 @@ async def send_premium_emoji_via_inline(
     elif isinstance(source_glyph, str) and source_glyph:
         glyph, glyph_source = source_glyph, "source_span"
     eligibility["glyph_source"] = glyph_source
+    document_free = None if not isinstance(facts, dict) else facts.get("free")
+    _route_diag(
+        run_id,
+        "ROUTE_STARTED",
+        route=SEND_PATH_INLINE_BOT_RESULT,
+        owner=owner_id,
+        destination=chat_id,
+        document_id=int(document_id) if _is_positive_int(document_id) else None,
+        owner_premium=premium,
+        document_free=document_free,
+        helper_bot_id=eligibility["helper_bot_id"],
+        glyph_source=glyph_source or None,
+    )
     if not glyph:
-        _trace("SEND_STARTED", started=False, reason="glyph")
-        failed = _failed(
+        return _refuse(
             ERROR_SOURCE,
             "the emoji's own fallback text could not be resolved — Telegram's "
             "documented rule requires the entity to wrap exactly the emoji in "
             "the document's alt text, so nothing was sent",
             SOURCE_ENTITY_MISSING,
         )
-        failed["eligibility"] = eligibility
-        return failed
+    _route_diag(
+        run_id,
+        "SOURCE_ENTITY_VALIDATED",
+        document_id=int(document_id),
+        source_span_utf16_len=(
+            utf16_length(source_glyph) if isinstance(source_glyph, str) else 0
+        ),
+        glyph_source=glyph_source,
+    )
 
     payload = build_inline_payload(int(document_id), glyph)
     issue = validate_inline_payload(payload)
     if issue:
-        _trace("OUTBOUND_PAYLOAD_BUILT", valid=False, issue=_bounded(issue))
-        failed = _failed(
+        _route_diag(run_id, "PAYLOAD_VALIDATED", valid=False, issue=_bounded(issue))
+        return _refuse(
             ERROR_PAYLOAD,
             f"the outbound payload failed its own validation: {issue}",
             OUTBOUND_PAYLOAD_INVALID,
             payload,
         )
-        failed["eligibility"] = eligibility
-        return failed
+    _route_diag(
+        run_id,
+        "PAYLOAD_VALIDATED",
+        valid=True,
+        document_id=payload["entity"]["document_id"],
+        offset=payload["entity"]["offset"],
+        length=payload["entity"]["length"],
+        glyph_utf16_len=payload.get("span_utf16_len"),
+        text_utf16_len=utf16_length(payload["text"]),
+        entity_count=len(payload["entities"]),
+    )
 
     reason = inline_engine.inline_unavailable_reason()
     if reason:
-        _trace("SEND_STARTED", started=False, reason="helper")
-        failed = _failed(
+        return _refuse(
             ERROR_HELPER,
             f"the inline bot cannot be used — {reason}",
             INLINE_UNAVAILABLE,
             payload,
         )
-        failed["eligibility"] = eligibility
-        return failed
 
     query = inline_query_for(int(document_id), glyph)
     query_started = time.monotonic()
@@ -1039,7 +1142,7 @@ async def send_premium_emoji_via_inline(
     if results is None:
         _trace("INLINE_QUERY_RESULT", ok=False, error=_bounded(query_error))
         if query_error == inline_engine.INLINE_ZERO_RESULTS_REASON:
-            failed = _failed(
+            failed = _refuse(
                 ERROR_QUERY,
                 "the helper bot answered the inline query with no result — "
                 "nothing could be inspected and the send was not attempted",
@@ -1047,13 +1150,12 @@ async def send_premium_emoji_via_inline(
                 payload,
             )
         else:
-            failed = _failed(
+            failed = _refuse(
                 ERROR_QUERY,
                 f"the helper bot could not answer the inline query: {query_error}",
                 INLINE_RESULT_REJECTED,
                 payload,
             )
-        failed["eligibility"] = eligibility
         failed["destination_chat_id"] = chat_id
         return failed
 
@@ -1066,6 +1168,7 @@ async def send_premium_emoji_via_inline(
         "send_path": None,
         "destination_chat_id": chat_id,
         "message_id": None,
+        "run_id": run_id,
         "payload": payload,
         "inline_result": await _inspect_inline_result(
             results,
@@ -1075,6 +1178,38 @@ async def send_premium_emoji_via_inline(
         "readback": _empty_readback(),
         "eligibility": eligibility,
     }
+    submitted = record["inline_result"].get("answer") or {}
+    _route_diag(
+        run_id,
+        "INLINE_RESULT_SUBMITTED",
+        returned_results=record["inline_result"].get("result_count"),
+        submitted_recorded=submitted.get("recorded"),
+        submitted_ok=submitted.get("ok"),
+        submitted_custom_emoji_count=submitted.get("custom_emoji_count"),
+        submitted_document_id_match=(
+            payload["entity"]["document_id"] in (submitted.get("document_ids") or [])
+            if submitted.get("recorded")
+            else None
+        ),
+        submitted_error=_bounded(submitted.get("error") or "") or None,
+    )
+    inspected = record["inline_result"]
+    _route_diag(
+        run_id,
+        "TELEGRAM_RESULT_INSPECTED",
+        ok=inspected.get("ok"),
+        reason=inspected.get("reason"),
+        entity_present=inspected.get("entity_present"),
+        entity_count=inspected.get("entity_count"),
+        document_id_match=inspected.get("document_id_match"),
+        span_match=inspected.get("span_match"),
+        text_match=(
+            inspected.get("text") == payload["text"]
+            if inspected.get("ok")
+            else None
+        ),
+        error=_bounded(inspected.get("error") or "") or None,
+    )
 
     def _fail(error: str, detail: str) -> dict[str, Any]:
         """Close the record on its recorded evidence — the verdict is derived, never chosen."""
@@ -1083,7 +1218,13 @@ async def send_premium_emoji_via_inline(
         record["diagnosis"] = classify_diagnosis(
             record["inline_result"], record["readback"], record["message_id"]
         )
-        _trace("DIAGNOSIS", diagnosis=record["diagnosis"])
+        _route_diag(
+            run_id,
+            "DIAGNOSIS",
+            diagnosis=record["diagnosis"],
+            sent="yes" if record["message_id"] else "no",
+            summary=_bounded(detail, 200),
+        )
         return record
 
     if not record["inline_result"]["ok"]:
@@ -1122,6 +1263,13 @@ async def send_premium_emoji_via_inline(
     sent, send_error = await _send_result(self_client, chat_id, results)
     if sent is None:
         _trace("INLINE_SEND_ACCEPTED", accepted=False, error=_bounded(send_error))
+        _route_diag(
+            run_id,
+            "MESSAGE_SENT",
+            sent=False,
+            destination=chat_id,
+            error=_bounded(send_error, 200),
+        )
         return _fail(
             ERROR_SEND, f"the user account's inline send failed: {send_error}"
         )
@@ -1132,6 +1280,14 @@ async def send_premium_emoji_via_inline(
     record["send_path"] = SEND_PATH_INLINE_BOT_RESULT
     record["message_id"] = message_id
     _trace("INLINE_SEND_ACCEPTED", accepted=True, message_id=message_id)
+    _route_diag(
+        run_id,
+        "MESSAGE_SENT",
+        sent=True,
+        message_id=message_id,
+        destination=chat_id,
+        send_path=SEND_PATH_INLINE_BOT_RESULT,
+    )
     if message_id is None:
         return _fail(
             ERROR_READBACK,
@@ -1145,14 +1301,48 @@ async def send_premium_emoji_via_inline(
         readback["error"] = readback_error
         record["readback"] = readback
         _trace("READBACK_RESULT", fetched=False, error=_bounded(readback_error))
+        _route_diag(
+            run_id,
+            "MESSAGE_READBACK_VERIFIED",
+            readback_ok=False,
+            error=_bounded(readback_error, 200),
+        )
         return _fail(ERROR_READBACK, f"the read-back failed: {readback_error}")
 
     record["readback"] = _read_back(stored, payload, helper_client.get_bot_id())
+    readback = record["readback"]
+    _route_diag(
+        run_id,
+        "MESSAGE_READBACK_VERIFIED",
+        readback_ok=True,
+        entity_present=readback.get("entity_present"),
+        stored_document_id=readback.get("document_id"),
+        stored_offset=readback.get("offset"),
+        stored_length=readback.get("length"),
+        document_id_match=readback.get("document_id_match"),
+        span_match=readback.get("span_match"),
+        text_match=readback.get("text_match"),
+    )
+    _route_diag(
+        run_id,
+        "VIA_BOT_ATTRIBUTION_VERIFIED",
+        via_bot_id=readback.get("via_bot_id"),
+        expected_via_bot_id=helper_client.get_bot_id() or None,
+        match=bool(readback.get("via_bot_match")),
+    )
     record["diagnosis"] = classify_diagnosis(
         record["inline_result"], record["readback"], message_id
     )
     record["verified"] = record["diagnosis"] == STORED_ENTITY_VERIFIED_RENDER_UNVERIFIED
-    _trace("DIAGNOSIS", diagnosis=record["diagnosis"])
+    _route_diag(
+        run_id,
+        "DIAGNOSIS",
+        diagnosis=record["diagnosis"],
+        sent="yes",
+        entity_stored=readback.get("entity_present"),
+        via_bot_id=readback.get("via_bot_id"),
+        summary=_bounded(outcome_summary(record), 200),
+    )
     return record
 
 

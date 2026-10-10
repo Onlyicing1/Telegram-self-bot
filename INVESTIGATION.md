@@ -1,225 +1,218 @@
-# Investigation — Alternative Premium Custom-Emoji Delivery Route: the Owner-Authored Self-Chat Message (2026-10-10)
+# Investigation — Is There a *Different* Supported Route to a Premium Custom-Emoji Message with `via_bot_id`? (2026-10-10)
 
 Canonical, latest-only record. **This file replaces the previous
-`INVESTIGATION.md` in full.** The inline entity-loss investigation it superseded —
-the boundary trace and the attribution work (`98c2825`, `a54877b`, `9633c0b`,
-`b463552`, `219c873`, `ac55042`) — remains readable in git history and is
-summarised only as far as this task depends on it.
+`INVESTIGATION.md` in full.** Everything it superseded — the inline entity-loss
+boundary trace (`98c2825`, `a54877b`, `9633c0b`, `b463552`) and the
+owner-authored self-send experiment (`f22894e`, `9b34e38`) — stays readable in
+git history and is summarised here only as far as this task's reasoning needs
+it.
 
 | Item | Value |
 |---|---|
 | Repository / branch | `Onlyicing1/Telegram-self-bot`, `main` |
-| Revision inspected | `ac55042` — fetched and verified `= origin/main = git ls-remote` at task start (no newer commits existed) |
-| Telethon | **pinned `telethon==1.34.0`**, layer 173 (`backend/requirements.txt:1`) |
-| Question | Can a route **other than the helper-bot inline result** deliver a genuine `MessageEntityCustomEmoji` to the owner's Saved Messages, and can that be tested decisively? |
-| Verdict | **The owner-authored `messages.sendMessage` route is documented, representable and testable, and it is the only route in which no bot participates — so no bot entitlement is checked. It has one structural difference from the inline route that must be stated rather than relaxed: a self-authored message CANNOT carry `via_bot_id`.** A controlled test for it is implemented and offline-verified (§6); whether Telegram **keeps** the entity on a self-authored Saved Messages message is **NOT yet established**, because this workspace holds no live session. |
-| Production code changed | **None.** The route exists only as an isolated, opt-in test-suite experiment (`tests/test_premium_emoji_self_send_route.py`) plus the `live_telegram` marker registration in `tests/conftest.py`. Nothing is wired into the bot. |
-| Live Telegram verification | **Not performed** (no `SESSION_STRING` in this workspace — `freebuff-env list` shows no credentials). The blocker and the exact run command are reported in §6/§9. |
+| Revision inspected | `9b34e38` — freshly fetched and verified `= origin/main` at task start |
+| Telethon | **pinned `telethon==1.34.0`** (`backend/requirements.txt:1`) |
+| Question | Can a route **other than the already-attempted helper-bot inline result** deliver a genuine `MessageEntityCustomEmoji` to the owner's Saved Messages **while producing `via_bot_id` attribution**, without Premium or a Fragment username? |
+| Verdict | **No such route was identified.** `via_bot_id` exists on exactly ONE path — a bot's inline result that the user's account sends with `messages.sendInlineBotResult` (documented verbatim, §3) — and the entity on that path can only travel in the bot's answer payload, i.e. the same two constructors the already-attempted request used (§4). Every other route that can carry a real entity (a user-authored message; forwarding) can never carry `via_bot_id` (§5). No speculative implementation was shipped: what shipped instead is the task's logging requirement, implemented on the **existing** owner-only action, which is the only thing that can turn the remaining unknown into evidence (§7). |
+| Production code changed | **Two files, behaviour-preserving**: the inline service gains the correlated, logs-only route diagnostic; the panel stops rendering an outcome report (§7). No route, gate, payload, entitlement or client changed. |
+| Live Telegram verification | **Not performed** — this workspace holds no `API_ID`/`API_HASH`/`SESSION_STRING`/`BOT_OWNER_ID` and no `.env`. **No Telegram request of any kind was made**, so nothing here is a live observation (§8). |
 
 ---
 
-## 1. Where this task starts
+## 1. Where this task starts (established evidence, deliberately not repeated)
 
-Three live attempts on the deployed revision produced the same result: the source
-`MessageEntityCustomEmoji` was extracted and validated, the outbound text /
-document id / UTF-16 geometry were validated, the helper bot's inline answer was
-submitted with one custom-emoji entity, and the inspected result Telegram
-returned had `entity_count=0` — text and document id matching, entity absent —
-so the fail-closed gate refused the send (`INLINE_RESULT_ENTITY_MISSING`).
-`messages.sendInlineBotResult` and the `via_bot_id` read-back were **never
-reached**, and nothing here claims either is broken.
+Three live attempts on the deployed revision produced the same result:
 
-Already established by source and byte-level verification (previous task, not
-repeated): the entity leaves this application intact inside a well-formed
-`messages.setInlineBotResults` request; the pinned Telethon parses a stored
-payload that keeps the entity; the sanitizer, the cache (`cache_time=0`) and the
-client-side shapes are all excluded. The loss is inside Telegram's processing of
-the bot's inline answer, and *which* server rule produces it is undocumented.
+1. the source `MessageEntityCustomEmoji` was extracted and validated;
+2. the outbound text, document id and UTF-16 geometry were validated;
+3. the helper bot's inline answer **was submitted** with one custom-emoji
+   entity;
+4. the result Telegram returned from `messages.getInlineBotResults` was
+   inspected: text and document id matched, `entity_count=0` — **the entity was
+   already absent before any send**;
+5. the fail-closed gate therefore refused the send
+   (`INLINE_RESULT_ENTITY_MISSING`), so `messages.sendInlineBotResult` was
+   **never** invoked and `via_bot_id` was **never** observed.
 
-That is why this task changes the **route**, not the attempt.
+Three facts follow, and this task treats them as premises rather than
+re-testing them:
 
-## 2. The route investigated
+* **The final inline send has not been proven to fail.** It has never run.
+* **`via_bot_id` has never been observed** on any message this project produced.
+* **The reason Telegram drops the entity from the bot's answer is not
+  established** — it is undocumented, and no attempt is made here to name it.
 
-**`messages.sendMessage` from the existing authenticated owner account with
-`peer = inputPeerSelf` and `entities = [messageEntityCustomEmoji(...)]`** — a
-message the owner authors themselves, in their own Saved Messages chat, with no
-bot anywhere in the path.
+The owner-authored `messages.sendMessage` route (already merged as an isolated
+opt-in test, `f22894e`/`9b34e38`) is a **separate route**: it can deliver a real
+entity but can never satisfy the `via_bot_id` criterion, so it cannot be the
+answer to this task's question (§5).
 
-Why this one:
+## 2. The shape of the search space (why it is so small)
 
-* it is the **only** route in which the sender is the owner's own account *and*
-  no bot supplies the entity, so the documented bot-side entitlement (Fragment
-  username; Bot API 9.4 owner-Premium for direct bot sends) is not consulted;
-* Telegram documents the non-Premium allowance for exactly this destination
-  (§3), which is why Saved Messages is the one permitted target;
-* it reuses the project's existing authenticated client factory, its existing
-  custom-emoji lookup facade and its existing UTF-16 machinery — no new client,
-  listener, loop, scheduler, executor or dependency;
-* the artifact is inspectable: the sent message id is known, so the stored
-  message can be read back by exact id and its entity verified.
+The acceptance criteria require **both** a genuine stored
+`MessageEntityCustomEmoji` **and** stored `via_bot_id == helper bot id`. So the
+search is not "any way to get an entity into Saved Messages" — it is the
+intersection of two independent constraints, and each constraint has exactly one
+documented home:
 
-Alternatives considered and **not** selected:
-
-* **helper bot sends it directly** (`messages.sendMessage` as the bot,
-  `backend/telegram_api/bridge.py`) — the closed POC's route; covered by the
-  documented bot entitlement and explicitly out of the approved behaviour
-  (ROADMAP §28/§34-D: no Fragment purchase, no alt-text fallback);
-* **the inline route** — the route that fails today (§1);
-* **forwarding the source message** — a documented user-account operation that
-  would not re-validate the entity, but it delivers the *original* message
-  (with forward metadata) rather than a controlled artifact with known
-  geometry, and the repository forbids `forward_messages` in its Save pipeline
-  (AGENTS.md §6). Recorded here as an option, deliberately not implemented.
-
-## 3. Documented evidence (all read this session)
-
-| Fact | Source | Status |
+| Constraint | Where it can be satisfied | Documented basis |
 |---|---|---|
-| "To send a message with one or more custom emojis, create and attach messageEntityCustomEmoji entities to a message." | <https://core.telegram.org/api/custom-emoji> | **CONFIRMED** — the documented construction for a user-authored message |
-| "…the messageEntityCustomEmoji entity must wrap exactly one regular emoji (the one contained in documentAttributeCustomEmoji.alt) in the related text, otherwise the server will ignore it." | same page | **CONFIRMED** — the one documented *ignore* rule; the experiment satisfies it by construction (the glyph is the document's own `alt` when resolvable, otherwise the source span, recorded as `glyph_source`) |
-| "Custom emoji documents will contain documentAttributeCustomEmoji … whether the emoji can be used by non-premium users (free)" | same page | **CONFIRMED** — per-document flag, recorded per run |
-| "All users – Premium or not – can see any animated emoji. Everyone can also use all custom emoji for free in their Saved Messages chat to try them out – or to add extra flair to notes and reminders." | <https://telegram.org/blog/custom-emoji> | **CONFIRMED** — the documented basis for targeting Saved Messages, and the documented allowance for a non-Premium owner |
-| `inputPeerSelf` — "Defines the current user." | <https://core.telegram.org/constructor/inputPeerSelf> | **CONFIRMED** — the peer that denotes the user's own chat (Saved Messages) |
-| `message#95ef6f2b … via_bot_id:flags.11?long … entities:flags.7?Vector<MessageEntity>` | <https://core.telegram.org/constructor/message> | **CONFIRMED** — `via_bot_id` is an **optional** flag field (present only when a message was sent through a bot), and a stored message can carry `entities` back to the reader |
-| Whether Telegram silently strips a custom-emoji entity from a **user-authored** message, and which account property (Premium, the document's `free` flag) would govern it | — | **NOT DOCUMENTED** — only a live read-back can decide it (§8) |
+| A genuine custom-emoji entity inside a stored message | any message the owner's account sends with `entities=[messageEntityCustomEmoji]` | "To send a message with one or more custom emojis, create and attach messageEntityCustomEmoji entities to a message." |
+| `via_bot_id` present on the stored message | **only** a message sent as an inline result (`messages.sendInlineBotResult`) | "The resulting message will have the `via_bot_id` field set, to indicate that the result was generated by the bot that generated the inline result." |
 
-## 4. Pinned-Telethon evidence (established offline, in this repository)
+The first constraint is what makes the inline route *indirect*: on that route
+the entity is authored by the **bot**, and the entity text the *human* client
+sends is whatever Telegram stored for the bot's answer (§4). The second
+constraint is what makes every direct route structurally unusable: a message the
+owner authors with `messages.sendMessage` has no `via_bot_id` field populated at
+all — not stripped, simply never set.
 
-| Fact | How it was verified |
+## 3. Documented evidence (read and quoted in this task)
+
+All four pages were fetched in this session; the TL lines are the live
+core.telegram.org schema (layer 225) at
+<https://core.telegram.org/api/bots/inline>, and the pinned Telethon exposes the
+same constructors (§4).
+
+| # | Quote | Source | Bearing |
+|---|---|---|---|
+| 1 | "The resulting message will have the `via_bot_id` field set, to indicate that the result was generated by the bot that generated the inline result." | <https://core.telegram.org/api/bots/inline> §3 | **The attribution criterion is a property of `sendInlineBotResult` alone.** No other documented operation sets it. |
+| 2 | `message#95ef6f2b … via_bot_id:flags.11?long … entities:flags.7?Vector<MessageEntity> … = Message;` | <https://core.telegram.org/constructor/message> | `via_bot_id` is an **optional, bot-only** flag field; `entities` is an independent optional field. A stored message can have either, both, or neither. |
+| 3 | `inputBotInlineMessageText#3dcd7a87 flags:# no_webpage:flags.0?true invert_media:flags.3?true message:string entities:flags.1?Vector<MessageEntity> reply_markup:flags.2?ReplyMarkup = InputBotInlineMessage;` | <https://core.telegram.org/api/bots/inline> §2 | The bot's answer payload can carry entities — the capability the already-attempted request used. |
+| 4 | `inputBotInlineMessageMediaAuto#3380c786 flags:# invert_media:flags.3?true message:string entities:flags.1?Vector<MessageEntity> reply_markup:flags.2?ReplyMarkup = InputBotInlineMessage;` | same page | **Exactly one other** `InputBotInlineMessage` variant carries `entities` (§4). |
+| 5 | `botInlineMessageText#8c7f65e2 … message:string entities:flags.1?Vector<MessageEntity> … = BotInlineMessage;` | same page §3 | The *stored* form of the answer keeps the same entity field — the field the live inspection found empty. |
+| 6 | `messages.sendInlineBotResult#c0cf7646 flags:# … peer:InputPeer … query_id:long id:string … = Updates;` and "If the user instead chooses a specific `BotInlineResult` …, the `messages.sendInlineBotResult` method should be invoked, passing: The `query_id` … / The `id` of the chosen result / The peer where to send the chosen result" | same page §3 | The send takes only a **result id** — the payload is entirely what the bot stored. Nothing at send time can re-attach a dropped entity. |
+| 7 | `messages.setInlineBotResults#bb12a419 flags:# … results:Vector<InputBotInlineResult> cache_time:int … = Bool;` and "In general, the method accepts a vector of `InputBotInlineResult` constructors, that when chosen, generates a message with optionally attached media, and even inline buttons." | same page §2 | The submission the project already performs — the step after which the entity was found missing. |
+| 8 | "To send a message with one or more custom emojis, create and attach `messageEntityCustomEmoji` entities to a message." | <https://core.telegram.org/api/custom-emoji> | The entity construction rule, for a user-authored message. |
+| 9 | "Note that when sending messages with attached custom emojis, the `messageEntityCustomEmoji` entity must wrap exactly one regular emoji (the one contained in `documentAttributeCustomEmoji.alt`) in the related text, otherwise the server will ignore it." | same page | The ONE documented *ignore* rule; recorded as unviolated, not as the cause (see §6). |
+| 10 | "All users – Premium or not – can see any animated emoji. Everyone can also use all custom emoji for free in their Saved Messages chat to try them out – or to add extra flair to notes and reminders." | <https://telegram.org/blog/custom-emoji> (read in the previous task, re-cited here) | The documented basis for Saved Messages being the one permitted destination. |
+
+**Not re-established in this session:** the bot-side Fragment-username
+entitlement rule. The current `core.telegram.org/api/custom-emoji` revision does
+**not** state it. It is therefore recorded here as *context only* — it is not a
+premise of any conclusion in this file, and no claim in this repository is
+rested on it.
+
+## 4. Pinned-Telethon evidence: is any inline-result representation materially different?
+
+The task asks explicitly whether another supported inline-result representation
+exists. Verified against the pinned `telethon==1.34.0` installed in this
+repository:
+
+| Fact | How |
 |---|---|
-| `telethon==1.34.0` `send_message(…, formatting_entities=…)` accepts `MessageEntityCustomEmoji` | signature inspection (`TelegramClient.send_message`), pinned by `test_the_pinned_telethon_forwards_formatting_entities_into_the_request` |
-| That call forwards the entities into the real request | `inspect.getsource(TelegramClient.send_message)` → `functions.messages.SendMessageRequest(…, entities=formatting_entities, …)` — pinned by the same test |
-| The request round-trips the entity through its own bytes | `BinaryReader(bytes(request)).tgread_object()` → `SendMessageRequest` with `InputPeerSelf`, the exact text and `MessageEntityCustomEmoji(doc, offset, length)` — `test_the_real_send_request_round_trips_the_entity` |
-| Duplicate-send protection exists by construction | Telethon generates a fresh `random_id` per request (`SendMessageRequest.__init__`), pinned by `test_two_requests_never_share_a_random_id` |
+| The user's send is `SendInlineBotResultRequest(peer, query_id, id, silent, background, clear_draft, hide_via, reply_to)` — no payload, no entities | `inspect.getsource(InlineResult.click)` (installed Telethon) |
+| The bot's answer on this route is `InputBotInlineResult(id, type, title, send_message=InputBotInlineMessageText(message, entities=[MessageEntityCustomEmoji]))` | `build_inline_result` in the service, re-read in this task |
+| Of the eight `InputBotInlineMessage` variants, exactly **two** accept `entities`: `InputBotInlineMessageText` and `InputBotInlineMessageMediaAuto` | constructor signatures printed from the installed types module; the other six (`MediaGeo`, `MediaVenue`, `MediaContact`, `MediaInvoice`, `MediaWebPage`, `Game`) have no `entities` parameter |
+| All four `InputBotInlineResult` variants (`InputBotInlineResult`, `…ResultPhoto`, `…ResultDocument`, `…ResultGame`) carry `send_message: InputBotInlineMessage` | constructor signatures from the installed types module |
+| The stored side mirrors it: `BotInlineResult` / `BotInlineMediaResult` → `send_message: BotInlineMessage`, of which only `BotInlineMessageText` and `BotInlineMessageMediaAuto` carry `entities` | same |
 
-**Explicitly a local fact, not a Telegram verdict:** serialization proves the
-request *can* represent the entity; it says nothing about what Telegram stores.
-That distinction is preserved in both the code comments and the reports.
+**Conclusion (offline, source-level):** the entity field space on the inline
+route is `{Text, MediaAuto}`, and every result *type* is just a different
+container around one of those two. The already-attempted request used `Text`,
+whose stored counterpart (`BotInlineMessageText.entities`) was found empty by
+live inspection.
 
-## 5. What this route can and cannot satisfy
+`MediaAuto` (a media document carrying the entity in its caption) was considered
+and **not** adopted, for stated reasons rather than taste:
 
-| Acceptance criterion (task §4) | How the route addresses it | Status |
-|---|---|---|
-| Target is the owner's Saved Messages | peer is `inputPeerSelf` **by construction** (the route can never address another chat); the stored message must additionally show `chat_id == owner_id` | implemented + offline-tested |
-| Stored message contains a genuine `MessageEntityCustomEmoji` | the read-back scans the stored message's entities; a plain glyph is never accepted | implemented + offline-tested |
-| Stored document id matches the source emoji | asserted | implemented + offline-tested |
-| Offsets/lengths correct in UTF-16 units | the production geometry builder/validator is reused; asserted on the stored entity | implemented + offline-tested |
-| Visible text and entity span consistent | text equality + exact offset/length/span equality | implemented + offline-tested |
-| Inspected **after** Telegram accepted and stored it | the read-back is by the exact message id returned by the send; nothing is concluded pre-submission | implemented (live run pending) |
-| **`via_bot_id` attribution verified independently** | **This route cannot produce it.** `via_bot_id` is the optional `flags.11` field of `message`, present only for messages sent through a bot; a self-authored message has none. The experiment therefore asserts its **absence** (any value fails closed as an anomaly) and reports the limitation instead of silently dropping the check | implemented + offline-tested |
+* it is a variant of the **same route** (`setInlineBotResults` →
+  `getInlineBotResults` → `sendInlineBotResult`), so it changes the artifact
+  (a media message with a caption) and not the failing step — Telegram's
+  storage of the bot's answer payload, where the entity was already gone;
+* no source, documentation or observation says a caption survives a step that a
+  text payload did not;
+* it would require the helper bot to upload/provide a media document it does
+  not have, and the task forbids reinforcing a failed request with another
+  speculative one ("If no distinct, supported route can be identified, stop and
+  report that conclusion rather than shipping another speculative
+  implementation").
 
-**Stated consequence:** the inline route's `via_bot_id` criterion is a property
-of the *inline* route, not of the artifact. A self-authored delivery path is a
-**different artifact** and must be accepted or rejected on its own terms — it is
-not a drop-in replacement for the inline route's acceptance criteria.
+The same reasoning rejects the layer-225 **prepared inline message** flow
+(`messages.savePreparedInlineMessage` → `messages.getPreparedInlineMessage`,
+<https://core.telegram.org/api/bots/inline> §2.1): it is a different way to
+*distribute a result id*, still ending in "send the message as specified here"
+with a `BotInlineResult` payload, it needs a **mini app** surface this project
+does not have, and it would add exactly the kind of new surface the task
+forbids (no new client/listener/loop/scheduler/executor/dependency).
 
-## 6. The controlled test (implemented; live run pending)
+## 5. Routes that can produce a real entity but cannot satisfy the criteria
 
-**Where it lives:** `tests/test_premium_emoji_self_send_route.py` — isolated in
-the test suite, exactly as the task requires ("prefer an isolated test that
-follows the existing test conventions"; "do not expose an unverified route to
-normal production behaviour"). No production module changes.
+| Route | Real entity? | `via_bot_id`? | Verdict |
+|---|---|---|---|
+| Owner-authored `messages.sendMessage(peer=self, entities=[…])` | documented, and the merged opt-in test exists | **Impossible** — field #1 in §3 is set only by `sendInlineBotResult`; a self-authored message never carries it | cannot satisfy acceptance criterion 4 → not the answer |
+| Forward the original emoji message (`messages.forwardMessages`) | preservation is not re-validated (the entity is copied server-side) | impossible (forwarding sets `fwd_from`, not `via_bot_id`) | also forbidden in the Save pipeline (AGENTS.md §6) and it delivers the *original* message, not a controlled artifact |
+| Helper bot sends directly (`messages.sendMessage` as the bot into Saved Messages) | possible in principle | impossible (no inline result) | out of the approved behaviour (ROADMAP §28/§34-D), and it is not the owner's own send |
+| Helper-bot inline result, `Text` payload | **the attempted one** — the stored answer came back without the entity | yes, if the send ever runs | the only route that can satisfy both criteria; its failing step is now instrumented (§7) |
+| Helper-bot inline result, `MediaAuto` payload / prepared inline message | same storage step, no evidence of a difference | yes | not adopted — see §4 |
 
-**The exact operation and its side effects** (task §5.1–5.4, §5.8):
+## 6. What is deliberately *not* claimed
 
-1. build the payload with the **production** builder/validator
-   (`premium_emoji_inline_service.build_inline_payload` / `validate_inline_payload`)
-   using this route's own identifiable prefix
-   `LifeOS premium emoji self-send test: `;
-2. discover a **known source message** carrying a genuine custom-emoji entity
-   (bounded scan of the last 100 Saved Messages, read through the production
-   `inspect_source_message`), or take a pinned document id from
-   `LIFEOS_LIVE_PREMIUM_EMOJI_DOC_ID`;
-3. resolve the glyph Telegram's documented rule requires — the document's own
-   `alt` when resolvable, else the source span (`glyph_source` recorded);
-4. send **exactly ONE** message: `send_message(inputPeerSelf, text,
-   formatting_entities=[MessageEntityCustomEmoji(offset, length, document_id)])`;
-5. read the stored message back **by its exact id** (`get_messages(peer, ids=…)`)
-   and verify every acceptance criterion;
-6. **no retry on any path** — a payload, send, read-back or verification failure
-   is returned as an honest verdict, so one run can never leave more than the
-   single message it attempted; the message is left in place as the evidence
-   (identifiable by its prefix; delete it manually if desired).
+* Not claimed: that Telegram strips the entity **because of** a bot entitlement,
+  a Premium requirement, the `free` document flag, the `alt` rule, or inline
+  mode. The entity was observed to be absent from the stored bot answer; the
+  rule that removed it is unknown and undocumented. §3 item 9 records the one
+  documented ignore rule and the reason the payload satisfies it by
+  construction (the glyph is the document's own `alt` when resolvable, else the
+  source span, recorded per run as `glyph_source`).
+* Not claimed: that the final `sendInlineBotResult` fails, or that a correctly
+  attributed message is impossible. It has never been attempted with an
+  entity-bearing stored result.
+* Not claimed: that any of the above is a live observation. No Telegram call was
+  made in this task.
 
-**Bounds and isolation:** one message, two target calls (send + read-back) inside
-the production `guarded_await` watchdog, one bounded history scan; the existing
-client factory (`backend.bot.client.build_client`) and the existing custom-emoji
-facade are reused; no new client, listener, update loop, scheduler, executor,
-persistence or dependency; no Supabase/SQL; Saved Messages is the only
-destination that can be addressed.
+## 7. What this task implemented instead (the one honest next step)
 
-**Run it (it skips honestly everywhere else):**
+Since no distinct supported route exists, the task's own rule applies: *stop and
+report* — and its logging requirement supplies the only further thing that can
+be done from inside the running application. That is what shipped:
 
-```
-LIFEOS_LIVE_PREMIUM_EMOJI_SELF_SEND=1 \
-  API_ID=… API_HASH=… SESSION_STRING=… BOT_OWNER_ID=… \
-  pytest tests/test_premium_emoji_self_send_route.py -m live_telegram -v -s
-```
+* the **existing** owner-only action (`Menu` → Emoji → Send Premium Emoji →
+  Reply Mode) is unchanged as a route and gains **no** button; it now writes one
+  **correlated, logs-only** diagnostic sequence
+  (`PREMIUM_EMOJI_ROUTE_DIAG`, `run=<id>`, stages
+  `ROUTE_STARTED` → `SOURCE_ENTITY_VALIDATED` → `PAYLOAD_VALIDATED` →
+  `INLINE_RESULT_SUBMITTED` → `TELEGRAM_RESULT_INSPECTED` → `MESSAGE_SENT` →
+  `MESSAGE_READBACK_VERIFIED` → `VIA_BOT_ATTRIBUTION_VERIFIED` → `DIAGNOSIS`)
+  carrying only ids, counts, offsets, UTF-16 lengths, booleans and bounded
+  exceptions;
+* the Telegram-facing panel **stopped being a report**: the outcome renderer was
+  removed, and the single response is a neutral notice that states no diagnosis,
+  no entity fact, no attribution fact and no success claim;
+* the pre-send gates, the fail-closed behaviour and the
+  Saved-Messages-only rule are byte-for-byte unchanged.
 
-The explicit opt-in flag is required **in addition to** credentials: a live send
-to the owner's account must never happen merely because the suite runs somewhere
-a session is configured.
+**What the sequence decides** (and this is the whole remaining question):
 
-**Why this workspace cannot run it:** no `API_ID`/`API_HASH`/`SESSION_STRING`
-exists here (`freebuff-env list` → no credentials). Per the task's own rule, the
-blocker is reported rather than improvised around.
-
-## 7. The `PeerChannel` entity-resolution warning
-
-Source inspection bounds it:
-
-* the **only** `PeerChannel` reference in the backend is `_peer_to_id` in
-  `backend/telegram_api/_helpers.py` — and it has **no callers** anywhere in the
-  backend;
-* the premium-inline path never resolves a channel peer: it reads the owner's
-  reply in **Saved Messages** (the destination gate refuses anything else) and
-  its inline query peer is that same Saved Messages id;
-* the only path that resolves the **panel** peer (which may well live in a
-  channel/group) is the helper bot's `edit_message` call behind `_edit_inline`,
-  whose failures are caught and logged as a bounded warning — a UI-editing
-  concern on a *different* client and a *different* call path.
-
-**Conclusion (source-established, not asserted about the live log):** the
-warning belongs to the panel-edit path; it cannot change what Telegram stored
-for the helper bot's inline answer, which is where the entity is lost. It is not
-offered as an explanation for `entity_count=0`.
-
-## 8. Falsifiers — what a live run decides
-
-| Live result | Meaning |
+| Logged outcome | Meaning |
 |---|---|
-| `entity_present=True`, `document_id_match=True`, `span_match=True`, `chat_id == owner_id`, `via_bot_id is None` | **The alternative route works**: a genuine custom-emoji entity survives a self-authored Saved Messages send. The next step is a product decision (an owner-authored delivery path or a one-shot tool), not a chat-routing change. |
-| `entity_present=False` (`entity_missing`) | Telegram also strips a **user-authored** custom-emoji entity in Saved Messages — the artifact cannot be produced by this account at all, and the remaining documented lever is the account-level Premium entitlement, an owner decision. |
-| `document_id_mismatch` / `span_mismatch` | Telegram stored an entity that is not the one sent (a real, reportable platform behaviour difference, not a harness bug — the harness is offline-proven). |
-| `not_saved_messages` / an unexpected `via_bot_id` | the artifact is not what this route claims; fail closed and investigate before any product use. |
+| `TELEGRAM_RESULT_INSPECTED ok=True entity_present=False` + `DIAGNOSIS INLINE_RESULT_ENTITY_MISSING` | the entity is lost in the bot's answer, *before* the send — the same finding as the three earlier attempts, now with one correlated, bounded record instead of a Telegram report |
+| `entity_present=True` … `MESSAGE_SENT sent=True message_id=…` + `MESSAGE_READBACK_VERIFIED` + `VIA_BOT_ATTRIBUTION_VERIFIED match=True` + `DIAGNOSIS STORED_ENTITY_VERIFIED_RENDER_UNVERIFIED` | **acceptance criteria 1–5 are satisfied**: the stored message is in Saved Messages, carries the exact document id and UTF-16 geometry, and carries `via_bot_id == helper bot id` — the success log is emitted only after the stored message was read back |
+| `entity_present=True` … `MESSAGE_SENT sent=True` … `readback entity_present=False` + `DIAGNOSIS STORED_ENTITY_STRIPPED` | Telegram accepted the send but did not store the entity — the first live evidence about the *send* step |
+| `… via_bot_id` absent + `DIAGNOSIS STORED_ATTRIBUTION_MISSING` | an entity was stored but not with helper-bot attribution — fail closed, never called success |
 
-A live failure here is necessarily Telegram's answer, not the harness: the
-sequence (identity → discovery → glyph → one send → verify) is itself covered
-offline against a recording fake client (§4 of `IMPLEMENTATION_REPORT.md`).
+## 8. Live verification: not performed, and why
 
-## 9. Remaining uncertainty and the smallest next experiment
+This workspace contains **no** Telegram credentials (`API_ID`, `API_HASH`,
+`SESSION_STRING`, `BOT_OWNER_ID`) and no `.env`; `backend/config.load()`
+hard-fails on exactly those. Render Free offers no shell. Therefore:
 
-1. **Whether Telegram keeps the entity on a self-authored Saved Messages
-   message — unknown, and the single remaining question.** The smallest
-   experiment is exactly the one implemented: one opt-in live run of
-   `tests/test_premium_emoji_self_send_route.py -m live_telegram`, read-back by
-   exact id.
-2. **Nothing was changed in production**, so no deployed behaviour changed and
-   no route is exposed before it is proven.
-3. **Attribution is inherently unavailable on this route** (§5) — any future
-   product use must state that, not paper over it.
-4. **The inline route's own blocker is unchanged and unexplained** (Telegram's
-   undocumented drop of a bot-supplied inline entity); this task deliberately
-   did not attempt it again.
+* **no Telegram request of any kind was made in this task** — not an inline
+  query, not a submission, not a send, not a read-back;
+* there is **no read-back evidence** and `via_bot_id` remains unobserved;
+* the live step must be triggered from the running deployment through the
+  existing owner-only action (exactly as the task requires — no SSH, no shell,
+  no manual credential entry, no new client, no new update loop), and the
+  result must be read from the application log by `run=<id>`.
 
-## 10. Scope honoured
+## 9. Scope honoured
 
-* No production file changed: no delivery route, gate, entity validation,
-  UTF-16 geometry, Saved-Messages-only rule or security boundary was weakened or
-  bypassed; no Unicode fallback, no retry, no duplicate sends, no new client /
-  listener / loop / scheduler / executor / dependency, no Supabase or SQL
-  (`DATABASE_ARCHITECTURE.md`, `ROADMAP.md` and `tests/test_stage13.py`
-  untouched).
-* The experiment is isolated in the test suite and inert by default: it is
-  disabled without an explicit opt-in flag **and** credentials, and the suite is
-  green with it skipped.
+* No new route, client, listener, update loop, scheduler, executor or
+  dependency; no Library/import change; no Supabase or SQL; no
+  `DATABASE_ARCHITECTURE.md`/`ROADMAP.md` change; no schema or migration.
+* Owner authorization checks, the fail-closed gates, the Saved-Messages-only
+  rule, the entity validation and the UTF-16 geometry are untouched.
+* The only Telegram-visible change is that the panel no longer reports an
+  outcome — it cannot claim success, and it cannot leak the diagnosis.
+* No unsupported MTProto field was invented; no entitlement rule was bypassed;
+  no plain Unicode glyph is ever treated as a custom emoji.

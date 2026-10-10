@@ -2022,6 +2022,16 @@ _INLINE_PROMPT = (
 #: runs inside this handler; every Telegram call it makes is bounded on its own.
 _INLINE_TIMEOUT_S = 180.0
 
+#: The panel's ONLY response to a premium-emoji attempt. The route's diagnosis
+#: belongs to the application log — one bounded sequence tagged
+#: ``PREMIUM_EMOJI_ROUTE_DIAG`` under a single correlation id — so this text
+#: states no diagnosis, no entity/attribution fact and never claims success.
+_PREMIUM_INLINE_NOTICE = (
+    "The attempt has been dispatched.\n"
+    "Its diagnosis is written to the application log only — the result, the "
+    "stored entity and the helper-bot attribution are never reported here."
+)
+
 
 def _premium_inline_buttons() -> list:
     builder = InlinePanelBuilder()
@@ -2041,132 +2051,6 @@ async def _premium_inline_builder(event, extra: str) -> list:
     except ValueError as exc:
         logger.warning("[EMOJI_UI] premium inline: refusing to build a result: %s", exc)
         return []
-
-
-def _premium_inline_report(outcome: dict[str, Any]) -> str:
-    """Every fact the pipeline establishes — and none that it does not."""
-    payload = outcome.get("payload") or {}
-    entity = payload.get("entity") or {}
-    inline_result = outcome.get("inline_result") or {}
-    readback = outcome.get("readback") or {}
-    eligibility = outcome.get("eligibility") or {}
-    document = eligibility.get("document")
-
-    lines: list[str] = [premium_inline_service.outcome_summary(outcome), ""]
-    lines.append(f"Diagnosis `{outcome.get('diagnosis')}`")
-    if outcome.get("error"):
-        lines.append(f"Error `{outcome.get('error')}`")
-
-    send_path = outcome.get("send_path")
-    lines.append(
-        "Path: `" + str(send_path) + "` (your account, via the helper bot)"
-        if send_path
-        else "Path: not reached"
-    )
-    destination = outcome.get("destination_chat_id")
-    if destination:
-        lines.append(f"Destination: Saved Messages `#{destination}`")
-    message_id = outcome.get("message_id")
-    lines.append(f"Message: `#{message_id}`" if message_id else "Message: not sent")
-
-    if entity:
-        lines.append(
-            f"Expected entity: document `#{entity.get('document_id')}`"
-            f" · offset {entity.get('offset')} · length {entity.get('length')}"
-            f" · span `{payload.get('glyph')}`"
-        )
-    if inline_result.get("attempted"):
-        if inline_result.get("entity_present"):
-            lines.append(
-                "Inline result: entity KEPT by Telegram"
-                f" (document `#{inline_result.get('document_id')}`"
-                f" · offset {inline_result.get('offset')}"
-                f" · length {inline_result.get('length')})"
-            )
-        elif inline_result.get("reason") == "empty":
-            lines.append("Inline result: the helper bot returned none")
-        elif inline_result.get("reason") in ("unsupported", "no_send_message"):
-            lines.append(
-                "Inline result: not inspectable ("
-                + str(inline_result.get("error") or "unsupported result shape")
-                + ")"
-            )
-        else:
-            lines.append(
-                "Inline result: entity missing ("
-                + str(inline_result.get("error") or "no custom-emoji entity in the stored result")
-                + ")"
-            )
-        # The other half of the comparison: what the HELPER BOT's own answer
-        # carried. Without it a missing entity cannot be attributed.
-        answer = inline_result.get("answer") or {}
-        if not answer.get("recorded"):
-            lines.append("Helper answer: no submission of this bot was recorded")
-        else:
-            submitted = answer.get("custom_emoji_count")
-            count = (
-                f"{submitted} custom-emoji entit" + ("y" if submitted == 1 else "ies")
-                if isinstance(submitted, int)
-                else "an unknown payload"
-            )
-            lines.append(
-                "Helper answer: submitted "
-                + count
-                + (" · accepted by Telegram" if answer.get("ok") else " · the submission did not complete")
-            )
-    if readback.get("attempted"):
-        if readback.get("ok"):
-            if readback.get("entity_present"):
-                lines.append(
-                    "Stored message: real `MessageEntityCustomEmoji`"
-                    f" (document `#{readback.get('document_id')}`"
-                    f" · offset {readback.get('offset')}"
-                    f" · length {readback.get('length')})"
-                    " · id match: " + ("yes" if readback.get("document_id_match") else "NO")
-                    + " · span match: " + ("yes" if readback.get("span_match") else "NO")
-                )
-            else:
-                lines.append(
-                    "Stored message: NO custom-emoji entity — it was stripped or ignored"
-                )
-            lines.append(
-                f"Attribution: `via_bot_id` = {readback.get('via_bot_id')!r} "
-                + (
-                    "(matches the helper bot)"
-                    if readback.get("via_bot_match")
-                    else "(does NOT match the configured helper bot id)"
-                )
-            )
-        else:
-            lines.append(f"Read-back: failed ({readback.get('error')})")
-
-    premium = eligibility.get("owner_premium")
-    premium_text = "unknown" if premium is None else ("yes" if premium else "no")
-    free = None if document is None else document.get("free")
-    free_text = (
-        "unknown"
-        if free is None
-        else ("yes (non-Premium allowed)" if free else "no (Premium-only)")
-    )
-    lines.append(
-        f"Owner Premium: {premium_text} · emoji `free`: {free_text} · "
-        f"text_color: {None if document is None else document.get('text_color')}"
-    )
-    if eligibility.get("document_error"):
-        lines.append(f"_Document facts: {eligibility['document_error']}_")
-    if eligibility.get("owner_premium_error"):
-        lines.append(f"_Premium status: {eligibility['owner_premium_error']}_")
-    if eligibility.get("glyph_source"):
-        lines.append(f"_Glyph source: {eligibility['glyph_source']}_")
-    lines.append(
-        f"_Helper bot: @{eligibility.get('helper_bot_username') or '?'}"
-        f" · id `{eligibility.get('helper_bot_id')}`_"
-    )
-    lines.append(
-        "\n_Telegram accepts this send; whether your client renders the "
-        "emoji is for you to confirm visually._"
-    )
-    return "\n".join(lines)
 
 
 async def _premium_inline_action(event, extra: str, chat_id: int) -> tuple[str, str, list]:
@@ -2292,11 +2176,11 @@ async def _premium_inline_reply_handler(
 
     found = premium_inline_service.inspect_source_message(reply)
     if found["kind"] != premium_inline_service.KIND_CUSTOM_EMOJI:
+        # Input guidance only: no diagnosis constant, no route fact.
         await _finish(
             "Send Premium Emoji",
-            f"! {found['detail']}.\n\n"
-            f"Diagnosis `{premium_inline_service.SOURCE_ENTITY_MISSING}` — nothing "
-            "was sent.",
+            "! That reply carries no genuine Premium custom emoji.\n"
+            "Reply with a real custom emoji — nothing was sent.",
             _premium_inline_buttons(),
         )
         return
@@ -2304,10 +2188,13 @@ async def _premium_inline_reply_handler(
     outcome = await premium_inline_service.send_premium_emoji_via_inline(
         client, chat_id, found["document_id"], found["span_text"], owner
     )
-    title = "Send Premium Emoji"
-    if outcome.get("verified"):
-        title = "Send Premium Emoji ✓"
-    await _finish(title, _premium_inline_report(outcome), _premium_inline_buttons())
+    # The diagnosis stays in the log. The panel is only told WHICH run it can
+    # correlate with; it is never shown the outcome, the entity facts or the
+    # attribution, and it never claims success.
+    logger.info(
+        "[EMOJI_UI] premium inline: run %s dispatched", outcome.get("run_id")
+    )
+    await _finish("Send Premium Emoji", _PREMIUM_INLINE_NOTICE, _premium_inline_buttons())
 
 
 # ── premium-emoji probe (POC: the helper bot renders the custom emoji) ────

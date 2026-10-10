@@ -301,6 +301,41 @@ def _send(client, monkeypatch, **kwargs):
     )
 
 
+# ── the correlated route-diagnostic log sequence ────────────────────────────
+#
+# ONE route attempt writes ONE sequence of stage lines, all tagged
+# ``PREMIUM_EMOJI_ROUTE_DIAG`` and correlated by the record's own
+# ``run=<id>``. It is the only place the diagnosis exists: the Telegram-facing
+# panel stays a neutral notice.
+
+
+def _route_diag_lines(caplog) -> list[str]:
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "backend.services.premium_emoji_inline_service"
+        and svc.ROUTE_DIAG_TAG in record.getMessage()
+    ]
+
+
+def _stage_of(line: str) -> str:
+    return line.split("stage=", 1)[1].split(" ", 1)[0]
+
+
+def _route_run_ids(caplog) -> list[str]:
+    return sorted(
+        {line.split("run=", 1)[1].split(" ", 1)[0] for line in _route_diag_lines(caplog)}
+    )
+
+
+def _diag_level(caplog) -> None:
+    import logging
+
+    caplog.set_level(
+        logging.INFO, logger="backend.services.premium_emoji_inline_service"
+    )
+
+
 # ── source entity extraction ────────────────────────────────────────────────
 
 
@@ -848,26 +883,19 @@ def test_the_inspection_trace_names_the_real_classes(caplog):
     )
 
 
-def test_the_report_renders_an_unsupported_shape_honestly():
-    outcome = {
-        "diagnosis": svc.INLINE_RESULT_UNSUPPORTED,
-        "error": svc.ERROR_QUERY,
-        "detail": "the inline result's runtime shape could not be inspected safely",
-        "payload": svc.build_inline_payload(DOC, ALT),
-        "inline_result": {
-            "attempted": True,
-            "ok": False,
-            "reason": "unsupported",
-            "error": "the inline result wrapper X carries no stored BotInlineResult",
-            "entity_present": False,
-        },
-        "readback": {},
-        "eligibility": {},
-    }
-    body = emoji._premium_inline_report(outcome)
-    assert svc.INLINE_RESULT_UNSUPPORTED in body
-    assert "not inspectable" in body
-    assert "entity missing" not in body
+def test_the_panel_notice_carries_no_diagnosis_and_no_success_claim():
+    notice = emoji._PREMIUM_INLINE_NOTICE
+    for leaked in (
+        "INLINE_RESULT_UNSUPPORTED",
+        "INLINE_RESULT_ENTITY_MISSING",
+        "STORED_ENTITY_VERIFIED_RENDER_UNVERIFIED",
+        "DIAGNOSIS",
+        "via_bot_id",
+        "document",
+        "✓",
+    ):
+        assert leaked not in notice, leaked
+    assert "application log" in notice
 
 
 # ── no fallback, ever ───────────────────────────────────────────────────────
@@ -988,35 +1016,47 @@ def test_reply_handler_accepts_only_the_exact_selection_message(monkeypatch):
     assert client.queries == []
 
 
-def test_reply_handler_rejects_a_plain_unicode_reply(monkeypatch):
+def test_reply_handler_rejects_a_plain_unicode_reply_without_a_diagnosis(monkeypatch):
     reply = _reply_targeting(SELECTION, ALT, [])
     client = _FakeSelfClient(reply=reply)
     inline_engine.set_self_client(client)
     captured = _run_reply(monkeypatch)
-    assert svc.SOURCE_ENTITY_MISSING in captured["body"]
+    assert "nothing was sent" in captured["body"]
+    assert svc.SOURCE_ENTITY_MISSING not in captured["body"]
+    assert "Diagnosis" not in captured["body"]
     assert client.queries == []
 
 
-def test_reply_handler_runs_the_full_flow_and_reports_it(monkeypatch):
+def test_reply_handler_dispatches_the_run_and_keeps_the_diagnosis_out_of_telegram(
+    monkeypatch, caplog
+):
+    import logging
+
     reply = _reply_targeting(SELECTION, ALT, [_entity()])
     text, entities = _result_payload()
     stored = _FakeMessage(text, entities, via_bot_id=BOT_ID)
     client = _FakeSelfClient(reply=reply, results=[_FakeInlineResult(text, entities)], stored=stored)
     inline_engine.set_self_client(client)
     _patch_facts(monkeypatch)
+    caplog.set_level(logging.INFO, logger="backend.services.premium_emoji_inline_service")
 
     captured = _run_reply(monkeypatch)
 
-    assert captured["title"] == "Send Premium Emoji ✓"
-    body = captured["body"]
-    assert svc.STORED_ENTITY_VERIFIED_RENDER_UNVERIFIED in body
-    assert "messages.sendInlineBotResult" in body
-    assert "matches the helper bot" in body
-    assert "Owner Premium: no" in body
-    assert "non-Premium allowed" in body
+    assert captured["title"] == "Send Premium Emoji"
+    assert captured["body"] == emoji._PREMIUM_INLINE_NOTICE
+    # … and the whole diagnosis IS in the log, under one correlation id.
+    lines = _route_diag_lines(caplog)
+    assert any("stage=DIAGNOSIS" in line for line in lines)
+    assert any(
+        svc.STORED_ENTITY_VERIFIED_RENDER_UNVERIFIED in line for line in lines
+    )
+    run_ids = _route_run_ids(caplog)
+    assert len(run_ids) == 1
 
 
-def test_reply_handler_reports_a_stripped_entity_honestly(monkeypatch):
+def test_reply_handler_reports_a_stripped_entity_in_the_log_only(monkeypatch, caplog):
+    import logging
+
     reply = _reply_targeting(SELECTION, ALT, [_entity()])
     text, entities = _result_payload()
     client = _FakeSelfClient(
@@ -1026,12 +1066,15 @@ def test_reply_handler_reports_a_stripped_entity_honestly(monkeypatch):
     )
     inline_engine.set_self_client(client)
     _patch_facts(monkeypatch)
+    caplog.set_level(logging.INFO, logger="backend.services.premium_emoji_inline_service")
 
     captured = _run_reply(monkeypatch)
 
     assert captured["title"] == "Send Premium Emoji"
-    assert svc.STORED_ENTITY_STRIPPED in captured["body"]
-    assert "NO custom-emoji entity" in captured["body"]
+    assert captured["body"] == emoji._PREMIUM_INLINE_NOTICE
+    assert svc.STORED_ENTITY_STRIPPED not in captured["body"]
+    lines = _route_diag_lines(caplog)
+    assert any(svc.STORED_ENTITY_STRIPPED in line for line in lines)
 
 
 # ── the live dispatch boundary (pending-input listener → reply handler) ─────
@@ -1105,7 +1148,8 @@ def test_the_real_pending_input_listener_reaches_the_production_flow(monkeypatch
     ]
     assert traces, "a dispatched reply must emit at least one [PREMIUM_INLINE] trace"
     assert traces[0].startswith("[PREMIUM_INLINE] SOURCE_ENTITY_VALIDATED")
-    assert captured_edits["title"] == "Send Premium Emoji ✓"
+    assert captured_edits["title"] == "Send Premium Emoji"
+    assert captured_edits["body"] == emoji._PREMIUM_INLINE_NOTICE
 
 
 def test_the_production_listener_ignores_a_reply_in_another_chat(monkeypatch, caplog):
@@ -1451,9 +1495,8 @@ def test_a_stored_result_without_the_entity_is_attributed_to_telegram(monkeypatc
     assert answer["document_ids"] == [DOC]
     assert "dropped by Telegram" in result["detail"]
     assert "not by this application" in result["detail"]
-    # the panel's own summary line IS the recorded detail
+    # the same attribution is what the summary sentence and the LOG carry
     assert "dropped by Telegram" in svc.outcome_summary(result)
-    assert "Helper answer: submitted 1 custom-emoji entity · accepted by Telegram" in emoji._premium_inline_report(result)
 
 
 def test_a_recorded_submission_without_the_entity_blames_this_application(monkeypatch):
@@ -1503,7 +1546,6 @@ def test_an_unrecorded_submission_leaves_the_cause_unproven(monkeypatch):
     assert result["inline_result"]["answer"]["recorded"] is False
     assert "unproven" in result["detail"]
     assert "dropped by Telegram" not in svc.outcome_summary(result)
-    assert "no submission of this bot was recorded" in emoji._premium_inline_report(result)
 
 
 def test_the_attribution_requires_the_submitted_entity_to_be_this_emoji(monkeypatch):
@@ -1660,3 +1702,162 @@ def test_serialize_document_adds_free_and_text_color_additively():
     assert entry["free"] is True
     assert entry["text_color"] is None
     assert "set" in entry
+
+
+# ── the route diagnostic: ONE correlated, logs-only sequence ────────────────
+#
+# Acceptance is decided by Telegram's stored message, so the evidence for ONE
+# attempt is written as ONE greppable, correlated sequence of bounded stage
+# lines — closing with a machine-readable ``DIAGNOSIS`` — and nowhere else. A
+# pre-send refusal is diagnosed too: every attempt that reaches the service
+# carries exactly one ``run=<id>`` and exactly one verdict.
+
+
+def test_one_verified_run_emits_the_whole_sequence_under_one_run_id(
+    monkeypatch, caplog
+):
+    text, entities = _result_payload()
+    client = _FakeSelfClient(
+        results=[_FakeInlineResult(text, entities)],
+        stored=_FakeMessage(text, entities, via_bot_id=BOT_ID),
+    )
+    _diag_level(caplog)
+
+    result = _send(client, monkeypatch)
+
+    assert result["diagnosis"] == svc.STORED_ENTITY_VERIFIED_RENDER_UNVERIFIED
+    assert result["verified"] is True
+    lines = _route_diag_lines(caplog)
+    assert [_stage_of(line) for line in lines] == [
+        "ROUTE_STARTED",
+        "SOURCE_ENTITY_VALIDATED",
+        "PAYLOAD_VALIDATED",
+        "INLINE_RESULT_SUBMITTED",
+        "TELEGRAM_RESULT_INSPECTED",
+        "MESSAGE_SENT",
+        "MESSAGE_READBACK_VERIFIED",
+        "VIA_BOT_ATTRIBUTION_VERIFIED",
+        "DIAGNOSIS",
+    ]
+    # ONE attempt, ONE correlation id — the id the record itself carries.
+    assert _route_run_ids(caplog) == [result["run_id"]]
+    assert all(line.startswith(f"[{svc.ROUTE_DIAG_TAG}] run={result['run_id']} ") for line in lines)
+    # …and the verdict is emitted AFTER the stored message was inspected.
+    assert f"stage=MESSAGE_SENT sent=True message_id=4242" in lines[5]
+    assert f"via_bot_id={BOT_ID} expected_via_bot_id={BOT_ID} match=True" in lines[7]
+    assert f"diagnosis={svc.STORED_ENTITY_VERIFIED_RENDER_UNVERIFIED}" in lines[8]
+    assert "entity_stored=True" in lines[8] and "sent=yes" in lines[8]
+
+
+def test_a_pre_send_refusal_still_emits_one_run_id_and_one_diagnosis(
+    monkeypatch, caplog
+):
+    client = _FakeSelfClient()
+    _diag_level(caplog)
+
+    result = _send(client, monkeypatch, chat_id=OTHER_CHAT)
+
+    assert result["diagnosis"] == svc.UNSUPPORTED_DESTINATION
+    lines = _route_diag_lines(caplog)
+    assert [_stage_of(line) for line in lines] == ["ROUTE_STARTED", "DIAGNOSIS"]
+    assert _route_run_ids(caplog) == [result["run_id"]]
+    assert "reason=destination" in lines[0]
+    assert "sent=no" in lines[1]
+    assert client.queries == []
+
+
+def test_the_run_start_records_the_entitlement_facts(monkeypatch, caplog):
+    text, entities = _result_payload()
+    client = _FakeSelfClient(
+        results=[_FakeInlineResult(text, entities)],
+        stored=_FakeMessage(text, entities, via_bot_id=BOT_ID),
+    )
+    _diag_level(caplog)
+
+    _send(client, monkeypatch, facts={"premium": True, "free": False})
+
+    first = _route_diag_lines(caplog)[0]
+    assert _stage_of(first) == "ROUTE_STARTED"
+    assert f"document_id={DOC}" in first
+    assert "owner_premium=True" in first
+    assert "document_free=False" in first
+    assert f"helper_bot_id={BOT_ID}" in first
+    assert "glyph_source=document_alt" in first
+
+
+def test_a_stripped_stored_entity_is_diagnosed_from_the_readback(
+    monkeypatch, caplog
+):
+    text, entities = _result_payload()
+    client = _FakeSelfClient(
+        results=[_FakeInlineResult(text, entities)],
+        stored=_FakeMessage(text, [], via_bot_id=BOT_ID),
+    )
+    _diag_level(caplog)
+
+    result = _send(client, monkeypatch)
+
+    assert result["diagnosis"] == svc.STORED_ENTITY_STRIPPED
+    assert result["verified"] is False
+    lines = _route_diag_lines(caplog)
+    readback = next(line for line in lines if _stage_of(line) == "MESSAGE_READBACK_VERIFIED")
+    assert "readback_ok=True entity_present=False" in readback
+    verdict = lines[-1]
+    assert _stage_of(verdict) == "DIAGNOSIS"
+    assert f"diagnosis={svc.STORED_ENTITY_STRIPPED}" in verdict
+    assert "sent=yes" in verdict and "entity_stored=False" in verdict
+
+
+def test_a_missing_attribution_is_diagnosed_and_never_called_success(
+    monkeypatch, caplog
+):
+    text, entities = _result_payload()
+    client = _FakeSelfClient(
+        results=[_FakeInlineResult(text, entities)],
+        stored=_FakeMessage(text, entities, via_bot_id=None),
+    )
+    _diag_level(caplog)
+
+    result = _send(client, monkeypatch)
+
+    assert result["diagnosis"] == svc.STORED_ATTRIBUTION_MISSING
+    assert result["verified"] is False
+    verdict = _route_diag_lines(caplog)[-1]
+    assert f"diagnosis={svc.STORED_ATTRIBUTION_MISSING}" in verdict
+    assert "via_bot_id=None" in verdict
+
+
+def test_the_sequence_stays_bounded_and_never_dumps_content(
+    monkeypatch, caplog
+):
+    text, entities = _result_payload()
+    long_glyph = "🔥" * 40
+    client = _FakeSelfClient(
+        results=[_FakeInlineResult(text, entities)],
+        stored=_FakeMessage(text, entities, via_bot_id=BOT_ID),
+    )
+    _diag_level(caplog)
+
+    _send(client, monkeypatch, source_glyph=long_glyph)
+
+    lines = _route_diag_lines(caplog)
+    joined = "\n".join(lines)
+    # spans and glyphs are recorded as NUMBERS, never as their text
+    assert long_glyph not in joined
+    assert f"source_span_utf16_len={utf16_length(long_glyph)}" in joined
+    # the prefix the entity's offset is computed from is length-only too
+    assert f"text_utf16_len={utf16_length(text)}" in joined
+    # …and no credential-shaped field ever reaches the log
+    for forbidden in (
+        "SESSION_STRING",
+        "SESSION",
+        "api_hash",
+        "API_HASH",
+        "access_hash",
+        "file_reference",
+        "BOT_TOKEN",
+        "authorization",
+        "Proxy",
+    ):
+        assert forbidden not in joined
+    assert all(len(line) < 400 for line in lines)
