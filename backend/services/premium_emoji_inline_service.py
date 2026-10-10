@@ -563,16 +563,19 @@ async def _inspect_inline_result(results: Any, payload: dict[str, Any]) -> dict[
         count = None
     evidence["result_count"] = count
     first = results[0]
-    message = getattr(first, "message", None)
-    if message is None:
+    # BotInlineResult (what GetInlineBotResultsRequest returns) stores the
+    # message under ``send_message``, not ``message``. Reading ``message``
+    # always returns None and would report a present entity as missing.
+    send_message = getattr(first, "send_message", None)
+    if send_message is None:
         evidence["error"] = "the stored inline result carries no send_message"
         evidence["entity_present"] = False
         _trace("INLINE_RESULT_INSPECTED", entity_present=False, reason="no_send_message")
         return evidence
     evidence["ok"] = True
-    text = getattr(message, "message", "") or ""
+    text = getattr(send_message, "message", "") or ""
     evidence["text"] = text
-    scan = _scan_custom_emoji(text, getattr(message, "entities", None))
+    scan = _scan_custom_emoji(text, getattr(send_message, "entities", None))
     expected = payload["entity"]
     if scan is None:
         evidence["entity_present"] = False
@@ -583,7 +586,7 @@ async def _inspect_inline_result(results: Any, payload: dict[str, Any]) -> dict[
             "INLINE_RESULT_INSPECTED",
             entity_present=False,
             text_utf16_len=utf16_length(text),
-            entity_count=len(getattr(message, "entities", None) or []),
+            entity_count=len(getattr(send_message, "entities", None) or []),
         )
         return evidence
     evidence["entity_present"] = True

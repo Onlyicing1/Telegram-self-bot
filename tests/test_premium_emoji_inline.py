@@ -98,7 +98,13 @@ class _FakeMessage:
 
 
 class _FakeInlineResult:
-    """A stored inline result as ``getInlineBotResults`` returns it."""
+    """A stored inline result as ``getInlineBotResults`` returns it.
+
+    Telegram returns ``BotInlineResult`` objects, whose field is
+    ``send_message`` (a ``BotInlineMessageText``), not ``message``.
+    The service's checkpoint-2 inspection reads ``send_message``, so this
+    fake mirrors that field name exactly.
+    """
 
     def __init__(
         self,
@@ -110,7 +116,7 @@ class _FakeInlineResult:
         click_error: Exception | None = None,
         click_returns_none: bool = False,
     ) -> None:
-        self.message = SimpleNamespace(message=text, entities=entities or [])
+        self.send_message = SimpleNamespace(message=text, entities=entities or [])
         self.clicks = 0
         self._message_id = message_id
         self._via_bot_id = via_bot_id
@@ -124,8 +130,8 @@ class _FakeInlineResult:
         if self._click_returns_none:
             return None
         return _FakeMessage(
-            self.message.message,
-            self.message.entities,
+            self.send_message.message,
+            self.send_message.entities,
             message_id=self._message_id,
             via_bot_id=self._via_bot_id,
         )

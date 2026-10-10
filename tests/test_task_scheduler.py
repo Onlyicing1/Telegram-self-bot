@@ -9,18 +9,18 @@ from backend.ai.task_scheduler import TaskScheduler, occurrence_key
 
 
 def task_data(**overrides):
-    value = {"label": "Hourly", "schedule_type": "interval", "schedule": {"seconds": 3600}, "timezone": "UTC", "next_run_at": datetime(2026, 8, 29, 9, tzinfo=timezone.utc), "actions": [{"name": "safe", "arguments": {}}], "notification_destination": {"chat_id": 1}}
+    value = {"label": "Hourly", "schedule_type": "interval", "schedule": {"seconds": 3600}, "timezone": "UTC", "next_run_at": datetime(2026, 9, 10, 9, tzinfo=timezone.utc), "actions": [{"name": "safe", "arguments": {}}], "notification_destination": {"chat_id": 1}}
     value.update(overrides); return value
 
 
 @pytest.mark.asyncio
 async def test_due_active_task_creates_one_idempotent_occurrence_and_advances():
     repo = InMemoryTaskRepository(); task = await repo.create_task(1, task_data())
-    scheduler = TaskScheduler(repo, 1); now = datetime(2026, 8, 29, 9, 5, tzinfo=timezone.utc)
+    scheduler = TaskScheduler(repo, 1); now = datetime(2026, 9, 10, 9, 5, tzinfo=timezone.utc)
     assert await scheduler.run_once(now) == 1
     assert await scheduler.run_once(now) == 0
     rows = await repo.list_occurrences(1, task.id); assert len(rows) == 1
-    assert (await repo.get_task(1, task.id)).next_run_at == datetime(2026, 8, 29, 10, tzinfo=timezone.utc)
+    assert (await repo.get_task(1, task.id)).next_run_at == datetime(2026, 9, 10, 10, tzinfo=timezone.utc)
 
 
 @pytest.mark.asyncio
@@ -37,7 +37,7 @@ async def test_due_discovery_filters_owner_status_and_orders_bounded():
 @pytest.mark.asyncio
 async def test_snapshot_and_version_are_preserved():
     repo = InMemoryTaskRepository(); task = await repo.create_task(1, task_data())
-    scheduler = TaskScheduler(repo, 1); await scheduler.run_once(datetime(2026, 8, 29, 9, 1, tzinfo=timezone.utc))
+    scheduler = TaskScheduler(repo, 1); await scheduler.run_once(datetime(2026, 9, 10, 9, 1, tzinfo=timezone.utc))
     await repo.update_task(1, task.id, 1, {"actions": [{"name": "changed", "arguments": {}}]})
     row = (await repo.list_occurrences(1, task.id))[0]
     assert row.definition_version == 1 and row.action_snapshot[0]["name"] == "safe"
