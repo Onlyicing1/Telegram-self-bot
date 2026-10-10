@@ -131,9 +131,10 @@ parsed = BinaryReader(bytes(request)).tgread_object()
 ```
 
 Pinned by `test_the_answer_carries_the_entity_into_the_set_inline_bot_results_bytes`.
-The same bytes were also dumped and read by hand during the trace: constructor
-`0xc8cf05f8`, offset 15, length 2, the live document id, inside a result whose
-text is `"Premium emoji: 😈"`.
+The same request was also dumped and read by hand during the trace: constructor
+`0xc8cf05f8`, offset 15, length 2 and the document id the payload carries (the
+one extracted from the owner's source entity), inside a result whose text is
+the prefix followed by that emoji.
 
 **Consequence:** the entity is not lost in application code and not in TL
 serialization. Whatever Telegram's reply contains, the request was complete.

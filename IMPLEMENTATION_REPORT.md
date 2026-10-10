@@ -115,9 +115,12 @@ in a way that hides its exit status.
 
 | Step | Value |
 |---|---|
-| Commit | this task's single commit — `backend/helper/inline_engine.py`, `backend/services/premium_emoji_inline_service.py`, `backend/bot/handlers/emoji.py`, `tests/test_premium_emoji_inline.py`, `INVESTIGATION.md`, `IMPLEMENTATION_REPORT.md` |
-| Push | pushed to `origin/main` |
-| Remote verification | `git fetch origin main` + `git rev-parse HEAD` + `git rev-parse origin/main` + `git ls-remote origin refs/heads/main` + `git merge-base --is-ancestor <commit> origin/main` |
+| Commit | one commit for this task's implementation — `backend/helper/inline_engine.py`, `backend/services/premium_emoji_inline_service.py`, `backend/bot/handlers/emoji.py`, `tests/test_premium_emoji_inline.py`, `INVESTIGATION.md`, `IMPLEMENTATION_REPORT.md` (the docs-only addendum that carries this very sentence is a second, report-only commit; no production file is touched by it) |
+| Push | pushed to `origin/main` as a fast-forward (`9633c0b..<commit>`); no rebase, no force-push, no history rewrite |
+| Remote verification | `git fetch origin main` → no new commits; `git rev-parse HEAD` = `git rev-parse origin/main` = `git ls-remote origin refs/heads/main`; `git merge-base --is-ancestor <commit> origin/main` exit 0; the remote `INVESTIGATION.md`/`IMPLEMENTATION_REPORT.md` were re-read from `origin/main` |
+| Final working tree | clean apart from the pre-existing untracked `.m14/` scratch directory (never touched); the checkout sits on the task branch `fix/premium-emoji-inline-entity` whose tip is `origin/main`; the pre-existing, unrelated unpushed local `main` (`db02e13`, bounded PDF/DOCX media extraction) is preserved untouched and also pointed at by `backup/db02e13-doc-extraction` |
+| Supabase | untouched — no SQL, no schema, no migration, no request; `DATABASE_ARCHITECTURE.md` unchanged |
+| Protected files | `tests/test_stage13.py`, `DATABASE_ARCHITECTURE.md` and `ROADMAP.md` were not modified by any commit of this task |
 
 A commit cannot contain its own hash: the commit SHA and the verified
 `origin/main` SHA are reported in this task's delivery response, and the remote
