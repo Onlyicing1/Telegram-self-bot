@@ -26,6 +26,12 @@ def pytest_configure(config):
         "live_supabase: opt-in live integration test against a real Supabase "
         "database (requires SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY; skips otherwise)",
     )
+    config.addinivalue_line(
+        "markers",
+        "live_telegram: opt-in live integration test against the real owner "
+        "account (requires LIFEOS_LIVE_PREMIUM_EMOJI_SELF_SEND=1 plus API_ID, "
+        "API_HASH, SESSION_STRING and BOT_OWNER_ID; skips otherwise)",
+    )
 
 
 @pytest.fixture
