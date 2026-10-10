@@ -72,7 +72,7 @@ infrastructure; no Unicode fallback; no retries; no Supabase/SQL; no
 | Focused experiment (**mocked/offline**) | `.venv/bin/python -m pytest tests/test_premium_emoji_self_send_route.py -q` | **41 passed, 1 skipped**, exit 0 (the skipped one is the live test) |
 | Live marker selection | `.venv/bin/python -m pytest tests/test_premium_emoji_self_send_route.py -m live_telegram -v -rs` | 1 selected, **SKIPPED** with the honest reason "the live Telegram self-send test is opt-in: set `LIFEOS_LIVE_PREMIUM_EMOJI_SELF_SEND=1`…", exit 0 |
 | Relevant regressions | `pytest tests/test_premium_emoji_self_send_route.py tests/test_premium_emoji_inline.py tests/test_premium_emoji_probe.py tests/test_emoji_ui.py tests/test_reaction_phase6.py tests/test_bridge_delivery.py -q` | **302 passed, 1 skipped**, exit 0 |
-| Full suite | `timeout 560 .venv/bin/python -m pytest tests/ -q` | **5838 passed, 27 skipped, 3 warnings in 119.59s**, exit 0 (baseline 5797 passed / 26 skipped → +41 new offline tests, +1 skipped live test, **0 regressions**) |
+| Full suite | `timeout 560 .venv/bin/python -m pytest tests/ -q` | **5838 passed, 27 skipped, 3 warnings in 124.32s**, exit 0 (baseline 5797 passed / 26 skipped → +41 new offline tests, +1 skipped live test, **0 regressions**; re-measured on the final revision, identical counts) |
 | Whitespace / diff sanity | `git diff --check` | exit 0; complete diff reviewed (one new test module + 6 lines in `tests/conftest.py`) |
 
 ### Mocked vs live — kept strictly separate
