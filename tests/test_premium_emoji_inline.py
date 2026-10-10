@@ -47,12 +47,15 @@ test claims Telegram will keep the entity on a real send.
 from __future__ import annotations
 
 import asyncio
+import time
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from telethon import types
+from telethon.extensions.binaryreader import BinaryReader
 from telethon.tl import custom as telethon_custom
+from telethon.tl.functions.messages import SetInlineBotResultsRequest
 from telethon.tl.types import messages as telethon_messages
 
 import backend.helper.client as helper_client
@@ -1194,6 +1197,353 @@ def test_serialize_user_adds_premium_without_dropping_keys():
         "id", "first_name", "last_name", "full_name", "username", "phone",
         "about", "is_bot", "is_deleted",
     }
+
+
+# ── the submission path: the entity the helper bot actually hands over ──────
+#
+# The live flow reaches ``INLINE_RESULT_ENTITY_MISSING``: Telegram's STORED
+# inline result carries no custom-emoji entity. Everything below pins the OTHER
+# half of that comparison against the REAL classes — the registered router
+# answers with the entity, that answer survives TL serialization into
+# ``messages.setInlineBotResults``, the sanitizer leaves it alone, and the
+# helper bot's own submission is recorded — so the loss is attributed to the
+# side that lost it instead of being guessed.
+
+
+class _RecordingHelperClient:
+    """The one surface ``register_inline_handler`` uses on the helper bot."""
+
+    def __init__(self):
+        self.handlers: list = []
+
+    def on(self, event_builder):
+        def decorator(handler):
+            self.handlers.append(handler)
+            return handler
+
+        return decorator
+
+
+class _RecordingInlineEvent:
+    """An InlineQuery event whose ``answer`` mirrors the installed Telethon.
+
+    ``telethon.events.inlinequery.InlineQuery.Event.answer`` puts the passed
+    results straight into ``messages.SetInlineBotResultsRequest``; capturing
+    that request is how this file inspects what the helper bot would submit.
+    """
+
+    def __init__(self, text: str, sender_id: int, query_id: int = 4242):
+        self.text = text
+        self.sender_id = sender_id
+        self.query = SimpleNamespace(query_id=query_id)
+        self.answers: list = []
+        self.requests: list = []
+
+    async def answer(
+        self, results=None, cache_time=0, *, gallery=False, next_offset=None,
+        private=False, switch_pm=None, switch_pm_param="",
+    ):
+        submitted = list(results or [])
+        self.answers.append(submitted)
+        self.requests.append(
+            SetInlineBotResultsRequest(
+                query_id=self.query.query_id,
+                results=submitted,
+                cache_time=cache_time,
+                gallery=gallery,
+                next_offset=next_offset,
+                private=private,
+                switch_pm=None,
+            )
+        )
+        return True
+
+
+class _AnsweringSelfClient(_FakeSelfClient):
+    """A self client whose inline query also runs the HELPER BOT's own answer.
+
+    Live, the bot answers while the query is in flight, so the recorded
+    submission is always newer than the service's ``query_started`` mark —
+    exactly the order the real flow has.
+    """
+
+    def __init__(self, *args, answer_results=None, answer_ok=True, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._answer_results = answer_results
+        self._answer_ok = answer_ok
+
+    async def inline_query(self, username, query, entity=None):
+        if self._answer_results is not None:
+            inline_engine.record_inline_answer(
+                svc.INLINE_QUERY_KEY, self._answer_results, ok=self._answer_ok
+            )
+        return await super().inline_query(username, query, entity=entity)
+
+
+def _registered_router():
+    """The PRODUCTION router, registered on a recording helper client."""
+    emoji.register(client=None, owner_id=OWNER)
+    helper = _RecordingHelperClient()
+    inline_engine.register_inline_handler(helper, OWNER)
+    assert helper.handlers, "the inline router was not registered"
+    return helper.handlers[-1]
+
+
+def test_the_registered_router_answers_the_query_with_the_real_entity():
+    router = _registered_router()
+    event = _RecordingInlineEvent(f"{svc.INLINE_QUERY_KEY}:{DOC}:{ALT}", OWNER)
+
+    _run(router(event))
+
+    assert len(event.answers) == 1
+    submitted = event.answers[0]
+    assert len(submitted) == 1
+    result = submitted[0]
+    assert isinstance(result, types.InputBotInlineResult)
+    assert result.type == "article"
+    payload = result.send_message
+    assert isinstance(payload, types.InputBotInlineMessageText)
+    assert payload.message == PREFIX + ALT
+    assert len(payload.entities) == 1
+    entity = payload.entities[0]
+    assert isinstance(entity, types.MessageEntityCustomEmoji)
+    assert (entity.document_id, entity.offset, entity.length) == (DOC, 15, 2)
+    assert svc._span_text(payload.message, entity.offset, entity.length) == ALT
+    expected = svc.build_inline_payload(DOC, ALT)
+    assert svc.validate_inline_payload(expected) == ""
+    assert entity.document_id == expected["entity"]["document_id"]
+    assert (entity.offset, entity.length) == (
+        expected["entity"]["offset"],
+        expected["entity"]["length"],
+    )
+
+
+def test_the_answer_carries_the_entity_into_the_set_inline_bot_results_bytes():
+    """The entity is on the WIRE — read back from the real request bytes.
+
+    The live stored result had no entity, so this is the fact that decides
+    which side lost it: the request the helper bot sends contains it.
+    """
+    router = _registered_router()
+    event = _RecordingInlineEvent(f"{svc.INLINE_QUERY_KEY}:{DOC}:{ALT}", OWNER)
+    _run(router(event))
+
+    parsed = BinaryReader(bytes(event.requests[0])).tgread_object()
+    assert isinstance(parsed, SetInlineBotResultsRequest)
+    assert len(parsed.results) == 1
+    payload = parsed.results[0].send_message
+    assert isinstance(payload, types.InputBotInlineMessageText)
+    assert payload.message == PREFIX + ALT
+    entity = payload.entities[0]
+    assert isinstance(entity, types.MessageEntityCustomEmoji)
+    assert (entity.document_id, entity.offset, entity.length) == (DOC, 15, 2)
+    assert svc._span_text(payload.message, entity.offset, entity.length) == ALT
+
+
+def test_the_sanitizer_keeps_the_entity_and_only_normalizes_button_rows():
+    result = svc.build_inline_result(DOC, ALT)
+    entity = result.send_message.entities[0]
+    geometry = (entity.document_id, entity.offset, entity.length)
+    with_buttons = inline_engine.make_result(
+        "Title", "Body", buttons=[("Open", "panel:x")]
+    )
+
+    sanitized = inline_engine._sanitize_results([result, with_buttons])
+
+    assert sanitized == [result, with_buttons]
+    assert result.send_message.entities == [entity]
+    assert isinstance(result.send_message.entities[0], types.MessageEntityCustomEmoji)
+    assert (entity.document_id, entity.offset, entity.length) == geometry
+    assert result.send_message.reply_markup is None
+    assert with_buttons.send_message.reply_markup is not None
+    assert with_buttons.send_message.entities is None
+
+
+def test_a_malformed_query_key_never_reaches_the_answer():
+    router = _registered_router()
+    for bad_query in (
+        f"{svc.INLINE_QUERY_KEY}:0:{ALT}",
+        f"{svc.INLINE_QUERY_KEY}:not-an-id:{ALT}",
+        f"{svc.INLINE_QUERY_KEY}:{DOC}:",
+    ):
+        event = _RecordingInlineEvent(bad_query, OWNER)
+        _run(router(event))
+        assert event.answers == [[]]
+
+
+def test_the_helper_bot_records_what_its_own_answer_submitted():
+    router = _registered_router()
+    since = time.monotonic()
+    _run(router(_RecordingInlineEvent(f"{svc.INLINE_QUERY_KEY}:{DOC}:{ALT}", OWNER)))
+
+    record = inline_engine.last_inline_answer(svc.INLINE_QUERY_KEY, since=since)
+    assert record["recorded"] is True
+    assert record["ok"] is True
+    assert record["result_count"] == 1
+    assert record["custom_emoji_count"] == 1
+    assert record["document_ids"] == [DOC]
+    # An answer that predates the attempt is not evidence for it.
+    stale = inline_engine.last_inline_answer(
+        svc.INLINE_QUERY_KEY, since=time.monotonic() + 60.0
+    )
+    assert stale["recorded"] is False
+    assert inline_engine.last_inline_answer("never_registered_key")["recorded"] is False
+
+
+def test_the_answer_record_counts_only_real_custom_emoji_entities():
+    inline_engine.record_inline_answer(
+        "unit_test_answer_key",
+        [
+            types.InputBotInlineResult(
+                id="0",
+                type="article",
+                send_message=types.InputBotInlineMessageText(
+                    message="plain", entities=[types.MessageEntityBold(0, 5)]
+                ),
+            )
+        ],
+        ok=True,
+    )
+    record = inline_engine.last_inline_answer("unit_test_answer_key")
+    assert record["recorded"] is True
+    assert record["custom_emoji_count"] == 0
+    assert record["document_ids"] == []
+
+
+def test_a_failing_answer_is_recorded_as_not_completed(monkeypatch):
+    router = _registered_router()
+
+    async def _boom(event, extra):
+        raise RuntimeError("the answer was rejected")
+
+    monkeypatch.setitem(inline_engine._builders, "unit_test_failing_key", _boom)
+    since = time.monotonic()
+    event = _RecordingInlineEvent("unit_test_failing_key:x", OWNER)
+    _run(router(event))
+
+    assert event.answers == [[]]                      # fail closed, as before
+    record = inline_engine.last_inline_answer("unit_test_failing_key", since=since)
+    assert record["recorded"] is True
+    assert record["ok"] is False
+    assert "RuntimeError" in record["error"]
+    assert record["custom_emoji_count"] == 0
+
+
+def test_a_stored_result_without_the_entity_is_attributed_to_telegram(monkeypatch):
+    text, _entities = _result_payload()
+    submitted = [svc.build_inline_result(DOC, ALT)]   # what the helper hands over
+    client = _AnsweringSelfClient(
+        results=[_FakeInlineResult(text, None)], answer_results=submitted
+    )
+
+    result = _send(client, monkeypatch)
+
+    assert result["ok"] is False
+    assert result["diagnosis"] == svc.INLINE_RESULT_ENTITY_MISSING
+    assert client.results[0].clicks == 0               # never sent
+    evidence = result["inline_result"]
+    assert evidence["ok"] is True                      # the stored payload WAS read
+    assert evidence["entity_present"] is False
+    answer = evidence["answer"]
+    assert answer["recorded"] is True
+    assert answer["ok"] is True
+    assert answer["custom_emoji_count"] == 1
+    assert answer["document_ids"] == [DOC]
+    assert "dropped by Telegram" in result["detail"]
+    assert "not by this application" in result["detail"]
+    # the panel's own summary line IS the recorded detail
+    assert "dropped by Telegram" in svc.outcome_summary(result)
+    assert "Helper answer: submitted 1 custom-emoji entity · accepted by Telegram" in emoji._premium_inline_report(result)
+
+
+def test_a_recorded_submission_without_the_entity_blames_this_application(monkeypatch):
+    text, _entities = _result_payload()
+    empty_answer = [
+        types.InputBotInlineResult(
+            id="0",
+            type="article",
+            send_message=types.InputBotInlineMessageText(message=text),
+        )
+    ]
+    client = _AnsweringSelfClient(
+        results=[_FakeInlineResult(text, None)], answer_results=empty_answer
+    )
+
+    result = _send(client, monkeypatch)
+
+    assert result["diagnosis"] == svc.INLINE_RESULT_ENTITY_MISSING
+    assert result["inline_result"]["answer"]["custom_emoji_count"] == 0
+    assert "no custom-emoji entity at all" in result["detail"]
+    assert "dropped by Telegram" not in svc.outcome_summary(result)
+
+
+def test_a_failed_submission_is_reported_as_such(monkeypatch):
+    text, _entities = _result_payload()
+    client = _AnsweringSelfClient(
+        results=[_FakeInlineResult(text, None)],
+        answer_results=[],
+        answer_ok=False,
+    )
+
+    result = _send(client, monkeypatch)
+
+    assert result["diagnosis"] == svc.INLINE_RESULT_ENTITY_MISSING
+    assert result["inline_result"]["answer"]["ok"] is False
+    assert "did not complete" in result["detail"]
+    assert "dropped by Telegram" not in svc.outcome_summary(result)
+
+
+def test_an_unrecorded_submission_leaves_the_cause_unproven(monkeypatch):
+    text, _entities = _result_payload()
+    client = _FakeSelfClient(results=[_FakeInlineResult(text, None)])
+
+    result = _send(client, monkeypatch)
+
+    assert result["diagnosis"] == svc.INLINE_RESULT_ENTITY_MISSING
+    assert result["inline_result"]["answer"]["recorded"] is False
+    assert "unproven" in result["detail"]
+    assert "dropped by Telegram" not in svc.outcome_summary(result)
+    assert "no submission of this bot was recorded" in emoji._premium_inline_report(result)
+
+
+def test_entity_missing_detail_tolerates_a_missing_evidence_block():
+    assert "unproven" in svc._entity_missing_detail({})
+    assert "unproven" in svc._entity_missing_detail(None)
+    assert "unproven" in svc._entity_missing_detail({"answer": {}})
+
+
+def test_the_inspection_trace_carries_the_submission_evidence(caplog):
+    import logging
+
+    text, _entities = _result_payload()
+    answer = {
+        "recorded": True,
+        "ok": True,
+        "error": "",
+        "result_count": 1,
+        "custom_emoji_count": 1,
+        "document_ids": [DOC],
+    }
+    caplog.set_level(
+        logging.INFO, logger="backend.services.premium_emoji_inline_service"
+    )
+    _run(
+        svc._inspect_inline_result(
+            [_FakeInlineResult(text, None)], svc.build_inline_payload(DOC, ALT), answer
+        )
+    )
+    traces = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name.endswith("premium_emoji_inline_service")
+    ]
+    assert any(
+        "INLINE_RESULT_INSPECTED" in line
+        and "entity_present=False" in line
+        and "answer_recorded=True" in line
+        and "answer_custom_emoji_count=1" in line
+        for line in traces
+    )
 
 
 def test_serialize_document_adds_free_and_text_color_additively():

@@ -6,6 +6,7 @@ The self-bot triggers inline mode via client.inline_query(bot_username, query)
 and auto-sends the first result.
 """
 import logging
+import time
 from typing import Awaitable, Callable, Any
 
 from telethon import events, types
@@ -102,6 +103,84 @@ def register_inline_builder(query_key: str, builder: InlineResultBuilder) -> Non
 
 def get_inline_builder(query_key: str) -> InlineResultBuilder | None:
     return _builders.get(query_key)
+
+
+#: The helper bot's OWN record of the last answer it submitted, per query key.
+#:
+#: ``event.answer`` returns only a boolean, so without this the self-side flow
+#: can see WHAT Telegram stored (``getInlineBotResults``) but never WHAT the bot
+#: actually handed over (``setInlineBotResults``) — and those are two different
+#: facts. Bounded by construction: a key is only ever recorded for a REGISTERED
+#: builder, so this mapping cannot grow with query input, and an entry holds a
+#: handful of scalars.
+_last_answers: dict[str, dict[str, Any]] = {}
+
+
+def _empty_answer_record() -> dict[str, Any]:
+    """The "this bot submitted nothing we know of" record — every key present."""
+    return {
+        "recorded": False,
+        "at": None,
+        "ok": None,
+        "error": "",
+        "result_count": None,
+        "custom_emoji_count": None,
+        "document_ids": [],
+    }
+
+
+def _count_custom_emoji(results: Any) -> tuple[int, list[int]]:
+    """The custom-emoji ENTITIES one answer carries — never a visible glyph."""
+    count = 0
+    document_ids: list[int] = []
+    for result in results or []:
+        message = getattr(result, "send_message", None)
+        for entity in getattr(message, "entities", None) or []:
+            document_id = getattr(entity, "document_id", None)
+            if not isinstance(document_id, int) or isinstance(document_id, bool):
+                continue
+            count += 1
+            if len(document_ids) < 32:
+                document_ids.append(document_id)
+    return count, document_ids
+
+
+def record_inline_answer(
+    query_key: str, results: Any, *, ok: bool, error: str = ""
+) -> None:
+    """Record what THIS bot's answer to one inline query carried.
+
+    Called for a registered query key right around ``event.answer``: ``ok``
+    states whether the submission completed without raising, and the counts
+    describe the payload the bot built (not what Telegram kept).
+    """
+    if not isinstance(query_key, str) or not query_key:
+        return
+    count, document_ids = _count_custom_emoji(results)
+    _last_answers[query_key] = {
+        "at": time.monotonic(),
+        "ok": bool(ok),
+        "error": error or "",
+        "result_count": len(results or []),
+        "custom_emoji_count": count,
+        "document_ids": document_ids,
+    }
+
+
+def last_inline_answer(query_key: str, *, since: float | None = None) -> dict[str, Any]:
+    """The recorded answer for ONE query key — every key present.
+
+    ``since`` is a monotonic timestamp taken BEFORE the query was issued, so a
+    caller that needs evidence for ONE attempt does not read an answer that
+    belongs to an earlier one: anything recorded before that moment is reported
+    as not recorded.
+    """
+    record = _last_answers.get(query_key)
+    if not isinstance(record, dict):
+        return _empty_answer_record()
+    if since is not None and record.get("at", 0) < since:
+        return _empty_answer_record()
+    return {"recorded": True, **record}
 
 
 def inline_unavailable_reason() -> str:
@@ -237,12 +316,20 @@ def register_inline_handler(helper_client, owner_id: int) -> None:
                 pass
             return
 
+        built: list = []
         try:
-            results = await builder(event, extra)
-            results = _sanitize_results(results)
-            await event.answer(results)
-        except Exception:
+            built = await builder(event, extra)
+            built = _sanitize_results(built)
+            await event.answer(built)
+            record_inline_answer(panel_id, built, ok=True)
+        except Exception as exc:
             logger.exception("Inline router error for panel '%s'", panel_id)
+            record_inline_answer(
+                panel_id,
+                built,
+                ok=False,
+                error=f"the answer raised {type(exc).__name__}: {exc}",
+            )
             try:
                 await event.answer([])
             except Exception:

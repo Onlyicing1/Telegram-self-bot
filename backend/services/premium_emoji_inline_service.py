@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any
 
 from telethon import types
@@ -427,6 +428,26 @@ def parse_inline_query_extra(extra: Any) -> tuple[int | None, str]:
     return document_id, glyph
 
 
+def _empty_answer_evidence() -> dict[str, Any]:
+    """What the HELPER BOT's own answer carried — the shape
+    :func:`backend.helper.inline_engine.last_inline_answer` reports.
+
+    ``event.answer`` returns a boolean and nothing else, so this is the only
+    place the bot's ``setInlineBotResults`` submission is observable: without
+    it, a stored result that lost the entity cannot be attributed to Telegram
+    or to this application. ``recorded=False`` means no answer of this bot was
+    seen for the query key since the query started — never "nothing submitted".
+    """
+    return {
+        "recorded": False,
+        "ok": None,
+        "error": "",
+        "result_count": None,
+        "custom_emoji_count": None,
+        "document_ids": [],
+    }
+
+
 def _empty_inline_evidence() -> dict[str, Any]:
     """The stored-inline-result evidence record — every key present."""
     return {
@@ -445,6 +466,7 @@ def _empty_inline_evidence() -> dict[str, Any]:
         "text": "",
         "document_id_match": None,
         "span_match": None,
+        "answer": _empty_answer_evidence(),
     }
 
 
@@ -505,6 +527,50 @@ def _failed(
         "eligibility": _empty_eligibility(),
     }
     return result
+
+
+def _entity_missing_detail(evidence: Any) -> str:
+    """WHY the stored inline result carries no custom-emoji entity.
+
+    The stored payload and the helper bot's own answer are two DIFFERENT
+    facts, and comparing them attributes the loss instead of guessing: an
+    entity the bot submitted that is absent from the stored payload was
+    dropped by Telegram, while an answer that raised or carried none is this
+    application's own outcome. Without a recorded answer the cause stays
+    unproven and is reported as such.
+    """
+    answer = evidence.get("answer") if isinstance(evidence, dict) else None
+    if not isinstance(answer, dict) or not answer.get("recorded"):
+        return (
+            "Telegram stored the helper bot's inline result WITHOUT the "
+            "custom-emoji entity, and no answer of this bot was recorded for "
+            "this query, so where the entity was lost is unproven — the send "
+            "was not attempted"
+        )
+    if not answer.get("ok"):
+        return (
+            "the helper bot's answer to the inline query did not complete "
+            f"({answer.get('error') or 'no reason recorded'}), so Telegram "
+            "stored a result carrying no custom-emoji entity — the send was "
+            "not attempted"
+        )
+    submitted = answer.get("custom_emoji_count")
+    if not isinstance(submitted, int) or submitted < 1:
+        return (
+            "the helper bot answered the inline query with no custom-emoji "
+            "entity at all, so Telegram stored exactly what it was given — "
+            "the send was not attempted"
+        )
+    documents = ", ".join(f"#{value}" for value in (answer.get("document_ids") or []))
+    return (
+        f"the helper bot's own answer submitted {submitted} custom-emoji "
+        f"entit{'y' if submitted == 1 else 'ies'}"
+        + (f" (document {documents})" if documents else "")
+        + " and its submission raised nothing, while the stored inline result "
+        "Telegram returned carries none — the entity was dropped by Telegram, "
+        "not by this application. The send was not attempted and no fallback "
+        "is ever used"
+    )
 
 
 def classify_diagnosis(
@@ -622,7 +688,9 @@ def _resolve_inline_result(result: Any) -> tuple[Any | None, Any | None, str, st
     return send_message, tl_object, "", ""
 
 
-async def _inspect_inline_result(results: Any, payload: dict[str, Any]) -> dict[str, Any]:
+async def _inspect_inline_result(
+    results: Any, payload: dict[str, Any], answer: Any = None
+) -> dict[str, Any]:
     """Checkpoint 2 — what Telegram KEPT in the stored inline result.
 
     Only the first result is inspected (the one the send clicks), and it is
@@ -630,6 +698,13 @@ async def _inspect_inline_result(results: Any, payload: dict[str, Any]) -> dict[
     ``custom.InlineResult`` wrapper whose underlying ``BotInlineResult`` lives
     in ``.result`` — the payload is ``.result.send_message``. A raw
     ``BotInlineResult`` is accepted too.
+
+    ``answer`` is what the HELPER BOT's own answer carried (its recorded
+    ``setInlineBotResults`` submission, read through
+    :func:`backend.helper.inline_engine.last_inline_answer`, keyed to this
+    attempt). It is NOT evidence about what Telegram stored — it is the other
+    half of the comparison, and the only way a stored payload that lost the
+    entity can be attributed honestly.
 
     ``ok`` means the stored payload was obtained and inspected; ``reason``
     names WHICH absence was seen (``"empty"``, ``"unsupported"``,
@@ -640,6 +715,8 @@ async def _inspect_inline_result(results: Any, payload: dict[str, Any]) -> dict[
     shape is reported as such, never as proof of stripping.
     """
     evidence = _empty_inline_evidence()
+    if isinstance(answer, dict):
+        evidence["answer"] = answer
     evidence["attempted"] = True
     try:
         count = len(results)
@@ -692,6 +769,9 @@ async def _inspect_inline_result(results: Any, payload: dict[str, Any]) -> dict[
             tl=evidence["tl_class"] or None,
             text_utf16_len=utf16_length(text),
             entity_count=len(getattr(send_message, "entities", None) or []),
+            answer_recorded=evidence["answer"].get("recorded"),
+            answer_ok=evidence["answer"].get("ok"),
+            answer_custom_emoji_count=evidence["answer"].get("custom_emoji_count"),
         )
         return evidence
     evidence["entity_present"] = True
@@ -907,6 +987,7 @@ async def send_premium_emoji_via_inline(
         return failed
 
     query = inline_query_for(int(document_id), glyph)
+    query_started = time.monotonic()
     _trace(
         "INLINE_QUERY_STARTED",
         started=True,
@@ -956,7 +1037,11 @@ async def send_premium_emoji_via_inline(
         "destination_chat_id": chat_id,
         "message_id": None,
         "payload": payload,
-        "inline_result": await _inspect_inline_result(results, payload),
+        "inline_result": await _inspect_inline_result(
+            results,
+            payload,
+            inline_engine.last_inline_answer(INLINE_QUERY_KEY, since=query_started),
+        ),
         "readback": _empty_readback(),
         "eligibility": eligibility,
     }
@@ -998,8 +1083,7 @@ async def send_premium_emoji_via_inline(
     if not record["inline_result"]["entity_present"]:
         return _fail(
             ERROR_QUERY,
-            "Telegram stored the helper bot's inline result WITHOUT the "
-            "custom-emoji entity — the send was not attempted",
+            _entity_missing_detail(record["inline_result"]),
         )
 
     _trace("INLINE_SEND_STARTED", started=True, via=SEND_PATH_INLINE_BOT_RESULT)

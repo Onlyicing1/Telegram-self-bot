@@ -2097,6 +2097,23 @@ def _premium_inline_report(outcome: dict[str, Any]) -> str:
                 + str(inline_result.get("error") or "no custom-emoji entity in the stored result")
                 + ")"
             )
+        # The other half of the comparison: what the HELPER BOT's own answer
+        # carried. Without it a missing entity cannot be attributed.
+        answer = inline_result.get("answer") or {}
+        if not answer.get("recorded"):
+            lines.append("Helper answer: no submission of this bot was recorded")
+        else:
+            submitted = answer.get("custom_emoji_count")
+            count = (
+                f"{submitted} custom-emoji entit" + ("y" if submitted == 1 else "ies")
+                if isinstance(submitted, int)
+                else "an unknown payload"
+            )
+            lines.append(
+                "Helper answer: submitted "
+                + count
+                + (" · accepted by Telegram" if answer.get("ok") else " · the submission did not complete")
+            )
     if readback.get("attempted"):
         if readback.get("ok"):
             if readback.get("entity_present"):

@@ -1,260 +1,260 @@
-# Investigation — Premium Custom Emoji Inline-Result Inspection Failure (2026-10-10)
+# Investigation — Where the Premium Custom-Emoji Entity Is Lost in the Helper Inline Result (2026-10-10)
 
-Canonical, latest-only record of why the live Premium custom-emoji inline flow
-stopped at `INLINE_RESULT_REJECTED`/`entity_present=False reason=no_send_message`
-after every earlier stage had succeeded, what object Telethon actually returns
-from `inline_query`, and which object was read instead. This document replaces
-the previous investigation record in full. Earlier records — the via-bot
-feasibility study (`b04cb41`), the implementation record (`977247e`), the
-checkpoint-2 fix record (`e13deee`), the `98c2825` audit, the boundary-tracing
-task (`a54877b`), and the callback-receipt task (`1bd843d`) — remain readable
-in git history and are referenced here only by commit id.
+Canonical, latest-only record of the defect the deployed flow still shows: after
+every earlier stage succeeds, the inline result the self-account receives from
+`messages.getInlineBotResults` carries **no** custom-emoji entity, the pre-send
+gate refuses to send, and the flow ends at
+`DIAGNOSIS diagnosis=INLINE_RESULT_ENTITY_MISSING`. **This file replaces the
+previous `INVESTIGATION.md` in full.** Earlier records — the checkpoint-2
+wrapper fix (`9633c0b`), the via-bot feasibility study (`b04cb41`), the
+implementation record (`977247e`), the `e13deee` field fix, the `98c2825` audit,
+the boundary trace (`a54877b`) and the callback receipt (`1bd843d`) — remain
+readable in git history and are referenced here only by commit id.
 
 | Item | Value |
 |---|---|
 | Repository | `Onlyicing1/Telegram-self-bot` |
 | Branch | `main` |
-| Revision this record was produced from | `1bd843d` (verified = `origin/main` at the start of this task) + this task's changes |
-| Telethon | **pinned `telethon==1.34.0`** (`backend/requirements.txt:1`); installed 1.34.0 — every shape below was read from that installed source |
-| Question | What object does `TelegramClient.inline_query` actually return, where does its `send_message` live, and why did inspection find none? |
-| Verdict | **(1)** `inline_query` returns `telethon.tl.custom.InlineResults` — a list of `custom.InlineResult` **wrappers** whose raw TL `BotInlineResult` lives in `.result`; the wrapper has **no `send_message` attribute at all**. **(2)** `_inspect_inline_result` read `getattr(results[0], "send_message", None)` — always `None` on a wrapper — so it reported `reason=no_send_message` and `INLINE_RESULT_REJECTED` **without ever looking at the payload Telegram actually returned**. **(3)** Telegram stripping the entity was never established and is **not** the cause: the send was never attempted. **(4)** Fixed by reading the payload through the real shapes (`.result.send_message`), with a distinct honest diagnosis for an empty answer, an unsupported shape and a real result without a send-message payload. |
-| Production code changed | **Yes** — `backend/services/premium_emoji_inline_service.py` (inspection + diagnoses), `backend/helper/inline_engine.py` (expose the zero-results reason), `backend/bot/handlers/emoji.py` (honest report line). No mechanism, client, loop or scheduler added. |
-| Live Telegram verification | **Not performed in this task** (no live session in this workspace); the fix is source-verified against the installed Telethon and test-pinned with the real wrapper/TL classes. |
+| Revision inspected | `9633c0b` (the deployed commit, verified `= origin/main` at task start) |
+| Telethon | **pinned `telethon==1.34.0`** (`backend/requirements.txt:1`); every TL shape below was read from / round-tripped through that installed source |
+| Question | In the path that **builds, submits and returns** the helper bot's Premium custom-emoji inline result, where is the entity actually lost? |
+| Verdict | **Not in application code and not in TL serialization.** The registered builder answers with exactly one real `MessageEntityCustomEmoji` and that entity is provably present in the bytes of the `messages.setInlineBotResults` request the helper bot sends. Telegram's **stored** answer — the payload `getInlineBotResults` returns — comes back without it. The loss therefore happens in **Telegram's processing of the bot's inline answer**. |
+| Production code changed | **Yes** — `backend/helper/inline_engine.py` (record the bot's own submission), `backend/services/premium_emoji_inline_service.py` (compare it, attribute the loss, surface it), `backend/bot/handlers/emoji.py` (render it). No new client, listener, loop, scheduler, executor or send mechanism. |
+| Live Telegram verification | **Not performed in this task** (no live session in this workspace). The determination is source- and byte-verified against the pinned Telethon and pinned by tests. |
 
 ---
 
-## 0. Status of every claim
+## 1. The evidence this task started from
+
+| # | Observed in production (deployed `9633c0b`) | Status |
+|---|---|---|
+| 1 | `emoji_premium_inline` callback received and dispatched | confirmed (log) |
+| 2 | `SOURCE_ENTITY_VALIDATED` — a genuine source `MessageEntityCustomEmoji` was extracted from the owner's reply | confirmed (log) |
+| 3 | `OUTBOUND_PAYLOAD_BUILT` — outbound text + entity offsets built | confirmed (log) |
+| 4 | `INLINE_QUERY_STARTED` — the self account queried the helper bot | confirmed (log) |
+| 5 | The returned object is `telethon.tl.custom.inlineresult.InlineResult` wrapping `telethon.tl.types.BotInlineResult` | confirmed (log) |
+| 6 | `INLINE_RESULT_INSPECTED entity_present=False … entity_count=0` — the **stored** `BotInlineResult.send_message` carried **zero** entities | confirmed (log) |
+| 7 | `DIAGNOSIS diagnosis=INLINE_RESULT_ENTITY_MISSING`; **no** `INLINE_SEND_STARTED` | confirmed (log) |
+
+Facts 5–7 only became observable after `9633c0b` corrected checkpoint 2 to read
+`results[0].result.send_message` (previously the code read `send_message` off the
+wrapper, which never exists, so it reported `reason=no_send_message` without
+reading anything). **No send and no exact-message read-back has ever been
+reached** — nothing in this document claims either is broken.
+
+---
+
+## 2. The path, traced in the current source
+
+```
+emoji_premium_inline (action)
+  → _premium_inline_action                 backend/bot/handlers/emoji.py   (:2172)
+      sends the Saved Messages selection message, arms reply mode
+  → _premium_inline_reply_handler          backend/bot/handlers/emoji.py   (:2225)
+      resolves the EXACT selection message, then
+  → send_premium_emoji_via_inline          backend/services/premium_emoji_inline_service.py
+      Saved-Messages-only gate, document facts (alt/free/text_color), payload
+      → build_inline_payload / validate_inline_payload / inline_query_for
+  → inline_engine.query_results            backend/helper/inline_engine.py  (:209)
+      self_client.inline_query(helper_username, "<key>:<doc>:<glyph>", entity=chat_id)
+        → messages.getInlineBotResultsRequest   (Telegram asks the bot to answer)
+  ── helper side ──────────────────────────────────────────────────────────
+  → _inline_router                         backend/helper/inline_engine.py  (:291)
+      is_owner gate → splits "<key>:<extra>" → get_inline_builder(key)
+  → _premium_inline_builder                backend/bot/handlers/emoji.py    (:2033)
+      → build_inline_result                premium_emoji_inline_service.py
+          InputBotInlineMessageText(message=<prefix+glyph>, entities=[MessageEntityCustomEmoji(doc,15,2)])
+          InputBotInlineResult(id="0", type="article", send_message=…)
+  → _sanitize_results (reply_markup rows only) → event.answer(results)
+      → messages.setInlineBotResultsRequest{query_id, results}
+  ── back on the self side ────────────────────────────────────────────────
+  → _inspect_inline_result (checkpoint 2)  reads results[0].result.send_message
+  → _send_result (checkpoint 3, NEVER REACHED) → messages.sendInlineBotResult
+  → _fetch_stored_message + _read_back (checkpoint 4, NEVER REACHED)
+```
+
+Registration is the production one — `backend/bot/handlers/emoji.py::register`
+binds `premium_inline_service.INLINE_QUERY_KEY` (`"premium_emoji_send"`) to
+`_premium_inline_builder` through `inline_engine.register_inline_builder`
+(`:2555`), and `backend/runtime/supervisor.py:431` wires
+`inline_engine.register_inline_handler` onto the helper bot client.
+
+---
+
+## 3. Statements kept separate
 
 | # | Statement | Status |
 |---|---|---|
-| 1 | `TelegramClient.inline_query` returns `custom.InlineResults(...)` | **CONFIRMED** — `telethon/client/bots.py` (`inline_query`, final statement) |
-| 2 | `InlineResults` is a `list` subclass whose elements are `custom.InlineResult` wrappers | **CONFIRMED** — `telethon/tl/custom/inlineresults.py` `__init__` (`InlineResult(client, x, original.query_id, entity=entity)`) |
-| 3 | The wrapper stores the raw TL object in `self.result` and exposes `.message`/`.click`; it has **no `send_message`** | **CONFIRMED** — `telethon/tl/custom/inlineresult.py` `__init__` (`self.result = original`), `message` property, `click()`. Runtime check: `hasattr(custom.InlineResult, "send_message") is False` |
-| 4 | The raw object (`types.BotInlineResult` / `BotInlineMediaResult`) is what carries `send_message` | **CONFIRMED** — `telethon/tl/types/__init__.py` field lists (`BotInlineResult(id, type, send_message, …)`) |
-| 5 | `getattr(results[0], "send_message", None)` is therefore **always `None`** on a real (or correctly faked) wrapper | **CONFIRMED** by 2–4 |
-| 6 | That exactly reproduces the live evidence: `INLINE_RESULT_INSPECTED entity_present=False reason=no_send_message` → `DIAGNOSIS diagnosis=INLINE_RESULT_REJECTED` | **CONFIRMED** — `_inspect_inline_result` (`send_message is None` branch) → `classify_diagnosis` (`not ok` → `INLINE_RESULT_REJECTED`) |
-| 7 | The inspected object and the clicked object are the **same** wrapper | **CONFIRMED** — service inspects `results[0]`, then `_send_result` → `inline_engine.click_result(self_client, chat_id, results[0])` → `result.click(chat_id)` |
-| 8 | The earlier `e13deee` "fix" addressed this | **REFUTED** — it changed `getattr(first, "message")` to `getattr(first, "send_message")`; **both** are wrapper-level and both are `None`. Neither the schema field nor the object was wrong *in the way assumed*: the object was wrong. |
-| 9 | Telegram stripped / rejected the custom-emoji entity | **NOT ESTABLISHED — and contradicted by this path**: inspection never read a payload, so no stripping claim is supported; the send was not attempted. |
-| 10 | The store of the entity inside the helper's `InputBotInlineMessageText` was invalid | **REFUTED** (unchanged) — the payload validated and the query started with `entity_count=1` |
+| 1 | Our payload object contains the entity | **CONFIRMED** (§4.1) |
+| 2 | The serialized `setInlineBotResults` request contains the entity | **CONFIRMED** (§4.2) |
+| 3 | The helper bot's answer was submitted without raising | **CONFIRMED from the 8th fact (§1: a result was returned)**, now also *recorded* at runtime (§5) |
+| 4 | Telegram **stored** the entity in the returned `BotInlineResult` | **REFUTED** — the live payload was inspected and has no entity (§1.6) |
+| 5 | Telegram therefore dropped an entity our code had submitted | **CONFIRMED** by 1+2+3+4 — the only side left |
+| 6 | The self account's `sendInlineBotResult` or the exact-message read-back is broken | **NOT TESTED — never reached** |
+| 7 | A documented rule explains *why* Telegram drops it | **UNRESOLVED — undocumented** (§6) |
 
 ---
 
-## 1. The reported live evidence
+## 4. What was actually verified (with the pinned Telethon)
 
-Deployed commit `1bd843ddc81f3f43ed0937b67f7af011ae724b95`, Render healthy. Three
-consecutive attempts (😈 and 🥰) reached **every** earlier stage:
+### 4.1 The payload the helper bot builds — `CONFIRMED`
 
+`build_inline_result(document_id, glyph)` builds
+`types.InputBotInlineResult(id="0", type="article",
+send_message=types.InputBotInlineMessageText(message="Premium emoji: <glyph>",
+entities=[types.MessageEntityCustomEmoji(15, 2, <document_id>)]))`.
+
+* `InputBotInlineMessageText` **does** have an `entities` field in the installed
+  1.34.0 (`__init__(message, no_webpage, invert_media, entities, reply_markup)`,
+  flags bit 1) — verified by inspecting the installed class, so reading
+  `send_message.entities` on the *returned* object is a real field, not a
+  phantom.
+* Pinned by `test_the_registered_router_answers_the_query_with_the_real_entity`:
+  the **registered router** answers `premium_emoji_send:<doc>:<glyph>` with
+  exactly one `InputBotInlineResult` whose payload carries exactly one
+  `MessageEntityCustomEmoji` with `document_id` = the real source id, UTF-16
+  offset 15, length 2, and a span that resolves to exactly the alt glyph (the
+  documented "the entity must wrap exactly the emoji in
+  `documentAttributeCustomEmoji.alt`" precondition).
+
+### 4.2 The submitted request — `CONFIRMED` at byte level
+
+Telethon 1.34.0's `InlineQuery.Event.answer` places the passed results straight
+into `messages.SetInlineBotResultsRequest(query_id, results, …)`
+(`telethon/events/inlinequery.py`). Driving the **production router** with a
+recording `InlineQuery`-shaped event and then re-reading the real bytes:
+
+```python
+parsed = BinaryReader(bytes(request)).tgread_object()
+# -> SetInlineBotResultsRequest: results[0].send_message.entities[0]
+#    == MessageEntityCustomEmoji(document_id=5361626279781934801, offset=15, length=2)
 ```
-[CALLBACK] received …
-_handle_action: action_id='emoji_premium_inline'
-[PREMIUM_INLINE] SOURCE_ENTITY_VALIDATED
-[PREMIUM_INLINE] OUTBOUND_PAYLOAD_BUILT          (offset 15, length 2, text_utf16_len 17)
-[PREMIUM_INLINE] INLINE_QUERY_STARTED
-```
 
-and each then produced:
+Pinned by `test_the_answer_carries_the_entity_into_the_set_inline_bot_results_bytes`.
+The same bytes were also dumped and read by hand during the trace: constructor
+`0xc8cf05f8`, offset 15, length 2, the live document id, inside a result whose
+text is `"Premium emoji: 😈"`.
 
-```
-[PREMIUM_INLINE] INLINE_RESULT_INSPECTED entity_present=False reason=no_send_message
-DIAGNOSIS diagnosis=INLINE_RESULT_REJECTED
-```
+**Consequence:** the entity is not lost in application code and not in TL
+serialization. Whatever Telegram's reply contains, the request was complete.
 
-**What this establishes:** the callback, the action, the source-entity
-extraction, the outbound payload build (offset/length/UTF-16 length exactly as
-designed) and the inline query all ran; the failure is precisely the inspection
-of the object returned by `inline_query`. **What it does NOT establish:** that
-Telegram stripped the entity, that a send was attempted, or that Telegram
-rejected the emoji — `no_send_message` is the inspection's own verdict about
-the object it was handed.
+### 4.3 The sanitizer — `CONFIRMED harmless`
+
+`inline_engine._sanitize_results` only rewrites `reply_markup.rows` into
+`KeyboardButtonRow` objects. It never reads or writes `entities`.
+Pinned by `test_the_sanitizer_keeps_the_entity_and_only_normalizes_button_rows`
+(the existing Glass UI result with no `entities` stays untouched, and our result
+keeps its exact entity object and geometry).
+
+### 4.4 The pre-send gate — `CONFIRMED unchanged and still refusing`
+
+`_inspect_inline_result` + `classify_diagnosis` still refuse to send when the
+**stored** payload has no entity (`INLINE_RESULT_ENTITY_MISSING`), and
+`_read_back` still requires the real entity **and** Telegram's own `via_bot_id`
+before anything is called verified. No Unicode fallback exists anywhere in the
+module, and the destination gate is still Saved-Messages-only. Every one of
+those tests is unchanged and green.
+
+### 4.5 The stored payload — `CONFIRMED empty of entities (live)`
+
+Live fact §1.6. The stored `BotInlineResult.send_message` was inspected through
+the real shape and carried `entity_count=0`. Since §4.1–§4.2 prove the bot's
+request carried one entity, and the router only submits an answer that the
+builder produced, Telegram's stored copy lost it.
 
 ---
 
-## 2. Mandatory source inspection — the real return value (Telethon 1.34.0)
+## 5. What this task changed (and why)
 
-### 2.1 What `inline_query` returns
+The flow could compare only ONE half of the question. `event.answer` returns a
+boolean, so the helper bot's own `setInlineBotResults` submission was
+observable **nowhere**: a stored result without an entity was consistent with
+(a) Telegram dropping a submitted entity, (b) the answer never carrying one, and
+(c) the submission raising — and the live log could not tell them apart. That is
+a real defect of the *diagnosis path*, and it is the earliest thing left that
+this application can act on.
 
-`telethon/client/bots.py`:
+* `backend/helper/inline_engine.py` — `record_inline_answer(query_key, results,
+  ok, error)` / `last_inline_answer(query_key, since=…)`. The router records, for
+  registered query keys only, whether the submission completed without raising
+  and **how many custom-emoji entities the built answer carried** (plus their
+  document ids). Bounded by construction: the key set is the registered builder
+  keys, the entry is a handful of scalars, and it is in-memory only. No new
+  client, listener, loop, scheduler or executor.
+* `backend/services/premium_emoji_inline_service.py` — the attempt's own
+  monotonic start mark is compared against that record, so only an answer
+  submitted **after the query was issued** counts as evidence (a stale answer
+  can never be misattributed). The record lands in the evidence block
+  (`inline_result["answer"]`), in the `INLINE_RESULT_INSPECTED` trace, and in a
+  new `_entity_missing_detail()` that attributes the loss:
+  a submitted entity missing from the stored payload ⇒ **dropped by Telegram,
+  not by this application**; a raised submission, a zero-entity answer, or no
+  record at all ⇒ reported as exactly that, with the unproven case labelled
+  **unproven**.
+* `backend/bot/handlers/emoji.py` — the panel report renders the helper bot's own
+  submission ("Helper answer: submitted 1 custom-emoji entity · accepted by
+  Telegram" / "no submission of this bot was recorded").
 
-```python
-result = await self(functions.messages.GetInlineBotResultsRequest(...))
-return custom.InlineResults(self, result, entity=peer if entity else None)
-```
-
-So the return value is **not** a raw TL object and **not** a plain list of TL
-results.
-
-### 2.2 What `InlineResults` contains
-
-`telethon/tl/custom/inlineresults.py`:
-
-```python
-class InlineResults(list):
-    def __init__(self, client, original, *, entity=None):
-        super().__init__(InlineResult(client, x, original.query_id, entity=entity)
-                         for x in original.results)
-        self.result = original      # the messages.BotResults TL object
-        self.query_id = original.query_id
-        ...
-```
-
-Each element is a `custom.InlineResult` **wrapper**. `len(results)` and
-`results[0]` work (it is a `list`), which is why the existing code got that far.
-
-### 2.3 What the wrapper exposes
-
-`telethon/tl/custom/inlineresult.py`:
-
-```python
-def __init__(self, client, original, query_id=None, *, entity=None):
-    self._client = client
-    self.result = original            # ← the raw BotInlineResult / BotInlineMediaResult
-    self._query_id = query_id
-    self._entity = entity
-
-@property
-def message(self):                    # ← the documented accessor
-    return self.result.send_message
-
-async def click(self, entity=None, ...):
-    ...
-    req = functions.messages.SendInlineBotResultRequest(
-        peer=entity, query_id=self._query_id, id=self.result.id, ...)
-```
-
-The wrapper's public surface is `type`, `message`, `title`, `description`,
-`url`, `photo`, `document`, `click`, `download_media`. **There is no
-`send_message` attribute on the wrapper.** Verified at runtime against the
-installed 1.34.0: `hasattr(custom.InlineResult, "send_message") is False`; an
-instance has `.result` and `.message` only.
-
-`inline_engine._sanitize_results`' `getattr(r, "send_message", None)` is **not**
-affected: it runs on the *helper bot's* outbound `InputBotInlineResult` objects,
-which really do have `send_message`.
-
-### 2.4 Where `send_message` really lives
-
-`types.BotInlineResult(id, type, send_message, title=None, description=None,
-url=None, thumb=None, content=None)` and
-`types.BotInlineMediaResult(id, type, send_message, photo=None, document=None,
-title=None, description=None)` — the payload field is on the **TL object**, e.g.
-`wrapper.result.send_message`.
-
-### 2.5 The defect in one line
-
-```python
-first = results[0]                          # a custom.InlineResult WRAPPER
-send_message = getattr(first, "send_message", None)   # ALWAYS None
-```
-
-`_inspect_inline_result` therefore never looked at
-`first.result.send_message` — the object Telegram had actually returned — and
-reported `entity_present=False reason=no_send_message`, which
-`classify_diagnosis` mapped to `INLINE_RESULT_REJECTED`.
+Nothing else moved: the entity/UTF-16 validation, the Saved-Messages-only
+destination, the `via_bot_id` attribution check, the `query_results` /
+`click_result` architecture, the send mechanism and the fail-closed pre-send
+gate are all byte-for-byte behaviourally unchanged.
 
 ---
 
-## 3. Why the `e13deee` change did not fix it
+## 6. Why Telegram drops it — the remaining, undocumented limitation
 
-`e13deee` is titled "read send_message field on BotInlineResult in checkpoint 2"
-and replaced `getattr(first, "message", None)` with
-`getattr(first, "send_message", None)`. Both reads target the **wrapper**, and
-neither exists there, so the live log after `e13deee` shows the same
-`reason=no_send_message`. The commit's premise — that `first` *is* a
-`BotInlineResult` — was the actual mistake. The schema note it added
-(`BotInlineResult` stores its message under `send_message`, not `message`) is
-true, but only of `first.result`.
+Confirmed in official documentation (read during the earlier via-bot study and
+re-verified for this record):
 
----
-
-## 4. The object traced through the code
-
-| Stage | Code | Object handed on |
+| Fact | Source | Status |
 |---|---|---|
-| query half | `inline_engine.query_results` (`self_client.inline_query(…)` → `results`) | the `custom.InlineResults` list, **elements are `custom.InlineResult` wrappers** |
-| inspection | `premium_emoji_inline_service._inspect_inline_result(results, payload)` | `results[0]` — the **wrapper** |
-| send half | `premium_emoji_inline_service._send_result` → `inline_engine.click_result(self_client, chat_id, results[0])` → `result.click(chat_id)` | **the same wrapper** (its `click` reads `self.result.id` + `self._query_id`) |
+| `inputBotInlineMessageText#3dcd7a87 … message:string entities:flags.1?Vector<MessageEntity>` — "Message entities for styled text"; **no** entity-type allow-list and no custom-emoji note | <https://core.telegram.org/constructor/inputBotInlineMessageText> | confirmed (schema capability only) |
+| `messages.setInlineBotResults` documents no custom-emoji-specific error | <https://core.telegram.org/method/messages.setInlineBotResults> | confirmed (absence of a documented error) |
+| "Custom emoji entities can only be used by bots that purchased additional usernames on Fragment **or** in the messages directly sent by the bot to private, group and supergroup chats if the owner of the bot has a Telegram Premium subscription." (Bot API 9.4, Feb 2026) | <https://core.telegram.org/bots/api>, <https://core.telegram.org/bots/api-changelog> | confirmed as **Bot API documentation** |
+| The documented bot-side entitlement is scoped to messages **directly sent by the bot** — an entity a bot **supplies inside an inline result** (the user is the sender) is not covered by that sentence | same | confirmed (documentation scope) |
+| Whether Telegram keeps, ignores or strips a custom-emoji entity in a bot's inline answer, and whose entitlement it checks | — | **UNRESOLVED / undocumented** |
+| Whether a Fragment-purchased username on the helper bot, or a Premium bot owner, would make Telegram keep it | — | **UNRESOLVED / undocumented** |
 
-Conclusion: the object that was *inspected* and the object that would have been
-*clicked* are one and the same. Only the **read** was wrong — the send mechanism
-never needed to change, and it did not.
+**What the evidence supports:** the entity leaves this application intact and
+Telegram's stored answer does not contain it. **What it does not support:** any
+statement about *which* server-side rule produces that, and therefore no
+workaround. The documented "silent ignore" rule that was already checked in the
+earlier direct-send POC is **not** the cause here either: the entity wraps
+exactly the document's `alt` glyph at its real UTF-16 offset (§4.1), and the
+document lookup that supplies that glyph is unchanged.
 
-The Saved-Messages-only gate, the genuine-entity requirement, the UTF-16
-offset/length validation, the `document_id` checks and the Telegram-owned
-`via_bot_id` verification are all untouched by this fix.
-
----
-
-## 5. The fix
-
-**`backend/services/premium_emoji_inline_service.py`**
-
-1. New `_resolve_inline_result(result)` — the single place that turns an
-   inline result into its stored payload, understanding **both** real shapes:
-   * a raw `types.BotInlineResult` / `types.BotInlineMediaResult`
-     (`_INLINE_RESULT_TYPES`) → used as-is;
-   * anything else → its `.result`, which must itself be one of those types.
-   Returns `(send_message, tl_object, kind, detail)`. No payload found yields
-   `kind` `"unsupported"` (a shape this module refuses to guess about) or
-   `"no_send_message"` (a real result with no payload) with a bounded `detail`
-   — never a stripping claim.
-2. `_inspect_inline_result` now:
-   * reports an **empty** result list as `reason="empty"`;
-   * resolves the payload via `_resolve_inline_result` instead of
-     `getattr(first, "send_message", None)`;
-   * records `wrapper_class` / `tl_class` (runtime `module.Class`, bounded,
-     non-sensitive) for the trace and the evidence block;
-   * keeps the entity scan, `document_id_match` and `span_match` exactly as
-     before, now against the payload Telegram actually returned.
-3. New diagnoses + honest branches: `INLINE_RESULT_EMPTY`,
-   `INLINE_RESULT_UNSUPPORTED`, `INLINE_RESULT_NO_SEND_MESSAGE` (added alongside
-   the existing `INLINE_RESULT_REJECTED` / `INLINE_RESULT_ENTITY_MISSING`);
-   `classify_diagnosis`, the post-inspection failure branches and
-   `outcome_summary` were extended to match.
-4. No second client, listener, scheduler, update loop or send mechanism; no
-   Unicode fallback; no fabricated entity; nothing sent when the payload cannot
-   be inspected safely.
-
-**`backend/helper/inline_engine.py`** — exposes the zero-results reason as
-`INLINE_ZERO_RESULTS_REASON` (and uses it in `query_results`), so the service
-can distinguish an *empty answer* from a *failed query* without matching prose.
-`trigger`'s contract is unchanged.
-
-**`backend/bot/handlers/emoji.py`** — the panel report renders the reason
-honestly ("the helper bot returned none" / "not inspectable (…)") instead of
-labelling every non-entity case "entity missing".
+This is why no workaround was invented: there is nothing in the documentation
+to build one on, and the pre-send gate exists precisely so an entity-less result
+is never sent as if it were a premium emoji.
 
 ---
 
-## 6. Diagnosis decision table (what each outcome now means)
+## 7. Falsifiers — what the next live run can prove, either way
 
-| Diagnosis | Evidence it is derived from | Meaning |
-|---|---|---|
-| `INLINE_RESULT_EMPTY` | the helper answered with zero results (or the inspected list was empty) | nothing to inspect; **nothing sent** |
-| `INLINE_RESULT_UNSUPPORTED` | `reason=="unsupported"` — the wrapper/object shape is not a stored `BotInlineResult` (or `.result` is missing/`None`) | the object could not be inspected safely; **nothing sent**; explicitly **not** evidence of stripping |
-| `INLINE_RESULT_NO_SEND_MESSAGE` | `reason=="no_send_message"` — a real `BotInlineResult` whose `send_message` is absent/`None` | a genuine result with no payload; **nothing sent** |
-| `INLINE_RESULT_REJECTED` | the query itself raised/timed out (`ok` False, no shape reason) | the helper could not answer; **nothing sent** |
-| `INLINE_RESULT_ENTITY_MISSING` | payload inspected (`ok` True) but no `MessageEntityCustomEmoji` inside it | a real Telegram-side result restriction; **nothing sent** |
-| `INLINE_SEND_FAILED` | payload had the entity; `click`/`sendInlineBotResult` failed | the send itself failed |
-| `READBACK_FAILED` | sent, but the exact message could not be read back | nothing about the stored entity is proven |
-| `STORED_ENTITY_STRIPPED` / `_MISMATCH` / `STORED_ATTRIBUTION_MISSING` | the stored message's own entities/`via_bot_id` | exactly what the stored message shows |
-| `STORED_ENTITY_VERIFIED_RENDER_UNVERIFIED` | entity + id + span + `via_bot_id` all match | the entity is stored and attributed; **display is still the client's decision** |
+The next live run of `Menu → Emoji → ✨ Send Premium Emoji → reply with a
+genuine Premium emoji` now records the bot's own submission, so it settles the
+question:
+
+| Live trace | Meaning |
+|---|---|
+| `INLINE_RESULT_INSPECTED entity_present=False … answer_recorded=True answer_ok=True answer_custom_emoji_count=1` then `INLINE_RESULT_ENTITY_MISSING` | **This record is confirmed on the live path**: the bot submitted the entity and Telegram dropped it from the stored answer. The inline-result construction is then blocked by Telegram's undocumented behaviour, not by this repository. |
+| `answer_recorded=True answer_ok=False` (or `answer_custom_emoji_count=0`) | an **application-side** defect the previous evidence could not see — the answer never carried the entity. That contradicts §4.1/§4.2 and must be diagnosed from the recorded reason. |
+| `answer_recorded=False` | the answer arrived outside this process's view (or not at all) — the cause stays unproven and must not be attributed to Telegram. |
+| `entity_present=True` then `INLINE_SEND_STARTED` | the stored payload kept the entity — checkpoint 4 (`sendInlineBotResult` + exact-message read-back + `via_bot_id`) becomes reachable for the first time. |
 
 ---
 
-## 7. What remains unverified
+## 8. Scope honoured
 
-1. **No live Telegram/Render verification in this task.** The fix is proven
-   against the installed Telethon classes and the full test suite, not against
-   a live `getInlineBotResults` response.
-2. **What the real Telegram payload contains** — whether Telegram *keeps* the
-   custom-emoji entity inside the returned `BotInlineResult` — is still
-   unknown. It could not be observed before, because the inspection never read
-   the payload. The next live run answers exactly that.
-3. Consequently the **send and the exact-message read-back have still never
-   been exercised live**.
-4. `BotInlineMessageText` vs. other `BotInlineMessage` variants: the helper
-   answers with an article/text result, so the payload is a
-   `BotInlineMessageText`; a media variant would be inspected the same way
-   (`_scan_custom_emoji` reads `entities`), but no live sample exists.
-5. Render-side log completeness beyond the quoted excerpts.
+* Only the relevant implementation points were inspected: the two
+  `InputBotInlineMessageText` construction sites that matter (the premium
+  builder and the shared panel renderer), the router, the sanitizer, the
+  checkpoint-2/3/4 code and the table above.
+* No new Telegram client, listener, update loop, scheduler, executor or
+  alternate send mechanism was introduced; `query_results` / `click_result` keep
+  their contracts.
+* No fabricated entity, no Unicode fallback, no bypass of the pre-send check, no
+  weakened or deleted test, no Supabase/schema/SQL change, no unrelated
+  refactor. `tests/test_stage13.py`, `DATABASE_ARCHITECTURE.md` and `ROADMAP.md`
+  were not touched.
