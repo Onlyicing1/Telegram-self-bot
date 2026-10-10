@@ -26,6 +26,11 @@ INVESTIGATION.md):
      (``emoji_premium_inline``) wired to the registered inline builder;
      ``inline_engine.trigger`` keeps its exact contract, and the two serializer
      additions (``free``/``text_color``, ``premium``) are additive.
+  7. The pending-input listener — the flow's ONLY update path — reaches the
+     production reply handler with the selection id (``extra``) intact, and
+     every dispatched reply emits its first ``[PREMIUM_INLINE]`` trace
+     (``SOURCE_ENTITY_*``); a reply in another chat dispatches nothing and
+     emits none.
 
 No live Telegram and no Supabase call is made: the Telegram boundary is faked
 at the surface the service consumes (``inline_query`` / ``click`` /
@@ -806,6 +811,133 @@ def test_reply_handler_reports_a_stripped_entity_honestly(monkeypatch):
     assert captured["title"] == "Send Premium Emoji"
     assert svc.STORED_ENTITY_STRIPPED in captured["body"]
     assert "NO custom-emoji entity" in captured["body"]
+
+
+# ── the live dispatch boundary (pending-input listener → reply handler) ─────
+#
+# The pending-input machinery is the production flow's ONLY update path, so it
+# is pinned end to end: arm it through the real action, register the REAL
+# listener, deliver the owner's outgoing Saved Messages reply, and assert the
+# selection id reached the handler AND the first ``[PREMIUM_INLINE]`` trace was
+# emitted. That first trace is the boundary whose absence in a live excerpt
+# proves the reply never dispatched: every dispatched reply emits exactly one
+# ``SOURCE_ENTITY_*`` line before anything else in the service.
+
+
+def test_the_real_pending_input_listener_reaches_the_production_flow(monkeypatch, caplog):
+    import logging
+
+    from backend.helper import inline_sender, input_state
+
+    reply = _reply_targeting(SELECTION, ALT, [_entity()])
+    text, entities = _result_payload()
+    stored = _FakeMessage(text, entities, via_bot_id=BOT_ID)
+    client = _FakeSelfClient(
+        reply=reply, results=[_FakeInlineResult(text, entities)], stored=stored
+    )
+    inline_engine.set_self_client(client)
+    _patch_facts(monkeypatch)
+
+    captured_edits: dict[str, Any] = {}
+
+    async def _fake_edit(inline_chat_id, inline_msg_id, title_, body, buttons):
+        captured_edits["title"] = title_
+        captured_edits["body"] = body
+
+    monkeypatch.setattr(emoji, "_edit_inline", _fake_edit)
+
+    input_state.clear_all()
+    _run(emoji._premium_inline_action(SimpleNamespace(message_id=555), "", 111))
+    pending = input_state.get_pending(OWNER)
+    assert pending is not None
+    assert pending["extra"] == str(SELECTION)
+
+    captured: dict[str, Any] = {}
+
+    def _on(*_args, **_kwargs):
+        def _decorator(func):
+            captured["listener"] = func
+            return func
+
+        return _decorator
+
+    inline_sender.register_input_listener(SimpleNamespace(on=_on), OWNER)
+    listener = captured["listener"]
+
+    caplog.set_level(
+        logging.INFO, logger="backend.services.premium_emoji_inline_service"
+    )
+    event = SimpleNamespace(
+        raw_text=ALT,
+        chat_id=OWNER,          # the Saved Messages chat of the selection message
+        sender_id=OWNER,
+        message=SimpleNamespace(id=910),
+    )
+    _run(listener(event))
+
+    assert input_state.get_pending(OWNER) is None      # the pending input was consumed
+    assert client.reads[0] == (OWNER, 910)             # the EXACT reply was read back
+    traces = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name.endswith("premium_emoji_inline_service")
+    ]
+    assert traces, "a dispatched reply must emit at least one [PREMIUM_INLINE] trace"
+    assert traces[0].startswith("[PREMIUM_INLINE] SOURCE_ENTITY_VALIDATED")
+    assert captured_edits["title"] == "Send Premium Emoji ✓"
+
+
+def test_the_production_listener_ignores_a_reply_in_another_chat(monkeypatch, caplog):
+    import logging
+
+    from backend.helper import inline_sender, input_state
+
+    client = _FakeSelfClient(
+        reply=_reply_targeting(SELECTION, ALT, [_entity()]),
+        results=[_FakeInlineResult(*_result_payload())],
+    )
+    inline_engine.set_self_client(client)
+    _patch_facts(monkeypatch)
+
+    async def _fake_edit(inline_chat_id, inline_msg_id, title_, body, buttons):
+        raise AssertionError("the reply handler must not run for another chat")
+
+    monkeypatch.setattr(emoji, "_edit_inline", _fake_edit)
+
+    input_state.clear_all()
+    _run(emoji._premium_inline_action(SimpleNamespace(message_id=555), "", 111))
+
+    captured: dict[str, Any] = {}
+
+    def _on(*_args, **_kwargs):
+        def _decorator(func):
+            captured["listener"] = func
+            return func
+
+        return _decorator
+
+    inline_sender.register_input_listener(SimpleNamespace(on=_on), OWNER)
+    caplog.set_level(
+        logging.INFO, logger="backend.services.premium_emoji_inline_service"
+    )
+
+    event = SimpleNamespace(
+        raw_text=ALT,
+        chat_id=OTHER_CHAT,
+        sender_id=OWNER,
+        message=SimpleNamespace(id=910),
+    )
+    _run(captured["listener"](event))
+
+    assert input_state.get_pending(OWNER) is not None   # still armed, nothing consumed
+    assert client.reads == []                           # the reply was never read
+    assert client.queries == []                         # no inline query ran
+    assert [
+        record
+        for record in caplog.records
+        if record.name.endswith("premium_emoji_inline_service")
+    ] == []                                             # and no [PREMIUM_INLINE] trace
+    input_state.clear_all()
 
 
 # ── backward compatibility of the touched shared code ───────────────────────
