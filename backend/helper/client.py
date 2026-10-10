@@ -116,7 +116,10 @@ def get_client() -> TelegramClient | None:
 def register_helper_hooks(client) -> None:
     """Register runtime event hooks on the helper bot client.
 
-    Tracks CallbackQuery and Raw events for health telemetry.
+    Tracks CallbackQuery and Raw events for health telemetry, and records one
+    bounded receipt line per delivered callback query BEFORE the callback
+    router's owner/coordinates/session gates, so a click that never arrived is
+    distinguishable from one that arrived and was dropped early.
     Must be called after the helper bot is connected.
     """
     @client.on(events.CallbackQuery())
@@ -125,6 +128,28 @@ def register_helper_hooks(client) -> None:
         try:
             set_last_callback()
             set_last_event_dispatch()
+        except Exception:
+            pass
+        # The health timestamp alone proves only THAT some callback arrived;
+        # this receipt line carries WHICH callback (bounded data + coordinates),
+        # which the router's first unconditional log cannot show for callbacks
+        # dropped at its pre-session gates.
+        try:
+            raw_data = getattr(event, "data", None)
+            data = (
+                raw_data.decode("utf-8", errors="replace")
+                if isinstance(raw_data, bytes)
+                else str(raw_data or "")
+            )
+            logger.info(
+                "[CALLBACK] received data='%s' sender_id=%s chat_id=%s "
+                "msg_id=%s inline_msg_id='%s'",
+                data[:64],
+                getattr(event, "sender_id", None),
+                getattr(event, "chat_id", None),
+                getattr(event, "message_id", None),
+                getattr(event, "inline_message_id", None) or "",
+            )
         except Exception:
             pass
 
