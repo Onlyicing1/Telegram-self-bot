@@ -31,6 +31,13 @@ INVESTIGATION.md):
      every dispatched reply emits its first ``[PREMIUM_INLINE]`` trace
      (``SOURCE_ENTITY_*``); a reply in another chat dispatches nothing and
      emits none.
+  8. Checkpoint 2 reads the REAL Telethon shapes: ``inline_query`` returns
+     ``telethon.tl.custom.InlineResults`` — a list of ``InlineResult``
+     WRAPPERS whose payload lives on ``.result.send_message`` (the wrapper
+     itself has NO ``send_message``). Only a genuine, present payload whose
+     entity is missing is ``INLINE_RESULT_ENTITY_MISSING``; an empty answer,
+     an unsupported shape and a real result without a send-message payload
+     each get their own honest diagnosis and never a stripping claim.
 
 No live Telegram and no Supabase call is made: the Telegram boundary is faked
 at the surface the service consumes (``inline_query`` / ``click`` /
@@ -45,6 +52,8 @@ from typing import Any
 
 import pytest
 from telethon import types
+from telethon.tl import custom as telethon_custom
+from telethon.tl.types import messages as telethon_messages
 
 import backend.helper.client as helper_client
 from backend.bot.handlers import emoji
@@ -102,13 +111,40 @@ class _FakeMessage:
         self.via_bot_id = via_bot_id
 
 
-class _FakeInlineResult:
-    """A stored inline result as ``getInlineBotResults`` returns it.
+def _bot_inline_result(
+    text: str,
+    entities: list[Any] | None,
+    *,
+    result_id: str = "0",
+    title: str = "Premium emoji",
+) -> types.BotInlineResult:
+    """The REAL ``BotInlineResult`` Telegram stores for the helper's answer.
 
-    Telegram returns ``BotInlineResult`` objects, whose field is
-    ``send_message`` (a ``BotInlineMessageText``), not ``message``.
-    The service's checkpoint-2 inspection reads ``send_message``, so this
-    fake mirrors that field name exactly.
+    Its payload field is ``send_message`` (a ``BotInlineMessageText``) — but on
+    the TL object, never on the wrapper Telethon hands back from
+    ``inline_query``.
+    """
+    return types.BotInlineResult(
+        id=result_id,
+        type="article",
+        title=title,
+        send_message=types.BotInlineMessageText(
+            message=text,
+            entities=list(entities) if entities is not None else None,
+        ),
+    )
+
+
+class _FakeInlineResult(telethon_custom.InlineResult):
+    """The REAL Telethon wrapper with only ``click`` stubbed.
+
+    ``TelegramClient.inline_query`` returns ``custom.InlineResults``: a list of
+    ``custom.InlineResult`` WRAPPERS. A wrapper keeps the raw TL object in
+    ``.result`` and exposes ``.message``/``.click``; it has NO ``send_message``
+    attribute (verified against telethon 1.34.0) — which is exactly why
+    ``getattr(results[0], "send_message", None)`` always found nothing live.
+    Stubbing only ``click`` (it needs a live client) keeps every other part of
+    the shape real.
     """
 
     def __init__(
@@ -120,8 +156,13 @@ class _FakeInlineResult:
         via_bot_id: int | None = BOT_ID,
         click_error: Exception | None = None,
         click_returns_none: bool = False,
+        original: Any = None,
     ) -> None:
-        self.send_message = SimpleNamespace(message=text, entities=entities or [])
+        super().__init__(
+            None,
+            original if original is not None else _bot_inline_result(text, entities),
+            query_id=7,
+        )
         self.clicks = 0
         self._message_id = message_id
         self._via_bot_id = via_bot_id
@@ -134,9 +175,10 @@ class _FakeInlineResult:
             raise self._click_error
         if self._click_returns_none:
             return None
+        send_message = self.result.send_message
         return _FakeMessage(
-            self.send_message.message,
-            self.send_message.entities,
+            getattr(send_message, "message", "") or "",
+            getattr(send_message, "entities", None) or [],
             message_id=self._message_id,
             via_bot_id=self._via_bot_id,
         )
@@ -153,7 +195,6 @@ class _FakeSelfClient:
         query_error: Exception | None = None,
         read_error: Exception | None = None,
         reply: Any = None,
-        result_for_query: Any = None,
     ) -> None:
         self.results = results
         self.stored = stored
@@ -163,20 +204,11 @@ class _FakeSelfClient:
         self.queries: list[tuple[Any, str, Any]] = []
         self.reads: list[tuple[Any, Any]] = []
         self.sent_messages: list[Any] = []
-        self.result_for_query = result_for_query
 
     async def inline_query(self, username, query, entity=None):
         self.queries.append((username, query, entity))
         if self.query_error is not None:
             raise self.query_error
-        if self.result_for_query is not None:
-            return [
-                _FakeInlineResult(
-                    *self.result_for_query,
-                    message_id=(self.stored.id if self.stored is not None else 4242),
-                    via_bot_id=getattr(self.stored, "via_bot_id", BOT_ID),
-                )
-            ]
         return self.results if self.results is not None else []
 
     async def get_messages(self, chat_id, ids=None):
@@ -491,11 +523,14 @@ def test_inline_query_exception_is_reported_as_rejected(monkeypatch):
     assert "QUERY_ID_INVALID" in result["detail"]
 
 
-def test_zero_inline_results_is_reported_as_rejected(monkeypatch):
+def test_zero_inline_results_is_reported_as_empty(monkeypatch):
     client = _FakeSelfClient(results=[])
     result = _send(client, monkeypatch)
-    assert result["diagnosis"] == svc.INLINE_RESULT_REJECTED
+    assert result["ok"] is False
+    assert result["diagnosis"] == svc.INLINE_RESULT_EMPTY
     assert result["readback"]["attempted"] is False
+    assert result["inline_result"]["attempted"] is False
+    assert "no result" in result["detail"]
 
 
 def test_send_exception_is_reported_as_send_failed(monkeypatch):
@@ -647,6 +682,189 @@ def test_the_owner_premium_status_is_observed_not_assumed(monkeypatch):
     unreadable = _send(client, monkeypatch, facts={"me_error": RuntimeError("nope")})
     assert unreadable["eligibility"]["owner_premium"] is None
     assert "nope" in unreadable["eligibility"]["owner_premium_error"]
+
+
+# ── checkpoint 2 against the REAL Telethon result shape ─────────────────────
+#
+# ``TelegramClient.inline_query`` returns ``telethon.tl.custom.InlineResults``:
+# a list of ``custom.InlineResult`` WRAPPERS. The wrapper keeps the raw TL
+# object in ``.result`` and exposes ``.message``/``.click``; it has NO
+# ``send_message`` attribute — so ``getattr(results[0], "send_message", None)``
+# is ALWAYS None, which was exactly the live
+# ``INLINE_RESULT_INSPECTED entity_present=False reason=no_send_message`` ⇒
+# ``DIAGNOSIS diagnosis=INLINE_RESULT_REJECTED``. These tests use the REAL
+# classes, so a regression to reading the wrong object cannot pass.
+
+
+def test_the_telethon_wrapper_keeps_the_payload_on_result_only():
+    text, entities = _result_payload()
+    wrapper = telethon_custom.InlineResult(
+        None, _bot_inline_result(text, entities), query_id=7
+    )
+    assert not hasattr(wrapper, "send_message")
+    assert wrapper.result.send_message.message == text
+    assert list(wrapper.result.send_message.entities) == list(entities)
+    assert wrapper.message is wrapper.result.send_message
+
+
+def test_inspection_reads_the_real_wrapper_payload():
+    text, entities = _result_payload()
+    wrapper = telethon_custom.InlineResult(
+        None, _bot_inline_result(text, entities), query_id=7
+    )
+    evidence = _run(
+        svc._inspect_inline_result([wrapper], svc.build_inline_payload(DOC, ALT))
+    )
+    assert evidence["ok"] is True
+    assert evidence["entity_present"] is True
+    assert evidence["document_id"] == DOC
+    assert (evidence["offset"], evidence["length"]) == (15, 2)
+    assert evidence["document_id_match"] is True
+    assert evidence["span_match"] is True
+    assert evidence["wrapper_class"] == "telethon.tl.custom.inlineresult.InlineResult"
+    assert evidence["tl_class"] == "telethon.tl.types.BotInlineResult"
+
+
+def test_inspection_accepts_a_raw_bot_inline_result_too():
+    text, entities = _result_payload()
+    evidence = _run(
+        svc._inspect_inline_result(
+            [_bot_inline_result(text, entities)], svc.build_inline_payload(DOC, ALT)
+        )
+    )
+    assert evidence["ok"] is True
+    assert evidence["entity_present"] is True
+    assert evidence["tl_class"] == "telethon.tl.types.BotInlineResult"
+
+
+def test_the_real_container_shape_sends_and_the_inspected_result_is_the_clicked_one(
+    monkeypatch,
+):
+    text, entities = _result_payload()
+    results = telethon_custom.InlineResults(
+        None,
+        telethon_messages.BotResults(
+            query_id=7,
+            results=[_bot_inline_result(text, entities)],
+            cache_time=0,
+            users=[],
+        ),
+    )
+    assert isinstance(results, list)
+    assert not hasattr(results[0], "send_message")
+    stored = _FakeMessage(text, entities, message_id=4242, via_bot_id=BOT_ID)
+    client = _FakeSelfClient(results=results, stored=stored)
+    clicked: dict[str, Any] = {}
+
+    async def _fake_click(self_client, chat_id, result):
+        clicked["result"] = result
+        clicked["chat_id"] = chat_id
+        return _FakeMessage(text, entities, message_id=4242, via_bot_id=BOT_ID), ""
+
+    monkeypatch.setattr(inline_engine, "click_result", _fake_click)
+    result = _send(client, monkeypatch)
+
+    assert result["ok"] is True
+    assert result["verified"] is True
+    assert result["diagnosis"] == svc.STORED_ENTITY_VERIFIED_RENDER_UNVERIFIED
+    assert result["inline_result"]["entity_present"] is True
+    assert clicked["result"] is results[0]      # inspected IS the clicked object
+    assert clicked["chat_id"] == OWNER
+
+
+def test_a_wrapper_without_a_stored_result_fails_closed(monkeypatch):
+    client = _FakeSelfClient(results=[SimpleNamespace(result=None)])
+    result = _send(client, monkeypatch)
+    assert result["ok"] is False
+    assert result["diagnosis"] == svc.INLINE_RESULT_UNSUPPORTED
+    assert result["inline_result"]["entity_present"] is False
+    assert "no stored BotInlineResult" in result["inline_result"]["error"]
+    assert "could not be inspected safely" in result["detail"]
+
+
+def test_send_message_placed_on_the_returned_object_is_not_accepted(monkeypatch):
+    """The live bug's shape: ``send_message`` put on the returned object.
+
+    Telegram never puts it there, so a reader that trusts it is reading a
+    fiction; the service must refuse the unknown shape instead of proceeding.
+    """
+    text, entities = _result_payload()
+    impostor = SimpleNamespace(
+        send_message=types.BotInlineMessageText(message=text, entities=list(entities))
+    )
+    client = _FakeSelfClient(results=[impostor])
+    result = _send(client, monkeypatch)
+    assert result["ok"] is False
+    assert result["diagnosis"] == svc.INLINE_RESULT_UNSUPPORTED
+    assert "SimpleNamespace" in result["inline_result"]["error"]
+
+
+def test_a_real_result_without_a_send_message_payload_fails_closed(monkeypatch):
+    raw = types.BotInlineResult(id="0", type="article", send_message=None)
+    client = _FakeSelfClient(results=[raw])
+    result = _send(client, monkeypatch)
+    assert result["ok"] is False
+    assert result["diagnosis"] == svc.INLINE_RESULT_NO_SEND_MESSAGE
+    assert "no send_message payload" in result["inline_result"]["error"]
+
+
+def test_a_real_wrapper_whose_payload_lacks_the_entity_is_entity_missing(monkeypatch):
+    text, _entities = _result_payload()
+    wrapper = _FakeInlineResult(text, None)
+    assert wrapper.result.send_message.entities is None
+    client = _FakeSelfClient(results=[wrapper])
+    result = _send(client, monkeypatch)
+    assert result["ok"] is False
+    assert result["inline_result"]["ok"] is True      # the payload WAS inspected
+    assert result["inline_result"]["entity_present"] is False
+    assert result["diagnosis"] == svc.INLINE_RESULT_ENTITY_MISSING
+    assert wrapper.clicks == 0                        # never sent
+
+
+def test_the_inspection_trace_names_the_real_classes(caplog):
+    import logging
+
+    text, entities = _result_payload()
+    wrapper = telethon_custom.InlineResult(
+        None, _bot_inline_result(text, entities), query_id=7
+    )
+    caplog.set_level(
+        logging.INFO, logger="backend.services.premium_emoji_inline_service"
+    )
+    _run(svc._inspect_inline_result([wrapper], svc.build_inline_payload(DOC, ALT)))
+    traces = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name.endswith("premium_emoji_inline_service")
+    ]
+    assert any("INLINE_RESULT_INSPECTED" in line for line in traces)
+    assert any("tl=telethon.tl.types.BotInlineResult" in line for line in traces)
+    assert any(
+        "wrapper=telethon.tl.custom.inlineresult.InlineResult" in line
+        for line in traces
+    )
+
+
+def test_the_report_renders_an_unsupported_shape_honestly():
+    outcome = {
+        "diagnosis": svc.INLINE_RESULT_UNSUPPORTED,
+        "error": svc.ERROR_QUERY,
+        "detail": "the inline result's runtime shape could not be inspected safely",
+        "payload": svc.build_inline_payload(DOC, ALT),
+        "inline_result": {
+            "attempted": True,
+            "ok": False,
+            "reason": "unsupported",
+            "error": "the inline result wrapper X carries no stored BotInlineResult",
+            "entity_present": False,
+        },
+        "readback": {},
+        "eligibility": {},
+    }
+    body = emoji._premium_inline_report(outcome)
+    assert svc.INLINE_RESULT_UNSUPPORTED in body
+    assert "not inspectable" in body
+    assert "entity missing" not in body
 
 
 # ── no fallback, ever ───────────────────────────────────────────────────────

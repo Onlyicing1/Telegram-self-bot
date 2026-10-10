@@ -97,6 +97,9 @@ SOURCE_ENTITY_MISSING = "SOURCE_ENTITY_MISSING"
 UNSUPPORTED_DESTINATION = "UNSUPPORTED_DESTINATION"
 OUTBOUND_PAYLOAD_INVALID = "OUTBOUND_PAYLOAD_INVALID"
 INLINE_UNAVAILABLE = "INLINE_UNAVAILABLE"
+INLINE_RESULT_EMPTY = "INLINE_RESULT_EMPTY"
+INLINE_RESULT_UNSUPPORTED = "INLINE_RESULT_UNSUPPORTED"
+INLINE_RESULT_NO_SEND_MESSAGE = "INLINE_RESULT_NO_SEND_MESSAGE"
 INLINE_RESULT_REJECTED = "INLINE_RESULT_REJECTED"
 INLINE_RESULT_ENTITY_MISSING = "INLINE_RESULT_ENTITY_MISSING"
 INLINE_SEND_FAILED = "INLINE_SEND_FAILED"
@@ -108,6 +111,12 @@ STORED_ENTITY_VERIFIED_RENDER_UNVERIFIED = "STORED_ENTITY_VERIFIED_RENDER_UNVERI
 
 #: The actual MTProto path a successful send used — recorded, never inferred.
 SEND_PATH_INLINE_BOT_RESULT = "messages.sendInlineBotResult"
+
+#: The two real TL results ``getInlineBotResults`` can return. Telethon hands
+#: them over inside ``custom.InlineResult`` WRAPPERS (``.result`` carries the raw
+#: object; the wrapper has NO ``send_message`` of its own), so both the raw
+#: object and the wrapper have to be understood.
+_INLINE_RESULT_TYPES = (types.BotInlineResult, types.BotInlineMediaResult)
 
 #: Bounds on the individual Telegram calls this module drives (the handler's
 #: own bound is a backstop; the wrappers bound their internals themselves).
@@ -137,6 +146,12 @@ def _bounded(value: Any, limit: int = 32) -> str:
 
 def _is_positive_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _class_path(value: Any) -> str:
+    """``module.Class`` of a runtime object — bounded, non-sensitive metadata."""
+    cls = type(value)
+    return f"{getattr(cls, '__module__', '')}.{getattr(cls, '__qualname__', cls.__name__)}"
 
 
 def _message_text(message: Any) -> str:
@@ -418,7 +433,10 @@ def _empty_inline_evidence() -> dict[str, Any]:
         "attempted": False,
         "ok": False,
         "error": None,
+        "reason": None,
         "result_count": None,
+        "wrapper_class": "",
+        "tl_class": "",
         "entity_present": None,
         "document_id": None,
         "offset": None,
@@ -494,14 +512,23 @@ def classify_diagnosis(
 ) -> str:
     """The ONE outcome the recorded evidence establishes — never more.
 
-    Separates an implementation failure from a Telegram-side restriction:
-    ``INLINE_RESULT_REJECTED`` (Telegram refused/stripped the bot's answer),
-    ``INLINE_RESULT_ENTITY_MISSING`` (the stored inline result lost the
-    entity), ``INLINE_SEND_FAILED`` (the send itself failed), and then the
-    stored-message verdicts. A retained entity with the expected id, span and
-    ``via_bot_id`` is still only ``…_RENDER_UNVERIFIED``.
+    Separates an implementation failure from a Telegram-side restriction: an
+    empty answer (``INLINE_RESULT_EMPTY``), a shape this module refuses to
+    inspect (``INLINE_RESULT_UNSUPPORTED``), a real result with no send-message
+    payload (``INLINE_RESULT_NO_SEND_MESSAGE``), ``INLINE_RESULT_REJECTED``
+    (the query itself failed), ``INLINE_RESULT_ENTITY_MISSING`` (a real stored
+    result lost the entity), ``INLINE_SEND_FAILED`` (the send itself failed),
+    and then the stored-message verdicts. A retained entity with the expected
+    id, span and ``via_bot_id`` is still only ``…_RENDER_UNVERIFIED``.
     """
     if not inline_result.get("ok"):
+        reason = inline_result.get("reason")
+        if reason == "empty":
+            return INLINE_RESULT_EMPTY
+        if reason == "unsupported":
+            return INLINE_RESULT_UNSUPPORTED
+        if reason == "no_send_message":
+            return INLINE_RESULT_NO_SEND_MESSAGE
         return INLINE_RESULT_REJECTED
     if not inline_result.get("entity_present"):
         return INLINE_RESULT_ENTITY_MISSING
@@ -546,14 +573,71 @@ async def _document_facts(self_client: Any, document_id: int) -> tuple[dict[str,
     return None, "Telegram did not return this document for the given id"
 
 
+def _resolve_inline_result(result: Any) -> tuple[Any | None, Any | None, str, str]:
+    """The STORED payload behind ONE inline result, for either real shape.
+
+    ``client.inline_query`` returns ``telethon.tl.custom.InlineResults`` — a
+    list of ``InlineResult`` WRAPPERS. A wrapper keeps the raw TL object in
+    ``.result`` and exposes ``.message``/``.click``; it carries NO
+    ``send_message`` attribute of its own, so reading one straight off the
+    returned element finds nothing even when Telegram kept the payload. A raw
+    ``BotInlineResult``/``BotInlineMediaResult`` is understood as well.
+
+    Returns ``(send_message, tl_object, kind, detail)``. On success ``kind``
+    and ``detail`` are ``""``. Otherwise ``send_message`` is ``None`` and
+    ``kind`` is ``"unsupported"`` (a shape this module refuses to guess about)
+    or ``"no_send_message"`` (a real result whose payload genuinely is not
+    there), with a bounded human ``detail`` — an unknown shape is never read as
+    a stripped entity.
+    """
+    if result is None:
+        return None, None, "unsupported", "the inline result object is None"
+    if isinstance(result, _INLINE_RESULT_TYPES):
+        tl_object = result
+    else:
+        tl_object = getattr(result, "result", None)
+        if not isinstance(tl_object, _INLINE_RESULT_TYPES):
+            return (
+                None,
+                None,
+                "unsupported",
+                f"the inline result wrapper {_class_path(result)} carries no "
+                f"stored BotInlineResult (its .result is {_class_path(tl_object)})",
+            )
+    if not hasattr(tl_object, "send_message"):
+        return (
+            None,
+            tl_object,
+            "no_send_message",
+            f"the stored {_class_path(tl_object)} carries no send_message field",
+        )
+    send_message = getattr(tl_object, "send_message", None)
+    if send_message is None:
+        return (
+            None,
+            tl_object,
+            "no_send_message",
+            f"the stored {_class_path(tl_object)} carries no send_message payload",
+        )
+    return send_message, tl_object, "", ""
+
+
 async def _inspect_inline_result(results: Any, payload: dict[str, Any]) -> dict[str, Any]:
     """Checkpoint 2 — what Telegram KEPT in the stored inline result.
 
-    Only the first result is inspected (the one the send clicks). ``ok`` means
-    the stored result was obtained and inspected; ``entity_present`` means a
-    real ``MessageEntityCustomEmoji`` survived INSIDE it. A missing entity
-    here is a Telegram-side result restriction, proven before the user's send
-    even happens.
+    Only the first result is inspected (the one the send clicks), and it is
+    read through the REAL Telethon shapes: ``results[0]`` is a
+    ``custom.InlineResult`` wrapper whose underlying ``BotInlineResult`` lives
+    in ``.result`` — the payload is ``.result.send_message``. A raw
+    ``BotInlineResult`` is accepted too.
+
+    ``ok`` means the stored payload was obtained and inspected; ``reason``
+    names WHICH absence was seen (``"empty"``, ``"unsupported"``,
+    ``"no_send_message"``, or ``""`` when a payload was inspected);
+    ``entity_present`` means a real ``MessageEntityCustomEmoji`` survived
+    INSIDE that payload. Only a genuine, present payload with the entity
+    missing is a Telegram-side restriction — an empty result or an unsupported
+    shape is reported as such, never as proof of stripping.
     """
     evidence = _empty_inline_evidence()
     evidence["attempted"] = True
@@ -562,15 +646,34 @@ async def _inspect_inline_result(results: Any, payload: dict[str, Any]) -> dict[
     except Exception:
         count = None
     evidence["result_count"] = count
-    first = results[0]
-    # BotInlineResult (what GetInlineBotResultsRequest returns) stores the
-    # message under ``send_message``, not ``message``. Reading ``message``
-    # always returns None and would report a present entity as missing.
-    send_message = getattr(first, "send_message", None)
-    if send_message is None:
-        evidence["error"] = "the stored inline result carries no send_message"
+    if not count:
+        evidence["error"] = "the helper bot returned no inline result to inspect"
+        evidence["reason"] = "empty"
         evidence["entity_present"] = False
-        _trace("INLINE_RESULT_INSPECTED", entity_present=False, reason="no_send_message")
+        _trace(
+            "INLINE_RESULT_INSPECTED",
+            entity_present=False,
+            reason="empty",
+            result_count=0,
+        )
+        return evidence
+    first = results[0]
+    evidence["wrapper_class"] = _class_path(first)
+    send_message, tl_object, kind, detail = _resolve_inline_result(first)
+    if tl_object is not None:
+        evidence["tl_class"] = _class_path(tl_object)
+    if send_message is None:
+        evidence["error"] = detail
+        evidence["reason"] = kind or "unsupported"
+        evidence["entity_present"] = False
+        _trace(
+            "INLINE_RESULT_INSPECTED",
+            entity_present=False,
+            reason=evidence["reason"],
+            wrapper=evidence["wrapper_class"],
+            tl=evidence["tl_class"] or None,
+            result_count=count,
+        )
         return evidence
     evidence["ok"] = True
     text = getattr(send_message, "message", "") or ""
@@ -585,6 +688,8 @@ async def _inspect_inline_result(results: Any, payload: dict[str, Any]) -> dict[
         _trace(
             "INLINE_RESULT_INSPECTED",
             entity_present=False,
+            wrapper=evidence["wrapper_class"],
+            tl=evidence["tl_class"] or None,
             text_utf16_len=utf16_length(text),
             entity_count=len(getattr(send_message, "entities", None) or []),
         )
@@ -603,6 +708,8 @@ async def _inspect_inline_result(results: Any, payload: dict[str, Any]) -> dict[
     _trace(
         "INLINE_RESULT_INSPECTED",
         entity_present=True,
+        wrapper=evidence["wrapper_class"],
+        tl=evidence["tl_class"] or None,
         document_id=scan["document_id"],
         document_id_match=evidence["document_id_match"],
         offset=scan["offset"],
@@ -820,12 +927,21 @@ async def send_premium_emoji_via_inline(
         results, query_error = None, f"the inline query timed out after {_INLINE_CALL_TIMEOUT_S:g}s"
     if results is None:
         _trace("INLINE_QUERY_RESULT", ok=False, error=_bounded(query_error))
-        failed = _failed(
-            ERROR_QUERY,
-            f"the helper bot could not answer the inline query: {query_error}",
-            INLINE_RESULT_REJECTED,
-            payload,
-        )
+        if query_error == inline_engine.INLINE_ZERO_RESULTS_REASON:
+            failed = _failed(
+                ERROR_QUERY,
+                "the helper bot answered the inline query with no result — "
+                "nothing could be inspected and the send was not attempted",
+                INLINE_RESULT_EMPTY,
+                payload,
+            )
+        else:
+            failed = _failed(
+                ERROR_QUERY,
+                f"the helper bot could not answer the inline query: {query_error}",
+                INLINE_RESULT_REJECTED,
+                payload,
+            )
         failed["eligibility"] = eligibility
         failed["destination_chat_id"] = chat_id
         return failed
@@ -856,11 +972,29 @@ async def send_premium_emoji_via_inline(
         return record
 
     if not record["inline_result"]["ok"]:
-        return _fail(
-            ERROR_QUERY,
-            "the stored inline result could not be inspected: "
-            f"{record['inline_result']['error']}",
-        )
+        inline_evidence = record["inline_result"]
+        reason = inline_evidence["reason"]
+        if reason == "empty":
+            detail = (
+                "the helper bot returned no inline result — nothing was "
+                "inspected and the send was not attempted"
+            )
+        elif reason == "unsupported":
+            detail = (
+                "the inline result's runtime shape could not be inspected "
+                f"safely ({inline_evidence['error']}) — the send was not attempted"
+            )
+        elif reason == "no_send_message":
+            detail = (
+                "the stored inline result carries no send-message payload "
+                f"({inline_evidence['error']}) — the send was not attempted"
+            )
+        else:
+            detail = (
+                "the stored inline result could not be inspected: "
+                f"{inline_evidence['error']}"
+            )
+        return _fail(ERROR_QUERY, detail)
     if not record["inline_result"]["entity_present"]:
         return _fail(
             ERROR_QUERY,
@@ -940,6 +1074,19 @@ def outcome_summary(result: Any) -> str:
         return (
             "the message was accepted but could not be read back, so nothing "
             f"about the stored entity is proven ({result.get('readback', {}).get('error')})."
+        )
+    if diagnosis == INLINE_RESULT_EMPTY:
+        return "the helper bot answered the inline query with no result — nothing was sent."
+    if diagnosis == INLINE_RESULT_UNSUPPORTED:
+        return (
+            "the inline result's runtime shape could not be inspected safely, "
+            "so nothing was sent — this is NOT evidence that Telegram stripped "
+            "the entity."
+        )
+    if diagnosis == INLINE_RESULT_NO_SEND_MESSAGE:
+        return (
+            "the stored inline result carries no send-message payload — "
+            "nothing was sent."
         )
     if diagnosis == INLINE_RESULT_ENTITY_MISSING:
         return (

@@ -2083,6 +2083,14 @@ def _premium_inline_report(outcome: dict[str, Any]) -> str:
                 f" · offset {inline_result.get('offset')}"
                 f" · length {inline_result.get('length')})"
             )
+        elif inline_result.get("reason") == "empty":
+            lines.append("Inline result: the helper bot returned none")
+        elif inline_result.get("reason") in ("unsupported", "no_send_message"):
+            lines.append(
+                "Inline result: not inspectable ("
+                + str(inline_result.get("error") or "unsupported result shape")
+                + ")"
+            )
         else:
             lines.append(
                 "Inline result: entity missing ("

@@ -25,6 +25,10 @@ _helper_username: str = ""
 _helper_id: int = 0
 _owner_id: int = 0
 
+#: The honest "the bot answered, but with nothing" reason. Exposed so a caller
+#: can tell an empty answer apart from a failed query WITHOUT matching prose.
+INLINE_ZERO_RESULTS_REASON = "the helper returned zero results for this query"
+
 
 def set_self_client(client) -> None:
     global _self_client
@@ -143,7 +147,7 @@ async def query_results(self_client, chat_id: int, query: str) -> tuple[Any, str
         return None, f"the inline query raised {type(exc).__name__}: {exc}"
     if not results:
         logger.warning("trigger: helper returned zero results for query '%s'", query)
-        return None, "the helper returned zero results for this query"
+        return None, INLINE_ZERO_RESULTS_REASON
     return results, ""
 
 

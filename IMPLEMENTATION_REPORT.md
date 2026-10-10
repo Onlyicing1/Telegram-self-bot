@@ -1,180 +1,174 @@
-# IMPLEMENTATION_REPORT.md — Callback Receipt Coverage, Earliest Unobserved Boundary, and the Receipt Diagnostic
+# IMPLEMENTATION_REPORT.md — Premium Custom Emoji: Reading the Real Inline-Result Payload
 
 This file describes ONLY the current state of the repository after this task.
 It replaces every previous report in full. Earlier reports — the emoji feature
-implementation (`977247e`), the checkpoint-2 fix (`e13deee`), the feasibility
-study (`b04cb41`), the 98c2825 audit, and the boundary-tracing task
-(`a54877b`) — are preserved in git history and referenced here only by commit
-id.
+implementation (`977247e`), the checkpoint-2 "field" fix (`e13deee`), the
+feasibility study (`b04cb41`), the `98c2825` audit, the boundary-tracing task
+(`a54877b`), and the callback-receipt task (`1bd843d`) — are preserved in git
+history and referenced here only by commit id.
 
 | Item | Value |
 |---|---|
-| Task | `last_callback_age` coverage analysis; callback receipt/matching/filtering trace; ReadError call-relationship verdict; implement the smallest evidence-based diagnostic for the earliest unobserved boundary; docs + commit + push + remote verification |
+| Task | Diagnose and fix the Premium custom-emoji flow at the earliest confirmed failing stage: inspection of the object returned by Telethon's `inline_query` |
 | Project | LifeOS Telegram self-bot (`Onlyicing1/Telegram-self-bot`), branch `main` |
-| Base revision | `a54877b` (verified equal to `origin/main` at task start) |
-| Status | **Investigation complete. Receipt was the earliest unobserved boundary; ONE bounded `[CALLBACK] received …` line per delivered callback is implemented in the helper hook (the smallest evidence-based diagnostic). The reply-dispatch deduction stands. No other production change.** |
-| Production code changed | **Yes — the one receipt line** (`backend/helper/client.py`); purely additive logging, no behavioral change |
-| Supabase | **not touched** (no SQL, no schema, no migration, no request) |
+| Base revision | `1bd843d` (verified equal to `origin/main` at task start) |
+| Telethon | **`telethon==1.34.0`** (`backend/requirements.txt:1`); all shapes verified against that installed source |
+| Status | **Root cause found and fixed.** `inline_query` returns `custom.InlineResults` — a list of `custom.InlineResult` **wrappers**, whose raw TL `BotInlineResult` lives in `.result`; the wrapper has **no `send_message`**. The inspection read `getattr(results[0], "send_message", None)` (always `None`) and reported `reason=no_send_message` → `INLINE_RESULT_REJECTED` without ever looking at the payload Telegram returned. The read now goes through the real shapes, with distinct honest diagnoses for an empty answer, an unsupported shape and a real result without a payload. |
+| Production code changed | **Yes** — `backend/services/premium_emoji_inline_service.py`, `backend/helper/inline_engine.py`, `backend/bot/handlers/emoji.py`. No new client, listener, scheduler, update loop or send mechanism. |
+| Supabase | **Not touched** (no SQL, no schema, no migration, no request) |
 | Live Telegram verification | **No** (no live session in this workspace); see §7 |
 
 ---
 
-## 1. What this task did
+## 1. Root cause (verified from the installed source)
 
-1. Verified the repository and remote state: HEAD `a54877b` = `origin/main`;
-   `a54877b`, `e13deee`, `98c2825`, `7d27e11` all ancestors of `origin/main`.
-2. Traced every writer of `last_callback_age`: `set_last_callback()`
-   (`health.py:206`) is called from exactly two places — the helper receipt
-   hook (`helper/client.py:129`) and the router entry
-   (`panels.py:334`) — both on the helper client and both BEFORE every
-   filter/gate; the heartbeat derives the age at `heartbeat.py:147/153/173`.
-   Answer: the counter is receipt-level only and cannot distinguish delivery
-   from handler invocation, nor name the button (INVESTIGATION.md §4).
-3. Traced callback receipt, handler matching, filtering and Premium Emoji
-   handler entry from the actual registration/dispatch code: only TWO
-   `CallbackQuery` handlers exist (hook at `client.py:125` — registered first,
-   `supervisor.py:415` — and router at `panels.py:328/329`); neither builder
-   filters; the router's gates and its first unconditional lines were
-   re-verified (INVESTIGATION.md §2).
-4. Evaluated the 17:07–17:08 evidence without inferring receipt: the
-   monotonic age growth (31 s → 61 s across a 30 s interval) proves no NEW
-   helper callback arrived in that window; it names no button and proves
-   nothing about the Premium Emoji callback. `last_update_age`/`last_event_age`
-   are written by hooks on both clients and are not helper-callback evidence.
-5. Re-verified the repository `ReadError` verdict: **no concrete call
-   relationship exists** with the callback path; failures are contained by the
-   repository's fallback + the handler/Telethon catches and confined to the
-   bounded DB thread pool (4 workers, 10 s watchdog) — consistent with keepalive
-   succeeding and low loop latency while the errors continued
-   (INVESTIGATION.md §5).
-6. Identified the **earliest unobserved boundary**: callback receipt itself
-   (delivery carried no log; the router's first unconditional line requires a
-   resolvable session), and implemented the smallest evidence-based diagnostic
-   — one bounded `[CALLBACK] received data=… sender_id=… chat_id=… msg_id=…
-   inline_msg_id='…'` line in `_helper_callback_hook`
-   (`backend/helper/client.py:144–152`) that fires for EVERY delivered
-   callback before any gate.
-7. Added focused tests (`tests/test_helper_callback_receipt.py`) pinning:
-   the hook is registered for `events.CallbackQuery`; one receipt line per
-   callback with data + coordinates; the health timestamp still written; the
-   fields bounded (64-char data cap); a bare event never raises.
-8. Ran the targeted suites and the FULL test suite, a compile check,
-   `git diff --check`, and reviewed the complete final diff.
-9. Replaced `INVESTIGATION.md` and `IMPLEMENTATION_REPORT.md` in full.
-10. Committed and delivered (§6).
+`telethon/client/bots.py` returns `custom.InlineResults(self, result, entity=…)`.
+`telethon/tl/custom/inlineresults.py` builds that list as
+`InlineResult(client, x, original.query_id, entity=entity)` for every
+`original.results` entry — i.e. **the elements are wrappers, not raw TL objects**.
+`telethon/tl/custom/inlineresult.py` stores the raw object as `self.result`
+(`self.result = original`), exposes it as `.message`
+(`return self.result.send_message`) and clicks via `self.result.id`.
 
-Deliberately NOT done: no reply-side instrumentation (logging the listener's
-"no pending" gate would require logging every owner message — unbounded spam);
-no changes to the debug gates; no behavioral change of any kind.
+The payload therefore lives at **`results[0].result.send_message`**; the wrapper
+itself has **no `send_message` attribute** — confirmed at runtime against the
+installed 1.34.0 (`hasattr(custom.InlineResult, "send_message") is False`).
+`_inspect_inline_result` read `getattr(first, "send_message", None)`, which is
+`None` for every real response, so it produced the live
+`INLINE_RESULT_INSPECTED entity_present=False reason=no_send_message` and
+`classify_diagnosis` mapped that to `INLINE_RESULT_REJECTED`.
 
----
+The earlier `e13deee` commit changed `.message` → `.send_message`, but **both are
+wrapper-level reads**; the wrong part was the *object*, not the field. Telegram
+keeping or stripping the entity was never established — nothing was ever sent.
 
-## 2. Repository and remote verification (task start)
-
-| Check | Command | Result |
-|---|---|---|
-| Branch / status | `git status --short --branch` | `main...origin/main`; the task's edits in progress + pre-existing untracked `telegram-self-bot/` |
-| HEAD | `git rev-parse HEAD` | `a54877bdd2bdb69fc3873f795f5a1c706a5b162d` |
-| Fetch | `git fetch origin` | no new commits (`FETCH_OK`) |
-| Remote tip | `git rev-parse origin/main` | `a54877bdd2bdb69fc3873f795f5a1c706a5b162d` (equal to HEAD) |
-| Ancestry | `git merge-base --is-ancestor <c> origin/main` for `a54877b`, `e13deee`, `98c2825`, `7d27e11` | all exit 0 — ANCESTOR |
-
-No history rewriting; nothing discarded; the pre-existing untracked
-`telegram-self-bot/` untouched.
-
----
-
-## 3. Findings (summary)
-
-* **`last_callback_age` coverage:** written at callback delivery (hook) and at
-  router entry — before any owner/coordinates/data/session gate. It proves "a
-  callback query arrived and entered the router"; it cannot distinguish an
-  incoming callback from a handler invocation, cannot identify the button, and
-  covers no post-entry stage. Monotonic growth across two samples does prove
-  the absence of any NEW helper callback in that interval.
-* **Earliest unobserved boundary → resolved:** callback receipt now logs one
-  bounded line per delivered callback; combined with the existing
-  unconditional chain (`session lookup` → `_handle_action` →
-  `[EMOJI_UI] … selection message #N sent`), every stage from receipt to the
-  action is now observable.
-* **The reply dispatch remains the flow's first missing boundary** in the
-  recorded tests (zero `[PREMIUM_INLINE]` ⇒ no reply reached the handler);
-  its state gates and discriminators are unchanged (INVESTIGATION.md §3/§10).
-* **`ReadError`:** no call relationship with the callback path; not causal.
-* **nararouter timeout / PeerChannel warning / `e13deee` fix:** unchanged
-  verdicts (unrelated / independent post-trace artifact / verified and
-  unrelated).
-
----
-
-## 4. Files changed in this task
+## 2. Files changed
 
 | File | Change | Rationale |
 |---|---|---|
-| `backend/helper/client.py` | `_helper_callback_hook` now also logs ONE bounded `[CALLBACK] received …` line per delivered callback (data ≤64 chars + sender/chat/msg/inline coords); docstring updated | The smallest evidence-based diagnostic: receipt was the earliest unobserved boundary; the line is additive, bounded, before every router gate, and can never raise (own try/except; health timestamp behavior unchanged) |
-| `tests/test_helper_callback_receipt.py` | NEW — 2 focused tests | Pin the receipt line (identity + coordinates), the health timestamp, the 64-char bound, and that a bare event never raises |
-| `INVESTIGATION.md` | Replaced in full with the latest verified state | Latest-only canonical record (task requirement) |
-| `IMPLEMENTATION_REPORT.md` | Replaced in full with this record | Latest-only canonical report (task requirement) |
+| `backend/services/premium_emoji_inline_service.py` | New `_resolve_inline_result()` (both real shapes → stored payload, with `unsupported` / `no_send_message` kinds) and `_class_path()`; `_inspect_inline_result()` resolves `results[0]` through it, handles an empty list, and records `reason`/`wrapper_class`/`tl_class`; `_empty_inline_evidence()` gained those keys; three new diagnoses (`INLINE_RESULT_EMPTY`, `INLINE_RESULT_UNSUPPORTED`, `INLINE_RESULT_NO_SEND_MESSAGE`) wired into `classify_diagnosis`, the post-inspection failure branches (honest per-reason details) and `outcome_summary` | Read the actual stored payload; never label an unknown shape as Telegram-side stripping |
+| `backend/helper/inline_engine.py` | New `INLINE_ZERO_RESULTS_REASON` constant, used by `query_results` | Let the service tell an empty answer apart from a failed query without matching prose; `trigger`'s contract unchanged |
+| `backend/bot/handlers/emoji.py` | `_premium_inline_report` renders the new reasons ("the helper bot returned none" / "not inspectable (…)") instead of "entity missing" for every non-entity case | The user-facing report must not claim stripping for a shape that was never inspected |
+| `tests/test_premium_emoji_inline.py` | Fakes rewritten to the **real** Telethon shapes (`_FakeInlineResult` now subclasses `telethon.tl.custom.InlineResult`; `_bot_inline_result()` builds a real `types.BotInlineResult`; the old `send_message`-on-the-wrapper fake is gone; unused `result_for_query` removed) + 10 new tests | Regression-proof the exact live failure |
+| `INVESTIGATION.md`, `IMPLEMENTATION_REPORT.md` | Replaced in full | Latest-only canonical records (task requirement) |
 
-**No other production code changed. No unrelated files modified. No Supabase
-schema, SQL, migration, or request. `DATABASE_ARCHITECTURE.md` untouched.**
+**No other production code changed. No unrelated refactors. No Supabase schema,
+SQL, migration or request. `DATABASE_ARCHITECTURE.md` untouched.**
 
----
+## 3. Tests added (all in `tests/test_premium_emoji_inline.py`)
 
-## 5. Verification executed (exact commands and results)
+* `test_the_telethon_wrapper_keeps_the_payload_on_result_only` — the real
+  wrapper has **no `send_message`**; `wrapper.message is
+  wrapper.result.send_message`.
+* `test_inspection_reads_the_real_wrapper_payload` — a real
+  `custom.InlineResult` around a real `BotInlineResult`: entity found,
+  `document_id`/UTF-16 offset/length/span validated, and `wrapper_class` /
+  `tl_class` recorded as the real classes.
+* `test_inspection_accepts_a_raw_bot_inline_result_too` — a raw TL object works.
+* `test_the_real_container_shape_sends_and_the_inspected_result_is_the_clicked_one`
+  — a real `custom.InlineResults` built from `messages.BotResults`: the flow
+  verifies end-to-end and the object handed to the click path **is** `results[0]`.
+* `test_a_wrapper_without_a_stored_result_fails_closed` — unsupported shape,
+  nothing sent.
+* `test_send_message_placed_on_the_returned_object_is_not_accepted` — the live
+  bug's shape (`send_message` on the returned object) is **refused**, not trusted.
+* `test_a_real_result_without_a_send_message_payload_fails_closed` — a real
+  `BotInlineResult(send_message=None)` → `INLINE_RESULT_NO_SEND_MESSAGE`.
+* `test_a_real_wrapper_whose_payload_lacks_the_entity_is_entity_missing` — the
+  payload **was** inspected; the entity is genuinely absent; no send.
+* `test_the_inspection_trace_names_the_real_classes` — the bounded
+  `INLINE_RESULT_INSPECTED` line names `wrapper=`/`tl=`.
+* `test_the_report_renders_an_unsupported_shape_honestly` — the panel says "not
+  inspectable", never "entity missing".
+* Renamed `test_zero_inline_results_is_reported_as_rejected` →
+  `test_zero_inline_results_is_reported_as_empty` (the refined, correct
+  diagnosis).
 
-All commands run from the repository root with `set -o pipefail` where piped.
+Coverage required by the task is met: the real wrapper shape with a valid
+custom-emoji entity; correct underlying-payload validation (document id, UTF-16
+offset/length, span); the inspected result is the clicked one; empty results
+fail closed; unsupported/malformed shapes fail closed without sending; a valid
+wrapper whose payload lacks the entity does not pass; and the pre-existing
+read-back (`via_bot_id` + entity) and no-Unicode-fallback / Saved-Messages-only
+tests are untouched and still pass.
+
+## 4. Verification executed
+
+All from the repository root, with `set -o pipefail` where piped.
 
 | Check | Command | Result |
 |---|---|---|
-| Compile (changed files) | `.venv/bin/python -m compileall -q backend/helper/client.py tests/test_helper_callback_receipt.py` | OK (exit 0) |
-| New focused tests | `.venv/bin/python -m pytest tests/test_helper_callback_receipt.py -v` | **2 passed in 0.22s** — exit 0 |
-| Targeted suites | `.venv/bin/python -m pytest tests/test_helper_callback_receipt.py tests/test_premium_emoji_inline.py tests/test_emoji_ui.py tests/test_premium_emoji_probe.py -q` | **134 passed in 0.51s** — exit 0 |
-| Full suite | `timeout 280 .venv/bin/python -m pytest tests/ -q` | **5771 passed, 26 skipped, 2 warnings in 119.16s** — exit 0 (previously 5769; the +2 are the new tests, 0 regressions) |
-| Whitespace / diff sanity | `git diff --check` | exit 0 |
-| Remote ancestry | `git fetch origin` + `git rev-parse origin/main` + `git merge-base --is-ancestor <c> origin/main` | all verified (§2) |
-| Final diff review | `git status --short`, full diff review of the changed files | Reviewed |
+| Compile (changed files) | `.venv/bin/python -m compileall -q backend/services/premium_emoji_inline_service.py backend/helper/inline_engine.py backend/bot/handlers/emoji.py tests/test_premium_emoji_inline.py` | **COMPILE_OK** (exit 0) |
+| Focused file | `.venv/bin/python -m pytest tests/test_premium_emoji_inline.py -q` | **62 passed** — exit 0 |
+| Focused suites | `.venv/bin/python -m pytest tests/test_premium_emoji_inline.py tests/test_emoji_ui.py tests/test_premium_emoji_probe.py tests/test_helper_callback_receipt.py -q` | **144 passed in 0.59s** — exit 0 |
+| Full suite | `timeout 400 .venv/bin/python -m pytest tests/ -q` | **5781 passed, 26 skipped, 2 warnings in 118.64s** — exit 0 (baseline 5771; +10 = exactly the 10 new tests, 0 regressions) |
+| Whitespace / diff sanity | `git diff --check` | **DIFF_CHECK_OK** (exit 0) |
+| Final diff review | full `git diff` of `backend/` + `git status --porcelain -uall` | Scoped to the 4 files; only bounded ids/offsets/class paths logged; no secrets, tokens or message bodies |
 
-No test was skipped, weakened, or suppressed. The tests are fake/stub-based
-(`client.on` capture, caplog) and prove the hook's source behavior only — they
-make no claim about live Telegram delivery.
+No test was skipped, weakened or suppressed; the only assertion changed is the
+zero-results diagnosis, which now asserts the **more precise** new verdict
+(`INLINE_RESULT_EMPTY`) plus the same `readback.attempted is False`.
 
----
-
-## 6. Delivery
+## 5. Delivery
 
 | Step | Value |
 |---|---|
-| Commit | This task's single commit — `backend/helper/client.py`, `tests/test_helper_callback_receipt.py`, `INVESTIGATION.md`, `IMPLEMENTATION_REPORT.md`; message `feat(helper): record one bounded callback receipt line per delivered callback` |
+| Commit | This task's single commit — `backend/services/premium_emoji_inline_service.py`, `backend/helper/inline_engine.py`, `backend/bot/handlers/emoji.py`, `tests/test_premium_emoji_inline.py`, `INVESTIGATION.md`, `IMPLEMENTATION_REPORT.md` |
 | Push | Pushed to `origin/main` as the final step of this task |
-| Remote verification | `git fetch origin` + `git rev-parse origin/main` + `git merge-base --is-ancestor <commit> origin/main` → exit 0; `origin/main` tip equals the pushed commit |
-| Working tree | clean except the pre-existing untracked `telegram-self-bot/` (never touched) |
+| Remote verification | `git fetch origin` + `git rev-parse origin/main` + `git merge-base --is-ancestor <commit> origin/main` — see the task's delivery response for the exact SHAs |
+| Working tree | Clean except the pre-existing untracked `telegram-self-bot/` (never touched) |
 
 A commit cannot contain its own hash: the full commit SHA and the verified
 `origin/main` SHA are reported in this task's delivery response, and the remote
 state was re-checked after the push with the commands above.
 
----
+## 6. Repository / remote verification (task start)
 
-## 7. What remains unverified / limitations
+| Check | Command | Result |
+|---|---|---|
+| Branch / status | `git status --short --branch` | `main...origin/main`; the task's edits in progress + pre-existing untracked `telegram-self-bot/` |
+| HEAD | `git rev-parse HEAD` | `1bd843ddc81f3f43ed0937b67f7af011ae724b95` |
+| Fetch | `git fetch origin` | no new commits |
+| Remote tip | `git rev-parse origin/main` | `1bd843ddc81f3f43ed0937b67f7af011ae724b95` (equal to HEAD) |
+| Ancestry | `git merge-base --is-ancestor <c> origin/main` for `1bd843d`, `a54877b`, `e13deee`, `98c2825`, `7d27e11` | all exit 0 |
 
-1. **No live Telegram or Render verification was performed.** The new receipt
-   line has not yet been observed in Render logs; no live session exists in
-   this workspace. Nothing here claims the live failure is "fixed".
-2. **Past windows cannot be retroactively named** — the receipt line applies
-   to the next run; the 15:32/17:07 callbacks remain unidentified.
-3. **Whether the ✨ button was clicked (and when) in the recorded windows**
-   is still not established, and was deliberately not inferred from
-   `last_callback_age`.
-4. **Telegram's live treatment of the custom-emoji entity** on the inline path
-   remains open (checkpoint 2 fixed but not exercised end-to-end live).
-5. The reply-side silent gates are intentionally left uninstrumented
-   (unbounded logging); their existing discriminators are listed in
-   INVESTIGATION.md §10.
+No history rewriting, no `rebase`, no force-push, nothing discarded; the
+pre-existing untracked `telegram-self-bot/` was never touched.
 
----
+## 7. Not verified live / limitations
 
-## 8. Supabase / database
+1. **No live Telegram or Render execution.** The fix is verified against the
+   installed Telethon 1.34.0 source/classes and the full suite — not against a
+   live `getInlineBotResults` response. Nothing here claims the feature works
+   end-to-end.
+2. **Whether Telegram keeps the custom-emoji entity in the returned
+   `BotInlineResult` is still unknown** — it could not be observed before,
+   because the inspection never read the payload. That is precisely what the
+   next live run establishes.
+3. **The send (`sendInlineBotResult`) and the exact-message read-back have never
+   been exercised live** and are therefore still unproven in production.
+4. The helper answers with an article/text result, so the live payload is
+   expected to be a `BotInlineMessageText`; a media variant would be inspected
+   the same way but has no live sample.
+5. The other previously recorded unrelated findings are unchanged and not
+   revisited here (nararouter timeout, `PeerChannel` panel-edit warning, the
+   `ReadError` burst living in the bounded DB pool).
+
+## 8. Next live test — the stage it must confirm
+
+Deploy this commit, then run `Menu → Emoji → ✨ Send Premium Emoji → reply with a
+genuine Premium emoji`. The pipeline must now advance **past** inline-result
+inspection. Search the window for:
+
+| Log after `INLINE_QUERY_STARTED` | Meaning |
+|---|---|
+| `INLINE_RESULT_INSPECTED entity_present=True …` then `INLINE_SEND_STARTED` | inspection now reads the real payload and the send was attempted — the earliest failing stage is cleared |
+| `INLINE_RESULT_INSPECTED entity_present=False` with **no** `reason=no_send_message` | a genuine Telegram-side result restriction (payload inspected, entity absent) — `INLINE_RESULT_ENTITY_MISSING` |
+| `reason=unsupported` / `reason=no_send_message` | the returned object is not what Telethon documents — report it; the trace now names `wrapper=` and `tl=` |
+| `INLINE_SEND_ACCEPTED` + `READBACK_RESULT` | the send and the exact-message read-back ran — compare `document_id_match` / `span_match` / `via_bot_match` |
+| `DIAGNOSIS diagnosis=STORED_ENTITY_VERIFIED_RENDER_UNVERIFIED` | the entity is stored and Telegram-attributed; **rendering is still for the owner to confirm visually** |
+
+## 9. Supabase / database
 
 Not touched in any way: no SQL executed, no schema or migration changed, no
 Supabase request made, `DATABASE_ARCHITECTURE.md` untouched.
