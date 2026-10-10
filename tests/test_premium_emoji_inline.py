@@ -1506,6 +1506,27 @@ def test_an_unrecorded_submission_leaves_the_cause_unproven(monkeypatch):
     assert "no submission of this bot was recorded" in emoji._premium_inline_report(result)
 
 
+def test_the_attribution_requires_the_submitted_entity_to_be_this_emoji(monkeypatch):
+    """A submission for ANOTHER emoji is uncorrelated — Telegram is not blamed."""
+    other_doc = 424242424242424242
+    text, _entities = _result_payload()
+    submitted = [svc.build_inline_result(other_doc, ALT)]
+    client = _AnsweringSelfClient(
+        results=[_FakeInlineResult(text, None)], answer_results=submitted
+    )
+
+    result = _send(client, monkeypatch)
+
+    assert result["diagnosis"] == svc.INLINE_RESULT_ENTITY_MISSING
+    assert client.results[0].clicks == 0               # never sent
+    assert result["inline_result"]["answer"]["document_ids"] == [other_doc]
+    assert f"#{other_doc}" in result["detail"]        # what was submitted
+    assert f"#{DOC}" in result["detail"]              # what this emoji needs
+    assert "unproven" in result["detail"]
+    assert "dropped by Telegram" not in result["detail"]
+    assert "dropped by Telegram" not in svc.outcome_summary(result)
+
+
 def test_entity_missing_detail_tolerates_a_missing_evidence_block():
     assert "unproven" in svc._entity_missing_detail({})
     assert "unproven" in svc._entity_missing_detail(None)
@@ -1544,6 +1565,70 @@ def test_the_inspection_trace_carries_the_submission_evidence(caplog):
         and "answer_custom_emoji_count=1" in line
         for line in traces
     )
+
+
+def test_the_inspection_trace_correlates_the_submitted_document_id(caplog):
+    import logging
+
+    text, _entities = _result_payload()
+    payload = svc.build_inline_payload(DOC, ALT)
+    caplog.set_level(
+        logging.INFO, logger="backend.services.premium_emoji_inline_service"
+    )
+    for document_id in (DOC, 424242424242424242):
+        _run(
+            svc._inspect_inline_result(
+                [_FakeInlineResult(text, None)],
+                payload,
+                {
+                    "recorded": True,
+                    "ok": True,
+                    "error": "",
+                    "result_count": 1,
+                    "custom_emoji_count": 1,
+                    "document_ids": [document_id],
+                },
+            )
+        )
+    traces = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name.endswith("premium_emoji_inline_service")
+    ]
+    assert any("answer_document_id_match=True" in line for line in traces)
+    assert any("answer_document_id_match=False" in line for line in traces)
+
+
+def test_a_stored_result_parsed_from_response_bytes_keeps_the_entity():
+    """Telegram's own reply shape round-trips — the parser is not the loss."""
+    stored = types.BotInlineResult(
+        id="0",
+        type="article",
+        send_message=types.BotInlineMessageText(
+            message=_payload_text(),
+            entities=[
+                types.MessageEntityCustomEmoji(
+                    utf16_length(PREFIX), utf16_length(ALT), DOC
+                )
+            ],
+        ),
+    )
+
+    parsed = BinaryReader(bytes(stored)).tgread_object()
+
+    assert isinstance(parsed, types.BotInlineResult)
+    evidence = _run(
+        svc._inspect_inline_result([parsed], svc.build_inline_payload(DOC, ALT))
+    )
+    assert evidence["ok"] is True
+    assert evidence["entity_present"] is True
+    assert (evidence["document_id"], evidence["offset"], evidence["length"]) == (
+        DOC,
+        utf16_length(PREFIX),
+        utf16_length(ALT),
+    )
+    assert evidence["document_id_match"] is True
+    assert evidence["span_match"] is True
 
 
 def test_serialize_document_adds_free_and_text_color_additively():

@@ -1,8 +1,9 @@
 """
 Premium custom emoji through the inline-bot path — production feature.
 
-Telegram has exactly TWO ways a genuine ``MessageEntityCustomEmoji`` can leave
-this project, and they are not the same mechanism:
+A genuine ``MessageEntityCustomEmoji`` can leave this project through three
+distinguishable routes; they are NOT the same mechanism and only ONE of them is
+implemented here:
 
 1. **the helper bot sends it itself** (``messages.sendMessage`` as the bot,
    ``backend/telegram_api/bridge.py``) — the path the closed POC tested, where
@@ -10,7 +11,15 @@ this project, and they are not the same mechanism:
 2. **the user account sends a bot-supplied inline result**
    (``messages.sendInlineBotResult``, the machinery every Glass UI panel
    already uses) — the sender is the owner's own account, the bot only
-   supplies the result, and Telegram stamps ``via_bot_id``.
+   supplies the result, and Telegram stamps ``via_bot_id``;
+3. **the owner's own account authors the entity itself**
+   (``messages.sendMessage`` from the self client with
+   ``formatting_entities=[MessageEntityCustomEmoji(...)]``) — no bot is
+   involved, so no bot entitlement is checked. Telegram documents the
+   non-Premium allowance for this route in the self chat alone
+   (<https://telegram.org/blog/custom-emoji>: everyone may use all custom
+   emoji in Saved Messages). **NOT implemented here and NOT live-verified** —
+   it is recorded as a documented route, never as a confirmed fix.
 
 This module implements (2) and nothing else. It is the ONLY place that puts a
 custom-emoji entity into an ``InputBotInlineMessageText`` and reads the sent
@@ -529,7 +538,7 @@ def _failed(
     return result
 
 
-def _entity_missing_detail(evidence: Any) -> str:
+def _entity_missing_detail(evidence: Any, expected_document_id: Any = None) -> str:
     """WHY the stored inline result carries no custom-emoji entity.
 
     The stored payload and the helper bot's own answer are two DIFFERENT
@@ -538,6 +547,12 @@ def _entity_missing_detail(evidence: Any) -> str:
     dropped by Telegram, while an answer that raised or carried none is this
     application's own outcome. Without a recorded answer the cause stays
     unproven and is reported as such.
+
+    The comparison is also an IDENTITY check, never only a count: the recorded
+    submission counts as evidence for THIS attempt only when it carried this
+    emoji's own ``document_id`` (``expected_document_id``). A submission that
+    carried some other custom-emoji entity is reported as uncorrelated —
+    Telegram is never blamed for an entity this attempt did not submit.
     """
     answer = evidence.get("answer") if isinstance(evidence, dict) else None
     if not isinstance(answer, dict) or not answer.get("recorded"):
@@ -562,6 +577,17 @@ def _entity_missing_detail(evidence: Any) -> str:
             "the send was not attempted"
         )
     documents = ", ".join(f"#{value}" for value in (answer.get("document_ids") or []))
+    if _is_positive_int(expected_document_id) and expected_document_id not in (
+        answer.get("document_ids") or []
+    ):
+        return (
+            f"the helper bot's answer submitted {submitted} custom-emoji "
+            f"entit{'y' if submitted == 1 else 'ies'}"
+            + (f" (document {documents})" if documents else "")
+            + f", none of them document #{int(expected_document_id)} — so it "
+            "is not correlated with this emoji and which side lost its entity "
+            "is unproven. The send was not attempted"
+        )
     return (
         f"the helper bot's own answer submitted {submitted} custom-emoji "
         f"entit{'y' if submitted == 1 else 'ies'}"
@@ -772,6 +798,10 @@ async def _inspect_inline_result(
             answer_recorded=evidence["answer"].get("recorded"),
             answer_ok=evidence["answer"].get("ok"),
             answer_custom_emoji_count=evidence["answer"].get("custom_emoji_count"),
+            answer_document_id_match=(
+                expected["document_id"]
+                in (evidence["answer"].get("document_ids") or [])
+            ),
         )
         return evidence
     evidence["entity_present"] = True
@@ -1083,7 +1113,9 @@ async def send_premium_emoji_via_inline(
     if not record["inline_result"]["entity_present"]:
         return _fail(
             ERROR_QUERY,
-            _entity_missing_detail(record["inline_result"]),
+            _entity_missing_detail(
+                record["inline_result"], payload["entity"]["document_id"]
+            ),
         )
 
     _trace("INLINE_SEND_STARTED", started=True, via=SEND_PATH_INLINE_BOT_RESULT)
