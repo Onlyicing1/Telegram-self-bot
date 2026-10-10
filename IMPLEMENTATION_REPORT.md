@@ -114,7 +114,7 @@ in a way that hides its exit status.
 |---|---|---|
 | Branch / status | `git status --short` | clean; on `main`, tracking `origin/main` |
 | Local HEAD | `git rev-parse HEAD` | `06eeb8d…` (behind the remote) |
-| Fetch | `git fetch origin main` | `06eeb8d..39de9cc` — the remote had **12 newer commits** (the inline feature chain) |
+| Fetch | `git fetch origin main` | `06eeb8d..39de9cc` — the remote had **14 newer commits** (the inline feature chain; `git rev-list --count 06eeb8d..39de9cc`) |
 | Ancestry / fast-forward | `git merge-base --is-ancestor 06eeb8d origin/main` | exit 0 → the workspace was fast-forwarded with `git merge --ff-only origin/main`; no rebase, no force-push, nothing discarded |
 | Remote tip | `git rev-parse origin/main` / `git ls-remote origin refs/heads/main` | `39de9cca6d45e3e7f499d28666a968899ef1824e` (both agree) |
 
