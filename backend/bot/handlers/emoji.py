@@ -44,6 +44,7 @@ from backend.helper.panels import (
 from backend.helper.input_state import set_pending
 from backend.services import emoji_category_service as cat_service
 from backend.services import emoji_state_service as state_service
+from backend.services import premium_emoji_direct_service as premium_direct_service
 from backend.services import premium_emoji_inline_service as premium_inline_service
 from backend.services import premium_emoji_probe_service as probe_service
 from backend.services import reaction_service
@@ -103,6 +104,7 @@ async def _emoji_panel_handler(event, extra: str) -> tuple[str, str, list] | Non
     builder.add_row("⬇ Import from Saved Messages", "action:emoji_import")
     builder.add_row("💬 React to a message", "action:emoji_react")
     builder.add_row("🧪 POC · helper-bot sent emoji", f"action:{_PROBE_ACTION}")
+    builder.add_row("🧪 Live test · direct self-chat", f"action:{_DIRECT_ACTION}")
     builder.add_row("📚 Library", f"panel:{_LIBRARY_PANEL}")
     builder.add_row("🗂 Categories", f"panel:{_CATEGORIES_PANEL}")
     builder.add_row("🔁 Replacement", f"panel:{_REPLACEMENT_PANEL}")
@@ -2394,6 +2396,278 @@ async def _react_premium_reply_handler(
     await _finish("Set Reaction Emoji", body, _probe_buttons())
 
 
+# ── direct self-chat live test (controlled, one message, read back) ────────
+#
+# The THIRD mechanism an entity can leave through, and the only one never
+# established: the owner's OWN account sending a genuine custom emoji directly
+# (``messages.sendMessage``) to its own Saved Messages. The helper-bot bridge
+# dropped the entity (closed POC) and the inline route is a different
+# mechanism whose three live attempts ended at ``INLINE_RESULT_ENTITY_MISSING``;
+# whether a direct owner-authored send preserves the entity is a question only
+# Telegram answers, so this action exists to ask it ONCE in the live runtime
+# and report the read-back evidence honestly.
+#
+# It is a DIAGNOSTIC entry point, not a second production route: the
+# production path stays ``emoji_premium_inline``, no caller falls back here,
+# and the service owns every Telegram interaction (this UI holds no send
+# logic, no entity rebuilding and no payload construction).
+
+#: The ONE action that runs the controlled direct live test.
+_DIRECT_ACTION = "emoji_premium_direct"
+
+#: Plain words only — the selection message is sent by the owner's own
+#: account, so it carries no glyph a category mapping could ever key on.
+_DIRECT_PROMPT = (
+    "Reply to this message with the Premium Emoji for the DIRECT self-chat "
+    "test.\nOnly a reply to THIS message is accepted."
+)
+
+#: The whole flow (reply read + the message the owner's account sends + the
+#: read-back) runs inside this handler; every Telegram call it makes is
+#: bounded on its own.
+_DIRECT_TIMEOUT_S = 180.0
+
+
+def _premium_direct_buttons() -> list:
+    builder = InlinePanelBuilder()
+    builder.add_row("🧪 Live test · direct self-chat", f"action:{_DIRECT_ACTION}")
+    builder.add_row("✨ Send Premium Emoji", f"action:{_INLINE_ACTION}")
+    return builder.build()
+
+
+def _premium_direct_report(outcome: dict[str, Any]) -> str:
+    """Every fact the direct test establishes — and none that it does not."""
+    payload = outcome.get("payload") or {}
+    entity = payload.get("entity") or {}
+    readback = outcome.get("readback") or {}
+    eligibility = outcome.get("eligibility") or {}
+    attribution = outcome.get("attribution") or {}
+    document = eligibility.get("document")
+
+    lines: list[str] = [premium_direct_service.outcome_summary(outcome), ""]
+    lines.append(f"Diagnosis `{outcome.get('diagnosis')}`")
+    if outcome.get("error"):
+        lines.append(f"Error `{outcome.get('error')}`")
+    send_path = outcome.get("send_path")
+    lines.append(
+        f"Path: `{send_path}` (your own account, directly)"
+        if send_path
+        else "Path: not reached"
+    )
+    destination = outcome.get("destination_chat_id")
+    if destination:
+        lines.append(f"Destination: Saved Messages `#{destination}`")
+    message_id = outcome.get("message_id")
+    lines.append(f"Message: `#{message_id}`" if message_id else "Message: not sent")
+
+    if entity:
+        lines.append(
+            f"Expected entity: document `#{entity.get('document_id')}`"
+            f" · offset {entity.get('offset')} · length {entity.get('length')}"
+            f" · span `{payload.get('glyph')}`"
+        )
+    if readback.get("attempted"):
+        if readback.get("ok"):
+            if readback.get("destination_match") is False:
+                lines.append(
+                    "Read-back: fetched from chat "
+                    f"`#{readback.get('stored_chat_id')}`, NOT your Saved Messages"
+                )
+            if readback.get("entity_present"):
+                lines.append(
+                    "Stored message: real `MessageEntityCustomEmoji`"
+                    f" (document `#{readback.get('document_id')}`"
+                    f" · offset {readback.get('offset')}"
+                    f" · length {readback.get('length')})"
+                    " · id match: "
+                    + ("yes" if readback.get("document_id_match") else "NO")
+                    + " · span match: "
+                    + ("yes" if readback.get("span_match") else "NO")
+                )
+                lines.append(
+                    "Entity preserved: "
+                    + ("yes" if outcome.get("entity_preserved") else "NO")
+                )
+            else:
+                lines.append(
+                    "Stored message: NO custom-emoji entity — it was stripped "
+                    "or ignored"
+                )
+                lines.append("Entity preserved: NO")
+        else:
+            lines.append(f"Read-back: failed ({readback.get('error')})")
+    lines.append(
+        "Bot attribution: NOT applicable to a direct owner-authored message "
+        f"(`via_bot_id` = {attribution.get('via_bot_id')!r}) — this route "
+        "never satisfies a `via_bot_id` requirement."
+    )
+
+    premium = eligibility.get("owner_premium")
+    premium_text = "unknown" if premium is None else ("yes" if premium else "no")
+    free = None if document is None else document.get("free")
+    free_text = (
+        "unknown"
+        if free is None
+        else ("yes (non-Premium allowed)" if free else "no (Premium-only)")
+    )
+    lines.append(
+        f"Owner Premium: {premium_text} · emoji `free`: {free_text} · "
+        f"text_color: {None if document is None else document.get('text_color')}"
+    )
+    if eligibility.get("document_error"):
+        lines.append(f"_Document facts: {eligibility['document_error']}_")
+    if eligibility.get("owner_premium_error"):
+        lines.append(f"_Premium status: {eligibility['owner_premium_error']}_")
+    if eligibility.get("glyph_source"):
+        lines.append(f"_Glyph source: {eligibility['glyph_source']}_")
+    if outcome.get("verified"):
+        lines.append(
+            "\n_Telegram stored the entity; whether your client renders the "
+            "emoji is for you to confirm visually._"
+        )
+    return "\n".join(lines)
+
+
+async def _premium_direct_action(event, extra: str, chat_id: int) -> tuple[str, str, list]:
+    """Send the selection message to Saved Messages and arm reply mode."""
+    client = get_self_client()
+    owner = get_owner_id()
+    if client is None:
+        return _error_panel("Direct Emoji Test", "Self client is not connected.")
+    if not owner:
+        return _error_panel("Direct Emoji Test", "Owner is not set.")
+
+    try:
+        selection = await client.send_message("me", _DIRECT_PROMPT)
+    except Exception as exc:
+        logger.warning("[EMOJI_UI] direct test: selection message not created: %s", exc)
+        return _error_panel(
+            "Direct Emoji Test",
+            f"Could not create the Saved Messages selection message: {exc}",
+        )
+
+    selection_id = getattr(selection, "id", 0) or 0
+    selection_chat = getattr(selection, "chat_id", 0) or 0
+    if (
+        not isinstance(selection_id, int)
+        or isinstance(selection_id, bool)
+        or selection_id <= 0
+        or not selection_chat
+    ):
+        return _error_panel(
+            "Direct Emoji Test",
+            "The selection message could not be created — nothing was armed.",
+        )
+
+    set_pending(
+        owner, _DIRECT_ACTION, _premium_direct_reply_handler, selection_chat,
+        _DIRECT_PROMPT,
+        inline_chat_id=chat_id,
+        inline_msg_id=getattr(event, "message_id", 0) or 0,
+        extra=str(selection_id),
+        timeout=_DIRECT_TIMEOUT_S,
+    )
+    logger.info(
+        "[EMOJI_UI] direct test: selection message #%s sent to Saved Messages",
+        selection_id,
+    )
+    body = (
+        "A selection message was sent to **Saved Messages**.\n\n"
+        "Reply to THAT message with the Premium Emoji to test.\n"
+        f"Only a reply to message `#{selection_id}` is accepted.\n\n"
+        "Your OWN account then sends one labelled test message directly to "
+        "Saved Messages, and that exact message is read back: the entity it "
+        "stores is reported as-is."
+    )
+    return "Direct Emoji Test", body, _premium_direct_buttons()
+
+
+async def _premium_direct_reply_handler(
+    text,
+    chat_id,
+    msg_id,
+    inline_chat_id,
+    inline_msg_id,
+    extra: str = "",
+) -> None:
+    """Resolve the EXACT selection-message reply, then run the direct test."""
+    client = get_self_client()
+    owner = get_owner_id()
+
+    async def _finish(title: str, body: str, buttons: list) -> None:
+        await _edit_inline(inline_chat_id, inline_msg_id, title, body, buttons)
+
+    selection_id = int(extra) if isinstance(extra, str) and extra.isdigit() else 0
+    if client is None:
+        await _finish("Direct Emoji Test", "! Self client is not connected.", [])
+        return
+    if not selection_id:
+        await _finish(
+            "Direct Emoji Test",
+            "! The selection message is no longer known — start the action again.",
+            _premium_direct_buttons(),
+        )
+        return
+
+    try:
+        reply = await client.get_messages(chat_id, ids=msg_id)
+    except Exception as exc:
+        logger.warning("[EMOJI_UI] direct test: cannot read the reply: %s", exc)
+        reply = None
+    if reply is None:
+        await _finish(
+            "Direct Emoji Test",
+            "! Could not read your reply message — please try again.",
+            _premium_direct_buttons(),
+        )
+        return
+
+    header = getattr(reply, "reply_to", None)
+    if getattr(header, "reply_to_peer_id", None) is not None:
+        await _finish(
+            "Direct Emoji Test",
+            "! That reply targets another chat.\nReply in Saved Messages.",
+            _premium_direct_buttons(),
+        )
+        return
+
+    target_id = getattr(reply, "reply_to_msg_id", None) or getattr(
+        header, "reply_to_msg_id", None
+    )
+    if not isinstance(target_id, int) or isinstance(target_id, bool) or target_id <= 0:
+        await _finish(
+            "Direct Emoji Test",
+            f"! Your message was not a reply.\nReply TO selection message `#{selection_id}`.",
+            _premium_direct_buttons(),
+        )
+        return
+    if target_id != selection_id:
+        await _finish(
+            "Direct Emoji Test",
+            f"! That reply targets message `#{target_id}`, not the selection "
+            f"message `#{selection_id}`.",
+            _premium_direct_buttons(),
+        )
+        return
+
+    found = premium_inline_service.inspect_source_message(reply)
+    if found["kind"] != premium_inline_service.KIND_CUSTOM_EMOJI:
+        await _finish(
+            "Direct Emoji Test",
+            f"! {found['detail']}.\n\n"
+            f"Diagnosis `{premium_inline_service.SOURCE_ENTITY_MISSING}` — nothing "
+            "was sent.",
+            _premium_direct_buttons(),
+        )
+        return
+
+    outcome = await premium_direct_service.send_premium_emoji_direct(
+        client, chat_id, found["document_id"], found["span_text"], owner
+    )
+    title = "Direct Emoji Test ✓" if outcome.get("verified") else "Direct Emoji Test"
+    await _finish(title, _premium_direct_report(outcome), _premium_direct_buttons())
+
+
 # ── registration ──────────────────────────────────────────────────────────
 
 
@@ -2443,6 +2717,7 @@ def register(client, owner_id: int) -> None:
         premium_inline_service.INLINE_QUERY_KEY, _premium_inline_builder
     )
     register_action(_PROBE_ACTION, _react_premium_action)
+    register_action(_DIRECT_ACTION, _premium_direct_action)
     register_action("emoji_state_toggle", _state_toggle_action)
     register_action("emoji_state_global_pick", _state_global_pick_action)
     register_action("emoji_state_override_pick", _state_override_pick_action)

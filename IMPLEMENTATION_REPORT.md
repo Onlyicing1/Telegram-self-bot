@@ -1,174 +1,164 @@
-# IMPLEMENTATION_REPORT.md — Premium Custom-Emoji Delivery: Logs-Only Route Diagnostic and the Verdict on Alternative Routes
+# IMPLEMENTATION_REPORT.md — Direct Owner-Authored Premium Custom-Emoji Send: Controlled POC
 
 This file describes **only** the current state of the repository after this task
-and **replaces every previous report in full**. The inline entity-loss trace
-(`98c2825`, `a54877b`, `9633c0b`, `b463552`) and the owner-authored self-send
-experiment (`f22894e`, `9b34e38`) stay readable in git history.
+and **replaces every previous report in full**. The inline route audit and its
+three live attempts (`98c2825` → … → `2eaaf93`) and the test-suite-only
+self-send experiment (`f22894e`, `9b34e38`) stay readable in git history.
 
 | Item | Value |
 |---|---|
-| Task | Resolve the premium custom-emoji delivery blocker with **log-based verification only**: find the smallest supported route that delivers a genuine `MessageEntityCustomEmoji` **with `via_bot_id` attribution**, or establish that no such route exists |
-| Project / branch | LifeOS Telegram self-bot (`Onlyicing1/Telegram-self-bot`), `main` |
-| Base revision | `9b34e38` — freshly fetched and verified `= origin/main` at task start |
-| Telethon | **`telethon==1.34.0`**, layer 173 (`backend/requirements.txt:1`) |
-| Route verdict | **No distinct, supported route exists.** `via_bot_id` is produced by `messages.sendInlineBotResult` alone, and the entity on that path can only travel inside the bot's answer payload — the exact two constructors (`InputBotInlineMessageText`, `InputBotInlineMessageMediaAuto`) the already-attempted request's field space consists of. Every route that can carry a real entity (user-authored message, forwarding, bot-direct send) can never carry `via_bot_id`. Details and quotes: `INVESTIGATION.md` §3–§5 |
-| Production code changed | **Two files, behaviour-preserving**: the inline service gains the correlated, logs-only route diagnostic; the panel stops rendering an outcome report. No route, gate, payload, entitlement, client or listener changed |
-| Live Telegram verification | **Not performed** — no `API_ID`/`API_HASH`/`SESSION_STRING`/`BOT_OWNER_ID` and no `.env` in this workspace. **No Telegram request of any kind was made**: no inline query, no submission, no send, no read-back. Nothing in this report is a live observation |
+| Task | **Controlled Direct-Owner Premium Custom Emoji Send Test** — establish whether the owner's account can send a genuine Premium custom emoji **directly** to its own Saved Messages, preserving a real `MessageEntityCustomEmoji`, and verify the stored message from the read-back |
+| Project / branch | LifeOS Telegram self-bot (`Onlyicing1/Telegram-self-bot`), `premium-emoji-attribution` (tracks `origin/main`) |
+| Base revision | `2eaaf93` — freshly fetched and verified `= origin/main` at task start |
+| Telethon | **`telethon==1.34.0`** (`backend/requirements.txt:1`) |
+| **Stage completed** | The isolated, owner-triggered **direct-send diagnostic path** in the live runtime, with the full pre-send validation chain and exact-id read-back verification; offline test coverage; these reports |
+| **Next stage** | **The live run in the deployed runtime**: `Menu` → Emoji → "🧪 Live test · direct self-chat" → reply to the selection message with the custom emoji → read the verdict (panel + `[PREMIUM_DIRECT] … DIAGNOSIS` log line). This is the only step that can answer the entity-preservation question |
+| Real Telegram send/read-back in this workspace | **NO — not performed.** No `API_ID`/`API_HASH`/`SESSION_STRING`/`BOT_OWNER_ID` and no `.env`; `backend/config.load()` hard-fails without them and Render Free exposes no shell. **No Telegram request of any kind was made in this workspace** |
+| Does the experiment prove the direct path works? | **NO — not yet.** What is proven is that the path is implemented, bounded and fail-closed offline. The decisive fact (Telegram's stored entity) is exactly what the live run must produce; until it runs, the question is **pending**, not answered |
+| Production inline route | **Untouched** — `backend/services/premium_emoji_inline_service.py` has a **zero-line diff**; no attribution check, gate or panel behaviour of the inline route was changed or weakened |
 | Supabase / SQL | untouched; `DATABASE_ARCHITECTURE.md` unchanged |
 
 ---
 
-## 1. What was investigated (and what was *not* repeated)
+## 1. Files changed and why
 
-The task's established evidence was treated as premises and **not** re-run:
-the three earlier attempts already established that the source entity and the
-outbound payload validate, that the helper bot's answer **was submitted** with
-one custom-emoji entity, and that the result Telegram returned from
-`messages.getInlineBotResults` carried `entity_count=0` — so the fail-closed
-gate refused the send, `messages.sendInlineBotResult` never ran, and
-`via_bot_id` was never observed.
-
-The investigation therefore moved to the **route** and to the **constructor
-space**, offline:
-
-1. which operation can set `via_bot_id` at all (documented: only
-   `messages.sendInlineBotResult`);
-2. which inline-message constructors can carry `entities` at all (pinned
-   Telethon: exactly `InputBotInlineMessageText` and
-   `InputBotInlineMessageMediaAuto`, out of eight; the result *types* are only
-   containers around one of those two);
-3. which other documented routes can carry a real entity (user-authored
-   `sendMessage`, forwarding, bot-direct send, layer-225 prepared inline
-   messages) and why each of them fails one of the two criteria.
-
-Result: **no distinct, supported route satisfies both criteria.** Per the task's
-own rule, that is reported rather than papered over with another speculative
-implementation (`INVESTIGATION.md` §4–§5).
-
-## 2. What was implemented
-
-The task's logging requirement, on the **existing** owner-only action — no new
-button, no new route, no repeated failed request:
-
-| # | Change | Why |
+| File | Change | Why |
 |---|---|---|
-| 1 | `backend/services/premium_emoji_inline_service.py` — one **correlated, logs-only** diagnostic sequence for ONE route attempt: `PREMIUM_EMOJI_ROUTE_DIAG`, `run=<id>`, stages `ROUTE_STARTED`, `SOURCE_ENTITY_VALIDATED`, `PAYLOAD_VALIDATED`, `INLINE_RESULT_SUBMITTED`, `TELEGRAM_RESULT_INSPECTED`, `MESSAGE_SENT`, `MESSAGE_READBACK_VERIFIED`, `VIA_BOT_ATTRIBUTION_VERIFIED`, `DIAGNOSIS`. Fields are ids, counts, offsets, UTF-16 lengths, booleans, `glyph_source`, bounded exception text and one bounded summary. The record returned to the caller now carries `run_id`, and **every** attempt — including a pre-send refusal — closes with exactly one machine-readable `DIAGNOSIS` | The acceptance criteria can only be decided by Telegram's stored message; the log is where that evidence belongs |
-| 2 | `backend/bot/handlers/emoji.py` — the outcome renderer (`_premium_inline_report`) and its call site are **removed**; the panel's only response is `_PREMIUM_INLINE_NOTICE`, which states no diagnosis, no entity fact, no attribution fact and never claims success. The handler logs the `run_id` so a UI action and a log sequence can be correlated | "Do not send diagnostic reports, test results, or status messages to Telegram" and "do not confuse 'the bot accepted the inline-result submission' with 'the message was sent and attribution verified'" |
-| 3 | `tests/test_premium_emoji_inline.py` — the panel assertions were rewritten to the neutral notice, and 6 tests were added for the log contract (stage order under ONE `run=<id>`, a refusal still diagnosed, the entitlement facts at `ROUTE_STARTED`, a stripped stored entity diagnosed from the read-back, missing attribution diagnosed and never called success, bounded fields with no secret/document text) | The log contract is the deliverable and must be pinned |
+| `backend/services/premium_emoji_direct_service.py` | **NEW** (~538 lines) — the isolated direct route: destination/owner/document/glyph/payload/entity validation, ONE `messages.sendMessage` to Saved Messages, exact-id read-back, evidence record and diagnoses | The direct path had no runtime implementation; this is it. It reuses the production entity builder/validator and the shared read-back/document/eligibility helpers from `premium_emoji_inline_service` instead of duplicating geometry or entitlement logic |
+| `backend/bot/handlers/emoji.py` | **+275 lines, no deletions** — one import; one new panel row ("🧪 Live test · direct self-chat"); the direct section (action, report renderer, reply handler); one `register_action` call | The test must be **explicitly triggered** by the owner in the live runtime, and its verdict must be visible. The UI holds no send logic: it resolves the exact selection-message reply and delegates everything to the service |
+| `tests/test_premium_emoji_direct.py` | **NEW** (~938 lines, **50 tests**) | Pins the whole contract: payload geometry, UTF-16 offsets, document id, the rebuilt TL entity, Saved-Messages-only destination, owner gate, no helper-bot inline query, no send on failed source validation, no Unicode fallback, read-back rejections (missing entity / mismatched id / wrong span / wrong chat), preservation-vs-attribution separation, and the UI wiring |
+| `INVESTIGATION.md`, `IMPLEMENTATION_REPORT.md` | **replaced in full** | Canonical latest-only records for this task (the previous reports described a different task) |
 
-**Unchanged on purpose:** the route, the reply-mode arming, the selection-message
-targeting, `inspect_source_message`, `build_inline_result`,
-`validate_inline_payload`, the fail-closed gates, the Saved-Messages-only rule,
-the helper bridge, the probe service, the Library/import design, the schema.
-No new client, listener, update loop, scheduler, executor or dependency; no
-Unicode fallback; no retry; no Supabase/SQL.
+**Deliberately unchanged:** `backend/services/premium_emoji_inline_service.py`
+(zero diff), the helper bridge, `inline_engine`, the probe service, the
+existing `tests/test_premium_emoji_inline.py` /
+`tests/test_premium_emoji_probe.py` /
+`tests/test_premium_emoji_self_send_route.py`, the database, the AI runtime,
+the schema, and unrelated working-tree state (the pre-existing untracked
+`telegram-self-bot/` directory is untouched and is **not** part of this
+commit).
 
-### The log contract (what an operator greps)
+### What the service guarantees (the requirements, item by item)
 
-```
-grep "PREMIUM_EMOJI_ROUTE_DIAG" <app log> | grep "run=<id>"
-```
+1. **Existing configured self-client** — the handler passes the self client it
+   is already running on; the service never creates a client, session or loop
+   (architecture tests forbid `TelegramClient`/`create_task`/event loops in the
+   module).
+2. **No helper-bot inline path** — no `inline_query`, no `click`, no inline
+   engine import; tests assert the fake client's `inline_query` is never called
+   and the module contains no listener/inline registration.
+3. **Genuine entity, real document id** — the id comes from the source reply's
+   `MessageEntityCustomEmoji`; the outbound TL entity is rebuilt and matched
+   against the validated payload (exactly one custom-emoji entity, same
+   document id/offset/length) or nothing is sent.
+4. **UTF-16 geometry** — offsets/lengths are computed in UTF-16 code units
+   (`utf16_length`), pinned by tests for astral and BMP glyphs.
+5. **Pre-send validation** — owner → destination → document id → glyph
+   (`alt`, fallback source span) → payload → entity; each failure is a precise
+   diagnosis with nothing sent.
+6. **Saved Messages only** — any `chat_id != owner_id` is refused before
+   anything is sent; the read-back additionally checks the stored message's own
+   chat.
+7. **One explicitly triggered message** — one action, one reply, one send, no
+   retry loop, no recurring sender; the fake client records exactly one send
+   and one read.
+8. **Reused abstractions** — `get_self_client`/`get_owner_id`, the pending-input
+   reply mode, `telegram_api.messages.send_message` (bounded
+   `guarded_await`), the shared payload builder/validator, `_owner_premium`,
+   `_document_facts`, `_fetch_stored_message`.
+9. **Isolation** — no caller falls back to this path; the inline route is not
+   rerouted (pinned by test).
+10. **No fabrication / no Unicode fallback** — a plain Unicode reply is refused
+    by the handler; a stripped entity is reported as stripped, never re-sent as
+    a glyph.
+11. **No security weakening** — owner-only action path as before; the
+    Saved-Messages restriction and all inline-route checks untouched.
+12. **Fail closed** — unusable document id/glyph/owner/destination all end in an
+    honest diagnosis, nothing sent.
+13. **Logs** — bounded `[PREMIUM_DIRECT]` stage lines: ids, offsets, lengths,
+    booleans, bounded exception class/text; no session strings, tokens, access
+    hashes or message bodies (asserted by test).
 
-One attempt = one `run=<id>` = one sequence ending in `stage=DIAGNOSIS`, e.g.
+## 2. The live-run procedure (owner-triggered, one message)
 
-```
-[PREMIUM_EMOJI_ROUTE_DIAG] run=… stage=ROUTE_STARTED route=messages.sendInlineBotResult owner=… destination=… document_id=… owner_premium=… document_free=… helper_bot_id=… glyph_source=document_alt
-[PREMIUM_EMOJI_ROUTE_DIAG] run=… stage=SOURCE_ENTITY_VALIDATED document_id=… source_span_utf16_len=2 glyph_source=document_alt
-[PREMIUM_EMOJI_ROUTE_DIAG] run=… stage=PAYLOAD_VALIDATED valid=True document_id=… offset=15 length=2 glyph_utf16_len=2 text_utf16_len=17 entity_count=1
-[PREMIUM_EMOJI_ROUTE_DIAG] run=… stage=INLINE_RESULT_SUBMITTED returned_results=1 submitted_recorded=True submitted_ok=True submitted_custom_emoji_count=1 submitted_document_id_match=True
-[PREMIUM_EMOJI_ROUTE_DIAG] run=… stage=TELEGRAM_RESULT_INSPECTED ok=… reason=… entity_present=… entity_count=… document_id_match=… span_match=… text_match=…
-[PREMIUM_EMOJI_ROUTE_DIAG] run=… stage=MESSAGE_SENT sent=… message_id=… destination=… send_path=messages.sendInlineBotResult
-[PREMIUM_EMOJI_ROUTE_DIAG] run=… stage=MESSAGE_READBACK_VERIFIED readback_ok=… entity_present=… stored_document_id=… stored_offset=… stored_length=… document_id_match=… span_match=… text_match=…
-[PREMIUM_EMOJI_ROUTE_DIAG] run=… stage=VIA_BOT_ATTRIBUTION_VERIFIED via_bot_id=… expected_via_bot_id=… match=…
-[PREMIUM_EMOJI_ROUTE_DIAG] run=… stage=DIAGNOSIS diagnosis=… sent=… entity_stored=… via_bot_id=… summary=…
-```
+1. `Menu` → **Emoji** → **"🧪 Live test · direct self-chat"**.
+2. A selection message is sent to **Saved Messages**; reply to **that exact
+   message** with the Premium custom emoji (only a reply to it is accepted).
+3. The owner's own account then sends **one** labelled message
+   (`Direct self-chat test: <glyph>`) directly to Saved Messages with the real
+   entity, and that exact message is fetched back by id.
+4. The panel shows the verdict; the application log carries the same verdict as
+   `[PREMIUM_DIRECT] … DIAGNOSIS diagnosis=<…>` (plus the stage lines before
+   it). The task's falsifier table (what each diagnosis means) lives in
+   `INVESTIGATION.md` §7.
 
-The success log (`MESSAGE_SENT` / `MESSAGE_READBACK_VERIFIED` /
-`VIA_BOT_ATTRIBUTION_VERIFIED` / `DIAGNOSIS`) is emitted **only after** the sent
-message has been read back by its exact id; the `DIAGNOSIS` line is always the
-last line of a run. Nothing in the sequence contains a session string, token,
-access hash, authorization header, file reference, message body or document
-text — asserted by test.
-
-### What this task's change did not add and why that was the decision
-
-The owner's in-chat trigger phrase (default `Nova`) **is not** sent to Telegram
-during this task, and no outbound AI turn is performed. It is recorded here as
-context only: during any live run of the project, a trigger text may be composed
-from `backend/ai/prompt/template.py` and submitted to the selected provider — so
-a per-request OpenAI-format `inline_query_content` tool description like
-`"Nova inline_query: "` could appear inside that turn's tool schema if future work
-chose to expose a `query_results` tool. This task did not expose such a tool and
-did not perform such a turn, so the one controlled, evidence-bearing step that
-would complete the acceptance criteria remains a Telegram inline-query /
-submission / send / read-back — which, while designed to exercise the existing
-appendix-boundary (`update.id == last_action_id`, identity gate, fail-closed),
-was **not** run for lack of credentials (`§8`).
-
-## 3. Tests
+## 3. Tests and validation
 
 | Check | Command | Result |
 |---|---|---|
-| Compile | `.venv/bin/python -m compileall -q backend/services/premium_emoji_inline_service.py backend/bot/handlers/emoji.py tests/test_premium_emoji_inline.py` | **COMPILE_OK**, exit 0 |
-| Focused file (offline) | `.venv/bin/python -m pytest tests/test_premium_emoji_inline.py -q` | **84 passed**, exit 0 (78 before this task: 6 added, the panel assertions rewritten) |
-| Emoji-related suites (offline) | `.venv/bin/python -m pytest tests/test_premium_emoji_inline.py tests/test_premium_emoji_probe.py tests/test_emoji_ui.py tests/test_premium_emoji_self_send_route.py -q` | **205 passed, 1 skipped**, exit 0 (the skip is the pre-existing opt-in `live_telegram` test) |
-| Full suite | `timeout 880 .venv/bin/python -m pytest tests/ -q -p no:cacheprovider` (exit status captured) | **5844 passed, 27 skipped, 2 warnings in 119.89s**, **EXIT=0** — baseline at `9b34e38` was 5838 passed / 27 skipped, i.e. exactly the **+6** new tests, **0 regressions** |
+| Compile | `.venv/bin/python -m compileall -q backend/services/premium_emoji_direct_service.py backend/bot/handlers/emoji.py tests/test_premium_emoji_direct.py` | **COMPILE OK**, exit 0 |
+| Focused (new file) | `.venv/bin/python -m pytest tests/test_premium_emoji_direct.py -q` | **50 passed**, exit 0 |
+| Emoji-related suites | `.venv/bin/python -m pytest tests/test_premium_emoji_direct.py tests/test_premium_emoji_inline.py tests/test_premium_emoji_probe.py tests/test_premium_emoji_self_send_route.py tests/test_emoji_ui.py -q` | **255 passed, 1 skipped**, exit 0 (the skip is the pre-existing opt-in `live_telegram` test) |
+| Full suite | `.venv/bin/python -m pytest tests -q` (exit status captured) | **5894 passed, 27 skipped, 2 warnings in 120.39s**, **EXIT=0** — baseline at `2eaaf93` was 5844 passed / 27 skipped, i.e. exactly the **+50** new tests, **0 regressions** |
 | Whitespace / diff sanity | `git diff --check` | exit 0 |
+| Full diff review | `git diff` + the two new files read end-to-end | done before commit |
 
-### Mocked/offline vs live — kept strictly separate
+### Offline (green) vs live (NOT executed) — kept strictly separate
 
-**Offline (green above):** the whole route diagnostic (stage order and single
-correlation id for a verified run; a pre-send refusal still diagnosed with the
-same id; the entitlement facts recorded at `ROUTE_STARTED`; a stripped stored
-entity diagnosed from the read-back; missing attribution diagnosed and never
-treated as success; bounded fields, no glyph text, no message body, no
-credential-shaped field), the neutral panel contract, and every pre-existing
-route/gate test.
+**Offline:** every service decision (payload/UTF-16/document-id/entity
+validation, destination gate, owner gate, one-send/no-retry, exact-id read-back,
+all read-back rejections, attribution separation, trace shape) and every UI
+wiring assertion, all against fakes at the Telegram boundary.
 
-**Live (NOT executed):** the actual inline query, submission, send and read-back
-against Telegram. No mocked test in this task claims server-side behaviour, and
-no live result is claimed anywhere in this repository as a result of this task.
+**Live:** the actual Telegram send and read-back of the stored message.
+**Not executed here** (no credentials). No test in this task claims
+server-side behaviour, and no statement anywhere claims the entity survives a
+real send — that is precisely the open question.
 
-## 4. Acceptance criteria
+## 4. Acceptance criteria vs. what is proven where
 
-| Criterion (task) | Independently verified? |
-|---|---|
-| 1. Destination is the owner's Saved Messages | **Offline only** (destination gate + read-back check). **Live: NO** |
-| 2. Stored message contains a genuine `MessageEntityCustomEmoji` | **Offline only** (a plain Unicode glyph is never accepted). **Live: NO** — the three earlier attempts observed the entity already absent from the bot's stored answer, which is a *pre-send* observation |
-| 3. Document id and entity geometry match the intended payload | **Offline only** (UTF-16, unit-counted). **Live: NO** |
-| 4. `via_bot_id` present and equal to the configured helper bot id | **Offline only** (the diagnostic records `via_bot_id` and `expected_via_bot_id` and marks a mismatch). **Live: NO** — `via_bot_id` has still never been observed on a message this project produced |
-| 5. The success log is emitted only after the stored message was inspected | **Offline only**, pinned by stage order: the read-back and attribution stages precede the `DIAGNOSIS` line, which is always last. **Live: NO** |
+| Criterion (task) | Offline | Live |
+|---|---|---|
+| Outgoing message built with a genuine `MessageEntityCustomEmoji` from the source document id | ✅ (rebuilt TL entity matched to the validated payload) | pending |
+| Correct UTF-16 offset/length | ✅ (unit-counted, pinned by tests) | pending |
+| Source entity / document id / span / payload validated before send | ✅ | pending |
+| Destination restricted to the owner's Saved Messages (no arbitrary chat) | ✅ (pre-send gate + stored-chat check) | pending |
+| One explicitly triggered message, no retry/recurring sender | ✅ | pending |
+| No helper-bot inline query/click anywhere in the direct path | ✅ (architecture + fake-client tests) | n/a |
+| No fabricated entity, no Unicode fallback, no success on a glyph alone | ✅ | pending |
+| Exact-id read-back: message exists in Saved Messages | ✅ (fetch by exact id from the owner's own peer) | pending |
+| Read-back rejects: no entity / mismatched id / mismatched span / wrong chat | ✅ | pending |
+| Entity preservation vs `via_bot_id` attribution judged separately; inline route's attribution checks unchanged | ✅ (zero-line diff on the inline service; explicit tests) | n/a |
+| **The direct send preserves the entity on real Telegram** | **cannot be decided offline** | **PENDING — the live run** |
 
-No criterion is claimed as live-verified. A locally passing test, a successful
-inline-answer submission and a constructed entity are each explicitly **not**
-live success.
+## 5. What was not verified, and the remaining blocker
 
-## 5. Production status, the live-run blocker, and the smallest live step
-
-* **Nothing was deployed or exposed.** The route is exactly as it was: blocked
-  at `INLINE_RESULT_ENTITY_MISSING` before the send.
-* **The live step is available from the running deployment with no shell, no
-  SSH and no new client**: `Menu` → Emoji → **Send Premium Emoji** → reply to the
-  selection message with the custom emoji. The owner-only action is unchanged;
-  only its log output changed. Read the result by `run=<id>` as shown in §2.
-* **Blocker for this workspace:** no Telegram credentials exist here
-  (`API_ID`/`API_HASH`/`SESSION_STRING`/`BOT_OWNER_ID` are absent and there is no
-  `.env`), and `backend/config.load()` hard-fails without them — so no request
-  could be issued from here. Reported, not improvised around.
-* **Not claimed:** that the send fails, that attribution is impossible in
-  practice, or that Telegram drops the entity for a named reason. The instrument
-  now answers the first two; the third remains undocumented
-  (`INVESTIGATION.md` §6).
+* **Not verified:** the decisive live fact — whether Telegram's stored message
+  keeps the custom-emoji entity on a direct owner-authored send to Saved
+  Messages; and, consequently, whether the client renders it. No live request
+  was made from this workspace.
+* **Not claimed:** that the direct route works, that it fails, or that any
+  Telegram-side rule (entitlement, Premium, `free` flag, `alt` rule) is the
+  cause of the inline route's entity loss. The inline route's three attempts
+  remain the only live evidence, and they are a *pre-send* observation.
+* **Remaining blocker:** this workspace has no Telegram credentials and the
+  deployment has no shell — so the live step must run in the deployed runtime
+  through the owner-only action (§2). Until then, live verification remains
+  **pending** by design, exactly as the task allows ("If the coding environment
+  cannot trigger the live test, implement the safe diagnostic path and report
+  that live verification remains pending").
 
 ## 6. Git status
 
 | Step | Value |
 |---|---|
-| Files in this task's commit | `backend/services/premium_emoji_inline_service.py`, `backend/bot/handlers/emoji.py`, `tests/test_premium_emoji_inline.py`, `INVESTIGATION.md`, `IMPLEMENTATION_REPORT.md` |
+| Files in this task's commit | `backend/services/premium_emoji_direct_service.py`, `backend/bot/handlers/emoji.py`, `tests/test_premium_emoji_direct.py`, `INVESTIGATION.md`, `IMPLEMENTATION_REPORT.md` |
 | Commit | one commit for the task (`type: description` style, matching the repository) |
 | Push | `git push origin HEAD:main` — fast-forward only; no rebase, no force-push, no history rewrite, no unrelated work discarded |
 | Remote verification | after the push: `git fetch origin` → `git rev-parse HEAD` = `git rev-parse origin/main` = `git ls-remote origin refs/heads/main`; `git merge-base --is-ancestor <commit> origin/main` exit 0 |
 
 A commit cannot contain its own hash: the commit SHA and the verified
 `origin/main` SHA are reported in this task's delivery response, re-checked with
-the commands above after the push.
+the commands above after the push. The pre-existing untracked
+`telegram-self-bot/` directory is left exactly as found and is excluded from the
+commit.
