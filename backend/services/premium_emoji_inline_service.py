@@ -120,6 +120,15 @@ INLINE_RESULT_UNSUPPORTED = "INLINE_RESULT_UNSUPPORTED"
 INLINE_RESULT_NO_SEND_MESSAGE = "INLINE_RESULT_NO_SEND_MESSAGE"
 INLINE_RESULT_REJECTED = "INLINE_RESULT_REJECTED"
 INLINE_RESULT_ENTITY_MISSING = "INLINE_RESULT_ENTITY_MISSING"
+#: The helper bot's OWN registered answer provably carried this emoji's entity
+#: (verified on this attempt, by identity), its submission raised nothing, and
+#: yet Telegram's STORED inline result carries none. The only side left is
+#: Telegram. Telegram documents custom-emoji entities as usable only by bots
+#: that purchased additional usernames on Fragment (or, for messages the bot
+#: sends directly, when the bot owner has Premium), so a non-entitled helper
+#: bot is the documented cause — reported as an entitlement restriction rather
+#: than the neutral "entity missing".
+INLINE_BOT_NOT_ENTITLED = "INLINE_BOT_NOT_ENTITLED"
 INLINE_SEND_FAILED = "INLINE_SEND_FAILED"
 READBACK_FAILED = "READBACK_FAILED"
 STORED_ENTITY_STRIPPED = "STORED_ENTITY_STRIPPED"
@@ -513,6 +522,7 @@ def _empty_inline_evidence() -> dict[str, Any]:
         "text": "",
         "document_id_match": None,
         "span_match": None,
+        "expected_document_id": None,
         "answer": _empty_answer_evidence(),
     }
 
@@ -632,9 +642,34 @@ def _entity_missing_detail(evidence: Any, expected_document_id: Any = None) -> s
         + (f" (document {documents})" if documents else "")
         + " and its submission raised nothing, while the stored inline result "
         "Telegram returned carries none — the entity was dropped by Telegram, "
-        "not by this application. The send was not attempted and no fallback "
+        "not by this application. Telegram documents custom-emoji entities as "
+        "usable only by bots that purchased additional usernames on Fragment "
+        "(or, for messages a bot sends directly, when the bot owner has "
+        "Premium), so a non-entitled helper bot cannot supply this entity "
+        "through the inline route. The send was not attempted and no fallback "
         "is ever used"
     )
+
+
+def _answer_proves_the_bot_submitted_this_emoji(
+    answer: Any, expected_document_id: Any
+) -> bool:
+    """Whether the bot's OWN answer provably carried THIS emoji's entity.
+
+    True only when an answer of this bot was recorded for this attempt, its
+    submission raised nothing, and it carried this exact ``document_id`` — the
+    same identity check :func:`_entity_missing_detail` relies on. Anything less
+    (an unrecorded/other-emoji answer, a failed submission, or no document id)
+    leaves the cause unproven and therefore never claims an entitlement
+    restriction.
+    """
+    if not isinstance(answer, dict) or not answer.get("recorded"):
+        return False
+    if not answer.get("ok"):
+        return False
+    if not _is_positive_int(expected_document_id):
+        return False
+    return int(expected_document_id) in (answer.get("document_ids") or [])
 
 
 def classify_diagnosis(
@@ -647,9 +682,12 @@ def classify_diagnosis(
     inspect (``INLINE_RESULT_UNSUPPORTED``), a real result with no send-message
     payload (``INLINE_RESULT_NO_SEND_MESSAGE``), ``INLINE_RESULT_REJECTED``
     (the query itself failed), ``INLINE_RESULT_ENTITY_MISSING`` (a real stored
-    result lost the entity), ``INLINE_SEND_FAILED`` (the send itself failed),
-    and then the stored-message verdicts. A retained entity with the expected
-    id, span and ``via_bot_id`` is still only ``…_RENDER_UNVERIFIED``.
+    result lost the entity), ``INLINE_BOT_NOT_ENTITLED`` (the bot's own
+    correlated answer DID carry the entity and Telegram still stored none — the
+    documented entitlement restriction), ``INLINE_SEND_FAILED`` (the send
+    itself failed), and then the stored-message verdicts. A retained entity
+    with the expected id, span and ``via_bot_id`` is still only
+    ``…_RENDER_UNVERIFIED``.
     """
     if not inline_result.get("ok"):
         reason = inline_result.get("reason")
@@ -661,6 +699,13 @@ def classify_diagnosis(
             return INLINE_RESULT_NO_SEND_MESSAGE
         return INLINE_RESULT_REJECTED
     if not inline_result.get("entity_present"):
+        # Only a PROVEN, correlated drop is Telegram's documented entitlement
+        # restriction; anything less stays the neutral "entity missing".
+        answer = inline_result.get("answer")
+        if _answer_proves_the_bot_submitted_this_emoji(
+            answer, inline_result.get("expected_document_id")
+        ):
+            return INLINE_BOT_NOT_ENTITLED
         return INLINE_RESULT_ENTITY_MISSING
     if not _is_positive_int(sent_message_id):
         return INLINE_SEND_FAILED
@@ -821,6 +866,7 @@ async def _inspect_inline_result(
     evidence["text"] = text
     scan = _scan_custom_emoji(text, getattr(send_message, "entities", None))
     expected = payload["entity"]
+    evidence["expected_document_id"] = expected["document_id"]
     if scan is None:
         evidence["entity_present"] = False
         evidence["span_text"] = _span_text(
@@ -1393,6 +1439,17 @@ def outcome_summary(result: Any) -> str:
         return (
             "the stored inline result carries no send-message payload — "
             "nothing was sent."
+        )
+    if diagnosis == INLINE_BOT_NOT_ENTITLED:
+        return (
+            "the helper bot's own answer carried the custom-emoji entity but "
+            "Telegram stored the inline result WITHOUT it — Telegram documents "
+            "custom-emoji entities as usable only by bots that purchased "
+            "additional usernames on Fragment (or, for messages a bot sends "
+            "directly, when the bot owner has Premium), so a non-entitled "
+            "helper bot cannot supply this entity through the inline route. "
+            "Nothing was sent; this is a Telegram entitlement restriction, not "
+            "a defect in the send path."
         )
     if diagnosis == INLINE_RESULT_ENTITY_MISSING:
         return (

@@ -35,9 +35,13 @@ INVESTIGATION.md):
      ``telethon.tl.custom.InlineResults`` — a list of ``InlineResult``
      WRAPPERS whose payload lives on ``.result.send_message`` (the wrapper
      itself has NO ``send_message``). Only a genuine, present payload whose
-     entity is missing is ``INLINE_RESULT_ENTITY_MISSING``; an empty answer,
-     an unsupported shape and a real result without a send-message payload
-     each get their own honest diagnosis and never a stripping claim.
+     entity is missing is an entity-loss outcome; an empty answer, an
+     unsupported shape and a real result without a send-message payload each
+     get their own honest diagnosis and never a stripping claim. When the
+     helper bot's OWN registered answer provably carried this emoji's entity
+     (recorded, no error, the expected ``document_id``) and Telegram still
+     stored none, the outcome is ``INLINE_BOT_NOT_ENTITLED`` — the documented
+     entitlement restriction, not the neutral ``INLINE_RESULT_ENTITY_MISSING``.
 
 No live Telegram and no Supabase call is made: the Telegram boundary is faked
 at the surface the service consumes (``inline_query`` / ``click`` /
@@ -888,6 +892,7 @@ def test_the_panel_notice_carries_no_diagnosis_and_no_success_claim():
     for leaked in (
         "INLINE_RESULT_UNSUPPORTED",
         "INLINE_RESULT_ENTITY_MISSING",
+        "INLINE_BOT_NOT_ENTITLED",
         "STORED_ENTITY_VERIFIED_RENDER_UNVERIFIED",
         "DIAGNOSIS",
         "via_bot_id",
@@ -1483,11 +1488,14 @@ def test_a_stored_result_without_the_entity_is_attributed_to_telegram(monkeypatc
     result = _send(client, monkeypatch)
 
     assert result["ok"] is False
-    assert result["diagnosis"] == svc.INLINE_RESULT_ENTITY_MISSING
+    # the bot provably submitted THIS emoji and Telegram still stored none:
+    # the documented entitlement restriction, not the neutral "missing".
+    assert result["diagnosis"] == svc.INLINE_BOT_NOT_ENTITLED
     assert client.results[0].clicks == 0               # never sent
     evidence = result["inline_result"]
     assert evidence["ok"] is True                      # the stored payload WAS read
     assert evidence["entity_present"] is False
+    assert evidence["expected_document_id"] == DOC
     answer = evidence["answer"]
     assert answer["recorded"] is True
     assert answer["ok"] is True
@@ -1496,7 +1504,44 @@ def test_a_stored_result_without_the_entity_is_attributed_to_telegram(monkeypatc
     assert "dropped by Telegram" in result["detail"]
     assert "not by this application" in result["detail"]
     # the same attribution is what the summary sentence and the LOG carry
-    assert "dropped by Telegram" in svc.outcome_summary(result)
+    summary = svc.outcome_summary(result)
+    assert "dropped by Telegram" in summary
+    assert "entitlement restriction" not in summary  # detail path, not the diagnosis branch
+    assert "Fragment" in summary
+
+
+def test_the_entitlement_verdict_needs_the_bot_own_correlated_submission():
+    """Only a recorded, error-free, identity-matching answer is the restriction."""
+    ok = {"recorded": True, "ok": True, "document_ids": [DOC]}
+    assert svc._answer_proves_the_bot_submitted_this_emoji(ok, DOC) is True
+    # unsupported shapes never claim a Telegram restriction
+    assert svc._answer_proves_the_bot_submitted_this_emoji(ok, None) is False
+    assert svc._answer_proves_the_bot_submitted_this_emoji(ok, 0) is False
+    assert svc._answer_proves_the_bot_submitted_this_emoji(ok, DOC + 1) is False
+    assert svc._answer_proves_the_bot_submitted_this_emoji(None, DOC) is False
+    assert svc._answer_proves_the_bot_submitted_this_emoji({}, DOC) is False
+    assert (
+        svc._answer_proves_the_bot_submitted_this_emoji(
+            {"recorded": False, "ok": True, "document_ids": [DOC]}, DOC
+        )
+        is False
+    )
+    assert (
+        svc._answer_proves_the_bot_submitted_this_emoji(
+            {"recorded": True, "ok": False, "document_ids": [DOC]}, DOC
+        )
+        is False
+    )
+    # classify_diagnosis consumes exactly this verdict
+    dropped = {"ok": True, "entity_present": False, "expected_document_id": DOC, "answer": ok}
+    assert svc.classify_diagnosis(dropped, {}, None) == svc.INLINE_BOT_NOT_ENTITLED
+    unproven = {
+        "ok": True,
+        "entity_present": False,
+        "expected_document_id": DOC,
+        "answer": {"recorded": False, "ok": None, "document_ids": []},
+    }
+    assert svc.classify_diagnosis(unproven, {}, None) == svc.INLINE_RESULT_ENTITY_MISSING
 
 
 def test_a_recorded_submission_without_the_entity_blames_this_application(monkeypatch):
