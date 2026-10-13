@@ -12,7 +12,8 @@ work (`50b035a`, PR #184) and the premium-emoji entitlement diagnosis (`78d8744`
 | Branch / delivery target | `main` (tracks `origin/main`) |
 | Base revision | `50b035a7894fd517278ccae1d573a4fedebc6f93` — verified `= origin/main` at task start |
 | Telethon | **`telethon==1.34.0`** (`backend/requirements.txt:1`) |
-| Delivered commit | one commit, subject `feat(emoji): make the primary panel a single-button diagnostic workflow` (exact SHA in the delivery section) |
+| Delivered commit | `4c12ff3661c64ea30a27493338e8332525d4d459` — subject `feat(emoji): make the primary panel a single-button diagnostic workflow` |
+| Pull request | **#185** (`feat/emoji-panel-single-diagnostic-button` → `main`) |
 | Live Telegram send/read-back in this workspace | **NO — not performed.** No `.env`, no credentials; `backend/config.load()` hard-fails. **No Telegram request of any kind was made here** |
 | Does this prove the artifact renders on live Telegram? | **NO.** Offline trace fidelity is verified against real outcome records; end-to-end acceptance still needs a live run |
 
@@ -110,9 +111,11 @@ The skip is the pre-existing opt-in `live_telegram` test.
 | Item | Value |
 |---|---|
 | Base | `50b035a7894fd517278ccae1d573a4fedebc6f93` (`= origin/main` at start) |
-| Commit | `feat(emoji): make the primary panel a single-button diagnostic workflow` |
-| Push | normal fast-forward to `origin/main` |
-| Remote verification | local HEAD = `origin/main` = `git ls-remote origin refs/heads/main`; `git merge-base --is-ancestor <sha> origin/main` = 0 |
+| Commit | `4c12ff3661c64ea30a27493338e8332525d4d459` — `feat(emoji): make the primary panel a single-button diagnostic workflow` |
+| Branch | `feat/emoji-panel-single-diagnostic-button` (pushed) |
+| Pull request | **#185** (`feat/emoji-panel-single-diagnostic-button` → `main`) |
+| Push | normal fast-forward to `origin/main` (`50b035a..4c12ff3 HEAD -> main`) |
+| Remote verification | local HEAD = `4c12ff3661c64ea30a27493338e8332525d4d459` = `origin/main` = `git ls-remote origin refs/heads/main`; `git merge-base --is-ancestor 4c12ff3 origin/main` = 0 |
 | Working tree | clean; unrelated pre-existing files untouched |
 
 ## 5. Deployment and live verification
