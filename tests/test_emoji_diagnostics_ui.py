@@ -240,35 +240,72 @@ def test_the_primary_button_label_is_exact():
     assert emoji._DIAGNOSTICS_LABEL == "🧪 Run Emoji Diagnostics"
 
 
-def test_the_primary_panel_exposes_one_diagnostic_button(monkeypatch):
+def test_the_primary_panel_exposes_exactly_one_diagnostic_button(monkeypatch):
     from backend.db import client as db_client
 
     db_client._fallback["emoji_library"] = []
     _title, _body, buttons = _run(emoji._emoji_panel_handler(None, ""))
     datas = _datas(buttons)
     texts = _texts(buttons)
-    assert f"action:{emoji._DIAGNOSTICS_ACTION}" in datas
-    assert datas.index(f"action:{emoji._DIAGNOSTICS_ACTION}") == 0  # primary
-    assert "🧪 Run Emoji Diagnostics" in texts
-    # the redundant standalone diagnostic buttons are gone
-    assert f"action:{emoji._PROBE_ACTION}" not in datas
-    assert f"action:{emoji._DIRECT_ACTION}" not in datas
+    # EXACTLY ONE application-level button, with the exact label.
+    assert datas == [f"action:{emoji._DIAGNOSTICS_ACTION}"]
+    assert texts == ["🧪 Run Emoji Diagnostics"]
+    # no other application-level button of any kind
+    for forbidden in (
+        f"action:{emoji._PROBE_ACTION}",
+        f"action:{emoji._DIRECT_ACTION}",
+        f"action:{emoji._INLINE_ACTION}",
+        "action:emoji_import",
+        "action:emoji_react",
+        "panel:emoji_library",
+        "panel:emoji_categories",
+        "panel:emoji_replacement",
+        "panel:_nav:back",
+        "panel:_nav:home",
+        "panel:_nav:close",
+    ):
+        assert forbidden not in datas, forbidden
     assert not any("POC" in t or "Live test" in t for t in texts)
 
 
-def test_the_useful_product_capabilities_remain(monkeypatch):
+def test_the_primary_panel_is_nav_free_through_the_finalize_path():
+    """The panel must not gain Back/Home/Close from the shared nav injector."""
+    from backend.helper.panels import _finalize_panel
+
+    emoji.register(client=None, owner_id=OWNER)  # production registration path
+    _title, _body, buttons = _finalize_panel(
+        "Emoji Diagnostics", "body", _diagnostics_panel_buttons(), emoji._MAIN_PANEL
+    )
+    assert _datas(buttons) == [f"action:{emoji._DIAGNOSTICS_ACTION}"]
+
+
+def _diagnostics_panel_buttons() -> list:
+    from backend.helper.panels import InlinePanelBuilder
+
+    builder = InlinePanelBuilder()
+    builder.add_row(emoji._DIAGNOSTICS_LABEL, f"action:{emoji._DIAGNOSTICS_ACTION}")
+    return builder.build()
+
+
+def test_the_other_emoji_capabilities_are_preserved_but_off_the_primary_panel(monkeypatch):
     from backend.db import client as db_client
+    from backend.helper.panels import get_action as _get_action, get_panel as _get_panel
 
     db_client._fallback["emoji_library"] = []
     _title, _body, buttons = _run(emoji._emoji_panel_handler(None, ""))
     datas = _datas(buttons)
-    # normal product features are preserved
-    assert "action:emoji_import" in datas
-    assert "action:emoji_react" in datas
-    assert f"action:{emoji._INLINE_ACTION}" in datas  # production send stays
-    assert "panel:emoji_library" in datas
-    assert "panel:emoji_categories" in datas
-    assert "panel:emoji_replacement" in datas
+    # The other capabilities' handlers/panels are NOT deleted...
+    emoji.register(client=None, owner_id=OWNER)
+    assert _get_action("emoji_import") is not None
+    assert _get_action("emoji_react") is not None
+    assert _get_action(emoji._INLINE_ACTION) is not None
+    assert _get_action(emoji._PROBE_ACTION) is not None
+    assert _get_action(emoji._DIRECT_ACTION) is not None
+    assert _get_panel(emoji._LIBRARY_PANEL) is not None
+    assert _get_panel(emoji._CATEGORIES_PANEL) is not None
+    assert _get_panel(emoji._REPLACEMENT_PANEL) is not None
+    # ...but none of them is exposed as a button on the primary panel.
+    assert datas == [f"action:{emoji._DIAGNOSTICS_ACTION}"]
 
 
 def test_the_primary_action_is_registered_through_the_existing_registry():
@@ -299,14 +336,23 @@ def test_the_action_sends_the_selection_prompt_and_arms_reply_mode():
     assert pending is not None
     assert pending["panel_id"] == emoji._DIAGNOSTICS_ACTION
     assert pending["extra"] == str(SELECTION)
-    assert f"action:{emoji._DIAGNOSTICS_ACTION}" in _datas(buttons)
+    # every state of the panel message exposes EXACTLY ONE application button
+    assert _datas(buttons) == [f"action:{emoji._DIAGNOSTICS_ACTION}"]
     input_state.clear_all()
 
 
-def test_the_action_fails_honestly_without_a_self_client():
+def test_every_error_state_still_exposes_exactly_one_button():
     inline_engine.set_self_client(None)
-    _title, body, _buttons = _run(emoji._diagnostics_action(None, "", OWNER))
+    _title, body, buttons = _run(emoji._diagnostics_action(None, "", OWNER))
     assert "not connected" in body.lower()
+    assert _datas(buttons) == [f"action:{emoji._DIAGNOSTICS_ACTION}"]
+
+    # duplicate while a run is in flight
+    inline_engine.set_self_client(_FakeSelfClient())
+    assert diag.begin_run(OWNER, "inflight") is True
+    _title2, body2, buttons2 = _run(emoji._diagnostics_action(None, "", OWNER))
+    assert "already in progress" in body2
+    assert _datas(buttons2) == [f"action:{emoji._DIAGNOSTICS_ACTION}"]
 
 
 def test_the_reply_handler_invokes_the_real_production_service(monkeypatch):

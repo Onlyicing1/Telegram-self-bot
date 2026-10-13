@@ -150,6 +150,23 @@ class InlinePanelBuilder:
 
 _NAV_ACTIONS = {"back", "home", "close"}
 
+#: Panels that render their OWN complete button set and must never receive the
+#: automatic Back/Home/Close navigation row. Used by the Emoji diagnostic
+#: panel, whose primary view must expose exactly one application-level button.
+_NAV_FREE_PANELS: set[str] = set()
+
+
+def set_panel_nav_free(panel_id: str, enabled: bool = True) -> None:
+    """Opt a panel out of (or back into) the automatic navigation row.
+
+    Only panels explicitly listed here are affected; every other panel keeps
+    the standard Back/Home/Close behaviour.
+    """
+    if enabled:
+        _NAV_FREE_PANELS.add(panel_id)
+    else:
+        _NAV_FREE_PANELS.discard(panel_id)
+
 
 def _add_close_button(builder: InlinePanelBuilder) -> None:
     builder.add_row("❌ Close", "panel:_nav:close")
@@ -197,6 +214,11 @@ def _finalize_panel(
             builder._rows.append(list(row))
         else:
             builder._rows.append([row])
+
+    # A nav-free panel renders its own complete button set (exactly the buttons
+    # it returned) — no automatic Back/Home/Close is appended.
+    if panel_id in _NAV_FREE_PANELS:
+        return title, body, builder.build()
 
     is_root = True
     if chat_id is not None and msg_id is not None:

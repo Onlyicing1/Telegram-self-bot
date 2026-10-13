@@ -40,6 +40,7 @@ from backend.helper.panels import (
     InlinePanelBuilder,
     register_action,
     register_panel,
+    set_panel_nav_free,
 )
 from backend.helper.input_state import set_pending
 from backend.services import emoji_category_service as cat_service
@@ -89,26 +90,24 @@ async def _emoji_panel_handler(event, extra: str) -> tuple[str, str, list] | Non
     if owner:
         _rows, total = await db_client.list_emoji_entries(owner, limit=1, offset=0)
 
-    lines = ["😀 **Emoji Library**", ""]
+    lines = ["😀 **Emoji Diagnostics**", ""]
     if total is None:
         lines.append("_Library size unknown._")
     elif total == 0:
-        lines.append("_Empty — run Import to scan Saved Messages._")
+        lines.append("_Library empty._")
     else:
-        lines.append(f"{total} custom emoji")
+        lines.append(f"{total} custom emoji in the library")
     if owner:
         enabled = await state_service.replacement_enabled(owner)
-        lines.append("")
         lines.append(f"Replacement: {'✅ ON' if enabled else '❌ OFF'}")
+    lines.append("")
+    lines.append(
+        "Tap **Run Emoji Diagnostics** to execute the real premium-emoji send "
+        "path and see a step-by-step trace of what actually happened."
+    )
     builder = InlinePanelBuilder()
     builder.add_row(_DIAGNOSTICS_LABEL, f"action:{_DIAGNOSTICS_ACTION}")
-    builder.add_row("✨ Send Premium Emoji", f"action:{_INLINE_ACTION}")
-    builder.add_row("⬇ Import from Saved Messages", "action:emoji_import")
-    builder.add_row("💬 React to a message", "action:emoji_react")
-    builder.add_row("📚 Library", f"panel:{_LIBRARY_PANEL}")
-    builder.add_row("🗂 Categories", f"panel:{_CATEGORIES_PANEL}")
-    builder.add_row("🔁 Replacement", f"panel:{_REPLACEMENT_PANEL}")
-    return "Emoji", "\n".join(lines), builder.build()
+    return "Emoji Diagnostics", "\n".join(lines), builder.build()
 
 
 # ── per-owner flow draft (server-side buffer, Bio-builder convention) ─────────
@@ -2700,12 +2699,15 @@ _DIAGNOSTICS_TIMEOUT_S = 180.0
 
 
 def _diagnostics_buttons() -> list:
-    """The primary action plus the minimal navigation/product controls."""
+    """The single application-level button this panel exposes."""
     builder = InlinePanelBuilder()
     builder.add_row(_DIAGNOSTICS_LABEL, f"action:{_DIAGNOSTICS_ACTION}")
-    builder.add_row("💬 React to a message", "action:emoji_react")
-    builder.add_row("📚 Library", f"panel:{_LIBRARY_PANEL}")
     return builder.build()
+
+
+def _diag_error(message: str) -> tuple[str, str, list]:
+    """An honest error view — still exactly the ONE application-level button."""
+    return _DIAGNOSTICS_LABEL, f"! {message}", _diagnostics_buttons()
 
 
 async def _diagnostics_action(event, extra: str, chat_id: int) -> tuple[str, str, list]:
@@ -2713,22 +2715,20 @@ async def _diagnostics_action(event, extra: str, chat_id: int) -> tuple[str, str
     client = get_self_client()
     owner = get_owner_id()
     if client is None:
-        return _error_panel(_DIAGNOSTICS_LABEL, "Self client is not connected.")
+        return _diag_error("Self client is not connected.")
     if not owner:
-        return _error_panel(_DIAGNOSTICS_LABEL, "Owner is not set.")
+        return _diag_error("Owner is not set.")
     if diag_service.is_running(owner):
-        return _error_panel(
-            _DIAGNOSTICS_LABEL,
-            "A diagnostic run is already in progress — wait for it to finish.",
+        return _diag_error(
+            "A diagnostic run is already in progress — wait for it to finish."
         )
 
     try:
         selection = await client.send_message("me", _DIAGNOSTICS_PROMPT)
     except Exception as exc:
         logger.warning("[EMOJI_UI] diagnostics: selection message not created: %s", exc)
-        return _error_panel(
-            _DIAGNOSTICS_LABEL,
-            f"Could not create the Saved Messages selection message: {exc}",
+        return _diag_error(
+            f"Could not create the Saved Messages selection message: {exc}"
         )
 
     selection_id = getattr(selection, "id", 0) or 0
@@ -2739,9 +2739,8 @@ async def _diagnostics_action(event, extra: str, chat_id: int) -> tuple[str, str
         or selection_id <= 0
         or not selection_chat
     ):
-        return _error_panel(
-            _DIAGNOSTICS_LABEL,
-            "The selection message could not be created — nothing was armed.",
+        return _diag_error(
+            "The selection message could not be created — nothing was armed."
         )
 
     set_pending(
@@ -2781,16 +2780,15 @@ async def _diagnostics_reply_handler(
     async def _finish(title: str, body: str, buttons: list) -> None:
         await _edit_inline(inline_chat_id, inline_msg_id, title, body, buttons)
 
+    async def _fail(message: str) -> None:
+        await _finish(_DIAGNOSTICS_LABEL, f"! {message}", _diagnostics_buttons())
+
     selection_id = int(extra) if isinstance(extra, str) and extra.isdigit() else 0
     if client is None:
-        await _finish(_DIAGNOSTICS_LABEL, "! Self client is not connected.", [])
+        await _fail("Self client is not connected.")
         return
     if not selection_id:
-        await _finish(
-            _DIAGNOSTICS_LABEL,
-            "! The selection message is no longer known — start the action again.",
-            _diagnostics_buttons(),
-        )
+        await _fail("The selection message is no longer known — start the action again.")
         return
 
     try:
@@ -2799,38 +2797,26 @@ async def _diagnostics_reply_handler(
         logger.warning("[EMOJI_UI] diagnostics: cannot read the reply: %s", exc)
         reply = None
     if reply is None:
-        await _finish(
-            _DIAGNOSTICS_LABEL,
-            "! Could not read your reply message — please try again.",
-            _diagnostics_buttons(),
-        )
+        await _fail("Could not read your reply message — please try again.")
         return
 
     header = getattr(reply, "reply_to", None)
     if getattr(header, "reply_to_peer_id", None) is not None:
-        await _finish(
-            _DIAGNOSTICS_LABEL,
-            "! That reply targets another chat.\nReply in Saved Messages.",
-            _diagnostics_buttons(),
-        )
+        await _fail("That reply targets another chat.\nReply in Saved Messages.")
         return
 
     target_id = getattr(reply, "reply_to_msg_id", None) or getattr(
         header, "reply_to_msg_id", None
     )
     if not isinstance(target_id, int) or isinstance(target_id, bool) or target_id <= 0:
-        await _finish(
-            _DIAGNOSTICS_LABEL,
-            f"! Your message was not a reply.\nReply TO selection message `#{selection_id}`.",
-            _diagnostics_buttons(),
+        await _fail(
+            f"Your message was not a reply.\nReply TO selection message `#{selection_id}`."
         )
         return
     if target_id != selection_id:
-        await _finish(
-            _DIAGNOSTICS_LABEL,
-            f"! That reply targets message `#{target_id}`, not the selection "
-            f"message `#{selection_id}`.",
-            _diagnostics_buttons(),
+        await _fail(
+            f"That reply targets message `#{target_id}`, not the selection "
+            f"message `#{selection_id}`."
         )
         return
 
@@ -2840,11 +2826,7 @@ async def _diagnostics_reply_handler(
     found = premium_inline_service.inspect_source_message(reply)
 
     if not diag_service.begin_run(owner):
-        await _finish(
-            _DIAGNOSTICS_LABEL,
-            "! A diagnostic run is already in progress — wait for it to finish.",
-            _diagnostics_buttons(),
-        )
+        await _fail("A diagnostic run is already in progress — wait for it to finish.")
         return
 
     started_at = time.monotonic()
@@ -2887,6 +2869,10 @@ async def _diagnostics_reply_handler(
 
 def register(client, owner_id: int) -> None:
     register_panel(_MAIN_PANEL, _emoji_panel_handler, parent="menu", title="Emoji")
+    # The primary Emoji panel must expose EXACTLY ONE application-level button
+    # (the diagnostics action), so it opts out of the automatic Back/Home/Close
+    # navigation row. All other emoji panels keep the standard navigation.
+    set_panel_nav_free(_MAIN_PANEL, True)
     register_panel(
         _LIBRARY_PANEL, _library_page_handler, parent=_MAIN_PANEL, title="Library"
     )

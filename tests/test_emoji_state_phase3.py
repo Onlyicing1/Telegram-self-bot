@@ -327,12 +327,14 @@ def test_ui_registers_replacement_panels_and_actions():
         assert get_action(action_id) is not None, action_id
 
 
-def test_main_panel_shows_replacement_state_and_row():
+def test_main_panel_shows_replacement_state_and_exactly_one_button():
     _run(state_service.set_replacement_enabled(OWNER, True))
     title, body, buttons = _run(emoji._emoji_panel_handler(None, ""))
     assert "Replacement: ✅ ON" in body
     datas = _datas(buttons)
-    assert "panel:emoji_replacement" in datas
+    # State is shown as TEXT; the panel still exposes exactly ONE button.
+    assert datas == [f"action:{emoji._DIAGNOSTICS_ACTION}"]
+    assert "panel:emoji_replacement" not in datas
 
 
 def test_main_panel_shows_replacement_off_by_default():

@@ -99,10 +99,13 @@ def test_registers_all_phase2_panels_and_actions():
         assert get_action(action) is not None, action
 
 
-def test_the_mother_menu_links_the_emoji_panel_and_categories_row_exists():
+def test_the_mother_menu_links_the_emoji_panel_which_is_now_diagnostics_only():
     assert "panel:emoji" in _datas(misc._build_menu_buttons())
     title, body, buttons = _run(emoji._emoji_panel_handler(None, ""))
-    assert "panel:emoji_categories" in _datas(buttons)
+    # The categories capability is preserved (panel still registered) but the
+    # primary panel exposes EXACTLY ONE application-level button.
+    assert "panel:emoji_categories" not in _datas(buttons)
+    assert _datas(buttons) == [f"action:{emoji._DIAGNOSTICS_ACTION}"]
 
 
 # ── categories panel ──────────────────────────────────────────────────────────

@@ -100,20 +100,21 @@ def test_panel_callback_data_stays_bounded():
 # ── main panel ────────────────────────────────────────────────────────────────
 
 
-def test_main_panel_shows_library_size_and_actions():
+def test_main_panel_shows_exactly_one_diagnostic_button():
     _seed([_entry(1), _entry(2)])
     title, body, buttons = _run(emoji._emoji_panel_handler(None, ""))
-    assert title == "Emoji"
+    assert title == "Emoji Diagnostics"
     assert "2" in body
     datas = _datas(buttons)
-    assert "action:emoji_import" in datas
-    assert "panel:emoji_library" in datas
+    # The primary panel exposes EXACTLY ONE application-level button.
+    assert datas == [f"action:{emoji._DIAGNOSTICS_ACTION}"]
+    assert _texts(buttons) == [emoji._DIAGNOSTICS_LABEL]
 
 
-def test_main_panel_empty_state_offers_the_import():
+def test_main_panel_empty_state_is_honest_and_still_one_button():
     _title, body, buttons = _run(emoji._emoji_panel_handler(None, ""))
-    assert "Empty" in body
-    assert "action:emoji_import" in _datas(buttons)
+    assert "empty" in body.lower()
+    assert _datas(buttons) == [f"action:{emoji._DIAGNOSTICS_ACTION}"]
 
 
 # ── library browser (2×5 grid) ────────────────────────────────────────────────
