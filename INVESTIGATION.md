@@ -48,7 +48,7 @@ else:
 ```
 
 Every callback render goes through `_render_and_edit → _finalize_panel`
-(`backend/helper/panels.py:278`) and the reuse path through
+(`backend/helper/panels.py:300`) and the reuse path through
 `backend/helper/lifecycle.py:215`. Because the Emoji panel is a **sub-panel**
 (`register_panel(_MAIN_PANEL, …, parent="menu")`), it is rendered with the
 `else` branch — i.e. it silently gained **Back + Home + Close** in addition to
@@ -111,12 +111,22 @@ This refactor surfaces the real outcome; it does not re-diagnose it.
 
 ## 5. Evidence gaps (explicitly not verified)
 
+* **Offline tests (verified locally, not live):** the repository's own suite
+  passes at this revision — full suite `5917 passed, 27 skipped` (the 27 are
+  pre-existing Ghost-Seen removals and opt-in live gates: Supabase, the
+  live-Telegram self-send, and live STT probes); the focused premium suites and
+  the Emoji/Diagnostics UI suites pass. These tests use in-process fakes and
+  make **no** network calls, so they confirm the contract, not the live system.
 * **Live Telegram:** no `.env` and no credentials exist in this workspace, so
   `backend/config.load()` hard-fails. **No Telegram request of any kind was
-  made.** End-to-end acceptance is therefore unverified.
-* **Render deployment:** the commit is on `origin/main`, which is the deploy
-  source (`render.yaml`/`Procfile`), but the Render build/runtime was not
-  inspected from here — treat the deploy as triggered, not confirmed.
+  made.** End-to-end acceptance (a real send plus final-message read-back) is
+  therefore unverified.
+* **Render deployment:** GitHub records the deployment as a **branch preview**
+  (`ref=feat/emoji-panel-single-diagnostic-button`, sha `4c12ff3`, env
+  `self-bot-pr-185.onrender.com`), status `in_progress` (never advanced to
+  `success`); the `/health` probe of that preview URL returned **HTTP 404**, and
+  no Render runtime logs or metrics were accessible. The deploy is **not
+  confirmed** — neither for the preview nor for production `main`.
 
 ## 6. Conclusion
 
