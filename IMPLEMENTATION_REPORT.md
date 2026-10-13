@@ -140,26 +140,31 @@ credentials). No statement claims end-to-end acceptance.
 | Step | Value |
 |---|---|
 | Files in this task's commit | `backend/services/premium_emoji_inline_service.py`, `tests/test_premium_emoji_inline.py`, `INVESTIGATION.md`, `IMPLEMENTATION_REPORT.md` |
-| Commit | one commit for the task (`type: description` style, matching the repository) |
-| Push | `git push origin HEAD:main` — fast-forward only; no rebase, no force-push, no history rewrite, no unrelated work discarded |
-| Remote verification | after the push: `git fetch origin` → `git rev-parse HEAD` = `git rev-parse origin/main`; `git merge-base --is-ancestor <commit> origin/main` exit 0 |
+| Commit | one commit for the task: `78d8744538da934541255ff86a10d2da531b0883` (`fix(emoji): report the inline entity drop as the documented bot entitlement restriction`) |
+| Direct push to `main` | **Not used.** An earlier direct `git push origin HEAD:main` was rejected (HTTP 403, read-only token at that time). Direct-to-`main` was not retried after write access was restored; the least-invasive PR route was used instead. |
+| Branch publication | `git push origin HEAD:refs/heads/fix/premium-emoji-inline-entitlement-diagnostic` → `[new branch]`; remote branch verified `= 78d8744538da934541255ff86a10d2da531b0883` (`git ls-remote` + API `git/ref`) |
+| Pull request | **Created and verified**: <https://github.com/Onlyicing1/Telegram-self-bot/pull/183> — state `open`, head `fix/premium-emoji-inline-entitlement-diagnostic` (`78d8744…`), base `main`, 1 commit, 4 changed files, mergeable |
+| `origin/main` | `34d7dc3b24d39beccc91368c66cabf2db34f5b6f` — **unchanged** (the PR is open, **not merged**) |
+| Working tree | **clean** (`git status --porcelain` empty); remote URL left token-free |
 
-A commit cannot contain its own hash: the commit SHA and the verified
-`origin/main` SHA are reported in this task's delivery response, re-checked with
-the commands above after the push. The pre-existing untracked
-`telegram-self-bot/` directory is left exactly as found and is excluded from the
-commit.
+A commit cannot contain its own hash: the commit SHA and the verified remote
+state are reported here and in this task's delivery response, re-checked with
+`git fetch` + `git ls-remote` + the GitHub API.
 
 ### Verified delivery state (this task)
 
 | Item | Value |
 |---|---|
-| Local commit | **one** commit for this task (`fix(emoji): report the inline entity drop as the documented bot entitlement restriction`); its exact SHA is reported in this task's delivery response (a commit cannot contain its own hash) |
-| Local HEAD | equals the task commit; `origin/main` has not moved |
-| `origin/main` | `34d7dc3b24d39beccc91368c66cabf2db34f5b6f` — **unchanged** |
-| Reachable from `origin/main`? | **NO** — the commit is **not** on the remote |
-| Push status | **NOT PUSHED** — `git push origin HEAD:main` was rejected: `remote: Permission to Onlyicing1/Telegram-self-bot.git denied to Onlyicing1` / `error: 403`. The available `GITHUB_TOKEN` is **read-only for this repository**: `GET /repos/…/contents/…` returns 200 but `POST /repos/…/git/refs` returns 403 (`Resource not accessible by integration`). No force-push, no rebase and no history rewrite was used; all work is preserved locally |
-| Working tree | **clean** after the commit (only the pre-existing untracked `telegram-self-bot/` directory remains, untouched) |
-| Action required to complete delivery | Push the task commit to `main` from an environment with write access (`git push origin HEAD:main`), then re-verify with `git fetch origin` → `git rev-parse origin/main` → `git merge-base --is-ancestor <commit> origin/main` |
+| Local commit / HEAD | `78d8744538da934541255ff86a10d2da531b0883` (`fix(emoji): report the inline entity drop as the documented bot entitlement restriction`) |
+| Commit already available remotely before this task? | **NO** — no remote branch contained it |
+| Remote branch created | **YES** — `fix/premium-emoji-inline-entitlement-diagnostic` = `78d8744538da934541255ff86a10d2da531b0883` (verified via `git ls-remote` and `GET /repos/…/git/ref/heads/…`) |
+| Pull request | **YES** — [#183](https://github.com/Onlyicing1/Telegram-self-bot/pull/183), `open`, head `fix/premium-emoji-inline-entitlement-diagnostic` → base `main`, 1 commit, 4 files, `mergeable=True` (verified via `GET /repos/…/pulls/183`) |
+| Permission errors | An **earlier** session hit HTTP 403 (`Resource not accessible by integration`) on `POST /repos/…/git/refs` with the then-available token. In this session the token was write-capable: `POST /repos/…/git/refs` returned **201** and the branch push succeeded. No authorization was bypassed. |
+| `main` changed? | **NO** — `origin/main` remains `34d7dc3b24d39beccc91368c66cabf2db34f5b6f`; the commit is **not** an ancestor of `origin/main` (it is only on the PR head branch) |
+| Deployment | **NOT deployed** — the change is not on `main` |
+| Live Telegram verification | **NOT performed** (no credentials in the workspace; no Telegram request made) |
+| Merge | **NOT performed** — the PR is intentionally left open; merging is not authorized here and repository policy requires the PR route |
+| Exact next step | Review and merge PR #183 into `main` (or `git push origin HEAD:main` from a write-capable environment), then re-verify: `git fetch origin` → `git rev-parse origin/main` → `git merge-base --is-ancestor 78d8744538da934541255ff86a10d2da531b0883 origin/main` (exit 0) |
+
 
 
