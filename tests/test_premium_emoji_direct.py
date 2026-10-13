@@ -662,7 +662,7 @@ def _arm(client, monkeypatch) -> dict[str, Any]:
     return captured
 
 
-def test_the_direct_action_is_registered_and_linked_from_the_main_panel(monkeypatch):
+def test_the_direct_action_is_registered_and_removed_from_the_primary_panel(monkeypatch):
     from backend.db import client as db_client
 
     emoji.register(client=None, owner_id=OWNER)
@@ -676,7 +676,10 @@ def test_the_direct_action_is_registered_and_linked_from_the_main_panel(monkeypa
         for row in buttons
         for btn in (row if isinstance(row, list) else [row])
     ]
-    assert f"action:{emoji._DIRECT_ACTION}" in datas
+    # The standalone direct-test button is gone from the primary panel; its
+    # diagnostic role is folded into the unified workflow.
+    assert f"action:{emoji._DIRECT_ACTION}" not in datas
+    assert f"action:{emoji._DIAGNOSTICS_ACTION}" in datas
 
 
 def test_the_action_arms_reply_mode_on_the_exact_selection_message():

@@ -1011,12 +1011,15 @@ def test_the_probe_action_is_registered_through_the_existing_registry():
     assert get_registry().get(emoji._PROBE_ACTION) is None  # an action, not a panel
 
 
-def test_the_main_panel_links_the_probe_action(monkeypatch):
+def test_the_main_panel_does_not_expose_the_probe_as_a_diagnostic_button(monkeypatch):
     from backend.db import client as db_client
 
     db_client._fallback["emoji_library"] = []
     _title, _body, buttons = _run(emoji._emoji_panel_handler(None, ""))
-    assert f"action:{emoji._PROBE_ACTION}" in _datas(buttons)
+    # The standalone probe diagnostic button is gone; its diagnostic role is
+    # folded into the unified workflow.
+    assert f"action:{emoji._PROBE_ACTION}" not in _datas(buttons)
+    assert f"action:{emoji._DIAGNOSTICS_ACTION}" in _datas(buttons)
 
 
 PROBE_MODULES = (

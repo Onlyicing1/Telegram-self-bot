@@ -949,7 +949,7 @@ def test_the_production_action_and_builder_are_registered():
     assert inline_engine.get_inline_builder(svc.INLINE_QUERY_KEY) is not None
 
 
-def test_the_main_panel_makes_the_production_entry_primary(monkeypatch):
+def test_the_main_panel_makes_the_diagnostics_entry_primary(monkeypatch):
     from backend.db import client as db_client
 
     db_client._fallback["emoji_library"] = []
@@ -959,9 +959,13 @@ def test_the_main_panel_makes_the_production_entry_primary(monkeypatch):
         for row in buttons
         for btn in (row if isinstance(row, list) else [row])
     ]
+    # The ONE primary action is the unified diagnostics workflow.
+    assert datas.index(f"action:{emoji._DIAGNOSTICS_ACTION}") == 0
+    # The production send capability is preserved as a normal product action.
     assert f"action:{emoji._INLINE_ACTION}" in datas
-    assert datas.index(f"action:{emoji._INLINE_ACTION}") == 0
-    assert f"action:{emoji._PROBE_ACTION}" in datas
+    # The standalone diagnostic buttons are gone from the primary panel.
+    assert f"action:{emoji._PROBE_ACTION}" not in datas
+    assert f"action:{emoji._DIRECT_ACTION}" not in datas
 
 
 def test_the_action_sends_the_selection_prompt_and_arms_reply_mode(monkeypatch):

@@ -45,6 +45,7 @@ from backend.helper.input_state import set_pending
 from backend.services import emoji_category_service as cat_service
 from backend.services import emoji_state_service as state_service
 from backend.services import premium_emoji_direct_service as premium_direct_service
+from backend.services import premium_emoji_diagnostics as diag_service
 from backend.services import premium_emoji_inline_service as premium_inline_service
 from backend.services import premium_emoji_probe_service as probe_service
 from backend.services import reaction_service
@@ -100,11 +101,10 @@ async def _emoji_panel_handler(event, extra: str) -> tuple[str, str, list] | Non
         lines.append("")
         lines.append(f"Replacement: {'✅ ON' if enabled else '❌ OFF'}")
     builder = InlinePanelBuilder()
+    builder.add_row(_DIAGNOSTICS_LABEL, f"action:{_DIAGNOSTICS_ACTION}")
     builder.add_row("✨ Send Premium Emoji", f"action:{_INLINE_ACTION}")
     builder.add_row("⬇ Import from Saved Messages", "action:emoji_import")
     builder.add_row("💬 React to a message", "action:emoji_react")
-    builder.add_row("🧪 POC · helper-bot sent emoji", f"action:{_PROBE_ACTION}")
-    builder.add_row("🧪 Live test · direct self-chat", f"action:{_DIRECT_ACTION}")
     builder.add_row("📚 Library", f"panel:{_LIBRARY_PANEL}")
     builder.add_row("🗂 Categories", f"panel:{_CATEGORIES_PANEL}")
     builder.add_row("🔁 Replacement", f"panel:{_REPLACEMENT_PANEL}")
@@ -2668,6 +2668,220 @@ async def _premium_direct_reply_handler(
     await _finish(title, _premium_direct_report(outcome), _premium_direct_buttons())
 
 
+# ── the ONE traceable Emoji diagnostic workflow ────────────────────────────
+#
+# The panel's primary action. It runs the REAL production inline route
+# (``premium_emoji_inline_service.send_premium_emoji_via_inline``) and renders
+# a step-by-step trace of what actually happened — which stage succeeded,
+# where execution stopped and why. The trace is built from the service's own
+# outcome record by ``backend.services.premium_emoji_diagnostics``; nothing is
+# simulated, and submission is never conflated with verified success.
+#
+# It is a diagnostic ENTRY POINT over the existing production route: it adds no
+# second client, listener, scheduler or executor, and it never fabricates a
+# Telegram operation. One run per owner at a time — a duplicate callback cannot
+# drive a duplicate Telegram operation.
+
+#: The ONE primary action of the Emoji panel.
+_DIAGNOSTICS_ACTION = "emoji_diagnostics"
+
+#: The exact English label the primary panel must expose.
+_DIAGNOSTICS_LABEL = "🧪 Run Emoji Diagnostics"
+
+#: Plain words only — the selection message is sent by the owner's own account.
+_DIAGNOSTICS_PROMPT = (
+    "Reply to this message with the Premium Emoji to diagnose.\n"
+    "Only a reply to THIS message is accepted."
+)
+
+#: The whole flow (reply read + inline query + the send + read-back) runs
+#: inside this handler; every Telegram call it makes is bounded on its own.
+_DIAGNOSTICS_TIMEOUT_S = 180.0
+
+
+def _diagnostics_buttons() -> list:
+    """The primary action plus the minimal navigation/product controls."""
+    builder = InlinePanelBuilder()
+    builder.add_row(_DIAGNOSTICS_LABEL, f"action:{_DIAGNOSTICS_ACTION}")
+    builder.add_row("💬 React to a message", "action:emoji_react")
+    builder.add_row("📚 Library", f"panel:{_LIBRARY_PANEL}")
+    return builder.build()
+
+
+async def _diagnostics_action(event, extra: str, chat_id: int) -> tuple[str, str, list]:
+    """Send the selection message to Saved Messages and arm reply mode."""
+    client = get_self_client()
+    owner = get_owner_id()
+    if client is None:
+        return _error_panel(_DIAGNOSTICS_LABEL, "Self client is not connected.")
+    if not owner:
+        return _error_panel(_DIAGNOSTICS_LABEL, "Owner is not set.")
+    if diag_service.is_running(owner):
+        return _error_panel(
+            _DIAGNOSTICS_LABEL,
+            "A diagnostic run is already in progress — wait for it to finish.",
+        )
+
+    try:
+        selection = await client.send_message("me", _DIAGNOSTICS_PROMPT)
+    except Exception as exc:
+        logger.warning("[EMOJI_UI] diagnostics: selection message not created: %s", exc)
+        return _error_panel(
+            _DIAGNOSTICS_LABEL,
+            f"Could not create the Saved Messages selection message: {exc}",
+        )
+
+    selection_id = getattr(selection, "id", 0) or 0
+    selection_chat = getattr(selection, "chat_id", 0) or 0
+    if (
+        not isinstance(selection_id, int)
+        or isinstance(selection_id, bool)
+        or selection_id <= 0
+        or not selection_chat
+    ):
+        return _error_panel(
+            _DIAGNOSTICS_LABEL,
+            "The selection message could not be created — nothing was armed.",
+        )
+
+    set_pending(
+        owner, _DIAGNOSTICS_ACTION, _diagnostics_reply_handler, selection_chat,
+        _DIAGNOSTICS_PROMPT,
+        inline_chat_id=chat_id,
+        inline_msg_id=getattr(event, "message_id", 0) or 0,
+        extra=str(selection_id),
+        timeout=_DIAGNOSTICS_TIMEOUT_S,
+    )
+    logger.info(
+        "[EMOJI_UI] diagnostics: selection message #%s sent to Saved Messages",
+        selection_id,
+    )
+    body = (
+        "A selection message was sent to **Saved Messages**.\n\n"
+        "Reply to THAT message with the Premium Emoji to diagnose.\n"
+        f"Only a reply to message `#{selection_id}` is accepted.\n\n"
+        "Your own account then sends it through the inline bot, and the run's "
+        "step-by-step trace is shown here."
+    )
+    return _DIAGNOSTICS_LABEL, body, _diagnostics_buttons()
+
+
+async def _diagnostics_reply_handler(
+    text,
+    chat_id,
+    msg_id,
+    inline_chat_id,
+    inline_msg_id,
+    extra: str = "",
+) -> None:
+    """Resolve the EXACT selection-message reply, then run the real workflow."""
+    client = get_self_client()
+    owner = get_owner_id()
+
+    async def _finish(title: str, body: str, buttons: list) -> None:
+        await _edit_inline(inline_chat_id, inline_msg_id, title, body, buttons)
+
+    selection_id = int(extra) if isinstance(extra, str) and extra.isdigit() else 0
+    if client is None:
+        await _finish(_DIAGNOSTICS_LABEL, "! Self client is not connected.", [])
+        return
+    if not selection_id:
+        await _finish(
+            _DIAGNOSTICS_LABEL,
+            "! The selection message is no longer known — start the action again.",
+            _diagnostics_buttons(),
+        )
+        return
+
+    try:
+        reply = await client.get_messages(chat_id, ids=msg_id)
+    except Exception as exc:
+        logger.warning("[EMOJI_UI] diagnostics: cannot read the reply: %s", exc)
+        reply = None
+    if reply is None:
+        await _finish(
+            _DIAGNOSTICS_LABEL,
+            "! Could not read your reply message — please try again.",
+            _diagnostics_buttons(),
+        )
+        return
+
+    header = getattr(reply, "reply_to", None)
+    if getattr(header, "reply_to_peer_id", None) is not None:
+        await _finish(
+            _DIAGNOSTICS_LABEL,
+            "! That reply targets another chat.\nReply in Saved Messages.",
+            _diagnostics_buttons(),
+        )
+        return
+
+    target_id = getattr(reply, "reply_to_msg_id", None) or getattr(
+        header, "reply_to_msg_id", None
+    )
+    if not isinstance(target_id, int) or isinstance(target_id, bool) or target_id <= 0:
+        await _finish(
+            _DIAGNOSTICS_LABEL,
+            f"! Your message was not a reply.\nReply TO selection message `#{selection_id}`.",
+            _diagnostics_buttons(),
+        )
+        return
+    if target_id != selection_id:
+        await _finish(
+            _DIAGNOSTICS_LABEL,
+            f"! That reply targets message `#{target_id}`, not the selection "
+            f"message `#{selection_id}`.",
+            _diagnostics_buttons(),
+        )
+        return
+
+    # The source entity is read from the reply's OWN entity (document id +
+    # UTF-16 span), never its visible glyph. A reply that carries no genuine
+    # custom-emoji entity still runs the workflow and produces a real trace.
+    found = premium_inline_service.inspect_source_message(reply)
+
+    if not diag_service.begin_run(owner):
+        await _finish(
+            _DIAGNOSTICS_LABEL,
+            "! A diagnostic run is already in progress — wait for it to finish.",
+            _diagnostics_buttons(),
+        )
+        return
+
+    started_at = time.monotonic()
+    try:
+        outcome = await premium_inline_service.send_premium_emoji_via_inline(
+            client, chat_id, found["document_id"], found["span_text"], owner
+        )
+    except Exception as exc:
+        logger.exception("[EMOJI_UI] diagnostics: run failed unexpectedly: %s", exc)
+        outcome = {
+            "ok": False,
+            "verified": False,
+            "error": "E_DIAG",
+            "detail": f"the diagnostic run raised {type(exc).__name__}: {exc}",
+            "diagnosis": None,
+            "run_id": None,
+            "payload": None,
+            "inline_result": {},
+            "readback": {},
+            "eligibility": {},
+        }
+    finally:
+        diag_service.end_run(owner, outcome=outcome)
+
+    from backend.helper.client import get_bot_id
+
+    trace = diag_service.build_trace(
+        outcome, started_at=started_at, helper_bot_id=get_bot_id()
+    )
+    logger.info(
+        "[EMOJI_UI] diagnostics: run %s -> %s (reached %s)",
+        trace.get("run_id"), trace.get("outcome_class"), trace.get("stage"),
+    )
+    title = "Emoji Diagnostics ✓" if trace.get("outcome_class") == "verified" else "Emoji Diagnostics"
+    await _finish(title, diag_service.render_trace(trace), _diagnostics_buttons())
+
+
 # ── registration ──────────────────────────────────────────────────────────
 
 
@@ -2712,6 +2926,7 @@ def register(client, owner_id: int) -> None:
     )
     register_action("emoji_import", _import_action)
     register_action("emoji_react", _react_action)
+    register_action(_DIAGNOSTICS_ACTION, _diagnostics_action)
     register_action(_INLINE_ACTION, _premium_inline_action)
     register_inline_builder(
         premium_inline_service.INLINE_QUERY_KEY, _premium_inline_builder
