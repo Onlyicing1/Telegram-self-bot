@@ -45,10 +45,19 @@ logger = logging.getLogger(__name__)
 
 
 def _build_general_buttons() -> list:
+    from backend.services import settings_service
+
     builder = InlinePanelBuilder()
     builder.add_row("Ping", "action:general_ping")
     builder.add_row("Chat & Msg IDs", "action:general_id")
     builder.add_row("Health Dashboard", "action:general_health")
+    # Label reflects the ACTUAL stored setting (never a hardcoded/stale value);
+    # the setting is read through the existing settings_service cache.
+    auto = settings_service.is_auto_reaction_enabled()
+    builder.add_row(
+        f"Auto-Reaction: {'✅ ON' if auto else '❌ OFF'}",
+        "action:general_toggle_auto_reaction",
+    )
     return builder.build()
 
 
@@ -399,6 +408,7 @@ def _register_panels() -> None:
     register_action("general_ping", _general_ping_action)
     register_action("general_id", _general_id_action)
     register_action("general_health", _general_health_action)
+    register_action("general_toggle_auto_reaction", _general_toggle_auto_reaction_action)
     register_input("settings", "auto_close_delay", {
         "handler": _settings_auto_close_delay_handler,
         "prompt": "**Auto-close Delay**\n\nEnter delay in seconds (5-3600):\n\n_Reply below._",
@@ -423,6 +433,20 @@ def _register_panels() -> None:
 
 async def _general_ping_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     return "General", "PONG", _build_general_buttons()
+
+
+async def _general_toggle_auto_reaction_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    """Toggle the Auto-Reaction SETTING and re-render the General panel.
+
+    This flips the persisted setting only — no reaction engine exists yet, so
+    nothing reacts to any message as a side effect of this toggle.
+    """
+    from backend.services import settings_service
+
+    settings_service.toggle_auto_reaction()
+    enabled = settings_service.is_auto_reaction_enabled()
+    notice = f"**General**\n\nAuto-Reaction is now {'✅ ON' if enabled else '❌ OFF'}."
+    return "General", notice, _build_general_buttons()
 
 
 async def _general_id_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:

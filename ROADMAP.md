@@ -28,7 +28,9 @@
 > are IMPLEMENTED and unit-TESTED
 > (no live Telegram). Media/caption reconstruction (§23), owner-visible
 > failure surfacing (§28) and the remaining validation items below remain
-> PLANNED. Schema work stays MANUAL-ONLY and unexecuted: the
+> PLANNED. **Emoji Stage 1** (panel restructure + the Auto-Reaction setting
+> entry under General, §27) is IMPLEMENTED and unit-TESTED offline — the
+> automatic reaction engine is explicitly OUT of scope for Stage 1. Schema work stays MANUAL-ONLY and unexecuted: the
 > `emoji_library`, `emoji_categories`, `emoji_mappings`, `emoji_state` and
 > `emoji_chat_overrides` tables plus the Phase 5 `emoji_categories`
 > `is_custom` / `source_category_ids` columns have never been applied
@@ -931,7 +933,7 @@ Implemented additions:
 - [x] Glass UI action: Emoji panel → `💬 React to a message` → the owner replies to the target message, and the reply's own content is the reaction value (a premium emoji arrives as a custom-emoji entity) — reusing the existing pending-input reply mode the Save panel uses, with no new listener, panel or input registration
 - [ ] Capability notes: custom-emoji reactions require the reacting account (the self-client) to have the emoji available; reaction availability per chat (`can_react`/`AvailableReaction` flags) is surfaced honestly through Telegram's own error text — no pre-flight probing was implemented (still OPEN)
 - [x] Reactions apply to messages the owner chooses (including others' messages — reacting is not authorship); this does NOT conflict with §19 (§19 governs content transformation only)
-- [x] No auto-reaction, no scheduled reactions (deferred, §4)
+- [x] No auto-reaction, no scheduled reactions (deferred, §4). **Emoji Stage 1** adds the Auto-Reaction *setting entry* under **General** (`action:general_toggle_auto_reaction`, persisted through the existing `settings_service` as `auto_reaction_enabled`, default OFF) — this is the SETTING only; the engine that would consume it remains deferred/not implemented.
 
 Status: **IMPLEMENTED + TESTED offline (80 tests in
 `tests/test_reaction_phase6.py`); live Telegram NOT verified; no schema

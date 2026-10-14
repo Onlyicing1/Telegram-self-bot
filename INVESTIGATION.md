@@ -1,14 +1,16 @@
-# INVESTIGATION.md — Emoji Panel: One-Button Diagnostic Workflow
+# INVESTIGATION.md — Emoji Stage 1: Panel Restructure + Auto-Reaction Setting Entry
 
 This file records **only** the current, evidence-based investigation and
-diagnosis. It **replaces every previous investigation in full**; earlier
-narratives (the premium-emoji inline entitlement diagnosis) remain readable in
-git history (`78d8744`, `798ff4b`, PR #183, and the previous `50b035a`).
+diagnosis for the active task. It **replaces every previous investigation in
+full**; earlier narratives (the premium-emoji inline entitlement diagnosis, the
+one-button Emoji diagnostic panel) remain readable in git history (`78d8744`,
+`798ff4b`, PR #183; `50b035a`, PR #184; `4c12ff3`, PR #185).
 
 | Item | Value |
 |---|---|
 | Project / remote | LifeOS Telegram self-bot, `Onlyicing1/Telegram-self-bot` (`origin` = `https://github.com/Onlyicing1/Telegram-self-bot.git`) |
 | Target branch | `main` (tracks `origin/main`) |
+| Base revision | `15fa807e07c429f0870eee3950eccc9c9ae4deb6` — verified `= origin/main` at task start (`git fetch origin` + `git rev-parse origin/main`) |
 | Telethon | **`telethon==1.34.0`** (`backend/requirements.txt:1`) |
 | Investigation method | Source inspection + the repository's own test suite, executed locally |
 
@@ -16,122 +18,103 @@ git history (`78d8744`, `798ff4b`, PR #183, and the previous `50b035a`).
 
 ## 1. Task under investigation
 
-Refactor the Emoji panel so its **primary panel exposes exactly ONE
-application-level button** — `🧪 Run Emoji Diagnostics` — which executes a real,
-bounded diagnostic workflow and renders an evidence-based trace. Every other
-button (send, import, react, library, categories, replacement, helper-bot
-tests, direct tests, Back/Home/Close) must be gone from the primary panel.
-Existing product capabilities must be preserved.
+**Stage 1 — Emoji Panel Restructure and Auto-Reaction Settings Entry.** Scope
+is limited to (a) restructuring the existing Emoji UI and (b) introducing the
+Auto-Reaction setting entry under **General**. The complete automatic reaction
+engine and any Telegram API investigation are explicitly **out of scope**.
 
-## 2. What the source actually shows (findings)
+## 2. Repository state at task start (verified)
 
-### 2.1 The primary panel before this change
+* Branch `feat/emoji-panel-single-diagnostic-button`; local HEAD =
+  `origin/main` = `15fa807`; working tree **clean**; no untracked files.
+* Documents present and read: `AGENTS.md`, `IMPLEMENTATION_REPORT.md`,
+  `INVESTIGATION.md`, and the current-feature roadmap `ROADMAP.md` (Emoji &
+  Reaction). `ROADMAP.md` §32 status: Phase 0 (code half) + Phases 1–6 done
+  offline; Phase 7 (hardening) + live validation remain PLANNED.
 
-`backend/bot/handlers/emoji.py::_emoji_panel_handler` returned **seven**
-application-level rows: the diagnostics action plus `✨ Send Premium Emoji`
-(`emoji_premium_inline`), `⬇ Import from Saved Messages`, `💬 React to a
-message`, and the `📚 Library` / `🗂 Categories` / `🔁 Replacement` sub-panels.
-The diagnostic *result* view (`_diagnostics_buttons`) additionally exposed
-`💬 React to a message` and `📚 Library`. So the "one button" requirement was
-**not** met.
+## 3. Findings
 
-### 2.2 The hidden source of extra buttons — automatic navigation injection
+### 3.1 The "Custom Emoji category" premise does not match the repository
 
-This is the decisive finding. The shared panel renderer
-`backend/helper/panels.py::_finalize_panel` appends navigation automatically:
+The brief refers to a "Custom Emoji category" in the Emoji panel. A search
+across **source, tests, docs, and the full git history** found **no such
+literal**. The only near-hit is `INVESTIGATION.md`'s own mention of the
+"Premium Custom Emoji inline failure" (a *product* failure, not a UI category).
+Consequences:
 
-```python
-if is_root:
-    _add_close_button(builder)          # "❌ Close"   → panel:_nav:close
-else:
-    _add_nav_buttons(builder)           # "⬅ Back"/"🏠 Home"/"❌ Close"
-```
+* There is **no "Custom Emoji category" button, panel, or action** to remove.
+* The concept that *does* exist is the ROADMAP §26 **Custom *Category*** — an
+  `is_custom=True` composed category type reached through the **Categories**
+  panel. Stage 1 must **not** remove it (removing a feature would exceed the
+  "restructure" scope).
 
-Every callback render goes through `_render_and_edit → _finalize_panel`
-(`backend/helper/panels.py:300`) and the reuse path through
-`backend/helper/lifecycle.py:215`. Because the Emoji panel is a **sub-panel**
-(`register_panel(_MAIN_PANEL, …, parent="menu")`), it is rendered with the
-`else` branch — i.e. it silently gained **Back + Home + Close** in addition to
-whatever the handler returned.
+### 3.2 The Emoji primary panel is already at the Stage 1 target state
 
-**Therefore, removing rows from the handler alone is insufficient.** The panel
-would still expose three application-level navigation buttons. Any fix that
-only edits the handler would fail the strict one-button acceptance test.
+`backend/bot/handlers/emoji.py::_emoji_panel_handler` returns **exactly one**
+application-level row (`🧪 Run Emoji Diagnostics`), and the panel is registered
+nav-free (`set_panel_nav_free(_MAIN_PANEL, True)`), so the shared renderer
+`_finalize_panel` injects **no** Back/Home/Close into it. This was delivered by
+the prior task (`4c12ff3`) and is pinned by
+`tests/test_emoji_diagnostics_ui.py`. Stage 1 therefore **verifies and pins**
+this state; it does not re-implement it.
 
-### 2.3 There is no alternate UI path for the other capabilities
+### 3.3 Emoji sub-panels already carry standard navigation
 
-A repository-wide search for `panel:emoji_library`, `panel:emoji_categories`,
-`panel:emoji_replacement`, `action:emoji_import`, `action:emoji_react`,
-`emoji_premium_inline`, `emoji_react_premium`, `emoji_premium_direct` found
-references **only** inside `backend/bot/handlers/emoji.py`. The AI tool layer
-(`backend/ai/tools/`) has no emoji/reaction tool. The mother menu (`Menu`) links
-only `panel:emoji`. So today the Emoji sub-panels and the import/react/premium
-actions are reachable **only** through the primary Emoji panel's buttons.
+Every non-root Emoji sub-panel (Library, Entry, Categories, Category, Mappings,
+Mapping, Picker, Replacement, State-Scope-Picker, Compose, Source-Picker) is
+rendered through `_finalize_panel`, which injects Back + Home + Close, wired to
+the existing `_handle_navigation` handler. The General panel is likewise a
+sub-panel and already receives the same navigation row. This satisfies the
+"Back/Home/Close" requirement **by construction**; Stage 1 pins it with tests
+and documents the deliberate primary-panel exception.
 
-### 2.4 The diagnostic workflow already exists and is real
+### 3.4 No Auto-Reaction setting existed
 
-`_diagnostics_action` + `_diagnostics_reply_handler` already run the **real**
-production route `premium_emoji_inline_service.send_premium_emoji_via_inline`
-and render a trace built by `backend/services/premium_emoji_diagnostics.py` from
-the service's own outcome record (stages, statuses, classification, evidence).
-Nothing in the trace is simulated. This part needed no change beyond removing
-its extra buttons.
+A repository-wide search found **no** auto-reaction references. The General
+panel (`backend/bot/handlers/misc.py`) exposed only `Ping`, `Chat & Msg IDs`,
+and `Health Dashboard`. The existing settings mechanism is
+`backend/services/settings_service.py` (column-per-setting, cached, validated,
+Supabase-or-in-memory-fallback via `panel_settings_repository`). It is the
+correct, existing home for a new General setting — no parallel store is
+justified.
 
-### 2.5 The Premium Custom Emoji inline failure (background, unchanged)
+## 4. Root cause / conclusion
 
-The unresolved product failure remains the documented **Telegram bot
-custom-emoji entitlement restriction**: the helper bot's correlated inline
-answer provably carried the entity, yet Telegram stored the inline result with
-the entity removed, so the fail-closed gate refuses before any send. The trace
-reports this honestly (`INLINE_BOT_NOT_ENTITLED`, blocked at
-`result_inspected`). The historical `reason=no_send_message` label was a
-pre-fix wrapper bug (reading `send_message` off the `custom.InlineResult`
-wrapper instead of `.result.send_message`) — **not** the current root cause.
-This refactor surfaces the real outcome; it does not re-diagnose it.
+* There is **no defect** in the Emoji panel to fix; the panel already meets the
+  Stage 1 target, and the "Custom Emoji category" premise has no referent.
+* The concrete Stage 1 gap is the **missing Auto-Reaction setting entry under
+  General**, which is implemented through the existing `settings_service`.
+* Persistence reuses the existing column-per-setting mechanism; the new
+  `panel_settings.auto_reaction_enabled` column is **proposed** (documented in
+  `DATABASE_ARCHITECTURE.md` §6) and **not applied** — no SQL was executed. The
+  setting degrades to the in-memory cache until the owner applies it.
 
-## 3. Root cause of the one-button failure (confirmed)
+## 5. Evidence — what is verified vs unverified
 
-1. The handler returned seven rows.
-2. `_finalize_panel` auto-injected Back/Home/Close into every non-root render
-   of the Emoji sub-panel.
-3. There is no per-panel opt-out, so a handler-only edit cannot satisfy the
-   strict requirement.
+**Verified (executed locally):**
 
-## 4. Hypotheses considered and rejected
+* Full suite: **5938 passed, 27 skipped** (`pytest -q`); the 27 skips are
+  pre-existing opt-in live gates (Supabase / live Telegram / live STT).
+* Focused Stage 1 suite: **21 passed**; focused Emoji/General/settings subset:
+  **351 passed**.
+* `compileall` / `py_compile` clean on the changed/added modules;
+  `git diff --check` clean.
+* These tests use in-process fakes and make **no** network calls; they confirm
+  the contract, not the live system.
 
-* *"Removing rows from `_emoji_panel_handler` is enough."* **Rejected** — the
-  automatic nav injection (2.2) still adds three buttons.
-* *"`panel_id` is unavailable at finalize time, so the injection cannot be
-  conditioned."* **Rejected** — `_finalize_panel(title, body, buttons,
-  panel_id, …)` receives `panel_id` on both the callback path and the reuse
-  path; `_handle_action` passes the current panel id and `_edit_inline` (the
-  diagnostic reply path) bypasses `_finalize_panel` entirely.
-* *"A disabled helper is a disconnect."* **Rejected** (per AGENTS.md 4/10) —
-  an idle/disabled helper is a valid state and never triggers recovery.
+**Unverified:**
 
-## 5. Evidence gaps (explicitly not verified)
-
-* **Offline tests (verified locally, not live):** the repository's own suite
-  passes at this revision — full suite `5917 passed, 27 skipped` (the 27 are
-  pre-existing Ghost-Seen removals and opt-in live gates: Supabase, the
-  live-Telegram self-send, and live STT probes); the focused premium suites and
-  the Emoji/Diagnostics UI suites pass. These tests use in-process fakes and
-  make **no** network calls, so they confirm the contract, not the live system.
 * **Live Telegram:** no `.env` and no credentials exist in this workspace, so
   `backend/config.load()` hard-fails. **No Telegram request of any kind was
-  made.** End-to-end acceptance (a real send plus final-message read-back) is
-  therefore unverified.
-* **Render deployment:** GitHub records the deployment as a **branch preview**
-  (`ref=feat/emoji-panel-single-diagnostic-button`, sha `4c12ff3`, env
-  `self-bot-pr-185.onrender.com`), status `in_progress` (never advanced to
-  `success`); the `/health` probe of that preview URL returned **HTTP 404**, and
-  no Render runtime logs or metrics were accessible. The deploy is **not
-  confirmed** — neither for the preview nor for production `main`.
+  made.** The General panel render, the toggle persistence, and a reopen
+  reflecting the stored value are therefore unverified live.
+* **Durable persistence:** the proposed `panel_settings.auto_reaction_enabled`
+  column is not applied; the setting runs on the in-memory cache.
+* **Deployment:** no Render deployment was inspected for this commit.
 
-## 6. Conclusion
+## 6. Delivery
 
-The smallest source-supported fix is: (a) render the primary Emoji panel with
-**exactly one** row, (b) add a minimal, explicit **per-panel nav opt-out** in
-`_finalize_panel` and mark the Emoji panel nav-free in its `register()`, and
-(c) keep every other capability's handler/panel/action registered. See
-`IMPLEMENTATION_REPORT.md` for what was implemented and the test results.
+* **Branch:** `main` (fast-forward).
+* **Commit:** recorded in the delivery block below after the push.
+
+<!-- DELIVERY_BLOCK -->
