@@ -3154,6 +3154,7 @@ a key-value store.
 | `owner_only` | `boolean` | NO | `true` | Restrict commands to owner only |
 | `dashboard_font` | `text` | NO | `'default'` | Glass UI / dashboard font key — one of `FONT_KEYS` in `backend/helper/font_style.py` (`DASHBOARD_FONTS` == `FONT_KEYS`); never free-text CSS |
 | `auto_reaction_enabled` | `boolean` | NO | `false` | Auto-Reaction setting (Emoji Stage 1) — whether the owner has enabled automatic reactions to their own outgoing messages. The setting is stored/read through `settings_service`; the reaction engine that would consume it is a later stage and is not yet implemented. **PROPOSED column — pending manual application** (see Migration Status) |
+| `auto_reaction_emoji` | `text` | NO | `''` | Auto-Reaction setting (Emoji Stage 2) — the exact Telegram reaction emoji the owner selected through the General panel selector, stored/read through `settings_service`. **PROPOSED column — pending manual application** (see Migration Status) |
 | `ghost_seen_retention_seconds` | `bigint` | NO | `2592000` | Ghost Seen registry retention window in seconds (30 min–365 days); presets include sub-day durations |
 | `update_stale_seconds` | `integer` | NO | `300` | Update staleness threshold (seconds) |
 | `updated_at` | `timestamptz` | YES | `now()` | Last update timestamp |
@@ -3174,12 +3175,12 @@ RLS is enabled. Only SELECT is granted to `anon` + `authenticated`.
 `update_field`, `update_fields`, `reload`.
 
 **`backend/services/settings_service.py`** — cache-first reads,
-write-through cache, **13 typed getters + 13 typed setters**
+write-through cache, **14 typed getters + 14 typed setters**
 (`auto_close_enabled`, `auto_close_delay`, `max_deep_save_mb`,
 `delete_batch_size`, `log_retention_days`, `panel_timeout_seconds`,
 `allow_multiple_panels`, `reuse_existing_panel`, `language`,
 `debug_callbacks`, `owner_only`, `dashboard_font`,
-`auto_reaction_enabled`), per-setting
+`auto_reaction_enabled`, `auto_reaction_emoji`), per-setting
 validators. See [§17 Panel Database](#17-panel-database) for details.
 
 > **Note:** `ghost_seen_retention_seconds` and `update_stale_seconds`
@@ -3225,6 +3226,22 @@ ALTER TABLE panel_settings ADD COLUMN IF NOT EXISTS auto_reaction_enabled boolea
 UPDATE panel_settings SET auto_reaction_enabled = false WHERE auto_reaction_enabled IS NULL;
 ALTER TABLE panel_settings ALTER COLUMN auto_reaction_enabled SET DEFAULT false;
 ALTER TABLE panel_settings ALTER COLUMN auto_reaction_enabled SET NOT NULL;
+```
+
+**Proposed (Emoji Stage 2, NOT yet a migration file):** the Auto-Reaction
+emoji selection adds one text column,
+`panel_settings.auto_reaction_emoji text NOT NULL DEFAULT ''`
+(mirroring the `settings_service` `_validate_nonempty_str` validator; the
+stored value is the exact Telegram reaction emoji). It is **documented
+here for the owner to apply manually** — no SQL has been executed and no
+migration file has been added, with the same graceful-degradation
+contract as above. Suggested idempotent SQL:
+
+```sql
+ALTER TABLE panel_settings ADD COLUMN IF NOT EXISTS auto_reaction_emoji text;
+UPDATE panel_settings SET auto_reaction_emoji = '' WHERE auto_reaction_emoji IS NULL;
+ALTER TABLE panel_settings ALTER COLUMN auto_reaction_emoji SET DEFAULT '';
+ALTER TABLE panel_settings ALTER COLUMN auto_reaction_emoji SET NOT NULL;
 ```
 
 ### Removed / phantom columns

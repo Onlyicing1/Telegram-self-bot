@@ -58,13 +58,140 @@ def _build_general_buttons() -> list:
         f"Auto-Reaction: {'✅ ON' if auto else '❌ OFF'}",
         "action:general_toggle_auto_reaction",
     )
+    builder.add_row("😀 Select Reaction", f"panel:{_REACTION_PANEL}")
     return builder.build()
 
 
 async def _general_body() -> str:
+    from backend.services import settings_service
+
+    auto = settings_service.is_auto_reaction_enabled()
+    emoji = settings_service.auto_reaction_emoji()
+    selected = emoji if emoji else "— none —"
     return (
         "**General**\n\n"
-        "Tap a button to execute instantly."
+        "Tap a button to execute instantly.\n\n"
+        f"Auto-Reaction: {'✅ ON' if auto else '❌ OFF'}\n"
+        f"Selected reaction: {selected}"
+    )
+
+
+# ── Auto-Reaction selector (Emoji Stage 2) ────────────────────────────────
+#: The reaction picker is a sub-panel of General, so the shared renderer
+#: injects the standard Back/Home/Close navigation row for it.
+_REACTION_PANEL = "general_reactions"
+_REACTION_PAGE_SIZE = 10
+
+
+def _reaction_page_of(extra: str) -> int:
+    page_s = str(extra or "").lstrip(":")
+    try:
+        return max(0, int(page_s or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+async def _render_reaction_picker(
+    page: int, *, notice: str | None = None, force: bool = False,
+) -> tuple[str, str, list]:
+    """Render the Auto-Reaction selector from Telegram's own catalog.
+
+    The catalog is read cache-first (a fresh cache serves without a request;
+    a stale/empty cache re-reads Telegram) unless ``force`` is set (the
+    explicit Refresh action). Every option is a real Telegram reaction; the
+    selection is persisted as the EXACT emoji value Telegram exposed, and
+    the option INDEX (never the raw emoji) travels in the callback data so
+    the payload stays within Telegram's bound while the underlying value is
+    resolved server-side from the same catalog.
+    """
+    from backend.services import reaction_source_service, settings_service
+    from backend.helper.inline_engine import get_self_client
+
+    result = await reaction_source_service.load_reactions(get_self_client(), force=force)
+    options = result.get("options") or []
+    current = settings_service.auto_reaction_emoji()
+    auto = settings_service.is_auto_reaction_enabled()
+
+    page_count = max(1, (len(options) + _REACTION_PAGE_SIZE - 1) // _REACTION_PAGE_SIZE)
+    page = max(0, min(page, page_count - 1))
+    start = page * _REACTION_PAGE_SIZE
+    window = options[start:start + _REACTION_PAGE_SIZE]
+
+    lines = [
+        "😀 **Auto-Reaction**",
+        "",
+        f"Toggle: {'✅ ON' if auto else '❌ OFF'}",
+        f"Selected: {current if current else '— none —'}",
+    ]
+    if notice:
+        lines.extend(["", notice])
+    if not result.get("ok"):
+        lines.extend(["", f"⚠️ {result.get('detail') or 'Reactions unavailable.'}"])
+    elif not options:
+        lines.extend(["", "_Telegram returned no usable reactions for this account._"])
+    else:
+        lines.extend(["", f"_{len(options)} reaction(s) available · page {page + 1}/{page_count}_"])
+
+    builder = InlinePanelBuilder()
+    for offset in range(0, len(window), 2):
+        pair = []
+        for j in (offset, offset + 1):
+            if j >= len(window):
+                break
+            option = window[j]
+            idx = start + j
+            mark = "✓ " if option.get("emoji") == current else ""
+            pair.append((
+                f"{mark}{reaction_source_service.option_label(option)}",
+                f"action:general_reaction_set:{idx}",
+            ))
+        builder.add_buttons(*pair)
+    if page_count > 1:
+        builder.add_buttons(
+            ("◀", f"panel:{_REACTION_PANEL}:{max(0, page - 1)}"),
+            (f"{page + 1}/{page_count}", f"panel:{_REACTION_PANEL}:{page}"),
+            ("▶", f"panel:{_REACTION_PANEL}:{min(page_count - 1, page + 1)}"),
+        )
+    builder.add_row("🔄 Refresh", "action:general_reaction_refresh")
+    builder.add_row("← Back", "panel:general")
+    return "Auto-Reaction", "\n".join(lines), builder.build()
+
+
+async def _reaction_picker_handler(event, extra: str) -> tuple[str, str, list] | None:
+    return await _render_reaction_picker(_reaction_page_of(extra))
+
+
+async def _general_reaction_refresh_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    """Explicit Refresh: re-read the catalog from Telegram, bypassing cache."""
+    return await _render_reaction_picker(0, notice="🔄 Refreshed from Telegram.", force=True)
+
+
+async def _general_reaction_set_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    """Persist the reaction at the given INDEX of the cached catalog.
+
+    The index is resolved against the SAME catalog the picker rendered, and
+    the persisted value is the exact emoji Telegram exposed — never the
+    callback payload and never a substituted glyph. An out-of-range index or
+    a missing catalog fails closed without changing the setting.
+    """
+    from backend.services import reaction_source_service, settings_service
+
+    try:
+        idx = int(str(extra).lstrip(":"))
+    except (TypeError, ValueError):
+        idx = -1
+    options = reaction_source_service.cached_options()
+    if not options or idx < 0 or idx >= len(options):
+        return await _render_reaction_picker(
+            0, notice="Selection out of date — the list changed. Try again.",
+        )
+    emoji = options[idx].get("emoji")
+    if not settings_service.set_auto_reaction_emoji(emoji):
+        return await _render_reaction_picker(
+            0, notice="✗ Could not save the selection — storage failed.",
+        )
+    return await _render_reaction_picker(
+        idx // _REACTION_PAGE_SIZE, notice=f"✓ Reaction set to {emoji}.",
     )
 
 
@@ -397,6 +524,11 @@ def _register_panels() -> None:
     register_inline_builder("settings", _settings_inline_builder)
     register_panel("general", _general_panel_handler, parent="menu", title="General")
     register_inline_builder("general", _general_inline_builder)
+    register_panel(
+        _REACTION_PANEL, _reaction_picker_handler, parent="general", title="Auto-Reaction",
+    )
+    register_action("general_reaction_refresh", _general_reaction_refresh_action)
+    register_action("general_reaction_set", _general_reaction_set_action)
     register_panel("font", _font_panel_handler, parent="settings", title="Font")
     register_action("font_set", _font_set_action)
     register_action("font_page", _font_page_action)

@@ -10,12 +10,14 @@ Same conventions as the sibling modules (``messages.py`` /
 normalized to ``TelegramAPIError`` / ``TelegramTimeoutError``, plain-dict
 results — callers never see Telethon objects and never build a request.
 
-Scope boundary: this module exposes exactly the TWO forms the feature design
-needs — ONE Unicode emoji (``ReactionEmoji``) or ONE custom-emoji document
-(``ReactionCustomEmoji``) — for ONE explicit ``(chat_id, msg_id)`` target.
-Arbitrary TL requests, multi-reaction payloads and reaction removal are not
-reachable from here. A rejected reaction is never retried with a different
-representation: Telegram's own verdict is reported honestly (ROADMAP §28).
+Scope boundary: this module exposes exactly the TWO send forms the feature
+design needs — ONE Unicode emoji (``ReactionEmoji``) or ONE custom-emoji
+document (``ReactionCustomEmoji``) — for ONE explicit ``(chat_id, msg_id)``
+target, plus ONE read: the account's available-reaction catalog
+(``get_available_reactions``). Arbitrary TL requests, multi-reaction
+payloads and reaction removal are not reachable from here. A rejected
+reaction is never retried with a different representation: Telegram's own
+verdict is reported honestly (ROADMAP §28).
 """
 from __future__ import annotations
 
@@ -23,8 +25,12 @@ import asyncio
 import logging
 from typing import Any
 
-from telethon.tl.functions.messages import SendReactionRequest
-from telethon.tl.types import ReactionCustomEmoji, ReactionEmoji
+from telethon.tl import types as tl_types
+from telethon.tl.functions.messages import (
+    GetAvailableReactionsRequest,
+    SendReactionRequest,
+)
+from telethon.tl.types import AvailableReaction, ReactionCustomEmoji, ReactionEmoji
 
 from backend.runtime.operation_watchdog import guarded_await
 from backend.telegram_api._helpers import utf16_length
@@ -36,6 +42,11 @@ from backend.telegram_api.exceptions import (
 logger = logging.getLogger(__name__)
 
 _SHORT_CALL_TIMEOUT = 30.0
+
+#: Defensive bound on one account's reaction catalog. Telegram's set is far
+#: smaller; this only stops a malformed/oversized response from being
+#: propagated whole.
+MAX_AVAILABLE_REACTIONS = 200
 
 #: The two reaction kinds this module can send — the plain-dict reaction
 #: shape shared by the wrapper, the reaction service and the Glass UI.
@@ -176,4 +187,87 @@ async def send_reaction(
         "message_id": msg_id,
         "reaction": normalized,
         "big": bool(big),
+    }
+
+
+def _serialize_available_reaction(reaction: Any) -> dict[str, Any] | None:
+    """One ``AvailableReaction`` as ``{reaction, title, premium, inactive}``.
+
+    ``reaction`` is the exact emoji string Telegram exposes and expects back
+    in ``ReactionEmoji`` — never normalized, never substituted. A record
+    without a usable reaction string is refused (``None``) so it can never be
+    offered as a selectable option.
+    """
+    if not isinstance(reaction, AvailableReaction):
+        return None
+    value = getattr(reaction, "reaction", None)
+    if not isinstance(value, str) or not value:
+        return None
+    title = getattr(reaction, "title", None)
+    return {
+        "reaction": value,
+        "title": title if isinstance(title, str) else "",
+        "premium": bool(getattr(reaction, "premium", False)),
+        "inactive": bool(getattr(reaction, "inactive", False)),
+    }
+
+
+async def get_available_reactions(
+    client: Any,
+    *,
+    hash: int = 0,
+) -> dict[str, Any]:
+    """Read the account's available-reaction catalog from Telegram.
+
+    Sends exactly ONE ``messages.GetAvailableReactionsRequest`` with a bounded
+    timeout and returns a plain dict:
+
+    ``{"ok": True, "modified": bool, "hash": int, "reactions": [...]}``
+
+    where each reaction is ``{reaction, title, premium, inactive}``.
+    ``modified=True`` means Telegram answered ``AvailableReactionsNotModified``
+    — the caller's cached catalog (matching ``hash``) is still current, so
+    ``reactions`` is empty and MUST NOT be read as "no reactions".
+
+    Raises ``TelegramAPIError`` for an unusable client or a failed call and
+    ``TelegramTimeoutError`` when the bounded call does not answer. An
+    unexpected/unsupported response shape fails closed (``ok=False``) rather
+    than fabricating a catalog.
+    """
+    if client is None:
+        raise TelegramAPIError("get_available_reactions requires a connected client")
+    try:
+        response = await guarded_await(
+            client(GetAvailableReactionsRequest(hash=int(hash))),
+            name="telegram:get_available_reactions",
+            timeout=_SHORT_CALL_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        raise TelegramTimeoutError(
+            f"get_available_reactions timed out after {_SHORT_CALL_TIMEOUT:g}s"
+        )
+    except Exception as exc:
+        if isinstance(exc, TelegramAPIError):
+            raise
+        raise TelegramAPIError(f"get_available_reactions failed: {exc}") from exc
+
+    if isinstance(response, tl_types.messages.AvailableReactionsNotModified):
+        return {"ok": True, "modified": True, "hash": int(hash), "reactions": []}
+    if not isinstance(response, tl_types.messages.AvailableReactions):
+        raise TelegramAPIError(
+            "get_available_reactions received an unexpected response "
+            f"({type(response).__name__})"
+        )
+    raw = list(getattr(response, "reactions", None) or [])[:MAX_AVAILABLE_REACTIONS]
+    serialized: list[dict[str, Any]] = []
+    for record in raw:
+        item = _serialize_available_reaction(record)
+        if item is not None:
+            serialized.append(item)
+    new_hash = getattr(response, "hash", hash)
+    return {
+        "ok": True,
+        "modified": False,
+        "hash": int(new_hash) if isinstance(new_hash, int) else int(hash),
+        "reactions": serialized,
     }

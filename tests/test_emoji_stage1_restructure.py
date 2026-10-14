@@ -1,17 +1,17 @@
-"""Emoji Stage 1 — panel restructure + Auto-Reaction setting entry.
+"""Emoji panel restructure — Auto-Reaction setting entry + Stage 2 cleanup.
 
-Pins the Stage 1 scope only:
+Pins the panel scope:
 
-* The Emoji primary panel remains the single-button diagnostic workflow
-  (there is NO "Custom Emoji category" entry point anywhere to remove — the
-  category concept that exists is the §26 *Custom Category*, which is out of
-  scope and preserved);
+* The Emoji primary panel remains the single-button diagnostic workflow;
 * The Emoji sub-panels keep their standard Back/Home/Close navigation, wired
   to the existing navigation handlers, and a missing/expired nav session
   fails safe (no crash);
 * General exposes an Auto-Reaction ON/OFF setting that toggles through the
   EXISTING ``settings_service`` persistence path, re-renders the stored
-  value, and never starts a reaction engine.
+  value, and never starts a reaction engine;
+* Stage 2 removed the "Custom Emoji" category feature (ROADMAP §26 — the
+  custom/composed category UI and its Compose/source machinery), so no such
+  entry point, panel or action remains registered.
 
 Everything runs offline: panels are driven directly and the settings service
 uses its in-memory cache (no Supabase, no Telegram).
@@ -82,9 +82,8 @@ def _texts(buttons) -> list[str]:
 def test_no_custom_emoji_category_entry_point_exists():
     """There is no 'Custom Emoji category' anywhere in the Emoji panel surface.
 
-    The only 'custom' concept is the §26 Custom Category (a composed category
-    type), which Stage 1 must NOT remove. This pins that the primary panel
-    carries no such entry point to begin with.
+    Stage 2 removed the §26 Custom Category (custom/composed) feature, so the
+    primary panel carries no such entry point and none exists elsewhere.
     """
     emoji.register(client=None, owner_id=OWNER)
     _title, _body, buttons = _run(emoji._emoji_panel_handler(None, ""))
@@ -97,25 +96,45 @@ def test_no_custom_emoji_category_entry_point_exists():
 
 
 def test_primary_panel_stays_single_button_diagnostic():
-    """Stage 1 does not regress the prior single-button acceptance test."""
+    """The prior single-button acceptance test is not regressed."""
     _title, _body, buttons = _run(emoji._emoji_panel_handler(None, ""))
     assert _datas(buttons) == [f"action:{emoji._DIAGNOSTICS_ACTION}"]
 
 
-def test_custom_category_capability_is_preserved():
-    """The §26 Custom Category UI stays registered (not removed by Stage 1)."""
+def test_custom_category_feature_is_removed():
+    """Stage 2 removed the Custom Category feature end to end.
+
+    No custom-creation entry point, no compose panel, no compose/refresh
+    actions, and the category service no longer exposes the composition API.
+    """
     emoji.register(client=None, owner_id=OWNER)
-    assert get_action("emoji_cat_new_custom") is not None
-    assert get_panel(emoji._CATEGORIES_PANEL) is not None
-    assert get_panel(emoji._COMPOSE_PANEL) is not None
+    assert get_action("emoji_cat_new_custom") is None
+    assert get_action("emoji_compose") is None
+    assert get_action("emoji_compose_add") is None
+    assert get_action("emoji_compose_rm") is None
+    assert get_action("emoji_compose_apply") is None
+    assert get_action("emoji_compose_confirm") is None
+    assert get_action("emoji_refresh") is None
+    assert get_panel("emoji_compose") is None
+    assert get_panel("emoji_sources") is None
+    assert not hasattr(emoji, "_COMPOSE_PANEL")
+    assert not hasattr(emoji, "_SOURCE_PICKER_PANEL")
+    from backend.services import emoji_category_service as cat_service
+    for name in (
+        "compose_category", "refresh_category", "plan_composition",
+        "category_sources", "is_custom_category",
+    ):
+        assert not hasattr(cat_service, name), name
+    assert not hasattr(cat_service, "E_NOT_CUSTOM")
 
 
-def test_other_emoji_capabilities_remain_accessible():
-    """Library / categories / replacement / reactions stay registered."""
+def test_ordinary_categories_remain_accessible():
+    """Ordinary category/mapping/reaction capabilities stay registered."""
     emoji.register(client=None, owner_id=OWNER)
     assert get_panel(emoji._LIBRARY_PANEL) is not None
     assert get_panel(emoji._CATEGORIES_PANEL) is not None
     assert get_panel(emoji._REPLACEMENT_PANEL) is not None
+    assert get_action("emoji_cat_new") is not None
     assert get_action("emoji_import") is not None
     assert get_action("emoji_react") is not None
 
