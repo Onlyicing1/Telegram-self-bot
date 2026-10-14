@@ -114,7 +114,13 @@ justified.
 
 ## 6. Delivery
 
-* **Branch:** `main` (fast-forward).
-* **Commit:** recorded in the delivery block below after the push.
-
-<!-- DELIVERY_BLOCK -->
+* **Branch:** `main` (fast-forward; no history rewrite, no force-push).
+* **Commit:** `fbdf9c4296338453e2bb4afb9a591624bad30df0` — subject
+  `feat(emoji): Stage 1 panel restructure + Auto-Reaction setting entry`.
+* **Local HEAD:** `fbdf9c4296338453e2bb4afb9a591624bad30df0`.
+* **`origin/main`:** `fbdf9c4296338453e2bb4afb9a591624bad30df0` — verified with
+  `git fetch origin` → `git rev-parse origin/main` →
+  `git merge-base --is-ancestor HEAD origin/main` (exit 0). The push advanced
+  `origin/main` `15fa807..fbdf9c4`.
+* **Remote reachability:** confirmed — `origin/main` and local HEAD are the same
+  commit, and the intended commit is an ancestor of `origin/main`.

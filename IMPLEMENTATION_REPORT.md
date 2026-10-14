@@ -120,11 +120,18 @@ setting is a known/validated key; and toggling starts no reaction engine.
 
 ---
 
-## 4. Commit and remote-push status
+## 4. Commit and remote-push status (verified)
 
-* **Branch:** `main` (fast-forward). Commit SHA, message, local HEAD,
-  `origin/main` SHA, and the remote reachability check are recorded in
-  `INVESTIGATION.md` §6 after the push.
+* **Branch:** `main` (fast-forward; no history rewrite, no force-push).
+* **Commit:** `fbdf9c4296338453e2bb4afb9a591624bad30df0` — subject
+  `feat(emoji): Stage 1 panel restructure + Auto-Reaction setting entry`.
+* **Local HEAD:** `fbdf9c4296338453e2bb4afb9a591624bad30df0`.
+* **`origin/main`:** `fbdf9c4296338453e2bb4afb9a591624bad30df0` — verified via
+  `git fetch origin` → `git rev-parse origin/main` →
+  `git merge-base --is-ancestor HEAD origin/main` (exit 0). The push advanced
+  `origin/main` `15fa807..fbdf9c4`.
+* **Working tree:** clean after the delivery-block commit (no untracked files;
+  no unrelated changes present).
 
 ---
 
