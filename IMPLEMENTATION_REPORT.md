@@ -1,18 +1,19 @@
-# IMPLEMENTATION_REPORT.md — Emoji Stage 2: Functional Auto-Reaction Selector + Custom Category Removal
+# IMPLEMENTATION_REPORT.md — Emoji Stage 3: The Auto-Reaction Engine
 
 This file describes **only** the current state of the repository after this
 task and **replaces every previous report in full**. Earlier reports (the
-Emoji Stage 1 panel restructure `34bed87`/`fbdf9c4`, the one-button Emoji
-diagnostic panel `4c12ff3`/PR #185, the unified diagnostics `50b035a`/PR #184,
-and the premium-emoji entitlement diagnosis `78d8744`/`798ff4b`/PR #183)
-remain readable in git history.
+Emoji Stage 2 selector + Custom Category removal `9854601`, the Emoji Stage 1
+panel restructure `34bed87`/`fbdf9c4`, the one-button Emoji diagnostic panel
+`4c12ff3`/PR #185, the unified diagnostics `50b035a`/PR #184, and the
+premium-emoji entitlement diagnosis `78d8744`/`798ff4b`/PR #183) remain
+readable in git history.
 
 | Item | Value |
 |---|---|
-| Task | **Emoji Stage 2** — complete the Auto-Reaction settings UI with a Telegram-sourced reaction selector, and remove the ROADMAP §26 Custom Category feature |
+| Task | **Emoji Stage 3** — implement the end-to-end Auto-Reaction engine that consumes the Stage 2 setting and applies the selected Telegram reaction to eligible owner-authored outgoing messages |
 | Project / remote | LifeOS Telegram self-bot, `Onlyicing1/Telegram-self-bot` (`origin` = `https://github.com/Onlyicing1/Telegram-self-bot.git`) |
 | Branch / delivery target | checked-out `feat/emoji-panel-single-diagnostic-button` == `origin/main`; delivery target `origin/main` |
-| Base revision | `34bed87d80af0e94e25954b3dbac601552bfe14f` — verified `= origin/main` at task start |
+| Base revision | `98546016b16494f023df68f851d8897bce9c211d` — verified `= origin/main` at task start |
 | Telethon | **`telethon==1.34.0`** (`backend/requirements.txt:1`) |
 | Live Telegram send/read-back in this workspace | **NO — not performed.** No `.env`, no credentials; `backend/config.load()` hard-fails. **No Telegram request of any kind was made here** |
 | Does this prove the feature works on live Telegram? | **NO.** Offline behavior is verified; live acceptance remains unverified |
@@ -21,82 +22,62 @@ remain readable in git history.
 
 ## 1. What was implemented
 
-### 1.1 Telegram-sourced reaction selection (new)
+### 1.1 The engine (`backend/services/auto_reaction_service.py`, new)
 
-* **`backend/telegram_api/reactions.py`** — added
-  `get_available_reactions(client, *, hash=0)`: one typed
-  `messages.GetAvailableReactionsRequest` through the existing self client,
-  bounded by the existing `guarded_await` watchdog, returning a plain dict
-  `{"ok", "modified", "hash", "reactions": [{reaction, title, premium,
-  inactive}]}`. `AvailableReactionsNotModified` is reported as
-  `modified=True` (distinct from an empty catalog); an unexpected response
-  fails closed (`TelegramAPIError`). `_serialize_available_reaction` keeps the
-  **exact** emoji string Telegram exposes (never normalized/substituted) and
-  drops records without a usable value. A defensive `MAX_AVAILABLE_REACTIONS`
-  bound is applied.
-* **`backend/services/reaction_source_service.py`** (new) — the single source
-  of selectable options. Options come **only** from Telegram's catalog; each
-  option's `reaction` is the shared `{"kind": "emoji", "emoji": <value>}`
-  shape the existing `send_reaction` path expects. Inactive/unusable records
-  are dropped. A bounded in-process TTL cache (`CACHE_TTL_S = 300`) serves the
-  selector and an explicit `force=True` (Refresh) always re-reads;
-  `AvailableReactionsNotModified` keeps the cached catalog. Honest
-  `E_NO_CLIENT` / `E_TELEGRAM` / `E_EMPTY` failures; no client/loop/scheduler/
-  AI of its own.
+The deterministic execution layer behind the Auto-Reaction setting. One entry
+point, `process_outgoing_message(*, owner_id, client, message, via_bot_id)`:
 
-### 1.2 Settings UI + functional selector (new)
+1. **Ownership re-proof.** The message dict must carry ``out is True`` and
+   ``sender_id == owner_id``; otherwise `skipped_not_owner_authored`. (The
+   handler already gates on `is_owner`; this is the same second proof the
+   Phase 4 replacement service performs.)
+2. **Inline-origin exclusion.** A message with a `via_bot_id` (the Glass UI
+   panel machinery) is `skipped_inline_origin` — never reacted to.
+3. **Bounded deduplication.** A small in-memory registry of
+   `(chat_id, message_id)` (TTL 900 s, cap 512, `OrderedDict`) makes a
+   duplicate `NewMessage` for the same message id `skipped_duplicate`. The
+   key is recorded **before** the RPC so an in-flight duplicate is also a
+   no-op.
+4. **Pending-input exclusion.** A message the owner is typing into a panel
+   input flow (`input_state.get_pending`) is `skipped_pending_input`.
+5. **Typed settings read.** `settings_service.is_auto_reaction_enabled()` and
+   `settings_service.auto_reaction_emoji()` — the SAME values the Glass UI
+   writes, so a toggle/selection change is honored on the next message with no
+   restart. Disabled ⇒ `skipped_disabled`; no usable reaction ⇒
+   `skipped_no_reaction` (logged) — **never a fabricated fallback**.
+6. **One reaction attempt.** The selected value is normalized to the exact
+   `{"kind": "emoji", "emoji": <value>}` shape and applied through the
+   **existing** `reaction_service.react_to_message` (which resolves the
+   explicit target and sends exactly one `SendReactionRequest`). Success ⇒
+   `reacted`; a Telegram error / flood wait / rejection / foreign target ⇒
+   `failed` with a bounded warning — no retry, no retry storm.
 
-* **`backend/services/settings_service.py`** — added the
-  `auto_reaction_emoji` setting (default `""`, `_validate_nonempty_str`
-  validator) with `auto_reaction_emoji()` / `set_auto_reaction_emoji()`,
-  persisted through the **existing** `panel_settings` path.
-* **`backend/bot/handlers/misc.py`** — the General panel now shows the
-  selected reaction and gains a `😀 Select Reaction` entry
-  (`panel:general_reactions`). The new `general_reactions` picker panel is a
-  sub-panel of General (standard Back/Home/Close), renders **real Telegram
-  options** (2-per-row, 10/page, paginated), marks the current selection with
-  `✓`, and offers `🔄 Refresh`. Selecting an option
-  (`action:general_reaction_set:<index>`) persists the **exact** emoji the
-  catalog exposed — the callback carries the **index**, resolved
-  server-side against the same cached catalog; an out-of-range index or a
-  missing catalog fails closed without changing the setting. An empty catalog
-  renders an honest notice and no selectable options.
+No client/loop/scheduler/executor/AI of its own; nothing from `backend.ai` is
+imported; `asyncio.create_task`/`ensure_future`/`call_later` do not appear.
 
-### 1.3 Custom Category removal (§26)
+### 1.2 The handler (`backend/bot/handlers/auto_reaction.py`, new)
 
-* **`backend/bot/handlers/emoji.py`** — removed the `🧩 New custom category`
-  button, the compose/source-picker panels (`_COMPOSE_PANEL`,
-  `_SOURCE_PICKER_PANEL`) and their handlers, the `emoji_compose*` /
-  `emoji_refresh` / `emoji_cat_new_custom` actions, and the custom branches in
-  the categories/detail/mappings/mapping-edit/mapping-delete surfaces.
-  Ordinary category/mapping/reaction capability is preserved.
-* **`backend/services/emoji_category_service.py`** — removed the composition
-  API (`compose_category`, `refresh_category`, `plan_composition`,
-  `category_sources`, `is_custom_category`), the `E_*` composition error
-  codes, the `json` import, the `is_custom` parameter of `create_category`
-  and the Phase-5 docstring paragraph. `create_category(owner_id, raw_name)`
-  now creates ordinary categories only.
-* **`backend/db/client.py`** — removed `set_emoji_category_sources` (sync +
-  async wrappers), which existed exclusively for custom-category composition.
-* **Physical schema left untouched.** The MANUAL-ONLY
-  `emoji_categories.is_custom` / `source_category_ids` columns and their
-  migration `20260928000001_create_emoji_reaction_tables.sql` are **not**
-  dropped (destructive DDL, out of scope; nothing reads or writes them). The
-  canonical setup block in `DATABASE_ARCHITECTURE.md` is byte-identical.
+One more `events.NewMessage(outgoing=True)` handler on the existing self-client
+update path. It calls `is_owner`, serializes the message, and hands it to the
+service; it catches everything (re-raising `CancelledError`) so one failure can
+never break the general update loop. Nothing is ever posted back into the chat.
+
+### 1.3 Router wiring (`backend/bot/router.py`)
+
+Registered as `("auto_reaction", lambda: auto_reaction.register(client,
+owner_id))`, **immediately before** the replacement pipeline. Rationale: the
+reaction targets the ORIGINAL message id, so the handler must run before the
+Phase 4 pipeline deletes/replaces the original (which runs last, unchanged).
 
 ### 1.4 Documentation
 
-* **`ROADMAP.md`** — §26 marked **REMOVED (Emoji Stage 2)**; §27 gains the
-  Stage 2 catalog-read + selector additions; the Phase-5 slice lines, the
-  §10 Custom-type line, decision §34-F (now VOID), and the §32 summary updated
-  to reflect the removal. No unrelated section was rewritten.
-* **`DATABASE_ARCHITECTURE.md`** — documents the proposed (MANUAL-ONLY,
-  unexecuted) `panel_settings.auto_reaction_emoji text NOT NULL DEFAULT ''`
-  column and its idempotent SQL, alongside the existing
-  `auto_reaction_enabled` note; the typed-accessor count updated 13 → 14.
-* **`INVESTIGATION.md`** — fully replaced with this task's evidence-based
-  investigation.
+* **`ROADMAP.md`** — §27 and the header/summary now record the Stage 3 engine
+  as IMPLEMENTED + TESTED offline; the "engine remains deferred" statements
+  were updated.
 * **`IMPLEMENTATION_REPORT.md`** — this file (fully replaced).
+
+No database change: the engine reuses the existing `panel_settings` typed
+accessors and the existing reaction send path. No SQL was executed.
 
 ---
 
@@ -104,23 +85,15 @@ remain readable in git history.
 
 Production:
 
-* `backend/telegram_api/reactions.py` (add catalog read)
-* `backend/services/reaction_source_service.py` (**new**)
-* `backend/services/settings_service.py` (add `auto_reaction_emoji`)
-* `backend/bot/handlers/misc.py` (General body + reaction picker panel/actions)
-* `backend/bot/handlers/emoji.py` (remove Custom Category UI)
-* `backend/services/emoji_category_service.py` (remove composition API)
-* `backend/db/client.py` (remove `set_emoji_category_sources`)
+* `backend/services/auto_reaction_service.py` (**new**)
+* `backend/bot/handlers/auto_reaction.py` (**new**)
+* `backend/bot/router.py` (register the handler before `emoji_replacement`)
 
 Tests:
 
-* `tests/test_emoji_stage2_reactions.py` (**new**, 27 tests)
-* `tests/test_emoji_stage1_restructure.py` (updated to pin the removal)
-* `tests/test_emoji_composition_phase5.py` (**deleted** — the feature it
-  pinned no longer exists)
+* `tests/test_auto_reaction_phase7.py` (**new**, 28 tests)
 
-Docs: `ROADMAP.md`, `DATABASE_ARCHITECTURE.md`, `INVESTIGATION.md`,
-`IMPLEMENTATION_REPORT.md`.
+Docs: `ROADMAP.md`, `IMPLEMENTATION_REPORT.md`.
 
 ---
 
@@ -128,73 +101,86 @@ Docs: `ROADMAP.md`, `DATABASE_ARCHITECTURE.md`, `INVESTIGATION.md`,
 
 | Command | Result |
 |---|---|
-| `python -m pytest tests/test_emoji_stage2_reactions.py -q` | **27 passed** |
-| `python -m pytest tests/test_emoji_stage1_restructure.py -q` | **21 passed** |
-| Emoji/reaction regression subset (`stage2` + `stage1` + `test_emoji_ui` + `test_emoji_category_service` + `test_emoji_ui_phase2` + `test_reaction_phase6` + `test_emoji_replacement_phase4`) | **315 passed** |
-| `python -m pytest -q` (full suite) | **5885 passed, 27 skipped** (117s) |
+| `python -m pytest tests/test_auto_reaction_phase7.py -q` | **28 passed** |
+| Focused + regression subset (`phase7` + `test_reaction_phase6` + `test_emoji_stage2_reactions` + `test_emoji_replacement_phase4` + `test_emoji_stage1_restructure` + `test_emoji_ui`) | **247 passed** |
+| `python -m pytest -q` (full suite) | **5913 passed, 27 skipped** (117s) |
 | `python -m compileall -q backend` | exit 0 |
-| `python -m py_compile` on the 7 changed/added modules | OK |
-| `git diff --check` | clean (no whitespace errors) |
+| `python -m py_compile` on the 2 new modules + router + test | OK |
+| `git diff --check` | clean |
 
-The new tests use a fake self client and the real Telethon TL types
-(`AvailableReactions`, `AvailableReactionsNotModified`, `AvailableReaction`)
-— no mocks of the code under test. They cover: wrapper serialization of real
-records; `NotModified` distinct from empty; malformed records dropped;
-unexpected response fails closed; options come from Telegram only; inactive
-records dropped; TTL cache + force refresh; `NotModified` keeps cache; empty
-and no-client and API-error honest failures; the `auto_reaction_emoji`
-default/round-trip/validator; the General selector entry + selected-value
-display; the picker renders real Telegram options (not a hardcoded list);
-selecting persists the exact emoji; stale index fails closed without changing
-the setting; refresh forces a new read; empty catalog shows an honest notice;
-the current selection is marked; the sub-panel gets standard navigation; and
-the source service imports no events/AI/second infrastructure. The Stage 1
-test now pins the Custom Category absence (no entry point, no compose panel/
-actions, no composition service symbols, no `E_NOT_CUSTOM`).
+The new tests use a fake self client at the `__call__`/`get_messages` boundary
+the typed wrapper already consumes (real `SendReactionRequest` / `ReactionEmoji`
+objects, real `FloodWaitError`) — the code under test is never mocked. They
+cover the ten required cases:
+
+1. enabled + eligible outgoing ⇒ the SELECTED reaction sent exactly once (and
+   a second test proves the exact value, not a hardcoded one);
+2. disabled ⇒ nothing sent;
+3. incoming ⇒ nothing sent;
+4. foreign author ⇒ nothing sent (plus inline-origin and pending-input
+   exclusions and a missing-ids case);
+5. missing/invalid selected reaction ⇒ safe no-op;
+6. duplicate update ⇒ no duplicate reaction (and a distinct message does
+   react);
+7. Telegram error / rate limit ⇒ honest `failed`, one attempt, no retry, does
+   not raise (a rejected message is not retried on a duplicate update);
+8. toggle change and selection change are honored on the next message;
+9. exactly one outgoing listener registered, it is the module's only listener,
+   the router registers it once, the engine imports no AI/second client and
+   has no scheduler/executor of its own;
+10. the replacement state is untouched and the dedup registry stays bounded.
 
 ---
 
 ## 4. Commit and remote-push status
 
 The implementation, tests and these report updates are delivered in a single
-commit (message: `feat(emoji): functional auto-reaction selector + remove
-custom category`), pushed to `origin/main` with a normal fast-forward push.
-The exact SHAs (local HEAD and `origin/main`) are verified after the push with
-`git fetch origin` + `git rev-parse origin/main` + `git merge-base
---is-ancestor <sha> origin/main`, and reported in the accompanying task
-summary. This file is committed **inside** that commit, so it cannot embed its
-own SHA.
+commit (message: `feat(emoji): implement the auto-reaction engine (Emoji Stage
+3)`), pushed to `origin/main` with a normal fast-forward push. The exact SHAs
+are verified after the push with `git fetch origin` + `git rev-parse
+origin/main` + `git merge-base --is-ancestor <sha> origin/main` and reported in
+the accompanying task summary. This file is committed inside that commit, so it
+cannot embed its own SHA.
 
 ---
 
-## 5. Deployment and live verification
+## 5. Manual Supabase SQL required
+
+**None.** The engine reuses the existing `panel_settings` settings path
+(`auto_reaction_enabled`, `auto_reaction_emoji`). The
+`panel_settings.auto_reaction_emoji` column is documented MANUAL-ONLY in
+`DATABASE_ARCHITECTURE.md` (Emoji Stage 2); on a configured Supabase without
+it, the write is a no-op and the setting runs on the in-memory cache — the
+engine reads through the same typed accessor either way. No new column, table
+or migration is introduced.
+
+---
+
+## 6. Deployment and live verification
 
 * **Not performed.** No Render deployment evidence was available in this
-  workspace, and no live Telegram request was made. Offline tests, compilation
-  and `git diff --check` are the only verification performed here.
-* The `panel_settings.auto_reaction_emoji` column is MANUAL-ONLY and
-  unapplied; on a configured Supabase without it the write is a no-op and the
-  setting runs on the in-memory cache (documented degradation).
-* The reaction engine that consumes the setting remains deferred.
+  workspace, and no live Telegram request was made (no credentials;
+  `config.load()` hard-fails). Offline tests, compilation and `git diff
+  --check` are the only verification performed here.
+* The reaction is applied through the existing, already-offline-tested
+  `send_reaction` path; live delivery and the applied reaction on a real
+  message remain unverified.
 
-## 6. Remaining limitations and next step
+## 7. Remaining limitations and next step
 
-* **Unverified end-to-end:** the catalog read, the picker, and the persisted
-  selection are verified offline only. A live Telegram check would confirm
-  that opening General → `😀 Select Reaction` lists the account's real
-  reactions and that a selection persists across a panel reopen.
+* **Unverified end-to-end:** the decision and execution paths are verified
+  offline against a fake client. A live Telegram check would confirm that,
+  with the toggle ON and a reaction selected, sending an eligible message
+  applies that reaction to the message.
+* **Design note (ordering):** the auto-reaction handler runs before the
+  replacement pipeline, so the reaction targets the original message id. If
+  the owner's replacement feature is ON for that chat, the original is then
+  deleted and the reaction would be removed with it. This is acceptable for
+  the default single-subsystem usage and is documented here; a cross-subsystem
+  ordering change (e.g. reacting to the reconstructed message) is out of scope
+  for this stage.
+* **Owner-visible failure surfacing** (ROADMAP §28) remains open — a rejected
+  reaction produces a bounded log line, not a chat notification.
 * **Next step:** if live validation is required, run the bot with real
-  credentials and open the selector; no code change is expected. If the owner
-  wants the selected reaction actually applied, that is the deferred
-  **reaction engine** (a separate, not-yet-implemented stage).
-
-## 7. Verified delivery
-
-| Item | Value |
-|---|---|
-| Commit message | `feat(emoji): functional auto-reaction selector + remove custom category` |
-| Delivery | single commit pushed to `origin/main` (normal fast-forward) |
-| Remote verification | `git fetch origin` + `git rev-parse origin/main` + `git merge-base --is-ancestor <sha> origin/main` |
-
-The exact SHAs are reported in the accompanying task summary; the working tree
-is left clean except for any pre-existing unrelated untracked files.
+  credentials, enable Auto-Reaction, select a reaction, send a message, and
+  confirm the reaction is applied; no code change is expected.
