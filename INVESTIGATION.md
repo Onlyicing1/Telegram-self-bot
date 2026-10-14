@@ -1,124 +1,128 @@
-# INVESTIGATION.md — Emoji Stage 2: Functional Auto-Reaction Selector + Custom Category Removal
+# INVESTIGATION.md — Colored Inline Button Styles: Feasibility for the Personal-Account Panel Flow
 
-This file records **only** the current, evidence-based investigation and
-diagnosis for the active task. It **replaces every previous investigation in
-full**; earlier narratives (the Emoji Stage 1 panel restructure, the
-premium-emoji inline entitlement diagnosis, the one-button Emoji diagnostic
-panel) remain readable in git history (`34bed87`, `fbdf9c4`, `78d8744`,
-`798ff4b`, PR #183; `50b035a`, PR #184; `4c12ff3`, PR #185).
+This file records **only** the current, evidence-based investigation for the
+active task and **replaces every previous investigation in full**; earlier
+narratives (Emoji Stage 3 auto-reaction engine `9073979`, Emoji Stage 2
+selector `9854601`, Emoji Stage 1 `34bed87`/`fbdf9c4`, and the premium-emoji
+diagnoses `78d8744`/`798ff4b`/`50b035a`/`4c12ff3`) remain readable in git
+history.
 
 | Item | Value |
 |---|---|
 | Project / remote | LifeOS Telegram self-bot, `Onlyicing1/Telegram-self-bot` (`origin` = `https://github.com/Onlyicing1/Telegram-self-bot.git`) |
 | Target branch | `main` (delivery target `origin/main`) |
-| Base revision | `34bed87d80af0e94e25954b3dbac601552bfe14f` — verified `= origin/main` at task start (`git fetch origin` + `git rev-parse origin/main`) |
-| Telethon | **`telethon==1.34.0`** (`backend/requirements.txt:1`) |
-| Investigation method | Source inspection + the repository's own test suite, executed locally |
-| Live Telegram | **NOT performed here.** No `.env`, no credentials; `backend/config.load()` hard-fails. No Telegram request of any kind was made |
+| Base revision | `90739792183158de953b82cff2378ef1f118c12f` — verified `= origin/main` at task start (`git fetch origin` + `git rev-parse origin/main`) |
+| Telethon | **`telethon==1.34.0`**, TL **Layer 173** (`backend/requirements.txt:1`; `telethon/tl/alltlobjects.py` → `LAYER = 173`) |
+| Investigation method | Source inspection of the pinned dependency + the current renderer, with **executable local probes**; repository test suite run locally |
+| Live Telegram | **NOT performed.** No `.env`, no credentials (`API_ID`/`API_HASH`/`SESSION_STRING`/`BOT_OWNER_ID`/`BOT_TOKEN` all unset); `backend/config.load()` hard-fails. **No Telegram request of any kind was made** |
 
 ---
 
 ## 1. Task under investigation
 
-Two deliverables:
-
-1. **Complete the Auto-Reaction settings UI** — the Emoji Stage 1 report
-   implemented only a bare ON/OFF toggle under General and left the feature
-   without a functional reaction selector.
-2. **Remove the "Custom Category" feature** — the brief's "Custom Emoji
-   category" premise does not match the repository; the actual referent is
-   the ROADMAP **§26 Custom Category** (the `🧩 New custom category` entry
-   point, its Compose panel and source-category picker), which is to be
-   removed.
+Determine whether named colored inline-button styles (`primary`, `success`,
+`danger`) can be used by the current **personal-account** self-bot through its
+existing inline-panel flow — establishing *actual* compatibility, not merely
+schema existence. Four separate claims must be kept distinct: **class/field
+existence**, **Telethon construction + serialization**, **Telegram request
+acceptance (live)**, and **visible client rendering (live)**.
 
 ## 2. Repository state at task start (verified)
 
 * Branch `feat/emoji-panel-single-diagnostic-button`; local HEAD =
-  `origin/main` = `34bed87`; working tree **clean** (no untracked files).
-  Note: the checked-out branch is not literally named `main` but **is the
-  current `origin/main` head** — HEAD == `origin/main` == `34bed87`. The local
-  `main` ref lags at `3159587` (an ancestor).
-* Documents read: `AGENTS.md`, `IMPLEMENTATION_REPORT.md`, `INVESTIGATION.md`,
-  and the actual roadmap file `ROADMAP.md` (Emoji & Reaction). `ROADMAP.md`
-  status: Phase 0 (code half) + Phases 1–6 done offline; Phase 7 (hardening)
-  + live validation remain PLANNED.
-* Files inspected per the brief: `backend/services/premium_emoji_inline_service.py`,
-  `backend/helper/inline_engine.py`, `backend/bot/handlers/emoji.py`,
-  `tests/test_premium_emoji_inline.py`, `backend/requirements.txt`. The
-  Premium Custom Emoji Inline flow is **not** the current task; it was
-  previously diagnosed as a bot-entitlement restriction (`78d8744`) and no
-  code change is made to it here.
+  `origin/main` = `9073979`; working tree **clean**. (The checked-out branch is
+  not literally named `main` but **is the current `origin/main` head**.)
+* No production changes were made by this task (see §5).
 
-## 3. Findings
+## 3. Source findings (verified)
 
-### 3.1 "Custom Emoji category" == ROADMAP §26 Custom Category
+### 3.1 The official MTProto schema *does* define the feature
 
-An exhaustive search (source, tests, docs, full git history) found **no literal
-"Custom Emoji category"**. The Emoji Stage 1 report itself named the referent
-as the "Custom *Category*". `ROADMAP.md` §26 documents the feature exactly:
+* `keyboardButtonStyle#4fdd3430 flags:# bg_primary:flags.0?true
+  bg_danger:flags.1?true bg_success:flags.2?true icon:flags.3?long =
+  KeyboardButtonStyle;` — only three **predefined** background flags
+  (primary = dark blue, danger = red, success = green); **no arbitrary
+  RGB/HEX** mechanism. (https://core.telegram.org/constructor/keyboardButtonStyle)
+* `keyboardButtonCallback#e62bc960 flags:# requires_password:flags.0?true
+  style:flags.10?KeyboardButtonStyle text:string data:bytes = KeyboardButton;`
+  — the callback button carries an optional `style` field.
+  (https://core.telegram.org/constructor/keyboardButtonCallback)
+* These constructors are **Layer 225** additions (the page's layer list), i.e.
+  newer than the project's pinned Layer 173.
 
-> `## 26. Custom Category` … `UI: categories panel → "🧩 New custom category"
-> (name input) → compose panel (ordered source list, add/remove, Compose,
-> Refresh, Mappings) → 2×5 source picker …`
+### 3.2 The pinned Telethon (1.34.0 / Layer 173) cannot construct or serialize it
 
-The concrete surface to remove was mapped precisely:
+Executable probes against the installed package:
 
-* **UI** (`backend/bot/handlers/emoji.py`): the `🧩 New custom category`
-  button, the compose/source-picker panels and their handlers/actions.
-* **Service** (`backend/services/emoji_category_service.py`): the composition
-  API (`compose_category`, `refresh_category`, `plan_composition`,
-  `category_sources`, `is_custom_category`) and the `E_*` composition error
-  codes.
-* **DB** (`backend/db/client.py`): `set_emoji_category_sources` — exclusively
-  custom-category infrastructure.
+| Probe | Result |
+|---|---|
+| `hasattr(telethon.tl.types, "KeyboardButtonStyle")` | **False** — the class does not exist |
+| `grep -rin style telethon/tl/**` | 0 relevant hits (only an unrelated docstring in `custom/file.py`) |
+| `inspect.signature(KeyboardButtonCallback.__init__)` | `(text: str, data: bytes, requires_password: Optional[bool] = None)` — **no `style`** |
+| `KeyboardButtonCallback.CONSTRUCTOR_ID` | `0x35bbdb6b` (the **pre-style** id; schema `0xe62bc960` is the styled one) |
+| `Button.inline("OK", b"x", style="primary")` | `TypeError: Button.inline() got an unexpected keyword argument 'style'` |
+| `KeyboardButtonCallback("OK", b"x", style="primary")` | `TypeError: ... unexpected keyword argument 'style'` |
+| `Button.inline("OK", b"payload")._bytes()` | `b'k\xdb\xbb5\x00\x00\x00\x00\x02OK\x00\x07payload'` — flags word carries **only bit 0** (`requires_password`); no `flags.10` exists to set |
+| `render(...)` full `InputBotInlineResult._bytes()` contains `b"style"` | **False** |
 
-### 3.2 The Auto-Reaction setting was incomplete
+**Interpretation:** `KeyboardButtonStyle` (class existence) is **absent** from
+the pinned version, and the button type has **no `style` field**, so Telethon
+1.34.0 **cannot construct or serialize** a styled button. The result would
+silently degrade to an ordinary, unstyled button — there is no way to smuggle a
+style through this version.
 
-`settings_service` exposed `auto_reaction_enabled` (Stage 1) but there was
-**no selectable reaction value** and **no Telegram-sourced catalog**. The
-General panel had only the toggle. There was no way for the owner to choose
-which reaction the (future) engine would apply, and no code path read
-Telegram's own available-reaction list.
+### 3.3 The current renderer cannot preserve a style even if one were attached
 
-## 4. Diagnosis (evidence-based)
+`backend/helper/panel_render.py::_normalize_button` (lines 36-56):
 
-* **Custom Category removal** is a pure application-level subtraction. The
-  feature's physical schema (`emoji_categories.is_custom` /
-  `source_category_ids`, migration `20260928000001_create_emoji_reaction_tables.sql`)
-  is **MANUAL-ONLY** and unexecuted; dropping columns is destructive DDL that
-  is out of scope. The correct, minimal action is to remove the UI/service/db
-  **code** and leave the physical columns untouched (nothing reads or writes
-  them). The canonical setup block is therefore left byte-identical.
-* **The reaction selector** needs a real source. Telegram exposes the account's
-  catalog through `messages.GetAvailableReactionsRequest`
-  (`telethon.tl.functions.messages`), answered by
-  `telethon.tl.types.messages.AvailableReactions` (with `reactions:
-  list[AvailableReaction]` and a `hash`) or `AvailableReactionsNotModified`
-  (catalog unchanged). Each `AvailableReaction` carries `reaction` (the exact
-  emoji string `ReactionEmoji` expects back), `title`, `premium`, `inactive`.
-  This is the **only** legitimate source — no hardcoded list and no Unicode
-  catalog substitute.
+* A real `KeyboardButtonCallback` with a different display font is rebuilt via
+  `Button.inline(styled, btn.data)` — a fresh **unstyled** object; any style
+  attribute is dropped.
+* A duck-typed object exposing `text`+`data` is returned **unchanged**, but such
+  an object is not a `TLObject` and cannot be serialized into an outgoing
+  request, so it cannot carry a style to Telegram either.
+* Tuples `("Text", "data")` (the format used throughout the panels) become
+  `Button.inline(text, data)` — no style channel at all.
 
-## 5. Scope decisions
+There is **no style parameter, no style field, and no style-preserving path**
+anywhere in the renderer.
 
-* **No new database.** The selected reaction is persisted through the
-  **existing** `settings_service` (`panel_settings`) path as a new column
-  `auto_reaction_emoji`, documented in `DATABASE_ARCHITECTURE.md` for the
-  owner to apply manually (same graceful-degradation contract as every other
-  `panel_settings` column). No SQL is executed.
-* **No second infrastructure.** The catalog read is one typed request through
-  the existing self client, wrapped by the existing `guarded_await` watchdog;
-  the picker is a normal sub-panel of General (no new listener/scheduler/
-  executor/update loop).
-* **Fail closed.** An empty catalog, an unsupported response, or an
-  out-of-range selection index is reported honestly and never fabricated.
+### 3.4 Sending path (context)
 
-## 6. Unresolved / unverified
+The panels are rendered as inline **results** and clicked through the helper
+bot (`backend/helper/inline_engine.py`, `backend/helper/inline_sender.py`).
+`reply_markup` on `messages.sendMessage` is documented as "Reply markup for
+sending **bot** buttons", and `keyboardButtonCallback` is documented as
+"clients send data **to the bot**" — so the style is applied to a
+helper-bot-authored inline keyboard, which is the existing, unchanged flow.
 
-* Live Telegram is **not** exercised here. The catalog read, the picker, and
-  the persisted selection are verified offline against a fake self client.
-* The `panel_settings.auto_reaction_emoji` column is MANUAL-ONLY and
-  unapplied; on a configured Supabase without it, the write is a no-op and
-  the setting runs on the in-memory cache (documented degradation).
-* The reaction engine that would consume the setting remains deferred/not
-  implemented (unchanged from Stage 1).
+## 4. Live verification — blocked
+
+A controlled live test (construct → send from the personal account → observe
+rendering → confirm callback routing) **could not be performed**: there is no
+authorized session or safe test destination in this workspace (no `.env`, all
+required credentials unset; `config.load()` hard-fails). Per the task's Step 2,
+the investigation stops after source-level verification and does **not** claim
+that colored buttons work.
+
+## 5. Conclusion
+
+* **Class/field existence:** exists in the current **schema** (Layer 225) and
+  in newer Telethon (Layer 229 upstream adds `Button.inline(..., style=...)`);
+  **absent** from the pinned **1.34.0**.
+* **Telethon construction/serialization (pinned):** **not supported** —
+  verified by executable probes.
+* **Telegram request acceptance (live):** **unverified** (no live test).
+* **Visible rendering (live):** **unverified** (no live test).
+* **Overall verdict:** **unsupported by the current pinned dependency; the live
+  stages remain not-yet-conclusively-verified.** No production change was made
+  (Step 3: compatibility not established).
+
+## 6. Exact blocker and next step
+
+**Blocker:** Telethon `1.34.0` (Layer 173) predates the `keyboardButtonStyle`
+constructor; it exposes no `KeyboardButtonStyle`, no `style` field, and no
+serialization path for it. A dependency upgrade (not authorized here) to a
+Telethon release that includes the Layer-225+ keyboard-button-style constructors
+would be the prerequisite — followed by an authorized live test to confirm
+server acceptance, rendering, and unchanged callback routing.
