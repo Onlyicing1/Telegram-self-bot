@@ -1,128 +1,106 @@
-# INVESTIGATION.md — Colored Inline Button Styles: Feasibility for the Personal-Account Panel Flow
+# INVESTIGATION.md — Colored Inline Buttons: Dependency Selection and Implementation Basis
 
 This file records **only** the current, evidence-based investigation for the
 active task and **replaces every previous investigation in full**; earlier
-narratives (Emoji Stage 3 auto-reaction engine `9073979`, Emoji Stage 2
-selector `9854601`, Emoji Stage 1 `34bed87`/`fbdf9c4`, and the premium-emoji
-diagnoses `78d8744`/`798ff4b`/`50b035a`/`4c12ff3`) remain readable in git
-history.
+narratives (the colored-button feasibility verdict `1396a19`, Emoji Stage 3
+`9073979`, Emoji Stage 2 `9854601`, Emoji Stage 1 `34bed87`/`fbdf9c4`, and the
+premium-emoji diagnoses `78d8744`/`798ff4b`/`50b035a`/`4c12ff3`) remain readable
+in git history.
 
 | Item | Value |
 |---|---|
 | Project / remote | LifeOS Telegram self-bot, `Onlyicing1/Telegram-self-bot` (`origin` = `https://github.com/Onlyicing1/Telegram-self-bot.git`) |
 | Target branch | `main` (delivery target `origin/main`) |
-| Base revision | `90739792183158de953b82cff2378ef1f118c12f` — verified `= origin/main` at task start (`git fetch origin` + `git rev-parse origin/main`) |
-| Telethon | **`telethon==1.34.0`**, TL **Layer 173** (`backend/requirements.txt:1`; `telethon/tl/alltlobjects.py` → `LAYER = 173`) |
-| Investigation method | Source inspection of the pinned dependency + the current renderer, with **executable local probes**; repository test suite run locally |
-| Live Telegram | **NOT performed.** No `.env`, no credentials (`API_ID`/`API_HASH`/`SESSION_STRING`/`BOT_OWNER_ID`/`BOT_TOKEN` all unset); `backend/config.load()` hard-fails. **No Telegram request of any kind was made** |
+| Base revision | `1396a19eac7a9bb2c379992e22923fbcd1862acf` — verified `= origin/main` at task start (`git fetch origin` + `git rev-parse origin/main`) |
+| Runtime | Python **3.13.15** |
+| Telethon | **upgraded `1.34.0` → `1.43.0`** (TL Layer 173 → 224) |
+| Investigation method | Source inspection of candidate wheels + executable probes against the installed package; full repository test suite run locally |
+| Live Telegram | **NOT performed.** No `.env`, no credentials; `backend/config.load()` hard-fails. **No Telegram request of any kind was made** |
 
 ---
 
 ## 1. Task under investigation
 
-Determine whether named colored inline-button styles (`primary`, `success`,
-`danger`) can be used by the current **personal-account** self-bot through its
-existing inline-panel flow — establishing *actual* compatibility, not merely
-schema existence. Four separate claims must be kept distinct: **class/field
-existence**, **Telethon construction + serialization**, **Telegram request
-acceptance (live)**, and **visible client rendering (live)**.
+Implement Telegram's named colored inline-button styles (`primary`, `success`,
+`danger`) in the **existing** LifeOS main panel, through the existing shared
+renderer — provided dependency compatibility and regression checks pass. The
+prior task (`1396a19`) established that the pinned `telethon==1.34.0` (Layer 173)
+has no `KeyboardButtonStyle`, no `style` field, and no serialization path; this
+task resolves the dependency question and implements the feature.
 
-## 2. Repository state at task start (verified)
+## 2. Dependency selection (the specific compatibility question)
 
-* Branch `feat/emoji-panel-single-diagnostic-button`; local HEAD =
-  `origin/main` = `9073979`; working tree **clean**. (The checked-out branch is
-  not literally named `main` but **is the current `origin/main` head**.)
-* No production changes were made by this task (see §5).
+### 2.1 Smallest Telethon release with the required API
 
-## 3. Source findings (verified)
+Candidate wheels were downloaded and inspected (`telethon/tl/alltlobjects.py`,
+`telethon/tl/custom/button.py`) to find the earliest release exposing both the
+`KeyboardButtonStyle` constructor and the `Button.inline(..., style=...)` API:
 
-### 3.1 The official MTProto schema *does* define the feature
+| Telethon | TL Layer | `KeyboardButtonStyle` | `Button.inline(style=)` |
+|---|---|---|---|
+| 1.34.0 (pinned) | 173 | No | No |
+| 1.38.0 | 193 | No | No |
+| 1.40.0 | 214 | No | No |
+| 1.41.0 | 214 | No | No |
+| 1.42.0 | 216 | No | No |
+| **1.43.0** | **224** | **Yes** | **Yes** |
+| 1.44.0 | 227 | Yes | Yes |
+| 1.45.0 | 229 | Yes | Yes |
 
-* `keyboardButtonStyle#4fdd3430 flags:# bg_primary:flags.0?true
-  bg_danger:flags.1?true bg_success:flags.2?true icon:flags.3?long =
-  KeyboardButtonStyle;` — only three **predefined** background flags
-  (primary = dark blue, danger = red, success = green); **no arbitrary
-  RGB/HEX** mechanism. (https://core.telegram.org/constructor/keyboardButtonStyle)
-* `keyboardButtonCallback#e62bc960 flags:# requires_password:flags.0?true
-  style:flags.10?KeyboardButtonStyle text:string data:bytes = KeyboardButton;`
-  — the callback button carries an optional `style` field.
-  (https://core.telegram.org/constructor/keyboardButtonCallback)
-* These constructors are **Layer 225** additions (the page's layer list), i.e.
-  newer than the project's pinned Layer 173.
+**`1.43.0` is the smallest release that supports the feature** and was selected.
+`Requires-Python: >=3.5`, dependencies unchanged (`pyaes`, `rsa`), so it is
+compatible with the project's Python 3.13 and existing usage.
 
-### 3.2 The pinned Telethon (1.34.0 / Layer 173) cannot construct or serialize it
+### 2.2 The API (verified in the installed 1.43.0)
 
-Executable probes against the installed package:
+* `Button.inline(text, data=None, style=None, icon=None)`.
+* `Button._get_style` accepts exactly `{'primary','danger','success'}` or
+  `None`, and raises `ValueError` for anything else (arbitrary RGB/HEX is **not**
+  supported — only the three Telegram-defined background flags).
+* `KeyboardButtonCallback(text, data, requires_password=None, style=None)`,
+  `CONSTRUCTOR_ID = 0xe62bc960`; `KeyboardButtonUrl(text, url, style=None)`,
+  `CONSTRUCTOR_ID = 0xd80c25ec`.
+* `KeyboardButtonStyle(bg_primary, bg_danger, bg_success, icon)`,
+  `CONSTRUCTOR_ID = 0x4fdd3430`.
 
-| Probe | Result |
-|---|---|
-| `hasattr(telethon.tl.types, "KeyboardButtonStyle")` | **False** — the class does not exist |
-| `grep -rin style telethon/tl/**` | 0 relevant hits (only an unrelated docstring in `custom/file.py`) |
-| `inspect.signature(KeyboardButtonCallback.__init__)` | `(text: str, data: bytes, requires_password: Optional[bool] = None)` — **no `style`** |
-| `KeyboardButtonCallback.CONSTRUCTOR_ID` | `0x35bbdb6b` (the **pre-style** id; schema `0xe62bc960` is the styled one) |
-| `Button.inline("OK", b"x", style="primary")` | `TypeError: Button.inline() got an unexpected keyword argument 'style'` |
-| `KeyboardButtonCallback("OK", b"x", style="primary")` | `TypeError: ... unexpected keyword argument 'style'` |
-| `Button.inline("OK", b"payload")._bytes()` | `b'k\xdb\xbb5\x00\x00\x00\x00\x02OK\x00\x07payload'` — flags word carries **only bit 0** (`requires_password`); no `flags.10` exists to set |
-| `render(...)` full `InputBotInlineResult._bytes()` contains `b"style"` | **False** |
+### 2.3 Serialization behaviour (verified by executable probe)
 
-**Interpretation:** `KeyboardButtonStyle` (class existence) is **absent** from
-the pinned version, and the button type has **no `style` field**, so Telethon
-1.34.0 **cannot construct or serialize** a styled button. The result would
-silently degrade to an ordinary, unstyled button — there is no way to smuggle a
-style through this version.
+* A styled button sets `flags.10` and embeds the `KeyboardButtonStyle`; e.g.
+  `Button.inline("Save", b"panel:save", style="primary")._bytes()` begins
+  `b'`\xc9+\xe6\x00\x04\x00\x00'` (`0x400` = bit 10 set).
+* In this Telethon, `Button.inline` always wraps a `KeyboardButtonStyle` (even
+  when no style is requested), so unstyled buttons also set `flags.10` with all
+  `bg_*` unset — a valid, semantically-unstyled wire form. A bare
+  `KeyboardButtonCallback(...)` without `style` sets no `flags.10`.
 
-### 3.3 The current renderer cannot preserve a style even if one were attached
+### 2.4 Regression check of the upgrade
 
-`backend/helper/panel_render.py::_normalize_button` (lines 36-56):
+The **full suite** was run against `telethon==1.43.0` before any code change:
+**5913 passed, 27 skipped** — identical to the recorded `1.34.0` baseline, i.e.
+**no regression** from the upgrade. The suite was run again after the code
+change (see `IMPLEMENTATION_REPORT.md`).
 
-* A real `KeyboardButtonCallback` with a different display font is rebuilt via
-  `Button.inline(styled, btn.data)` — a fresh **unstyled** object; any style
-  attribute is dropped.
-* A duck-typed object exposing `text`+`data` is returned **unchanged**, but such
-  an object is not a `TLObject` and cannot be serialized into an outgoing
-  request, so it cannot carry a style to Telegram either.
-* Tuples `("Text", "data")` (the format used throughout the panels) become
-  `Button.inline(text, data)` — no style channel at all.
+## 3. Implementation basis (current renderer)
 
-There is **no style parameter, no style field, and no style-preserving path**
-anywhere in the renderer.
+`backend/helper/panel_render.py::_normalize_button` normalizes tuples and
+`Button` objects. The prior version rebuilt a font-restyled button via
+`Button.inline(styled, btn.data)` — dropping any style — and had no style
+channel. This task adds a minimal style path (see `IMPLEMENTATION_REPORT.md`)
+that preserves the selected style through normalization, display-text
+formatting, inline-result construction, and the existing callback path.
 
-### 3.4 Sending path (context)
+## 4. Conclusion
 
-The panels are rendered as inline **results** and clicked through the helper
-bot (`backend/helper/inline_engine.py`, `backend/helper/inline_sender.py`).
-`reply_markup` on `messages.sendMessage` is documented as "Reply markup for
-sending **bot** buttons", and `keyboardButtonCallback` is documented as
-"clients send data **to the bot**" — so the style is applied to a
-helper-bot-authored inline keyboard, which is the existing, unchanged flow.
+* **Dependency compatibility:** confirmed — `1.43.0` provides the constructor,
+  the field, and the serialization path; the upgrade caused no test regression.
+* **Source-level implementation:** complete (see `IMPLEMENTATION_REPORT.md`).
+* **Live Telegram acceptance / visual rendering / callback delivery:**
+  **unverified** — no credentials or safe test destination in this workspace.
+  No Telegram request was made. The feature is **not** claimed live-verified.
 
-## 4. Live verification — blocked
+## 5. Remaining limitation
 
-A controlled live test (construct → send from the personal account → observe
-rendering → confirm callback routing) **could not be performed**: there is no
-authorized session or safe test destination in this workspace (no `.env`, all
-required credentials unset; `config.load()` hard-fails). Per the task's Step 2,
-the investigation stops after source-level verification and does **not** claim
-that colored buttons work.
-
-## 5. Conclusion
-
-* **Class/field existence:** exists in the current **schema** (Layer 225) and
-  in newer Telethon (Layer 229 upstream adds `Button.inline(..., style=...)`);
-  **absent** from the pinned **1.34.0**.
-* **Telethon construction/serialization (pinned):** **not supported** —
-  verified by executable probes.
-* **Telegram request acceptance (live):** **unverified** (no live test).
-* **Visible rendering (live):** **unverified** (no live test).
-* **Overall verdict:** **unsupported by the current pinned dependency; the live
-  stages remain not-yet-conclusively-verified.** No production change was made
-  (Step 3: compatibility not established).
-
-## 6. Exact blocker and next step
-
-**Blocker:** Telethon `1.34.0` (Layer 173) predates the `keyboardButtonStyle`
-constructor; it exposes no `KeyboardButtonStyle`, no `style` field, and no
-serialization path for it. A dependency upgrade (not authorized here) to a
-Telethon release that includes the Layer-225+ keyboard-button-style constructors
-would be the prerequisite — followed by an authorized live test to confirm
-server acceptance, rendering, and unchanged callback routing.
+Live acceptance must be confirmed by the owner with real credentials: send the
+existing `Menu` panel from the account and confirm (a) Telegram accepts the
+request, (b) Save/Delete/AI render green/red/blue in a current client, and
+(c) each styled button's callback still routes to the existing handler.

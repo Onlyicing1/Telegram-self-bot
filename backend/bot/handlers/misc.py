@@ -198,8 +198,8 @@ async def _general_reaction_set_action(event, extra: str, chat_id: int) -> tuple
 def _build_menu_buttons() -> list:
     builder = InlinePanelBuilder()
     builder.add_buttons(
-        ("Save", "panel:save"),
-        ("Delete", "panel:del"),
+        ("Save", "panel:save", "success"),
+        ("Delete", "panel:del", "danger"),
     )
     builder.add_buttons(
         ("Profile", "panel:profile"),
@@ -211,7 +211,7 @@ def _build_menu_buttons() -> list:
         ("👻 Ghost Seen", "panel:ghost_seen_v2"),
     )
     builder.add_row("📋 Todo", "panel:todo")
-    builder.add_row("🧠 AI", "panel:ai")
+    builder.add_row("🧠 AI", "panel:ai", "primary")
     builder.add_row("😀 Emoji", "panel:emoji")
     return builder.build()
 

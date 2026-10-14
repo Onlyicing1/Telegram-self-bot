@@ -21,6 +21,7 @@ from backend.helper.context import truncate_callback_data
 from backend.helper.input_state import set_pending, clear_pending, get_pending
 from backend.helper.lifecycle import get_lifecycle
 from backend.helper.panel_registry import registry as get_registry
+from backend.helper.panel_render import _callback
 from backend.helper.session_manager import Session
 
 logger = logging.getLogger(__name__)
@@ -127,16 +128,27 @@ _actions: dict[str, ActionHandler] = {}
 _inputs: dict[str, dict[str, InputConfig]] = {}
 
 
+def _styled_button(text: str, callback_data: str, style: str | None = None):
+    """Panel button that may carry a named style.
+
+    Both styled and unstyled buttons are real ``KeyboardButtonCallback``
+    objects (data already encoded), preserving the builder's existing contract.
+    Unsupported styles fall back to an unstyled button.
+    """
+    return _callback(text, truncate_callback_data(callback_data), style)
+
+
 class InlinePanelBuilder:
     def __init__(self):
         self._rows: list[list[Any]] = []
 
-    def add_row(self, text: str, callback_data: str) -> "InlinePanelBuilder":
-        self._rows.append([Button.inline(text, truncate_callback_data(callback_data))])
+    def add_row(self, text: str, callback_data: str, style: str | None = None) -> "InlinePanelBuilder":
+        self._rows.append([_styled_button(text, callback_data, style)])
         return self
 
-    def add_buttons(self, *buttons: tuple[str, str]) -> "InlinePanelBuilder":
-        row = [Button.inline(text, truncate_callback_data(data)) for text, data in buttons]
+    def add_buttons(self, *buttons: tuple) -> "InlinePanelBuilder":
+        row = [_styled_button(text, data, style) for text, data, style in
+               ((*b, None) if len(b) == 2 else b for b in buttons)]
         self._rows.append(row)
         return self
 

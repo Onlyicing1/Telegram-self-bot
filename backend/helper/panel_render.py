@@ -16,6 +16,11 @@ from backend.helper.context import truncate_callback_data
 
 logger = logging.getLogger(__name__)
 
+#: Named inline-button background styles defined by the MTProto
+#: ``KeyboardButtonStyle`` constructor. Only these three Telegram-defined
+#: colors exist — arbitrary RGB/HEX is not part of the schema.
+SUPPORTED_BUTTON_STYLES = ("primary", "success", "danger")
+
 
 def _style(text) -> str:
     """Apply the persisted Glass UI font to display text.
@@ -34,14 +39,50 @@ def _style(text) -> str:
         return str(text)
 
 
+def _named_style(style) -> str | None:
+    """Normalize a style value to a supported name, else ``None`` (fail safe)."""
+    if isinstance(style, str):
+        candidate = style.strip().lower()
+        if candidate in SUPPORTED_BUTTON_STYLES:
+            return candidate
+    return None
+
+
+def _style_name_from_tl(style_obj) -> str | None:
+    """Recover the named style from a Telethon ``KeyboardButtonStyle``."""
+    if style_obj is None:
+        return None
+    for name in SUPPORTED_BUTTON_STYLES:
+        if getattr(style_obj, f"bg_{name}", None):
+            return name
+    return None
+
+
+def _callback(text, data, style=None) -> types.KeyboardButtonCallback:
+    """Build a callback button, applying a supported named style if present.
+
+    An unsupported or malformed style degrades to an unstyled button rather
+    than raising, so one bad button can never break a whole panel.
+    """
+    name = _named_style(style)
+    if name is not None:
+        try:
+            return Button.inline(text, data, style=name)
+        except (ValueError, TypeError):
+            logger.warning("Button style %r rejected by Telethon; rendering unstyled", style)
+    elif style is not None:
+        logger.warning("Unsupported button style %r; rendering unstyled", style)
+    return Button.inline(text, data)
+
+
 def _normalize_button(btn) -> types.KeyboardButtonCallback:
     if isinstance(btn, tuple):
         text, data = _style(btn[0]), btn[1]
-        return Button.inline(text, truncate_callback_data(str(data)))
+        return _callback(text, truncate_callback_data(str(data)))
     if isinstance(btn, types.KeyboardButtonCallback):
         styled = _style(btn.text)
         if styled != btn.text:
-            return Button.inline(styled, btn.data)
+            return _callback(styled, btn.data, _style_name_from_tl(getattr(btn, "style", None)))
         return btn
     if isinstance(btn, type(Button.inline("x", "y"))):
         return btn
@@ -52,7 +93,7 @@ def _normalize_button(btn) -> types.KeyboardButtonCallback:
     text = getattr(btn, "text", None)
     if not text:
         text = "Button"
-    return Button.inline(_style(str(text)), "panel:_nav:close")
+    return _callback(_style(str(text)), "panel:_nav:close")
 
 
 def _normalize_row(row) -> list:
