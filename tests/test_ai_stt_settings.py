@@ -557,7 +557,7 @@ async def test_the_stt_settings_panel_shows_the_current_values(monkeypatch):
     assert "Passes · 3" in body
     assert ("Language…", "input:ai_media_stt:stt_language") in flat
     assert ("Recognition passes…", "input:ai_media_stt:stt_passes") in flat
-    assert ("← Back", "panel:_nav:back") in flat
+    assert ("❮ Back", "panel:_nav:back") in flat
     assert ("⌂ Home", "panel:_nav:home") in flat
 
 

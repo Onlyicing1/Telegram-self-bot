@@ -41,6 +41,7 @@ from backend.helper import (
 )
 from backend.helper.client import get_client
 from backend.helper.styles import DANGER, SUCCESS
+from backend.helper import symbols as sym
 
 logger = logging.getLogger(__name__)
 
@@ -78,14 +79,14 @@ def _render_preview(buf: str) -> str:
 
 def _build_username_main_buttons() -> list:
     builder = InlinePanelBuilder()
-    builder.add_row("✅ Enable Sync", "panel:usernamehelp:cmd:on")
+    builder.add_row(sym.label(sym.OP_SAVE, "Enable Sync"), "panel:usernamehelp:cmd:on")
     builder.add_row("⏹ Disable Sync", "panel:usernamehelp:cmd:off")
     builder.add_row("👁 Show State", "panel:username:state")
     builder.add_row("🏗 Template Builder", "panel:usernamehelp:builder")
     builder.add_row("💬 Set Text", "panel:username:text")
     builder.add_row("💭 Set Mood", "panel:username:mood")
     builder.add_row("🔧 Variables", "panel:usernamehelp:vars")
-    builder.add_row("📋 Commands", "panel:usernamehelp:cmds")
+    builder.add_row(sym.label(sym.CONTENT_STATIC, "Commands"), "panel:usernamehelp:cmds")
     return builder.build()
 
 
@@ -125,7 +126,7 @@ async def _username_inline_builder(event, extra: str) -> list:
 def _build_username_help_menu_buttons() -> list:
     builder = InlinePanelBuilder()
     builder.add_row("🔧 Variables", "panel:usernamehelp:vars")
-    builder.add_row("📋 Commands", "panel:usernamehelp:cmds")
+    builder.add_row(sym.label(sym.CONTENT_STATIC, "Commands"), "panel:usernamehelp:cmds")
     builder.add_row("🏗 Template Builder", "panel:usernamehelp:builder")
     return builder.build()
 
@@ -134,7 +135,7 @@ def _build_username_commands_menu_buttons() -> list:
     builder = InlinePanelBuilder()
     builder.add_row("💬 Set Text", "panel:usernamehelp:cmd:text")
     builder.add_row("💭 Set Mood", "panel:usernamehelp:cmd:mood")
-    builder.add_row("✅ Enable Sync", "panel:usernamehelp:cmd:on")
+    builder.add_row(sym.label(sym.OP_SAVE, "Enable Sync"), "panel:usernamehelp:cmd:on")
     builder.add_row("⏹ Disable Sync", "panel:usernamehelp:cmd:off")
     builder.add_row("👁 Show State", "panel:usernamehelp:cmd:show")
     return builder.build()
@@ -147,7 +148,7 @@ def _build_builder_buttons() -> list:
     builder.add_row("␣ Space", "action:username_builder_space")
     builder.add_row("🗑 Clear", "action:username_builder_clear", DANGER)
     builder.add_row("↩ Reset", "action:username_builder_reset", DANGER)
-    builder.add_row("✅ Apply Template", "action:username_builder_apply", SUCCESS)
+    builder.add_row(sym.label(sym.OP_SAVE, "Apply Template"), "action:username_builder_apply", SUCCESS)
     builder.add_row("📝 Reply to Edit", "action:username_reply_mode")
     return builder.build()
 
@@ -185,7 +186,7 @@ async def _usernamehelp_panel_handler(event, extra: str) -> tuple[str, str, list
         sub = extra[4:]
         if sub == "on":
             builder = InlinePanelBuilder()
-            builder.add_row("✅ Enable Now", "action:username_on")
+            builder.add_row(sym.label(sym.OP_SAVE, "Enable Now"), "action:username_on")
             return "Enable Sync", "Start the username cron — auto-updates your first name every minute.", builder.build()
         if sub == "off":
             builder = InlinePanelBuilder()
@@ -375,7 +376,7 @@ async def _username_off_action(event, extra: str, chat_id: int) -> tuple[str, st
     from backend.helper.inline_engine import _owner_id
     result = await username_service.do_off(_owner_id)
     builder = InlinePanelBuilder()
-    builder.add_row("✅ Enable Sync", "panel:usernamehelp:cmd:on")
+    builder.add_row(sym.label(sym.OP_SAVE, "Enable Sync"), "panel:usernamehelp:cmd:on")
     builder.add_row("👁 Show State", "panel:username:state")
     return "Username Engine", result, builder.build()
 

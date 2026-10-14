@@ -33,6 +33,7 @@ from backend.helper import (
     render,
 )
 from backend.helper.styles import DANGER, SUCCESS
+from backend.helper import symbols as sym
 
 logger = logging.getLogger(__name__)
 
@@ -65,14 +66,14 @@ def _owner() -> int:
 
 def _nav(builder: InlinePanelBuilder) -> None:
     builder.add_buttons(
-        ("← Back", "panel:_nav:back"),
-        ("⌂ Home", "panel:_nav:home"),
+        (sym.label(sym.OP_BACK, "Back"), "panel:_nav:back"),
+        (sym.label(sym.OP_HOME, "Home"), "panel:_nav:home"),
     )
 
 
 def _row_label(task) -> str:
     label = " ".join(str(getattr(task, "label", "") or "").split()) or "Untitled"
-    return f"#{getattr(task, 'id', '?')} · {label[:32] + ('…' if len(label) > 32 else '')}"
+    return f"#{getattr(task, 'id', '?')} {sym.SEPARATOR} {label[:32] + ('…' if len(label) > 32 else '')}"
 
 
 def _page_of(tasks: list, extra: str) -> tuple[list, int, int]:
@@ -90,15 +91,15 @@ def _pager(builder: InlinePanelBuilder, panel_id: str, page: int, page_count: in
     if page_count <= 1:
         return
     builder.add_row(
-        "❮" if page > 0 else "·",
+        sym.OP_PREV if page > 0 else sym.SEPARATOR,
         f"panel:{panel_id}:{page - 1}" if page > 0 else f"panel:{panel_id}",
     )
     builder.add_row(
-        f"{page + 1} / {page_count}",
+        f"{sym.PAGE_CURRENT} {page + 1} / {page_count}",
         f"panel:{panel_id}:{page + 1}" if page + 1 < page_count else f"panel:{panel_id}:{page}",
     )
     if page + 1 < page_count:
-        builder.add_row("❯", f"panel:{panel_id}:{page + 1}")
+        builder.add_row(sym.OP_NEXT, f"panel:{panel_id}:{page + 1}")
 
 
 async def _todo_list_panel(event, extra: str) -> tuple[str, str, list] | None:
@@ -115,15 +116,16 @@ async def _todo_list_panel(event, extra: str) -> tuple[str, str, list] | None:
     visible, page, page_count = _page_of(active, extra)
 
     lines = [
-        "📋 **Todo**",
-        f"▶️ {counts.get('active', 0)} active · ✅ {completed} completed",
+        f"{sym.PANEL_HEADING} **Todo**",
+        f"{sym.STATE_ACTIVE} {counts.get('active', 0)} active {sym.SEPARATOR} "
+        f"{sym.STATE_COMPLETED} {completed} completed",
         "",
     ]
     builder = InlinePanelBuilder()
-    builder.add_row("➕ Add todo", f"input:{_LIST_PANEL}:new")
+    builder.add_row(sym.label(sym.OP_CREATE, "Add todo"), f"input:{_LIST_PANEL}:new")
     if not active:
         lines.append("_No active todos._")
-        lines.append("_Tap ➕ Add todo, or say \"add a todo: …\"_")
+        lines.append(f"_Tap {sym.OP_CREATE} Add todo, or say \"add a todo: …\"_")
     else:
         for task in visible:
             builder.add_row(_row_label(task), f"panel:{_DETAIL_PANEL}:{task.id}")
@@ -132,7 +134,7 @@ async def _todo_list_panel(event, extra: str) -> tuple[str, str, list] | None:
         # A degraded read is not an authoritative empty list.
         lines.append("")
         lines.append(fallback_note(snapshot.fallback_reason))
-    builder.add_row(f"✅ Completed ({completed})", f"panel:{_DONE_PANEL}")
+    builder.add_row(f"{sym.STATE_COMPLETED} Completed ({completed})", f"panel:{_DONE_PANEL}")
     _nav(builder)
     return "Todo", "\n".join(lines), builder.build()
 
@@ -155,7 +157,7 @@ async def _todo_done_panel(event, extra: str) -> tuple[str, str, list] | None:
     visible, page, page_count = _page_of(completed, extra)
 
     lines = [
-        "✅ **Completed todos**",
+        f"{sym.STATE_COMPLETED} **Completed todos**",
         f"{len(completed)} completed",
         "",
     ]
@@ -169,7 +171,7 @@ async def _todo_done_panel(event, extra: str) -> tuple[str, str, list] | None:
     if snapshot.fallback_active:
         lines.append("")
         lines.append(fallback_note(snapshot.fallback_reason))
-    builder.add_row("▶️ Active todos", f"panel:{_LIST_PANEL}")
+    builder.add_row(f"{sym.STATE_ACTIVE} Active todos", f"panel:{_LIST_PANEL}")
     _nav(builder)
     return "Completed todos", "\n".join(lines), builder.build()
 
@@ -189,12 +191,12 @@ async def _todo_detail_panel(event, extra: str) -> tuple[str, str, list] | None:
     try:
         task_id = int(extra)
     except (TypeError, ValueError):
-        return "Todo", "× Invalid todo id.", []
+        return "Todo", f"{sym.STATE_FAILED} Invalid todo id.", []
 
     service = _service(_owner())
     view = await service.inspect(task_id, occurrence_limit=0)
     if view is None or str(getattr(view.task, "schedule_type", "")) != "todo":
-        return "Todo", "× Todo not found.", []
+        return "Todo", f"{sym.STATE_FAILED} Todo not found.", []
 
     task = view.task
     # ONE progress read drives the summary line, the step button and the
@@ -211,24 +213,24 @@ async def _todo_detail_panel(event, extra: str) -> tuple[str, str, list] | None:
             # Plain completion is refused while a step remains; the labelled
             # button is the explicit way to finish both together.
             builder.add_row(
-                f"✓ Complete all ({progress.completed}/{progress.total})",
+                sym.label(sym.OP_SAVE, f"Complete all ({progress.completed}/{progress.total})"),
                 f"action:todo_complete_all:{task.id}:{task.version}",
             )
         else:
-            builder.add_row("✓ Complete", f"action:todo_complete:{task.id}:{task.version}", SUCCESS)
-        builder.add_row("✏️ Edit", f"input:{_DETAIL_PANEL}:edit:{task.id}:{task.version}")
+            builder.add_row(sym.label(sym.OP_SAVE, "Complete"), f"action:todo_complete:{task.id}:{task.version}", SUCCESS)
+        builder.add_row(sym.label(sym.OP_EDIT, "Edit"), f"input:{_DETAIL_PANEL}:edit:{task.id}:{task.version}")
     elif str(task.status) == "completed":
-        builder.add_row("↩️ Reopen", f"action:todo_reopen:{task.id}:{task.version}")
-        builder.add_row("✏️ Edit", f"input:{_DETAIL_PANEL}:edit:{task.id}:{task.version}")
+        builder.add_row(sym.label(sym.OP_RESUME, "Reopen"), f"action:todo_reopen:{task.id}:{task.version}")
+        builder.add_row(sym.label(sym.OP_EDIT, "Edit"), f"input:{_DETAIL_PANEL}:edit:{task.id}:{task.version}")
     if progress is not None and progress.total:
         builder.add_row(
-            f"🧩 Steps ({progress.completed}/{progress.total})",
+            sym.label(sym.CONTENT_STATIC, f"Steps ({progress.completed}/{progress.total})"),
             f"panel:{_STEPS_PANEL}:{task.id}",
         )
     else:
-        builder.add_row("🧩 Add steps", f"input:{_STEPS_PANEL}:add:{task.id}")
-    builder.add_row("🗑 Delete", f"action:todo_delete:{task.id}:{task.version}", DANGER)
-    builder.add_row("⟳ Refresh", f"panel:{_DETAIL_PANEL}:{task.id}")
+        builder.add_row(sym.label(sym.CONTENT_STATIC, "Add steps"), f"input:{_STEPS_PANEL}:add:{task.id}")
+    builder.add_row(sym.label(sym.OP_DELETE, "Delete"), f"action:todo_delete:{task.id}:{task.version}", DANGER)
+    builder.add_row(sym.label(sym.OP_REFRESH, "Refresh"), f"panel:{_DETAIL_PANEL}:{task.id}")
     _nav(builder)
     return f"Todo #{task.id}", "\n".join(lines), builder.build()
 
@@ -255,12 +257,12 @@ async def _todo_steps_panel(event, extra: str) -> tuple[str, str, list] | None:
     try:
         task_id = int(parts[0])
     except (TypeError, ValueError, IndexError):
-        return "Todo", "× Invalid todo id.", []
+        return "Todo", f"{sym.STATE_FAILED} Invalid todo id.", []
 
     service = _service(_owner())
     steps = await service.list_steps(task_id)
     if steps is None:
-        return "Todo", "× Todo not found.", []
+        return "Todo", f"{sym.STATE_FAILED} Todo not found.", []
 
     try:
         page = max(0, int(parts[1])) if len(parts) > 1 else 0
@@ -281,37 +283,37 @@ async def _todo_steps_panel(event, extra: str) -> tuple[str, str, list] | None:
     builder = InlinePanelBuilder()
     for index, step in enumerate(visible, start=offset + 1):
         step_title = " ".join(str(getattr(step, "title", "") or "").split()) or "Untitled"
-        mark = "✓" if str(getattr(step, "status", "")) == "completed" else "○"
+        mark = sym.STATE_COMPLETED if str(getattr(step, "status", "")) == "completed" else sym.SCHEDULE_ONCE
         label = f"{mark} {index}. {step_title[:26] + ('…' if len(step_title) > 26 else '')}"
         builder.add_row(label, f"panel:{_STEPS_PANEL}:{task_id}:{page}")
         if str(getattr(step, "status", "")) == "completed":
             builder.add_buttons(
-                ("↩️ Reopen", f"action:todo_step_reopen:{step.id}:{step.version}"),
-                ("✏️ Edit", f"input:{_STEPS_PANEL}:edit:{step.id}:{step.version}"),
-                ("🗑", f"action:todo_step_delete:{step.id}:{step.version}"),
+                (sym.label(sym.OP_RESUME, "Reopen"), f"action:todo_step_reopen:{step.id}:{step.version}"),
+                (sym.label(sym.OP_EDIT, "Edit"), f"input:{_STEPS_PANEL}:edit:{step.id}:{step.version}"),
+                (sym.OP_DELETE, f"action:todo_step_delete:{step.id}:{step.version}"),
             )
         else:
             builder.add_buttons(
-                ("✓ Complete", f"action:todo_step_complete:{step.id}:{step.version}"),
-                ("✏️ Edit", f"input:{_STEPS_PANEL}:edit:{step.id}:{step.version}"),
-                ("🗑", f"action:todo_step_delete:{step.id}:{step.version}"),
+                (sym.label(sym.OP_SAVE, "Complete"), f"action:todo_step_complete:{step.id}:{step.version}"),
+                (sym.label(sym.OP_EDIT, "Edit"), f"input:{_STEPS_PANEL}:edit:{step.id}:{step.version}"),
+                (sym.OP_DELETE, f"action:todo_step_delete:{step.id}:{step.version}"),
             )
     if page_count > 1:
         builder.add_row(
-            "❮" if page > 0 else "·",
+            sym.OP_PREV if page > 0 else sym.SEPARATOR,
             f"panel:{_STEPS_PANEL}:{task_id}:{page - 1}" if page > 0 else f"panel:{_STEPS_PANEL}:{task_id}",
         )
         builder.add_row(
-            f"{page + 1} / {page_count}",
+            f"{sym.PAGE_CURRENT} {page + 1} / {page_count}",
             f"panel:{_STEPS_PANEL}:{task_id}:{page + 1}" if page + 1 < page_count else f"panel:{_STEPS_PANEL}:{task_id}:{page}",
         )
         if page + 1 < page_count:
-            builder.add_row("❯", f"panel:{_STEPS_PANEL}:{task_id}:{page + 1}")
+            builder.add_row(sym.OP_NEXT, f"panel:{_STEPS_PANEL}:{task_id}:{page + 1}")
     # Adding steps is only offered while the todo is active: a completed todo
     # accepts no new work until it is reopened (the service refuses otherwise).
     if str(getattr(task, "status", "")) == "active":
-        builder.add_row("➕ Add step", f"input:{_STEPS_PANEL}:add:{task_id}")
-    builder.add_row("← Todo", f"panel:{_DETAIL_PANEL}:{task_id}")
+        builder.add_row(sym.label(sym.OP_CREATE, "Add step"), f"input:{_STEPS_PANEL}:add:{task_id}")
+    builder.add_row(sym.label(sym.OP_BACK, "Todo"), f"panel:{_DETAIL_PANEL}:{task_id}")
     _nav(builder)
     return f"Steps of Todo #{task_id}", "\n".join(lines), builder.build()
 
@@ -341,24 +343,24 @@ async def _mutate(extra: str, verb: str) -> tuple[str, str, list] | None:
     """Shared CAS mutation -> refreshed todo detail (nothing on a stale one)."""
     parsed = _parse_action_extra(extra)
     if parsed is None:
-        return "Todo", "× Invalid action arguments.", []
+        return "Todo", f"{sym.STATE_FAILED} Invalid action arguments.", []
     task_id, version = parsed
     service = _service(_owner())
     try:
         task = await getattr(service, verb)(task_id, version)
     except ValueError as exc:
-        return f"Todo #{task_id}", f"× {exc}", []
+        return f"Todo #{task_id}", f"{sym.STATE_FAILED} {exc}", []
     except Exception:
         logger.exception("Todo %s failed for todo %s", verb, task_id)
-        return f"Todo #{task_id}", "× Operation failed; no change was confirmed.", []
+        return f"Todo #{task_id}", f"{sym.STATE_FAILED} Operation failed; no change was confirmed.", []
     if task is None:
         return (
             f"Todo #{task_id}",
-            "× Todo not found, or it changed since this panel was drawn "
+            f"{sym.STATE_FAILED} Todo not found, or it changed since this panel was drawn "
             "(version is stale). Nothing was changed.",
             [],
         )
-    notice = f"✓ Todo #{task.id} {_VERB_PAST.get(verb, verb + 'd')} · v{task.version}\n\n"
+    notice = f"{sym.OP_SAVE} Todo #{task.id} {_VERB_PAST.get(verb, verb + 'd')} {sym.SEPARATOR} v{task.version}\n\n"
     result = await _todo_detail_panel(None, str(task_id))
     if result is None:
         return f"Todo #{task_id}", notice.rstrip(), []
@@ -385,14 +387,14 @@ async def _delete_action(event, extra: str, chat_id: int):
 
     parsed = _parse_action_extra(extra)
     if parsed is None:
-        return "Todo", "× Invalid action arguments.", []
+        return "Todo", f"{sym.STATE_FAILED} Invalid action arguments.", []
     task_id, version = parsed
     service = _service(_owner())
     try:
         result = await service.delete(task_id, version)
     except Exception:
         logger.exception("Todo delete failed for todo %s", task_id)
-        return f"Todo #{task_id}", "× Operation failed; no change was confirmed.", []
+        return f"Todo #{task_id}", f"{sym.STATE_FAILED} Operation failed; no change was confirmed.", []
     if not result.deleted:
         if result.fallback_backend:
             from backend.ai.database.task_repository import FALLBACK_REASON_LOCAL_RESOURCE
@@ -400,18 +402,18 @@ async def _delete_action(event, extra: str, chat_id: int):
             if getattr(result, "fallback_reason", "") == FALLBACK_REASON_LOCAL_RESOURCE:
                 return (
                     f"Todo #{task_id}",
-                    "× Local resource error; the durable store was not reached, "
+                    f"{sym.STATE_FAILED} Local resource error; the durable store was not reached, "
                     "so nothing durable was deleted.",
                     [],
                 )
-            return f"Todo #{task_id}", "× Supabase unavailable; nothing durable was deleted.", []
+            return f"Todo #{task_id}", f"{sym.STATE_FAILED} Supabase unavailable; nothing durable was deleted.", []
         if result.outcome == DELETION_STALE:
-            return f"Todo #{task_id}", "× Version is stale; nothing was deleted.", []
-        return f"Todo #{task_id}", "× Todo not found or ownership check failed.", []
+            return f"Todo #{task_id}", f"{sym.STATE_FAILED} Version is stale; nothing was deleted.", []
+        return f"Todo #{task_id}", f"{sym.STATE_FAILED} Todo not found or ownership check failed.", []
     notice = (
-        f"✓ Deleted todo #{task_id}\n\n"
+        f"{sym.OP_SAVE} Deleted todo #{task_id}\n\n"
         if result.durable
-        else f"✓ Deleted todo #{task_id} (memory only — not durable)\n\n"
+        else f"{sym.OP_SAVE} Deleted todo #{task_id} (memory only — not durable)\n\n"
     )
     refreshed = await _todo_list_panel(None, "")
     if refreshed is None:
@@ -431,7 +433,7 @@ async def _step_mutate(extra: str, verb: str) -> tuple[str, str, list] | None:
     """Shared CAS step mutation → refreshed step panel (nothing on a stale one)."""
     parsed = _parse_action_extra(extra)
     if parsed is None:
-        return "Steps", "× Invalid action arguments.", []
+        return "Steps", f"{sym.STATE_FAILED} Invalid action arguments.", []
     step_id, version = parsed
     service = _service(_owner())
     try:
@@ -439,19 +441,19 @@ async def _step_mutate(extra: str, verb: str) -> tuple[str, str, list] | None:
     except ValueError as exc:
         # A refusal the owner must read (a step of a completed todo cannot be
         # reopened before the todo itself is reopened).
-        return "Steps", f"× {exc}", []
+        return "Steps", f"{sym.STATE_FAILED} {exc}", []
     except Exception:
         logger.exception("Todo step %s failed for step %s", verb, step_id)
-        return "Steps", "× Operation failed; no change was confirmed.", []
+        return "Steps", f"{sym.STATE_FAILED} Operation failed; no change was confirmed.", []
     if step is None:
         return (
             "Steps",
-            "× Step not found, or it changed since this panel was drawn "
+            f"{sym.STATE_FAILED} Step not found, or it changed since this panel was drawn "
             "(version is stale). Nothing was changed.",
             [],
         )
     notice = (
-        f"✓ Step {_STEP_VERB_PAST.get(verb, verb)} — {_step_title_of(step)}\n\n"
+        f"{sym.OP_SAVE} Step {_STEP_VERB_PAST.get(verb, verb)} — {_step_title_of(step)}\n\n"
     )
     result = await _todo_steps_panel(None, str(int(step.task_id)))
     if result is None:
@@ -472,7 +474,7 @@ async def _step_delete_action(event, extra: str, chat_id: int):
     """Remove ONE step for real — the parent todo always survives it."""
     parsed = _parse_action_extra(extra)
     if parsed is None:
-        return "Steps", "× Invalid action arguments.", []
+        return "Steps", f"{sym.STATE_FAILED} Invalid action arguments.", []
     step_id, version = parsed
     service = _service(_owner())
     step = None
@@ -485,13 +487,13 @@ async def _step_delete_action(event, extra: str, chat_id: int):
         removed = await service.delete_step(step_id, version)
     except Exception:
         logger.exception("Todo step delete failed for step %s", step_id)
-        return "Steps", "× Operation failed; no change was confirmed.", []
+        return "Steps", f"{sym.STATE_FAILED} Operation failed; no change was confirmed.", []
     if not removed:
         current = await service.get_step(step_id)
         if current is not None:
-            return "Steps", "× Version is stale; nothing was deleted.", []
-        return "Steps", "× Step not found, so nothing was deleted.", []
-    notice = "🗑 Step removed — the todo itself is untouched\n\n"
+            return "Steps", f"{sym.STATE_FAILED} Version is stale; nothing was deleted.", []
+        return "Steps", f"{sym.STATE_FAILED} Step not found, so nothing was deleted.", []
+    notice = f"{sym.OP_DELETE} Step removed — the todo itself is untouched\n\n"
     if task_id <= 0:
         return "Steps", notice.rstrip(), []
     result = await _todo_steps_panel(None, str(task_id))
@@ -510,25 +512,25 @@ async def _complete_all_action(event, extra: str, chat_id: int):
     """
     parsed = _parse_action_extra(extra)
     if parsed is None:
-        return "Todo", "× Invalid action arguments.", []
+        return "Todo", f"{sym.STATE_FAILED} Invalid action arguments.", []
     task_id, version = parsed
     service = _service(_owner())
     try:
         task = await service.complete_todo_with_steps(task_id, version)
     except ValueError as exc:
-        return f"Todo #{task_id}", f"× {exc}", []
+        return f"Todo #{task_id}", f"{sym.STATE_FAILED} {exc}", []
     except Exception:
         logger.exception("Todo complete-all failed for todo %s", task_id)
-        return f"Todo #{task_id}", "× Operation failed; no change was confirmed.", []
+        return f"Todo #{task_id}", f"{sym.STATE_FAILED} Operation failed; no change was confirmed.", []
     if task is None:
         return (
             f"Todo #{task_id}",
-            "× Todo not found, or it changed since this panel was drawn "
+            f"{sym.STATE_FAILED} Todo not found, or it changed since this panel was drawn "
             "(version is stale). Nothing was changed.",
             [],
         )
     notice = (
-        f"✓ Todo #{task.id} completed with its remaining steps · v{task.version}\n\n"
+        f"{sym.OP_SAVE} Todo #{task.id} completed with its remaining steps {sym.SEPARATOR} v{task.version}\n\n"
     )
     result = await _todo_detail_panel(None, str(task_id))
     if result is None:
@@ -556,24 +558,24 @@ async def _steps_add_input_handler(
     titles = [title for title in titles if title]
     notice = ""
     if task_id <= 0:
-        notice = "× This step input expired; open the todo again."
+        notice = f"{sym.STATE_FAILED} This step input expired; open the todo again."
     elif not titles:
-        notice = "× A step needs a title."
+        notice = f"{sym.STATE_FAILED} A step needs a title."
     else:
         try:
             added = await _service(_owner()).add_steps(task_id, titles)
         except ValueError as exc:
-            notice = f"× {exc}"
+            notice = f"{sym.STATE_FAILED} {exc}"
         except Exception:
             logger.exception("Todo steps add failed for todo %s", task_id)
-            notice = "× Steps were not added; no change was confirmed."
+            notice = f"{sym.STATE_FAILED} Steps were not added; no change was confirmed."
         else:
             if added is None:
-                notice = "× That todo was not found."
+                notice = f"{sym.STATE_FAILED} That todo was not found."
             elif len(added) == 1:
-                notice = f"✓ Step added — {_step_title_of(added[0])}"
+                notice = f"{sym.OP_SAVE} Step added — {_step_title_of(added[0])}"
             else:
-                notice = f"✓ {len(added)} steps added"
+                notice = f"{sym.OP_SAVE} {len(added)} steps added"
     await _finish_input(
         notice,
         chat_id,
@@ -603,23 +605,23 @@ async def _steps_edit_input_handler(
     title = " ".join(str(text or "").split())
     step = None
     if parsed is None:
-        notice = "× This step edit expired; open the step again."
+        notice = f"{sym.STATE_FAILED} This step edit expired; open the step again."
     elif not title:
-        notice = "× A step needs a title."
+        notice = f"{sym.STATE_FAILED} A step needs a title."
     else:
         step_id, version = parsed
         try:
             step = await _service(_owner()).rename_step(step_id, version, title)
         except ValueError as exc:
-            notice = f"× {exc}"
+            notice = f"{sym.STATE_FAILED} {exc}"
         except Exception:
             logger.exception("Todo step edit failed for step %s", step_id)
-            notice = "× Step was not changed; no change was confirmed."
+            notice = f"{sym.STATE_FAILED} Step was not changed; no change was confirmed."
         else:
             notice = (
-                f"✓ Step is now — {_step_title_of(step)}"
+                f"{sym.OP_SAVE} Step is now — {_step_title_of(step)}"
                 if step is not None
-                else "× Step changed since this panel was drawn; open it again and retry."
+                else f"{sym.STATE_FAILED} Step changed since this panel was drawn; open it again and retry."
             )
     await _finish_input(
         notice,
@@ -684,18 +686,18 @@ async def _add_input_handler(text: str, chat_id: int, msg_id: int, inline_chat_i
     title = " ".join(str(text or "").split())
     notice = ""
     if not title:
-        notice = "× A todo needs a title."
+        notice = f"{sym.STATE_FAILED} A todo needs a title."
     else:
         try:
             task = await TaskCreationService(
                 get_repository_manager().task, _owner()
             ).create_todo(title, _DEFAULT_TZ, datetime.now(timezone.utc))
-            notice = f"✓ Todo #{task.id} added"
+            notice = f"{sym.OP_SAVE} Todo #{task.id} added"
         except TaskCreationError as exc:
-            notice = f"× {exc}"
+            notice = f"{sym.STATE_FAILED} {exc}"
         except Exception:
             logger.exception("Todo creation failed")
-            notice = "× Todo was not added; no change was confirmed."
+            notice = f"{sym.STATE_FAILED} Todo was not added; no change was confirmed."
     await _finish_input(
         notice, chat_id, msg_id, inline_chat_id, inline_msg_id, panel_id=_LIST_PANEL
     )
@@ -712,23 +714,23 @@ async def _edit_input_handler(text: str, chat_id: int, msg_id: int, inline_chat_
     parsed = _parse_action_extra(str(pending.get("extra") or ""))
     title = " ".join(str(text or "").split())
     if parsed is None:
-        notice = "× This edit expired; open the todo again."
+        notice = f"{sym.STATE_FAILED} This edit expired; open the todo again."
     elif not title:
-        notice = "× A todo needs a title."
+        notice = f"{sym.STATE_FAILED} A todo needs a title."
     else:
         task_id, version = parsed
         try:
             task = await _service(_owner()).edit_todo_title(task_id, version, title)
         except ValueError as exc:
-            notice = f"× {exc}"
+            notice = f"{sym.STATE_FAILED} {exc}"
         except Exception:
             logger.exception("Todo edit failed for todo %s", task_id)
-            notice = "× Todo was not changed; no change was confirmed."
+            notice = f"{sym.STATE_FAILED} Todo was not changed; no change was confirmed."
         else:
             notice = (
-                f"✓ Todo #{task.id} is now — {task.label}"
+                f"{sym.OP_SAVE} Todo #{task.id} is now — {task.label}"
                 if task is not None
-                else "× Todo changed since this panel was drawn; reopen it and retry."
+                else f"{sym.STATE_FAILED} Todo changed since this panel was drawn; reopen it and retry."
             )
     await _finish_input(
         notice,
@@ -762,9 +764,9 @@ def register(client, owner_id: int, tz_str: str) -> None:
     global _DEFAULT_TZ
     _DEFAULT_TZ = str(tz_str or "").strip() or "UTC"
     try:
-        register_panel(_LIST_PANEL, _todo_list_panel, parent="menu", title="📋 Todo")
+        register_panel(_LIST_PANEL, _todo_list_panel, parent="menu", title=f"{sym.PANEL_HEADING} Todo")
         register_inline_builder(_LIST_PANEL, _todo_list_inline_builder)
-        register_panel(_DONE_PANEL, _todo_done_panel, parent=_LIST_PANEL, title="✅ Completed todos")
+        register_panel(_DONE_PANEL, _todo_done_panel, parent=_LIST_PANEL, title=f"{sym.STATE_COMPLETED} Completed todos")
         register_inline_builder(_DONE_PANEL, _todo_done_inline_builder)
         register_panel(_DETAIL_PANEL, _todo_detail_panel, parent=_LIST_PANEL, title="Todo")
         register_inline_builder(_DETAIL_PANEL, _todo_detail_inline_builder)
@@ -780,22 +782,22 @@ def register(client, owner_id: int, tz_str: str) -> None:
         register_input(_LIST_PANEL, "new", {
             "handler": _add_input_handler,
             "prompt": _INPUT_PROMPTS["new"],
-            "extra_rows": (("✕ Cancel", f"panel:{_LIST_PANEL}"),),
+            "extra_rows": ((sym.label(sym.OP_CLOSE, "Cancel"), f"panel:{_LIST_PANEL}"),),
         })
         register_input(_DETAIL_PANEL, "edit", {
             "handler": _edit_input_handler,
             "prompt": _INPUT_PROMPTS["edit"],
-            "extra_rows": (("✕ Cancel", f"panel:{_LIST_PANEL}"),),
+            "extra_rows": ((sym.label(sym.OP_CLOSE, "Cancel"), f"panel:{_LIST_PANEL}"),),
         })
         register_input(_STEPS_PANEL, "add", {
             "handler": _steps_add_input_handler,
             "prompt": _STEPS_INPUT_PROMPTS["add"],
-            "extra_rows": (("✕ Cancel", f"panel:{_LIST_PANEL}"),),
+            "extra_rows": ((sym.label(sym.OP_CLOSE, "Cancel"), f"panel:{_LIST_PANEL}"),),
         })
         register_input(_STEPS_PANEL, "edit", {
             "handler": _steps_edit_input_handler,
             "prompt": _STEPS_INPUT_PROMPTS["edit"],
-            "extra_rows": (("✕ Cancel", f"panel:{_LIST_PANEL}"),),
+            "extra_rows": ((sym.label(sym.OP_CLOSE, "Cancel"), f"panel:{_LIST_PANEL}"),),
         })
         logger.info("Todo panels registered OK")
     except Exception as exc:

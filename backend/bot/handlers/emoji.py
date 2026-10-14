@@ -50,6 +50,7 @@ from backend.services import premium_emoji_diagnostics as diag_service
 from backend.services import premium_emoji_inline_service as premium_inline_service
 from backend.services import premium_emoji_probe_service as probe_service
 from backend.helper.styles import DANGER
+from backend.helper import symbols as sym
 from backend.services import reaction_service
 from backend.services.emoji_library_service import import_from_saved_messages
 
@@ -411,8 +412,8 @@ async def _category_page_handler(event, extra: str) -> tuple[str, str, list] | N
     ]
     builder = InlinePanelBuilder()
     builder.add_row("🗺 Mappings", f"panel:{_MAPPINGS_PANEL}:{cid}:0")
-    builder.add_row("✏️ Rename", f"action:emoji_cat_rename:{cid}")
-    builder.add_row("🗑 Delete", f"action:emoji_cat_del:{cid}", DANGER)
+    builder.add_row(sym.label(sym.OP_EDIT, "Rename"), f"action:emoji_cat_rename:{cid}")
+    builder.add_row(sym.label(sym.OP_DELETE, "Delete"), f"action:emoji_cat_del:{cid}", DANGER)
     return "Category", "\n".join(lines), builder.build()
 
 
@@ -427,7 +428,7 @@ async def _cat_new_action(event, extra: str, chat_id: int) -> tuple[str, str, li
         inline_chat_id=chat_id or 0, inline_msg_id=0,
     )
     builder = InlinePanelBuilder()
-    builder.add_row("← Back", f"panel:{_CATEGORIES_PANEL}")
+    builder.add_row(sym.label(sym.OP_BACK, "Back"), f"panel:{_CATEGORIES_PANEL}")
     return "New Category", "Send the category name as your next message.", builder.build()
 
 
@@ -490,7 +491,7 @@ async def _cat_rename_action(event, extra: str, chat_id: int) -> tuple[str, str,
         inline_chat_id=chat_id or 0, inline_msg_id=0,
     )
     builder = InlinePanelBuilder()
-    builder.add_row("← Back", f"panel:{_CATEGORIES_PANEL}")
+    builder.add_row(sym.label(sym.OP_BACK, "Back"), f"panel:{_CATEGORIES_PANEL}")
     return "Rename Category", "Send the new name as your next message.", builder.build()
 
 
@@ -547,7 +548,7 @@ async def _cat_del_action(event, extra: str, chat_id: int) -> tuple[str, str, li
         "Library entries are NOT deleted."
     )
     builder = InlinePanelBuilder()
-    builder.add_row("🗑 Delete", "action:emoji_cat_delgo", DANGER)
+    builder.add_row(sym.label(sym.OP_DELETE, "Delete"), "action:emoji_cat_delgo", DANGER)
     builder.add_row("✗ Cancel", f"panel:{_CATEGORIES_PANEL}:0")
     return "Delete Category", body, builder.build()
 
@@ -682,8 +683,8 @@ async def _mapping_page_handler(event, extra: str) -> tuple[str, str, list] | No
     if entry_row is None:
         lines.append("_Library entry no longer exists._")
     builder = InlinePanelBuilder()
-    builder.add_row("✏️ Change", f"action:emoji_map_edit:{row.get('simple_emoji')}:{wid}")
-    builder.add_row("🗑 Remove", f"action:emoji_map_del:{row.get('simple_emoji')}:{wid}", DANGER)
+    builder.add_row(sym.label(sym.OP_EDIT, "Change"), f"action:emoji_map_edit:{row.get('simple_emoji')}:{wid}")
+    builder.add_row(sym.label(sym.OP_DELETE, "Remove"), f"action:emoji_map_del:{row.get('simple_emoji')}:{wid}", DANGER)
     return "Mapping", "\n".join(lines), builder.build()
 
 
@@ -716,7 +717,7 @@ async def _map_new_action(event, extra: str, chat_id: int) -> tuple[str, str, li
         inline_chat_id=chat_id or 0, inline_msg_id=0,
     )
     builder = InlinePanelBuilder()
-    builder.add_row("← Back", f"panel:{_MAPPINGS_PANEL}::0:{intw(cid)}")
+    builder.add_row(sym.label(sym.OP_BACK, "Back"), f"panel:{_MAPPINGS_PANEL}::0:{intw(cid)}")
     return "Add Mapping", "Send the simple emoji as your next message.", builder.build()
 
 
@@ -1068,7 +1069,7 @@ async def _render_replacement(
         )
         builder.add_row("✖ Clear chat override", f"action:emoji_state_clear:{target_chat}")
     builder.add_row("🗂 Manage categories", f"panel:{_CATEGORIES_PANEL}")
-    builder.add_row("← Back", f"panel:{_MAIN_PANEL}")
+    builder.add_row(sym.label(sym.OP_BACK, "Back"), f"panel:{_MAIN_PANEL}")
     return "Emoji Replacement", "\n".join(lines), builder.build()
 
 
@@ -1153,7 +1154,7 @@ async def _render_state_picker(owner: int, extra: str) -> tuple[str, str, list]:
             (f"{page + 1}/{page_count}", f"panel:{_STATE_SCOPE_PICKER_PANEL}:{seed}:{page}"),
             ("▶", f"panel:{_STATE_SCOPE_PICKER_PANEL}:{seed}:{page + 1}"),
         )
-    builder.add_row("← Back", f"panel:{_REPLACEMENT_PANEL}")
+    builder.add_row(sym.label(sym.OP_BACK, "Back"), f"panel:{_REPLACEMENT_PANEL}")
     return title, "Pick the category to activate:", builder.build()
 
 

@@ -15,6 +15,7 @@ from backend.ai import diagnostics as ai_diag
 from backend.helper import inline_engine
 from backend.helper.client import get_client
 from backend.helper.styles import DANGER
+from backend.helper import symbols as sym
 from backend.helper.lifecycle import get_lifecycle
 from backend.services import ghost_seen_v2 as service
 from backend.services.ghost_seen_v2 import (
@@ -292,7 +293,7 @@ def _context_buttons(source: int) -> list:
     builder = InlinePanelBuilder()
     for count in (1, 5, 10, 20):
         builder.add_row(str(count), f"action:ghost_seen_v2_ai_generate:{source}:{count}")
-    builder.add_row("← Back", f"action:ghost_seen_v2_actions_back:{source}")
+    builder.add_row(sym.label(sym.OP_BACK, "Back"), f"action:ghost_seen_v2_actions_back:{source}")
     return builder.build()
 
 
@@ -315,7 +316,7 @@ async def _ai_generate_action(event, extra: str, chat_id: int):
     builder = InlinePanelBuilder()
     builder.add_row("Yes", f"action:ghost_seen_v2_ai_disclosure:yes:{source}")
     builder.add_row("No", f"action:ghost_seen_v2_ai_disclosure:no:{source}")
-    builder.add_row("← Back", f"action:ghost_seen_v2_ai_reply:{source}")
+    builder.add_row(sym.label(sym.OP_BACK, "Back"), f"action:ghost_seen_v2_ai_reply:{source}")
     return "👀 Ghost Seen · AI Reply", "Should the recipient be told this reply was written by AI?", builder.build()
 
 
@@ -834,7 +835,7 @@ def _manage_buttons(view: BrowserPage) -> list:
             nav.append(("Next ›", f"action:ghost_seen_v2_manage_page:{view.page + 1}"))
         builder.add_buttons(*nav)
     builder.add_row("🔎 Search", f"input:{_MANAGE_ID}:{_MANAGE_SEARCH_ID}")
-    builder.add_row("← Back", "panel:ghost_seen_v2")
+    builder.add_row(sym.label(sym.OP_BACK, "Back"), "panel:ghost_seen_v2")
     return builder.build()
 
 

@@ -340,7 +340,7 @@ def test_an_out_of_range_page_clamps_onto_the_last_valid_page(panel):
 
     assert "No tasks yet" not in body
     assert len(_task_rows(buttons)) == 1
-    assert "2 / 2" in _labels(buttons)
+    assert "▰ 2 / 2" in _labels(buttons)
 
 
 def test_pagination_survives_a_shrink_so_no_page_renders_empty(panel):

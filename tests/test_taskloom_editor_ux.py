@@ -182,7 +182,7 @@ def test_edit_hub_shows_the_font_of_a_static_message_task(editor):
 
     _title, body, _buttons_ = _open_edit(taskloom, task.id)
 
-    assert "✍ `hello`" in body
+    assert "≡ `hello`" in body
     assert "**Font:** script" in body
 
 
@@ -209,7 +209,7 @@ def test_back_button_of_each_editor_step_targets_the_hub(editor):
         _run(taskloom._wizard_action(None, f"step:{step}", 1))
         _title, _body, buttons = taskloom._wizard_render(taskloom._draft(OWNER))
         rows = _rows(buttons)
-        back = [pairs for pairs in rows if pairs and pairs[0][0].startswith("← Back")]
+        back = [pairs for pairs in rows if pairs and pairs[0][0].startswith("❮ Back")]
         assert len(back) == 1, f"{step} must expose exactly one editor Back"
         assert back[0][0][1] == f"action:taskloom_wizard:step:{taskloom.STEP_EDIT}"
 

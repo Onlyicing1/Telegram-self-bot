@@ -29,6 +29,7 @@ from backend.helper import (
 from backend.helper.client import get_client
 from backend.helper.rpc_timeout import rpc_await
 from backend.helper.styles import DANGER, PRIMARY, SUCCESS
+from backend.helper import symbols as sym
 
 _RPC_T = 30.0
 
@@ -56,11 +57,11 @@ def _build_general_buttons() -> list:
     # the setting is read through the existing settings_service cache.
     auto = settings_service.is_auto_reaction_enabled()
     builder.add_row(
-        f"Auto-Reaction: {'✅ ON' if auto else '❌ OFF'}",
+        f"Auto-Reaction: {sym.label(sym.OP_SAVE, 'ON') if auto else sym.label(sym.OP_CLOSE, 'OFF')}",
         "action:general_toggle_auto_reaction",
         PRIMARY,
     )
-    builder.add_row("😀 Select Reaction", f"panel:{_REACTION_PANEL}", PRIMARY)
+    builder.add_row("Select Reaction", f"panel:{_REACTION_PANEL}", PRIMARY)
     return builder.build()
 
 
@@ -150,12 +151,12 @@ async def _render_reaction_picker(
         builder.add_buttons(*pair)
     if page_count > 1:
         builder.add_buttons(
-            ("◀", f"panel:{_REACTION_PANEL}:{max(0, page - 1)}"),
-            (f"{page + 1}/{page_count}", f"panel:{_REACTION_PANEL}:{page}"),
-            ("▶", f"panel:{_REACTION_PANEL}:{min(page_count - 1, page + 1)}"),
+            (sym.OP_PREV, f"panel:{_REACTION_PANEL}:{max(0, page - 1)}"),
+            (f"{sym.PAGE_CURRENT} {page + 1}/{page_count}", f"panel:{_REACTION_PANEL}:{page}"),
+            (sym.OP_NEXT, f"panel:{_REACTION_PANEL}:{min(page_count - 1, page + 1)}"),
         )
-    builder.add_row("🔄 Refresh", "action:general_reaction_refresh")
-    builder.add_row("← Back", "panel:general")
+    builder.add_row(sym.label(sym.OP_REFRESH, "Refresh"), "action:general_reaction_refresh")
+    builder.add_row(sym.label(sym.OP_BACK, "Back"), "panel:general")
     return "Auto-Reaction", "\n".join(lines), builder.build()
 
 
@@ -165,7 +166,7 @@ async def _reaction_picker_handler(event, extra: str) -> tuple[str, str, list] |
 
 async def _general_reaction_refresh_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     """Explicit Refresh: re-read the catalog from Telegram, bypassing cache."""
-    return await _render_reaction_picker(0, notice="🔄 Refreshed from Telegram.", force=True)
+    return await _render_reaction_picker(0, notice=f"{sym.OP_REFRESH} Refreshed from Telegram.", force=True)
 
 
 async def _general_reaction_set_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
@@ -190,10 +191,10 @@ async def _general_reaction_set_action(event, extra: str, chat_id: int) -> tuple
     emoji = options[idx].get("emoji")
     if not settings_service.set_auto_reaction_emoji(emoji):
         return await _render_reaction_picker(
-            0, notice="✗ Could not save the selection — storage failed.",
+            0, notice=f"{sym.STATE_FAILED} Could not save the selection — storage failed.",
         )
     return await _render_reaction_picker(
-        idx // _REACTION_PAGE_SIZE, notice=f"✓ Reaction set to {emoji}.",
+        idx // _REACTION_PAGE_SIZE, notice=f"{sym.OP_SAVE} Reaction set to {emoji}.",
     )
 
 
@@ -210,11 +211,11 @@ def _build_menu_buttons() -> list:
     builder.add_buttons(
         ("General", "panel:general", PRIMARY),
         ("Settings", "panel:settings", PRIMARY),
-        ("👻 Ghost Seen", "panel:ghost_seen_v2", PRIMARY),
+        ("Ghost Seen", "panel:ghost_seen_v2", PRIMARY),
     )
-    builder.add_row("📋 Todo", "panel:todo", PRIMARY)
-    builder.add_row("🧠 AI", "panel:ai", PRIMARY)
-    builder.add_row("😀 Emoji", "panel:emoji", PRIMARY)
+    builder.add_row("Todo", "panel:todo", PRIMARY)
+    builder.add_row("AI", "panel:ai", PRIMARY)
+    builder.add_row("Emoji", "panel:emoji", PRIMARY)
     return builder.build()
 
 
@@ -291,14 +292,14 @@ def _font_panel_page(current_key: str) -> tuple[str, str, list]:
     page = min(max(_font_page, 0), len(pages) - 1) if pages else 0
     builder = InlinePanelBuilder()
     for key in pages[page] if pages else ():
-        mark = "✓" if key == current_key else "·"
+        mark = sym.STATE_COMPLETED if key == current_key else sym.SEPARATOR
         # Each option demonstrates itself in its own style.
         builder.add_row(f"{mark} {font_option_label(key)}", f"action:font_set:{key}")
     if len(pages) > 1:
         builder.add_buttons(
-            ("◀ Prev", "action:font_page:prev"),
-            (f"{page + 1}/{len(pages)}", "panel:_nav:noop"),
-            ("Next ▶", "action:font_page:next"),
+            (sym.label(sym.OP_PREV, "Prev"), "action:font_page:prev"),
+            (f"{sym.PAGE_CURRENT} {page + 1}/{len(pages)}", "panel:_nav:noop"),
+            (f"Next {sym.OP_NEXT}", "action:font_page:next"),
         )
     label = _FONT_BY_KEY[current_key].label
     body = (
@@ -352,7 +353,7 @@ async def _settings_panel_handler(event, extra: str) -> tuple[str, str, list] | 
     builder.add_row("Set Delete Batch Size", "input:settings:delete_batch_size", PRIMARY)
     builder.add_row("Set Log Retention", "input:settings:log_retention_days", PRIMARY)
     builder.add_row("Set Panel Timeout", "input:settings:panel_timeout_seconds", PRIMARY)
-    builder.add_row("🔤 Font", "panel:font", PRIMARY)
+    builder.add_row("Font", "panel:font", PRIMARY)
     return "Settings", await _build_settings_body(), builder.build()
 
 

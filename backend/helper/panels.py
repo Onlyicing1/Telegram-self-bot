@@ -23,6 +23,7 @@ from backend.helper.panel_registry import registry as get_registry
 from backend.helper.panel_render import _callback, _url
 from backend.helper.session_manager import Session
 from backend.helper.styles import PRIMARY
+from backend.helper import symbols as sym
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +71,7 @@ async def _safe_edit(event, text: str, buttons: list, chat_id: int | None, msg_i
 def _progress_buttons() -> list:
     """Minimal nav row for transient states (progress, working panels)."""
     builder = InlinePanelBuilder()
-    builder.add_row("⌂ Home", "panel:_nav:home")
+    builder.add_row(sym.label(sym.OP_HOME, "Home"), "panel:_nav:home")
     return builder.build()
 
 
@@ -183,15 +184,15 @@ def set_panel_nav_free(panel_id: str, enabled: bool = True) -> None:
 
 
 def _add_close_button(builder: InlinePanelBuilder) -> None:
-    builder.add_row("❌ Close", "panel:_nav:close")
+    builder.add_row(sym.label(sym.OP_CLOSE, "Close"), "panel:_nav:close")
 
 
 def _add_nav_buttons(builder: InlinePanelBuilder) -> None:
     builder.add_buttons(
-        ("⬅ Back", "panel:_nav:back"),
-        ("🏠 Home", "panel:_nav:home"),
+        (sym.label(sym.OP_BACK, "Back"), "panel:_nav:back"),
+        (sym.label(sym.OP_HOME, "Home"), "panel:_nav:home"),
     )
-    builder.add_row("❌ Close", "panel:_nav:close")
+    builder.add_row(sym.label(sym.OP_CLOSE, "Close"), "panel:_nav:close")
 
 
 def _has_nav_buttons(buttons: list) -> bool:
@@ -614,12 +615,12 @@ async def _handle_input(event, remainder: str, owner_id: int, chat_id: int, msg_
     # discard declare it as an explicit extra row (see ``extra_rows``).
     # Home/Close are still offered as explicit navigation.
     builder = InlinePanelBuilder()
-    builder.add_row("← Back", input_cfg.get("back") or f"panel:{panel_id}")
+    builder.add_row(sym.label(sym.OP_BACK, "Back"), input_cfg.get("back") or f"panel:{panel_id}")
     for extra_row in input_cfg.get("extra_rows") or ():
         label, data = extra_row
         builder.add_row(str(label), str(data))
-    builder.add_row("🏠 Home", "panel:_nav:home")
-    builder.add_row("❌ Close", "panel:_nav:close")
+    builder.add_row(sym.label(sym.OP_HOME, "Home"), "panel:_nav:home")
+    builder.add_row(sym.label(sym.OP_CLOSE, "Close"), "panel:_nav:close")
 
     built = builder.build()
     _sync_timer(chat_id or 0, msg_id or 0, panel_id, prompt, built)

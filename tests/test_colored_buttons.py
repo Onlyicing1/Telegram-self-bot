@@ -201,13 +201,13 @@ class TestMainPanelStyles:
         buttons = {b.text: b for r in result.send_message.reply_markup.rows for b in r.buttons}
         assert _bg(buttons["Save"], "success") is True
         assert _bg(buttons["Delete"], "danger") is True
-        assert _bg(buttons["🧠 AI"], "primary") is True
+        assert _bg(buttons["AI"], "primary") is True
 
     def test_other_menu_buttons_are_primary(self):
         result = self._menu_result()
         buttons = {b.text: b for r in result.send_message.reply_markup.rows for b in r.buttons}
-        for label in ("Profile", "Database", "General", "Settings", "👻 Ghost Seen",
-                      "📋 Todo", "😀 Emoji"):
+        for label in ("Profile", "Database", "General", "Settings", "Ghost Seen",
+                      "Todo", "Emoji"):
             assert _bg(buttons[label], "primary") is True, label
 
     def test_menu_only_save_and_delete_use_success_and_danger(self):
@@ -223,7 +223,7 @@ class TestMainPanelStyles:
         buttons = {b.text: b for r in result.send_message.reply_markup.rows for b in r.buttons}
         assert buttons["Save"].data == b"panel:save"
         assert buttons["Delete"].data == b"panel:del"
-        assert buttons["🧠 AI"].data == b"panel:ai"
+        assert buttons["AI"].data == b"panel:ai"
 
     def test_menu_result_serializes_with_style_flag(self):
         result = self._menu_result()
@@ -271,7 +271,7 @@ class TestSubmenuStyles:
         from backend.bot.handlers import misc
         _, _, rows = await misc._settings_panel_handler(None, "")
         buttons = self._by_text(rows)
-        assert _bg(buttons["🔤 Font"], "primary") is True
+        assert _bg(buttons["Font"], "primary") is True
         assert all(_bg(b, "danger") in (None, False) for b in buttons.values())
 
     def test_general_submenu_is_primary(self):
@@ -301,14 +301,14 @@ class TestNavigationStyling:
         builder = InlinePanelBuilder()
         _add_nav_buttons(builder)
         buttons = self._by_text(builder.build())
-        for label in ("⬅ Back", "🏠 Home", "❌ Close"):
+        for label in ("❮ Back", "⌂ Home", "× Close"):
             assert _bg(buttons[label], "primary") is True, label
 
     def test_close_button_is_primary(self):
         from backend.helper.panels import InlinePanelBuilder, _add_close_button
         builder = InlinePanelBuilder()
         _add_close_button(builder)
-        assert _bg(self._by_text(builder.build())["❌ Close"], "primary") is True
+        assert _bg(self._by_text(builder.build())["× Close"], "primary") is True
 
     def test_progress_home_button_is_primary(self):
         from backend.helper.panels import _progress_buttons
@@ -320,7 +320,7 @@ class TestNavigationStyling:
         # appended; the injected control must still be primary.
         _, _, rows = _finalize_panel("T", "B", [], "some_panel", chat_id=1, msg_id=1)
         buttons = self._by_text(rows)
-        assert _bg(buttons["❌ Close"], "primary") is True
+        assert _bg(buttons["× Close"], "primary") is True
 
 
 # ── 9c. Semantic overrides across the other panel families ──
@@ -332,14 +332,14 @@ class TestFamilyOverrides:
         buttons = TestSubmenuStyles._by_text(bio._build_builder_buttons())
         assert _bg(buttons["🗑 Clear"], "danger") is True
         assert _bg(buttons["↩ Reset"], "danger") is True
-        assert _bg(buttons["✅ Apply Template"], "success") is True
+        assert _bg(buttons["✓ Apply Template"], "success") is True
 
     def test_username_builder_clear_reset_red_apply_green(self):
         from backend.bot.handlers import username
         buttons = TestSubmenuStyles._by_text(username._build_builder_buttons())
         assert _bg(buttons["🗑 Clear"], "danger") is True
         assert _bg(buttons["↩ Reset"], "danger") is True
-        assert _bg(buttons["✅ Apply Template"], "success") is True
+        assert _bg(buttons["✓ Apply Template"], "success") is True
 
 
 # ── 10. Exhaustive: no registered panel renders an unstyled button ──

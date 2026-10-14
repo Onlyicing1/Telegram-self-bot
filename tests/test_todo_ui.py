@@ -152,7 +152,7 @@ def test_pagination_clamps_onto_the_current_list(registered, repo):
     _title, body, buttons = _run(registered._todo_list_panel(None, "9"))
     assert "9 active" in body
     assert any("todo 8" in text for text in _texts(buttons))
-    assert "3 / 3" in _texts(buttons)
+    assert "▰ 3 / 3" in _texts(buttons)
 
 
 def test_a_degraded_read_is_never_shown_as_an_authoritative_empty_list(

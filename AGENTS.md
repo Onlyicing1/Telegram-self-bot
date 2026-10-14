@@ -511,6 +511,11 @@ Docs (`/docs`, `/redoc`) are disabled.
    blocks.
 10. **Single recovery authority** — never add a second supervisor; route
     reconnect/rebuild through `RuntimeSupervisor`.
+11. **One symbol registry** — every panel/task symbol and button-label glyph
+    comes from `backend/helper/symbols.py`; compose labels with `sym.label`.
+    Never hard-code a glyph literal in a handler. Glyphs are functional
+    abstract marks (geometric shapes, arrows, math signs), never emoji; see
+    §16.
 
 ---
 
@@ -563,6 +568,34 @@ Docs (`/docs`, `/redoc`) are disabled.
 This table records a verified snapshot, not a permanent assumption: re-verify
 with the commands above before any future push-related claim, and if a fresh
 check disagrees, the fresh remote state wins.
+
+---
+
+## 16. Unicode Symbol System (Glass UI + Taskloom)
+
+One central registry, `backend/helper/symbols.py`, is the single source of
+truth for every functional symbol the panels and the Taskloom task system
+render. Handlers import it as `from backend.helper import symbols as sym` and
+compose labels with `sym.label(glyph, text)`; a glyph literal is never
+hard-coded in a handler.
+
+- **Functional, not decorative** — glyphs are abstract marks (geometric shapes,
+  arrows, math signs), never emoji, and never carry a variation selector
+  (`U+FE0F`). This keeps panels compact/monochrome, survives the display-font
+  pipeline untouched (it transforms only Latin letters + standalone digit
+  runs), and keeps callback data byte-identical.
+- **Categories** — task states (`TASK_STATE_SYMBOLS`), schedule types
+  (`SCHEDULE_SYMBOLS`), destination + content (`CONTENT_SYMBOLS`), common
+  operations (`OPERATION_SYMBOLS`), and panel/wizard structure
+  (`STRUCTURE_SYMBOLS`). Lookups `status_glyph` / `schedule_glyph` /
+  `content_glyph` fail safe on an unknown value.
+- **Uniqueness** — within a category no two members share a glyph; the only
+  cross-category reuses are documented in `DOCUMENTED_REUSE` (e.g. `OP_SAVE` =
+  `✓` = `STATE_COMPLETED`, because saving *is* completing). `tests/test_symbols.py`
+  enforces both invariants.
+- **Labels** — a button label is `"<glyph> <text>"` describing its action;
+  shared nav (`_add_nav_buttons`, `_add_close_button`, `_progress_buttons`) and
+  pagination rows use the registry, and callback/action data is never touched.
 
 ---
 

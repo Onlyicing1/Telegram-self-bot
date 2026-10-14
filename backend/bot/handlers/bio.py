@@ -44,6 +44,7 @@ from backend.helper import (
 )
 from backend.helper.client import get_client
 from backend.helper.styles import DANGER, SUCCESS
+from backend.helper import symbols as sym
 
 logger = logging.getLogger(__name__)
 
@@ -81,14 +82,14 @@ def _render_preview(buf: str) -> str:
 
 def _build_bio_main_buttons() -> list:
     builder = InlinePanelBuilder()
-    builder.add_row("✅ Enable Sync", "panel:biohelp:cmd:on")
+    builder.add_row(sym.label(sym.OP_SAVE, "Enable Sync"), "panel:biohelp:cmd:on")
     builder.add_row("⏹ Disable Sync", "panel:biohelp:cmd:off")
     builder.add_row("👁 Show State", "panel:bio:state")
     builder.add_row("🏗 Template Builder", "panel:biohelp:builder")
     builder.add_row("💬 Set Text", "panel:bio:text")
     builder.add_row("💭 Set Mood", "panel:bio:mood")
     builder.add_row("🔧 Variables", "panel:biohelp:vars")
-    builder.add_row("📋 Commands", "panel:biohelp:cmds")
+    builder.add_row(sym.label(sym.CONTENT_STATIC, "Commands"), "panel:biohelp:cmds")
     return builder.build()
 
 
@@ -128,7 +129,7 @@ async def _bio_inline_builder(event, extra: str) -> list:
 def _build_bio_help_menu_buttons() -> list:
     builder = InlinePanelBuilder()
     builder.add_row("🔧 Variables", "panel:biohelp:vars")
-    builder.add_row("📋 Commands", "panel:biohelp:cmds")
+    builder.add_row(sym.label(sym.CONTENT_STATIC, "Commands"), "panel:biohelp:cmds")
     builder.add_row("🏗 Template Builder", "panel:biohelp:builder")
     return builder.build()
 
@@ -137,7 +138,7 @@ def _build_commands_menu_buttons() -> list:
     builder = InlinePanelBuilder()
     builder.add_row("💬 Set Text", "panel:biohelp:cmd:text")
     builder.add_row("💭 Set Mood", "panel:biohelp:cmd:mood")
-    builder.add_row("✅ Enable Sync", "panel:biohelp:cmd:on")
+    builder.add_row(sym.label(sym.OP_SAVE, "Enable Sync"), "panel:biohelp:cmd:on")
     builder.add_row("⏹ Disable Sync", "panel:biohelp:cmd:off")
     builder.add_row("👁 Show State", "panel:biohelp:cmd:show")
     return builder.build()
@@ -150,7 +151,7 @@ def _build_builder_buttons() -> list:
     builder.add_row("␣ Space", "action:bio_builder_space")
     builder.add_row("🗑 Clear", "action:bio_builder_clear", DANGER)
     builder.add_row("↩ Reset", "action:bio_builder_reset", DANGER)
-    builder.add_row("✅ Apply Template", "action:bio_builder_apply", SUCCESS)
+    builder.add_row(sym.label(sym.OP_SAVE, "Apply Template"), "action:bio_builder_apply", SUCCESS)
     builder.add_row("📝 Reply to Edit", "action:bio_reply_mode")
     return builder.build()
 
@@ -188,7 +189,7 @@ async def _biohelp_panel_handler(event, extra: str) -> tuple[str, str, list] | N
         sub = extra[4:]
         if sub == "on":
             builder = InlinePanelBuilder()
-            builder.add_row("✅ Enable Now", "action:bio_on")
+            builder.add_row(sym.label(sym.OP_SAVE, "Enable Now"), "action:bio_on")
             return "Enable Sync", "Start the bio cron — auto-updates your profile bio every minute.", builder.build()
         if sub == "off":
             builder = InlinePanelBuilder()
@@ -378,7 +379,7 @@ async def _bio_off_action(event, extra: str, chat_id: int) -> tuple[str, str, li
     from backend.helper.inline_engine import _owner_id
     result = await bio_service.do_off(_owner_id)
     builder = InlinePanelBuilder()
-    builder.add_row("✅ Enable Sync", "panel:biohelp:cmd:on")
+    builder.add_row(sym.label(sym.OP_SAVE, "Enable Sync"), "panel:biohelp:cmd:on")
     builder.add_row("👁 Show State", "panel:bio:state")
     return "Bio Engine", result, builder.build()
 

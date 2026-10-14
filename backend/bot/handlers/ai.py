@@ -40,6 +40,7 @@ from backend.helper import (
     render,
     render_edit,
 )
+from backend.helper import symbols as sym
 from backend.runtime.task_guard import guarded_create_task
 
 logger = logging.getLogger(__name__)
@@ -213,8 +214,8 @@ def _context_line(context_tokens: int, max_context: int) -> str:
 
 def _nav_buttons(builder: InlinePanelBuilder) -> None:
     builder.add_buttons(
-        ("← Back", "panel:_nav:back"),
-        ("⌂ Home", "panel:_nav:home"),
+        (sym.label(sym.OP_BACK, "Back"), "panel:_nav:back"),
+        (sym.label(sym.OP_HOME, "Home"), "panel:_nav:home"),
     )
 
 
@@ -428,7 +429,7 @@ async def _ai_model_panel_handler(event, extra: str) -> tuple[str, str, list] | 
     if not provider_name:
         logger.warning("[AI_TRACE] model_panel_handler NO PROVIDER — config=%s", config)
         return "◇ Model", "! Select a provider first.", [
-            [InlinePanelBuilder().add_row("← Back", "panel:ai").build()[0][0]],
+            [InlinePanelBuilder().add_row(sym.label(sym.OP_BACK, "Back"), "panel:ai").build()[0][0]],
         ]
     from backend.ai.model_discovery import (
         fetch_models,
@@ -440,7 +441,7 @@ async def _ai_model_panel_handler(event, extra: str) -> tuple[str, str, list] | 
     base_url = get_base_url_for_provider(provider_name)
     if not api_key:
         return "◇ Model", "! No API key for this provider.", [
-            [InlinePanelBuilder().add_row("← Back", "panel:ai").build()[0][0]],
+            [InlinePanelBuilder().add_row(sym.label(sym.OP_BACK, "Back"), "panel:ai").build()[0][0]],
         ]
     page = 0
     if extra.startswith("page:"):
@@ -452,7 +453,7 @@ async def _ai_model_panel_handler(event, extra: str) -> tuple[str, str, list] | 
     if not models:
         return "◇ Model", "! Could not fetch models.\n\nTap **Refresh** to try again.", [
             [InlinePanelBuilder().add_row("↻ Refresh", "action:ai_refresh_models").build()[0][0]],
-            [InlinePanelBuilder().add_row("← Back", "panel:ai").build()[0][0]],
+            [InlinePanelBuilder().add_row(sym.label(sym.OP_BACK, "Back"), "panel:ai").build()[0][0]],
         ]
     ordered = order_models_for_selector(models)
     total = len(ordered)
@@ -1228,12 +1229,12 @@ async def _ai_start_chat_action(event, extra: str, chat_id: int) -> tuple[str, s
     if not provider:
         return "◉ AI", "! No provider configured.\n\nTap **Provider** to select one.", [
             [InlinePanelBuilder().add_row("◈ Select Provider", "panel:ai_provider").build()[0][0]],
-            [InlinePanelBuilder().add_row("← Back", "panel:ai").build()[0][0]],
+            [InlinePanelBuilder().add_row(sym.label(sym.OP_BACK, "Back"), "panel:ai").build()[0][0]],
         ]
     if not model:
         return "◉ AI", "! No model selected.\n\nTap **Model** to select one.", [
             [InlinePanelBuilder().add_row("◇ Select Model", "panel:ai_model").build()[0][0]],
-            [InlinePanelBuilder().add_row("← Back", "panel:ai").build()[0][0]],
+            [InlinePanelBuilder().add_row(sym.label(sym.OP_BACK, "Back"), "panel:ai").build()[0][0]],
         ]
     if not trigger_en and not trigger_fa:
         return "AI", (
@@ -1241,7 +1242,7 @@ async def _ai_start_chat_action(event, extra: str, chat_id: int) -> tuple[str, s
             "Set one in Settings — you need it to start chatting."
         ), [
             [InlinePanelBuilder().add_row("Set wake word", "panel:ai_settings").build()[0][0]],
-            [InlinePanelBuilder().add_row("← Back", "panel:ai").build()[0][0]],
+            [InlinePanelBuilder().add_row(sym.label(sym.OP_BACK, "Back"), "panel:ai").build()[0][0]],
         ]
     trigger_display = []
     if trigger_en:
@@ -1490,7 +1491,7 @@ async def _ai_test_models_action(event, extra: str, chat_id: int) -> tuple[str, 
     # instead of racing a second tester pass.
     if _test_running:
         builder = InlinePanelBuilder()
-        builder.add_row("⌂ Home", "panel:_nav:home")
+        builder.add_row(sym.label(sym.OP_HOME, "Home"), "panel:_nav:home")
         return (
             "Test Modules",
             f"◌ Already running — this panel will update when done.\n\n{_runtime_pair_line()}",
@@ -1503,7 +1504,7 @@ async def _ai_test_models_action(event, extra: str, chat_id: int) -> tuple[str, 
         name="ai_test_models:run",
     )
     builder = InlinePanelBuilder()
-    builder.add_row("⌂ Home", "panel:_nav:home")
+    builder.add_row(sym.label(sym.OP_HOME, "Home"), "panel:_nav:home")
     builder.add_row("Overview", "panel:ai")
     return (
         "Test Modules",

@@ -40,6 +40,12 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from backend.ai.preparation_policy import derive_policy
+from backend.helper.symbols import (
+    SCHEDULE_ONCE,
+    SCHEDULE_INTERVAL,
+    SCHEDULE_DAILY,
+    SCHEDULE_WEEKLY,
+)
 
 MAX_TEXT_CHARS = 4096
 MAX_SOURCE_CHARS = 64
@@ -99,15 +105,15 @@ class ActionDefinition:
 
 ACTION_DEFINITIONS: dict[str, ActionDefinition] = {
     "bio": ActionDefinition(
-        "bio", "🧬 Bio update", "Update Bio", "bio_set_text",
+        "bio", "Bio update", "Update Bio", "bio_set_text",
         "update my bio", "with a randomly generated dialogue", "dialogue",
     ),
     "username": ActionDefinition(
-        "username", "👤 Username update", "Update Username", "username_set_text",
+        "username", "Username update", "Update Username", "username_set_text",
         "update my username", "with a randomly generated line", "line",
     ),
     "message": ActionDefinition(
-        "message", "📨 Write a message", "Write a message", "send_message",
+        "message", "Write a message", "Write a message", "send_message",
         "write a message", "", "",
     ),
 }
@@ -116,10 +122,10 @@ ACTION_ORDER = ("bio", "username", "message")
 _ACTION_BY_TOOL = {definition.tool: key for key, definition in ACTION_DEFINITIONS.items()}
 SCHEDULE_TYPES = ("once", "interval", "daily", "weekly")
 SCHEDULE_BUTTONS = (
-    ("once", "Once…"),
-    ("interval", "Every N minutes…"),
-    ("daily", "Daily…"),
-    ("weekly", "Weekly…"),
+    ("once", f"{SCHEDULE_ONCE} Once…"),
+    ("interval", f"{SCHEDULE_INTERVAL} Every N minutes…"),
+    ("daily", f"{SCHEDULE_DAILY} Daily…"),
+    ("weekly", f"{SCHEDULE_WEEKLY} Weekly…"),
 )
 
 

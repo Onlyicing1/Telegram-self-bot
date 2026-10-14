@@ -5,6 +5,7 @@ from datetime import timezone
 from zoneinfo import ZoneInfo
 
 from backend.ai.task_management import TaskListSnapshot, TaskManagementService, TaskView
+from backend.helper import symbols as _sym
 
 MAX_LINES = 20
 
@@ -45,17 +46,17 @@ def fallback_note(reason: str) -> str:
     return FALLBACK_NOTE
 
 _STATUS_LABELS = {
-    "active": ("▶️", "Active"),
-    "paused": ("⏸", "Paused"),
-    "completed": ("✅", "Completed"),
-    "failed": ("❌", "Failed"),
-    "expired": ("⌛", "Expired"),
-    "deleted": ("🗑", "Deleted"),
-    "claimed": ("◷", "Claimed"),
-    "running": ("⟳", "Running"),
-    "succeeded": ("✅", "Succeeded"),
-    "retry_pending": ("↻", "Retry pending"),
-    "cancelled": ("⊘", "Cancelled"),
+    "active": (_sym.STATE_ACTIVE, "Active"),
+    "paused": (_sym.STATE_PAUSED, "Paused"),
+    "completed": (_sym.STATE_COMPLETED, "Completed"),
+    "failed": (_sym.STATE_FAILED, "Failed"),
+    "expired": (_sym.STATE_EXPIRED, "Expired"),
+    "deleted": (_sym.STATE_DELETED, "Deleted"),
+    "claimed": (_sym.SCHEDULE_DAILY, "Claimed"),
+    "running": (_sym.SCHEDULE_INTERVAL, "Running"),
+    "succeeded": (_sym.STATE_COMPLETED, "Succeeded"),
+    "retry_pending": (_sym.OP_REFRESH, "Retry pending"),
+    "cancelled": (_sym.STATE_DELETED, "Cancelled"),
     "interrupted": ("⚠️", "Interrupted"),
 }
 
@@ -167,7 +168,7 @@ def steps_block_text(
         return "\n".join(lines)
     lines.append("Steps:")
     for index, step in enumerate(steps, start=1):
-        mark = "✓" if str(getattr(step, "status", "")) == "completed" else "○"
+        mark = _sym.STATE_COMPLETED if str(getattr(step, "status", "")) == "completed" else _sym.SCHEDULE_ONCE
         step_title = " ".join(str(getattr(step, "title", "") or "").split()) or "Untitled"
         lines.append(f"{mark} {index}. {step_title}")
     next_step = getattr(progress, "next_step", None)
