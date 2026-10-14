@@ -14,15 +14,15 @@ import logging
 from typing import Awaitable, Callable, Any
 
 from telethon import events
-from telethon.tl.custom import Button
 
 from backend.bot.handlers.guard import is_owner
 from backend.helper.context import truncate_callback_data
 from backend.helper.input_state import set_pending, clear_pending, get_pending
 from backend.helper.lifecycle import get_lifecycle
 from backend.helper.panel_registry import registry as get_registry
-from backend.helper.panel_render import _callback
+from backend.helper.panel_render import _callback, _url
 from backend.helper.session_manager import Session
+from backend.helper.styles import PRIMARY
 
 logger = logging.getLogger(__name__)
 
@@ -133,9 +133,11 @@ def _styled_button(text: str, callback_data: str, style: str | None = None):
 
     Both styled and unstyled buttons are real ``KeyboardButtonCallback``
     objects (data already encoded), preserving the builder's existing contract.
-    Unsupported styles fall back to an unstyled button.
+    When no style is supplied the button defaults to ``primary`` (blue), so a
+    caller that omits the argument never produces a silently-unstyled button;
+    unsupported styles fall back to an unstyled button.
     """
-    return _callback(text, truncate_callback_data(callback_data), style)
+    return _callback(text, truncate_callback_data(callback_data), style if style is not None else PRIMARY)
 
 
 class InlinePanelBuilder:
@@ -152,8 +154,8 @@ class InlinePanelBuilder:
         self._rows.append(row)
         return self
 
-    def add_url(self, text: str, url: str) -> "InlinePanelBuilder":
-        self._rows.append([Button.url(text, url)])
+    def add_url(self, text: str, url: str, style: str | None = None) -> "InlinePanelBuilder":
+        self._rows.append([_url(text, url, style if style is not None else PRIMARY)])
         return self
 
     def build(self) -> list[list[Any]]:

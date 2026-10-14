@@ -111,29 +111,44 @@ class TestStylePreservationAndSerialization:
         assert _bg(built[0][0], "danger") is True
 
 
-# ── 4 + 5. Existing tuple / unstyled / URL buttons are unchanged ──
+# ── 4 + 5. Default styling for tuple / raw / URL buttons; explicit overrides ──
 
 
-class TestUnstyledUnchanged:
-    def test_tuple_button_is_unstyled(self):
+class TestDefaultStyling:
+    """No button may silently render unstyled: the shared renderer defaults
+    every style-less button to ``primary`` (blue)."""
+
+    def test_tuple_button_defaults_to_primary(self):
         btn = _normalize_button(("Save", "panel:save"))
         assert isinstance(btn, types.KeyboardButtonCallback)
         assert _has_style_flag(btn)
-        assert all(_bg(btn, n) in (None, False) for n in SUPPORTED_BUTTON_STYLES)
+        assert _bg(btn, "primary") is True
+        assert btn.data == b"panel:save"
 
-    def test_plain_button_object_is_unstyled(self):
+    def test_plain_button_object_defaults_to_primary(self):
         btn = _normalize_button(Button.inline("Profile", b"panel:profile"))
-        assert all(_bg(btn, n) in (None, False) for n in SUPPORTED_BUTTON_STYLES)
+        assert _bg(btn, "primary") is True
 
-    def test_url_button_is_unchanged_and_unstyled(self):
+    def test_plain_button_object_keeps_explicit_style(self):
+        btn = _normalize_button(Button.inline("Del", b"panel:del", style="danger"))
+        assert _bg(btn, "danger") is True
+        assert _bg(btn, "primary") in (None, False)
+
+    def test_url_button_defaults_to_primary_and_keeps_url(self):
         btn = _normalize_button(Button.url("Docs", "https://example.com"))
         assert isinstance(btn, types.KeyboardButtonUrl)
         assert btn.url == "https://example.com"
+        assert _bg(btn, "primary") is True
 
-    def test_unstyled_render_has_no_background(self):
+    def test_url_button_keeps_explicit_style(self):
+        btn = _normalize_button(Button.url("Docs", "https://example.com", style="danger"))
+        assert btn.url == "https://example.com"
+        assert _bg(btn, "danger") is True
+
+    def test_tuple_render_defaults_to_primary(self):
         result = render("T", "B", [[("Profile", "panel:profile")]])
         button = result.send_message.reply_markup.rows[0].buttons[0]
-        assert all(_bg(button, n) in (None, False) for n in SUPPORTED_BUTTON_STYLES)
+        assert _bg(button, "primary") is True
 
 
 # ── 6. Callback data and navigation behaviour unchanged ──
@@ -159,7 +174,10 @@ class TestCallbackDataUnchanged:
 class TestUnsupportedStyles:
     @pytest.mark.parametrize("bad", ["purple", "#ff0000", "PINK", "", 123, object()])
     def test_unsupported_style_degrades_to_unstyled(self, bad):
-        btn = _normalize_button(_callback("X", b"panel:x", bad))
+        # A caller-supplied *unsupported* style must not be upgraded to a
+        # default either — it degrades to a plain, unstyled button (fail safe,
+        # never raising), preserving the action.
+        btn = _callback("X", b"panel:x", bad)
         assert isinstance(btn, types.KeyboardButtonCallback)
         assert all(_bg(btn, n) in (None, False) for n in SUPPORTED_BUTTON_STYLES)
         assert btn.data == b"panel:x"  # never raises, action preserved
@@ -167,6 +185,7 @@ class TestUnsupportedStyles:
     def test_case_insensitive_supported_style_is_accepted(self):
         btn = _normalize_button(_callback("X", b"panel:x", "PRIMARY"))
         assert _bg(btn, "primary") is True
+
 
 
 # ── 8. The existing main panel applies the intended styles end to end ──
@@ -240,13 +259,12 @@ class TestSubmenuStyles:
         assert all(_bg(b, "success") in (None, False) for b in buttons.values())
 
     @pytest.mark.asyncio
-    async def test_delete_confirm_is_red_and_back_stays_unstyled(self):
+    async def test_delete_confirm_is_red_and_back_is_blue(self):
         from backend.bot.handlers import delete
         _, _, rows = await delete._delfrom_confirm(123)
         buttons = self._by_text(rows)
         assert _bg(buttons["🗑 Confirm Delete"], "danger") is True
-        assert all(_bg(buttons["‹ Back to methods"], n) in (None, False)
-                   for n in SUPPORTED_BUTTON_STYLES)
+        assert _bg(buttons["‹ Back to methods"], "primary") is True
 
     @pytest.mark.asyncio
     async def test_settings_submenu_is_primary(self):
@@ -267,3 +285,135 @@ class TestSubmenuStyles:
         for rows in (misc._build_menu_buttons(), misc._build_general_buttons()):
             for b in self._by_text(rows).values():
                 assert not (_bg(b, "success") and _bg(b, "danger"))
+
+
+# ── 9b. Automatically injected navigation + transient progress buttons ──
+
+
+class TestNavigationStyling:
+    @staticmethod
+    def _by_text(rows):
+        result = render("T", "B", rows)
+        return {b.text: b for r in result.send_message.reply_markup.rows for b in r.buttons}
+
+    def test_nav_row_back_home_close_are_primary(self):
+        from backend.helper.panels import InlinePanelBuilder, _add_nav_buttons
+        builder = InlinePanelBuilder()
+        _add_nav_buttons(builder)
+        buttons = self._by_text(builder.build())
+        for label in ("⬅ Back", "🏠 Home", "❌ Close"):
+            assert _bg(buttons[label], "primary") is True, label
+
+    def test_close_button_is_primary(self):
+        from backend.helper.panels import InlinePanelBuilder, _add_close_button
+        builder = InlinePanelBuilder()
+        _add_close_button(builder)
+        assert _bg(self._by_text(builder.build())["❌ Close"], "primary") is True
+
+    def test_progress_home_button_is_primary(self):
+        from backend.helper.panels import _progress_buttons
+        assert _bg(self._by_text(_progress_buttons())["⌂ Home"], "primary") is True
+
+    def test_finalize_panel_appends_primary_nav(self):
+        from backend.helper.panels import _finalize_panel
+        # No registered session → treated as the root view, so only Close is
+        # appended; the injected control must still be primary.
+        _, _, rows = _finalize_panel("T", "B", [], "some_panel", chat_id=1, msg_id=1)
+        buttons = self._by_text(rows)
+        assert _bg(buttons["❌ Close"], "primary") is True
+
+
+# ── 9c. Semantic overrides across the other panel families ──
+
+
+class TestFamilyOverrides:
+    def test_bio_builder_clear_reset_red_apply_green(self):
+        from backend.bot.handlers import bio
+        buttons = TestSubmenuStyles._by_text(bio._build_builder_buttons())
+        assert _bg(buttons["🗑 Clear"], "danger") is True
+        assert _bg(buttons["↩ Reset"], "danger") is True
+        assert _bg(buttons["✅ Apply Template"], "success") is True
+
+    def test_username_builder_clear_reset_red_apply_green(self):
+        from backend.bot.handlers import username
+        buttons = TestSubmenuStyles._by_text(username._build_builder_buttons())
+        assert _bg(buttons["🗑 Clear"], "danger") is True
+        assert _bg(buttons["↩ Reset"], "danger") is True
+        assert _bg(buttons["✅ Apply Template"], "success") is True
+
+
+# ── 10. Exhaustive: no registered panel renders an unstyled button ──
+
+
+class _FakeClient:
+    """Minimal stand-in used only to run handler registration in tests."""
+
+    def on(self, *a, **k):
+        def deco(fn):
+            return fn
+        return deco
+
+    def __getattr__(self, name):
+        def _f(*a, **k):
+            async def _c():
+                return None
+            return _c()
+        return _f
+
+
+def _register_every_panel():
+    import inspect
+    from backend.bot.handlers import (
+        misc, save, retrieve, delete, bio, discover, database, username, ai,
+        ghost_seen_v2, ai_credentials, ai_stt_settings, ai_tts_settings, emoji,
+        tasks, taskloom, task_events, todo,
+    )
+    mods = [misc, save, retrieve, delete, bio, discover, database, username, ai,
+            ai_credentials, ai_stt_settings, ai_tts_settings, emoji, ghost_seen_v2,
+            tasks, taskloom, task_events, todo]
+    client = _FakeClient()
+    for mod in mods:
+        n = len(inspect.signature(mod.register).parameters)
+        if n == 2:
+            mod.register(client, 1)
+        else:
+            mod.register(client, 1, "Asia/Tehran")
+
+
+class TestEveryPanelButtonIsStyled:
+    """Every button of every registered panel must carry one of the three
+    supported styles once it passes through the shared render path."""
+
+    @pytest.mark.asyncio
+    async def test_no_registered_panel_renders_an_unstyled_button(self):
+        import inspect
+        from backend.helper.panel_registry import registry
+        from backend.helper.panels import _finalize_panel, _extract_render_result
+        _register_every_panel()
+        reg = registry()
+        checked = 0
+        for pid in reg.all_ids():
+            handler = reg.get_handler(pid)
+            try:
+                res = handler(None, "")
+                if inspect.isawaitable(res):
+                    res = await res
+                title, body, rows = _extract_render_result(res)
+            except Exception:
+                # Panels that need a real ``extra`` segment (dynamic sub-ids)
+                # are exercised elsewhere; skip the ones that cannot render
+                # without live state.
+                continue
+            _, _, rows = _finalize_panel(title, body, rows, pid, chat_id=1, msg_id=1)
+            result = render(title, body, rows)
+            markup = result.send_message.reply_markup
+            if markup is None:
+                continue
+            checked += 1
+            for row in markup.rows:
+                for btn in row.buttons:
+                    styles = [n for n in SUPPORTED_BUTTON_STYLES if _bg(btn, n)]
+                    assert len(styles) == 1, (
+                        f"panel '{pid}' button {btn.text!r} has styles={styles}"
+                    )
+        assert checked > 20, f"expected to inspect many panels, only saw {checked}"

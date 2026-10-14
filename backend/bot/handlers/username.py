@@ -40,6 +40,7 @@ from backend.helper import (
     render,
 )
 from backend.helper.client import get_client
+from backend.helper.styles import DANGER, SUCCESS
 
 logger = logging.getLogger(__name__)
 
@@ -144,9 +145,9 @@ def _build_builder_buttons() -> list:
     for var_token, _, _ in _USERNAME_VARS:
         builder.add_row(f"+ {var_token}", f"action:username_builder_add:{var_token}")
     builder.add_row("␣ Space", "action:username_builder_space")
-    builder.add_row("🗑 Clear", "action:username_builder_clear")
-    builder.add_row("↩ Reset", "action:username_builder_reset")
-    builder.add_row("✅ Apply Template", "action:username_builder_apply")
+    builder.add_row("🗑 Clear", "action:username_builder_clear", DANGER)
+    builder.add_row("↩ Reset", "action:username_builder_reset", DANGER)
+    builder.add_row("✅ Apply Template", "action:username_builder_apply", SUCCESS)
     builder.add_row("📝 Reply to Edit", "action:username_reply_mode")
     return builder.build()
 

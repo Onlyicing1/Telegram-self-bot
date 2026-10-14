@@ -32,6 +32,7 @@ from backend.helper import (
     register_inline_builder,
     render,
 )
+from backend.helper.styles import DANGER, SUCCESS
 
 logger = logging.getLogger(__name__)
 
@@ -214,7 +215,7 @@ async def _todo_detail_panel(event, extra: str) -> tuple[str, str, list] | None:
                 f"action:todo_complete_all:{task.id}:{task.version}",
             )
         else:
-            builder.add_row("✓ Complete", f"action:todo_complete:{task.id}:{task.version}")
+            builder.add_row("✓ Complete", f"action:todo_complete:{task.id}:{task.version}", SUCCESS)
         builder.add_row("✏️ Edit", f"input:{_DETAIL_PANEL}:edit:{task.id}:{task.version}")
     elif str(task.status) == "completed":
         builder.add_row("↩️ Reopen", f"action:todo_reopen:{task.id}:{task.version}")
@@ -226,7 +227,7 @@ async def _todo_detail_panel(event, extra: str) -> tuple[str, str, list] | None:
         )
     else:
         builder.add_row("🧩 Add steps", f"input:{_STEPS_PANEL}:add:{task.id}")
-    builder.add_row("🗑 Delete", f"action:todo_delete:{task.id}:{task.version}")
+    builder.add_row("🗑 Delete", f"action:todo_delete:{task.id}:{task.version}", DANGER)
     builder.add_row("⟳ Refresh", f"panel:{_DETAIL_PANEL}:{task.id}")
     _nav(builder)
     return f"Todo #{task.id}", "\n".join(lines), builder.build()

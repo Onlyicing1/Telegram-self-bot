@@ -54,6 +54,7 @@ from backend.ai.task_wizard import (
     TaskDraft,
     TaskWizardError,
 )
+from backend.helper.styles import DANGER, SUCCESS
 
 logger = logging.getLogger(__name__)
 
@@ -266,10 +267,10 @@ async def _task_detail_panel(event, extra: str) -> tuple[str, str, list] | None:
     elif task.status == "paused":
         builder.add_row("● Resume", f"action:taskloom_resume:{task.id}:{task.version}")
     if task.status not in ("completed", "deleted", "expired"):
-        builder.add_row("✓ Complete", f"action:taskloom_complete:{task.id}:{task.version}")
+        builder.add_row("✓ Complete", f"action:taskloom_complete:{task.id}:{task.version}", SUCCESS)
     builder.add_row("✎ Edit", f"panel:{_WIZARD_PANEL}:edit:{task.id}")
     if task.status not in ("deleted",):
-        builder.add_row("⌫ Delete", f"action:taskloom_delete:{task.id}:{task.version}")
+        builder.add_row("⌫ Delete", f"action:taskloom_delete:{task.id}:{task.version}", DANGER)
     builder.add_row("⟳ Refresh", f"panel:taskloom_task:{task.id}")
     _nav(builder)
     return f"Task #{task.id}", "\n".join(lines), builder.build()

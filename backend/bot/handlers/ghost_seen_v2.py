@@ -14,6 +14,7 @@ from backend.helper import (
 from backend.ai import diagnostics as ai_diag
 from backend.helper import inline_engine
 from backend.helper.client import get_client
+from backend.helper.styles import DANGER
 from backend.helper.lifecycle import get_lifecycle
 from backend.services import ghost_seen_v2 as service
 from backend.services.ghost_seen_v2 import (
@@ -181,7 +182,7 @@ def _viewer_buttons(view: MessageViewerPage) -> list:
         label = f"✓ {preview_snip}" if is_selected else f"Select {preview_snip}"
         builder.add_row(label, f"action:ghost_seen_v2_select:{view.source_chat_id}|{message.message_id}")
     if view.selected_ids:
-        builder.add_row(f"Clear ({len(view.selected_ids)})", f"action:ghost_seen_v2_clear:{view.source_chat_id}")
+        builder.add_row(f"Clear ({len(view.selected_ids)})", f"action:ghost_seen_v2_clear:{view.source_chat_id}", DANGER)
         builder.add_row(f"Actions ({len(view.selected_ids)})", f"action:ghost_seen_v2_actions:{view.source_chat_id}")
     builder.add_row("‹ Back to chats", "panel:ghost_seen_v2")
     if view.total_pages > 1:
