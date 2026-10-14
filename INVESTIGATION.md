@@ -1,19 +1,19 @@
-# INVESTIGATION.md — Colored Inline Buttons: Dependency Selection and Implementation Basis
+# INVESTIGATION.md — Colored Inline Buttons: Dependency Selection and Semantic Mapping
 
 This file records **only** the current, evidence-based investigation for the
 active task and **replaces every previous investigation in full**; earlier
-narratives (the colored-button feasibility verdict `1396a19`, Emoji Stage 3
-`9073979`, Emoji Stage 2 `9854601`, Emoji Stage 1 `34bed87`/`fbdf9c4`, and the
-premium-emoji diagnoses `78d8744`/`798ff4b`/`50b035a`/`4c12ff3`) remain readable
-in git history.
+narratives (the colored-button feasibility verdict `1396a19`, the first
+colored-button implementation `3370eae`, Emoji Stage 3 `9073979`, Emoji Stage 2
+`9854601`, Emoji Stage 1 `34bed87`/`fbdf9c4`, and the premium-emoji diagnoses
+`78d8744`/`798ff4b`/`50b035a`/`4c12ff3`) remain readable in git history.
 
 | Item | Value |
 |---|---|
 | Project / remote | LifeOS Telegram self-bot, `Onlyicing1/Telegram-self-bot` (`origin` = `https://github.com/Onlyicing1/Telegram-self-bot.git`) |
 | Target branch | `main` (delivery target `origin/main`) |
-| Base revision | `1396a19eac7a9bb2c379992e22923fbcd1862acf` — verified `= origin/main` at task start (`git fetch origin` + `git rev-parse origin/main`) |
+| Base revision | `3370eae982a0785038224a42e6d68884be48c2c5` — verified `= origin/main` at task start (`git fetch origin` + `git rev-parse origin/main`) |
 | Runtime | Python **3.13.15** |
-| Telethon | **upgraded `1.34.0` → `1.43.0`** (TL Layer 173 → 224) |
+| Telethon | **`1.43.0`** (TL Layer 224) — already pinned by the prior task; re-confirmed below as the smallest release with the required API |
 | Investigation method | Source inspection of candidate wheels + executable probes against the installed package; full repository test suite run locally |
 | Live Telegram | **NOT performed.** No `.env`, no credentials; `backend/config.load()` hard-fails. **No Telegram request of any kind was made** |
 
@@ -21,35 +21,37 @@ in git history.
 
 ## 1. Task under investigation
 
-Implement Telegram's named colored inline-button styles (`primary`, `success`,
-`danger`) in the **existing** LifeOS main panel, through the existing shared
-renderer — provided dependency compatibility and regression checks pass. The
-prior task (`1396a19`) established that the pinned `telethon==1.34.0` (Layer 173)
-has no `KeyboardButtonStyle`, no `style` field, and no serialization path; this
-task resolves the dependency question and implements the feature.
+Apply Telegram's three officially supported inline-button styles
+(`primary`/blue, `success`/green, `danger`/red) **consistently** across the
+existing LifeOS main panel and its first-level submenus, using the existing
+shared renderer — without a secondary panel, arbitrary colors, or a parallel
+rendering system. The prior task (`3370eae`) had already added the style
+channel and colored the main panel's Save/Delete/AI buttons; this task extends
+the mapping and makes it consistent and restrained.
 
-## 2. Dependency selection (the specific compatibility question)
+## 2. Dependency selection (re-verified)
 
 ### 2.1 Smallest Telethon release with the required API
 
-Candidate wheels were downloaded and inspected (`telethon/tl/alltlobjects.py`,
+Candidate wheels were inspected (`telethon/tl/alltlobjects.py`,
 `telethon/tl/custom/button.py`) to find the earliest release exposing both the
 `KeyboardButtonStyle` constructor and the `Button.inline(..., style=...)` API:
 
 | Telethon | TL Layer | `KeyboardButtonStyle` | `Button.inline(style=)` |
 |---|---|---|---|
-| 1.34.0 (pinned) | 173 | No | No |
+| 1.34.0 (original pin) | 173 | No | No |
 | 1.38.0 | 193 | No | No |
-| 1.40.0 | 214 | No | No |
-| 1.41.0 | 214 | No | No |
+| 1.40.0 / 1.41.0 | 214 | No | No |
 | 1.42.0 | 216 | No | No |
 | **1.43.0** | **224** | **Yes** | **Yes** |
 | 1.44.0 | 227 | Yes | Yes |
 | 1.45.0 | 229 | Yes | Yes |
 
-**`1.43.0` is the smallest release that supports the feature** and was selected.
+**`1.43.0` is the smallest release that supports the feature.** It was already
+selected and pinned in `backend/requirements.txt` by `3370eae`;
 `Requires-Python: >=3.5`, dependencies unchanged (`pyaes`, `rsa`), so it is
-compatible with the project's Python 3.13 and existing usage.
+compatible with the project's Python 3.13 and existing usage. No further
+dependency change was required for this task.
 
 ### 2.2 The API (verified in the installed 1.43.0)
 
@@ -66,33 +68,29 @@ compatible with the project's Python 3.13 and existing usage.
 ### 2.3 Serialization behaviour (verified by executable probe)
 
 * A styled button sets `flags.10` and embeds the `KeyboardButtonStyle`; e.g.
-  `Button.inline("Save", b"panel:save", style="primary")._bytes()` begins
-  `b'`\xc9+\xe6\x00\x04\x00\x00'` (`0x400` = bit 10 set).
+  `Button.inline("Save", b"panel:save", style="success")._bytes()` contains a
+  `0x400` (bit 10) flags word.
 * In this Telethon, `Button.inline` always wraps a `KeyboardButtonStyle` (even
   when no style is requested), so unstyled buttons also set `flags.10` with all
   `bg_*` unset — a valid, semantically-unstyled wire form. A bare
   `KeyboardButtonCallback(...)` without `style` sets no `flags.10`.
 
-### 2.4 Regression check of the upgrade
+## 3. Rendering / callback path (verified)
 
-The **full suite** was run against `telethon==1.43.0` before any code change:
-**5913 passed, 27 skipped** — identical to the recorded `1.34.0` baseline, i.e.
-**no regression** from the upgrade. The suite was run again after the code
-change (see `IMPLEMENTATION_REPORT.md`).
-
-## 3. Implementation basis (current renderer)
-
-`backend/helper/panel_render.py::_normalize_button` normalizes tuples and
-`Button` objects. The prior version rebuilt a font-restyled button via
-`Button.inline(styled, btn.data)` — dropping any style — and had no style
-channel. This task adds a minimal style path (see `IMPLEMENTATION_REPORT.md`)
-that preserves the selected style through normalization, display-text
-formatting, inline-result construction, and the existing callback path.
+Panel button definitions flow through `InlinePanelBuilder`
+(`backend/helper/panels.py`) → `panel_render._normalize_button` →
+`render()` → `InputBotInlineMessageText.reply_markup`. The builder's
+`add_row`/`add_buttons` accept an optional trailing `style`; `_styled_button`
+→ `panel_render._callback` builds a real `KeyboardButtonCallback` (data already
+encoded) with the named style. `_normalize_button` preserves an existing style
+through font restyling (`_style_name_from_tl`), so styling survives the
+text/font-formatting step. Callback data is never passed through the display
+formatter, and URL buttons are untouched.
 
 ## 4. Conclusion
 
 * **Dependency compatibility:** confirmed — `1.43.0` provides the constructor,
-  the field, and the serialization path; the upgrade caused no test regression.
+  the field, and the serialization path (already in place).
 * **Source-level implementation:** complete (see `IMPLEMENTATION_REPORT.md`).
 * **Live Telegram acceptance / visual rendering / callback delivery:**
   **unverified** — no credentials or safe test destination in this workspace.
@@ -101,6 +99,7 @@ formatting, inline-result construction, and the existing callback path.
 ## 5. Remaining limitation
 
 Live acceptance must be confirmed by the owner with real credentials: send the
-existing `Menu` panel from the account and confirm (a) Telegram accepts the
-request, (b) Save/Delete/AI render green/red/blue in a current client, and
-(c) each styled button's callback still routes to the existing handler.
+existing `Menu` panel (and a submenu) from the account and confirm (a) Telegram
+accepts the styled markup, (b) the buttons render blue/green/red in a current
+client, and (c) each styled button's callback still routes to the existing
+handler.

@@ -28,6 +28,7 @@ from backend.helper import (
     render,
 )
 from backend.helper.client import get_client
+from backend.helper.styles import PRIMARY, SUCCESS
 
 logger = logging.getLogger(__name__)
 
@@ -35,14 +36,14 @@ logger = logging.getLogger(__name__)
 async def _save_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
     if extra.startswith("type:"):
         builder = InlinePanelBuilder()
-        builder.add_row("💬 Reply Mode", "action:save_reply")
-        builder.add_row("✏️ Name & tags", "input:save:meta")
-        builder.add_row("🔗 Save using a link", "input:save:link")
+        builder.add_row("💬 Reply Mode", "action:save_reply", SUCCESS)
+        builder.add_row("✏️ Name & tags", "input:save:meta", PRIMARY)
+        builder.add_row("🔗 Save using a link", "input:save:link", PRIMARY)
         return "Deep Save", "Choose a source. Name & tags are optional.", builder.build()
 
     builder = InlinePanelBuilder()
-    builder.add_row("⬇️ Deep Save", "panel:save:type:d")
-    builder.add_row("🔍 Retrieve", "panel:retrieve")
+    builder.add_row("⬇️ Deep Save", "panel:save:type:d", SUCCESS)
+    builder.add_row("🔍 Retrieve", "panel:retrieve", PRIMARY)
     return (
         "Save",
         "Deep Save downloads the message and re-uploads it as a new Saved Messages message.",
@@ -53,14 +54,14 @@ async def _save_panel_handler(event, extra: str) -> tuple[str, str, list] | None
 async def _save_inline_builder(event, extra: str) -> list:
     if extra.startswith("type:"):
         builder = InlinePanelBuilder()
-        builder.add_row("💬 Reply Mode", "action:save_reply")
-        builder.add_row("✏️ Name & tags", "input:save:meta")
-        builder.add_row("🔗 Save using a link", "input:save:link")
+        builder.add_row("💬 Reply Mode", "action:save_reply", SUCCESS)
+        builder.add_row("✏️ Name & tags", "input:save:meta", PRIMARY)
+        builder.add_row("🔗 Save using a link", "input:save:link", PRIMARY)
         return [render("Deep Save", "Choose a source. Name & tags are optional.", builder.build())]
 
     builder = InlinePanelBuilder()
-    builder.add_row("⬇️ Deep Save", "panel:save:type:d")
-    builder.add_row("🔍 Retrieve", "panel:retrieve")
+    builder.add_row("⬇️ Deep Save", "panel:save:type:d", SUCCESS)
+    builder.add_row("🔍 Retrieve", "panel:retrieve", PRIMARY)
     return [
         render(
             "Save",

@@ -28,6 +28,7 @@ from backend.helper import (
 )
 from backend.helper.client import get_client
 from backend.helper.rpc_timeout import rpc_await
+from backend.helper.styles import DANGER, PRIMARY, SUCCESS
 
 _RPC_T = 30.0
 
@@ -48,17 +49,18 @@ def _build_general_buttons() -> list:
     from backend.services import settings_service
 
     builder = InlinePanelBuilder()
-    builder.add_row("Ping", "action:general_ping")
-    builder.add_row("Chat & Msg IDs", "action:general_id")
-    builder.add_row("Health Dashboard", "action:general_health")
+    builder.add_row("Ping", "action:general_ping", PRIMARY)
+    builder.add_row("Chat & Msg IDs", "action:general_id", PRIMARY)
+    builder.add_row("Health Dashboard", "action:general_health", PRIMARY)
     # Label reflects the ACTUAL stored setting (never a hardcoded/stale value);
     # the setting is read through the existing settings_service cache.
     auto = settings_service.is_auto_reaction_enabled()
     builder.add_row(
         f"Auto-Reaction: {'✅ ON' if auto else '❌ OFF'}",
         "action:general_toggle_auto_reaction",
+        PRIMARY,
     )
-    builder.add_row("😀 Select Reaction", f"panel:{_REACTION_PANEL}")
+    builder.add_row("😀 Select Reaction", f"panel:{_REACTION_PANEL}", PRIMARY)
     return builder.build()
 
 
@@ -198,21 +200,21 @@ async def _general_reaction_set_action(event, extra: str, chat_id: int) -> tuple
 def _build_menu_buttons() -> list:
     builder = InlinePanelBuilder()
     builder.add_buttons(
-        ("Save", "panel:save", "success"),
-        ("Delete", "panel:del", "danger"),
+        ("Save", "panel:save", SUCCESS),
+        ("Delete", "panel:del", DANGER),
     )
     builder.add_buttons(
-        ("Profile", "panel:profile"),
-        ("Database", "panel:db"),
+        ("Profile", "panel:profile", PRIMARY),
+        ("Database", "panel:db", PRIMARY),
     )
     builder.add_buttons(
-        ("General", "panel:general"),
-        ("Settings", "panel:settings"),
-        ("👻 Ghost Seen", "panel:ghost_seen_v2"),
+        ("General", "panel:general", PRIMARY),
+        ("Settings", "panel:settings", PRIMARY),
+        ("👻 Ghost Seen", "panel:ghost_seen_v2", PRIMARY),
     )
-    builder.add_row("📋 Todo", "panel:todo")
-    builder.add_row("🧠 AI", "panel:ai", "primary")
-    builder.add_row("😀 Emoji", "panel:emoji")
+    builder.add_row("📋 Todo", "panel:todo", PRIMARY)
+    builder.add_row("🧠 AI", "panel:ai", PRIMARY)
+    builder.add_row("😀 Emoji", "panel:emoji", PRIMARY)
     return builder.build()
 
 
@@ -234,15 +236,15 @@ async def _general_inline_builder(event, extra: str) -> list:
 
 async def _profile_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
     builder = InlinePanelBuilder()
-    builder.add_row("Bio", "panel:bio")
-    builder.add_row("Username", "panel:username")
+    builder.add_row("Bio", "panel:bio", PRIMARY)
+    builder.add_row("Username", "panel:username", PRIMARY)
     return "Profile", "Choose a section:", builder.build()
 
 
 async def _profile_inline_builder(event, extra: str) -> list:
     builder = InlinePanelBuilder()
-    builder.add_row("Bio", "panel:bio")
-    builder.add_row("Username", "panel:username")
+    builder.add_row("Bio", "panel:bio", PRIMARY)
+    builder.add_row("Username", "panel:username", PRIMARY)
     return [render("Profile", "Choose a section:", builder.build())]
 
 
@@ -340,17 +342,17 @@ async def _font_page_action(event, extra: str, chat_id: int) -> tuple[str, str, 
 
 async def _settings_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
     builder = InlinePanelBuilder()
-    builder.add_row("Toggle Auto-close", "action:settings_toggle_autoclose")
-    builder.add_row("Toggle Debug Callbacks", "action:settings_toggle_debug_callbacks")
-    builder.add_row("Toggle Owner Only", "action:settings_toggle_owner_only")
-    builder.add_row("Toggle Multiple Panels", "action:settings_toggle_multiple_panels")
-    builder.add_row("Toggle Reuse Panel", "action:settings_toggle_reuse_panel")
-    builder.add_row("Set Auto-close Delay", "input:settings:auto_close_delay")
-    builder.add_row("Set Max Deep Save", "input:settings:max_deep_save_mb")
-    builder.add_row("Set Delete Batch Size", "input:settings:delete_batch_size")
-    builder.add_row("Set Log Retention", "input:settings:log_retention_days")
-    builder.add_row("Set Panel Timeout", "input:settings:panel_timeout_seconds")
-    builder.add_row("🔤 Font", "panel:font")
+    builder.add_row("Toggle Auto-close", "action:settings_toggle_autoclose", PRIMARY)
+    builder.add_row("Toggle Debug Callbacks", "action:settings_toggle_debug_callbacks", PRIMARY)
+    builder.add_row("Toggle Owner Only", "action:settings_toggle_owner_only", PRIMARY)
+    builder.add_row("Toggle Multiple Panels", "action:settings_toggle_multiple_panels", PRIMARY)
+    builder.add_row("Toggle Reuse Panel", "action:settings_toggle_reuse_panel", PRIMARY)
+    builder.add_row("Set Auto-close Delay", "input:settings:auto_close_delay", PRIMARY)
+    builder.add_row("Set Max Deep Save", "input:settings:max_deep_save_mb", PRIMARY)
+    builder.add_row("Set Delete Batch Size", "input:settings:delete_batch_size", PRIMARY)
+    builder.add_row("Set Log Retention", "input:settings:log_retention_days", PRIMARY)
+    builder.add_row("Set Panel Timeout", "input:settings:panel_timeout_seconds", PRIMARY)
+    builder.add_row("🔤 Font", "panel:font", PRIMARY)
     return "Settings", await _build_settings_body(), builder.build()
 
 

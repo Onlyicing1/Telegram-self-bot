@@ -23,6 +23,7 @@ from backend.helper import (
     to_edit_buttons,
 )
 from backend.helper.client import get_client
+from backend.helper.styles import DANGER, PRIMARY
 
 logger = logging.getLogger(__name__)
 
@@ -84,15 +85,15 @@ async def _del_reply_input_handler(text, chat_id, msg_id, inline_chat_id, inline
 
 async def _del_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
     builder = InlinePanelBuilder()
-    builder.add_row("🗑 Delete last N messages", "input:del:n")
-    builder.add_row("🗑 Delete From...", "panel:delfrom")
+    builder.add_row("🗑 Delete last N messages", "input:del:n", DANGER)
+    builder.add_row("🗑 Delete From...", "panel:delfrom", DANGER)
     return "Delete", "Choose a deletion mode:", builder.build()
 
 
 async def _del_inline_builder(event, extra: str) -> list:
     builder = InlinePanelBuilder()
-    builder.add_row("🗑 Delete last N messages", "input:del:n")
-    builder.add_row("🗑 Delete From...", "panel:delfrom")
+    builder.add_row("🗑 Delete last N messages", "input:del:n", DANGER)
+    builder.add_row("🗑 Delete From...", "panel:delfrom", DANGER)
     return [render("Delete", "Choose a deletion mode:", builder.build())]
 
 
@@ -118,9 +119,9 @@ async def _delfrom_panel_handler(event, extra: str) -> tuple[str, str, list] | N
                 return "Delete From Message", result, []
 
     builder = InlinePanelBuilder()
-    builder.add_row("Reply to Message", "action:delfrom_reply")
-    builder.add_row("Recent Messages", "panel:delfrom:recent:0")
-    builder.add_row("Enter Message ID", "input:del:id")
+    builder.add_row("Reply to Message", "action:delfrom_reply", PRIMARY)
+    builder.add_row("Recent Messages", "panel:delfrom:recent:0", PRIMARY)
+    builder.add_row("Enter Message ID", "input:del:id", PRIMARY)
     return "Delete From...", "Choose a method:", builder.build()
 
 
@@ -136,9 +137,9 @@ async def _delfrom_inline_builder(event, extra: str) -> list:
             title, body, buttons = await _delfrom_confirm(int(msg_id_str))
             return [render(title, body, buttons)]
     builder = InlinePanelBuilder()
-    builder.add_row("Reply to Message", "action:delfrom_reply")
-    builder.add_row("Recent Messages", "panel:delfrom:recent:0")
-    builder.add_row("Enter Message ID", "input:del:id")
+    builder.add_row("Reply to Message", "action:delfrom_reply", PRIMARY)
+    builder.add_row("Recent Messages", "panel:delfrom:recent:0", PRIMARY)
+    builder.add_row("Enter Message ID", "input:del:id", PRIMARY)
     return [render("Delete From...", "Choose a method:", builder.build())]
 
 
@@ -201,7 +202,7 @@ async def _delfrom_recent_page(event, page: int) -> tuple[str, str, list]:
 
 async def _delfrom_confirm(msg_id: int) -> tuple[str, str, list]:
     builder = InlinePanelBuilder()
-    builder.add_row("🗑 Confirm Delete", f"panel:delfrom:exec:{msg_id}")
+    builder.add_row("🗑 Confirm Delete", f"panel:delfrom:exec:{msg_id}", DANGER)
     builder.add_row("‹ Back to methods", "panel:delfrom")
     return "Confirm Delete", f"Delete all outgoing messages from ID `{msg_id}` forward?", builder.build()
 

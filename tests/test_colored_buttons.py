@@ -184,11 +184,20 @@ class TestMainPanelStyles:
         assert _bg(buttons["Delete"], "danger") is True
         assert _bg(buttons["🧠 AI"], "primary") is True
 
-    def test_other_menu_buttons_remain_unstyled(self):
+    def test_other_menu_buttons_are_primary(self):
         result = self._menu_result()
         buttons = {b.text: b for r in result.send_message.reply_markup.rows for b in r.buttons}
-        for label in ("Profile", "Database", "General", "Settings", "📋 Todo", "😀 Emoji"):
-            assert all(_bg(buttons[label], n) in (None, False) for n in SUPPORTED_BUTTON_STYLES), label
+        for label in ("Profile", "Database", "General", "Settings", "👻 Ghost Seen",
+                      "📋 Todo", "😀 Emoji"):
+            assert _bg(buttons[label], "primary") is True, label
+
+    def test_menu_only_save_and_delete_use_success_and_danger(self):
+        result = self._menu_result()
+        buttons = {b.text: b for r in result.send_message.reply_markup.rows for b in r.buttons}
+        greened = [t for t, b in buttons.items() if _bg(b, "success") is True]
+        reddened = [t for t, b in buttons.items() if _bg(b, "danger") is True]
+        assert greened == ["Save"]
+        assert reddened == ["Delete"]
 
     def test_menu_callback_data_unchanged(self):
         result = self._menu_result()
@@ -202,3 +211,59 @@ class TestMainPanelStyles:
         button = result.send_message.reply_markup.rows[0].buttons[0]
         assert button.CONSTRUCTOR_ID == _CALLBACK_ID
         assert _has_style_flag(button)
+
+
+# ── 9. Relevant submenus apply the same restrained mapping ──
+
+
+class TestSubmenuStyles:
+    @staticmethod
+    def _by_text(rows):
+        result = render("T", "B", rows)
+        return {b.text: b for r in result.send_message.reply_markup.rows for b in r.buttons}
+
+    @pytest.mark.asyncio
+    async def test_save_submenu_deep_save_green_retrieve_blue(self):
+        from backend.bot.handlers import save
+        _, _, rows = await save._save_panel_handler(None, "")
+        buttons = self._by_text(rows)
+        assert _bg(buttons["⬇️ Deep Save"], "success") is True
+        assert _bg(buttons["🔍 Retrieve"], "primary") is True
+
+    @pytest.mark.asyncio
+    async def test_delete_submenu_is_danger_only(self):
+        from backend.bot.handlers import delete
+        _, _, rows = await delete._del_panel_handler(None, "")
+        buttons = self._by_text(rows)
+        assert _bg(buttons["🗑 Delete last N messages"], "danger") is True
+        assert _bg(buttons["🗑 Delete From..."], "danger") is True
+        assert all(_bg(b, "success") in (None, False) for b in buttons.values())
+
+    @pytest.mark.asyncio
+    async def test_delete_confirm_is_red_and_back_stays_unstyled(self):
+        from backend.bot.handlers import delete
+        _, _, rows = await delete._delfrom_confirm(123)
+        buttons = self._by_text(rows)
+        assert _bg(buttons["🗑 Confirm Delete"], "danger") is True
+        assert all(_bg(buttons["‹ Back to methods"], n) in (None, False)
+                   for n in SUPPORTED_BUTTON_STYLES)
+
+    @pytest.mark.asyncio
+    async def test_settings_submenu_is_primary(self):
+        from backend.bot.handlers import misc
+        _, _, rows = await misc._settings_panel_handler(None, "")
+        buttons = self._by_text(rows)
+        assert _bg(buttons["🔤 Font"], "primary") is True
+        assert all(_bg(b, "danger") in (None, False) for b in buttons.values())
+
+    def test_general_submenu_is_primary(self):
+        from backend.bot.handlers import misc
+        buttons = self._by_text(misc._build_general_buttons())
+        app = {t: b for t, b in buttons.items() if t != "❌ Close"}
+        assert all(_bg(b, "primary") is True for b in app.values())
+
+    def test_no_submenu_button_is_both_green_and_red(self):
+        from backend.bot.handlers import misc
+        for rows in (misc._build_menu_buttons(), misc._build_general_buttons()):
+            for b in self._by_text(rows).values():
+                assert not (_bg(b, "success") and _bg(b, "danger"))
