@@ -183,7 +183,7 @@ def _viewer_buttons(view: MessageViewerPage) -> list:
         label = f"{sym.OP_SAVE} {preview_snip}" if is_selected else f"Select {preview_snip}"
         builder.add_row(label, f"action:ghost_seen_v2_select:{view.source_chat_id}|{message.message_id}")
     if view.selected_ids:
-        builder.add_row(f"Clear ({len(view.selected_ids)})", f"action:ghost_seen_v2_clear:{view.source_chat_id}", DANGER)
+        builder.add_row(f"Clear ({len(view.selected_ids)})", f"action:ghost_seen_v2_clear:{view.source_chat_id}")
         builder.add_row(f"Actions ({len(view.selected_ids)})", f"action:ghost_seen_v2_actions:{view.source_chat_id}")
     builder.add_row(sym.label(sym.OP_BACK, "Back to chats"), "panel:ghost_seen_v2")
     if view.total_pages > 1:
@@ -728,7 +728,7 @@ def _begin_input_for(source: int, chat_id: int, msg_id: int, name: str, mode: st
         extra=f"source={source}", timeout=120.0,
     )
     builder = InlinePanelBuilder()
-    builder.add_row(sym.label(sym.OP_CLOSE, "Cancel"), f"action:ghost_seen_v2_reply_cancel:{source}")
+    builder.add_row(sym.label(sym.OP_CLOSE, "Cancel"), f"action:ghost_seen_v2_reply_cancel:{source}", DANGER)
     return "Ghost Seen", prompt, builder.build()
 
 

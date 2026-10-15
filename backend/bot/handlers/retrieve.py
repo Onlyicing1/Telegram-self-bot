@@ -49,7 +49,7 @@ from backend.helper import (
     to_edit_buttons,
 )
 from backend.helper.client import get_client
-from backend.helper.styles import DANGER
+from backend.helper.styles import PRIMARY
 from backend.helper import symbols as sym
 from backend.helper.input_state import set_pending
 
@@ -174,7 +174,7 @@ async def _retrieve_item_panel_handler(event, extra: str) -> tuple[str, str, lis
     builder.add_row(_file_name_row_label(row), f"input:retrieve_item:filename:{code}")
     builder.add_row(sym.label(sym.META_TAGS, "Tags"), f"input:retrieve_item:tags:{code}")
     builder.add_row(sym.label(sym.OP_HOME, "Move"), f"input:retrieve_item:move:{code}")
-    builder.add_row(sym.label(sym.OP_DELETE, "Delete"), f"action:retrieve_item_delete:{code}", DANGER)
+    builder.add_row(sym.label(sym.OP_DELETE, "Delete"), f"action:retrieve_item_delete:{code}", PRIMARY)
     return "Item Preview", body, builder.build()
 
 

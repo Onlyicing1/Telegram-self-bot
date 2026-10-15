@@ -28,7 +28,7 @@ from backend.helper import (
     render,
 )
 from backend.helper.client import get_client
-from backend.helper.styles import PRIMARY, SUCCESS
+from backend.helper.styles import PRIMARY
 from backend.helper import symbols as sym
 
 logger = logging.getLogger(__name__)
@@ -37,13 +37,13 @@ logger = logging.getLogger(__name__)
 async def _save_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
     if extra.startswith("type:"):
         builder = InlinePanelBuilder()
-        builder.add_row(sym.label(sym.OP_CHAT, "Reply Mode"), "action:save_reply", SUCCESS)
+        builder.add_row(sym.label(sym.OP_CHAT, "Reply Mode"), "action:save_reply", PRIMARY)
         builder.add_row(sym.label(sym.OP_EDIT, "Name & tags"), "input:save:meta", PRIMARY)
         builder.add_row(sym.label(sym.OP_SAVE, "Save using a link"), "input:save:link", PRIMARY)
         return "Deep Save", "Choose a source. Name & tags are optional.", builder.build()
 
     builder = InlinePanelBuilder()
-    builder.add_row(sym.label(sym.OP_SAVE, "Deep Save"), "panel:save:type:d", SUCCESS)
+    builder.add_row(sym.label(sym.OP_SAVE, "Deep Save"), "panel:save:type:d", PRIMARY)
     builder.add_row(sym.label(sym.OP_SEARCH, "Retrieve"), "panel:retrieve", PRIMARY)
     return (
         "Save",
@@ -55,13 +55,13 @@ async def _save_panel_handler(event, extra: str) -> tuple[str, str, list] | None
 async def _save_inline_builder(event, extra: str) -> list:
     if extra.startswith("type:"):
         builder = InlinePanelBuilder()
-        builder.add_row(sym.label(sym.OP_CHAT, "Reply Mode"), "action:save_reply", SUCCESS)
+        builder.add_row(sym.label(sym.OP_CHAT, "Reply Mode"), "action:save_reply", PRIMARY)
         builder.add_row(sym.label(sym.OP_EDIT, "Name & tags"), "input:save:meta", PRIMARY)
         builder.add_row(sym.label(sym.OP_SAVE, "Save using a link"), "input:save:link", PRIMARY)
         return [render("Deep Save", "Choose a source. Name & tags are optional.", builder.build())]
 
     builder = InlinePanelBuilder()
-    builder.add_row(sym.label(sym.OP_SAVE, "Deep Save"), "panel:save:type:d", SUCCESS)
+    builder.add_row(sym.label(sym.OP_SAVE, "Deep Save"), "panel:save:type:d", PRIMARY)
     builder.add_row(sym.label(sym.OP_SEARCH, "Retrieve"), "panel:retrieve", PRIMARY)
     return [
         render(

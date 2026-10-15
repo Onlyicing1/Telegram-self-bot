@@ -28,7 +28,7 @@ from backend.helper import (
 )
 from backend.helper.client import get_client
 from backend.helper.rpc_timeout import rpc_await
-from backend.helper.styles import DANGER, PRIMARY, SUCCESS
+from backend.helper.styles import PRIMARY
 from backend.helper import symbols as sym
 
 _RPC_T = 30.0
@@ -201,8 +201,8 @@ async def _general_reaction_set_action(event, extra: str, chat_id: int) -> tuple
 def _build_menu_buttons() -> list:
     builder = InlinePanelBuilder()
     builder.add_buttons(
-        ("Save", "panel:save", SUCCESS),
-        ("Delete", "panel:del", DANGER),
+        ("Save", "panel:save", PRIMARY),
+        ("Delete", "panel:del", PRIMARY),
     )
     builder.add_buttons(
         ("Profile", "panel:profile", PRIMARY),
@@ -748,7 +748,7 @@ async def _context_panel_handler(event, extra: str) -> tuple[str, str, list] | N
     except Exception as exc:
         body_lines.append(f"Error: {exc}")
     builder = InlinePanelBuilder()
-    builder.add_row(sym.label(sym.OP_SAVE, "Deep Save"), "action:save_reply", SUCCESS)
+    builder.add_row(sym.label(sym.OP_SAVE, "Deep Save"), "action:save_reply", PRIMARY)
     return "Context Panel", "\n".join(body_lines), builder.build()
 
 

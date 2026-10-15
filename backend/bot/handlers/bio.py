@@ -43,7 +43,7 @@ from backend.helper import (
     render,
 )
 from backend.helper.client import get_client
-from backend.helper.styles import DANGER, SUCCESS
+from backend.helper.styles import DANGER, PRIMARY
 from backend.helper import symbols as sym
 
 logger = logging.getLogger(__name__)
@@ -149,9 +149,9 @@ def _build_builder_buttons() -> list:
     for var_token, _, _ in _BIO_VARS:
         builder.add_row(sym.label(sym.OP_CREATE, var_token), f"action:bio_builder_add:{var_token}")
     builder.add_row(sym.label(sym.OP_CREATE, "Space"), "action:bio_builder_space")
-    builder.add_row(sym.label(sym.OP_DELETE, "Clear"), "action:bio_builder_clear", DANGER)
-    builder.add_row(sym.label(sym.OP_REFRESH, "Reset"), "action:bio_builder_reset", DANGER)
-    builder.add_row(sym.label(sym.OP_SAVE, "Apply Template"), "action:bio_builder_apply", SUCCESS)
+    builder.add_row(sym.label(sym.OP_DELETE, "Clear"), "action:bio_builder_clear", PRIMARY)
+    builder.add_row(sym.label(sym.OP_REFRESH, "Reset"), "action:bio_builder_reset", PRIMARY)
+    builder.add_row(sym.label(sym.OP_SAVE, "Apply Template"), "action:bio_builder_apply", PRIMARY)
     builder.add_row(sym.label(sym.OP_EDIT, "Reply to Edit"), "action:bio_reply_mode")
     return builder.build()
 
@@ -252,7 +252,7 @@ _CUSTOM_BODY = (
 
 def _build_custom_buttons() -> list:
     builder = InlinePanelBuilder()
-    builder.add_row("Cancel", "panel:biohelp:builder")
+    builder.add_row("Cancel", "panel:biohelp:builder", DANGER)
     return builder.build()
 
 

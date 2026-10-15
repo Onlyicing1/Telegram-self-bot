@@ -115,7 +115,9 @@ def test_every_wizard_input_registers_the_back_and_cancel_rows(wizard):
                   "weekly", "once", "tz", "font"):
         config = panels.get_input("taskloom_new", field)
         assert config is not None, field
-        assert config["extra_rows"] == ((f"{sym.STATE_FAILED} Cancel", "action:taskloom_wizard:cancel"),)
+        assert config["extra_rows"] == (
+            (f"{sym.STATE_FAILED} Cancel", "action:taskloom_wizard:cancel", "danger"),
+        )
         assert "back" not in config  # the shared default (the panel itself) applies
 
 

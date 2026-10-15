@@ -23,7 +23,7 @@ from backend.helper import (
     to_edit_buttons,
 )
 from backend.helper.client import get_client
-from backend.helper.styles import DANGER, PRIMARY
+from backend.helper.styles import PRIMARY, SUCCESS
 from backend.helper import symbols as sym
 
 logger = logging.getLogger(__name__)
@@ -86,15 +86,15 @@ async def _del_reply_input_handler(text, chat_id, msg_id, inline_chat_id, inline
 
 async def _del_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
     builder = InlinePanelBuilder()
-    builder.add_row(sym.label(sym.OP_DELETE, "Delete last N messages"), "input:del:n", DANGER)
-    builder.add_row(sym.label(sym.OP_DELETE, "Delete From..."), "panel:delfrom", DANGER)
+    builder.add_row(sym.label(sym.OP_DELETE, "Delete last N messages"), "input:del:n", PRIMARY)
+    builder.add_row(sym.label(sym.OP_DELETE, "Delete From..."), "panel:delfrom", PRIMARY)
     return "Delete", "Choose a deletion mode:", builder.build()
 
 
 async def _del_inline_builder(event, extra: str) -> list:
     builder = InlinePanelBuilder()
-    builder.add_row(sym.label(sym.OP_DELETE, "Delete last N messages"), "input:del:n", DANGER)
-    builder.add_row(sym.label(sym.OP_DELETE, "Delete From..."), "panel:delfrom", DANGER)
+    builder.add_row(sym.label(sym.OP_DELETE, "Delete last N messages"), "input:del:n", PRIMARY)
+    builder.add_row(sym.label(sym.OP_DELETE, "Delete From..."), "panel:delfrom", PRIMARY)
     return [render("Delete", "Choose a deletion mode:", builder.build())]
 
 
@@ -203,7 +203,7 @@ async def _delfrom_recent_page(event, page: int) -> tuple[str, str, list]:
 
 async def _delfrom_confirm(msg_id: int) -> tuple[str, str, list]:
     builder = InlinePanelBuilder()
-    builder.add_row(sym.label(sym.OP_DELETE, "Confirm Delete"), f"panel:delfrom:exec:{msg_id}", DANGER)
+    builder.add_row(sym.label(sym.OP_DELETE, "Confirm Delete"), f"panel:delfrom:exec:{msg_id}", SUCCESS)
     builder.add_row(sym.label(sym.OP_BACK, "Back to methods"), "panel:delfrom")
     return "Confirm Delete", f"Delete all outgoing messages from ID `{msg_id}` forward?", builder.build()
 

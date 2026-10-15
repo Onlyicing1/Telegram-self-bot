@@ -1,16 +1,28 @@
 """Colored inline buttons — focused regression tests.
 
 Covers the named Telegram styles (``primary``/``success``/``danger``) applied
-through the EXISTING main panel and shared renderer:
+through the EXISTING main panel and shared renderer under the corrected
+semantic contract:
+
+  * ``primary`` (blue) — the default for ordinary actions and navigation,
+    including **Save** and **Delete**.
+  * ``success`` (green) — reserved for explicit confirmation actions
+    (**Confirm**, **Approve**, or an equivalent final confirmation step).
+  * ``danger`` (red) — reserved for explicit cancellation actions
+    (**Cancel**, **Abort**, **Discard changes**).
+
+Specifics verified here:
 
 1. Each supported named style constructs the correct ``KeyboardButtonStyle``.
 2. Style survives button normalization and inline-result construction.
 3. The serialized TL type/flags are correct (``0xe62bc960`` + ``flags.10``).
-4. Existing tuple-based buttons are unchanged (unstyled, no ``flags.10``).
-5. Existing unstyled buttons and URL buttons are unchanged.
+4. Tuple / raw / URL buttons default to ``primary`` (blue).
+5. Existing unstyled buttons and URL buttons keep their callback data / URL.
 6. Callback data and navigation behaviour are untouched.
 7. Unsupported styles fail safe (unstyled, never raise).
-8. The main panel (``Menu``) applies the intended styles end to end.
+8. The main panel (``Menu``) and the relevant submenus follow the contract:
+   Save/Delete blue, Confirm green, Cancel red.
+9. Every registered panel's every button carries exactly one supported style.
 
 Live Telegram acceptance/rendering is NOT covered here (no credentials); these
 are offline, source-level assertions.
@@ -198,11 +210,11 @@ class TestMainPanelStyles:
         from backend.bot.handlers.misc import _build_menu_buttons
         return render("LifeOS", "Choose a category:", _build_menu_buttons())
 
-    def test_save_success_delete_danger_ai_primary(self):
+    def test_save_and_delete_are_primary_ai_primary(self):
         result = self._menu_result()
         buttons = {b.text: b for r in result.send_message.reply_markup.rows for b in r.buttons}
-        assert _bg(buttons["Save"], "success") is True
-        assert _bg(buttons["Delete"], "danger") is True
+        assert _bg(buttons["Save"], "primary") is True
+        assert _bg(buttons["Delete"], "primary") is True
         assert _bg(buttons["AI"], "primary") is True
 
     def test_other_menu_buttons_are_primary(self):
@@ -212,13 +224,15 @@ class TestMainPanelStyles:
                       "Todo"):
             assert _bg(buttons[label], "primary") is True, label
 
-    def test_menu_only_save_and_delete_use_success_and_danger(self):
+    def test_menu_has_no_green_or_red_buttons(self):
+        # The root menu is pure navigation/ordinary actions: colour never
+        # echoes a category, so no button is green or red here.
         result = self._menu_result()
         buttons = {b.text: b for r in result.send_message.reply_markup.rows for b in r.buttons}
         greened = [t for t, b in buttons.items() if _bg(b, "success") is True]
         reddened = [t for t, b in buttons.items() if _bg(b, "danger") is True]
-        assert greened == ["Save"]
-        assert reddened == ["Delete"]
+        assert greened == []
+        assert reddened == []
 
     def test_menu_callback_data_unchanged(self):
         result = self._menu_result()
@@ -244,28 +258,33 @@ class TestSubmenuStyles:
         return {b.text: b for r in result.send_message.reply_markup.rows for b in r.buttons}
 
     @pytest.mark.asyncio
-    async def test_save_submenu_deep_save_green_retrieve_blue(self):
+    async def test_save_submenu_deep_save_primary_retrieve_blue(self):
         from backend.bot.handlers import save
         _, _, rows = await save._save_panel_handler(None, "")
         buttons = self._by_text(rows)
-        assert _bg(buttons["✓ Deep Save"], "success") is True
+        # Save is an ordinary action → blue, never green.
+        assert _bg(buttons["✓ Deep Save"], "primary") is True
         assert _bg(buttons["⌕ Retrieve"], "primary") is True
-
-    @pytest.mark.asyncio
-    async def test_delete_submenu_is_danger_only(self):
-        from backend.bot.handlers import delete
-        _, _, rows = await delete._del_panel_handler(None, "")
-        buttons = self._by_text(rows)
-        assert _bg(buttons["⌫ Delete last N messages"], "danger") is True
-        assert _bg(buttons["⌫ Delete From..."], "danger") is True
         assert all(_bg(b, "success") in (None, False) for b in buttons.values())
 
     @pytest.mark.asyncio
-    async def test_delete_confirm_is_red_and_back_is_blue(self):
+    async def test_delete_submenu_is_primary(self):
+        from backend.bot.handlers import delete
+        _, _, rows = await delete._del_panel_handler(None, "")
+        buttons = self._by_text(rows)
+        # Delete is an ordinary action → blue, never red.
+        assert _bg(buttons["⌫ Delete last N messages"], "primary") is True
+        assert _bg(buttons["⌫ Delete From..."], "primary") is True
+        assert all(_bg(b, "success") in (None, False) for b in buttons.values())
+        assert all(_bg(b, "danger") in (None, False) for b in buttons.values())
+
+    @pytest.mark.asyncio
+    async def test_delete_confirm_is_green_and_back_is_blue(self):
         from backend.bot.handlers import delete
         _, _, rows = await delete._delfrom_confirm(123)
         buttons = self._by_text(rows)
-        assert _bg(buttons["⌫ Confirm Delete"], "danger") is True
+        # The explicit confirmation step is green; its Back is blue.
+        assert _bg(buttons["⌫ Confirm Delete"], "success") is True
         assert _bg(buttons["❮ Back to methods"], "primary") is True
 
     @pytest.mark.asyncio
@@ -329,19 +348,123 @@ class TestNavigationStyling:
 
 
 class TestFamilyOverrides:
-    def test_bio_builder_clear_reset_red_apply_green(self):
+    def test_bio_builder_clear_reset_apply_all_primary(self):
         from backend.bot.handlers import bio
         buttons = TestSubmenuStyles._by_text(bio._build_builder_buttons())
-        assert _bg(buttons[sym.label(sym.OP_DELETE, "Clear")], "danger") is True
-        assert _bg(buttons[sym.label(sym.OP_REFRESH, "Reset")], "danger") is True
-        assert _bg(buttons["✓ Apply Template"], "success") is True
+        # Clear / Reset / Apply are ordinary actions → blue; none is coloured.
+        for label in ("Clear", "Reset", "Apply Template"):
+            assert _bg(buttons[sym.label(sym.OP_DELETE if label == "Clear"
+                                          else sym.OP_REFRESH if label == "Reset"
+                                          else sym.OP_SAVE, label)], "primary") is True, label
+        assert all(_bg(b, "success") in (None, False) for b in buttons.values())
+        assert all(_bg(b, "danger") in (None, False) for b in buttons.values())
 
-    def test_username_builder_clear_reset_red_apply_green(self):
+    def test_username_builder_clear_reset_apply_all_primary(self):
         from backend.bot.handlers import username
         buttons = TestSubmenuStyles._by_text(username._build_builder_buttons())
-        assert _bg(buttons[sym.label(sym.OP_DELETE, "Clear")], "danger") is True
-        assert _bg(buttons[sym.label(sym.OP_REFRESH, "Reset")], "danger") is True
-        assert _bg(buttons["✓ Apply Template"], "success") is True
+        for label in ("Clear", "Reset", "Apply Template"):
+            assert _bg(buttons[sym.label(sym.OP_DELETE if label == "Clear"
+                                          else sym.OP_REFRESH if label == "Reset"
+                                          else sym.OP_SAVE, label)], "primary") is True, label
+        assert all(_bg(b, "success") in (None, False) for b in buttons.values())
+        assert all(_bg(b, "danger") in (None, False) for b in buttons.values())
+
+    def test_bio_custom_cancel_is_danger(self):
+        from backend.bot.handlers import bio
+        buttons = TestSubmenuStyles._by_text(bio._build_custom_buttons())
+        assert _bg(buttons["Cancel"], "danger") is True
+
+    def test_username_custom_cancel_is_danger(self):
+        from backend.bot.handlers import username
+        buttons = TestSubmenuStyles._by_text(username._build_custom_buttons())
+        assert _bg(buttons["Cancel"], "danger") is True
+
+
+# ── 9d. Explicit confirm (green) and cancel (red) across the panels ──
+
+
+class TestConfirmCancelSemantics:
+    @staticmethod
+    def _by_text(rows):
+        result = render("T", "B", rows)
+        return {b.text: b for r in result.send_message.reply_markup.rows for b in r.buttons}
+
+    @pytest.mark.asyncio
+    async def test_emoji_delete_confirmation_is_green_cancel_red(self):
+        from backend.helper import inline_engine
+        from backend.bot.handlers import emoji as emoji_mod
+        from backend.services import emoji_category_service as cat_service
+
+        owner = 777000
+        inline_engine.set_owner_id(owner)
+        created = await cat_service.create_category(owner, "ColorSemantics")
+        assert created["ok"] is True, created
+        cid = created["category"]["id"]
+        try:
+            _, _, rows = await emoji_mod._cat_del_action(None, str(cid), 0)
+            buttons = self._by_text(rows)
+            delete_btn = next(b for t, b in buttons.items() if "Delete" in t)
+            cancel_btn = next(b for t, b in buttons.items() if "Cancel" in t)
+            assert _bg(delete_btn, "success") is True
+            assert _bg(cancel_btn, "danger") is True
+        finally:
+            await cat_service.delete_category(owner, cid)
+
+    @pytest.mark.asyncio
+    async def test_ai_credential_delete_confirm_green(self, monkeypatch):
+        # The credential delete-confirmation ("Delete now") is the explicit
+        # confirmation → green.
+        from backend.bot.handlers import ai_credentials
+        from backend.services import credential_service
+
+        item = credential_service.CredentialMetadata(
+            credential_id="cred-1", provider="openai", label="Main",
+            enabled=True, priority=1,
+        )
+
+        async def _resolve(owner, handle):
+            return item
+
+        async def _owner_id():
+            return 424242
+
+        monkeypatch.setattr(credential_service, "resolve_handle", _resolve)
+        monkeypatch.setattr(ai_credentials, "_owner_id", _owner_id)
+
+        _title, _body, rows = await ai_credentials._ai_cred_delete_action(None, item.handle, 0)
+        buttons = self._by_text(rows)
+        assert _bg(buttons[f"{sym.OP_DELETE} Delete now"], "success") is True
+
+    def test_taskloom_wizard_cancel_and_discard_are_danger(self):
+        from backend.bot.handlers import taskloom
+        # Creating: plain Cancel is red.
+        builder = taskloom.InlinePanelBuilder()
+        taskloom._wizard_footer(builder, editing=False)
+        buttons = self._by_text(builder.build())
+        assert _bg(buttons[f"{sym.OP_CLOSE} Cancel"], "danger") is True
+        # Editing: Discard changes is red.
+        builder = taskloom.InlinePanelBuilder()
+        taskloom._wizard_footer(builder, editing=True)
+        buttons = self._by_text(builder.build())
+        assert _bg(buttons[f"{sym.OP_CLOSE} Discard changes"], "danger") is True
+
+    def test_todo_input_cancel_rows_are_danger(self):
+        from backend.bot.handlers import todo
+        from backend.helper import panels as panels_mod
+        todo.register(None, 12345, "UTC")
+        for panel_id, input_id in (
+            (todo._LIST_PANEL, "new"),
+            (todo._DETAIL_PANEL, "edit"),
+            (todo._STEPS_PANEL, "add"),
+            (todo._STEPS_PANEL, "edit"),
+        ):
+            cfg = panels_mod.get_input(panel_id, input_id)
+            assert cfg is not None, (panel_id, input_id)
+            rows = cfg.get("extra_rows")
+            assert rows, (panel_id, input_id)
+            for row in rows:
+                assert row[2] == "danger"
+                assert "Cancel" in row[0]
 
 
 # ── 10. Exhaustive: no registered panel renders an unstyled button ──

@@ -49,7 +49,7 @@ from backend.services import premium_emoji_direct_service as premium_direct_serv
 from backend.services import premium_emoji_diagnostics as diag_service
 from backend.services import premium_emoji_inline_service as premium_inline_service
 from backend.services import premium_emoji_probe_service as probe_service
-from backend.helper.styles import DANGER
+from backend.helper.styles import DANGER, PRIMARY, SUCCESS
 from backend.helper import symbols as sym
 from backend.services import reaction_service
 from backend.services.emoji_library_service import import_from_saved_messages
@@ -413,7 +413,7 @@ async def _category_page_handler(event, extra: str) -> tuple[str, str, list] | N
     builder = InlinePanelBuilder()
     builder.add_row(sym.label(sym.ICON_MAPPING, "Mappings"), f"panel:{_MAPPINGS_PANEL}:{cid}:0")
     builder.add_row(sym.label(sym.OP_EDIT, "Rename"), f"action:emoji_cat_rename:{cid}")
-    builder.add_row(sym.label(sym.OP_DELETE, "Delete"), f"action:emoji_cat_del:{cid}", DANGER)
+    builder.add_row(sym.label(sym.OP_DELETE, "Delete"), f"action:emoji_cat_del:{cid}", PRIMARY)
     return "Category", "\n".join(lines), builder.build()
 
 
@@ -548,8 +548,8 @@ async def _cat_del_action(event, extra: str, chat_id: int) -> tuple[str, str, li
         "Library entries are NOT deleted."
     )
     builder = InlinePanelBuilder()
-    builder.add_row(sym.label(sym.OP_DELETE, "Delete"), "action:emoji_cat_delgo", DANGER)
-    builder.add_row(sym.label(sym.STATE_FAILED, "Cancel"), f"panel:{_CATEGORIES_PANEL}:0")
+    builder.add_row(sym.label(sym.OP_DELETE, "Delete"), "action:emoji_cat_delgo", SUCCESS)
+    builder.add_row(sym.label(sym.STATE_FAILED, "Cancel"), f"panel:{_CATEGORIES_PANEL}:0", DANGER)
     return "Delete Category", body, builder.build()
 
 
@@ -684,7 +684,7 @@ async def _mapping_page_handler(event, extra: str) -> tuple[str, str, list] | No
         lines.append("_Library entry no longer exists._")
     builder = InlinePanelBuilder()
     builder.add_row(sym.label(sym.OP_EDIT, "Change"), f"action:emoji_map_edit:{row.get('simple_emoji')}:{wid}")
-    builder.add_row(sym.label(sym.OP_DELETE, "Remove"), f"action:emoji_map_del:{row.get('simple_emoji')}:{wid}", DANGER)
+    builder.add_row(sym.label(sym.OP_DELETE, "Remove"), f"action:emoji_map_del:{row.get('simple_emoji')}:{wid}", PRIMARY)
     return "Mapping", "\n".join(lines), builder.build()
 
 
@@ -871,7 +871,7 @@ def _render_conflict(
     )
     builder = InlinePanelBuilder()
     builder.add_row(sym.label(sym.ICON_REACTION, "Replace"), f"action:emoji_map_repl:{wid}:{emoji}")
-    builder.add_row(sym.label(sym.STATE_FAILED, "Cancel"), f"panel:{_MAPPINGS_PANEL}::0:{wid}")
+    builder.add_row(sym.label(sym.STATE_FAILED, "Cancel"), f"panel:{_MAPPINGS_PANEL}::0:{wid}", DANGER)
     return "Mapping Conflict", body, builder.build()
 
 

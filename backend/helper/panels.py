@@ -617,8 +617,9 @@ async def _handle_input(event, remainder: str, owner_id: int, chat_id: int, msg_
     builder = InlinePanelBuilder()
     builder.add_row(sym.label(sym.OP_BACK, "Back"), input_cfg.get("back") or f"panel:{panel_id}")
     for extra_row in input_cfg.get("extra_rows") or ():
-        label, data = extra_row
-        builder.add_row(str(label), str(data))
+        label, data = extra_row[0], extra_row[1]
+        style = extra_row[2] if len(extra_row) > 2 else None
+        builder.add_row(str(label), str(data), style)
     builder.add_row(sym.label(sym.OP_HOME, "Home"), "panel:_nav:home")
     builder.add_row(sym.label(sym.OP_CLOSE, "Close"), "panel:_nav:close")
 

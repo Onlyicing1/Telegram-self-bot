@@ -54,7 +54,7 @@ from backend.ai.task_wizard import (
     TaskDraft,
     TaskWizardError,
 )
-from backend.helper.styles import DANGER, SUCCESS
+from backend.helper.styles import DANGER
 from backend.helper import symbols as sym
 
 logger = logging.getLogger(__name__)
@@ -118,9 +118,9 @@ def _wizard_footer(builder: InlinePanelBuilder, *, editing: bool = False) -> Non
     to the Taskloom list. Back never cancels and never discards the draft.
     """
     if editing:
-        builder.add_row(sym.label(sym.OP_CLOSE, "Discard changes"), "action:taskloom_wizard:cancel")
+        builder.add_row(sym.label(sym.OP_CLOSE, "Discard changes"), "action:taskloom_wizard:cancel", DANGER)
     else:
-        builder.add_row(sym.label(sym.OP_CLOSE, "Cancel"), "panel:taskloom")
+        builder.add_row(sym.label(sym.OP_CLOSE, "Cancel"), "panel:taskloom", DANGER)
     builder.add_row(sym.label(sym.OP_CLOSE, "Close"), "panel:_nav:close")
 
 
@@ -258,10 +258,10 @@ async def _task_detail_panel(event, extra: str) -> tuple[str, str, list] | None:
     elif task.status == "paused":
         builder.add_row(sym.label(sym.OP_RESUME, "Resume task"), f"action:taskloom_resume:{task.id}:{task.version}")
     if task.status not in ("completed", "deleted", "expired"):
-        builder.add_row(sym.label(sym.OP_SAVE, "Complete task"), f"action:taskloom_complete:{task.id}:{task.version}", SUCCESS)
+        builder.add_row(sym.label(sym.OP_SAVE, "Complete task"), f"action:taskloom_complete:{task.id}:{task.version}")
     builder.add_row(sym.label(sym.OP_EDIT, "Edit task"), f"panel:{_WIZARD_PANEL}:edit:{task.id}")
     if task.status not in ("deleted",):
-        builder.add_row(sym.label(sym.OP_DELETE, "Delete task"), f"action:taskloom_delete:{task.id}:{task.version}", DANGER)
+        builder.add_row(sym.label(sym.OP_DELETE, "Delete task"), f"action:taskloom_delete:{task.id}:{task.version}")
     builder.add_row(sym.label(sym.OP_REFRESH, "Refresh"), f"panel:taskloom_task:{task.id}")
     _nav(builder)
     return f"Task #{task.id}", "\n".join(lines), builder.build()
@@ -1070,7 +1070,7 @@ def register(client, owner_id: int, tz_str: str) -> None:
                 # explicit Cancel row really DISCARDS the draft — mode-aware in
                 # the handler (edit → the task's detail view, create → the
                 # Taskloom list).
-                "extra_rows": ((sym.label(sym.STATE_FAILED, "Cancel"), "action:taskloom_wizard:cancel"),),
+                "extra_rows": ((sym.label(sym.STATE_FAILED, "Cancel"), "action:taskloom_wizard:cancel", DANGER),),
             })
         logger.info("Taskloom panels registered OK")
     except Exception as exc:

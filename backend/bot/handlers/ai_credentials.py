@@ -74,7 +74,7 @@ from backend.helper import (
     render,
 )
 from backend.services import credential_service
-from backend.helper.styles import DANGER
+from backend.helper.styles import PRIMARY, SUCCESS
 
 logger = logging.getLogger(__name__)
 
@@ -354,7 +354,7 @@ async def _credential_panel(owner_id: int, handle: str) -> tuple[str, str, list]
     builder.add_row("Replace key…", f"input:{_INPUT_SCOPE}:secret_replace_{item.handle}")
     if testable:
         builder.add_row("Test key", f"action:ai_cred_test:{item.handle}")
-    builder.add_row(sym.label(sym.OP_DELETE, "Delete"), f"action:ai_cred_delete:{item.handle}", DANGER)
+    builder.add_row(sym.label(sym.OP_DELETE, "Delete"), f"action:ai_cred_delete:{item.handle}", PRIMARY)
     _nav_buttons(builder)
     return "Credential", "\n".join(lines), builder.build()
 
@@ -540,7 +540,7 @@ async def _ai_cred_delete_action(event, extra: str, chat_id: int) -> tuple[str, 
         "be undone._"
     )
     builder = InlinePanelBuilder()
-    builder.add_row(sym.label(sym.OP_DELETE, "Delete now"), f"action:ai_cred_delete_yes:{item.handle}", DANGER)
+    builder.add_row(sym.label(sym.OP_DELETE, "Delete now"), f"action:ai_cred_delete_yes:{item.handle}", SUCCESS)
     _nav_buttons(builder)
     return title, body, builder.build()
 

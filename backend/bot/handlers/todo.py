@@ -32,7 +32,7 @@ from backend.helper import (
     register_inline_builder,
     render,
 )
-from backend.helper.styles import DANGER, SUCCESS
+from backend.helper.styles import DANGER
 from backend.helper import symbols as sym
 
 logger = logging.getLogger(__name__)
@@ -217,7 +217,7 @@ async def _todo_detail_panel(event, extra: str) -> tuple[str, str, list] | None:
                 f"action:todo_complete_all:{task.id}:{task.version}",
             )
         else:
-            builder.add_row(sym.label(sym.OP_SAVE, "Complete"), f"action:todo_complete:{task.id}:{task.version}", SUCCESS)
+            builder.add_row(sym.label(sym.OP_SAVE, "Complete"), f"action:todo_complete:{task.id}:{task.version}")
         builder.add_row(sym.label(sym.OP_EDIT, "Edit"), f"input:{_DETAIL_PANEL}:edit:{task.id}:{task.version}")
     elif str(task.status) == "completed":
         builder.add_row(sym.label(sym.OP_RESUME, "Reopen"), f"action:todo_reopen:{task.id}:{task.version}")
@@ -229,7 +229,7 @@ async def _todo_detail_panel(event, extra: str) -> tuple[str, str, list] | None:
         )
     else:
         builder.add_row(sym.label(sym.CONTENT_STATIC, "Add steps"), f"input:{_STEPS_PANEL}:add:{task.id}")
-    builder.add_row(sym.label(sym.OP_DELETE, "Delete"), f"action:todo_delete:{task.id}:{task.version}", DANGER)
+    builder.add_row(sym.label(sym.OP_DELETE, "Delete"), f"action:todo_delete:{task.id}:{task.version}")
     builder.add_row(sym.label(sym.OP_REFRESH, "Refresh"), f"panel:{_DETAIL_PANEL}:{task.id}")
     _nav(builder)
     return f"Todo #{task.id}", "\n".join(lines), builder.build()
@@ -782,22 +782,22 @@ def register(client, owner_id: int, tz_str: str) -> None:
         register_input(_LIST_PANEL, "new", {
             "handler": _add_input_handler,
             "prompt": _INPUT_PROMPTS["new"],
-            "extra_rows": ((sym.label(sym.OP_CLOSE, "Cancel"), f"panel:{_LIST_PANEL}"),),
+            "extra_rows": ((sym.label(sym.OP_CLOSE, "Cancel"), f"panel:{_LIST_PANEL}", DANGER),),
         })
         register_input(_DETAIL_PANEL, "edit", {
             "handler": _edit_input_handler,
             "prompt": _INPUT_PROMPTS["edit"],
-            "extra_rows": ((sym.label(sym.OP_CLOSE, "Cancel"), f"panel:{_LIST_PANEL}"),),
+            "extra_rows": ((sym.label(sym.OP_CLOSE, "Cancel"), f"panel:{_LIST_PANEL}", DANGER),),
         })
         register_input(_STEPS_PANEL, "add", {
             "handler": _steps_add_input_handler,
             "prompt": _STEPS_INPUT_PROMPTS["add"],
-            "extra_rows": ((sym.label(sym.OP_CLOSE, "Cancel"), f"panel:{_LIST_PANEL}"),),
+            "extra_rows": ((sym.label(sym.OP_CLOSE, "Cancel"), f"panel:{_LIST_PANEL}", DANGER),),
         })
         register_input(_STEPS_PANEL, "edit", {
             "handler": _steps_edit_input_handler,
             "prompt": _STEPS_INPUT_PROMPTS["edit"],
-            "extra_rows": ((sym.label(sym.OP_CLOSE, "Cancel"), f"panel:{_LIST_PANEL}"),),
+            "extra_rows": ((sym.label(sym.OP_CLOSE, "Cancel"), f"panel:{_LIST_PANEL}", DANGER),),
         })
         logger.info("Todo panels registered OK")
     except Exception as exc:
