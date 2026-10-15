@@ -2,7 +2,7 @@
 The ONE traceable Emoji diagnostic workflow — the panel's primary action.
 
 Pins the unified integration: the primary panel exposes exactly one diagnostic
-button (``🧪 Run Emoji Diagnostics``), the redundant standalone diagnostic
+button (the single "Run Emoji Diagnostics" action), the redundant standalone diagnostic
 buttons are gone while the useful product actions stay, clicking the button
 runs the REAL production inline route, and the rendered trace reflects the
 route's actual outcome (which stage succeeded, where it stopped and why).
@@ -18,6 +18,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from backend.helper import symbols as sym
 from telethon import types
 from telethon.tl import custom as telethon_custom
 
@@ -237,7 +238,7 @@ def _result_payload(glyph: str = ALT, document_id: int = DOC):
 
 
 def test_the_primary_button_label_is_exact():
-    assert emoji._DIAGNOSTICS_LABEL == "🧪 Run Emoji Diagnostics"
+    assert emoji._DIAGNOSTICS_LABEL == f"{sym.ICON_DIAGNOSTIC} Run Emoji Diagnostics"
 
 
 def test_the_primary_panel_exposes_exactly_one_diagnostic_button(monkeypatch):
@@ -249,7 +250,7 @@ def test_the_primary_panel_exposes_exactly_one_diagnostic_button(monkeypatch):
     texts = _texts(buttons)
     # EXACTLY ONE application-level button, with the exact label.
     assert datas == [f"action:{emoji._DIAGNOSTICS_ACTION}"]
-    assert texts == ["🧪 Run Emoji Diagnostics"]
+    assert texts == [emoji._DIAGNOSTICS_LABEL]
     # no other application-level button of any kind
     for forbidden in (
         f"action:{emoji._PROBE_ACTION}",
@@ -330,7 +331,7 @@ def test_the_action_sends_the_selection_prompt_and_arms_reply_mode():
     inline_engine.set_self_client(client)
     input_state.clear_all()
     title, body, buttons = _run(emoji._diagnostics_action(None, "", OWNER))
-    assert title == "🧪 Run Emoji Diagnostics"
+    assert title == emoji._DIAGNOSTICS_LABEL
     assert client.sent_messages == [("me", emoji._DIAGNOSTICS_PROMPT)]
     pending = input_state.get_pending(OWNER)
     assert pending is not None

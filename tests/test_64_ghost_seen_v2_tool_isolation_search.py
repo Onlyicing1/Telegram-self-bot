@@ -319,7 +319,7 @@ async def test_main_search_callback_reaches_registered_open_action(search_state,
 
     assert captured["chat_id"] == 60
     assert captured["msg_id"] == 5
-    assert captured["result"][0] == "👀 Ghost Seen"
+    assert captured["result"][0] == "Ghost Seen"
     assert "Ali" in captured["result"][1]
     nav = lifecycle.sessions.current_nav(60, 5)
     assert nav is not None and nav[0] == "ghost_seen_v2_viewer"

@@ -147,8 +147,8 @@ async def test_database_stats_adds_ai_counts_without_changing_saved_stats():
         result = await database_service.do_stats(42, "UTC")
 
     assert "Total saved items: `3`" in result
-    assert "📷 Photo: `2`" in result
-    assert "📄 Document: `1`" in result
+    assert "▢ Photo: `2`" in result
+    assert "▤ Document: `1`" in result
     assert "**Database size estimate:** `2.0 KB`" in result
     assert "**AI usage rows:** `1`" in result
     assert "**AI provider rows:** `1`" in result
@@ -186,7 +186,7 @@ async def test_database_stats_preserves_failure_boundary_for_saved_items():
     ), patch.object(database_service, "record_event"):
         result = await database_service.do_stats(42, "UTC")
 
-    assert result.startswith("❌ Stats error:")
+    assert result.startswith("× Stats error:")
     assert "saved_items unavailable" in result
 
 

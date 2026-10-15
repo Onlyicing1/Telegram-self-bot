@@ -795,7 +795,7 @@ async def _wizard_create(draft: TaskDraft, chat_id: int) -> tuple[str, str, list
                         notice=(
                             f"{sym.STATE_FAILED} The task changed since the form was opened "
                             "(stale version); nothing was saved. "
-                            "← Back → ⟳ Reload from task to adopt the current version."
+                            f"{sym.OP_BACK} Back {sym.OP_NEXT} {sym.OP_REFRESH} Reload from task to adopt the current version."
                         ),
                     )
                 )
@@ -1049,7 +1049,7 @@ def register(client, owner_id: int, tz_str: str) -> None:
     global _DEFAULT_TZ
     _DEFAULT_TZ = tz_str if task_wizard.valid_timezone(tz_str or "") else "UTC"
     try:
-        register_panel("taskloom", _taskloom_panel, parent="ai", title="▦ Taskloom")
+        register_panel("taskloom", _taskloom_panel, parent="ai", title=sym.label(sym.ICON_LIBRARY, "Taskloom"))
         register_inline_builder("taskloom", _taskloom_inline_builder)
         register_panel("taskloom_task", _task_detail_panel, parent="taskloom", title="Task")
         register_inline_builder("taskloom_task", _task_detail_inline_builder)
@@ -1057,7 +1057,7 @@ def register(client, owner_id: int, tz_str: str) -> None:
         register_action("taskloom_resume", _resume_action)
         register_action("taskloom_complete", _complete_action)
         register_action("taskloom_delete", _delete_action)
-        register_panel(_WIZARD_PANEL, _wizard_panel, parent="taskloom", title="＋ New task")
+        register_panel(_WIZARD_PANEL, _wizard_panel, parent="taskloom", title=sym.label(sym.OP_CREATE, "New task"))
         register_inline_builder(_WIZARD_PANEL, _wizard_inline_builder)
         register_action("taskloom_wizard", _wizard_action)
         for field, prompt in _INPUT_PROMPTS.items():
@@ -1070,7 +1070,7 @@ def register(client, owner_id: int, tz_str: str) -> None:
                 # explicit Cancel row really DISCARDS the draft — mode-aware in
                 # the handler (edit → the task's detail view, create → the
                 # Taskloom list).
-                "extra_rows": (("✕ Cancel", "action:taskloom_wizard:cancel"),),
+                "extra_rows": ((sym.label(sym.STATE_FAILED, "Cancel"), "action:taskloom_wizard:cancel"),),
             })
         logger.info("Taskloom panels registered OK")
     except Exception as exc:

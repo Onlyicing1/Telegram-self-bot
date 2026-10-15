@@ -31,6 +31,7 @@ Contracts:
   is no client/loop/scheduler/executor/AI of this module's own.
 """
 from __future__ import annotations
+from backend.helper import symbols as sym
 
 import logging
 import time
@@ -153,7 +154,7 @@ def option_label(option: dict[str, Any]) -> str:
     marker. Telegram's ``title`` is a localized name, not a distinct glyph,
     so the emoji is the reliable visual."""
     emoji = str(option.get("emoji") or "?")
-    return f"{emoji} ⭐" if option.get("premium") else emoji
+    return f"{emoji} {sym.ICON_MAPPING}" if option.get("premium") else emoji
 
 
 def find_option(options: list[dict[str, Any]], emoji: str) -> dict[str, Any] | None:

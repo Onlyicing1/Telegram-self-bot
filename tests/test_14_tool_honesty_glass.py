@@ -2,7 +2,7 @@
 AI tool honesty + compact glass model message regression tests.
 
 Covers the "false success" bug class: services communicate failures as
-"❌ ..."/"⚠️ ..." strings, and tools must NEVER wrap those in
+"× ..."/"◬ ..." strings, and tools must NEVER wrap those in
 ``success=True`` — the AI must answer from the real outcome.
 
 Also covers:
@@ -18,6 +18,7 @@ Also covers:
 from __future__ import annotations
 
 import pytest
+from backend.helper import symbols as sym
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from backend.ai.tools.base import ToolResult, result_from_service
@@ -29,15 +30,15 @@ from backend.services import delete_service
 
 
 def test_result_from_service_marks_failure_prefixes_as_failure():
-    assert result_from_service("✅ Done.").success is True
+    assert result_from_service("✓ Done.").success is True
     assert result_from_service("🗑 Deleted 3 messages.").success is True
-    assert result_from_service("❌ Delete failed: boom").success is False
-    assert result_from_service("⚠️ Template cannot be empty.").success is False
+    assert result_from_service("× Delete failed: boom").success is False
+    assert result_from_service("◬ Template cannot be empty.").success is False
 
 
 def test_result_from_service_preserves_message_and_data():
-    res = result_from_service("❌ DB error", data={"key": 1})
-    assert res.message == "❌ DB error"
+    res = result_from_service("× DB error", data={"key": 1})
+    assert res.message == "× DB error"
     assert res.data == {"key": 1}
 
 
@@ -203,7 +204,7 @@ async def test_save_tool_is_deep_only_and_has_no_mode_param():
     # propose but never invent.
     assert sorted(SaveTool.parameters.fget(SaveTool)) == ["display_name", "tags"]
 
-    with patch("backend.services.save_service.execute_save", AsyncMock(return_value="✅ Saved")) as m:
+    with patch("backend.services.save_service.execute_save", AsyncMock(return_value="✓ Saved")) as m:
         tool = SaveTool(_ctx(FakeDeleteClient()))
         with patch.object(tool, "_resolve_reply_message", AsyncMock(return_value=_FakeMessage())):
             result = await tool.execute(_ctx(FakeDeleteClient()), {})
@@ -226,7 +227,7 @@ async def test_save_tool_service_error_string_is_not_success():
 
     with patch(
         "backend.services.save_service.execute_save",
-        AsyncMock(return_value="❌ Deep Save failed: unable to download the source message."),
+        AsyncMock(return_value="× Deep Save failed: unable to download the source message."),
     ):
         tool = SaveTool(_ctx(FakeDeleteClient()))
         with patch.object(tool, "_resolve_reply_message", AsyncMock(return_value=_FakeMessage())):
@@ -240,7 +241,7 @@ async def test_save_tool_service_error_string_is_not_success():
 async def test_bio_tool_service_error_string_is_not_success():
     from backend.ai.tools.bio import BioSetTemplateTool
 
-    with patch("backend.services.bio_service.do_template", AsyncMock(return_value="❌ DB error: boom")):
+    with patch("backend.services.bio_service.do_template", AsyncMock(return_value="× DB error: boom")):
         tool = BioSetTemplateTool(_ctx(FakeDeleteClient()))
         result = await tool.execute(_ctx(FakeDeleteClient()), {"template": "t"})
 
@@ -307,7 +308,7 @@ async def test_deep_save_protected_chat_never_forwards():
 
     assert "download_media" in calls
     assert "forward_messages" not in calls
-    assert result.startswith("❌")
+    assert result.startswith("×")
     assert "protected chat" in result
 
 
@@ -388,17 +389,17 @@ async def test_glass_test_models_message_is_compact_and_preserves_buttons():
     assert mock_edit.await_count == 1
     body = mock_edit.await_args.args[1]
     # Compact: provider-grouped usable list, model name dominant.
-    assert "**✓ Usable Models**" in body
-    assert "◇ **Groq**" in body
-    assert "• `gpt-oss-120b`" in body
-    assert "• `gpt-oss-20b`" in body
+    assert f"**{sym.OP_SAVE} Usable Models**" in body
+    assert f"{sym.ICON_MODEL} **Groq**" in body
+    assert f"{sym.BULLET} `gpt-oss-120b`" in body
+    assert f"{sym.BULLET} `gpt-oss-20b`" in body
     # Summary chips still present.
-    assert "✓ 3 · × 3" in body
+    assert f"{sym.OP_SAVE} 3 · {sym.STATE_FAILED} 3" in body
     # No diagnostic paragraphs in the main message.
     assert "HTTP" not in body
     assert "retry-after" not in body
     # Failed models: one compact line each, capped.
-    assert "**× Not usable: 3**" in body
+    assert f"**{sym.STATE_FAILED} Not usable: 3**" in body
     # Buttons preserved: pick-model rows + re-run + details.
     datas = _flatten_button_datas(mock_edit.await_args.args[2])
     assert any(d.startswith("action:ai_pick_model:groq:openai/gpt-oss-120b") for d in datas)

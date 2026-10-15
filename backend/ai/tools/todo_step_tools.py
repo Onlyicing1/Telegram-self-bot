@@ -23,6 +23,7 @@ has steps is ``task_transition`` (``complete_steps``), the only operation that
 ever touches the parent and its steps together.
 """
 from __future__ import annotations
+from backend.helper import symbols as sym
 
 from typing import Any
 
@@ -253,10 +254,10 @@ class TodoStepAddTool(Tool):
         )
         title = " ".join(str(task.label).split())
         if len(entries) == 1:
-            message = f"➕ Step {entries[0]['step']} added to «{title}» — {entries[0]['title']}"
+            message = f"{sym.OP_CREATE} Step {entries[0]['step']} added to «{title}» — {entries[0]['title']}"
         else:
             message = (
-                f"➕ {len(entries)} steps added to «{title}»:\n{listing}"
+                f"{sym.OP_CREATE} {len(entries)} steps added to «{title}»:\n{listing}"
             )
         note = _fallback_note_for(service, list(added))
         data: dict[str, Any] = {
@@ -282,8 +283,8 @@ class TodoStepListTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Show the ordered steps of ONE Todo: how many are completed, the "
-            "numbered list (✓ completed, ○ remaining) and which step is next. "
+            f"Show the ordered steps of ONE Todo: how many are completed, the "
+            f"numbered list ({sym.STEP_COMPLETED} completed, {sym.SCHEDULE_ONCE} remaining) and which step is next. "
             "Address the todo by its id (task_id) or by the owner's own words "
             "(query). Use the returned step numbers with "
             "todo_step_transition / todo_step_edit / todo_step_delete."
@@ -497,7 +498,7 @@ class TodoStepTransitionTool(Tool):
 
         progress = await service.step_progress(task.id)
         verb = "completed" if status == "completed" else "reopened"
-        mark = "✓" if status == "completed" else "↩️"
+        mark = sym.OP_SAVE if status == "completed" else sym.OP_REFRESH
         message = (
             f"{mark} Step {ordinal} {verb} — {_step_text(updated, ordinal)}"
         )
@@ -620,7 +621,7 @@ class TodoStepEditTool(Tool):
             return ToolResult(
                 success=False, message=f"Step {ordinal} was not found. Nothing was changed."
             )
-        message = f"✏️ Step {ordinal} of «{str(task.label).strip()}» is now — {updated.title}"
+        message = f"{sym.OP_EDIT} Step {ordinal} of «{str(task.label).strip()}» is now — {updated.title}"
         data: dict[str, Any] = {
             "task_id": int(task.id),
             "step_id": int(updated.id),
@@ -726,7 +727,7 @@ class TodoStepDeleteTool(Tool):
 
         progress = step_progress_of(remaining)
         message = (
-            f"🗑 Step {ordinal} ({_step_text(step, ordinal)}) removed from "
+            f"{sym.OP_DELETE} Step {ordinal} ({_step_text(step, ordinal)}) removed from "
             f"«{str(task.label).strip()}»\n{progress.label}"
         )
         data: dict[str, Any] = {

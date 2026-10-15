@@ -375,7 +375,7 @@ async def test_a_foreign_match_is_indistinguishable_from_missing():
     _seed(_row("S0001", display_name="Private Medical Record", owner_id=OTHER_OWNER))
     text = retrieve_service.format_resolution(await _resolve("private medical record", OWNER))
     assert text == (
-        "🔍 No saved item matches `private medical record`. "
+        "⌕ No saved item matches `private medical record`. "
         "Try the saved name, one of its tags, or its save code."
     )
     assert "S0001" not in text and "Private" not in text
@@ -465,7 +465,7 @@ async def test_tool_query_unique_retrieves_exactly_once():
 
     with patch.object(
         retrieve_service, "do_retrieve",
-        AsyncMock(return_value="✅ Retrieved `S0001` to this chat."),
+        AsyncMock(return_value="✓ Retrieved `S0001` to this chat."),
     ) as spy:
         result = await _run_tool(executor, ctx, "retrieve_save", {"query": "university weekly schedule"})
 
@@ -542,7 +542,7 @@ async def test_tool_ignores_model_supplied_owner_and_destination():
 
     with patch.object(
         retrieve_service, "do_retrieve",
-        AsyncMock(return_value="✅ Retrieved `S0001` to this chat."),
+        AsyncMock(return_value="✓ Retrieved `S0001` to this chat."),
     ) as spy:
         result = await _run_tool(
             executor, ctx, "retrieve_save",
@@ -785,7 +785,7 @@ async def test_manual_search_unique_retrieves_immediately(engine, helper_client)
     _seed(_row("S0001", display_name="University Weekly Schedule"))
     with patch.object(
         retrieve_service, "do_retrieve",
-        AsyncMock(return_value="✅ Retrieved `S0001` to this chat."),
+        AsyncMock(return_value="✓ Retrieved `S0001` to this chat."),
     ) as spy:
         await handler._resolve_saved_item_request(
             "university weekly schedule", engine, OWNER, CHAT, 42, -100, 7
@@ -928,7 +928,7 @@ async def test_listener_numbered_reply_retrieves_the_presented_candidate(
 
     with patch.object(
         retrieve_service, "do_retrieve",
-        AsyncMock(return_value="✅ Retrieved to this chat."),
+        AsyncMock(return_value="✓ Retrieved to this chat."),
     ) as spy:
         await listener(_event("2"))
 
@@ -1067,7 +1067,7 @@ async def test_rename_input_uses_the_extra_carry_through(engine, helper_client):
     input_state.set_pending(OWNER, "retrieve_item", handler._retrieve_rename_input_handler, CHAT, "p")
     input_state.clear_pending(OWNER)  # the listener pops the state before calling
 
-    with patch.object(retrieve_service, "do_rename", AsyncMock(return_value="✅ Renamed.")) as spy:
+    with patch.object(retrieve_service, "do_rename", AsyncMock(return_value="✓ Renamed.")) as spy:
         await handler._retrieve_rename_input_handler(
             "Semester Two", CHAT, 42, -100, 7, extra="S0001"
         )
@@ -1093,7 +1093,7 @@ async def test_rename_input_without_carry_through_never_writes(engine, helper_cl
 async def test_move_input_uses_the_extra_carry_through(engine, helper_client):
     from backend.bot.handlers import retrieve as handler
 
-    with patch.object(retrieve_service, "do_move", AsyncMock(return_value="✅ Moved.")) as spy:
+    with patch.object(retrieve_service, "do_move", AsyncMock(return_value="✓ Moved.")) as spy:
         await handler._retrieve_move_input_handler("unfiled", CHAT, 42, -100, 7, extra="S0001")
 
     spy.assert_awaited_once_with(OWNER, "S0001", None)

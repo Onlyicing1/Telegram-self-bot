@@ -31,6 +31,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 from backend.diagnostics import record_event
+from backend.helper import symbols as sym
 
 logger = logging.getLogger(__name__)
 
@@ -889,8 +890,8 @@ def _get_or_create_bio_state_sync(owner_id: int) -> dict:
 
     default = {
         "owner_id": owner_id,
-        "template": "🕒 {time} | 💭 {mood}",
-        "mood": "😊",
+        "template": sym.BIO_DEFAULT_TEMPLATE,
+        "mood": sym.ICON_MOOD,
         "custom_text": "",
         "is_active": False,
         "last_bio": "",
@@ -923,8 +924,8 @@ async def get_or_create_bio_state(owner_id: int) -> dict:
         logger.error("[SAVE_DB] get_or_create_bio_state FAILED: %s", exc)
         return _fallback["bio_state"].get(owner_id) or {
             "owner_id": owner_id,
-            "template": "🕒 {time} | 💭 {mood}",
-            "mood": "😊",
+            "template": sym.BIO_DEFAULT_TEMPLATE,
+            "mood": sym.ICON_MOOD,
             "custom_text": "",
             "is_active": False,
             "last_bio": "",
@@ -991,7 +992,7 @@ def _get_or_create_username_state_sync(owner_id: int) -> dict:
     default = {
         "owner_id": owner_id,
         "template": "{time} | {mood}",
-        "mood": "😊",
+        "mood": sym.ICON_MOOD,
         "custom_text": "",
         "is_active": False,
         "last_name": "",
@@ -1029,7 +1030,7 @@ async def get_or_create_username_state(owner_id: int) -> dict:
         return _fallback["username_state"].get(owner_id) or {
             "owner_id": owner_id,
             "template": "{time} | {mood}",
-            "mood": "😊",
+            "mood": sym.ICON_MOOD,
             "custom_text": "",
             "is_active": False,
             "last_name": "",

@@ -8,6 +8,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from backend.helper import symbols as sym
 
 from backend.ai.actions import KIND_EXECUTABLE, KIND_INVALID, parse_action_text
 
@@ -344,7 +345,7 @@ def test_summarize_renders_real_message_list():
         },
     ])
     assert "[1] Ali: hello" in summary
-    assert "[2] Me: (no text) 📎" in summary
+    assert f"[2] Me: (no text) {sym.MEDIA_DOCUMENT}" in summary
 
 
 def test_summarize_reports_real_failure():

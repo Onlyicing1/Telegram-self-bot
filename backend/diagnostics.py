@@ -11,6 +11,7 @@ non-blocking — they touch module-level state only, never perform I/O.
 """
 import logging
 from collections import deque
+from backend.helper import symbols as sym
 from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
@@ -69,8 +70,8 @@ def filter_events(limit: int = 20, module: str | None = None, errors_only: bool 
 
 def format_events(events: list) -> str:
     if not events:
-        return "📭 No events recorded."
-    lines = [f"📋 **Event Log** ({len(events)})", ""]
+        return f"{sym.MEDIA_UNKNOWN} No events recorded."
+    lines = [f"{sym.CONTENT_STATIC} **Event Log** ({len(events)})", ""]
     for e in events:
         lines.append(f"```\n{_format_event(e)}\n```")
     return "\n".join(lines)

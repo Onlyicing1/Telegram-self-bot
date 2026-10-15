@@ -153,8 +153,8 @@ async def test_a_foreign_or_missing_code_is_indistinguishable():
     assert foreign.status == missing.status == retrieve_service.TARGET_NOT_FOUND
     # A foreign item is reported EXACTLY like a missing one — never as
     # "someone else's item" — and neither resolution carries a code.
-    assert foreign.message == "❌ No item found for `S0001`"
-    assert missing.message == "❌ No item found for `S9999`"
+    assert foreign.message == "× No item found for `S0001`"
+    assert missing.message == "× No item found for `S9999`"
     assert foreign.save_code == missing.save_code == ""
 
 
@@ -259,7 +259,7 @@ async def test_rename_persists_the_owner_name_and_touches_nothing_else():
 
     result = await retrieve_service.do_rename(OWNER, "s0001", "  University   Weekly Schedule  ")
 
-    assert result.startswith("✅ Renamed `S0001`")
+    assert result.startswith("✓ Renamed `S0001`")
     after = _stored("S0001")
     assert after["display_name"] == "University Weekly Schedule"  # trimmed + collapsed
     # Only the name changed: identity, Telegram location, file and tags are intact.
@@ -274,7 +274,7 @@ async def test_rename_refuses_an_empty_or_oversized_name_without_writing():
 
     for bad in ("", "   ", "x" * (save_service.MAX_DISPLAY_NAME_CHARS + 1)):
         result = await retrieve_service.do_rename(OWNER, "S0001", bad)
-        assert result.startswith("⚠️ Nothing was renamed"), result
+        assert result.startswith("◬ Nothing was renamed"), result
 
     assert _stored("S0001")["display_name"] == "Old Name"
 
@@ -286,8 +286,8 @@ async def test_rename_of_a_missing_or_foreign_item_writes_nothing():
     missing = await retrieve_service.do_rename(OWNER, "S9999", "Mine")
     foreign = await retrieve_service.do_rename(OWNER, "S0001", "Mine")
 
-    assert missing.startswith("❌ No item found")
-    assert foreign.startswith("❌ No item found")
+    assert missing.startswith("× No item found")
+    assert foreign.startswith("× No item found")
     assert _stored("S0001")["display_name"] == "Their Item"
 
 
@@ -298,7 +298,7 @@ async def test_rename_reports_failure_when_the_write_is_not_stored():
     with patch.object(db_client, "update_save_field", AsyncMock(return_value=None)):
         result = await retrieve_service.do_rename(OWNER, "S0001", "New Name")
 
-    assert result.startswith("❌")
+    assert result.startswith("×")
     assert "not stored" in result
     assert _stored("S0001")["display_name"] == "Old Name"
 
@@ -326,7 +326,7 @@ async def test_tags_can_be_added_replaced_and_removed():
         OWNER, "S0001", retrieve_service.TAG_OP_REMOVE, ["archive"]
     )
     assert retrieve_service._owner_tags(_stored("S0001")) == ()
-    assert removed.startswith("✅")
+    assert removed.startswith("✓")
 
 
 @pytest.mark.asyncio
@@ -337,7 +337,7 @@ async def test_replacing_with_an_empty_list_clears_every_tag():
         OWNER, "S0001", retrieve_service.TAG_OP_REPLACE, []
     )
 
-    assert result.startswith("✅")
+    assert result.startswith("✓")
     assert "no tags" in result
     assert retrieve_service._owner_tags(_stored("S0001")) == ()
     assert _stored("S0001")["tags"] == []
@@ -368,7 +368,7 @@ async def test_add_dedupes_case_insensitively_and_keeps_the_owners_spelling():
         OWNER, "S0001", retrieve_service.TAG_OP_ADD, ["university", "  Semester 2  "]
     )
 
-    assert result.startswith("✅")
+    assert result.startswith("✓")
     assert retrieve_service._owner_tags(_stored("S0001")) == ("University", "Semester 2")
 
 
@@ -383,8 +383,8 @@ async def test_tag_limits_are_the_shared_save_limits_and_refuse_before_writing()
         OWNER, "S0001", retrieve_service.TAG_OP_ADD, ["x" * (save_service.MAX_TAG_CHARS + 1)]
     )
 
-    assert too_many.startswith("⚠️")
-    assert too_long.startswith("⚠️")
+    assert too_many.startswith("◬")
+    assert too_long.startswith("◬")
     assert retrieve_service._owner_tags(_stored("S0001")) == tuple(
         f"tag{i}" for i in range(save_service.MAX_SAVE_TAGS)
     )
@@ -410,7 +410,7 @@ async def test_removing_tags_that_are_not_there_changes_nothing():
         OWNER, "S0001", retrieve_service.TAG_OP_REMOVE, ["dentist"]
     )
 
-    assert result.startswith("⚠️ Nothing was changed")
+    assert result.startswith("◬ Nothing was changed")
     assert retrieve_service._owner_tags(_stored("S0001")) == ("university",)
 
 
@@ -423,8 +423,8 @@ async def test_an_unknown_or_empty_operation_is_refused():
         OWNER, "S0001", retrieve_service.TAG_OP_ADD, []
     )
 
-    assert unknown.startswith("⚠️ Nothing was changed")
-    assert empty_add.startswith("⚠️ Nothing was changed")
+    assert unknown.startswith("◬ Nothing was changed")
+    assert empty_add.startswith("◬ Nothing was changed")
     assert retrieve_service._owner_tags(_stored("S0001")) == ("university",)
 
 
@@ -436,7 +436,7 @@ async def test_tag_edit_owner_isolation_and_confirmation():
         OWNER, "S0001", retrieve_service.TAG_OP_REPLACE, ["mine"]
     )
 
-    assert foreign.startswith("❌ No item found")
+    assert foreign.startswith("× No item found")
     assert _stored("S0001")["tags"] == ["theirs"]
 
 
@@ -449,7 +449,7 @@ async def test_a_tag_write_that_is_not_stored_is_reported_as_failure():
             OWNER, "S0001", retrieve_service.TAG_OP_REPLACE, ["archive"]
         )
 
-    assert result.startswith("❌")
+    assert result.startswith("×")
     assert "not stored" in result
     assert retrieve_service._owner_tags(_stored("S0001")) == ("university",)
 
@@ -919,7 +919,7 @@ async def test_the_manual_delete_action_uses_the_same_owner_scoped_lookup(engine
 
     _seed(_row("S0001", display_name="University Schedule"))
     with patch.object(
-        retrieve_service, "do_delete", AsyncMock(return_value="✅ Deleted `S0001`")
+        retrieve_service, "do_delete", AsyncMock(return_value="✓ Deleted `S0001`")
     ) as spy:
         await handler._retrieve_item_delete_action(None, "S0001", CHAT)
 

@@ -37,6 +37,7 @@ persistence, no background cleanup, ``clear_all()`` for tests. No database
 table, no migration, no new persistence authority.
 """
 from __future__ import annotations
+from backend.helper import symbols as sym
 
 import time
 import unicodedata
@@ -85,7 +86,7 @@ _EXPLICIT_CONFIRMATIONS = frozenset({
 })
 
 CONFIRMATION_ALREADY_PENDING_TEXT = (
-    "⚠️ An earlier owner-only action is still waiting for your approval.\n\n"
+    f"{sym.STATE_WARNING} An earlier owner-only action is still waiting for your approval.\n\n"
     "Reply to that request with «تأیید» / «بله» / \"yes\" to approve it, or "
     "wait for it to expire. The new request was NOT scheduled — ask again "
     "after the first approval (or once it has expired)."
@@ -235,7 +236,7 @@ def confirmation_request_text(tool_name: str, arguments: dict[str, Any]) -> str:
     precisely what will execute.
     """
     lines = [
-        "⚠️ Owner approval required",
+        f"{sym.STATE_WARNING} Owner approval required",
         "",
         "The AI wants to run an owner-only action:",
         "",

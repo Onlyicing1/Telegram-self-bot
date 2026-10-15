@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from backend.helper import symbols as sym
 
 from backend.ai.task_candidate import TaskCandidate
 from backend.ai.database.task_repository import TaskRecord
@@ -56,7 +57,7 @@ async def test_authorized_request_interprets_then_persists_and_edits_in_place():
         with patch.object(tasks.TaskCreationService, "create", new=AsyncMock(return_value=record)) as create:
             await client.handler(event)
     assert create.await_count == 1
-    assert "✅ Created" in event.edits[-1]
+    assert f"{sym.OP_SAVE} Created" in event.edits[-1]
     assert len(event.edits) == 2
 
 

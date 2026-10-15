@@ -50,6 +50,7 @@ from backend.helper import (
 )
 from backend.helper.client import get_client
 from backend.helper.styles import DANGER
+from backend.helper import symbols as sym
 from backend.helper.input_state import set_pending
 
 logger = logging.getLogger(__name__)
@@ -73,9 +74,9 @@ def _parse_extra_id(extra: str) -> str | None:
 
 def _retrieve_menu_rows(total: int) -> list:
     builder = InlinePanelBuilder()
-    builder.add_row(f"📋 Saved Items ({total})", "panel:retrieve_saved")
-    builder.add_row("🔍 Search by Name/Tag", "input:retrieve:search")
-    builder.add_row("🔍 Retrieve by Code", "panel:retrieve_code")
+    builder.add_row(f"{sym.CONTENT_STATIC} Saved Items ({total})", "panel:retrieve_saved")
+    builder.add_row(sym.label(sym.OP_SEARCH, "Search by Name/Tag"), "input:retrieve:search")
+    builder.add_row(sym.label(sym.OP_SEARCH, "Retrieve by Code"), "panel:retrieve_code")
     return builder.build()
 
 
@@ -120,7 +121,7 @@ async def _retrieve_saved_panel_handler(event, extra: str) -> tuple[str, str, li
         items, total = await db_client.list_saves(_owner_id, limit=per_page, offset=offset)
 
     if not items:
-        return "Saved Items", "_No saved items found._\n\nSave something first from the LifeOS menu (📥 Save → Deep Save).", []
+        return "Saved Items", f"_No saved items found._\n\nSave something first from the LifeOS menu ({sym.OP_SAVE} Save → Deep Save).", []
 
     body = f"_{total} items · page {page}/{total_pages}_"
 
@@ -136,10 +137,10 @@ async def _retrieve_saved_panel_handler(event, extra: str) -> tuple[str, str, li
 
     nav_row = []
     if page > 1:
-        nav_row.append(("◀ Prev", f"panel:retrieve_saved:page:{page - 1}"))
+        nav_row.append((sym.label(sym.OP_PREV, "Prev"), f"panel:retrieve_saved:page:{page - 1}"))
     nav_row.append((f"{page}/{total_pages}", "panel:_nav:noop"))
     if page < total_pages:
-        nav_row.append(("Next ▶", f"panel:retrieve_saved:page:{page + 1}"))
+        nav_row.append((f"Next {sym.OP_NEXT}", f"panel:retrieve_saved:page:{page + 1}"))
     builder.add_buttons(*nav_row)
 
     return "Saved Items", body, builder.build()
@@ -164,16 +165,16 @@ async def _retrieve_item_panel_handler(event, extra: str) -> tuple[str, str, lis
     # renders stored metadata exactly like the AI preview does.
     row = await retrieve_service.load_saved_item(code, _owner_id)
     if not row:
-        return "Item", f"❌ No item found for `{code}`", []
+        return "Item", f"{sym.STATE_FAILED} No item found for `{code}`", []
 
     body = retrieve_service.format_preview(row)
     builder = InlinePanelBuilder()
-    builder.add_row("⬇ Retrieve", f"action:retrieve_item_exec:{code}")
-    builder.add_row("✏ Rename", f"input:retrieve_item:rename:{code}")
+    builder.add_row(sym.label(sym.OP_SAVE, "Retrieve"), f"action:retrieve_item_exec:{code}")
+    builder.add_row(sym.label(sym.OP_EDIT, "Rename"), f"input:retrieve_item:rename:{code}")
     builder.add_row(_file_name_row_label(row), f"input:retrieve_item:filename:{code}")
-    builder.add_row("🏷 Tags", f"input:retrieve_item:tags:{code}")
-    builder.add_row("📂 Move", f"input:retrieve_item:move:{code}")
-    builder.add_row("🗑 Delete", f"action:retrieve_item_delete:{code}", DANGER)
+    builder.add_row(sym.label(sym.META_TAGS, "Tags"), f"input:retrieve_item:tags:{code}")
+    builder.add_row(sym.label(sym.OP_HOME, "Move"), f"input:retrieve_item:move:{code}")
+    builder.add_row(sym.label(sym.OP_DELETE, "Delete"), f"action:retrieve_item_delete:{code}", DANGER)
     return "Item Preview", body, builder.build()
 
 
@@ -186,9 +187,9 @@ def _file_name_row_label(row: dict) -> str:
     """
     current = retrieve_service.saved_file_name(row)
     if not current:
-        return "📄 File Name"
+        return f"{sym.FILE_NAME} File Name"
     shown = current if len(current) <= 18 else current[:15] + "…"
-    return f"📄 {shown}"
+    return f"{sym.FILE_NAME} {shown}"
 
 
 async def _retrieve_item_inline_builder(event, extra: str) -> list:
@@ -303,14 +304,14 @@ async def _resolve_saved_item_request(query: str, self_client, owner_id: int,
     except Exception as exc:
         await _show_result(
             self_client, chat_id, msg_id, inline_chat_id, inline_msg_id,
-            f"❌ Search failed: {exc}",
+            f"{sym.STATE_FAILED} Search failed: {exc}",
         )
         return
 
     if resolution.status == retrieve_service.RESOLUTION_NOT_FOUND:
         builder = InlinePanelBuilder()
-        builder.add_row("🔍 Search Again", "input:retrieve:search")
-        builder.add_row("‹ Back", "panel:retrieve")
+        builder.add_row(sym.label(sym.OP_SEARCH, "Search Again"), "input:retrieve:search")
+        builder.add_row(sym.label(sym.OP_BACK, "Back"), "panel:retrieve")
         await _show_result(
             self_client, chat_id, msg_id, inline_chat_id, inline_msg_id,
             retrieve_service.format_resolution(resolution), builder.build(),
@@ -334,8 +335,8 @@ async def _resolve_saved_item_request(query: str, self_client, owner_id: int,
             f"{index}. {retrieve_service.candidate_label(candidate)}",
             f"action:resolve_pick:{candidate.save_code}",
         )
-    builder.add_row("🔍 Search Again", "input:retrieve:search")
-    builder.add_row("‹ Back", "panel:retrieve")
+    builder.add_row(sym.label(sym.OP_SEARCH, "Search Again"), "input:retrieve:search")
+    builder.add_row(sym.label(sym.OP_BACK, "Back"), "panel:retrieve")
 
     set_pending(
         owner_id,
@@ -369,7 +370,7 @@ async def _retrieve_pick_input_handler(text, chat_id, msg_id, inline_chat_id, in
     if answer.casefold() in ("cancel", "لغو"):
         await _show_result(
             _self_client, chat_id, msg_id, inline_chat_id, inline_msg_id,
-            "Cancelled — nothing was retrieved. Search again from 🔍 Retrieve.",
+            f"Cancelled — nothing was retrieved. Search again from {sym.OP_SEARCH} Retrieve.",
         )
         return
     selection = answer.upper() if answer.upper() in codes else None
@@ -377,8 +378,8 @@ async def _retrieve_pick_input_handler(text, chat_id, msg_id, inline_chat_id, in
     if not codes or (selection is None and index is None):
         await _show_result(
             _self_client, chat_id, msg_id, inline_chat_id, inline_msg_id,
-            "⚠️ Please reply with the number of the saved item you want (e.g. 2), "
-            "or open 🔍 Retrieve to search again. Nothing was retrieved.",
+            f"{sym.STATE_WARNING} Please reply with the number of the saved item you want (e.g. 2), "
+            f"or open {sym.OP_SEARCH} Retrieve to search again. Nothing was retrieved.",
         )
         return
     code = selection or codes[index - 1]
@@ -386,7 +387,7 @@ async def _retrieve_pick_input_handler(text, chat_id, msg_id, inline_chat_id, in
     if not row:
         await _show_result(
             _self_client, chat_id, msg_id, inline_chat_id, inline_msg_id,
-            f"❌ No item found for `{code}` — it may have been deleted. Nothing was retrieved.",
+            f"{sym.STATE_FAILED} No item found for `{code}` — it may have been deleted. Nothing was retrieved.",
         )
         return
     result = await retrieve_service.do_retrieve(_self_client, owner_id, code, chat_id)
@@ -409,15 +410,15 @@ async def _resolve_pick_action(event, extra: str, chat_id: int) -> tuple[str, st
     from backend.helper.inline_engine import _self_client, _owner_id
     code = (extra or "").strip().upper()
     builder = InlinePanelBuilder()
-    builder.add_row("🔍 Search Again", "input:retrieve:search")
-    builder.add_row("‹ Back to Saved Items", "panel:retrieve_saved")
+    builder.add_row(sym.label(sym.OP_SEARCH, "Search Again"), "input:retrieve:search")
+    builder.add_row(sym.label(sym.OP_BACK, "Back to Saved Items"), "panel:retrieve_saved")
     if not code:
-        return "Retrieve", "❌ No item selected. Nothing was retrieved.", builder.build()
+        return "Retrieve", f"{sym.STATE_FAILED} No item selected. Nothing was retrieved.", builder.build()
     row = await retrieve_service.load_saved_item(code, _owner_id)
     if not row:
         return (
             "Retrieve",
-            f"❌ No item found for `{code}` — it may have been deleted. Nothing was retrieved.",
+            f"{sym.STATE_FAILED} No item found for `{code}` — it may have been deleted. Nothing was retrieved.",
             builder.build(),
         )
     result = await retrieve_service.do_retrieve(_self_client, _owner_id, code, chat_id)
@@ -428,10 +429,10 @@ async def _retrieve_item_exec_action(event, extra: str, chat_id: int) -> tuple[s
     from backend.helper.inline_engine import _self_client, _owner_id
     code = extra.strip()
     if not code:
-        return "Retrieve", "❌ No code specified.", []
+        return "Retrieve", f"{sym.STATE_FAILED} No code specified.", []
     if not chat_id:
         logger.error("[RETRIEVE] invalid target chat from callback: chat_id=%r", chat_id)
-        return "Retrieve", "❌ Cannot determine target chat.", []
+        return "Retrieve", f"{sym.STATE_FAILED} Cannot determine target chat.", []
     result = await retrieve_service.do_retrieve(_self_client, _owner_id, code, chat_id)
     row = await db_client.query_save(code)
     if row:
@@ -441,8 +442,8 @@ async def _retrieve_item_exec_action(event, extra: str, chat_id: int) -> tuple[s
 
 def _retrieve_item_buttons(code: str) -> list:
     builder = InlinePanelBuilder()
-    builder.add_row("⬇ Retrieve Again", f"action:retrieve_item_exec:{code}")
-    builder.add_row("‹ Back to Item", f"panel:retrieve_item:id:{code}")
+    builder.add_row(sym.label(sym.OP_SAVE, "Retrieve Again"), f"action:retrieve_item_exec:{code}")
+    builder.add_row(sym.label(sym.OP_BACK, "Back to Item"), f"panel:retrieve_item:id:{code}")
     return builder.build()
 
 
@@ -450,10 +451,10 @@ async def _retrieve_item_delete_action(event, extra: str, chat_id: int) -> tuple
     from backend.helper.inline_engine import _self_client, _owner_id
     code = extra.strip()
     if not code:
-        return "Delete", "❌ No code specified.", []
+        return "Delete", f"{sym.STATE_FAILED} No code specified.", []
     result = await retrieve_service.do_delete(_self_client, _owner_id, code)
     builder = InlinePanelBuilder()
-    builder.add_row("‹ Back to Saved Items", "panel:retrieve_saved")
+    builder.add_row(sym.label(sym.OP_BACK, "Back to Saved Items"), "panel:retrieve_saved")
     return "Delete", result, builder.build()
 
 
@@ -483,9 +484,9 @@ async def _retrieve_rename_input_handler(text, chat_id, msg_id, inline_chat_id, 
     code = (extra or "").strip()
     text_stripped = text.strip()
     if not text_stripped:
-        result = "⚠️ Nothing was renamed: send a name for the item."
+        result = f"{sym.STATE_WARNING} Nothing was renamed: send a name for the item."
     elif not code:
-        result = "⚠️ No item selected."
+        result = f"{sym.STATE_WARNING} No item selected."
     else:
         result = await retrieve_service.do_rename(_owner_id, code, text_stripped)
     helper = get_client()
@@ -562,12 +563,12 @@ async def _retrieve_tags_input_handler(text, chat_id, msg_id, inline_chat_id, in
     from backend.helper.inline_engine import _self_client, _owner_id
     code = (extra or "").strip()
     if not code:
-        result = "⚠️ No item selected. Nothing was changed."
+        result = f"{sym.STATE_WARNING} No item selected. Nothing was changed."
     else:
         try:
             op, tags = parse_tags_line(text)
         except ValueError as exc:
-            result = f"⚠️ Nothing was changed: {exc}"
+            result = f"{sym.STATE_WARNING} Nothing was changed: {exc}"
         else:
             result = await retrieve_service.do_edit_tags(
                 _owner_id, code, op, tags, client=_self_client
@@ -597,7 +598,7 @@ async def _retrieve_filename_input_handler(text, chat_id, msg_id, inline_chat_id
     from backend.helper.inline_engine import _self_client, _owner_id
     code = (extra or "").strip()
     if not code:
-        result = "⚠️ No item selected. Nothing was renamed."
+        result = f"{sym.STATE_WARNING} No item selected. Nothing was renamed."
     else:
         result = await retrieve_service.do_change_file_name(
             _self_client, _owner_id, code, text
@@ -621,9 +622,9 @@ async def _retrieve_move_input_handler(text, chat_id, msg_id, inline_chat_id, in
     code = (extra or "").strip()
     text_stripped = text.strip()
     if not code:
-        result = "⚠️ No item selected."
+        result = f"{sym.STATE_WARNING} No item selected."
     elif not text_stripped:
-        result = "⚠️ Folder name cannot be empty. Enter 'unfiled' to remove folder."
+        result = f"{sym.STATE_WARNING} Folder name cannot be empty. Enter 'unfiled' to remove folder."
     else:
         folder = None if text_stripped.lower() == "unfiled" else text_stripped
         result = await retrieve_service.do_move(_owner_id, code, folder)
@@ -643,7 +644,7 @@ async def _retrieve_move_input_handler(text, chat_id, msg_id, inline_chat_id, in
 # ── Registration ──
 
 def register(client, owner_id: int):
-    register_panel("retrieve", _retrieve_panel_handler, parent="save", title="🔍 Retrieve")
+    register_panel("retrieve", _retrieve_panel_handler, parent="save", title="Retrieve")
     register_panel("retrieve_saved", _retrieve_saved_panel_handler, parent="retrieve", title="Saved Items")
     register_panel("retrieve_item", _retrieve_item_panel_handler, parent="retrieve_saved", title="Item Detail")
     register_panel("retrieve_code", _retrieve_code_panel_handler, parent="retrieve", title="Retrieve by Code")

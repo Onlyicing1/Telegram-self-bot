@@ -10,23 +10,24 @@ from datetime import datetime
 from backend.db import client as db_client
 from backend.bio.engine import _get_tz
 from backend.diagnostics import record_event
+from backend.helper import symbols as sym
 
 logger = logging.getLogger(__name__)
 
 _MEDIA_ICON = {
-    "Photo": "📷",
-    "Video": "🎬",
-    "Animation": "🎞",
-    "Audio": "🎵",
-    "Voice": "🎤",
-    "Sticker": "🏷",
-    "Document": "📄",
-    "Unknown": "📦",
+    "Photo": sym.MEDIA_PHOTO,
+    "Video": sym.MEDIA_VIDEO,
+    "Animation": sym.MEDIA_ANIMATION,
+    "Audio": sym.MEDIA_AUDIO,
+    "Voice": sym.MEDIA_VOICE,
+    "Sticker": sym.MEDIA_STICKER,
+    "Document": sym.MEDIA_DOCUMENT,
+    "Unknown": sym.MEDIA_UNKNOWN,
 }
 
 
 def icon(media_type: str | None) -> str:
-    return _MEDIA_ICON.get(media_type or "Unknown", "📦")
+    return _MEDIA_ICON.get(media_type or "Unknown", sym.MEDIA_UNKNOWN)
 
 
 def format_date(iso_str: str | None, tz_str: str) -> str:
@@ -65,10 +66,10 @@ async def do_list(owner_id: int, limit: int, tz_str: str) -> str:
     except Exception as exc:
         logger.error("list db error: %s", exc)
         record_event("database", "list_recent_saves", 0, "ERROR", str(exc))
-        return f"❌ DB error: {exc}"
+        return f"{sym.STATE_FAILED} DB error: {exc}"
     if not items:
-        return "📭 No saved items yet."
-    lines = [f"📋 **Recent Saves** ({len(items)})", ""]
+        return f"{sym.CONTENT_STATIC} No saved items yet."
+    lines = [f"{sym.CONTENT_STATIC} **Recent Saves** ({len(items)})", ""]
     lines.extend(format_list_entry(r, tz_str) for r in items)
     return "\n".join(lines)
 
@@ -81,9 +82,9 @@ async def do_find(owner_id: int, query: str, tz_str: str) -> str:
     except Exception as exc:
         logger.error("find db error: %s", exc)
         record_event("database", "search_saves", 0, "ERROR", str(exc))
-        return f"❌ DB error: {exc}"
+        return f"{sym.STATE_FAILED} DB error: {exc}"
     if not items:
-        return f"🔍 No matches for `{query}`"
-    lines = [f"🔍 **Results** for `{query}` ({len(items)})", ""]
+        return f"{sym.OP_SEARCH} No matches for `{query}`"
+    lines = [f"{sym.OP_SEARCH} **Results** for `{query}` ({len(items)})", ""]
     lines.extend(format_find_entry(r, tz_str) for r in items)
     return "\n".join(lines)

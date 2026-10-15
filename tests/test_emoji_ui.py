@@ -16,6 +16,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from backend.helper import symbols as sym
 from telethon.tl.functions.messages import (
     GetCustomEmojiDocumentsRequest,
     GetStickerSetRequest,
@@ -85,8 +86,10 @@ def test_registers_panels_and_the_import_action():
     assert get_action("emoji_import") is not None
 
 
-def test_the_mother_menu_links_the_emoji_panel():
-    assert "panel:emoji" in _datas(misc._build_menu_buttons())
+def test_the_emoji_button_is_absent_from_the_mother_menu():
+    # The Emoji button was intentionally removed from the main menu; the
+    # Emoji feature/panel/handlers remain registered and reachable.
+    assert "panel:emoji" not in _datas(misc._build_menu_buttons())
 
 
 def test_panel_callback_data_stays_bounded():
@@ -264,7 +267,7 @@ def test_import_action_runs_the_real_service_and_renders_success(monkeypatch):
     monkeypatch.setattr(emoji, "get_self_client", lambda: client)
     title, body, buttons = _run(emoji._import_action(None, "", 0))
     assert title == "Emoji Import"
-    assert "✓ Import complete" in body
+    assert f"{sym.OP_SAVE} Import complete" in body
     assert "Imported 1" in body
     assert "+1" in body  # the deduplicated set member
     _rows, total = _run(db_client.list_emoji_entries(OWNER, limit=10, offset=0))
@@ -292,7 +295,7 @@ def test_report_renderer_covers_failure_and_budget_states():
         {"ok": False, "error": "telegram page fetch timed out after 15s"}
     )
     assert "timed out" in failed[1]
-    assert "✗" in failed[1]
+    assert sym.STATE_FAILED in failed[1]
 
     budget = emoji._render_report(
         {

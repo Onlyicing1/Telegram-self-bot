@@ -10,25 +10,26 @@ from datetime import datetime
 from backend.db import client as db_client
 from backend.bio.engine import _get_tz
 from backend.diagnostics import record_event
+from backend.helper import symbols as sym
 
 logger = logging.getLogger(__name__)
 
 _AI_STATS_TIMEOUT = 3.0
 
 _MEDIA_ICON = {
-    "Photo": "📷",
-    "Video": "🎬",
-    "Animation": "🎞",
-    "Audio": "🎵",
-    "Voice": "🎤",
-    "Sticker": "🏷",
-    "Document": "📄",
-    "Unknown": "📦",
+    "Photo": sym.MEDIA_PHOTO,
+    "Video": sym.MEDIA_VIDEO,
+    "Animation": sym.MEDIA_ANIMATION,
+    "Audio": sym.MEDIA_AUDIO,
+    "Voice": sym.MEDIA_VOICE,
+    "Sticker": sym.MEDIA_STICKER,
+    "Document": sym.MEDIA_DOCUMENT,
+    "Unknown": sym.MEDIA_UNKNOWN,
 }
 
 
 def icon(media_type: str | None) -> str:
-    return _MEDIA_ICON.get(media_type or "Unknown", "📦")
+    return _MEDIA_ICON.get(media_type or "Unknown", sym.MEDIA_UNKNOWN)
 
 
 def format_date(iso_str: str | None, tz_str: str) -> str:
@@ -70,7 +71,7 @@ async def do_clean(client, owner_id: int) -> str:
             "removed": removed, "remaining": remaining,
         })
         return (
-            f"🧹 **Database cleanup complete**\n\n"
+            f"**Database cleanup complete**\n\n"
             f"Removed: `{removed}` orphan rows\n"
             f"Remaining: `{remaining}` items"
         )
@@ -78,7 +79,7 @@ async def do_clean(client, owner_id: int) -> str:
         logger.error("db clean failed: %s", exc)
         record_event("database", "clean orphans", 0, "ERROR", str(exc))
         await db_client.log(owner_id, "ERROR", f"DB clean failed: {exc}", {})
-        return f"❌ Cleanup error: {exc}"
+        return f"{sym.STATE_FAILED} Cleanup error: {exc}"
 
 
 async def _ai_database_counts(owner_id: int) -> tuple[int | None, int | None]:
@@ -125,7 +126,7 @@ async def do_stats(owner_id: int, tz_str: str) -> str:
             size_str = f"{size_bytes} B"
 
         lines = [
-            f"📊 **Database Statistics**\n",
+            f"**Database Statistics**\n",
             f"Total saved items: `{total}`\n",
             f"**Breakdown by type:**",
         ]
@@ -162,7 +163,7 @@ async def do_stats(owner_id: int, tz_str: str) -> str:
     except Exception as exc:
         logger.error("db stats failed: %s", exc)
         record_event("database", "stats", 0, "ERROR", str(exc))
-        return f"❌ Stats error: {exc}"
+        return f"{sym.STATE_FAILED} Stats error: {exc}"
 
 
 async def do_vacuum(client, owner_id: int) -> str:
@@ -176,7 +177,7 @@ async def do_vacuum(client, owner_id: int) -> str:
             "removed": removed, "remaining": remaining,
         })
         return (
-            f"⚙️ **Vacuum complete**\n\n"
+            f"**Vacuum complete**\n\n"
             f"Orphans removed: `{removed}`\n"
             f"Items remaining: `{remaining}`\n"
             f"Index optimization: skipped (PostgREST)"
@@ -185,4 +186,4 @@ async def do_vacuum(client, owner_id: int) -> str:
         logger.error("db vacuum failed: %s", exc)
         record_event("database", "vacuum", 0, "ERROR", str(exc))
         await db_client.log(owner_id, "ERROR", f"DB vacuum failed: {exc}", {})
-        return f"❌ Vacuum error: {exc}"
+        return f"{sym.STATE_FAILED} Vacuum error: {exc}"

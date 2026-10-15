@@ -11,10 +11,12 @@ import asyncio
 from backend.bio import engine as bio_engine
 from backend.db import client as db_client
 from backend.diagnostics import record_event
+from backend.helper import symbols as sym
 
 logger = logging.getLogger(__name__)
 
 _PROFILE_TIMEOUT = 30.0
+_DEFAULT_TEMPLATE = sym.BIO_DEFAULT_TEMPLATE
 
 
 async def _apply_profile(owner_id: int, tz_str: str | None = None) -> str:
@@ -40,8 +42,8 @@ async def _apply_profile(owner_id: int, tz_str: str | None = None) -> str:
     if not state:
         raise RuntimeError("bio state unavailable")
     about = bio_engine.render_bio(
-        state.get("template", "🕒 {time} | 💭 {mood}"),
-        state.get("mood", "😊"),
+        state.get("template", _DEFAULT_TEMPLATE),
+        state.get("mood", sym.ICON_MOOD),
         state.get("custom_text", ""),
         tz_str or "UTC",
     )
@@ -79,27 +81,27 @@ async def do_on(client, owner_id: int, tz_str: str) -> str:
         await db_client.get_or_create_bio_state(owner_id)
         await db_client.update_bio_state(owner_id, {"is_active": True})
     except Exception as exc:
-        return f"❌ DB error: {exc}"
+        return f"{sym.STATE_FAILED} DB error: {exc}"
     bio_engine.start_cron(client, owner_id, tz_str)
     record_event("bio", "cron on", 0, "SUCCESS")
     state = await db_client.get_or_create_bio_state(owner_id)
     preview = bio_engine.render_bio(
-        state.get("template", "🕒 {time} | 💭 {mood}"),
-        state.get("mood", "😊"),
+        state.get("template", _DEFAULT_TEMPLATE),
+        state.get("mood", sym.ICON_MOOD),
         state.get("custom_text", ""),
         tz_str,
     )
-    return f"✅ Bio cron **ON**\nPreview: `{preview}`"
+    return f"{sym.OP_SAVE} Bio cron **ON**\nPreview: `{preview}`"
 
 
 async def do_off(owner_id: int) -> str:
     try:
         await db_client.update_bio_state(owner_id, {"is_active": False})
     except Exception as exc:
-        return f"❌ DB error: {exc}"
+        return f"{sym.STATE_FAILED} DB error: {exc}"
     await bio_engine.stop_cron()
     record_event("bio", "cron off", 0, "SUCCESS")
-    return "⏹ Bio cron **OFF**"
+    return f"{sym.OP_STOP} Bio cron **OFF**"
 
 
 async def do_show(owner_id: int, tz_str: str) -> str:
@@ -107,8 +109,8 @@ async def do_show(owner_id: int, tz_str: str) -> str:
     now = bio_engine._get_tz(tz_str)
     now_dt = datetime.now(now)
     preview = bio_engine.render_bio(
-        state.get("template", "🕒 {time} | 💭 {mood}"),
-        state.get("mood", "😊"),
+        state.get("template", _DEFAULT_TEMPLATE),
+        state.get("mood", sym.ICON_MOOD),
         state.get("custom_text", ""),
         tz_str,
     )
@@ -119,8 +121,8 @@ async def do_show(owner_id: int, tz_str: str) -> str:
     return (
         f"**Bio State**\n\n"
         f"Status: `{status}`\n"
-        f"Template: `{state.get('template') or '🕒 {time} | 💭 {mood}'}`\n"
-        f"Mood: {state.get('mood') or '😊'}\n"
+        f"Template: `{state.get('template') or _DEFAULT_TEMPLATE}`\n"
+        f"Mood: {state.get('mood') or sym.ICON_MOOD}\n"
         f"Text: {state.get('custom_text') or '—'}\n"
         f"Last Bio: {state.get('last_bio') or '—'}\n"
         f"Preview: {preview}\n"
@@ -130,37 +132,37 @@ async def do_show(owner_id: int, tz_str: str) -> str:
 
 async def do_template(owner_id: int, template: str, *, client=None, tz_str: str | None = None) -> str:
     if not template:
-        return "⚠️ Template cannot be empty."
+        return f"{sym.STATE_WARNING} Template cannot be empty."
     try:
         await db_client.update_bio_state(owner_id, {"template": template})
     except Exception as exc:
-        return f"❌ DB error: {exc}"
+        return f"{sym.STATE_FAILED} DB error: {exc}"
     try:
         about = await _apply_profile(owner_id, tz_str)
     except Exception as exc:
-        return f"⚠️ Template saved, but the Telegram bio was NOT updated: {exc}"
-    return f"✅ Template updated and applied:\n`{about}`"
+        return f"{sym.STATE_WARNING} Template saved, but the Telegram bio was NOT updated: {exc}"
+    return f"{sym.OP_SAVE} Template updated and applied:\n`{about}`"
 
 
 async def do_text(owner_id: int, text: str, *, client=None, tz_str: str | None = None) -> str:
     try:
         await db_client.update_bio_state(owner_id, {"custom_text": text})
     except Exception as exc:
-        return f"❌ DB error: {exc}"
+        return f"{sym.STATE_FAILED} DB error: {exc}"
     try:
         about = await _apply_profile(owner_id, tz_str)
     except Exception as exc:
-        return f"⚠️ Text saved, but the Telegram bio was NOT updated: {exc}"
-    return f"✅ Bio set to: `{about}`"
+        return f"{sym.STATE_WARNING} Text saved, but the Telegram bio was NOT updated: {exc}"
+    return f"{sym.OP_SAVE} Bio set to: `{about}`"
 
 
 async def do_mood(owner_id: int, mood: str, *, client=None, tz_str: str | None = None) -> str:
     try:
         await db_client.update_bio_state(owner_id, {"mood": mood})
     except Exception as exc:
-        return f"❌ DB error: {exc}"
+        return f"{sym.STATE_FAILED} DB error: {exc}"
     try:
         about = await _apply_profile(owner_id, tz_str)
     except Exception as exc:
-        return f"⚠️ Mood saved, but the Telegram bio was NOT updated: {exc}"
-    return f"✅ Mood set, bio applied: `{about}`"
+        return f"{sym.STATE_WARNING} Mood saved, but the Telegram bio was NOT updated: {exc}"
+    return f"{sym.OP_SAVE} Mood set, bio applied: `{about}`"

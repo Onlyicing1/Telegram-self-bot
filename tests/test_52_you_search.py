@@ -22,6 +22,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+from backend.helper import symbols as sym
 
 FAKE_KEY = "ydc-fake-test-key-000"
 
@@ -761,7 +762,7 @@ class TestWebSearchRuntime:
         registry.register(search)
         engine = Engine(providers=manager)
         engine.attach_tools(registry, ToolContext(telegram=None, owner_id=1, tz_str="UTC"))
-        with patch("backend.services.web_search_service.do_web_search", new=AsyncMock(return_value=(True, "🌐 Web results", {"results": [{"title": "Current", "url": "https://example.test"}]}))):
+        with patch("backend.services.web_search_service.do_web_search", new=AsyncMock(return_value=(True, f"{sym.ICON_WEB} Web results", {"results": [{"title": "Current", "url": "https://example.test"}]}))):
             result = await engine.execute(AIRequest(session_id="loop", user_message="current", owner_id=1, chat_id=1, message_id=1))
         assert result.success is True
         assert "Web results" in result.response

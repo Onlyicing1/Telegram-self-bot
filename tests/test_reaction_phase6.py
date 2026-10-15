@@ -31,6 +31,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from backend.helper import symbols as sym
 from telethon.tl.functions.messages import SendReactionRequest
 from telethon.tl.types import (
     MessageEntityCustomEmoji,
@@ -725,7 +726,7 @@ def test_the_reply_flow_reports_an_invalid_reaction_value(monkeypatch):
     client = _wired_reply_client(_reply(text="a b"))
     edit = _run_reply_handler(client, monkeypatch, text="a b")
     assert client.calls == []
-    assert "✗" in edit[3]
+    assert sym.STATE_FAILED in edit[3]
     assert reaction_service.ERROR_REACTION in edit[3]
 
 
@@ -735,7 +736,7 @@ def test_the_reply_flow_reports_a_telegram_rejection_honestly(monkeypatch):
     )
     edit = _run_reply_handler(client, monkeypatch, text="👍")
     assert len(client.calls) == 1
-    assert "✗" in edit[3]
+    assert sym.STATE_FAILED in edit[3]
     assert reaction_service.ERROR_TELEGRAM in edit[3]
     assert "REACTION_INVALID" in edit[3]
 

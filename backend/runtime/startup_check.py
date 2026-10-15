@@ -21,6 +21,7 @@ Usage:
         sys.exit(1)
 """
 from __future__ import annotations
+from backend.helper import symbols as sym
 
 import logging
 import os
@@ -269,12 +270,12 @@ def run_startup_checks(cfg: dict) -> StartupReport:
     if report.failures:
         logger.error("[STARTUP CHECK] %d CRITICAL failure(s) — will retry:", len(report.failures))
         for f in report.failures:
-            logger.error("  ✗ %s: %s", f.name, f.message)
+            logger.error("  %s %s: %s", sym.STATE_FAILED, f.name, f.message)
     else:
         logger.info("[STARTUP CHECK] All critical checks passed.")
         if report.warnings:
             logger.warning("[STARTUP CHECK] %d warning(s):", len(report.warnings))
             for w in report.warnings:
-                logger.warning("  ⚠ %s: %s", w.name, w.message)
+                logger.warning("  %s %s: %s", sym.STATE_WARNING, w.name, w.message)
 
     return report

@@ -28,6 +28,7 @@ Contracts:
   loop, scheduler, executor or listener of its own.
 """
 from __future__ import annotations
+from backend.helper import symbols as sym
 
 import time
 from typing import Any
@@ -511,34 +512,34 @@ def _stage_detail(
 # ── rendering ────────────────────────────────────────────────────────────────
 
 _STATUS_MARK = {
-    STATUS_SUCCEEDED: "✅",
-    STATUS_FAILED: "❌",
-    STATUS_SKIPPED: "⏭️",
-    STATUS_BLOCKED: "⛔",
-    STATUS_INCONCLUSIVE: "◌",
+    STATUS_SUCCEEDED: sym.STATE_COMPLETED,
+    STATUS_FAILED: sym.STATE_FAILED,
+    STATUS_SKIPPED: sym.OP_NEXT,
+    STATUS_BLOCKED: sym.OP_STOP,
+    STATUS_INCONCLUSIVE: sym.MEDIA_UNKNOWN,
     STATUS_RUNNING: "…",
     STATUS_PENDING: "·",
 }
 
 _OUTCOME_HEADLINE = {
-    "verified": "✓ Verified stored — genuine custom-emoji entity with the helper bot's attribution",
-    "verified_stored": "✓ Verified stored — genuine custom-emoji entity with the helper bot's attribution",
-    "bot_not_entitled": "⛔ Blocked — Telegram entitlement restriction (the helper bot may not use custom-emoji entities)",
-    "entity_missing": "❌ Failed — the stored inline result lost the custom-emoji entity",
-    "unsupported_result": "❌ Failed — the inline result shape could not be inspected safely",
-    "no_send_message": "❌ Failed — the stored inline result carries no send-message payload",
-    "empty_result": "❌ Failed — the helper bot returned no inline result",
-    "query_failed": "❌ Failed — the inline query did not return a usable result",
-    "send_failed": "❌ Failed — the inline send was not accepted",
-    "readback_failed": "◌ Inconclusive — the send was accepted but could not be read back",
-    "stored_entity_stripped": "❌ Failed — Telegram stored the message WITHOUT the entity",
-    "stored_entity_mismatch": "❌ Failed — the stored entity does not match the one sent",
-    "attribution_missing": "❌ Failed — the stored entity lacks the helper bot's attribution",
-    "source_entity_missing": "❌ Failed — the reply carried no genuine custom-emoji entity",
-    "unsupported_destination": "⛔ Blocked — only your Saved Messages is a supported destination",
-    "payload_invalid": "❌ Failed — the outbound payload failed its own validation",
-    "inline_unavailable": "⛔ Blocked — the helper bot is not available for the inline route",
-    "failed": "❌ Failed — the run did not complete",
+    "verified": f"{sym.OP_SAVE} Verified stored — genuine custom-emoji entity with the helper bot's attribution",
+    "verified_stored": f"{sym.OP_SAVE} Verified stored — genuine custom-emoji entity with the helper bot's attribution",
+    "bot_not_entitled": f"{sym.OP_STOP} Blocked — Telegram entitlement restriction (the helper bot may not use custom-emoji entities)",
+    "entity_missing": f"{sym.STATE_FAILED} Failed — the stored inline result lost the custom-emoji entity",
+    "unsupported_result": f"{sym.STATE_FAILED} Failed — the inline result shape could not be inspected safely",
+    "no_send_message": f"{sym.STATE_FAILED} Failed — the stored inline result carries no send-message payload",
+    "empty_result": f"{sym.STATE_FAILED} Failed — the helper bot returned no inline result",
+    "query_failed": f"{sym.STATE_FAILED} Failed — the inline query did not return a usable result",
+    "send_failed": f"{sym.STATE_FAILED} Failed — the inline send was not accepted",
+    "readback_failed": f"{sym.MEDIA_UNKNOWN} Inconclusive — the send was accepted but could not be read back",
+    "stored_entity_stripped": f"{sym.STATE_FAILED} Failed — Telegram stored the message WITHOUT the entity",
+    "stored_entity_mismatch": f"{sym.STATE_FAILED} Failed — the stored entity does not match the one sent",
+    "attribution_missing": f"{sym.STATE_FAILED} Failed — the stored entity lacks the helper bot's attribution",
+    "source_entity_missing": f"{sym.STATE_FAILED} Failed — the reply carried no genuine custom-emoji entity",
+    "unsupported_destination": f"{sym.OP_STOP} Blocked — only your Saved Messages is a supported destination",
+    "payload_invalid": f"{sym.STATE_FAILED} Failed — the outbound payload failed its own validation",
+    "inline_unavailable": f"{sym.OP_STOP} Blocked — the helper bot is not available for the inline route",
+    "failed": f"{sym.STATE_FAILED} Failed — the run did not complete",
 }
 
 

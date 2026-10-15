@@ -34,6 +34,7 @@ import zipfile
 from types import SimpleNamespace
 
 import pytest
+from backend.helper import symbols as sym
 from telethon.tl.types import (
     DocumentAttributeAnimated,
     DocumentAttributeFilename,
@@ -269,7 +270,7 @@ async def test_the_owner_gets_a_deterministic_refusal_and_no_provider_round():
         request_id="scope",
     )
 
-    assert answer.text.startswith("⚠️ I can't process this Video")
+    assert answer.text.startswith(sym.STATE_WARNING) and "I can't process this Video" in answer.text
     assert "outside the Media Processing scope" in answer.text
     assert answer.provider == "local"
     assert manager.calls == 0

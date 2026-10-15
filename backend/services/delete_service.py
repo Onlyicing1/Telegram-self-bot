@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 from backend.ai.semantic_delete import normalize_text
 from backend.db import client as db_client
 from backend.diagnostics import record_event
+from backend.helper import symbols as sym
 from backend.helper.rpc_timeout import rpc_await
 from backend.services import settings_service
 
@@ -574,18 +575,18 @@ async def do_del_id_counts(
 
 async def do_del_n(client, chat_id, n: int) -> str:
     if n < 1 or n > 500:
-        return "⚠️ n must be between 1 and 500."
+        return f"{sym.STATE_WARNING} n must be between 1 and 500."
     deleted, err = await do_del_n_counts(client, chat_id, n)
     if err is not None:
-        return f"❌ Delete failed: {err}"
-    return f"🗑 Deleted `{deleted}` messages."
+        return f"{sym.STATE_FAILED} Delete failed: {err}"
+    return f"{sym.OP_DELETE} Deleted `{deleted}` messages."
 
 
 async def do_del_id(client, chat_id, start_id: int) -> str:
     deleted, err = await do_del_id_counts(client, chat_id, start_id)
     if err is not None:
-        return f"❌ Delete failed: {err}"
-    return f"🗑 Deleted messages from ID `{start_id}` forward."
+        return f"{sym.STATE_FAILED} Delete failed: {err}"
+    return f"{sym.OP_DELETE} Deleted messages from ID `{start_id}` forward."
 
 
 async def do_del_code(client, owner_id: int, code: str) -> str:
@@ -597,9 +598,9 @@ async def do_del_code(client, owner_id: int, code: str) -> str:
     except Exception as exc:
         logger.error("del save_code DB query failed: %s", exc)
         record_event("database", "query_save", 0, "ERROR", str(exc))
-        return f"❌ DB error: {exc}"
+        return f"{sym.STATE_FAILED} DB error: {exc}"
     if not row:
-        return f"❌ No saved item found for `{code}`"
+        return f"{sym.STATE_FAILED} No saved item found for `{code}`"
 
     saved_chat_id = row.get("saved_chat_id")
     saved_msg_id = row.get("saved_msg_id")
@@ -634,11 +635,11 @@ async def do_del_code(client, owner_id: int, code: str) -> str:
     )
 
     if tg_deleted and db_deleted:
-        return f"🗑 Deleted `{display}`"
+        return f"{sym.OP_DELETE} Deleted `{display}`"
     elif tg_deleted and not db_deleted:
-        return f"⚠️ `{display}`: Telegram message deleted, but DB row removal failed: {db_error}"
+        return f"{sym.STATE_WARNING} `{display}`: Telegram message deleted, but DB row removal failed: {db_error}"
     elif not tg_deleted and db_deleted:
         if tg_error:
-            return f"⚠️ `{display}`: DB row deleted, but Telegram message deletion failed: {tg_error}"
-        return f"🗑 Deleted `{display}` (Telegram message was already missing)"
-    return f"❌ `{display}`: Both Telegram and DB deletion failed. TG: {tg_error}, DB: {db_error}"
+            return f"{sym.STATE_WARNING} `{display}`: DB row deleted, but Telegram message deletion failed: {tg_error}"
+        return f"{sym.OP_DELETE} Deleted `{display}` (Telegram message was already missing)"
+    return f"{sym.STATE_FAILED} `{display}`: Both Telegram and DB deletion failed. TG: {tg_error}, DB: {db_error}"

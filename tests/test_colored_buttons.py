@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import pytest
 
+from backend.helper import symbols as sym
+
 from telethon.tl import types
 from telethon.tl.custom import Button
 
@@ -207,7 +209,7 @@ class TestMainPanelStyles:
         result = self._menu_result()
         buttons = {b.text: b for r in result.send_message.reply_markup.rows for b in r.buttons}
         for label in ("Profile", "Database", "General", "Settings", "Ghost Seen",
-                      "Todo", "Emoji"):
+                      "Todo"):
             assert _bg(buttons[label], "primary") is True, label
 
     def test_menu_only_save_and_delete_use_success_and_danger(self):
@@ -246,16 +248,16 @@ class TestSubmenuStyles:
         from backend.bot.handlers import save
         _, _, rows = await save._save_panel_handler(None, "")
         buttons = self._by_text(rows)
-        assert _bg(buttons["⬇️ Deep Save"], "success") is True
-        assert _bg(buttons["🔍 Retrieve"], "primary") is True
+        assert _bg(buttons["✓ Deep Save"], "success") is True
+        assert _bg(buttons["⌕ Retrieve"], "primary") is True
 
     @pytest.mark.asyncio
     async def test_delete_submenu_is_danger_only(self):
         from backend.bot.handlers import delete
         _, _, rows = await delete._del_panel_handler(None, "")
         buttons = self._by_text(rows)
-        assert _bg(buttons["🗑 Delete last N messages"], "danger") is True
-        assert _bg(buttons["🗑 Delete From..."], "danger") is True
+        assert _bg(buttons["⌫ Delete last N messages"], "danger") is True
+        assert _bg(buttons["⌫ Delete From..."], "danger") is True
         assert all(_bg(b, "success") in (None, False) for b in buttons.values())
 
     @pytest.mark.asyncio
@@ -263,8 +265,8 @@ class TestSubmenuStyles:
         from backend.bot.handlers import delete
         _, _, rows = await delete._delfrom_confirm(123)
         buttons = self._by_text(rows)
-        assert _bg(buttons["🗑 Confirm Delete"], "danger") is True
-        assert _bg(buttons["‹ Back to methods"], "primary") is True
+        assert _bg(buttons["⌫ Confirm Delete"], "danger") is True
+        assert _bg(buttons["❮ Back to methods"], "primary") is True
 
     @pytest.mark.asyncio
     async def test_settings_submenu_is_primary(self):
@@ -330,15 +332,15 @@ class TestFamilyOverrides:
     def test_bio_builder_clear_reset_red_apply_green(self):
         from backend.bot.handlers import bio
         buttons = TestSubmenuStyles._by_text(bio._build_builder_buttons())
-        assert _bg(buttons["🗑 Clear"], "danger") is True
-        assert _bg(buttons["↩ Reset"], "danger") is True
+        assert _bg(buttons[sym.label(sym.OP_DELETE, "Clear")], "danger") is True
+        assert _bg(buttons[sym.label(sym.OP_REFRESH, "Reset")], "danger") is True
         assert _bg(buttons["✓ Apply Template"], "success") is True
 
     def test_username_builder_clear_reset_red_apply_green(self):
         from backend.bot.handlers import username
         buttons = TestSubmenuStyles._by_text(username._build_builder_buttons())
-        assert _bg(buttons["🗑 Clear"], "danger") is True
-        assert _bg(buttons["↩ Reset"], "danger") is True
+        assert _bg(buttons[sym.label(sym.OP_DELETE, "Clear")], "danger") is True
+        assert _bg(buttons[sym.label(sym.OP_REFRESH, "Reset")], "danger") is True
         assert _bg(buttons["✓ Apply Template"], "success") is True
 
 

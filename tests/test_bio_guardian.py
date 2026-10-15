@@ -13,6 +13,8 @@ import asyncio
 
 import pytest
 
+from backend.helper import symbols as sym
+
 from backend.services import bio_guardian
 from backend.services.bio_guardian import (
     BioMutationGuarded,
@@ -148,7 +150,7 @@ async def test_flood_wait_never_starts_window_and_is_an_honest_failure():
 
         profile_scheduler._client = MagicMock(side_effect=_ok)
         second = await bio_service.do_text(9, "after flood", tz_str="UTC")
-        assert second.startswith("✅"), second
+        assert second.startswith(sym.OP_SAVE), second
         assert seconds_until_bio_mutation_allowed() > 0.0
     finally:
         profile_scheduler._client = previous_client

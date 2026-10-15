@@ -30,6 +30,7 @@ import tempfile
 from typing import Any
 
 import pytest
+from backend.helper import symbols as sym
 
 from backend.ai.tools.context import ToolContext
 from backend.services import openai_tts_engine
@@ -488,7 +489,7 @@ async def test_a_request_is_answered_with_exactly_one_voice_message(monkeypatch)
 
     assert result.success is True
     assert telegram.sent == [(CHAT_ID, AUDIO, openai_tts_engine.AUDIO_MIME)]
-    assert result.message == f"🔊 Spoke {len(SPOKEN)} characters as a voice message."
+    assert result.message == f"{sym.ICON_SPEAK} Spoke {len(SPOKEN)} characters as a voice message."
 
 
 @pytest.mark.asyncio

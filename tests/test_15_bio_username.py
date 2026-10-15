@@ -26,6 +26,7 @@ from backend.db import client as db_client
 from backend.profile import scheduler as profile_scheduler
 from backend.profile.engine import ProfileEngine
 from backend.username import engine as username_engine
+from backend.helper import symbols as sym
 
 
 class FakeClient:
@@ -61,7 +62,7 @@ def _reset_profile_state():
 # ── Rendering ──
 
 def test_bio_render_replaces_tokens():
-    result = bio_engine.render_bio("🕒 {time} | 💭 {mood} | {text}", "😊", "Working", "UTC")
+    result = bio_engine.render_bio(f"{sym.META_TIME} {{time}} | {sym.ICON_MOOD} {{mood}} | {{text}}", "😊", "Working", "UTC")
     assert "{time}" not in result
     assert "{mood}" not in result
     assert "{text}" not in result
@@ -80,7 +81,7 @@ def test_username_render_replaces_tokens():
 
 def test_bio_render_uses_wellformed_default_template():
     result = bio_engine.render_bio("", "😊", "Working", "UTC")
-    assert "💭 😊" in result
+    assert f"{sym.ICON_MOOD} 😊" in result
     assert "{time}" not in result
     assert "{mood}" not in result
 
@@ -88,7 +89,7 @@ def test_bio_render_uses_wellformed_default_template():
 def test_bio_handler_default_template_is_well_formed():
     from backend.bot.handlers import bio as bio_handler
 
-    assert bio_handler._DEFAULT_TEMPLATE == "🕒 {time} | 💭 {mood}"
+    assert bio_handler._DEFAULT_TEMPLATE == sym.BIO_DEFAULT_TEMPLATE
 
 
 def test_engine_field_wiring():

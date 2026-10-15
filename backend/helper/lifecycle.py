@@ -22,6 +22,7 @@ All resource management goes through this manager.
 import asyncio
 import logging
 from enum import Enum, auto
+from backend.helper import symbols as sym
 from typing import Any
 
 from backend.helper.input_state import clear_pending, clear_all as clear_all_pending
@@ -313,7 +314,7 @@ class PanelLifecycleManager:
         self._set_state(chat_id, msg_id, PanelState.IDLE)
 
         if edit_message:
-            closed_text = "✕ **Panel closed**"
+            closed_text = f"{sym.OP_CLOSE} **Panel closed**"
             edited = False
             if event is not None:
                 try:

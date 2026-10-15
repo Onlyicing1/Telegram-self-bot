@@ -1,5 +1,6 @@
 """Centralized, language-agnostic AI output normalization and Telegram delivery."""
 from __future__ import annotations
+from backend.helper import symbols as sym
 
 import io
 import logging
@@ -108,7 +109,7 @@ def _render_markdown(text: str) -> str:
     text = re.sub(r"(?<!\w)\*\*(?!\s)(.+?)(?<!\s)\*\*(?!\w)|(?<!\w)__(?!\s)(.+?)(?<!\s)__(?!\w)", lambda m: m.group(1) or m.group(2), text, flags=re.S)
     text = re.sub(r"(?<!\w)\*(?!\s)(.+?)(?<!\s)\*(?!\w)|(?<!\w)_(?!\s)(.+?)(?<!\s)_(?!\w)", lambda m: m.group(1) or m.group(2), text, flags=re.S)
     text = re.sub(r"^\s{0,3}#{1,6}\s+", "", text, flags=re.M)
-    text = re.sub(r"^\s*[-*+]\s+", "• ", text, flags=re.M)
+    text = re.sub(r"^\s*[-*+]\s+", f"{sym.BULLET} ", text, flags=re.M)
     text = re.sub(r"^\s*>\s?", "▎ ", text, flags=re.M)
     text = text.replace("\\\\", "\\")
     return _restore(text, tokens)
@@ -506,7 +507,7 @@ def format_failure(user_message: str, notice: str, show_question: bool) -> str:
     """FAILURE state: the notice only, never a successful-answer elbow,
     so a failure can never read as an answer."""
     if not isinstance(notice, str) or not notice.strip():
-        notice = "✕ Couldn't get a response"
+        notice = f"{sym.STATE_FAILED} Couldn't get a response"
     if not show_question:
         return notice
     question = _question_block(user_message)
@@ -696,7 +697,7 @@ def _attachment_notice(chars: int, notes_block: str = "") -> str:
     the answer did not fit one message.
     """
     notice = (
-        f"\U0001f4c4 Extracted content is {chars} characters \u2014 too long for one "
+        f"{sym.MEDIA_DOCUMENT} Extracted content is {chars} characters \u2014 too long for one "
         f"Telegram message. The complete result is attached as "
         f"{_MEDIA_ATTACHMENT_NAME} (nothing was truncated or split)."
     )

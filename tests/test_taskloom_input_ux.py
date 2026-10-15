@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from backend.helper import symbols as sym
 
 from backend.ai.database.task_repository import InMemoryTaskRepository
 
@@ -102,7 +103,7 @@ def test_field_input_prompt_offers_back_and_a_real_cancel(wizard, monkeypatch):
     # and never the main menu.
     assert ("❮ Back", "panel:taskloom_new") in pairs
     assert "panel:_nav:back" not in data
-    assert ("✕ Cancel", "action:taskloom_wizard:cancel") in pairs
+    assert (f"{sym.STATE_FAILED} Cancel", "action:taskloom_wizard:cancel") in pairs
     assert "Cancel" not in labels
 
 
@@ -114,7 +115,7 @@ def test_every_wizard_input_registers_the_back_and_cancel_rows(wizard):
                   "weekly", "once", "tz", "font"):
         config = panels.get_input("taskloom_new", field)
         assert config is not None, field
-        assert config["extra_rows"] == (("✕ Cancel", "action:taskloom_wizard:cancel"),)
+        assert config["extra_rows"] == ((f"{sym.STATE_FAILED} Cancel", "action:taskloom_wizard:cancel"),)
         assert "back" not in config  # the shared default (the panel itself) applies
 
 

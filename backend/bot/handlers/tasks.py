@@ -1,5 +1,6 @@
 """Owner-scoped durable task commands."""
 from __future__ import annotations
+from backend.helper import symbols as sym
 
 import asyncio
 from datetime import datetime, timezone
@@ -21,7 +22,7 @@ _MANAGEMENT_COMMANDS = {"list", "inspect", "pause", "resume", "complete", "fail"
 
 
 def _feedback(text: str, status: str) -> str:
-    return f"{text}\n────────────\n🗓 Task\n{status}"
+    return f"{text}\n────────────\n{sym.SCHEDULE_EVENT} Task\n{status}"
 
 
 def _provider_manager():
@@ -75,18 +76,18 @@ async def _handle_management(event, owner_id: int, args: list[str], raw: str) ->
             version = _parse_version(args[2])
             task = await getattr(service, command)(task_id, version)
             result = (
-                f"✅ {command}d task `{task.id}` · version {task.version}."
+                f"{sym.OP_SAVE} {command}d task `{task.id}` · version {task.version}."
                 if task is not None
-                else "❌ Task not found, ownership check failed, or version is stale."
+                else f"{sym.STATE_FAILED} Task not found, ownership check failed, or version is stale."
             )
         await event.edit(_feedback(raw, result))
     except (ValueError, TypeError):
-        await event.edit(_feedback(raw, f"❌ Invalid task command. {_management_help()}"))
+        await event.edit(_feedback(raw, f"{sym.STATE_FAILED} Invalid task command. {_management_help()}"))
     except asyncio.CancelledError:
         raise
     except Exception:
         logger.exception("Task management handler failed")
-        await event.edit(_feedback(raw, "❌ Task operation failed; no change was confirmed."))
+        await event.edit(_feedback(raw, f"{sym.STATE_FAILED} Task operation failed; no change was confirmed."))
     return True
 
 
@@ -103,7 +104,7 @@ def register(client, owner_id: int, tz_str: str):
             return
         request = raw[len(_COMMAND):].strip()
         if not request:
-            await event.edit(_feedback(raw, "❌ Describe the task after `.task`."))
+            await event.edit(_feedback(raw, f"{sym.STATE_FAILED} Describe the task after `.task`."))
             return
         try:
             await event.edit(_feedback(raw, "⏳ Interpreting..."))
@@ -113,14 +114,14 @@ def register(client, owner_id: int, tz_str: str):
             )
             service = TaskCreationService(get_repository_manager().task, owner_id)
             task = await service.create(candidate, datetime.now(timezone.utc))
-            await event.edit(_feedback(raw, f"✅ Created `{task.id}` — {task.label}"))
+            await event.edit(_feedback(raw, f"{sym.OP_SAVE} Created `{task.id}` — {task.label}"))
         except asyncio.CancelledError:
             raise
         except asyncio.TimeoutError:
-            await event.edit(_feedback(raw, "❌ Task interpretation timed out."))
+            await event.edit(_feedback(raw, f"{sym.STATE_FAILED} Task interpretation timed out."))
         except (TaskInterpretationError, TaskCreationError) as exc:
             logger.info("Task creation rejected: %s", type(exc).__name__)
-            await event.edit(_feedback(raw, "❌ Task was not created: invalid or ambiguous request."))
+            await event.edit(_feedback(raw, f"{sym.STATE_FAILED} Task was not created: invalid or ambiguous request."))
         except Exception:
             logger.exception("Task creation handler failed")
-            await event.edit(_feedback(raw, "❌ Task was not created because persistence failed."))
+            await event.edit(_feedback(raw, f"{sym.STATE_FAILED} Task was not created because persistence failed."))

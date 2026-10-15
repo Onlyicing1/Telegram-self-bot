@@ -13,6 +13,7 @@ executed later by the single TaskScheduler through the registered ToolExecutor
 — no new executor, no second scheduler.
 """
 from __future__ import annotations
+from backend.helper import symbols as sym
 
 import asyncio
 import hashlib
@@ -649,7 +650,7 @@ class CreateTaskTool(Tool):
             return ToolResult(
                 success=True,
                 message=(
-                    f"✅ Task #{task.id} created — {task.label}\n\n"
+                    f"{sym.OP_SAVE} Task #{task.id} created — {task.label}\n\n"
                     f"{fallback_note(fallback_reason)}"
                 ),
                 data={
@@ -667,7 +668,7 @@ class CreateTaskTool(Tool):
 
         return ToolResult(
             success=True,
-            message=f"✅ Task #{task.id} created — {task.label}",
+            message=f"{sym.OP_SAVE} Task #{task.id} created — {task.label}",
             data={
                 "task_id": int(task.id),
                 "label": str(task.label),

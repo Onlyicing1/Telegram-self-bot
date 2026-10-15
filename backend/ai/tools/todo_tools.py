@@ -19,6 +19,7 @@ Completion, reopening and deletion are the existing ``task_transition`` /
 reference), so there is no parallel lifecycle implementation anywhere.
 """
 from __future__ import annotations
+from backend.helper import symbols as sym
 
 from datetime import datetime, timezone
 from typing import Any
@@ -247,7 +248,7 @@ class TodoAddTool(Tool):
             "status": str(task.status),
             "version": int(task.version),
         }
-        message = f"📋 Todo #{task.id} added — {task.label}"
+        message = f"{sym.CONTENT_STATIC} Todo #{task.id} added — {task.label}"
         if raw_steps:
             # Read the steps back so the reported numbers and titles are the
             # STORED ones — never the request echoed as if it had been saved.
@@ -513,7 +514,7 @@ class TodoEditTool(Tool):
             "status": str(updated.status),
             "version": int(updated.version),
         }
-        message = f"✏️ Todo #{updated.id} is now — {updated.label}"
+        message = f"{sym.OP_EDIT} Todo #{updated.id} is now — {updated.label}"
         fallback_backend = str(getattr(updated, "fallback_backend", "") or "")
         if fallback_backend:
             from backend.ai.task_management_interface import fallback_note

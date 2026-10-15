@@ -24,6 +24,7 @@ from backend.helper import (
 )
 from backend.helper.client import get_client
 from backend.helper.styles import DANGER, PRIMARY
+from backend.helper import symbols as sym
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +35,7 @@ async def _del_n_input_handler(text, chat_id, msg_id, inline_chat_id, inline_msg
     from backend.helper.inline_engine import _self_client
     text = text.strip()
     if not text.isdigit():
-        result = "⚠️ Please enter a number between 1 and 500."
+        result = f"{sym.STATE_WARNING} Please enter a number between 1 and 500."
     else:
         result = await delete_service.do_del_n(_self_client, chat_id, int(text))
     helper = get_client()
@@ -54,7 +55,7 @@ async def _del_id_input_handler(text, chat_id, msg_id, inline_chat_id, inline_ms
     from backend.helper.inline_engine import _self_client
     text = text.strip()
     if not text.isdigit():
-        result = "⚠️ Please enter a valid message ID (number)."
+        result = f"{sym.STATE_WARNING} Please enter a valid message ID (number)."
     else:
         result = await delete_service.do_del_id(_self_client, chat_id, int(text))
     helper = get_client()
@@ -74,7 +75,7 @@ async def _del_reply_input_handler(text, chat_id, msg_id, inline_chat_id, inline
     from backend.helper.inline_engine import _self_client
     from backend.helper.input_state import clear_pending
     clear_pending(0)
-    result = "⚠️ Reply mode cancelled."
+    result = f"{sym.STATE_WARNING} Reply mode cancelled."
     helper = get_client()
     if helper and inline_chat_id and inline_msg_id:
         try:
@@ -85,15 +86,15 @@ async def _del_reply_input_handler(text, chat_id, msg_id, inline_chat_id, inline
 
 async def _del_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
     builder = InlinePanelBuilder()
-    builder.add_row("🗑 Delete last N messages", "input:del:n", DANGER)
-    builder.add_row("🗑 Delete From...", "panel:delfrom", DANGER)
+    builder.add_row(sym.label(sym.OP_DELETE, "Delete last N messages"), "input:del:n", DANGER)
+    builder.add_row(sym.label(sym.OP_DELETE, "Delete From..."), "panel:delfrom", DANGER)
     return "Delete", "Choose a deletion mode:", builder.build()
 
 
 async def _del_inline_builder(event, extra: str) -> list:
     builder = InlinePanelBuilder()
-    builder.add_row("🗑 Delete last N messages", "input:del:n", DANGER)
-    builder.add_row("🗑 Delete From...", "panel:delfrom", DANGER)
+    builder.add_row(sym.label(sym.OP_DELETE, "Delete last N messages"), "input:del:n", DANGER)
+    builder.add_row(sym.label(sym.OP_DELETE, "Delete From..."), "panel:delfrom", DANGER)
     return [render("Delete", "Choose a deletion mode:", builder.build())]
 
 
@@ -152,7 +153,7 @@ async def _delfrom_recent_page(event, page: int) -> tuple[str, str, list]:
     ctx = get_target(owner_id)
     chat_id = ctx.reply_chat_id if ctx and ctx.kind == "reply" else 0
     if not chat_id:
-        return "Delete From...", "⚠️ No chat context. Use `.panel` while replying to a message first.", []
+        return "Delete From...", f"{sym.STATE_WARNING} No chat context. Use `.panel` while replying to a message first.", []
 
     try:
         msgs = []
@@ -163,7 +164,7 @@ async def _delfrom_recent_page(event, page: int) -> tuple[str, str, list]:
         page_msgs = msgs[_RECENT_PAGE_SIZE * page: _RECENT_PAGE_SIZE * (page + 1)]
     except Exception as exc:
         logger.warning("delfrom recent: fetch failed: %s", exc)
-        return "Delete From...", f"⚠️ Failed to fetch messages: {exc}", []
+        return "Delete From...", f"{sym.STATE_WARNING} Failed to fetch messages: {exc}", []
 
     if not page_msgs:
         return "Delete From...", "No more messages.", []
@@ -191,9 +192,9 @@ async def _delfrom_recent_page(event, page: int) -> tuple[str, str, list]:
     has_next = len(page_msgs) == _RECENT_PAGE_SIZE
     nav_buttons = []
     if has_prev:
-        nav_buttons.append(("‹ Previous", f"panel:delfrom:recent:{page - 1}"))
+        nav_buttons.append((sym.label(sym.OP_PREV, "Previous"), f"panel:delfrom:recent:{page - 1}"))
     if has_next:
-        nav_buttons.append(("Next ›", f"panel:delfrom:recent:{page + 1}"))
+        nav_buttons.append((f"Next {sym.OP_NEXT}", f"panel:delfrom:recent:{page + 1}"))
     if nav_buttons:
         builder.add_buttons(*nav_buttons)
 
@@ -202,8 +203,8 @@ async def _delfrom_recent_page(event, page: int) -> tuple[str, str, list]:
 
 async def _delfrom_confirm(msg_id: int) -> tuple[str, str, list]:
     builder = InlinePanelBuilder()
-    builder.add_row("🗑 Confirm Delete", f"panel:delfrom:exec:{msg_id}", DANGER)
-    builder.add_row("‹ Back to methods", "panel:delfrom")
+    builder.add_row(sym.label(sym.OP_DELETE, "Confirm Delete"), f"panel:delfrom:exec:{msg_id}", DANGER)
+    builder.add_row(sym.label(sym.OP_BACK, "Back to methods"), "panel:delfrom")
     return "Confirm Delete", f"Delete all outgoing messages from ID `{msg_id}` forward?", builder.build()
 
 
@@ -213,7 +214,7 @@ async def _delfrom_reply_action(event, extra: str, chat_id: int) -> tuple[str, s
 
     owner_id = _owner_id
     if not chat_id:
-        return "Delete From...", "⚠️ Could not determine the current chat. Please try again.", []
+        return "Delete From...", f"{sym.STATE_WARNING} Could not determine the current chat. Please try again.", []
 
     prompt = "**Delete From — Reply Mode**\n\nReply to any message in this chat.\nAll outgoing messages from that point will be deleted.\n\n_Reply to a message now._"
 
@@ -238,11 +239,11 @@ async def _delfrom_reply_wait_handler(text, chat_id, msg_id, inline_chat_id, inl
         elif reply_msg and getattr(reply_msg, "out", False):
             result = await delete_service.do_del_id(client, chat_id, msg_id)
         elif reply_msg:
-            result = "⚠️ Your message was not a reply. Please reply to a message to select the starting point."
+            result = f"{sym.STATE_WARNING} Your message was not a reply. Please reply to a message to select the starting point."
         else:
-            result = "⚠️ Could not find your reply message. Please try again."
+            result = f"{sym.STATE_WARNING} Could not find your reply message. Please try again."
     except Exception as exc:
-        result = f"❌ Delete failed: {exc}"
+        result = f"{sym.STATE_FAILED} Delete failed: {exc}"
 
     helper = get_client()
     if helper and inline_chat_id and inline_msg_id:
@@ -261,7 +262,7 @@ def _circled_num(n: int) -> str:
 
 
 def register(client, owner_id: int):
-    register_panel("del", _del_panel_handler, parent="menu", title="🗑 Delete")
+    register_panel("del", _del_panel_handler, parent="menu", title="Delete")
     register_panel("delfrom", _delfrom_panel_handler, parent="del", title="Delete from Message")
     register_inline_builder("del", _del_inline_builder)
     register_inline_builder("delfrom", _delfrom_inline_builder)

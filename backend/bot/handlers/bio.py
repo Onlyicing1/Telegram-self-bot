@@ -51,11 +51,11 @@ logger = logging.getLogger(__name__)
 
 _BIO_VARS = [
     ("{time}", "Current time in HH:MM format", "14:30"),
-    ("{mood}", "Current mood value", "😊"),
+    ("{mood}", "Current mood value", sym.ICON_MOOD),
     ("{text}", "Custom freeform text", "Working"),
 ]
 
-_DEFAULT_TEMPLATE = "🕒 {time} | 💭 {mood}"
+_DEFAULT_TEMPLATE = sym.BIO_DEFAULT_TEMPLATE
 
 _builder_buffers: dict[int, str] = {}
 
@@ -83,12 +83,12 @@ def _render_preview(buf: str) -> str:
 def _build_bio_main_buttons() -> list:
     builder = InlinePanelBuilder()
     builder.add_row(sym.label(sym.OP_SAVE, "Enable Sync"), "panel:biohelp:cmd:on")
-    builder.add_row("⏹ Disable Sync", "panel:biohelp:cmd:off")
-    builder.add_row("👁 Show State", "panel:bio:state")
-    builder.add_row("🏗 Template Builder", "panel:biohelp:builder")
-    builder.add_row("💬 Set Text", "panel:bio:text")
-    builder.add_row("💭 Set Mood", "panel:bio:mood")
-    builder.add_row("🔧 Variables", "panel:biohelp:vars")
+    builder.add_row(sym.label(sym.OP_STOP, "Disable Sync"), "panel:biohelp:cmd:off")
+    builder.add_row(sym.label(sym.ICON_PROFILE, "Show State"), "panel:bio:state")
+    builder.add_row(sym.label(sym.OP_EDIT, "Template Builder"), "panel:biohelp:builder")
+    builder.add_row(sym.label(sym.OP_EDIT, "Set Text"), "panel:bio:text")
+    builder.add_row(sym.label(sym.ICON_MOOD, "Set Mood"), "panel:bio:mood")
+    builder.add_row(sym.label(sym.ICON_VARIABLE, "Variables"), "panel:biohelp:vars")
     builder.add_row(sym.label(sym.CONTENT_STATIC, "Commands"), "panel:biohelp:cmds")
     return builder.build()
 
@@ -105,7 +105,7 @@ async def _bio_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
         state = await db_client.get_or_create_bio_state(_owner_id)
         current = state.get("custom_text") or "—"
         builder = InlinePanelBuilder()
-        builder.add_row("💬 Enter New Text", "input:bio:text")
+        builder.add_row(sym.label(sym.OP_EDIT, "Enter New Text"), "input:bio:text")
         return "Set Text", f"**Current text:** {current}\n\nTap the button below, then reply with the new text value.", builder.build()
 
     if extra == "mood":
@@ -113,7 +113,7 @@ async def _bio_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
         state = await db_client.get_or_create_bio_state(_owner_id)
         current = state.get("mood") or "—"
         builder = InlinePanelBuilder()
-        builder.add_row("💭 Enter New Mood", "input:bio:mood")
+        builder.add_row(sym.label(sym.ICON_MOOD, "Enter New Mood"), "input:bio:mood")
         return "Set Mood", f"**Current mood:** {current}\n\nTap the button below, then reply with the new mood value.", builder.build()
 
     return "Bio Engine", "Choose an action:", _build_bio_main_buttons()
@@ -128,38 +128,38 @@ async def _bio_inline_builder(event, extra: str) -> list:
 
 def _build_bio_help_menu_buttons() -> list:
     builder = InlinePanelBuilder()
-    builder.add_row("🔧 Variables", "panel:biohelp:vars")
+    builder.add_row(sym.label(sym.ICON_VARIABLE, "Variables"), "panel:biohelp:vars")
     builder.add_row(sym.label(sym.CONTENT_STATIC, "Commands"), "panel:biohelp:cmds")
-    builder.add_row("🏗 Template Builder", "panel:biohelp:builder")
+    builder.add_row(sym.label(sym.OP_EDIT, "Template Builder"), "panel:biohelp:builder")
     return builder.build()
 
 
 def _build_commands_menu_buttons() -> list:
     builder = InlinePanelBuilder()
-    builder.add_row("💬 Set Text", "panel:biohelp:cmd:text")
-    builder.add_row("💭 Set Mood", "panel:biohelp:cmd:mood")
+    builder.add_row(sym.label(sym.OP_EDIT, "Set Text"), "panel:biohelp:cmd:text")
+    builder.add_row(sym.label(sym.ICON_MOOD, "Set Mood"), "panel:biohelp:cmd:mood")
     builder.add_row(sym.label(sym.OP_SAVE, "Enable Sync"), "panel:biohelp:cmd:on")
-    builder.add_row("⏹ Disable Sync", "panel:biohelp:cmd:off")
-    builder.add_row("👁 Show State", "panel:biohelp:cmd:show")
+    builder.add_row(sym.label(sym.OP_STOP, "Disable Sync"), "panel:biohelp:cmd:off")
+    builder.add_row(sym.label(sym.ICON_PROFILE, "Show State"), "panel:biohelp:cmd:show")
     return builder.build()
 
 
 def _build_builder_buttons() -> list:
     builder = InlinePanelBuilder()
     for var_token, _, _ in _BIO_VARS:
-        builder.add_row(f"+ {var_token}", f"action:bio_builder_add:{var_token}")
-    builder.add_row("␣ Space", "action:bio_builder_space")
-    builder.add_row("🗑 Clear", "action:bio_builder_clear", DANGER)
-    builder.add_row("↩ Reset", "action:bio_builder_reset", DANGER)
+        builder.add_row(sym.label(sym.OP_CREATE, var_token), f"action:bio_builder_add:{var_token}")
+    builder.add_row(sym.label(sym.OP_CREATE, "Space"), "action:bio_builder_space")
+    builder.add_row(sym.label(sym.OP_DELETE, "Clear"), "action:bio_builder_clear", DANGER)
+    builder.add_row(sym.label(sym.OP_REFRESH, "Reset"), "action:bio_builder_reset", DANGER)
     builder.add_row(sym.label(sym.OP_SAVE, "Apply Template"), "action:bio_builder_apply", SUCCESS)
-    builder.add_row("📝 Reply to Edit", "action:bio_reply_mode")
+    builder.add_row(sym.label(sym.OP_EDIT, "Reply to Edit"), "action:bio_reply_mode")
     return builder.build()
 
 
 def _build_applied_buttons() -> list:
     builder = InlinePanelBuilder()
-    builder.add_row("👁 Show State", "panel:bio:state")
-    builder.add_row("🏗 Back to Builder", "panel:biohelp:builder")
+    builder.add_row(sym.label(sym.ICON_PROFILE, "Show State"), "panel:bio:state")
+    builder.add_row(sym.label(sym.OP_BACK, "Back to Builder"), "panel:biohelp:builder")
     return builder.build()
 
 
@@ -193,7 +193,7 @@ async def _biohelp_panel_handler(event, extra: str) -> tuple[str, str, list] | N
             return "Enable Sync", "Start the bio cron — auto-updates your profile bio every minute.", builder.build()
         if sub == "off":
             builder = InlinePanelBuilder()
-            builder.add_row("⏹ Disable Now", "action:bio_off")
+            builder.add_row(sym.label(sym.OP_STOP, "Disable Now"), "action:bio_off")
             return "Disable Sync", "Stop the bio cron. Your bio will no longer auto-update.", builder.build()
         if sub == "show":
             from backend.helper.inline_engine import _owner_id
@@ -205,14 +205,14 @@ async def _biohelp_panel_handler(event, extra: str) -> tuple[str, str, list] | N
             state = await db_client.get_or_create_bio_state(_owner_id)
             current = state.get("custom_text") or "—"
             builder = InlinePanelBuilder()
-            builder.add_row("💬 Enter New Text", "input:biohelp:text")
+            builder.add_row(sym.label(sym.OP_EDIT, "Enter New Text"), "input:biohelp:text")
             return "Set Text", f"**Current text:** {current}\n\nTap the button below, then reply with the new text value.", builder.build()
         if sub == "mood":
             from backend.helper.inline_engine import _owner_id
             state = await db_client.get_or_create_bio_state(_owner_id)
             current = state.get("mood") or "—"
             builder = InlinePanelBuilder()
-            builder.add_row("💭 Enter New Mood", "input:biohelp:mood")
+            builder.add_row(sym.label(sym.ICON_MOOD, "Enter New Mood"), "input:biohelp:mood")
             return "Set Mood", f"**Current mood:** {current}\n\nTap the button below, then reply with the new mood value.", builder.build()
         return "Bio Commands", "Unknown command.", _build_commands_menu_buttons()
 
@@ -245,7 +245,7 @@ _CUSTOM_BODY = (
     "Reply to THIS message with your template.\n\n"
     "Available variables: `{time}`, `{mood}`, `{text}`\n\n"
     "Example reply:\n"
-    "`🕒 {time} | 💭 {mood} | 📝 {text}`\n\n"
+    f"`{sym.META_TIME} {{time}} | {sym.ICON_MOOD} {{mood}} | {sym.OP_EDIT} {{text}}`\n\n"
     "Your reply will instantly become the active bio template."
 )
 
@@ -356,9 +356,9 @@ async def _bio_builder_apply_action(event, extra: str, chat_id: int) -> tuple[st
     from backend.helper.inline_engine import _owner_id
     buf = _get_buf(_owner_id)
     if not buf:
-        return "Template Builder", "⚠️ Nothing to apply — build a template first.", _build_builder_buttons()
+        return "Template Builder", f"{sym.STATE_WARNING} Nothing to apply — build a template first.", _build_builder_buttons()
     result = await bio_service.do_template(_owner_id, buf)
-    if not result.startswith("✅"):
+    if not result.startswith(sym.OP_SAVE):
         return "Template Builder", result, _build_builder_buttons()
     return "Template Applied", result, _build_applied_buttons()
 
@@ -370,8 +370,8 @@ async def _bio_on_action(event, extra: str, chat_id: int) -> tuple[str, str, lis
     from backend.bot.handlers.misc import _resolve_tz
     result = await bio_service.do_on(_self_client, _owner_id, _resolve_tz())
     builder = InlinePanelBuilder()
-    builder.add_row("⏹ Disable Sync", "panel:biohelp:cmd:off")
-    builder.add_row("👁 Show State", "panel:bio:state")
+    builder.add_row(sym.label(sym.OP_STOP, "Disable Sync"), "panel:biohelp:cmd:off")
+    builder.add_row(sym.label(sym.ICON_PROFILE, "Show State"), "panel:bio:state")
     return "Bio Engine", result, builder.build()
 
 
@@ -380,7 +380,7 @@ async def _bio_off_action(event, extra: str, chat_id: int) -> tuple[str, str, li
     result = await bio_service.do_off(_owner_id)
     builder = InlinePanelBuilder()
     builder.add_row(sym.label(sym.OP_SAVE, "Enable Sync"), "panel:biohelp:cmd:on")
-    builder.add_row("👁 Show State", "panel:bio:state")
+    builder.add_row(sym.label(sym.ICON_PROFILE, "Show State"), "panel:bio:state")
     return "Bio Engine", result, builder.build()
 
 
@@ -426,7 +426,7 @@ async def _bio_mood_input_handler(text, chat_id, msg_id, inline_chat_id, inline_
 
 def register(client, owner_id: int, tz_str: str):
 
-    register_panel("bio", _bio_panel_handler, parent="profile", title="🧬 Bio")
+    register_panel("bio", _bio_panel_handler, parent="profile", title="Bio")
     register_panel("biohelp", _biohelp_panel_handler, parent="bio", title="Bio Help")
     register_inline_builder("bio", _bio_inline_builder)
     register_inline_builder("biohelp", _biohelp_inline_builder)

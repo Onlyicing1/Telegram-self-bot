@@ -13,6 +13,7 @@ Semantics preserved from the existing boundary:
   - the tool layer adds NO new persistence or status logic.
 """
 from __future__ import annotations
+from backend.helper import symbols as sym
 
 from typing import Any
 
@@ -400,7 +401,7 @@ class TaskTransitionTool(Tool):
             "completed": "completed",
         }
         message = (
-            f"✅ Task #{task.id} "
+            f"{sym.OP_SAVE} Task #{task.id} "
             f"{_STATUS_VERB.get(str(task.status), 'is now ' + str(task.status))} "
             f"· version {task.version}."
         )
@@ -562,7 +563,7 @@ class TaskDeleteTool(Tool):
                 return ToolResult(
                     success=False,
                     message=(
-                        f"⚠️ Task #{task_id} was not deleted: {cause} and the "
+                        f"{sym.STATE_WARNING} Task #{task_id} was not deleted: {cause} and the "
                         "in-memory fallback holds no matching task. Nothing "
                         "durable was changed."
                     ),
@@ -599,7 +600,7 @@ class TaskDeleteTool(Tool):
             "deleted": True,
             "durable": bool(result.durable),
         }
-        message = f"🗑 Task #{task_id} deleted."
+        message = f"{sym.OP_DELETE} Task #{task_id} deleted."
         if not result.durable:
             # A degraded deletion is NOT durable: the shared in-memory
             # fallback lost the row, but the durable store still holds it (a

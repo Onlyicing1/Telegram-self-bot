@@ -8,6 +8,7 @@ model reasons over the returned sources; the Self Bot remains the only
 execution authority.
 """
 from __future__ import annotations
+from backend.helper import symbols as sym
 
 from typing import Any
 
@@ -140,7 +141,7 @@ class WebSearchTool(Tool):
             )
         except Exception as exc:
             reason = web_search_service.sanitize_reason(exc)
-            return ToolResult(success=False, message=f"❌ Web search failed: {reason}.")
+            return ToolResult(success=False, message=f"{sym.STATE_FAILED} Web search failed: {reason}.")
         if ok and isinstance(data, dict):
             data = {**data, **_top_result_projection(data)}
         return ToolResult(success=ok, message=text, data=data)

@@ -43,6 +43,7 @@ Rules this module exists to enforce:
     completed translation or summary.
 """
 from __future__ import annotations
+from backend.helper import symbols as sym
 
 import asyncio
 import logging
@@ -231,12 +232,12 @@ class HistoryPlan:
         notes: list[str] = []
         if self.capped:
             notes.append(
-                f"⚠️ The most recent {history_service.MAX_HISTORY_MESSAGES} messages "
+                f"{sym.STATE_WARNING} The most recent {history_service.MAX_HISTORY_MESSAGES} messages "
                 "is the maximum per request."
             )
         if len(self.messages) < self.count:
             notes.append(
-                f"⚠️ Only {len(self.messages)} of the requested {self.count} "
+                f"{sym.STATE_WARNING} Only {len(self.messages)} of the requested {self.count} "
                 "messages were available"
                 + (", and older messages may exist." if self.truncated else ".")
             )
@@ -714,7 +715,7 @@ async def translate_history(
     """
     manager = _resolve_manager(provider_manager)
     if manager is None:
-        return False, "❌ Translation unavailable — the AI engine is not running.", {
+        return False, f"{sym.STATE_FAILED} Translation unavailable — the AI engine is not running.", {
             "error": ERROR_ENGINE,
         }
 
@@ -725,7 +726,7 @@ async def translate_history(
             current_message_id=current_message_id, request_id=request_id,
         )
     except HistoryAIError as exc:
-        return False, f"❌ Couldn't read the Telegram history: {exc}", {
+        return False, f"{sym.STATE_FAILED} Couldn't read the Telegram history: {exc}", {
             "error": exc.code,
         }
 
@@ -741,7 +742,7 @@ async def translate_history(
     capacity = max_map_calls(budget)
     if len(chunks) > capacity:
         return False, (
-            f"❌ These {len(plan.messages)} messages need {len(chunks)} AI passes, "
+            f"{sym.STATE_FAILED} These {len(plan.messages)} messages need {len(chunks)} AI passes, "
             f"more than the {capacity} one request can run while paced to stay "
             "under the provider's rate limits. Try fewer messages."
         ), {"error": ERROR_TOO_LARGE, **_result_data(plan)}
@@ -770,7 +771,7 @@ async def translate_history(
         for chunk, raw in zip(chunks, raw_results, strict=False):
             translated.update(_parse_translation(raw, chunk.message_ids))
     except HistoryAIError as exc:
-        return False, f"❌ Translation failed: {exc}", {
+        return False, f"{sym.STATE_FAILED} Translation failed: {exc}", {
             "error": exc.code, **_result_data(plan),
         }
 
@@ -803,7 +804,7 @@ async def summarize_history(
     """
     manager = _resolve_manager(provider_manager)
     if manager is None:
-        return False, "❌ Summarization unavailable — the AI engine is not running.", {
+        return False, f"{sym.STATE_FAILED} Summarization unavailable — the AI engine is not running.", {
             "error": ERROR_ENGINE,
         }
 
@@ -814,7 +815,7 @@ async def summarize_history(
             current_message_id=current_message_id, request_id=request_id,
         )
     except HistoryAIError as exc:
-        return False, f"❌ Couldn't read the Telegram history: {exc}", {
+        return False, f"{sym.STATE_FAILED} Couldn't read the Telegram history: {exc}", {
             "error": exc.code,
         }
 
@@ -839,7 +840,7 @@ async def summarize_history(
     capacity = max_map_calls(map_budget)
     if len(chunks) > capacity:
         return False, (
-            f"❌ These {len(plan.messages)} messages need {len(chunks)} AI passes, "
+            f"{sym.STATE_FAILED} These {len(plan.messages)} messages need {len(chunks)} AI passes, "
             f"more than the {capacity} one request can run while paced to stay "
             "under the provider's rate limits. Try fewer messages."
         ), {"error": ERROR_TOO_LARGE, **_result_data(plan)}
@@ -872,7 +873,7 @@ async def summarize_history(
     except asyncio.CancelledError:
         raise
     except HistoryAIError as exc:
-        return False, f"❌ Summary failed: {exc}", {
+        return False, f"{sym.STATE_FAILED} Summary failed: {exc}", {
             "error": exc.code, **_result_data(plan),
         }
 

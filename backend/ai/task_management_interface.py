@@ -1,5 +1,6 @@
 """Presentation helpers for the user-facing task management boundary."""
 from __future__ import annotations
+from backend.helper import symbols as sym
 
 from datetime import timezone
 from zoneinfo import ZoneInfo
@@ -18,7 +19,7 @@ DISPLAY_TIMEZONE = "Asia/Tehran"
 # of the durable tasks, and a fallback WRITE is not durable at all. Either way
 # the owner must never be told this state is authoritative.
 FALLBACK_NOTE = (
-    "⚠️ Memory fallback — Supabase unavailable "
+    f"{_sym.STATE_WARNING} Memory fallback — Supabase unavailable "
     "(tasks may be missing, and anything created now is not durable)."
 )
 # Truthful counterpart for a LOCAL resource failure: the durable store may be
@@ -26,7 +27,7 @@ FALLBACK_NOTE = (
 # surface must never claim a Supabase outage. The non-durable semantics are
 # identical — only the attribution changes.
 FALLBACK_RESOURCE_NOTE = (
-    "⚠️ Memory fallback — a local resource error prevented the durable store "
+    f"{_sym.STATE_WARNING} Memory fallback — a local resource error prevented the durable store "
     "from being reached (tasks may be missing, and anything created now is "
     "not durable)."
 )
@@ -57,14 +58,14 @@ _STATUS_LABELS = {
     "succeeded": (_sym.STATE_COMPLETED, "Succeeded"),
     "retry_pending": (_sym.OP_REFRESH, "Retry pending"),
     "cancelled": (_sym.STATE_DELETED, "Cancelled"),
-    "interrupted": ("⚠️", "Interrupted"),
+    "interrupted": (_sym.STATE_WARNING, "Interrupted"),
 }
 
 
 def _status_text(status: object) -> str:
     value = str(status or "").strip()
     icon, label = _STATUS_LABELS.get(
-        value.casefold(), ("•", value.replace("_", " ").title() or "Unknown")
+        value.casefold(), (sym.BULLET, value.replace("_", " ").title() or "Unknown")
     )
     return f"{icon} {label}"
 
@@ -268,7 +269,7 @@ async def inspect_text(service: TaskManagementService, task_id: int) -> str:
             occurrence_blocks.append(
                 "\n".join(
                     [
-                        f"• {item.occurrence_key}",
+                        f"{sym.BULLET} {item.occurrence_key}",
                         f"  Status: {_status_text(item.status)}",
                         f"  Scheduled: {_format_datetime(item.scheduled_for, empty='Not scheduled')}",
                         f"  Attempt: {item.attempt}",

@@ -44,6 +44,7 @@ bounded counts (ready/total) and its management stays in the existing API
 Credentials surface, which this screen only links to.
 """
 from __future__ import annotations
+from backend.helper import symbols as sym
 
 import logging
 
@@ -438,7 +439,7 @@ def _outcome(saved: bool, success: str) -> str:
     if saved:
         return success
     return (
-        f"{success}\n⚠ Saved only for this session — the settings row was not "
+        f"{success}\n{sym.STATE_WARNING} Saved only for this session — the settings row was not "
         "updated, so the choice is lost on restart."
     )
 
@@ -453,10 +454,10 @@ async def _ai_tts_select_action(event, extra: str, chat_id: int) -> tuple[str, s
     """
     entry = get_provider(extra)
     if entry is None:
-        return await _tts_panel_with_notice("× Unknown speech provider — nothing changed.")
+        return await _tts_panel_with_notice(f"{sym.STATE_FAILED} Unknown speech provider — nothing changed.")
     if not entry.implemented:
         return await _tts_panel_with_notice(
-            f"× {entry.label} is registered but not available on this runtime yet."
+            f"{sym.STATE_FAILED} {entry.label} is registered but not available on this runtime yet."
         )
 
     owner, _config = await owner_and_config()
@@ -470,7 +471,7 @@ async def _ai_tts_select_action(event, extra: str, chat_id: int) -> tuple[str, s
     await apply_tts_settings_now(owner)
     return await _tts_panel_with_notice(_outcome(
         saved,
-        f"✓ Text-to-Speech now uses {entry.label} · {candidate.model_label} · "
+        f"{sym.OP_SAVE} Text-to-Speech now uses {entry.label} · {candidate.model_label} · "
         f"{candidate.voice_label}",
     ))
 
@@ -482,16 +483,16 @@ async def _ai_tts_select_model_action(event, extra: str, chat_id: int) -> tuple[
     entry = get_provider(selection.provider)
     model = entry.model(extra) if entry is not None else None
     if model is None:
-        return await _tts_panel_with_notice("× Unknown model for this provider — nothing changed.")
+        return await _tts_panel_with_notice(f"{sym.STATE_FAILED} Unknown model for this provider — nothing changed.")
     if not model.implemented:
         return await _tts_panel_with_notice(
-            f"× {model.label} is registered but not available on this runtime yet."
+            f"{sym.STATE_FAILED} {model.label} is registered but not available on this runtime yet."
         )
     candidate = resolve(selection.provider, model.model_id, model.default_voice_id)
     saved = await persist_selection(owner, candidate)
     await apply_tts_settings_now(owner)
     return await _tts_panel_with_notice(_outcome(
-        saved, f"✓ Text-to-Speech now uses {entry.label} · {model.label} · {candidate.voice}",
+        saved, f"{sym.OP_SAVE} Text-to-Speech now uses {entry.label} · {model.label} · {candidate.voice}",
     ))
 
 
@@ -502,12 +503,12 @@ async def _ai_tts_select_voice_action(event, extra: str, chat_id: int) -> tuple[
     model = selection.model_entry
     voice = model.voice(extra) if model is not None else None
     if voice is None:
-        return await _tts_panel_with_notice("× Unknown voice for this model — nothing changed.")
+        return await _tts_panel_with_notice(f"{sym.STATE_FAILED} Unknown voice for this model — nothing changed.")
     candidate = resolve(selection.provider, selection.model, voice.voice_id)
     saved = await persist_selection(owner, candidate)
     await apply_tts_settings_now(owner)
     return await _tts_panel_with_notice(_outcome(
-        saved, f"✓ Voice set to {voice.label} · Persian {candidate.persian_label()}",
+        saved, f"{sym.OP_SAVE} Voice set to {voice.label} · Persian {candidate.persian_label()}",
     ))
 
 

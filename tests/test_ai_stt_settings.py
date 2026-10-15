@@ -27,6 +27,7 @@ import pytest
 from backend.ai import config_store
 from backend.ai import stt_control_plane as control_plane
 from backend.services import media_service
+from backend.helper import symbols as sym
 
 API_KEY = "test-stt-settings-key"
 API_KEY_VAR = "AI_GEMINI_API_KEY"
@@ -541,7 +542,7 @@ async def test_the_behavioral_controls_moved_into_stt_settings(monkeypatch):
     assert "Language · Auto" in main_body
     assert "Passes · 1" in main_body
     # One way into the nested settings panel.
-    assert ("\u2699 STT Settings", "panel:ai_media_stt_settings") in main_flat
+    assert (sym.label(sym.OP_MANAGE, "STT Settings"), "panel:ai_media_stt_settings") in main_flat
 
 
 @pytest.mark.asyncio

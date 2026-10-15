@@ -192,7 +192,7 @@ async def test_settings_callback_dispatch_renders_panel():
 
 
 def test_append_original_text():
-    base = "📦 S0001 · DEEP"
+    base = "◌ S0001 · DEEP"
     assert save_service._append_original_text(base, FakeMessage(text="source text")) == (
         f"{base}\n\nsource text"
     )
@@ -406,7 +406,7 @@ async def test_deep_save_cleans_temp_on_download_error():
     media = MessageMediaPhoto(photo=FakePhoto(), ttl_seconds=None)
     msg = FakeMessage(media=media)
     result = await save_service.execute_save(client, 42, msg, "UTC")
-    assert "❌ Deep Save failed" in result
+    assert "× Deep Save failed" in result
     # A download failure must remain a DEEP-save failure — it must never
     # react by falling back to forwarding (protected-chat invariant).
     assert not [c for c in client.calls if c[0] == "forward_messages"]
@@ -501,7 +501,7 @@ async def test_deep_save_upload_failure_no_db_record_and_cleanup():
     msg = FakeMessage(media=media)
     result = await save_service.execute_save(client, 42, msg, "UTC")
 
-    assert "❌ Deep Save failed" in result
+    assert "× Deep Save failed" in result
     assert db_client._fallback["saved_items"] == []  # no success DB record
     _assert_no_leftover_temp_dirs()
 

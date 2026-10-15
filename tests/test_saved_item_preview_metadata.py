@@ -163,7 +163,7 @@ async def test_preview_is_produced_by_the_shared_owner_scoped_lookup():
     with patch.object(retrieve_service, "load_saved_item", AsyncMock(return_value=None)):
         text = await retrieve_service.do_preview(_TelegramTrap(), OWNER, "S0001")
 
-    assert text == "❌ No item found for `S0001`"
+    assert text == "× No item found for `S0001`"
 
 
 # ── historical / incomplete metadata is reported, never manufactured ────────
@@ -210,7 +210,7 @@ async def test_missing_metadata_is_honest_instead_of_fabricated():
 async def test_preview_never_reads_another_owners_row():
     log = AsyncMock()
     text, _ = await _preview(_row(owner_id=OTHER_OWNER))
-    assert text == "❌ No item found for `S0001`"
+    assert text == "× No item found for `S0001`"
 
     with (
         patch.object(db_client, "query_save", AsyncMock(return_value=_row(owner_id=OTHER_OWNER))),
@@ -218,7 +218,7 @@ async def test_preview_never_reads_another_owners_row():
     ):
         text = await retrieve_service.do_preview(_TelegramTrap(), OWNER, "S0001")
 
-    assert text == "❌ No item found for `S0001`"
+    assert text == "× No item found for `S0001`"
     log.assert_not_awaited()
 
 
@@ -226,7 +226,7 @@ async def test_preview_never_reads_another_owners_row():
 async def test_preview_refuses_a_row_that_belongs_to_another_code():
     text, _ = await _preview(_row(save_code="S0009"))
 
-    assert text == "❌ No item found for `S0001`"
+    assert text == "× No item found for `S0001`"
     assert "stored-sender" not in text
 
 
@@ -234,7 +234,7 @@ async def test_preview_refuses_a_row_that_belongs_to_another_code():
 async def test_a_db_failure_is_reported_as_a_failure_not_empty_metadata():
     text, _ = await _preview(RuntimeError("boom"))
 
-    assert text == "❌ DB error: boom"
+    assert text == "× DB error: boom"
 
     with patch.object(db_client, "query_save", AsyncMock(side_effect=RuntimeError("boom"))):
         with pytest.raises(RuntimeError):
@@ -266,7 +266,7 @@ async def test_the_item_panel_never_renders_a_foreign_or_missing_row():
     with patch.object(retrieve_service, "load_saved_item", AsyncMock(return_value=None)):
         _title, body, _buttons = await retrieve_handler._retrieve_item_panel_handler(None, "id:S0001")
 
-    assert body == "❌ No item found for `S0001`"
+    assert body == "× No item found for `S0001`"
 
 
 # ── deterministic routing: one item's code never becomes the listing ───────

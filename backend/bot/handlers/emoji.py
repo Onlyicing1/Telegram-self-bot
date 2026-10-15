@@ -90,7 +90,7 @@ async def _emoji_panel_handler(event, extra: str) -> tuple[str, str, list] | Non
     if owner:
         _rows, total = await db_client.list_emoji_entries(owner, limit=1, offset=0)
 
-    lines = ["😀 **Emoji Diagnostics**", ""]
+    lines = [f"{sym.ICON_DIAGNOSTIC} **Emoji Diagnostics**", ""]
     if total is None:
         lines.append("_Library size unknown._")
     elif total == 0:
@@ -99,7 +99,7 @@ async def _emoji_panel_handler(event, extra: str) -> tuple[str, str, list] | Non
         lines.append(f"{total} custom emoji in the library")
     if owner:
         enabled = await state_service.replacement_enabled(owner)
-        lines.append(f"Replacement: {'✅ ON' if enabled else '❌ OFF'}")
+        lines.append(f"Replacement: {sym.STATE_COMPLETED} ON" if enabled else f"Replacement: {sym.STATE_FAILED} OFF")
     lines.append("")
     lines.append(
         "Tap **Run Emoji Diagnostics** to execute the real premium-emoji send "
@@ -172,12 +172,12 @@ def _report_lines(report: dict[str, Any]) -> list[str]:
     """Concise, honest report body — failure first, counters second."""
     lines: list[str] = []
     if report.get("error"):
-        lines.append(f"✗ {report['error']}")
+        lines.append(f"{sym.STATE_FAILED} {report['error']}")
     elif not report.get("ok"):
-        lines.append(f"✗ {report.get('failed', 0)} record(s) failed to save")
+        lines.append(f"{sym.STATE_FAILED} {report.get('failed', 0)} record(s) failed to save")
     elif report.get("degraded"):
         if report.get("set_error"):
-            lines.append(f"◌ {report['set_error']}")
+            lines.append(f"{sym.MEDIA_UNKNOWN} {report['set_error']}")
         else:
             degraded = []
             if report.get("unresolved_documents"):
@@ -186,9 +186,9 @@ def _report_lines(report: dict[str, Any]) -> list[str]:
                 degraded.append(f"{report['documents_without_set']} without set info")
             if report.get("hit_set_limit") or report.get("hit_set_member_limit"):
                 degraded.append("set scan budget reached")
-            lines.append("◌ Partial set enrichment — " + ", ".join(degraded))
+            lines.append(f"{sym.MEDIA_UNKNOWN} Partial set enrichment — " + ", ".join(degraded))
     else:
-        lines.append("✓ Import complete")
+        lines.append(f"{sym.OP_SAVE} Import complete")
 
     lines.append("")
     lines.append(
@@ -223,8 +223,8 @@ def _report_lines(report: dict[str, Any]) -> list[str]:
 def _render_report(report: dict[str, Any]) -> tuple[str, str, list]:
     body = "\n".join(_report_lines(report))
     builder = InlinePanelBuilder()
-    builder.add_row("↻ Import again", "action:emoji_import")
-    builder.add_row("📚 Library", f"panel:{_LIBRARY_PANEL}")
+    builder.add_row(sym.label(sym.OP_REFRESH, "Import again"), "action:emoji_import")
+    builder.add_row(sym.label(sym.ICON_LIBRARY, "Library"), f"panel:{_LIBRARY_PANEL}")
     return "Emoji Import", body, builder.build()
 
 
@@ -270,11 +270,11 @@ async def _library_page_handler(event, extra: str) -> tuple[str, str, list] | No
         )
 
     builder = InlinePanelBuilder()
-    lines = [f"📚 **Emoji Library** — {total}", ""]
+    lines = [f"{sym.ICON_LIBRARY} **Emoji Library** — {total}", ""]
     if not rows:
-        lines = [f"📚 **Emoji Library** — {total}", "", "_Empty._"]
+        lines = [f"{sym.ICON_LIBRARY} **Emoji Library** — {total}", "", "_Empty._"]
     else:
-        lines = [f"📚 **Emoji Library** — {total} · page {page + 1}/{_page_count(total)}"]
+        lines = [f"{sym.ICON_LIBRARY} **Emoji Library** — {total} · page {page + 1}/{_page_count(total)}"]
         for i in range(0, len(rows), 2):
             pair = []
             for j in (i, i + 1):
@@ -289,7 +289,7 @@ async def _library_page_handler(event, extra: str) -> tuple[str, str, list] | No
             builder.add_buttons(
                 ("◀", f"panel:{_LIBRARY_PANEL}:{page - 1}" if page else f"panel:{_LIBRARY_PANEL}"),
                 (f"{page + 1}/{page_count}", f"panel:{_LIBRARY_PANEL}:{page}"),
-                ("▶", f"panel:{_LIBRARY_PANEL}:{page + 1}"),
+                (sym.OP_RESUME, f"panel:{_LIBRARY_PANEL}:{page + 1}"),
             )
     return "Library", "\n".join(lines), builder.build()
 
@@ -355,13 +355,13 @@ async def _render_categories(
         lines.append(notice)
         lines.append("")
     if not rows:
-        lines.append(f"🗂 **Categories** — {total}")
+        lines.append(f"{sym.ICON_CATEGORY} **Categories** — {total}")
         lines.append("")
         lines.append("_No categories yet. Create one to start mapping._")
     else:
         page_count = _page_count(total)
         lines.append(
-            f"🗂 **Categories** — {total} · page {page + 1}/{page_count}"
+            f"{sym.ICON_CATEGORY} **Categories** — {total} · page {page + 1}/{page_count}"
         )
         for i in range(0, len(rows), 2):
             pair = []
@@ -377,9 +377,9 @@ async def _render_categories(
             builder.add_buttons(
                 ("◀", f"panel:{_CATEGORIES_PANEL}:{page - 1}" if page else f"panel:{_CATEGORIES_PANEL}"),
                 (f"{page + 1}/{page_count}", f"panel:{_CATEGORIES_PANEL}:{page}"),
-                ("▶", f"panel:{_CATEGORIES_PANEL}:{page + 1}"),
+                (sym.OP_RESUME, f"panel:{_CATEGORIES_PANEL}:{page + 1}"),
             )
-    builder.add_row("＋ New category", "action:emoji_cat_new")
+    builder.add_row(sym.label(sym.OP_CREATE, "New category"), "action:emoji_cat_new")
     return "Categories", "\n".join(lines), builder.build()
 
 
@@ -402,7 +402,7 @@ async def _category_page_handler(event, extra: str) -> tuple[str, str, list] | N
     cid = row.get("id")
     count_label = _count_label(counts, cid)
     lines = [
-        f"🗂 **{row.get('name') or '?'}**",
+        f"{sym.ICON_CATEGORY} **{row.get('name') or '?'}**",
         "",
         (
             f"{count_label} mapping(s)"
@@ -411,7 +411,7 @@ async def _category_page_handler(event, extra: str) -> tuple[str, str, list] | N
         ),
     ]
     builder = InlinePanelBuilder()
-    builder.add_row("🗺 Mappings", f"panel:{_MAPPINGS_PANEL}:{cid}:0")
+    builder.add_row(sym.label(sym.ICON_MAPPING, "Mappings"), f"panel:{_MAPPINGS_PANEL}:{cid}:0")
     builder.add_row(sym.label(sym.OP_EDIT, "Rename"), f"action:emoji_cat_rename:{cid}")
     builder.add_row(sym.label(sym.OP_DELETE, "Delete"), f"action:emoji_cat_del:{cid}", DANGER)
     return "Category", "\n".join(lines), builder.build()
@@ -543,13 +543,13 @@ async def _cat_del_action(event, extra: str, chat_id: int) -> tuple[str, str, li
     count_text = str(count) if count is not None else "unknown number of"
     _set_draft(owner, kind="delete", category_id=cid, name=category.get("name"))
     body = (
-        f"⚠️ **Delete category “{category.get('name')}”?**\n\n"
+        f"{sym.STATE_WARNING} **Delete category “{category.get('name')}”?**\n\n"
         f"{count_text} mapping(s) will be removed with it.\n"
         "Library entries are NOT deleted."
     )
     builder = InlinePanelBuilder()
     builder.add_row(sym.label(sym.OP_DELETE, "Delete"), "action:emoji_cat_delgo", DANGER)
-    builder.add_row("✗ Cancel", f"panel:{_CATEGORIES_PANEL}:0")
+    builder.add_row(sym.label(sym.STATE_FAILED, "Cancel"), f"panel:{_CATEGORIES_PANEL}:0")
     return "Delete Category", body, builder.build()
 
 
@@ -565,7 +565,7 @@ async def _cat_delgo_action(event, extra: str, chat_id: int) -> tuple[str, str, 
     _clear_draft(owner)
     if result.get("ok"):
         notice = (
-            f"✓ Category deleted — {result.get('removed_mappings', 0)} mapping(s) "
+            f"{sym.OP_SAVE} Category deleted — {result.get('removed_mappings', 0)} mapping(s) "
             "removed. Library entries kept."
         )
         return await _render_categories(owner, "0", notice=notice)
@@ -577,11 +577,11 @@ async def _cat_delgo_action(event, extra: str, chat_id: int) -> tuple[str, str, 
         )
     if result.get("category_deleted"):
         notice = (
-            "✗ Category row could not be deleted — storage failed. "
+            f"{sym.STATE_FAILED} Category row could not be deleted — storage failed. "
             f"{result.get('removed_mappings', 0)} mapping(s) were already removed."
         )
     else:
-        notice = "✗ Delete failed — storage error. Nothing was changed."
+        notice = f"{sym.STATE_FAILED} Delete failed — storage error. Nothing was changed."
     return _error_panel("Delete Category", notice, f"panel:{_CATEGORIES_PANEL}")
 
 
@@ -616,15 +616,15 @@ async def _render_mappings(
     wid = intw(cid)
     builder = InlinePanelBuilder()
     if notice:
-        lines: list[str] = [notice, "", f"🗺 **{category.get('name')}** — {total}"]
+        lines: list[str] = [notice, "", f"{sym.ICON_MAPPING} **{category.get('name')}** — {total}"]
     elif not rows:
         lines = [
-            f"🗺 **{category.get('name')}** — {total}", "",
+            f"{sym.ICON_MAPPING} **{category.get('name')}** — {total}", "",
             "_No mappings yet. Add one below._",
         ]
     else:
         lines = [
-            f"🗺 **{category.get('name')}** — {total} · page {page + 1}/{page_count}",
+            f"{sym.ICON_MAPPING} **{category.get('name')}** — {total} · page {page + 1}/{page_count}",
             "",
             "_simple → premium:_",
         ]
@@ -651,9 +651,9 @@ async def _render_mappings(
         builder.add_buttons(
             ("◀", prev_data),
             (f"{page + 1}/{page_count}", f"panel:{_MAPPINGS_PANEL}::{page}:{wid}"),
-            ("▶", f"panel:{_MAPPINGS_PANEL}::{page + 1}:{wid}"),
+            (sym.OP_RESUME, f"panel:{_MAPPINGS_PANEL}::{page + 1}:{wid}"),
         )
-    builder.add_row("＋ Add mapping", f"action:emoji_map_new:{wid}")
+    builder.add_row(sym.label(sym.OP_CREATE, "Add mapping"), f"action:emoji_map_new:{wid}")
     return "Mappings", "\n".join(lines), builder.build()
 
 
@@ -709,7 +709,7 @@ async def _map_new_action(event, extra: str, chat_id: int) -> tuple[str, str, li
     prompt = (
         "**Add Mapping — Step 1/2**\n\n"
         f"Category: **{category.get('name')}**\n\n"
-        "Send the SIMPLE emoji to be mapped (e.g. 🗑)."
+        f"Send the SIMPLE emoji to be mapped (e.g. {sym.OP_DELETE})."
     )
     set_pending(
         owner, _MAIN_PANEL, _map_emoji_input_handler,
@@ -779,7 +779,7 @@ async def _render_picker(owner: int, extra: str) -> tuple[str, str, list]:
         )
     page_count = _page_count(total)
     builder = InlinePanelBuilder()
-    lines = [f"📚 **Pick premium emoji** for {emoji} · page {page + 1}/{page_count}"]
+    lines = [f"{sym.ICON_LIBRARY} **Pick premium emoji** for {emoji} · page {page + 1}/{page_count}"]
     for i in range(0, len(rows), 2):
         pair = []
         for j in (i, i + 1):
@@ -795,7 +795,7 @@ async def _render_picker(owner: int, extra: str) -> tuple[str, str, list]:
         builder.add_buttons(
             ("◀", f"panel:{_PICKER_PANEL}:{seed}:{page - 1}" if page else f"panel:{_PICKER_PANEL}:{seed}:0"),
             (f"{page + 1}/{page_count}", f"panel:{_PICKER_PANEL}:{seed}:{page}"),
-            ("▶", f"panel:{_PICKER_PANEL}:{seed}:{page + 1}"),
+            (sym.OP_RESUME, f"panel:{_PICKER_PANEL}:{seed}:{page + 1}"),
         )
     return "Pick Emoji", "\n".join(lines), builder.build()
 
@@ -835,7 +835,7 @@ async def _map_pick_action(event, extra: str, chat_id: int) -> tuple[str, str, l
     if result.get("ok"):
         _clear_draft(owner)
         return await _render_mappings(
-            owner, cid, 0, notice=f"✓ {emoji} mapped to {_entry_visual(result.get('new_entry'))}",
+            owner, cid, 0, notice=f"{sym.OP_SAVE} {emoji} mapped to {_entry_visual(result.get('new_entry'))}",
         )
     if result.get("conflict"):
         _set_draft(
@@ -863,15 +863,15 @@ def _render_conflict(
     current_entry = result.get("current_entry")
     new_entry = result.get("new_entry")
     body = (
-        "⚠️ **Mapping conflict**\n\n"
+        f"{sym.STATE_WARNING} **Mapping conflict**\n\n"
         f"{emoji} is already defined in this category:\n"
         f"**Current:** {_entry_visual(current_entry)}\n"
         f"**New:**     {_entry_visual(new_entry)}\n\n"
         "_Nothing has been overwritten._"
     )
     builder = InlinePanelBuilder()
-    builder.add_row("🔁 Replace", f"action:emoji_map_repl:{wid}:{emoji}")
-    builder.add_row("✗ Cancel", f"panel:{_MAPPINGS_PANEL}::0:{wid}")
+    builder.add_row(sym.label(sym.ICON_REACTION, "Replace"), f"action:emoji_map_repl:{wid}:{emoji}")
+    builder.add_row(sym.label(sym.STATE_FAILED, "Cancel"), f"panel:{_MAPPINGS_PANEL}::0:{wid}")
     return "Mapping Conflict", body, builder.build()
 
 
@@ -899,7 +899,7 @@ async def _map_repl_action(event, extra: str, chat_id: int) -> tuple[str, str, l
     if result.get("ok"):
         return await _render_mappings(
             owner, draft.get("category_id"), 0,
-            notice=f"✓ {emoji} now maps to #{draft.get('document_id')}",
+            notice=f"{sym.OP_SAVE} {emoji} now maps to #{draft.get('document_id')}",
         )
     if result.get("error") == cat_service.E_LIBRARY_MISSING:
         return _error_panel(
@@ -964,7 +964,7 @@ async def _map_del_action(event, extra: str, chat_id: int) -> tuple[str, str, li
     result = await cat_service.delete_mapping(owner, cid, emoji)
     if result.get("ok"):
         return await _render_mappings(
-            owner, cid, 0, notice=f"✓ {emoji} removed — the library entry was kept.",
+            owner, cid, 0, notice=f"{sym.OP_SAVE} {emoji} removed — the library entry was kept.",
         )
     if result.get("error") == cat_service.E_NOT_FOUND:
         return _error_panel(
@@ -1023,7 +1023,7 @@ async def _render_replacement(
         if ctx is not None and ctx.kind == "reply" and ctx.reply_chat_id:
             target_chat = ctx.reply_chat_id
 
-    lines = [f"Replacement: {'✅ ON' if enabled else '❌ OFF'}", ""]
+    lines = [f"Replacement: {sym.STATE_COMPLETED} ON" if enabled else f"Replacement: {sym.STATE_FAILED} OFF", ""]
 
     default_name = _category_name_of(rows, default_id)
     lines.append(
@@ -1058,17 +1058,17 @@ async def _render_replacement(
 
     builder = InlinePanelBuilder()
     builder.add_row(
-        "🔘 Turn OFF" if enabled else "🔘 Turn ON",
+        sym.label(sym.ICON_SELECT, "Turn OFF") if enabled else sym.label(sym.ICON_SELECT, "Turn ON"),
         "action:emoji_state_toggle",
     )
-    builder.add_row("🌐 Set global default", "action:emoji_state_global_pick")
+    builder.add_row(sym.label(sym.ICON_WEB, "Set global default"), "action:emoji_state_global_pick")
     if target_chat:
         seed = f"override:{target_chat}"
         builder.add_row(
-            "📍 Set chat override", f"action:emoji_state_override_pick:{target_chat}"
+            sym.label(sym.ICON_PIN, "Set chat override"), f"action:emoji_state_override_pick:{target_chat}"
         )
-        builder.add_row("✖ Clear chat override", f"action:emoji_state_clear:{target_chat}")
-    builder.add_row("🗂 Manage categories", f"panel:{_CATEGORIES_PANEL}")
+        builder.add_row(sym.label(sym.OP_CLOSE, "Clear chat override"), f"action:emoji_state_clear:{target_chat}")
+    builder.add_row(sym.label(sym.ICON_CATEGORY, "Manage categories"), f"panel:{_CATEGORIES_PANEL}")
     builder.add_row(sym.label(sym.OP_BACK, "Back"), f"panel:{_MAIN_PANEL}")
     return "Emoji Replacement", "\n".join(lines), builder.build()
 
@@ -1152,7 +1152,7 @@ async def _render_state_picker(owner: int, extra: str) -> tuple[str, str, list]:
         builder.add_buttons(
             ("◀", f"panel:{_STATE_SCOPE_PICKER_PANEL}:{seed}:{page - 1}" if page else f"panel:{_STATE_SCOPE_PICKER_PANEL}:{seed}:0"),
             (f"{page + 1}/{page_count}", f"panel:{_STATE_SCOPE_PICKER_PANEL}:{seed}:{page}"),
-            ("▶", f"panel:{_STATE_SCOPE_PICKER_PANEL}:{seed}:{page + 1}"),
+            (sym.OP_RESUME, f"panel:{_STATE_SCOPE_PICKER_PANEL}:{seed}:{page + 1}"),
         )
     builder.add_row(sym.label(sym.OP_BACK, "Back"), f"panel:{_REPLACEMENT_PANEL}")
     return title, "Pick the category to activate:", builder.build()
@@ -1182,9 +1182,9 @@ async def _state_choose_action(event, extra: str, chat_id: int):
     if scope == "global":
         ok = await state_service.set_global_default_category(owner, cid)
         notice = (
-            "✓ Global default set."
+            f"{sym.OP_SAVE} Global default set."
             if ok
-            else "✗ Category not found (or storage failed) — nothing changed."
+            else f"{sym.STATE_FAILED} Category not found (or storage failed) — nothing changed."
         )
     elif scope == "override":
         if not target_chat:
@@ -1194,9 +1194,9 @@ async def _state_choose_action(event, extra: str, chat_id: int):
             )
         ok = await state_service.set_chat_override(owner, target_chat, cid)
         notice = (
-            f"✓ Override set for chat `{target_chat}`."
+            f"{sym.OP_SAVE} Override set for chat `{target_chat}`."
             if ok
-            else "✗ Category not found (or storage failed) — nothing changed."
+            else f"{sym.STATE_FAILED} Category not found (or storage failed) — nothing changed."
         )
     else:
         return _error_panel(
@@ -1214,11 +1214,11 @@ async def _state_toggle_action(event, extra: str, chat_id: int):
         # distinguish a genuine OFF result from a degraded write
         enabled_now = await state_service.replacement_enabled(owner)
         if enabled_now:
-            notice = "✗ Could not save the toggle — storage failed. Still OFF."
+            notice = f"{sym.STATE_FAILED} Could not save the toggle — storage failed. Still OFF."
         else:
-            notice = "🔘 Replacement is OFF."
+            notice = f"{sym.ICON_SELECT} Replacement is OFF."
     else:
-        notice = f"✅ Replacement is ON." if new_value else "🔘 Replacement is OFF."
+        notice = f"{sym.STATE_COMPLETED} Replacement is ON." if new_value else f"{sym.ICON_SELECT} Replacement is OFF."
     return await _render_replacement(owner, "", notice)
 
 
@@ -1233,10 +1233,10 @@ async def _state_clear_action(event, extra: str, chat_id: int):
         )
     ok = await state_service.clear_chat_override(owner, target_chat)
     notice = (
-        f"✓ Override cleared for chat `{target_chat}` — the global default "
+        f"{sym.OP_SAVE} Override cleared for chat `{target_chat}` — the global default "
         "applies again."
         if ok
-        else "✗ Could not clear the override — storage failed. Nothing changed."
+        else f"{sym.STATE_FAILED} Could not clear the override — storage failed. Nothing changed."
     )
     return await _render_replacement(owner, "", notice)
 
@@ -1289,13 +1289,13 @@ def _reaction_from_reply(reply_msg, text: str) -> tuple[dict | None, str]:
 def _render_reaction_result(result: dict, target_id: int) -> tuple[str, str, list]:
     """Honest outcome panel: the applied reaction, or the exact failure."""
     builder = InlinePanelBuilder()
-    builder.add_row("💬 React to another message", "action:emoji_react")
+    builder.add_row(sym.label(sym.ICON_REACTION, "React to another message"), "action:emoji_react")
     if result.get("ok"):
         label = reaction_service.reaction_label(result.get("reaction"))
-        return "React", f"✓ Reacted with {label}\n\nto message `#{target_id}`", builder.build()
+        return "React", f"{sym.OP_SAVE} Reacted with {label}\n\nto message `#{target_id}`", builder.build()
     detail = result.get("detail") or "the reaction was not applied"
     code = result.get("error") or "?"
-    return "React", f"✗ {detail}\n\n`{code}` · message `#{target_id}`", builder.build()
+    return "React", f"{sym.STATE_FAILED} {detail}\n\n`{code}` · message `#{target_id}`", builder.build()
 
 
 async def _react_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
@@ -1460,8 +1460,8 @@ _PREMIUM_INLINE_NOTICE = (
 
 def _premium_inline_buttons() -> list:
     builder = InlinePanelBuilder()
-    builder.add_row("✨ Send Premium Emoji", f"action:{_INLINE_ACTION}")
-    builder.add_row("💬 React to a message", "action:emoji_react")
+    builder.add_row(sym.label(sym.ICON_PREMIUM, "Send Premium Emoji"), f"action:{_INLINE_ACTION}")
+    builder.add_row(sym.label(sym.ICON_REACTION, "React to a message"), "action:emoji_react")
     return builder.build()
 
 
@@ -1654,8 +1654,8 @@ _PROBE_TIMEOUT_S = 90.0
 
 def _probe_buttons() -> list:
     builder = InlinePanelBuilder()
-    builder.add_row("💬 Set Reaction Emoji", f"action:{_PROBE_ACTION}")
-    builder.add_row("💬 React to a message", "action:emoji_react")
+    builder.add_row(sym.label(sym.ICON_REACTION, "Set Reaction Emoji"), f"action:{_PROBE_ACTION}")
+    builder.add_row(sym.label(sym.ICON_REACTION, "React to a message"), "action:emoji_react")
     return builder.build()
 
 
@@ -1796,7 +1796,7 @@ async def _react_premium_reply_handler(
     entity = outcome.get("entity") or {}
     if outcome.get("ok"):
         body = (
-            f"✓ Telegram accepted the helper bot's message "
+            f"{sym.OP_SAVE} Telegram accepted the helper bot's message "
             f"`#{outcome.get('message_id')}` carrying a REAL custom-emoji "
             f"entity for document `#{entity.get('document_id')}` "
             f"(offset {entity.get('offset')}, length {entity.get('length')}).\n\n"
@@ -1811,7 +1811,7 @@ async def _react_premium_reply_handler(
         return
 
     body = (
-        f"✗ {outcome.get('detail')}\n\n"
+        f"{sym.STATE_FAILED} {outcome.get('detail')}\n\n"
         f"`{outcome.get('error')}` · the custom-emoji entity "
         f"(document `#{found['document_id']}`) was NOT rendered by the helper bot.\n\n"
         f"Diagnosis `{outcome.get('diagnosis')}`."
@@ -1853,8 +1853,8 @@ _DIRECT_TIMEOUT_S = 180.0
 
 def _premium_direct_buttons() -> list:
     builder = InlinePanelBuilder()
-    builder.add_row("🧪 Live test · direct self-chat", f"action:{_DIRECT_ACTION}")
-    builder.add_row("✨ Send Premium Emoji", f"action:{_INLINE_ACTION}")
+    builder.add_row(sym.label(sym.ICON_DIAGNOSTIC, "Live test · direct self-chat"), f"action:{_DIRECT_ACTION}")
+    builder.add_row(sym.label(sym.ICON_PREMIUM, "Send Premium Emoji"), f"action:{_INLINE_ACTION}")
     return builder.build()
 
 
@@ -2087,7 +2087,7 @@ async def _premium_direct_reply_handler(
     outcome = await premium_direct_service.send_premium_emoji_direct(
         client, chat_id, found["document_id"], found["span_text"], owner
     )
-    title = "Direct Emoji Test ✓" if outcome.get("verified") else "Direct Emoji Test"
+    title = f"Direct Emoji Test {sym.OP_SAVE}" if outcome.get("verified") else "Direct Emoji Test"
     await _finish(title, _premium_direct_report(outcome), _premium_direct_buttons())
 
 
@@ -2109,7 +2109,7 @@ async def _premium_direct_reply_handler(
 _DIAGNOSTICS_ACTION = "emoji_diagnostics"
 
 #: The exact English label the primary panel must expose.
-_DIAGNOSTICS_LABEL = "🧪 Run Emoji Diagnostics"
+_DIAGNOSTICS_LABEL = sym.label(sym.ICON_DIAGNOSTIC, "Run Emoji Diagnostics")
 
 #: Plain words only — the selection message is sent by the owner's own account.
 _DIAGNOSTICS_PROMPT = (
@@ -2284,7 +2284,7 @@ async def _diagnostics_reply_handler(
         "[EMOJI_UI] diagnostics: run %s -> %s (reached %s)",
         trace.get("run_id"), trace.get("outcome_class"), trace.get("stage"),
     )
-    title = "Emoji Diagnostics ✓" if trace.get("outcome_class") == "verified" else "Emoji Diagnostics"
+    title = f"Emoji Diagnostics {sym.OP_SAVE}" if trace.get("outcome_class") == "verified" else "Emoji Diagnostics"
     await _finish(title, diag_service.render_trace(trace), _diagnostics_buttons())
 
 

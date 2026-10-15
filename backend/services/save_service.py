@@ -36,6 +36,7 @@ from telethon.tl.types import (
 from backend.bio.engine import _get_tz
 from backend.db import client as db_client
 from backend.diagnostics import record_event
+from backend.helper import symbols as sym
 from backend.services import settings_service
 
 logger = logging.getLogger(__name__)
@@ -59,16 +60,18 @@ _MEDIA_TYPE_MAP = {
     "application/pdf": "Document",
 }
 
+# Media-type glyphs come from the ONE central registry so the caption, the
+# DB statistics and the retrieve list never drift apart.
 _MEDIA_ICON = {
-    "Photo": "📷",
-    "Video": "🎬",
-    "Animation": "🎞",
-    "Audio": "🎵",
-    "Voice": "🎤",
-    "Sticker": "🏷",
-    "Document": "📄",
-    "Text": "📝",
-    "Unknown": "📦",
+    "Photo": sym.MEDIA_PHOTO,
+    "Video": sym.MEDIA_VIDEO,
+    "Animation": sym.MEDIA_ANIMATION,
+    "Audio": sym.MEDIA_AUDIO,
+    "Voice": sym.MEDIA_VOICE,
+    "Sticker": sym.MEDIA_STICKER,
+    "Document": sym.MEDIA_DOCUMENT,
+    "Text": sym.MEDIA_TEXT,
+    "Unknown": sym.MEDIA_UNKNOWN,
 }
 
 _MIME_EXT = {
@@ -98,12 +101,12 @@ MAX_FILE_NAME_CHARS = 120
 # path, so a separator or a control character can never be part of it.
 _FORBIDDEN_FILE_NAME_CHARS = frozenset("/\\")
 
-# The caption's own section labels. ``📄`` is written by ``build_caption`` for
-# the Telegram file name; the system hashtag line (#saved…) marks the END of
-# the LifeOS metadata block, so everything after it is the original source
-# text and is never touched by a metadata rewrite.
-FILE_NAME_PREFIX = "📄"
-ADDITIONAL_TAGS_PREFIX = "🏷 Additional tags"
+# The caption's own section labels. ``sym.FILE_NAME`` is written by
+# ``build_caption`` for the Telegram file name; the system hashtag line
+# (#saved…) marks the END of the LifeOS metadata block, so everything after it
+# is the original source text and is never touched by a metadata rewrite.
+FILE_NAME_PREFIX = sym.FILE_NAME
+ADDITIONAL_TAGS_PREFIX = f"{sym.META_TAGS} Additional tags"
 _SYSTEM_TAG_MARKER = "#saved"
 # Only the caption's own header line ("{icon} {code} · DEEP") contains this,
 # and a saved DOCUMENT's header icon IS ``FILE_NAME_PREFIX`` — so the header
@@ -313,7 +316,7 @@ def detect_media_type(mime: str | None) -> str:
 
 
 def media_icon(media_type: str | None) -> str:
-    return _MEDIA_ICON.get(media_type or "Unknown", "📦")
+    return _MEDIA_ICON.get(media_type or "Unknown", sym.MEDIA_UNKNOWN)
 
 
 def extract_file_name(media) -> str | None:
@@ -379,10 +382,10 @@ def build_caption(
     icon = media_icon(media_type)
     lines = [
         f"{icon} {save_code} · DEEP",
-        f"👤 {sender}",
-        f"🕒 {dt.strftime('%Y-%m-%d %H:%M')}",
-        f"🆔 {chat_id}/{msg_id}",
-        f"🗂 {media_type} · {size_str}" + (f" · {mime}" if mime else ""),
+        f"{sym.META_SENDER} {sender}",
+        f"{sym.META_TIME} {dt.strftime('%Y-%m-%d %H:%M')}",
+        f"{sym.META_ID} {chat_id}/{msg_id}",
+        f"{sym.META_MEDIA} {media_type} · {size_str}" + (f" · {mime}" if mime else ""),
     ]
     if file_name:
         lines.append(f"{FILE_NAME_PREFIX} {file_name}")
@@ -648,7 +651,7 @@ async def execute_save(
         try:
             metadata = SaveMetadata.from_raw(metadata.display_name, list(metadata.tags))
         except ValueError as exc:
-            return f"⚠️ Nothing was saved: {exc}"
+            return f"{sym.STATE_WARNING} Nothing was saved: {exc}"
 
     save_code = await db_client.get_next_save_code()
     now = datetime.now(_get_tz(tz_str))
@@ -663,7 +666,7 @@ async def execute_save(
     if media is None:
         original_text = (reply_msg.text or "").strip()
         if not original_text:
-            return "⚠️ Replied message has no text or media to save."
+            return f"{sym.STATE_WARNING} Replied message has no text or media to save."
         media_type = "Text"
         mime_type = None
         file_name = None
@@ -681,7 +684,7 @@ async def execute_save(
     if file_size and file_size > max_bytes:
         mb = file_size / (1024 * 1024)
         limit_mb = settings_service.max_deep_save_mb()
-        return f"⚠️ File is {mb:.1f} MB — exceeds the {limit_mb} MB deep-save limit."
+        return f"{sym.STATE_WARNING} File is {mb:.1f} MB — exceeds the {limit_mb} MB deep-save limit."
 
     caption_tags = caption_hashtags(media_type, now)
     caption = _append_original_text(
@@ -712,7 +715,7 @@ async def execute_save(
         except Exception as exc:
             logger.error("deep save text send failed: %s", exc)
             record_event("save", "send_message", 0, "ERROR", str(exc))
-            return f"❌ Deep Save failed: text could not be uploaded to Saved Messages ({exc})"
+            return f"{sym.STATE_FAILED} Deep Save failed: text could not be uploaded to Saved Messages ({exc})"
     else:
         # Isolated temp storage per operation; removed on every exit path.
         tmp_dir = tempfile.mkdtemp(prefix="lifeos_dl_")
@@ -726,14 +729,14 @@ async def execute_save(
             except Exception as exc:
                 logger.error("deep save download failed: %s", exc)
                 record_event("save", "download_media", 0, "ERROR", str(exc))
-                return f"❌ Deep Save failed: unable to download the source message ({exc})"
+                return f"{sym.STATE_FAILED} Deep Save failed: unable to download the source message ({exc})"
 
             # Validate the download before uploading anything.
             if not os.path.exists(tmp_path):
-                return "❌ Deep Save failed: downloaded file is missing."
+                return f"{sym.STATE_FAILED} Deep Save failed: downloaded file is missing."
             actual_size = os.path.getsize(tmp_path)
             if actual_size == 0:
-                return "❌ Deep Save failed: downloaded file is empty."
+                return f"{sym.STATE_FAILED} Deep Save failed: downloaded file is empty."
 
             # STAGE 2 — upload the downloaded content as a NEW message.
             try:
@@ -748,7 +751,7 @@ async def execute_save(
             except Exception as exc:
                 logger.error("deep save upload failed: %s", exc)
                 record_event("save", "send_file", 0, "ERROR", str(exc))
-                return f"❌ Deep Save failed: downloaded media could not be uploaded to Saved Messages ({exc})"
+                return f"{sym.STATE_FAILED} Deep Save failed: downloaded media could not be uploaded to Saved Messages ({exc})"
         except asyncio.CancelledError:
             raise
         finally:
@@ -791,7 +794,7 @@ async def execute_save(
             "origin_chat_id": origin_chat_id,
             "origin_msg_id": origin_msg_id,
         })
-        return f"⚠️ Uploaded to Saved Messages, but the database record failed for `{save_code}`."
+        return f"{sym.STATE_WARNING} Uploaded to Saved Messages, but the database record failed for `{save_code}`."
 
     await db_client.log(owner_id, "INFO", f"Saved D {save_code}", {
         "save_code": save_code,
@@ -824,7 +827,7 @@ async def execute_link_save(
     channel, chat_id, msg_id = parse_telegram_link(link)
     if not channel and not chat_id:
         logger.warning("[LINK_SAVE] invalid telegram link: %s", link)
-        return "❌ Could not parse link. Use https://t.me/channel/123 or https://t.me/c/123/456"
+        return f"{sym.STATE_FAILED} Could not parse link. Use https://t.me/channel/123 or https://t.me/c/123/456"
 
     try:
         if chat_id:
@@ -838,10 +841,10 @@ async def execute_link_save(
         )
     except Exception as exc:
         logger.error("[LINK_SAVE] fetch source message failed: %s", exc, exc_info=True)
-        return f"❌ Could not resolve link: {exc}"
+        return f"{sym.STATE_FAILED} Could not resolve link: {exc}"
 
     if target_msg is None:
         logger.warning("[LINK_SAVE] source message not found at link")
-        return "❌ Message not found at that link."
+        return f"{sym.STATE_FAILED} Message not found at that link."
 
     return await execute_save(client, owner_id, target_msg, tz_str, metadata=metadata)

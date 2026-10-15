@@ -28,6 +28,7 @@ provider at all — the owner gets the deterministic explanation produced from t
 analysis instead of fabricated content.
 """
 from __future__ import annotations
+from backend.helper import symbols as sym
 
 import asyncio
 import logging
@@ -233,7 +234,7 @@ def unsupported_text(analysis: MediaAnalysis) -> str:
     """The deterministic explanation for media this phase cannot process."""
     label = analysis.media_type or "media"
     detail = analysis.reason or "this media type is not processable yet"
-    return f"⚠️ I can't process this {label} yet.\n{detail}"
+    return f"{sym.STATE_WARNING} I can't process this {label} yet.\n{detail}"
 
 
 def _trace(request_id: str, stage: str, **fields: Any) -> None:

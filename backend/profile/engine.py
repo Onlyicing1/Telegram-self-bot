@@ -27,6 +27,7 @@ from typing import Any, Awaitable, Callable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from backend.diagnostics import record_event
+from backend.helper import symbols as sym
 from backend.profile import scheduler as profile_scheduler
 from backend.runtime.tracer import trace
 
@@ -70,7 +71,7 @@ class ProfileEngine:
         value = (
             (template or self.default_template)
             .replace("{time}", now.strftime("%H:%M"))
-            .replace("{mood}", mood or "😊")
+            .replace("{mood}", mood or sym.ICON_MOOD)
             .replace("{text}", text or "")
         )
         # The owner-selected Glass UI font applies to the visible profile
@@ -95,7 +96,7 @@ class ProfileEngine:
             return None
 
         template = state.get("template", self.default_template)
-        mood = state.get("mood", "😊")
+        mood = state.get("mood", sym.ICON_MOOD)
         text = state.get("custom_text", "")
 
         new_value = self.render(template, mood, text, tz_str)

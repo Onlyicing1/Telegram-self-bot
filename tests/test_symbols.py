@@ -314,3 +314,100 @@ def test_callback_data_is_never_touched_by_font_styling():
     # The button TEXT is styled, but the callback DATA is byte-identical.
     assert built[0][0].data.decode("utf-8") == data
     assert built[0][0].text.startswith(sym.OP_PAUSE)
+
+
+# ── 5. registry conformance: no full-color emoji in migrated modules ────────
+
+# The registry owns abstract, monochrome marks only. Full-color emoji and the
+# U+FE0F variation selector must never appear as literals in the migrated
+# production modules — those are the glyphs the font pipeline cannot style and
+# the registry deliberately replaced.
+_EMOJI_RANGES = (
+    (0x1F000, 0x1FAFF),   # emoji / pictographs / transport / symbols
+    (0x2600, 0x26FF),     # misc symbols (☀ ☺ ⚡ …)
+    (0x2700, 0x27BF),     # dingbats (✅ ✂ ✈ …)
+    (0x2B00, 0x2BFF),     # misc symbols and arrows (⬅ ⬡ …)
+    (0x1F1E6, 0x1F1FF),   # regional indicators
+)
+
+
+def _is_full_color_emoji(ch: str) -> bool:
+    o = ord(ch)
+    return any(lo <= o <= hi for lo, hi in _EMOJI_RANGES)
+
+
+# base.py keeps the *documented* legacy service-failure prefix set on purpose;
+# reactions.py and the emoji library expose owner-authored emoji as data.
+_CONFORMANCE_EXEMPT = {"symbols.py", "base.py", "reactions.py", "font_style.py"}
+
+
+def _string_literals(path):
+    """Yield (lineno, value) for every non-docstring string literal."""
+    import ast
+
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    docstrings = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            body = getattr(node, "body", [])
+            if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) \
+                    and isinstance(body[0].value.value, str):
+                docstrings.add(id(body[0].value))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in docstrings:
+            yield node.lineno, node.value
+        elif isinstance(node, ast.JoinedStr):
+            for part in node.values:
+                if isinstance(part, ast.Constant) and isinstance(part.value, str):
+                    yield node.lineno, part.value
+
+
+def test_migrated_production_modules_have_no_full_color_emoji():
+    from pathlib import Path
+
+    backend = Path(__file__).resolve().parent.parent / "backend"
+    offenders: list[str] = []
+    for path in sorted(backend.rglob("*.py")):
+        if path.name in _CONFORMANCE_EXEMPT:
+            continue
+        for lineno, value in _string_literals(path):
+            bad = sorted({c for c in value if _is_full_color_emoji(c)})
+            if bad:
+                offenders.append(f"{path.relative_to(backend)}:{lineno} {bad}")
+    assert not offenders, "full-color emoji remain in production code:\n" + "\n".join(offenders)
+
+
+def test_registry_exposes_model_credential_bullet_and_empty_page_glyphs():
+    assert sym.ICON_MODEL and sym.ICON_MODEL == sym.CONTENT_AI
+    assert sym.ICON_CREDENTIAL
+    assert sym.BULLET == "\u2022"
+    assert sym.PAGE_EMPTY == "\u25b1"
+    for key in ("model", "credential", "bullet", "page_empty"):
+        assert key in sym.ALL_SYMBOLS
+    assert sym.ALL_SYMBOLS["model"].glyph == sym.ICON_MODEL
+
+
+def test_ai_test_status_icons_come_from_the_registry():
+    from backend.bot.handlers import ai as ai_module
+
+    icons = ai_module._TEST_STATUS_ICONS
+    assert icons["AVAILABLE"] == sym.OP_SAVE
+    assert icons["AUTH_ERROR"] == sym.STATE_FAILED
+    assert set(icons.values()) <= {sym.OP_SAVE, sym.STATE_FAILED, "\u2026", "\u00b7"}
+
+
+def test_ai_test_results_use_registry_glyphs_not_literals():
+    from backend.bot.handlers import ai as ai_module
+
+    payload = {
+        "results": [
+            {"provider": "groq", "model": "m1", "status": "AVAILABLE", "display_name": "Groq"},
+            {"provider": "openai", "model": "gpt-4o", "status": "AUTH_ERROR", "display_name": "OpenAI"},
+        ],
+        "summary": {"available": 1, "failed": 1},
+    }
+    body, _buttons = ai_module._render_test_results(payload, current=("groq", "m1"))
+    assert f"**{sym.OP_SAVE} Usable Models**" in body
+    assert f"{sym.ICON_MODEL} **Groq**" in body
+    assert sym.MEDIA_VOICE in body          # the active model's in-place mark
+    assert sym.STATE_FAILED in body         # the failure prefix

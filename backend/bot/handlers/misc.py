@@ -74,7 +74,7 @@ async def _general_body() -> str:
     return (
         "**General**\n\n"
         "Tap a button to execute instantly.\n\n"
-        f"Auto-Reaction: {'✅ ON' if auto else '❌ OFF'}\n"
+        f"Auto-Reaction: {sym.label(sym.OP_SAVE, 'ON') if auto else sym.label(sym.OP_CLOSE, 'OFF')}\n"
         f"Selected reaction: {selected}"
     )
 
@@ -121,15 +121,15 @@ async def _render_reaction_picker(
     window = options[start:start + _REACTION_PAGE_SIZE]
 
     lines = [
-        "😀 **Auto-Reaction**",
+        "**Auto-Reaction**",
         "",
-        f"Toggle: {'✅ ON' if auto else '❌ OFF'}",
+        f"Toggle: {sym.label(sym.OP_SAVE, 'ON') if auto else sym.label(sym.OP_CLOSE, 'OFF')}",
         f"Selected: {current if current else '— none —'}",
     ]
     if notice:
         lines.extend(["", notice])
     if not result.get("ok"):
-        lines.extend(["", f"⚠️ {result.get('detail') or 'Reactions unavailable.'}"])
+        lines.extend(["", f"{sym.STATE_WARNING} {result.get('detail') or 'Reactions unavailable.'}"])
     elif not options:
         lines.extend(["", "_Telegram returned no usable reactions for this account._"])
     else:
@@ -143,7 +143,7 @@ async def _render_reaction_picker(
                 break
             option = window[j]
             idx = start + j
-            mark = "✓ " if option.get("emoji") == current else ""
+            mark = f"{sym.OP_SAVE} " if option.get("emoji") == current else ""
             pair.append((
                 f"{mark}{reaction_source_service.option_label(option)}",
                 f"action:general_reaction_set:{idx}",
@@ -215,7 +215,6 @@ def _build_menu_buttons() -> list:
     )
     builder.add_row("Todo", "panel:todo", PRIMARY)
     builder.add_row("AI", "panel:ai", PRIMARY)
-    builder.add_row("Emoji", "panel:emoji", PRIMARY)
     return builder.build()
 
 
@@ -580,7 +579,10 @@ async def _general_toggle_auto_reaction_action(event, extra: str, chat_id: int) 
 
     settings_service.toggle_auto_reaction()
     enabled = settings_service.is_auto_reaction_enabled()
-    notice = f"**General**\n\nAuto-Reaction is now {'✅ ON' if enabled else '❌ OFF'}."
+    notice = (
+        f"**General**\n\nAuto-Reaction is now "
+        f"{sym.label(sym.OP_SAVE, 'ON') if enabled else sym.label(sym.OP_CLOSE, 'OFF')}."
+    )
     return "General", notice, _build_general_buttons()
 
 
@@ -746,7 +748,7 @@ async def _context_panel_handler(event, extra: str) -> tuple[str, str, list] | N
     except Exception as exc:
         body_lines.append(f"Error: {exc}")
     builder = InlinePanelBuilder()
-    builder.add_row("⬇️ Deep Save", "action:save_reply", SUCCESS)
+    builder.add_row(sym.label(sym.OP_SAVE, "Deep Save"), "action:save_reply", SUCCESS)
     return "Context Panel", "\n".join(body_lines), builder.build()
 
 
