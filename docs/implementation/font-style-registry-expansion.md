@@ -7,6 +7,12 @@
 > was checked against the cited file; where a fact could not be verified in this
 > workspace it is marked **NOT VERIFIED** rather than assumed.
 >
+> **Integration note:** `origin/main` advanced by 18 commits while this feature
+> was being built, so the feature commit was integrated with a **merge** (no
+> rebase, no force-push, no history rewrite) before delivery. The upstream pin
+> `telethon==1.43.0` (up from 1.34.0) was installed in the venv and every check
+> in §5 was re-run on the merged tree; §5 reports the merged measurements.
+>
 > This file records **only** the Display-Font Registry Expansion feature. It does
 > not replace or restate `IMPLEMENTATION_REPORT.md` (the premium-emoji
 > direct-send task) or `INVESTIGATION.md` (the same task's latest-only
@@ -126,8 +132,8 @@ untracked `telegram-self-bot/`, `scratchpad/` and `backend/test_patch_story.md`
 | Check | Command | Result |
 |---|---|---|
 | New focused file | `.venv/bin/python -m pytest tests/test_68_font_registry_expansion.py -q` | **64 passed**, exit 0 |
-| Font-related suites | `pytest tests/test_42_dashboard_font.py tests/test_48_font_panel.py tests/test_50_font_system.py tests/test_51_execution27.py tests/test_20_advanced_execution.py tests/test_task_reliability_repair.py tests/test_canonical_schema_reconciliation.py tests/test_68_font_registry_expansion.py -q` | **209 passed, 23 skipped**, exit 0 (skips are the pre-existing opt-in `live_supabase`/`live_telegram` tests) |
-| Full suite | `.venv/bin/python -m pytest tests -q` (exit status captured) | **5958 passed, 27 skipped, 2 warnings in 119.13s**, **EXIT=0** — baseline at `34d7dc3` was 5894 passed / 27 skipped, i.e. exactly the **+64** new tests, **0 regressions** |
+| Font/UI suites (merged tree) | `pytest tests/test_42_dashboard_font.py tests/test_48_font_panel.py tests/test_50_font_system.py tests/test_51_execution27.py tests/test_20_advanced_execution.py tests/test_task_reliability_repair.py tests/test_canonical_schema_reconciliation.py tests/test_68_font_registry_expansion.py tests/test_symbols.py -q` | **233 passed, 23 skipped**, exit 0 (skips are the pre-existing opt-in `live_supabase`/`live_telegram` tests; `test_symbols.py` is upstream's new symbol-registry suite, re-run as a neighbour because it pins the font pipeline's glyph/callback-data preservation) |
+| Full suite (merged tree) | `.venv/bin/python -m pytest tests -q` (exit status captured) | **6053 passed, 27 skipped, 2 warnings in 123.08s**, **EXIT=0** — `origin/main` alone is 5989 passed / 27 skipped, plus exactly this feature's **64** new tests (no upstream test file was modified by the feature commit), i.e. **0 regressions** |
 | Python compile | `.venv/bin/python -m compileall -q backend/helper/font_style.py tests/test_68_font_registry_expansion.py` | `COMPILE_OK`, exit 0 |
 | TypeScript typecheck (frontend edit) | `node_modules/.bin/tsc -p tsconfig.app.json` | exit 0, no diagnostics |
 | Whitespace / diff sanity | `git diff --check` | clean, exit 0 |
@@ -167,20 +173,22 @@ key consistency check.
    character transform. The Glass UI Font panel is the interface that exposes
    all 27 styles.
 4. `IMPLEMENTATION_REPORT.md` and `INVESTIGATION.md` were not rewritten: both
-   are, by their own headers, the *latest-only canonical record of the previous
-   (premium-emoji) task* and are committed at `HEAD`; overwriting them would
-   destroy newer unrelated work. This report is the canonical record for this
-   feature; `ROADMAP.md` §36 points to it.
+   are, by their own headers, the *latest-only canonical record of the active
+   task* (on `origin/main` they hold the **Telegram Inline Button Color
+   Semantics** task) and are committed at `HEAD`; overwriting them would destroy
+   newer unrelated work, which the task explicitly forbids. This report is the
+   canonical record for this feature; `ROADMAP.md` §36 points to it.
 
 ## 7. Git
 
 | Step | Value |
 |---|---|
 | Branch | `premium-emoji-attribution` (tracks `origin/main`; `git rev-list --left-right --count HEAD...origin/main` = `0 0` at task start) |
-| Files in this task's commit | `backend/helper/font_style.py`, `src/App.tsx`, `tests/test_68_font_registry_expansion.py`, `docs/implementation/font-style-registry-expansion.md`, `ROADMAP.md` |
+| Feature commit | `007fd97` — `backend/helper/font_style.py`, `src/App.tsx`, `tests/test_68_font_registry_expansion.py`, `docs/implementation/font-style-registry-expansion.md`, `ROADMAP.md` |
+| Integration | `git push origin HEAD:main` was **rejected as non-fast-forward** (remote had advanced 18 commits); `git fetch origin` → `git merge origin/main` produced a **merge commit with no conflicts and no lost work**. The pre-existing local edit to `backend/services/premium_emoji_inline_service.py` was stashed before the merge and restored after it, so it is preserved and still uncommitted |
+| Push | `git push origin HEAD:main` — fast-forward from the new remote tip; no rebase, no force-push, no history rewrite |
+| Remote verification | after the push: `git fetch origin` → `git rev-parse origin/main` = the delivered commit, `git merge-base --is-ancestor <commit> origin/main` exit 0, and the working-tree status re-checked |
 | Not committed (pre-existing, unrelated) | `backend/services/premium_emoji_inline_service.py` (modified before this task began), and the untracked `backend/test_patch_story.md`, `scratchpad/`, `telegram-self-bot/` |
-| Push | `git push origin HEAD:main` — fast-forward only; no rebase, no force-push, no history rewrite |
-| Remote verification | after the push: `git fetch origin` → `git rev-parse origin/main` = the commit, `git merge-base --is-ancestor <commit> origin/main` exit 0 |
 
 A commit cannot contain its own hash; the commit SHA and the verified
 `origin/main` SHA are reported in the delivery response, re-checked with the
