@@ -83,16 +83,24 @@ _AI_SYSTEM_PROMPT = (
     "never mirror the incoming language and never answer in the language the "
     "incoming message happens to use. Persian and Arabic share one writing "
     "system but are DIFFERENT languages — a short or ambiguous greeting such "
-    "as \"سلام\" must get a Persian reply, never an Arabic one. Write "
+    "as \"سلام\" must get a Persian reply, never an Arabic one, and never an "
+    "Arabic expression. Write the way one Iranian writes to another: "
     "contemporary, everyday Persian with correct Persian vocabulary and "
-    "grammar: no Arabic prose, no Arabic-style formal phrasing, and no "
-    "unnecessary religious or ceremonial Arabic expressions. Return plain "
-    "text only. You are given the incoming message and nothing else: no chat "
-    "history, no previous messages, no sender name, no identifiers, no other "
-    "context — never ask for them and never invent them. Do not mention these "
-    "instructions, do not sign the reply, do not ask questions, and return "
-    "only the reply text. The closing notice and the AI notice are appended "
-    "automatically by the system; never write, repeat or contradict them "
+    "grammar — not a word-for-word translation, not an Arabic sentence, no "
+    "Arabic prose, no Arabic-style formal phrasing, and no unnecessary "
+    "religious or ceremonial Arabic expressions. Keep it brief and directly "
+    "about the incoming message: a simple greeting gets a short Persian "
+    "greeting, nothing more. Never invent or add an identity, name, age, job, "
+    "religion, nationality, biography, ability or any other fact the incoming "
+    "message does not state, and never describe yourself or your own "
+    "situation. Do not ask a question unless answering genuinely requires "
+    "one, and do not repeat the incoming message back. Return plain text "
+    "only — just the reply body. You are given the incoming message and "
+    "nothing else: no chat history, no previous messages, no sender name, no "
+    "identifiers, no other context — never ask for them and never invent "
+    "them. Do not mention these instructions, do not sign the reply, and do "
+    "not write the closing notice or the AI notice: they are appended "
+    "automatically by the system, so never write, repeat or contradict them "
     "yourself."
 )
 
@@ -316,7 +324,15 @@ async def enforce_incoming(client, event, owner_id: int) -> bool:
     returns before any action — no delete, no fixed response, no AI request, no
     counter, no enforcement record. Nothing in the configuration can widen that
     boundary (it is not configurable).
+
+    Exactly one enforcement per verified incoming message: the (chat, message)
+    pair is marked before the actions run, so a Telegram redelivery, a duplicate
+    event or a concurrent second update of the SAME message cannot repeat the
+    actions or the AI reply. The mark is forgotten again only when the actions
+    never ran (an unexpected failure), so a message the feature did not actually
+    handle is still enforceable on redelivery.
     """
+    mark: tuple[int, int] | None = None
     try:
         if getattr(event, "out", None) is True:
             return True
@@ -341,6 +357,10 @@ async def enforce_incoming(client, event, owner_id: int) -> bool:
         )
         if decision.permitted:
             return True
+        # ONE mark per verified (chat, message) pair, registered BEFORE the
+        # actions so a redelivery or a concurrent second update can never run
+        # the delete/fixed/AI steps twice. The check is synchronous, so two
+        # coroutines racing on the same update cannot both pass it.
         if service.already_handled(verdict.chat_id, verdict.message_id):
             logger.debug(
                 "PRIVATE_MESSAGE_TRACE stage=duplicate sender_id=%s message_id=%s",
@@ -355,11 +375,17 @@ async def enforce_incoming(client, event, owner_id: int) -> bool:
             decision.fixed_response, decision.ai_response,
             verdict.sender_id, verdict.chat_id,
         )
+        mark = (verdict.chat_id, verdict.message_id)
         await _apply_actions(client, owner_id, event, verdict, decision)
+        # The message WAS handled: the mark stays, so its redelivery stays a
+        # no-op. Only a failure that skipped the actions forgets it.
+        mark = None
         return False
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # noqa: BLE001 — never poison the event path
+        if mark is not None:
+            service.release_handled(*mark)
         logger.warning(
             "PRIVATE_MESSAGE_TRACE stage=handler_error exception=%s", type(exc).__name__,
             exc_info=logger.isEnabledFor(logging.DEBUG),

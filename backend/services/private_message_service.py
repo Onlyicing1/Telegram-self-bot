@@ -40,6 +40,12 @@ Boundaries kept on purpose
   path, and receives NOTHING but the incoming message text. Both required
   disclosures are plain-Unicode application text appended after generation, so
   the model can neither remove nor override them.
+* **Deterministic reply envelope.** The model's own body is validated before it
+  can be delivered (:func:`validate_generated_reply`): empty, over-long,
+  letter-less, non-Persian-script, Latin-dominant and clearly Arabic bodies are
+  refused, and an echoed notice line is de-duplicated so each disclosure lands
+  exactly once. The verdict is computed from the GENERATED text alone — never
+  from the incoming message — and a refused body is dropped, never repaired.
 * **Durable allowance.** The per-person AI reply limit and interval are
   enforced by ONE conditional (CAS) write per reply into
   ``private_message_senders`` (with the documented in-memory fallback when
@@ -62,6 +68,7 @@ import json
 import logging
 import os
 import time
+import unicodedata
 from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import date, datetime, time as clock_time, timedelta, timezone
@@ -159,6 +166,55 @@ LEGACY_STATE_ROW_KEY = "private_message_management"
 #: remove, weaken or override them.
 CLOSED_NOTICE = "این پی‌وی در حال حاضر بسته است."
 AI_NOTICE = "این پیام توسط هوش مصنوعی تولید و ارسال شده است."
+
+#: Deterministic pre-send envelope for the model's OWN reply body (the two
+#: disclosures excluded). Anything longer is not the configured "short reply"
+#: and is REFUSED — never truncated — so an over-long answer takes the ordinary
+#: safe-failure path (nothing is sent, the claimed reply is given back).
+MAX_AI_GENERATED_LENGTH = 1200
+
+#: Script evidence for the Persian-vs-Arabic check. Persian and Arabic share
+#: most of their code points, so the check NEVER rejects on a shared letter: it
+#: looks for the letters/forms and the vocabulary each language alone uses, and
+#: classifies a body as Arabic only when it carries Arabic evidence AND no
+#: Persian evidence at all (:func:`is_clearly_arabic`). A false NEGATIVE
+#: (Arabic text that passes) is tolerated; a false POSITIVE (valid Persian
+#: refused, leaving the person unanswered) is what these lists are shaped to
+#: avoid.
+_PERSIAN_ONLY_LETTERS = frozenset("پچژگ")
+#: Persian's kaf/yeh (U+06A9 / U+06CC). Arabic orthography writes U+0643 /
+#: U+064A instead, so either form is direct evidence the body is Persian.
+_PERSIAN_FORMS = frozenset("کی")
+#: The Arabic forms of those two letters, plus teh marbuta and alef maksura —
+#: forms Persian orthography does not use.
+_ARABIC_FORMS = frozenset("كيةى")
+#: Persian function words, matched as WHOLE tokens (Persian writes them
+#: separately). Exonerating only: a hit stops the Arabic verdict.
+_PERSIAN_TOKENS = frozenset({
+    "را", "که", "این", "از", "شما", "هست", "نیست", "چی", "یه", "دارم",
+    "دارید", "خوبی", "خوبم", "سلامت", "باشه", "حتما", "کنم", "کنید",
+    "کنیم", "بگو", "رسید", "پاسخ", "ممنون", "مرسی", "چطور", "چقدر",
+})
+#: Morphology Persian attaches to a stem ("میتونم", "نمی‌دونم"). Spelled with
+#: Persian letters, so Arabic orthography can never match them.
+_PERSIAN_TOKEN_PREFIXES = ("می", "نمی", "چطور", "ممنون")
+#: The Persian copula as a token SUFFIX ("کجاست", "چطوراست"). Arabic words
+#: containing this sequence ("استقلال") do not END with it.
+_PERSIAN_COPULA_SUFFIX = "است"
+#: Hamza-bearing alef forms folded onto the plain alef for token matching, so
+#: an Arabic word spelled with `أ`/`إ`/`آ` still matches its vocabulary entry.
+_ALEF_FOLD = {
+    "\u0622": "\u0627", "\u0623": "\u0627", "\u0625": "\u0627", "\u0671": "\u0627",
+}
+#: Arabic-only vocabulary, matched as WHOLE tokens (diacritics and tatweel are
+#: removed first). An Arabic sentence almost always carries two of these; a
+#: Persian sentence written in Persian orthography carries none of them.
+_ARABIC_TOKENS = frozenset({
+    "في", "على", "هذا", "هذه", "ذلك", "التي", "الذي", "لكن", "انا",
+    "انت", "كان", "يكون", "كيف", "حالك", "اهلا", "مرحبا", "شكرا", "بك",
+    "لكم", "السلام", "عليكم", "وعليكم", "ماذا", "كثيرا", "ايضا", "هو",
+    "هي",
+})
 
 #: Bounded duplicate-update guard: an exact (chat, message) pair is enforced
 #: once, so a Telegram redelivery can never delete twice, answer twice or spend
@@ -990,6 +1046,17 @@ def already_handled(chat_id: int, message_id: int, monotonic_now: float | None =
     return False
 
 
+def release_handled(chat_id: int, message_id: int) -> bool:
+    """Forget ONE (chat, message) mark, returning whether one was removed.
+
+    Used when the enforcement of that message failed BEFORE its actions ran: a
+    message the feature never actually handled must not be remembered as done,
+    so the redelivery of it may still be enforced (and is then bounded by the
+    ordinary quota/interval rules).
+    """
+    return _handled.pop((chat_id, message_id), None) is not None
+
+
 async def claim_ai_reply(owner: int, sender_id: int, config: dict[str, Any]) -> dict[str, Any]:
     """Claim ONE AI reply from this person's durable allowance.
 
@@ -1043,17 +1110,176 @@ async def counter_rows(owner: int) -> list[dict[str, Any]] | None:
     return await db_client.list_private_message_senders(owner)
 
 
+def _is_arabic_script(ch: str) -> bool:
+    code = ord(ch)
+    return (
+        0x0600 <= code <= 0x06FF      # Arabic + the Persian letter extensions
+        or 0x0750 <= code <= 0x077F   # Arabic Supplement
+        or 0xFB50 <= code <= 0xFDFF   # Arabic Presentation Forms-A
+        or 0xFE70 <= code <= 0xFEFF   # Arabic Presentation Forms-B
+    )
+
+
+def _letters(text: str) -> list[str]:
+    """Every LETTER of the text — digits, punctuation, emoji and combining
+    marks are not letters and never count as language evidence."""
+    return [ch for ch in text if unicodedata.category(ch).startswith("L")]
+
+
+def _arabic_script_letters(letters: list[str]) -> list[str]:
+    return [ch for ch in letters if _is_arabic_script(ch)]
+
+
+def _latin_letters(letters: list[str]) -> list[str]:
+    return [ch for ch in letters if "LATIN" in unicodedata.name(ch, "")]
+
+
+def _tokens(text: str) -> set[str]:
+    """The Arabic-script WORD tokens of the text.
+
+    Combining marks (harakat) and the tatweel are treated as separators, the
+    hamza-bearing alef forms are folded onto the plain alef (`أنا` == `انا` for
+    vocabulary matching), and a token is a maximal run of Arabic-script letters
+    — so a Persian word never matches an Arabic-only word from inside, and a
+    joined prefix ("میکنم") or suffix ("کجاست") still leaves a clean token.
+    """
+    cleaned = "".join(
+        " "
+        if unicodedata.combining(ch) or ch == "\u0640"
+        else _ALEF_FOLD.get(ch, ch)
+        for ch in text
+    )
+    tokens: set[str] = set()
+    current: list[str] = []
+    for ch in cleaned:
+        if _is_arabic_script(ch):
+            current.append(ch)
+        else:
+            if current:
+                tokens.add("".join(current))
+                current = []
+    if current:
+        tokens.add("".join(current))
+    return tokens
+
+
+def _arabic_tokens(text: str) -> set[str]:
+    return {token for token in _tokens(text) if token in _ARABIC_TOKENS}
+
+
+def _persian_evidence(text: str) -> bool:
+    """True when the text could plausibly be Persian.
+
+    Any single hit is enough: the check exists to STOP the Arabic verdict, so
+    the safe failure direction is "this might be Persian, accept it".
+    """
+    if any(ch in _PERSIAN_ONLY_LETTERS or ch in _PERSIAN_FORMS for ch in text):
+        return True
+    for token in _tokens(text):
+        if token in _PERSIAN_TOKENS:
+            return True
+        if token.startswith(_PERSIAN_TOKEN_PREFIXES):
+            return True
+        if token.endswith(_PERSIAN_COPULA_SUFFIX):
+            return True
+    return False
+
+
+def is_clearly_arabic(text: str) -> bool:
+    """True only when the text carries Arabic evidence and NO Persian evidence.
+
+    A bounded, deterministic heuristic — NOT language detection: `سلام` alone
+    shares every code point with Arabic and is never classified as Arabic here,
+    and any Persian letter form, Persian function word or Persian-only letter
+    stops the verdict outright. It deliberately errs towards accepting text, so
+    some Arabic sentences pass; that is documented, not hidden.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return False
+    if _persian_evidence(text):
+        return False
+    arabic = _arabic_script_letters(_letters(text))
+    if not arabic:
+        return False
+    arabic_forms = sum(1 for ch in arabic if ch in _ARABIC_FORMS)
+    tokens = _arabic_tokens(text)
+    if len(tokens) >= 2:
+        return True
+    if tokens and arabic_forms:
+        return True
+    return arabic_forms * 2 >= len(arabic)
+
+
+def _strip_owned_notices(text: str) -> tuple[str, bool]:
+    """Remove the application-owned notice LINES from a model body.
+
+    The two notices belong to the application: when a model echoes one, it is
+    dropped here (deterministically, line-exact) so the delivered reply carries
+    each of them exactly once. Only those known lines are removed — the model's
+    own words are never rewritten, translated or invented.
+    """
+    dropped = False
+    kept: list[str] = []
+    for line in text.splitlines():
+        if line.strip() in (CLOSED_NOTICE, AI_NOTICE):
+            dropped = True
+            continue
+        kept.append(line)
+    return "\n".join(kept).strip(), dropped
+
+
+def validate_generated_reply(generated: Any) -> tuple[str, str]:
+    """The deterministic pre-send verdict for ONE model reply body.
+
+    Returns ``(reason, body)``; an empty reason means the body may be delivered.
+    The checks, in order: a non-empty plain string, the application-owned notice
+    lines removed, a length inside the short-reply envelope, actual letters
+    present, Persian/Arabic script present (an English answer is refused), not
+    Latin-dominant, and not clearly Arabic. The incoming text is NEVER consulted
+    — the required output language is always Persian, whatever arrived — and a
+    refused body is dropped, never repaired into a fabricated reply.
+    """
+    if not isinstance(generated, str) or not generated.strip():
+        return "empty", ""
+    text, notices_removed = _strip_owned_notices(generated)
+    if notices_removed:
+        logger.info(
+            "private_message: the model echoed an application-owned notice — removed before composing"
+        )
+    if not text:
+        return "notices_only", ""
+    if len(text) > MAX_AI_GENERATED_LENGTH:
+        return "too_long", ""
+    letters = _letters(text)
+    if not letters:
+        return "no_letters", ""
+    script = _arabic_script_letters(letters)
+    if not script:
+        return "not_persian_script", ""
+    if len(_latin_letters(letters)) > len(script):
+        return "not_persian_script", ""
+    if is_clearly_arabic(text):
+        return "arabic", ""
+    return "", text
+
+
 def compose_ai_reply(generated: Any) -> str | None:
     """The generated text PLUS both required disclosures, or None when the
-    result cannot be delivered within Telegram's text ceiling.
+    result is not deliverable (see :func:`validate_generated_reply`).
 
     The disclosures are appended here, after generation, as
     application-controlled plain Unicode: the model can never remove, weaken or
-    override them, and an over-long reply is refused rather than truncated.
+    override them, and a body that already echoes them is de-duplicated so each
+    notice appears EXACTLY once. An over-long reply is refused rather than
+    truncated.
     """
-    if not isinstance(generated, str) or not generated.strip():
+    reason, text = validate_generated_reply(generated)
+    if reason:
+        logger.warning(
+            "PRIVATE_MESSAGE_TRACE stage=ai_reply_rejected reason=%s", reason
+        )
         return None
-    body = f"{generated.strip()}\n\n{CLOSED_NOTICE}\n{AI_NOTICE}"
+    body = f"{text}\n\n{CLOSED_NOTICE}\n{AI_NOTICE}"
     if len(body) > MAX_DELIVERED_TEXT_LENGTH:
         logger.warning(
             "private_message: AI reply refused — %d chars exceeds the delivery ceiling", len(body)

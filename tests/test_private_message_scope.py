@@ -622,7 +622,7 @@ def test_the_actions_execute_in_the_documented_order(db, client, monkeypatch):
 
     monkeypatch.setattr(pm, "_delete_incoming", _delete)
     monkeypatch.setattr(pm, "_send_text", _send)
-    monkeypatch.setattr(pm, "_generate_ai_reply", _async_return("generated"))
+    monkeypatch.setattr(pm, "_generate_ai_reply", _async_return("پیام شما رسید."))
 
     _restricted(
         db,
@@ -648,10 +648,12 @@ def _async_return(value):
 # ── the AI boundary ──────────────────────────────────────────────────────────
 
 
-def test_the_ai_reply_carries_both_disclosures(db):
+def test_the_ai_reply_carries_both_disclosures_exactly_once(db):
     body = svc.compose_ai_reply("  متنی  ")
     assert body.endswith(f"{svc.CLOSED_NOTICE}\n{svc.AI_NOTICE}")
     assert body.startswith("متنی")
+    assert body.count(svc.CLOSED_NOTICE) == 1
+    assert body.count(svc.AI_NOTICE) == 1
     assert svc.compose_ai_reply("") is None
     assert svc.compose_ai_reply(None) is None
     assert svc.compose_ai_reply("x" * svc.MAX_DELIVERED_TEXT_LENGTH) is None
@@ -664,7 +666,7 @@ def test_the_ai_receives_only_the_incoming_text(db, client, monkeypatch):
 
     class _Response:
         success = True
-        text = "ok"
+        text = "پیام شما رسید."
 
     class _Providers:
         async def chat(self, messages, **kwargs):
@@ -740,7 +742,8 @@ def test_the_prompt_keeps_the_response_contract_and_the_context_isolation():
     lowered = pm._AI_SYSTEM_PROMPT.lower()
     assert "one short reply" in lowered
     assert "return plain text only" in lowered
-    assert "do not ask questions" in lowered
+    assert "do not ask a question unless answering genuinely requires one" in lowered
+    assert "do not repeat the incoming message back" in lowered
     assert "do not sign the reply" in lowered
     assert "appended automatically by the system" in lowered
     assert "never write, repeat or contradict them" in lowered
@@ -806,6 +809,117 @@ def test_the_language_policy_is_local_to_the_private_message_feature():
     assert references == ["backend/bot/handlers/private_message.py"]
 
 
+def test_the_prompt_forbids_inventing_facts_and_describing_itself():
+    lowered = pm._AI_SYSTEM_PROMPT.lower()
+    assert "never invent" in lowered
+    for fact in ("identity", "name", "job", "religion", "nationality", "biography"):
+        assert fact in lowered, fact
+    assert "the incoming message does not state" in lowered
+    assert "never describe yourself or your own situation" in lowered
+
+
+def test_the_prompt_requires_brevity_and_natural_persian_over_translation():
+    lowered = pm._AI_SYSTEM_PROMPT.lower()
+    assert "keep it brief and directly about the incoming message" in lowered
+    assert "a simple greeting gets a short persian greeting, nothing more" in lowered
+    assert "not a word-for-word translation" in lowered
+    assert "never an arabic expression" in lowered
+    assert "everyday persian" in lowered
+
+
+# ── the deterministic reply envelope (validation BEFORE any send) ─────────────
+
+_PERSIAN_REPLY = "سلام! چطور می‌تونم کمکت کنم؟"
+_ARABIC_REPLY = "أهلاً بك! كيف يمكنني مساعدتك اليوم؟"
+_ENGLISH_REPLY = "Hello, thank you for your message."
+
+
+def test_the_reply_validator_refuses_empty_and_whitespace_only_bodies():
+    for value in ("", "   ", "\n\t ", None, 7, ["x"]):
+        assert svc.validate_generated_reply(value) == ("empty", ""), value
+    assert svc.compose_ai_reply("") is None
+    assert svc.compose_ai_reply("   ") is None
+
+
+def test_the_reply_validator_refuses_letterless_and_foreign_script_bodies():
+    assert svc.validate_generated_reply("!!! 123 😀")[0] == "no_letters"
+    assert svc.validate_generated_reply(_ENGLISH_REPLY)[0] == "not_persian_script"
+    # A Persian sentence carrying a Latin word is still Persian: only a
+    # Latin-DOMINANT body is refused.
+    reason, body = svc.validate_generated_reply("سلام! این یه فایل PDF بود.")
+    assert reason == "" and body == "سلام! این یه فایل PDF بود."
+
+
+def test_the_reply_validator_refuses_clearly_arabic_bodies():
+    for arabic in (
+        _ARABIC_REPLY,
+        "مرحبا بك، شكرا لك على رسالتك",
+        "كيف حالك؟",
+        "السلام عليكم",
+        "شكرا جزيلا لك",
+        "وعليكم السلام",
+        "أنا هنا لمساعدتك",
+    ):
+        assert svc.validate_generated_reply(arabic)[0] == "arabic", arabic
+        assert svc.compose_ai_reply(arabic) is None
+
+
+def test_the_reply_validator_keeps_valid_persian_and_the_ambiguous_greeting():
+    """Everyday Persian — including text with no Persian-only letter — must NOT
+    be rejected by the shared-code-point check."""
+    for persian in (
+        "سلام",
+        "سلام! چطور هستید؟",
+        "سلام، خوبی؟",
+        "ممنونم، پیام شما رسید.",
+        "حتماً، الان پاسخ می‌دم.",
+        "سلام! خوبم، مرسی که پیام دادی.",
+        "باشه، خبرت می‌کنم.",
+        "وقت بخیر، الان پاسخ می‌دم.",
+        "ممنون از پیامت",
+        "بله، حتماً",
+        "خواهش می‌کنم.",
+        "کجاست؟",
+        "آقا سلام",
+    ):
+        reason, body = svc.validate_generated_reply(persian)
+        assert reason == "", (persian, reason)
+        assert body == persian
+    # The shared-code-point guarantee: `سلام` is never classified as Arabic.
+    assert svc.is_clearly_arabic("سلام") is False
+    assert svc.is_clearly_arabic("") is False
+
+
+def test_the_reply_validator_refuses_an_over_long_body():
+    long_body = "سلام " + "خیلی طولانی " * 200
+    assert len(long_body) > svc.MAX_AI_GENERATED_LENGTH
+    assert svc.validate_generated_reply(long_body)[0] == "too_long"
+    assert svc.compose_ai_reply(long_body) is None
+
+
+def test_the_reply_validator_reads_only_the_generated_text():
+    """No incoming text, no sender, no chat: Persian is required regardless."""
+    parameters = list(inspect.signature(svc.validate_generated_reply).parameters)
+    assert parameters == ["generated"]
+
+
+def test_the_disclosures_are_appended_exactly_once_even_when_the_model_echoes_them():
+    echoed = f"{_PERSIAN_REPLY}\n\n{svc.CLOSED_NOTICE}\n{svc.AI_NOTICE}"
+    body = svc.compose_ai_reply(echoed)
+    assert body is not None
+    assert body.count(svc.CLOSED_NOTICE) == 1
+    assert body.count(svc.AI_NOTICE) == 1
+    assert body.startswith("سلام!")  # the model's own words survive untouched
+    plain = svc.compose_ai_reply(_PERSIAN_REPLY)
+    assert plain.count(svc.CLOSED_NOTICE) == 1 and plain.count(svc.AI_NOTICE) == 1
+
+
+def test_a_body_that_is_only_the_notices_is_refused():
+    reason, _ = svc.validate_generated_reply(f"{svc.CLOSED_NOTICE}\n{svc.AI_NOTICE}")
+    assert reason == "notices_only"
+    assert svc.compose_ai_reply(f"\n{svc.AI_NOTICE}\n") is None
+
+
 def test_the_scope_gate_runs_outside_the_ai(db, client, monkeypatch):
     """A rejected event never reaches the model, with every action enabled."""
     import backend.ai.engine.engine as engine_module
@@ -850,7 +964,7 @@ def test_a_message_without_text_gets_no_ai_reply_and_spends_nothing(db, client):
 # ── the durable per-person allowance ─────────────────────────────────────────
 
 
-def _ai_handler(db, client, monkeypatch, *, reply_text="generated", fail_generation=False):
+def _ai_handler(db, client, monkeypatch, *, reply_text="پیام شما رسید.", fail_generation=False):
     import backend.ai.engine.engine as engine_module
 
     class _Response:
@@ -1083,6 +1197,19 @@ def test_no_second_client_loop_scheduler_or_executor_is_introduced():
     assert "events.NewMessage" not in source
 
 
+def test_one_incoming_message_has_exactly_one_action_path():
+    """Structural guarantee behind the single-reply contract: the enforcement
+    has ONE action entry point, ONE AI-response step and ONE generation call, so
+    a single verified update cannot fan out into several replies.
+    """
+    source = inspect.getsource(pm)
+    assert source.count("await _apply_actions(") == 1
+    assert source.count("await _ai_response(") == 1
+    assert source.count("await _generate_ai_reply(") == 1
+    assert source.count("service.already_handled(") == 1
+    assert source.count("await _send_text(") == 2  # one fixed response, one AI reply
+
+
 def test_the_incoming_hook_is_reached_through_the_existing_handler(client):
     """The ONE existing all-messages handler calls the enforcement hook first."""
     handler = _handler(client)
@@ -1145,3 +1272,175 @@ def test_the_feature_documentation_exists_and_states_the_manual_action():
     assert "20260929000001_create_private_message_tables.sql" in doc
     assert "part 10 of 10" in doc
     assert "private_message_senders" in doc
+
+
+# ── duplicate protection, end to end ─────────────────────────────────────────
+
+
+def _counting_ai_handler(db, client, monkeypatch, *, reply_text=_PERSIAN_REPLY):
+    """The end-to-end harness with an observable provider-call count."""
+    import backend.ai.engine.engine as engine_module
+
+    calls: list[dict] = []
+
+    class _Response:
+        success = True
+        text = reply_text
+
+    class _Providers:
+        async def chat(self, messages, **kwargs):
+            calls.append({"messages": messages, "kwargs": kwargs})
+            return _Response()
+
+    class _Engine:
+        provider_manager = _Providers()
+
+    async def _apply(owner_id):
+        return True
+
+    monkeypatch.setattr(engine_module, "get_engine", lambda: _Engine())
+    monkeypatch.setattr(engine_module, "apply_persisted_config", _apply)
+    _restricted(db, ai_response_enabled=True)
+    _run(svc.set_ai_max_replies_per_person(10))
+    _run(svc.set_ai_interval_seconds(0))
+    return _handler(client), calls
+
+
+def test_a_simple_greeting_is_answered_once_in_persian_with_one_copy_of_each_notice(db, client, monkeypatch):
+    handler, calls = _counting_ai_handler(db, client, monkeypatch)
+
+    _run(handler(_event(STRANGER, STRANGER, message_id=110, text="سلام")))
+
+    assert len(calls) == 1
+    assert calls[0]["messages"][1]["content"] == "سلام"
+    assert len(client.sent) == 1
+    body = client.sent[0][1]
+    assert body == f"{_PERSIAN_REPLY}\n\n{svc.CLOSED_NOTICE}\n{svc.AI_NOTICE}"
+    assert body.count(svc.CLOSED_NOTICE) == 1 and body.count(svc.AI_NOTICE) == 1
+
+
+def test_the_incoming_language_never_changes_the_contract(db, client, monkeypatch):
+    """Arabic and English inputs are answered by the SAME Persian contract."""
+    handler, calls = _counting_ai_handler(db, client, monkeypatch)
+
+    _run(handler(_event(STRANGER, STRANGER, message_id=111, text="مرحبا كيف حالك؟")))
+    _run(handler(_event(STRANGER, STRANGER, message_id=112, text="hello")))
+
+    assert [call["messages"][1]["content"] for call in calls] == [
+        "مرحبا كيف حالك؟", "hello",
+    ]
+    assert all(call["messages"][0]["content"] == pm._AI_SYSTEM_PROMPT for call in calls)
+    assert all(call["kwargs"] == {"tools": []} for call in calls)
+    assert len(client.sent) == 2
+
+
+def test_an_arabic_or_english_reply_is_never_sent_and_the_claim_is_given_back(db, monkeypatch):
+    for message_id, reply in ((113, _ARABIC_REPLY), (114, _ENGLISH_REPLY)):
+        client = _RecordingClient()
+        handler, _calls = _counting_ai_handler(db, client, monkeypatch, reply_text=reply)
+
+        _run(handler(_event(STRANGER, STRANGER, message_id=message_id, text="سلام")))
+
+        assert client.sent == [], reply
+        assert all(row.get("ai_replies_used", 0) == 0 for row in db.senders), reply
+
+
+def test_an_over_long_reply_takes_the_safe_failure_path_and_releases_the_claim(db, client, monkeypatch):
+    handler, _calls = _counting_ai_handler(
+        db, client, monkeypatch, reply_text="سلام " + "خیلی طولانی " * 200
+    )
+
+    _run(handler(_event(STRANGER, STRANGER, message_id=115, text="سلام")))
+
+    assert client.sent == []
+    assert all(row.get("ai_replies_used", 0) == 0 for row in db.senders)
+
+
+def test_a_duplicate_delivery_of_one_message_answers_once(db, client, monkeypatch):
+    handler, calls = _counting_ai_handler(db, client, monkeypatch)
+
+    _run(handler(_event(STRANGER, STRANGER, message_id=120, text="سلام")))
+    _run(handler(_event(STRANGER, STRANGER, message_id=120, text="سلام")))
+
+    assert len(calls) == 1
+    assert len(client.sent) == 1
+
+
+def test_concurrent_deliveries_of_one_message_answer_once(db, client, monkeypatch):
+    handler, calls = _counting_ai_handler(db, client, monkeypatch)
+
+    async def _both():
+        await asyncio.gather(
+            handler(_event(STRANGER, STRANGER, message_id=121, text="سلام")),
+            handler(_event(STRANGER, STRANGER, message_id=121, text="سلام")),
+        )
+
+    _run(_both())
+    assert len(calls) == 1
+    assert len(client.sent) == 1
+
+
+def test_a_different_message_from_the_same_sender_is_still_answered(db, client, monkeypatch):
+    handler, calls = _counting_ai_handler(db, client, monkeypatch)
+
+    _run(handler(_event(STRANGER, STRANGER, message_id=122, text="سلام")))
+    _run(handler(_event(STRANGER, STRANGER, message_id=123, text="سلام دوباره")))
+
+    assert len(calls) == 2
+    assert len(client.sent) == 2
+
+
+def test_both_independent_responses_run_once_for_one_message(db, client, monkeypatch):
+    """The duplicate guard suppresses a REPEAT, never two separate actions."""
+    handler, calls = _counting_ai_handler(db, client, monkeypatch)
+    assert _run(svc.set_action(svc.ACTION_FIXED, True)) is True
+    _run(svc.set_fixed_response_text("این پی‌وی بسته است."))
+
+    _run(handler(_event(STRANGER, STRANGER, message_id=124, text="سلام")))
+    _run(handler(_event(STRANGER, STRANGER, message_id=124, text="سلام")))
+
+    assert [text for _chat, text in client.sent] == [
+        "این پی‌وی بسته است.",
+        f"{_PERSIAN_REPLY}\n\n{svc.CLOSED_NOTICE}\n{svc.AI_NOTICE}",
+    ]
+    assert len(calls) == 1
+
+
+def test_a_failure_before_the_actions_does_not_remember_the_message_as_handled(db, client, monkeypatch):
+    _restricted(db, ai_response_enabled=True)
+    handler = _handler(client)
+
+    async def _boom(*args, **kwargs):
+        raise RuntimeError("enforcement exploded")
+
+    monkeypatch.setattr(pm, "_apply_actions", _boom)
+
+    _run(handler(_event(STRANGER, STRANGER, message_id=125, text="سلام")))
+
+    # The actions never ran, so the pair must NOT be remembered as handled.
+    assert svc.already_handled(STRANGER, 125) is False
+
+
+def test_a_completed_enforcement_keeps_the_duplicate_mark(db, client):
+    _restricted(db, delete_incoming=True)
+    handler = _handler(client)
+
+    _run(handler(_event(STRANGER, STRANGER, message_id=126)))
+    _run(handler(_event(STRANGER, STRANGER, message_id=126)))
+
+    assert client.deleted == [(STRANGER, [126])]
+    assert svc.already_handled(STRANGER, 126) is True
+
+
+def test_the_accounts_own_sent_reply_is_never_an_incoming_human_message(db, client, monkeypatch):
+    """The AI reply is sent BY the account, so its own update is outgoing and
+    can never re-enter the incoming policy path."""
+    handler, calls = _counting_ai_handler(db, client, monkeypatch)
+
+    _run(handler(_event(
+        STRANGER, OWNER, message_id=127, text=_PERSIAN_REPLY, out=True,
+    )))
+
+    assert calls == []
+    assert client.sent == [] and client.deleted == []
+    assert db.senders == []
