@@ -14,14 +14,16 @@ import logging
 from typing import Awaitable, Callable, Any
 
 from telethon import events
-from telethon.tl.custom import Button
 
 from backend.bot.handlers.guard import is_owner
 from backend.helper.context import truncate_callback_data
 from backend.helper.input_state import set_pending, clear_pending, get_pending
 from backend.helper.lifecycle import get_lifecycle
 from backend.helper.panel_registry import registry as get_registry
+from backend.helper.panel_render import _callback, _url
 from backend.helper.session_manager import Session
+from backend.helper.styles import PRIMARY
+from backend.helper import symbols as sym
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +71,7 @@ async def _safe_edit(event, text: str, buttons: list, chat_id: int | None, msg_i
 def _progress_buttons() -> list:
     """Minimal nav row for transient states (progress, working panels)."""
     builder = InlinePanelBuilder()
-    builder.add_row("⌂ Home", "panel:_nav:home")
+    builder.add_row(sym.label(sym.OP_HOME, "Home"), "panel:_nav:home")
     return builder.build()
 
 
@@ -127,21 +129,34 @@ _actions: dict[str, ActionHandler] = {}
 _inputs: dict[str, dict[str, InputConfig]] = {}
 
 
+def _styled_button(text: str, callback_data: str, style: str | None = None):
+    """Panel button that may carry a named style.
+
+    Both styled and unstyled buttons are real ``KeyboardButtonCallback``
+    objects (data already encoded), preserving the builder's existing contract.
+    When no style is supplied the button defaults to ``primary`` (blue), so a
+    caller that omits the argument never produces a silently-unstyled button;
+    unsupported styles fall back to an unstyled button.
+    """
+    return _callback(text, truncate_callback_data(callback_data), style if style is not None else PRIMARY)
+
+
 class InlinePanelBuilder:
     def __init__(self):
         self._rows: list[list[Any]] = []
 
-    def add_row(self, text: str, callback_data: str) -> "InlinePanelBuilder":
-        self._rows.append([Button.inline(text, truncate_callback_data(callback_data))])
+    def add_row(self, text: str, callback_data: str, style: str | None = None) -> "InlinePanelBuilder":
+        self._rows.append([_styled_button(text, callback_data, style)])
         return self
 
-    def add_buttons(self, *buttons: tuple[str, str]) -> "InlinePanelBuilder":
-        row = [Button.inline(text, truncate_callback_data(data)) for text, data in buttons]
+    def add_buttons(self, *buttons: tuple) -> "InlinePanelBuilder":
+        row = [_styled_button(text, data, style) for text, data, style in
+               ((*b, None) if len(b) == 2 else b for b in buttons)]
         self._rows.append(row)
         return self
 
-    def add_url(self, text: str, url: str) -> "InlinePanelBuilder":
-        self._rows.append([Button.url(text, url)])
+    def add_url(self, text: str, url: str, style: str | None = None) -> "InlinePanelBuilder":
+        self._rows.append([_url(text, url, style if style is not None else PRIMARY)])
         return self
 
     def build(self) -> list[list[Any]]:
@@ -150,17 +165,34 @@ class InlinePanelBuilder:
 
 _NAV_ACTIONS = {"back", "home", "close"}
 
+#: Panels that render their OWN complete button set and must never receive the
+#: automatic Back/Home/Close navigation row. Used by the Emoji diagnostic
+#: panel, whose primary view must expose exactly one application-level button.
+_NAV_FREE_PANELS: set[str] = set()
+
+
+def set_panel_nav_free(panel_id: str, enabled: bool = True) -> None:
+    """Opt a panel out of (or back into) the automatic navigation row.
+
+    Only panels explicitly listed here are affected; every other panel keeps
+    the standard Back/Home/Close behaviour.
+    """
+    if enabled:
+        _NAV_FREE_PANELS.add(panel_id)
+    else:
+        _NAV_FREE_PANELS.discard(panel_id)
+
 
 def _add_close_button(builder: InlinePanelBuilder) -> None:
-    builder.add_row("❌ Close", "panel:_nav:close")
+    builder.add_row(sym.label(sym.OP_CLOSE, "Close"), "panel:_nav:close")
 
 
 def _add_nav_buttons(builder: InlinePanelBuilder) -> None:
     builder.add_buttons(
-        ("⬅ Back", "panel:_nav:back"),
-        ("🏠 Home", "panel:_nav:home"),
+        (sym.label(sym.OP_BACK, "Back"), "panel:_nav:back"),
+        (sym.label(sym.OP_HOME, "Home"), "panel:_nav:home"),
     )
-    builder.add_row("❌ Close", "panel:_nav:close")
+    builder.add_row(sym.label(sym.OP_CLOSE, "Close"), "panel:_nav:close")
 
 
 def _has_nav_buttons(buttons: list) -> bool:
@@ -197,6 +229,11 @@ def _finalize_panel(
             builder._rows.append(list(row))
         else:
             builder._rows.append([row])
+
+    # A nav-free panel renders its own complete button set (exactly the buttons
+    # it returned) — no automatic Back/Home/Close is appended.
+    if panel_id in _NAV_FREE_PANELS:
+        return title, body, builder.build()
 
     is_root = True
     if chat_id is not None and msg_id is not None:
@@ -578,12 +615,13 @@ async def _handle_input(event, remainder: str, owner_id: int, chat_id: int, msg_
     # discard declare it as an explicit extra row (see ``extra_rows``).
     # Home/Close are still offered as explicit navigation.
     builder = InlinePanelBuilder()
-    builder.add_row("← Back", input_cfg.get("back") or f"panel:{panel_id}")
+    builder.add_row(sym.label(sym.OP_BACK, "Back"), input_cfg.get("back") or f"panel:{panel_id}")
     for extra_row in input_cfg.get("extra_rows") or ():
-        label, data = extra_row
-        builder.add_row(str(label), str(data))
-    builder.add_row("🏠 Home", "panel:_nav:home")
-    builder.add_row("❌ Close", "panel:_nav:close")
+        label, data = extra_row[0], extra_row[1]
+        style = extra_row[2] if len(extra_row) > 2 else None
+        builder.add_row(str(label), str(data), style)
+    builder.add_row(sym.label(sym.OP_HOME, "Home"), "panel:_nav:home")
+    builder.add_row(sym.label(sym.OP_CLOSE, "Close"), "panel:_nav:close")
 
     built = builder.build()
     _sync_timer(chat_id or 0, msg_id or 0, panel_id, prompt, built)

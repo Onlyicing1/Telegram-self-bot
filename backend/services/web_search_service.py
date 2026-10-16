@@ -6,6 +6,7 @@ capability. The provider never touches Telegram; this module only formats
 the normalized result into text the reasoning model can cite honestly.
 """
 from __future__ import annotations
+from backend.helper import symbols as sym
 
 import logging
 import re
@@ -55,7 +56,7 @@ async def do_web_search(
 
         engine = get_engine()
         if engine is None:
-            return False, "❌ Web search unavailable — AI engine is not running.", {}
+            return False, f"{sym.STATE_FAILED} Web search unavailable — AI engine is not running.", {}
         provider_manager = engine.provider_manager
 
     try:
@@ -68,14 +69,14 @@ async def do_web_search(
     except Exception as exc:
         reason = sanitize_reason(exc)
         logger.warning("web_search: manager call failed: %s", reason)
-        return False, f"❌ Web search failed: {reason}.", {}
+        return False, f"{sym.STATE_FAILED} Web search failed: {reason}.", {}
 
     if not isinstance(result, dict):
-        return False, f"❌ Web search returned an invalid result ({type(result).__name__}).", {}
+        return False, f"{sym.STATE_FAILED} Web search returned an invalid result ({type(result).__name__}).", {}
 
     if not result.get("success"):
         error = str(result.get("error") or "unknown error")
-        return False, f"⚠️ Web search failed: {error}", dict(result)
+        return False, f"{sym.STATE_WARNING} Web search failed: {error}", dict(result)
 
     return True, _format_results(result), dict(result)
 
@@ -83,7 +84,7 @@ async def do_web_search(
 def _format_results(result: dict[str, Any]) -> str:
     query = str(result.get("query") or "")
     items = [r for r in (result.get("results") or []) if isinstance(r, dict)]
-    lines = [f'🌐 Web results for "{query}":', ""]
+    lines = [f'{sym.ICON_WEB} Web results for "{query}":', ""]
     if not items:
         lines.append("_No results found._")
         return "\n".join(lines)

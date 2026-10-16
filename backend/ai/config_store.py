@@ -16,6 +16,7 @@ All operations are async and use asyncio.to_thread with bounded
 timeouts, matching the pattern in backend/db/client.py.
 """
 from __future__ import annotations
+from backend.helper import symbols as sym
 
 import asyncio
 import logging
@@ -474,8 +475,8 @@ async def update_triggers(owner_id: int, trigger_en: str, trigger_fa: str) -> tu
     config["trigger_fa"] = (trigger_fa or "").strip()
     ok = await save_config(owner_id, config)
     if ok:
-        return True, "✅ Triggers updated."
-    return False, "❌ Failed to save triggers."
+        return True, f"{sym.OP_SAVE} Triggers updated."
+    return False, f"{sym.STATE_FAILED} Failed to save triggers."
 
 
 async def get_triggers(owner_id: int) -> dict[str, str]:

@@ -77,17 +77,21 @@ class ToolResult:
     data: dict[str, Any] = field(default_factory=dict)
 
 
-# Service-layer failure prefixes. Services communicate failures as
-# "❌ ..." / "⚠️ ..." result strings instead of raising. Tools must
-# derive ``success`` from these prefixes — a service returning a string
-# is NOT proof the operation succeeded.
-_SERVICE_FAILURE_PREFIXES = ("❌", "⚠️", "🚫")
+# Service-layer failure prefixes. Services communicate failures as a
+# leading status glyph instead of raising: the migrated functional marks
+# (``STATE_FAILED``/``STATE_WARNING``) and the legacy emoji they replaced
+# (``❌``/``⚠️``/``🚫``) are BOTH recognised, so a service that has not yet
+# moved to the registry still reports failure honestly. Tools derive
+# ``success`` from these prefixes — a service returning a string is NOT
+# proof the operation succeeded.
+_SERVICE_FAILURE_PREFIXES = ("❌", "⚠️", "🚫", "×", "◬")
 
 
 def result_from_service(result: str, *, data: dict[str, Any] | None = None) -> ToolResult:
     """Wrap a service-layer result string, deriving success from the outcome.
 
-    Services communicate failures as "❌ ..." / "⚠️ ..." strings. A tool
+    Services communicate failures as a leading status glyph (the functional
+    ``×``/``◬`` marks, or the legacy ``❌``/``⚠️``/``🚫``). A tool
     that merely returned without raising must never report success: the AI
     answers from the REAL result, so failures are surfaced as
     ``success=False`` with the actual service message.

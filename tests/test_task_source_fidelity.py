@@ -40,6 +40,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from backend.helper import symbols as sym
+
 from backend.ai.database.task_repository import InMemoryTaskRepository
 from backend.ai.preparation_policy import derive_policy
 from backend.ai.task_execution import (
@@ -592,7 +594,7 @@ async def test_manual_bio_then_scheduled_bio_share_one_window(_guardian_env):
 
     executor, ctx = _real_bio_registry(owner=9)
     first = await bio_service.do_text(9, "manual bio", tz_str="UTC")
-    assert first.startswith("✅"), first
+    assert first.startswith(sym.OP_SAVE), first
     assert bio_guardian.seconds_until_bio_mutation_allowed() > 0
 
     # The scheduled path executes the real bio_set_text tool through the
@@ -613,7 +615,7 @@ async def test_retry_within_window_cannot_bypass_guardian(_guardian_env):
 
     executor, ctx = _real_bio_registry(owner=9)
     first = await bio_service.do_text(9, "first", tz_str="UTC")
-    assert first.startswith("✅"), first
+    assert first.startswith(sym.OP_SAVE), first
 
     for _ in range(2):  # simulate immediate retry attempts
         results = await executor.execute_calls(

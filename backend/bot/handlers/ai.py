@@ -40,6 +40,7 @@ from backend.helper import (
     render,
     render_edit,
 )
+from backend.helper import symbols as sym
 from backend.runtime.task_guard import guarded_create_task
 
 logger = logging.getLogger(__name__)
@@ -135,7 +136,7 @@ def _effective_pair(engine_info: dict, config: dict) -> tuple[str, str]:
 
 
 def _status_icon(connected: bool) -> str:
-    return "●" if connected else "○"
+    return sym.STATE_ACTIVE if connected else sym.SCHEDULE_ONCE
 
 
 _PROVIDER_DISPLAY_FALLBACK = {
@@ -213,8 +214,8 @@ def _context_line(context_tokens: int, max_context: int) -> str:
 
 def _nav_buttons(builder: InlinePanelBuilder) -> None:
     builder.add_buttons(
-        ("← Back", "panel:_nav:back"),
-        ("⌂ Home", "panel:_nav:home"),
+        (sym.label(sym.OP_BACK, "Back"), "panel:_nav:back"),
+        (sym.label(sym.OP_HOME, "Home"), "panel:_nav:home"),
     )
 
 
@@ -236,8 +237,8 @@ async def _ai_main_panel_handler(event, extra: str) -> tuple[str, str, list] | N
         lines = ["**AI**\n", "! **No provider configured**", "",
                  "_Tap **Provider** to select one._"]
         builder = InlinePanelBuilder()
-        builder.add_row("◈ Select Provider", "panel:ai_provider")
-        builder.add_row("▣ Media Analysis", "panel:ai_media")
+        builder.add_row(sym.label(sym.ICON_PROVIDER, "Select Provider"), "panel:ai_provider")
+        builder.add_row(sym.label(sym.PANEL_HEADING, "Media Analysis"), "panel:ai_media")
         builder.add_row("Test Modules", "action:ai_test_models")
         _nav_buttons(builder)
         return "AI", "\n".join(lines), builder.build()
@@ -247,9 +248,9 @@ async def _ai_main_panel_handler(event, extra: str) -> tuple[str, str, list] | N
                  f"{saved_provider.title()} · ! **No model selected**", "",
                  "_Tap **Model** to select one._"]
         builder = InlinePanelBuilder()
-        builder.add_row("◇ Select Model", "panel:ai_model")
-        builder.add_row("◈ Change Provider", "panel:ai_provider")
-        builder.add_row("▣ Media Analysis", "panel:ai_media")
+        builder.add_row(sym.label(sym.ICON_MODEL, "Select Model"), "panel:ai_model")
+        builder.add_row(sym.label(sym.ICON_PROVIDER, "Change Provider"), "panel:ai_provider")
+        builder.add_row(sym.label(sym.PANEL_HEADING, "Media Analysis"), "panel:ai_media")
         _nav_buttons(builder)
         return "AI", "\n".join(lines), builder.build()
 
@@ -274,12 +275,12 @@ async def _ai_main_panel_handler(event, extra: str) -> tuple[str, str, list] | N
         lines.append("_No requests yet_")
 
     builder = InlinePanelBuilder()
-    builder.add_row("» Start Chat", "action:ai_start_chat")
-    builder.add_row("⌗ Taskloom", "panel:taskloom")
-    builder.add_buttons(("▤ Usage", "panel:ai_usage"), ("✚ Health", "panel:ai_health"))
-    builder.add_buttons(("⌕ Details", "panel:ai_details"), ("◇ Model", "panel:ai_model"))
-    builder.add_buttons(("◈ Provider", "panel:ai_provider"), ("⚙ Settings", "panel:ai_settings"))
-    builder.add_row("▣ Media Analysis", "panel:ai_media")
+    builder.add_row(sym.label(sym.OP_NEXT, "Start Chat"), "action:ai_start_chat")
+    builder.add_row(sym.label(sym.META_ID, "Taskloom"), "panel:taskloom")
+    builder.add_buttons((sym.label(sym.ICON_STATS, "Usage"), "panel:ai_usage"), (sym.label(sym.ICON_HEALTH, "Health"), "panel:ai_health"))
+    builder.add_buttons((sym.label(sym.OP_SEARCH, "Details"), "panel:ai_details"), (sym.label(sym.ICON_MODEL, "Model"), "panel:ai_model"))
+    builder.add_buttons((sym.label(sym.ICON_PROVIDER, "Provider"), "panel:ai_provider"), (sym.label(sym.OP_MANAGE, "Settings"), "panel:ai_settings"))
+    builder.add_row(sym.label(sym.PANEL_HEADING, "Media Analysis"), "panel:ai_media")
     builder.add_row("Test Modules", "action:ai_test_models")
     _nav_buttons(builder)
     return "AI", "\n".join(lines), builder.build()
@@ -288,7 +289,7 @@ async def _ai_main_panel_handler(event, extra: str) -> tuple[str, str, list] | N
 async def _ai_main_inline_builder(event, extra: str) -> list:
     result = await _ai_main_panel_handler(event, extra)
     if result is None:
-        return [render("◉ AI", "Error loading panel.", [])]
+        return [render(f"{sym.MEDIA_VOICE} AI", "Error loading panel.", [])]
     title, body, buttons = result
     return [render(title, body, buttons)]
 
@@ -305,13 +306,13 @@ async def _ai_provider_panel_handler(event, extra: str) -> tuple[str, str, list]
     invalid_capabilities = [p for p in capability_results if p.status == "invalid"]
     current = config.get("provider", "")
 
-    lines = ["**◈ Provider**\n"]
+    lines = [f"**{sym.ICON_PROVIDER} Provider**\n"]
 
     if available:
         lines.append("**Available:**")
         for p in available:
-            mark = "✓" if p.name == current else "  "
-            lines.append(f"  {mark} ◈ {p.display_name}")
+            mark = sym.OP_SAVE if p.name == current else "  "
+            lines.append(f"  {mark} {sym.ICON_PROVIDER} {p.display_name}")
         lines.append("")
     else:
         lines.append("_No providers available._")
@@ -321,35 +322,35 @@ async def _ai_provider_panel_handler(event, extra: str) -> tuple[str, str, list]
     if invalid:
         lines.append("**Invalid Key:**")
         for p in invalid:
-            lines.append(f"  ! ◈ {p.display_name}")
+            lines.append(f"  ! {sym.ICON_PROVIDER} {p.display_name}")
         lines.append("")
 
     if available_capabilities:
         lines.append("**Capabilities:**")
         for p in available_capabilities:
             caps = ", ".join(p.capabilities) or p.capability_kind
-            lines.append(f"  ✓ ◈ {p.display_name} · {caps}")
+            lines.append(f"  {sym.OP_SAVE} {sym.ICON_PROVIDER} {p.display_name} · {caps}")
         lines.append("")
 
     if invalid_capabilities:
         lines.append("**Capability Key Issues:**")
         for p in invalid_capabilities:
-            lines.append(f"  ! ◈ {p.display_name}")
+            lines.append(f"  ! {sym.ICON_PROVIDER} {p.display_name}")
         lines.append("")
 
     builder = InlinePanelBuilder()
     if available:
         for p in available:
-            label = f"{'✓' if p.name == current else '  '} ◈ {p.display_name}"
+            label = f"{sym.OP_SAVE if p.name == current else '  '} {sym.ICON_PROVIDER} {p.display_name}"
             builder.add_row(label, f"action:ai_select_provider:{p.name}")
     else:
-        builder.add_row("☰ Setup Guide", "panel:ai_wizard")
+        builder.add_row(sym.label(sym.OP_MANAGE, "Setup Guide"), "panel:ai_wizard")
     if available_capabilities or invalid_capabilities:
-        builder.add_row("⌕ Search Capability", "panel:ai_web_search")
+        builder.add_row(sym.label(sym.OP_SEARCH, "Search Capability"), "panel:ai_web_search")
 
-    builder.add_row("↻ Refresh", "action:ai_refresh_providers")
+    builder.add_row(sym.label(sym.OP_REFRESH, "Refresh"), "action:ai_refresh_providers")
     _nav_buttons(builder)
-    return "◈ Provider", "\n".join(lines), builder.build()
+    return f"{sym.ICON_PROVIDER} Provider", "\n".join(lines), builder.build()
 
 
 async def _ai_web_search_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
@@ -358,7 +359,7 @@ async def _ai_web_search_panel_handler(event, extra: str) -> tuple[str, str, lis
     builder = InlinePanelBuilder()
     _nav_buttons(builder)
     if search is None:
-        return "⌕ Web Search", "Web-search capability is not registered.", builder.build()
+        return sym.label(sym.OP_SEARCH, "Web Search"), "Web-search capability is not registered.", builder.build()
     if search.status == "available":
         body = (
             f"**{search.display_name}**\n\n"
@@ -378,7 +379,7 @@ async def _ai_web_search_panel_handler(event, extra: str) -> tuple[str, str, lis
             "Status: **Not configured**\n"
             f"Set `{search.env_var}` and restart the process, then refresh this panel."
         )
-    return "⌕ Web Search", body, builder.build()
+    return sym.label(sym.OP_SEARCH, "Web Search"), body, builder.build()
 
 
 async def _ai_web_search_inline_builder(event, extra: str) -> list:
@@ -409,7 +410,7 @@ def _model_callback_hash(model_id: str) -> str:
 def _model_button_label(m, current_model: str) -> str:
     """Compact two-column button label: current mark, name, free/ctx tag."""
     name = m.name or m.id.split("/")[-1]
-    mark = "✓ " if m.id == current_model else ""
+    mark = f"{sym.OP_SAVE} " if m.id == current_model else ""
     label = f"{mark}{name}"
     if m.is_free:
         label += " ·free"
@@ -427,8 +428,8 @@ async def _ai_model_panel_handler(event, extra: str) -> tuple[str, str, list] | 
     logger.info("[AI_TRACE] model_panel_handler provider_name='%s' extra='%s'", provider_name, extra)
     if not provider_name:
         logger.warning("[AI_TRACE] model_panel_handler NO PROVIDER — config=%s", config)
-        return "◇ Model", "! Select a provider first.", [
-            [InlinePanelBuilder().add_row("← Back", "panel:ai").build()[0][0]],
+        return f"{sym.ICON_MODEL} Model", "! Select a provider first.", [
+            [InlinePanelBuilder().add_row(sym.label(sym.OP_BACK, "Back"), "panel:ai").build()[0][0]],
         ]
     from backend.ai.model_discovery import (
         fetch_models,
@@ -439,8 +440,8 @@ async def _ai_model_panel_handler(event, extra: str) -> tuple[str, str, list] | 
     api_key = get_api_key_for_provider(provider_name)
     base_url = get_base_url_for_provider(provider_name)
     if not api_key:
-        return "◇ Model", "! No API key for this provider.", [
-            [InlinePanelBuilder().add_row("← Back", "panel:ai").build()[0][0]],
+        return f"{sym.ICON_MODEL} Model", "! No API key for this provider.", [
+            [InlinePanelBuilder().add_row(sym.label(sym.OP_BACK, "Back"), "panel:ai").build()[0][0]],
         ]
     page = 0
     if extra.startswith("page:"):
@@ -450,9 +451,9 @@ async def _ai_model_panel_handler(event, extra: str) -> tuple[str, str, list] | 
             page = 0
     models = await fetch_models(provider_name, api_key, base_url)
     if not models:
-        return "◇ Model", "! Could not fetch models.\n\nTap **Refresh** to try again.", [
+        return f"{sym.ICON_MODEL} Model", "! Could not fetch models.\n\nTap **Refresh** to try again.", [
             [InlinePanelBuilder().add_row("↻ Refresh", "action:ai_refresh_models").build()[0][0]],
-            [InlinePanelBuilder().add_row("← Back", "panel:ai").build()[0][0]],
+            [InlinePanelBuilder().add_row(sym.label(sym.OP_BACK, "Back"), "panel:ai").build()[0][0]],
         ]
     ordered = order_models_for_selector(models)
     total = len(ordered)
@@ -488,15 +489,15 @@ async def _ai_model_panel_handler(event, extra: str) -> tuple[str, str, list] | 
         builder.add_buttons(*pair)
     nav = []
     if page > 0:
-        nav.append(("‹ Prev", f"panel:ai_model:page:{page - 1}"))
+        nav.append((sym.label(sym.OP_PREV, "Prev"), f"panel:ai_model:page:{page - 1}"))
     nav.append((f"{page + 1}/{total_pages}", "panel:ai_model:noop"))
     if page < total_pages - 1:
-        nav.append(("Next ›", f"panel:ai_model:page:{page + 1}"))
+        nav.append((sym.label(sym.OP_NEXT, "Next"), f"panel:ai_model:page:{page + 1}"))
     if nav:
         builder.add_buttons(*nav)
-    builder.add_row("↻ Refresh Models", "action:ai_refresh_models")
+    builder.add_row(sym.label(sym.OP_REFRESH, "Refresh Models"), "action:ai_refresh_models")
     _nav_buttons(builder)
-    return "◇ Model", "\n".join(lines), builder.build()
+    return f"{sym.ICON_MODEL} Model", "\n".join(lines), builder.build()
 
 
 async def _ai_model_inline_builder(event, extra: str) -> list:
@@ -513,24 +514,24 @@ async def _ai_wizard_panel_handler(event, extra: str) -> tuple[str, str, list] |
     results = await _discover()
     invalid = [p for p in results if p.status == "invalid" and p.capability_kind == "chat"]
     lines = [
-        "**◉ AI Setup**\n",
+        f"**{sym.MEDIA_VOICE} AI Setup**\n",
         "No provider detected.\n",
         "To use AI, set one API key as an environment variable:\n",
     ]
     for p in wizard_info:
-        lines.append(f"  ◈ **{p['display_name']}**")
+        lines.append(f"  {sym.ICON_PROVIDER} **{p['display_name']}**")
         lines.append(f"     Set: `{p['env_var']}`")
         lines.append("")
     if invalid:
         lines.append("! **Invalid keys detected:**")
         for p in invalid:
-            lines.append(f"  ◈ {p.display_name} — key may be expired or wrong")
+            lines.append(f"  {sym.ICON_PROVIDER} {p.display_name} — key may be expired or wrong")
         lines.append("")
     lines.append("_Set a key and tap **Refresh**._")
     builder = InlinePanelBuilder()
-    builder.add_row("↻ Refresh", "action:ai_refresh_providers")
+    builder.add_row(sym.label(sym.OP_REFRESH, "Refresh"), "action:ai_refresh_providers")
     _nav_buttons(builder)
-    return "◉ AI Setup", "\n".join(lines), builder.build()
+    return f"{sym.MEDIA_VOICE} AI Setup", "\n".join(lines), builder.build()
 
 
 async def _ai_wizard_inline_builder(event, extra: str) -> list:
@@ -682,7 +683,7 @@ def _render_per_message_details(resolved) -> tuple[str, str, list]:
     width = max(len(label) for label, _ in rows)
     body = "\n".join(f"{label.ljust(width)}  {value}" for label, value in rows)
     builder = InlinePanelBuilder()
-    builder.add_buttons(("▤ Usage", "panel:ai_usage"), ("✚ Health", "panel:ai_health"))
+    builder.add_buttons((sym.label(sym.ICON_STATS, "Usage"), "panel:ai_usage"), (sym.label(sym.ICON_HEALTH, "Health"), "panel:ai_health"))
     _nav_buttons(builder)
     return "AI · Details", "**AI · Details**\n\n" + f"```\n{body}\n```", builder.build()
 
@@ -763,7 +764,7 @@ async def _ai_details_panel_handler(event, extra: str) -> tuple[str, str, list] 
         lines = ["**AI · Details**\n", f"```\n{body}\n```"]
 
     builder = InlinePanelBuilder()
-    builder.add_buttons(("▤ Usage", "panel:ai_usage"), ("✚ Health", "panel:ai_health"))
+    builder.add_buttons((sym.label(sym.ICON_STATS, "Usage"), "panel:ai_usage"), (sym.label(sym.ICON_HEALTH, "Health"), "panel:ai_health"))
     _nav_buttons(builder)
     return "AI · Details", "\n".join(lines), builder.build()
 
@@ -823,7 +824,7 @@ async def _ai_usage_panel_handler(event, extra: str) -> tuple[str, str, list] | 
 
     builder = InlinePanelBuilder()
     builder.add_buttons(*[
-        (f"{'✓ ' if key == range_key else ''}{lbl}", f"panel:ai_usage:{key}")
+        (f"{sym.OP_SAVE + ' ' if key == range_key else ''}{lbl}", f"panel:ai_usage:{key}")
         for key, lbl in _USAGE_RANGES
     ])
     _nav_buttons(builder)
@@ -983,7 +984,7 @@ async def _ai_health_panel_handler(event, extra: str) -> tuple[str, str, list] |
         lines.append(f"{label} · retry in ~{_format_cooldown(remaining)}")
 
     builder = InlinePanelBuilder()
-    builder.add_row("↻ Refresh", "action:ai_health_refresh")
+    builder.add_row(sym.label(sym.OP_REFRESH, "Refresh"), "action:ai_health_refresh")
     _nav_buttons(builder)
     return "AI · Health", "\n".join(lines), builder.build()
 
@@ -1033,15 +1034,15 @@ async def _ai_toggle_show_question_action(event, extra: str, chat_id: int) -> tu
     result = await _ai_settings_panel_handler(event, extra)
     if not persisted and result is not None:
         title, body, buttons = result
-        result = (title, "× Couldn't save — the panel shows the saved state. Try again.\n\n" + body, buttons)
+        result = (title, f"{sym.STATE_FAILED} Couldn't save — the panel shows the saved state. Try again.\n\n" + body, buttons)
     return result
 
 
 async def _ai_diagnostics_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
     engine = _get_engine()
-    lines = ["**⊞ AI Diagnostics**\n"]
+    lines = [f"**{sym.ICON_ORGANIZE} AI Diagnostics**\n"]
     if engine is None:
-        lines.append("× Engine not available")
+        lines.append(f"{sym.STATE_FAILED} Engine not available")
     else:
         try:
             health = engine.engine_health()
@@ -1053,9 +1054,9 @@ async def _ai_diagnostics_panel_handler(event, extra: str) -> tuple[str, str, li
         except Exception as exc:
             lines.append(f"Error: {exc}")
     builder = InlinePanelBuilder()
-    builder.add_row("↻ Refresh", "action:ai_diagnostics_refresh")
+    builder.add_row(sym.label(sym.OP_REFRESH, "Refresh"), "action:ai_diagnostics_refresh")
     _nav_buttons(builder)
-    return "⊞ Diagnostics", "\n".join(lines), builder.build()
+    return sym.label(sym.ICON_ORGANIZE, "Diagnostics"), "\n".join(lines), builder.build()
 
 
 async def _ai_diagnostics_inline_builder(event, extra: str) -> list:
@@ -1074,7 +1075,7 @@ async def _ai_select_provider_action(event, extra: str, chat_id: int) -> tuple[s
     info = get_provider_info(provider_name)
     if not info:
         logger.warning("[AI_TRACE] select_provider UNKNOWN provider '%s'", provider_name)
-        return "Provider", "× Unknown provider.", []
+        return "Provider", f"{sym.STATE_FAILED} Unknown provider.", []
     config = await _get_saved_config(owner_id)
     config["provider"] = provider_name
     config["model"] = info["default_model"]
@@ -1170,10 +1171,10 @@ async def _ai_pick_model_action(event, extra: str, chat_id: int) -> tuple[str, s
     owner_id = await _get_owner_id()
     logger.info("[AI_TRACE] pick_model START provider='%s' model='%s' owner_id=%s", provider_name, model_id, owner_id)
     if not provider_name or not model_id:
-        return "◉ AI", "× Invalid model selection.", []
+        return f"{sym.MEDIA_VOICE} AI", f"{sym.STATE_FAILED} Invalid model selection.", []
     from backend.ai.discovery import get_provider_info
     if not get_provider_info(provider_name):
-        return "◉ AI", f"× Unknown provider '{provider_name}'.", []
+        return f"{sym.MEDIA_VOICE} AI", f"{sym.STATE_FAILED} Unknown provider '{provider_name}'.", []
 
     config = await _get_saved_config(owner_id)
     config["provider"] = provider_name
@@ -1184,12 +1185,12 @@ async def _ai_pick_model_action(event, extra: str, chat_id: int) -> tuple[str, s
     logger.info("[AI_TRACE] pick_model SAVED + APPLIED provider='%s' model='%s'", provider_name, model_id)
 
     builder = InlinePanelBuilder()
-    builder.add_row("» Start Chat", "action:ai_start_chat")
-    builder.add_row("↻ Re-run Tests", "action:ai_test_models")
+    builder.add_row(sym.label(sym.OP_NEXT, "Start Chat"), "action:ai_start_chat")
+    builder.add_row(sym.label(sym.OP_REFRESH, "Re-run Tests"), "action:ai_test_models")
     builder.add_row("Overview", "panel:ai")
     _nav_buttons(builder)
     return (
-        "◉ AI",
+        f"{sym.MEDIA_VOICE} AI",
         f"**Model selected**\n\nProvider: **{provider_name}**\nModel: `{model_id}`\n\n"
         f"This pair is saved and applied to the runtime. Start chat to use it.",
         builder.build(),
@@ -1226,14 +1227,14 @@ async def _ai_start_chat_action(event, extra: str, chat_id: int) -> tuple[str, s
     trigger_en = config.get("trigger_en", "") or ""
     trigger_fa = config.get("trigger_fa", "") or ""
     if not provider:
-        return "◉ AI", "! No provider configured.\n\nTap **Provider** to select one.", [
-            [InlinePanelBuilder().add_row("◈ Select Provider", "panel:ai_provider").build()[0][0]],
-            [InlinePanelBuilder().add_row("← Back", "panel:ai").build()[0][0]],
+        return f"{sym.MEDIA_VOICE} AI", "! No provider configured.\n\nTap **Provider** to select one.", [
+            [InlinePanelBuilder().add_row(sym.label(sym.ICON_PROVIDER, "Select Provider"), "panel:ai_provider").build()[0][0]],
+            [InlinePanelBuilder().add_row(sym.label(sym.OP_BACK, "Back"), "panel:ai").build()[0][0]],
         ]
     if not model:
-        return "◉ AI", "! No model selected.\n\nTap **Model** to select one.", [
-            [InlinePanelBuilder().add_row("◇ Select Model", "panel:ai_model").build()[0][0]],
-            [InlinePanelBuilder().add_row("← Back", "panel:ai").build()[0][0]],
+        return f"{sym.MEDIA_VOICE} AI", "! No model selected.\n\nTap **Model** to select one.", [
+            [InlinePanelBuilder().add_row(sym.label(sym.ICON_MODEL, "Select Model"), "panel:ai_model").build()[0][0]],
+            [InlinePanelBuilder().add_row(sym.label(sym.OP_BACK, "Back"), "panel:ai").build()[0][0]],
         ]
     if not trigger_en and not trigger_fa:
         return "AI", (
@@ -1241,7 +1242,7 @@ async def _ai_start_chat_action(event, extra: str, chat_id: int) -> tuple[str, s
             "Set one in Settings — you need it to start chatting."
         ), [
             [InlinePanelBuilder().add_row("Set wake word", "panel:ai_settings").build()[0][0]],
-            [InlinePanelBuilder().add_row("← Back", "panel:ai").build()[0][0]],
+            [InlinePanelBuilder().add_row(sym.label(sym.OP_BACK, "Back"), "panel:ai").build()[0][0]],
         ]
     trigger_display = []
     if trigger_en:
@@ -1261,17 +1262,17 @@ async def _ai_start_chat_action(event, extra: str, chat_id: int) -> tuple[str, s
 # Test Modules status marks — plain Unicode symbols only (no colorful
 # emoji) so the diagnostics view stays monochrome and compact.
 _TEST_STATUS_ICONS: dict[str, str] = {
-    "AVAILABLE": "✓",
+    "AVAILABLE": sym.OP_SAVE,
     "NOT_CONFIGURED": "·",
-    "AUTH_ERROR": "×",
-    "RATE_LIMITED": "×",
+    "AUTH_ERROR": sym.STATE_FAILED,
+    "RATE_LIMITED": sym.STATE_FAILED,
     "TIMEOUT": "…",
-    "PROVIDER_ERROR": "×",
-    "INVALID_MODEL": "×",
-    "BLOCKED": "×",
-    "INSUFFICIENT_CREDITS": "×",
-    "UNKNOWN_ERROR": "×",
-    "ERROR": "×",
+    "PROVIDER_ERROR": sym.STATE_FAILED,
+    "INVALID_MODEL": sym.STATE_FAILED,
+    "BLOCKED": sym.STATE_FAILED,
+    "INSUFFICIENT_CREDITS": sym.STATE_FAILED,
+    "UNKNOWN_ERROR": sym.STATE_FAILED,
+    "ERROR": sym.STATE_FAILED,
 }
 
 # Most recent Test Models payload — powers the compact message and the
@@ -1381,8 +1382,8 @@ def _render_test_results(
 
     lines = ["**Model Tests**\n"]
     lines.append(
-        f"_✓ {s('available')} · × {s('failed')} · × rate {s('rate_limited')} · · not configured {s('not_configured')} · "
-        f"× invalid {s('invalid')} · × no credits {s('insufficient_credits')}_"
+        f"_{sym.OP_SAVE} {s('available')} · {sym.STATE_FAILED} {s('failed')} · {sym.STATE_FAILED} rate {s('rate_limited')} · · not configured {s('not_configured')} · "
+        f"{sym.STATE_FAILED} invalid {s('invalid')} · {sym.STATE_FAILED} no credits {s('insufficient_credits')}_"
     )
     lines.append("")
     lines.append(_current_model_line(active_provider, active_model))
@@ -1394,15 +1395,15 @@ def _render_test_results(
     usable_sorted = _usable_results(results)
 
     if usable_sorted:
-        lines.append("**✓ Usable Models**")
+        lines.append(f"**{sym.OP_SAVE} Usable Models**")
         current_provider = None
         for r in usable_sorted:
             provider = r.get("provider", "?")
             if provider != current_provider:
                 current_provider = provider
-                lines.append(f"◇ **{r.get('display_name', provider)}**")
+                lines.append(f"{sym.ICON_MODEL} **{r.get('display_name', provider)}**")
             is_active = bool(active_model) and provider == active_provider and r.get("model") == active_model
-            mark = "◉" if is_active else "•"
+            mark = sym.MEDIA_VOICE if is_active else sym.BULLET
             free_tag = " ·free" if r.get("is_free") else ""
             lines.append(f"{mark} `{_short_model_name(r.get('model', '?'))}`{free_tag}")
         lines.append("")
@@ -1412,7 +1413,7 @@ def _render_test_results(
 
     failed = [r for r in results if r.get("status") != "AVAILABLE"]
     if failed:
-        lines.append(f"**× Not usable: {len(failed)}**")
+        lines.append(f"**{sym.STATE_FAILED} Not usable: {len(failed)}**")
         for r in failed[:8]:
             status = r.get("status", "UNKNOWN_ERROR")
             icon = _TEST_STATUS_ICONS.get(status, "×")
@@ -1442,7 +1443,7 @@ def _render_test_results(
         for r in page_models[i:i + columns]:
             provider = r.get("provider", "?")
             is_active = bool(active_model) and provider == active_provider and r.get("model") == active_model
-            mark = "◉" if is_active else "✓"
+            mark = sym.MEDIA_VOICE if is_active else sym.OP_SAVE
             label = f"{mark} {r.get('display_name', provider)} — {_short_model_name(r.get('model', '?'))}"
             if r.get("is_free"):
                 label += " ·free"
@@ -1454,15 +1455,15 @@ def _render_test_results(
     if total_pages > 1:
         nav: list[tuple[str, str]] = []
         if page > 0:
-            nav.append(("‹ Prev", f"action:ai_test_page:{page - 1}"))
+            nav.append((sym.label(sym.OP_PREV, "Prev"), f"action:ai_test_page:{page - 1}"))
         nav.append((f"{page + 1}/{total_pages}", "panel:_nav:noop"))
         if page < total_pages - 1:
-            nav.append(("Next ›", f"action:ai_test_page:{page + 1}"))
+            nav.append((sym.label(sym.OP_NEXT, "Next"), f"action:ai_test_page:{page + 1}"))
         builder.add_buttons(*nav)
-    builder.add_row("↻ Re-run Tests", "action:ai_test_models")
+    builder.add_row(sym.label(sym.OP_REFRESH, "Re-run Tests"), "action:ai_test_models")
     if results:
         builder.add_row("⌕ All Results", "action:ai_test_details")
-    builder.add_row("≡ Pick Model", "panel:ai_model")
+    builder.add_row(sym.label(sym.CONTENT_STATIC, "Pick Model"), "panel:ai_model")
     builder.add_row("Overview", "panel:ai")
     _nav_buttons(builder)
     return "\n".join(lines).rstrip(), builder.build()
@@ -1490,7 +1491,7 @@ async def _ai_test_models_action(event, extra: str, chat_id: int) -> tuple[str, 
     # instead of racing a second tester pass.
     if _test_running:
         builder = InlinePanelBuilder()
-        builder.add_row("⌂ Home", "panel:_nav:home")
+        builder.add_row(sym.label(sym.OP_HOME, "Home"), "panel:_nav:home")
         return (
             "Test Modules",
             f"◌ Already running — this panel will update when done.\n\n{_runtime_pair_line()}",
@@ -1503,7 +1504,7 @@ async def _ai_test_models_action(event, extra: str, chat_id: int) -> tuple[str, 
         name="ai_test_models:run",
     )
     builder = InlinePanelBuilder()
-    builder.add_row("⌂ Home", "panel:_nav:home")
+    builder.add_row(sym.label(sym.OP_HOME, "Home"), "panel:_nav:home")
     builder.add_row("Overview", "panel:ai")
     return (
         "Test Modules",
@@ -1567,8 +1568,8 @@ async def _ai_test_details_action(event, extra: str, chat_id: int) -> tuple[str,
         lines.append("")
 
     builder = InlinePanelBuilder()
-    builder.add_row("↻ Re-run Tests", "action:ai_test_models")
-    builder.add_row("≡ Pick Model", "panel:ai_model")
+    builder.add_row(sym.label(sym.OP_REFRESH, "Re-run Tests"), "action:ai_test_models")
+    builder.add_row(sym.label(sym.CONTENT_STATIC, "Pick Model"), "panel:ai_model")
     _nav_buttons(builder)
     return "Test Modules", "\n".join(lines).rstrip(), builder.build()
 
@@ -1647,9 +1648,9 @@ async def _ai_temperature_input(text, chat_id, msg_id, inline_chat_id, inline_ms
         if 0.0 <= val <= 2.0:
             from backend.ai.config_store import update_setting
             await update_setting(owner_id, "temperature", val)
-            result = f"✓ Creativity set to {val}"
+            result = f"{sym.OP_SAVE} Creativity set to {val}"
         else:
-            result = "× Creativity must be 0.0–2.0"
+            result = f"{sym.STATE_FAILED} Creativity must be 0.0–2.0"
     await _finish_input(
         result, _ai_settings_adv_panel_handler,
         chat_id, msg_id, inline_chat_id, inline_msg_id,
@@ -1661,14 +1662,14 @@ async def _ai_max_tokens_input(text, chat_id, msg_id, inline_chat_id, inline_msg
     try:
         val = int(text.strip())
     except ValueError:
-        result = "× Enter a number like 4096"
+        result = f"{sym.STATE_FAILED} Enter a number like 4096"
     else:
         if val > 0:
             from backend.ai.config_store import update_setting
             await update_setting(owner_id, "max_tokens", val)
-            result = f"✓ Response length set to {val:,} tokens"
+            result = f"{sym.OP_SAVE} Response length set to {val:,} tokens"
         else:
-            result = "× Must be positive."
+            result = f"{sym.STATE_FAILED} Must be positive."
     await _finish_input(
         result, _ai_settings_adv_panel_handler,
         chat_id, msg_id, inline_chat_id, inline_msg_id,
@@ -1680,14 +1681,14 @@ async def _ai_history_budget_input(text, chat_id, msg_id, inline_chat_id, inline
     try:
         val = int(text.strip())
     except ValueError:
-        result = "× Enter a number like 4000"
+        result = f"{sym.STATE_FAILED} Enter a number like 4000"
     else:
         if val > 0:
             from backend.ai.config_store import update_setting
             await update_setting(owner_id, "history_budget", val)
-            result = f"✓ Memory set to {val:,} tokens"
+            result = f"{sym.OP_SAVE} Memory set to {val:,} tokens"
         else:
-            result = "× Must be positive."
+            result = f"{sym.STATE_FAILED} Must be positive."
     await _finish_input(
         result, _ai_settings_adv_panel_handler,
         chat_id, msg_id, inline_chat_id, inline_msg_id,
@@ -1699,20 +1700,20 @@ async def _ai_trigger_en_input(text, chat_id, msg_id, inline_chat_id, inline_msg
     if text_stripped.lower() == "clear":
         from backend.ai.config_store import update_setting
         await update_setting(await _get_owner_id(), "trigger_en", "")
-        result = "✓ English wake word cleared."
+        result = f"{sym.OP_SAVE} English wake word cleared."
     elif " " in text_stripped:
-        result = "× Wake word must be a single word."
+        result = f"{sym.STATE_FAILED} Wake word must be a single word."
     else:
         config = await _get_saved_config(await _get_owner_id())
         existing_fa = config.get("trigger_fa", "") or ""
         if text_stripped and existing_fa and text_stripped.lower() == existing_fa.lower():
-            result = "× English wake word must differ from the Persian one."
+            result = f"{sym.STATE_FAILED} English wake word must differ from the Persian one."
         else:
             from backend.ai.config_store import update_setting
             await update_setting(await _get_owner_id(), "trigger_en", text_stripped)
             result = (
-                f"✓ English wake word set to `{text_stripped}`"
-                if text_stripped else "✓ English wake word cleared."
+                f"{sym.OP_SAVE} English wake word set to `{text_stripped}`"
+                if text_stripped else f"{sym.OP_SAVE} English wake word cleared."
             )
     await _finish_input(
         result, _ai_settings_panel_handler,
@@ -1725,20 +1726,20 @@ async def _ai_trigger_fa_input(text, chat_id, msg_id, inline_chat_id, inline_msg
     if text_stripped.lower() == "clear":
         from backend.ai.config_store import update_setting
         await update_setting(await _get_owner_id(), "trigger_fa", "")
-        result = "✓ Persian wake word cleared."
+        result = f"{sym.OP_SAVE} Persian wake word cleared."
     elif " " in text_stripped:
-        result = "× Wake word must be a single word."
+        result = f"{sym.STATE_FAILED} Wake word must be a single word."
     else:
         config = await _get_saved_config(await _get_owner_id())
         existing_en = config.get("trigger_en", "") or ""
         if text_stripped and existing_en and text_stripped.lower() == existing_en.lower():
-            result = "× Persian wake word must differ from the English one."
+            result = f"{sym.STATE_FAILED} Persian wake word must differ from the English one."
         else:
             from backend.ai.config_store import update_setting
             await update_setting(await _get_owner_id(), "trigger_fa", text_stripped)
             result = (
-                f"✓ Persian wake word set to `{text_stripped}`"
-                if text_stripped else "✓ Persian wake word cleared."
+                f"{sym.OP_SAVE} Persian wake word set to `{text_stripped}`"
+                if text_stripped else f"{sym.OP_SAVE} Persian wake word cleared."
             )
     await _finish_input(
         result, _ai_settings_panel_handler,
@@ -1752,10 +1753,10 @@ async def _ai_system_prompt_input(text, chat_id, msg_id, inline_chat_id, inline_
     stripped = text.strip()
     if stripped.lower() == "reset":
         await update_setting(owner_id, "system_prompt", "")
-        result = "✓ Personality prompt reset to default."
+        result = f"{sym.OP_SAVE} Personality prompt reset to default."
     else:
         await update_setting(owner_id, "system_prompt", stripped)
-        result = "✓ Personality prompt updated."
+        result = f"{sym.OP_SAVE} Personality prompt updated."
     await _finish_input(
         result, _ai_settings_adv_panel_handler,
         chat_id, msg_id, inline_chat_id, inline_msg_id,
@@ -1764,7 +1765,7 @@ async def _ai_system_prompt_input(text, chat_id, msg_id, inline_chat_id, inline_
 
 def register(client, owner_id: int) -> None:
     try:
-        register_panel("ai", _ai_main_panel_handler, parent="menu", title="◉ AI")
+        register_panel("ai", _ai_main_panel_handler, parent="menu", title=f"{sym.MEDIA_VOICE} AI")
         register_inline_builder("ai", _ai_main_inline_builder)
         register_panel("ai_provider", _ai_provider_panel_handler, parent="ai", title="◈ Provider")
         register_inline_builder("ai_provider", _ai_provider_inline_builder)
@@ -1774,15 +1775,15 @@ def register(client, owner_id: int) -> None:
         register_inline_builder("ai_model", _ai_model_inline_builder)
         register_panel("ai_wizard", _ai_wizard_panel_handler, parent="ai", title="Setup")
         register_inline_builder("ai_wizard", _ai_wizard_inline_builder)
-        register_panel("ai_settings", _ai_settings_panel_handler, parent="ai", title="⚙ Settings")
+        register_panel("ai_settings", _ai_settings_panel_handler, parent="ai", title="Settings")
         register_inline_builder("ai_settings", _ai_settings_inline_builder)
         register_panel("ai_settings_adv", _ai_settings_adv_panel_handler, parent="ai_settings", title="Advanced")
         register_inline_builder("ai_settings_adv", _ai_settings_adv_inline_builder)
-        register_panel("ai_usage", _ai_usage_panel_handler, parent="ai", title="▤ Usage")
+        register_panel("ai_usage", _ai_usage_panel_handler, parent="ai", title="Usage")
         register_inline_builder("ai_usage", _ai_usage_inline_builder)
-        register_panel("ai_health", _ai_health_panel_handler, parent="ai", title="✚ Health")
+        register_panel("ai_health", _ai_health_panel_handler, parent="ai", title="Health")
         register_inline_builder("ai_health", _ai_health_inline_builder)
-        register_panel("ai_details", _ai_details_panel_handler, parent="ai", title="⌕ Details")
+        register_panel("ai_details", _ai_details_panel_handler, parent="ai", title="Details")
         register_inline_builder("ai_details", _ai_details_inline_builder)
         register_panel("ai_diagnostics", _ai_diagnostics_panel_handler, parent="ai", title="⊞ Diagnostics")
         register_inline_builder("ai_diagnostics", _ai_diagnostics_inline_builder)

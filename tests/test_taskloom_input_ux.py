@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from backend.helper import symbols as sym
 
 from backend.ai.database.task_repository import InMemoryTaskRepository
 
@@ -100,9 +101,9 @@ def test_field_input_prompt_offers_back_and_a_real_cancel(wizard, monkeypatch):
 
     # Back re-opens the wizard (same step, draft intact) — never a stack pop
     # and never the main menu.
-    assert ("← Back", "panel:taskloom_new") in pairs
+    assert ("❮ Back", "panel:taskloom_new") in pairs
     assert "panel:_nav:back" not in data
-    assert ("✕ Cancel", "action:taskloom_wizard:cancel") in pairs
+    assert (f"{sym.STATE_FAILED} Cancel", "action:taskloom_wizard:cancel") in pairs
     assert "Cancel" not in labels
 
 
@@ -114,7 +115,9 @@ def test_every_wizard_input_registers_the_back_and_cancel_rows(wizard):
                   "weekly", "once", "tz", "font"):
         config = panels.get_input("taskloom_new", field)
         assert config is not None, field
-        assert config["extra_rows"] == (("✕ Cancel", "action:taskloom_wizard:cancel"),)
+        assert config["extra_rows"] == (
+            (f"{sym.STATE_FAILED} Cancel", "action:taskloom_wizard:cancel", "danger"),
+        )
         assert "back" not in config  # the shared default (the panel itself) applies
 
 
@@ -352,8 +355,8 @@ def test_edit_hub_back_returns_to_the_task_detail_and_keeps_the_draft(wizard, mo
 
     title, body, buttons = handler._wizard_render(handler._draft(OWNER))
     rows = _pairs(buttons)
-    back = [pair for pair in rows if pair[0].startswith("← Back")]
-    assert back == [("← Back", "action:taskloom_wizard:leave")]
+    back = [pair for pair in rows if pair[0].startswith("❮ Back")]
+    assert back == [("❮ Back", "action:taskloom_wizard:leave")]
     assert "panel:_nav:back" not in [value for _label, value in rows]
 
     title, body, _buttons = _run(handler._wizard_action(None, "leave", 1))
@@ -434,7 +437,7 @@ def test_field_input_back_inside_an_edit_reopens_the_editor_not_taskloom_home(wi
     _run(panels._handle_input(object(), "taskloom_new:interval", OWNER, 111, 222))
     _text, buttons = captured[-1]
     pairs = _pairs(buttons)
-    assert ("← Back", "panel:taskloom_new") in pairs
+    assert ("❮ Back", "panel:taskloom_new") in pairs
 
     # Dispatch exactly that callback target.
     rendered: list = []

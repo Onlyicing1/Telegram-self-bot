@@ -34,6 +34,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from backend.helper import symbols as sym
 
 from backend.ai.context.provenance import (
     AI_PROVENANCE_MARKER,
@@ -752,7 +753,7 @@ async def test_failure_does_not_render_as_a_successful_answer():
     final = _without_bidi_controls(captured["edits"][-1])
 
     assert "└" not in final and "┘" not in final
-    assert "temporarily unavailable" in final or "✕" in final
+    assert "temporarily unavailable" in final or sym.STATE_FAILED in final
 
 
 # ── delivery / chunking keep the contract ────────────────────────────────────

@@ -327,7 +327,7 @@ async def test_reply_input_failure_is_honest_and_consumes_state(monkeypatch):
         await handler_module._ghost_reply_input_handler("hi", 60, 321, 60, 5)
 
     assert client.edited is not None
-    assert client.edited[0].startswith("❌ Send failed:")
+    assert client.edited[0].startswith("× Send failed:")
     assert get_reply(60) is None
 
 

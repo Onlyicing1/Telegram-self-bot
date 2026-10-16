@@ -19,6 +19,7 @@ existing ``TaskExecutionCoordinator`` retry boundary — it is never reported
 as a success and never silently swallowed.
 """
 from __future__ import annotations
+from backend.helper import symbols as sym
 
 from typing import Any
 
@@ -139,6 +140,6 @@ class SendMessageTool(Tool):
             )
         return ToolResult(
             success=True,
-            message=f"📨 Sent to chat {chat_id}.",
+            message=f"{sym.ICON_SEND} Sent to chat {chat_id}.",
             data={"text": text, "chat_id": int(chat_id)},
         )

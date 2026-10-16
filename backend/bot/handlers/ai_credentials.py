@@ -60,6 +60,7 @@ Dispatch, registration and navigation all use the ONE shared helper registry —
 no parallel UI framework and no second registry.
 """
 from __future__ import annotations
+from backend.helper import symbols as sym
 
 import logging
 from typing import Any, Awaitable, Callable
@@ -73,6 +74,7 @@ from backend.helper import (
     render,
 )
 from backend.services import credential_service
+from backend.helper.styles import PRIMARY, SUCCESS
 
 logger = logging.getLogger(__name__)
 
@@ -270,7 +272,7 @@ async def _provider_panel(owner_id: int, provider: str) -> tuple[str, str, list]
         ),
         back=f"panel:ai_cred_prov:{provider}",
     )
-    builder.add_row("➕ Add credential", f"input:{_INPUT_SCOPE}:secret_add_{provider}")
+    builder.add_row(sym.label(sym.OP_CREATE, "Add credential"), f"input:{_INPUT_SCOPE}:secret_add_{provider}")
     _nav_buttons(builder)
     return label, "\n".join(lines), builder.build()
 
@@ -283,7 +285,7 @@ async def _credential_panel(owner_id: int, handle: str) -> tuple[str, str, list]
         _nav_buttons(builder)
         return (
             "Credential",
-            "**Credential**\n\n× That credential is not there any more — reopen the "
+            f"**Credential**\n\n{sym.STATE_FAILED} That credential is not there any more — reopen the "
             "provider to refresh.",
             builder.build(),
         )
@@ -352,7 +354,7 @@ async def _credential_panel(owner_id: int, handle: str) -> tuple[str, str, list]
     builder.add_row("Replace key…", f"input:{_INPUT_SCOPE}:secret_replace_{item.handle}")
     if testable:
         builder.add_row("Test key", f"action:ai_cred_test:{item.handle}")
-    builder.add_row("🗑 Delete", f"action:ai_cred_delete:{item.handle}")
+    builder.add_row(sym.label(sym.OP_DELETE, "Delete"), f"action:ai_cred_delete:{item.handle}", PRIMARY)
     _nav_buttons(builder)
     return "Credential", "\n".join(lines), builder.build()
 
@@ -390,7 +392,7 @@ async def _ai_cred_prov_panel_handler(event, extra: str) -> tuple[str, str, list
     provider = str(extra or "").strip()
     if not credential_service.is_registered_provider(provider):
         title, body, buttons = await _credentials_root(await _owner_id())
-        return title, f"× Unknown provider — nothing changed.\n\n{body}", buttons
+        return title, f"{sym.STATE_FAILED} Unknown provider — nothing changed.\n\n{body}", buttons
     return await _provider_panel(await _owner_id(), provider)
 
 
@@ -457,16 +459,16 @@ async def _ai_cred_toggle_action(event, extra: str, chat_id: int) -> tuple[str, 
     owner = await _owner_id()
     item = await credential_service.resolve_handle(owner, handle)
     if item is None:
-        return await _credential_with_notice(handle, "× That credential is gone — reopen the provider.")
+        return await _credential_with_notice(handle, f"{sym.STATE_FAILED} That credential is gone — reopen the provider.")
 
     outcome = await credential_service.update_metadata(
         owner, item.credential_id, enabled=not item.enabled,
     )
     if not outcome.ok:
-        return await _credential_with_notice(handle, f"× {outcome.reason_label}.")
+        return await _credential_with_notice(handle, f"{sym.STATE_FAILED} {outcome.reason_label}.")
     await credential_service.refresh_provider(item.provider)
     word = "enabled" if not item.enabled else "disabled"
-    return await _credential_with_notice(handle, f"✓ {item.label} {word}")
+    return await _credential_with_notice(handle, f"{sym.OP_SAVE} {item.label} {word}")
 
 
 async def _move_priority(handle: str, delta: int) -> tuple[str, str, list]:
@@ -474,7 +476,7 @@ async def _move_priority(handle: str, delta: int) -> tuple[str, str, list]:
     owner = await _owner_id()
     item = await credential_service.resolve_handle(owner, handle)
     if item is None:
-        return await _credential_with_notice(handle, "× That credential is gone — reopen the provider.")
+        return await _credential_with_notice(handle, f"{sym.STATE_FAILED} That credential is gone — reopen the provider.")
 
     target = max(
         credential_service.MIN_PRIORITY,
@@ -486,9 +488,9 @@ async def _move_priority(handle: str, delta: int) -> tuple[str, str, list]:
 
     outcome = await credential_service.update_metadata(owner, item.credential_id, priority=target)
     if not outcome.ok:
-        return await _credential_with_notice(handle, f"× {outcome.reason_label}.")
+        return await _credential_with_notice(handle, f"{sym.STATE_FAILED} {outcome.reason_label}.")
     await credential_service.refresh_provider(item.provider)
-    return await _credential_with_notice(handle, f"✓ {item.label} · priority {target}")
+    return await _credential_with_notice(handle, f"{sym.OP_SAVE} {item.label} · priority {target}")
 
 
 async def _ai_cred_up_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
@@ -505,7 +507,7 @@ async def _ai_cred_test_action(event, extra: str, chat_id: int) -> tuple[str, st
     owner = await _owner_id()
     item = await credential_service.resolve_handle(owner, handle)
     if item is None:
-        return await _credential_with_notice(handle, "× That credential is gone — reopen the provider.")
+        return await _credential_with_notice(handle, f"{sym.STATE_FAILED} That credential is gone — reopen the provider.")
 
     result = await credential_service.test_credential(owner, item.credential_id)
     return await _credential_with_notice(handle, _test_notice(result))
@@ -513,7 +515,7 @@ async def _ai_cred_test_action(event, extra: str, chat_id: int) -> tuple[str, st
 
 def _test_notice(result: credential_service.CredentialTestResult) -> str:
     """ONE bounded owner-facing notice for a finished key test."""
-    mark = "✓" if result.passed else "×"
+    mark = sym.OP_SAVE if result.passed else sym.STATE_FAILED
     line = f"{mark} Key test · {result.state_label}"
     if result.failure_class:
         line += f" · {result.failure_class}"
@@ -528,7 +530,7 @@ async def _ai_cred_delete_action(event, extra: str, chat_id: int) -> tuple[str, 
     owner = await _owner_id()
     item = await credential_service.resolve_handle(owner, handle)
     if item is None:
-        return await _credential_with_notice(handle, "× That credential is gone — reopen the provider.")
+        return await _credential_with_notice(handle, f"{sym.STATE_FAILED} That credential is gone — reopen the provider.")
 
     title = credential_service.provider_label(item.provider)
     body = (
@@ -538,7 +540,7 @@ async def _ai_cred_delete_action(event, extra: str, chat_id: int) -> tuple[str, 
         "be undone._"
     )
     builder = InlinePanelBuilder()
-    builder.add_row("🗑 Delete now", f"action:ai_cred_delete_yes:{item.handle}")
+    builder.add_row(sym.label(sym.OP_DELETE, "Delete now"), f"action:ai_cred_delete_yes:{item.handle}", SUCCESS)
     _nav_buttons(builder)
     return title, body, builder.build()
 
@@ -549,13 +551,13 @@ async def _ai_cred_delete_yes_action(event, extra: str, chat_id: int) -> tuple[s
     owner = await _owner_id()
     item = await credential_service.resolve_handle(owner, handle)
     if item is None:
-        return await _credential_with_notice(handle, "× That credential is gone — reopen the provider.")
+        return await _credential_with_notice(handle, f"{sym.STATE_FAILED} That credential is gone — reopen the provider.")
 
     outcome = await credential_service.delete_credential(owner, item.credential_id)
     if not outcome.ok:
-        return await _credential_with_notice(handle, f"× Nothing was deleted — {outcome.reason_label}.")
+        return await _credential_with_notice(handle, f"{sym.STATE_FAILED} Nothing was deleted — {outcome.reason_label}.")
     await credential_service.refresh_provider(item.provider)
-    return await _provider_with_notice(item.provider, f"✓ Deleted {item.label} and its stored key")
+    return await _provider_with_notice(item.provider, f"{sym.OP_SAVE} Deleted {item.label} and its stored key")
 
 
 # ── Inputs ─────────────────────────────────────────────────────────────────
@@ -588,11 +590,11 @@ def _make_secret_add_handler(provider: str):
             await credential_service.refresh_provider(provider)
             item = outcome.credential
             notice = (
-                f"✓ Key added\n\n{credential_service.provider_label(item.provider)} · "
+                f"{sym.OP_SAVE} Key added\n\n{credential_service.provider_label(item.provider)} · "
                 f"{item.label}\n{item.state_word()} · priority {item.priority}"
             )
         else:
-            notice = f"× Nothing was stored — {outcome.reason_label}."
+            notice = f"{sym.STATE_FAILED} Nothing was stored — {outcome.reason_label}."
         await _finish_secret_input(
             notice,
             _restore(lambda: _provider_panel(owner, provider)),
@@ -612,9 +614,9 @@ def _make_secret_replace_handler(credential_id: str):
         outcome = await credential_service.replace_secret(owner, credential_id, text)
         if outcome.ok:
             await credential_service.refresh_provider(item.provider if item else "")
-            notice = "✓ Key replaced — the previous key is gone"
+            notice = f"{sym.OP_SAVE} Key replaced — the previous key is gone"
         else:
-            notice = f"× Nothing was changed — {outcome.reason_label}."
+            notice = f"{sym.STATE_FAILED} Nothing was changed — {outcome.reason_label}."
         await _finish_secret_input(
             notice,
             _restore(lambda: _credential_panel(owner, handle)),
@@ -632,16 +634,16 @@ def _make_label_handler(credential_id: str):
         item = await credential_service.credential(owner, credential_id)
         if item is None:
             await _finish_input(
-                "× That credential is gone — reopen the provider.",
+                f"{sym.STATE_FAILED} That credential is gone — reopen the provider.",
                 _restore(lambda: _credentials_root(owner)),
                 chat_id, msg_id, inline_chat_id, inline_msg_id,
             )
             return
         outcome = await credential_service.update_metadata(owner, credential_id, label=text)
         if outcome.ok and outcome.credential is not None:
-            notice = f"✓ Renamed to {outcome.credential.label}"
+            notice = f"{sym.OP_SAVE} Renamed to {outcome.credential.label}"
         else:
-            notice = f"× Nothing was changed — {outcome.reason_label}."
+            notice = f"{sym.STATE_FAILED} Nothing was changed — {outcome.reason_label}."
         await _finish_input(
             notice,
             _restore(lambda: _credential_panel(owner, item.handle)),
@@ -659,7 +661,7 @@ def _make_priority_handler(credential_id: str):
         item = await credential_service.credential(owner, credential_id)
         if item is None:
             await _finish_input(
-                "× That credential is gone — reopen the provider.",
+                f"{sym.STATE_FAILED} That credential is gone — reopen the provider.",
                 _restore(lambda: _credentials_root(owner)),
                 chat_id, msg_id, inline_chat_id, inline_msg_id,
             )
@@ -668,7 +670,7 @@ def _make_priority_handler(credential_id: str):
             priority = int(str(text).strip())
         except ValueError:
             notice = (
-                f"× Enter a whole number ({credential_service.MIN_PRIORITY}–"
+                f"{sym.STATE_FAILED} Enter a whole number ({credential_service.MIN_PRIORITY}–"
                 f"{credential_service.MAX_PRIORITY})."
             )
         else:
@@ -677,9 +679,9 @@ def _make_priority_handler(credential_id: str):
             )
             if outcome.ok and outcome.credential is not None:
                 await credential_service.refresh_provider(item.provider)
-                notice = f"✓ {item.label} · priority {outcome.credential.priority}"
+                notice = f"{sym.OP_SAVE} {item.label} · priority {outcome.credential.priority}"
             else:
-                notice = f"× Nothing was changed — {outcome.reason_label}."
+                notice = f"{sym.STATE_FAILED} Nothing was changed — {outcome.reason_label}."
         await _finish_input(
             notice,
             _restore(lambda: _credential_panel(owner, item.handle)),

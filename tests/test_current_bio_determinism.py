@@ -22,6 +22,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from backend.helper import symbols as sym
 
 
 ENGINE_STATE = "NatN. disalle"        # Bio Engine last_bio — must NEVER appear
@@ -323,7 +324,7 @@ async def test_empty_authoritative_bio_is_success_with_empty_data():
 
     assert result.success is True
     assert result.data == {"bio": ""}
-    assert "📝 Bio: —" in result.message
+    assert f"{sym.OP_EDIT} Bio: —" in result.message
 
 
 # ── 5. Exactly one get_bio tool; bio_show remains distinct ──

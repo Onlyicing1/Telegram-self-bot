@@ -24,6 +24,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from backend.helper import symbols as sym
+
 from backend.ai.database.task_repository import InMemoryTaskRepository
 from backend.ai.preparation_policy import (
     PreparationPolicyError,
@@ -577,7 +579,7 @@ async def test_label_free_bio_still_shares_the_one_guardian_window(_guardian_env
 
     executor, ctx = _real_bio_registry(owner=9)
     first = await bio_service.do_text(9, "manual bio", tz_str="UTC")
-    assert first.startswith("✅"), first
+    assert first.startswith(sym.OP_SAVE), first
     assert bio_guardian.seconds_until_bio_mutation_allowed() > 0
 
     # The label-free presentation output goes through the SAME boundary.

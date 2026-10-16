@@ -40,13 +40,17 @@ from backend.helper.panels import (
     InlinePanelBuilder,
     register_action,
     register_panel,
+    set_panel_nav_free,
 )
 from backend.helper.input_state import set_pending
 from backend.services import emoji_category_service as cat_service
 from backend.services import emoji_state_service as state_service
 from backend.services import premium_emoji_direct_service as premium_direct_service
+from backend.services import premium_emoji_diagnostics as diag_service
 from backend.services import premium_emoji_inline_service as premium_inline_service
 from backend.services import premium_emoji_probe_service as probe_service
+from backend.helper.styles import DANGER, PRIMARY, SUCCESS
+from backend.helper import symbols as sym
 from backend.services import reaction_service
 from backend.services.emoji_library_service import import_from_saved_messages
 
@@ -76,8 +80,6 @@ _MAPPING_PANEL = "emoji_map"
 _PICKER_PANEL = "emoji_pick"
 _REPLACEMENT_PANEL = "emoji_replacement"
 _STATE_SCOPE_PICKER_PANEL = "emoji_state_scope"
-_COMPOSE_PANEL = "emoji_compose"
-_SOURCE_PICKER_PANEL = "emoji_sources"
 
 
 async def _emoji_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
@@ -88,27 +90,24 @@ async def _emoji_panel_handler(event, extra: str) -> tuple[str, str, list] | Non
     if owner:
         _rows, total = await db_client.list_emoji_entries(owner, limit=1, offset=0)
 
-    lines = ["😀 **Emoji Library**", ""]
+    lines = [f"{sym.ICON_DIAGNOSTIC} **Emoji Diagnostics**", ""]
     if total is None:
         lines.append("_Library size unknown._")
     elif total == 0:
-        lines.append("_Empty — run Import to scan Saved Messages._")
+        lines.append("_Library empty._")
     else:
-        lines.append(f"{total} custom emoji")
+        lines.append(f"{total} custom emoji in the library")
     if owner:
         enabled = await state_service.replacement_enabled(owner)
-        lines.append("")
-        lines.append(f"Replacement: {'✅ ON' if enabled else '❌ OFF'}")
+        lines.append(f"Replacement: {sym.STATE_COMPLETED} ON" if enabled else f"Replacement: {sym.STATE_FAILED} OFF")
+    lines.append("")
+    lines.append(
+        "Tap **Run Emoji Diagnostics** to execute the real premium-emoji send "
+        "path and see a step-by-step trace of what actually happened."
+    )
     builder = InlinePanelBuilder()
-    builder.add_row("✨ Send Premium Emoji", f"action:{_INLINE_ACTION}")
-    builder.add_row("⬇ Import from Saved Messages", "action:emoji_import")
-    builder.add_row("💬 React to a message", "action:emoji_react")
-    builder.add_row("🧪 POC · helper-bot sent emoji", f"action:{_PROBE_ACTION}")
-    builder.add_row("🧪 Live test · direct self-chat", f"action:{_DIRECT_ACTION}")
-    builder.add_row("📚 Library", f"panel:{_LIBRARY_PANEL}")
-    builder.add_row("🗂 Categories", f"panel:{_CATEGORIES_PANEL}")
-    builder.add_row("🔁 Replacement", f"panel:{_REPLACEMENT_PANEL}")
-    return "Emoji", "\n".join(lines), builder.build()
+    builder.add_row(_DIAGNOSTICS_LABEL, f"action:{_DIAGNOSTICS_ACTION}")
+    return "Emoji Diagnostics", "\n".join(lines), builder.build()
 
 
 # ── per-owner flow draft (server-side buffer, Bio-builder convention) ─────────
@@ -173,12 +172,12 @@ def _report_lines(report: dict[str, Any]) -> list[str]:
     """Concise, honest report body — failure first, counters second."""
     lines: list[str] = []
     if report.get("error"):
-        lines.append(f"✗ {report['error']}")
+        lines.append(f"{sym.STATE_FAILED} {report['error']}")
     elif not report.get("ok"):
-        lines.append(f"✗ {report.get('failed', 0)} record(s) failed to save")
+        lines.append(f"{sym.STATE_FAILED} {report.get('failed', 0)} record(s) failed to save")
     elif report.get("degraded"):
         if report.get("set_error"):
-            lines.append(f"◌ {report['set_error']}")
+            lines.append(f"{sym.MEDIA_UNKNOWN} {report['set_error']}")
         else:
             degraded = []
             if report.get("unresolved_documents"):
@@ -187,9 +186,9 @@ def _report_lines(report: dict[str, Any]) -> list[str]:
                 degraded.append(f"{report['documents_without_set']} without set info")
             if report.get("hit_set_limit") or report.get("hit_set_member_limit"):
                 degraded.append("set scan budget reached")
-            lines.append("◌ Partial set enrichment — " + ", ".join(degraded))
+            lines.append(f"{sym.MEDIA_UNKNOWN} Partial set enrichment — " + ", ".join(degraded))
     else:
-        lines.append("✓ Import complete")
+        lines.append(f"{sym.OP_SAVE} Import complete")
 
     lines.append("")
     lines.append(
@@ -224,8 +223,8 @@ def _report_lines(report: dict[str, Any]) -> list[str]:
 def _render_report(report: dict[str, Any]) -> tuple[str, str, list]:
     body = "\n".join(_report_lines(report))
     builder = InlinePanelBuilder()
-    builder.add_row("↻ Import again", "action:emoji_import")
-    builder.add_row("📚 Library", f"panel:{_LIBRARY_PANEL}")
+    builder.add_row(sym.label(sym.OP_REFRESH, "Import again"), "action:emoji_import")
+    builder.add_row(sym.label(sym.ICON_LIBRARY, "Library"), f"panel:{_LIBRARY_PANEL}")
     return "Emoji Import", body, builder.build()
 
 
@@ -271,11 +270,11 @@ async def _library_page_handler(event, extra: str) -> tuple[str, str, list] | No
         )
 
     builder = InlinePanelBuilder()
-    lines = [f"📚 **Emoji Library** — {total}", ""]
+    lines = [f"{sym.ICON_LIBRARY} **Emoji Library** — {total}", ""]
     if not rows:
-        lines = [f"📚 **Emoji Library** — {total}", "", "_Empty._"]
+        lines = [f"{sym.ICON_LIBRARY} **Emoji Library** — {total}", "", "_Empty._"]
     else:
-        lines = [f"📚 **Emoji Library** — {total} · page {page + 1}/{_page_count(total)}"]
+        lines = [f"{sym.ICON_LIBRARY} **Emoji Library** — {total} · page {page + 1}/{_page_count(total)}"]
         for i in range(0, len(rows), 2):
             pair = []
             for j in (i, i + 1):
@@ -290,7 +289,7 @@ async def _library_page_handler(event, extra: str) -> tuple[str, str, list] | No
             builder.add_buttons(
                 ("◀", f"panel:{_LIBRARY_PANEL}:{page - 1}" if page else f"panel:{_LIBRARY_PANEL}"),
                 (f"{page + 1}/{page_count}", f"panel:{_LIBRARY_PANEL}:{page}"),
-                ("▶", f"panel:{_LIBRARY_PANEL}:{page + 1}"),
+                (sym.OP_RESUME, f"panel:{_LIBRARY_PANEL}:{page + 1}"),
             )
     return "Library", "\n".join(lines), builder.build()
 
@@ -356,13 +355,13 @@ async def _render_categories(
         lines.append(notice)
         lines.append("")
     if not rows:
-        lines.append(f"🗂 **Categories** — {total}")
+        lines.append(f"{sym.ICON_CATEGORY} **Categories** — {total}")
         lines.append("")
         lines.append("_No categories yet. Create one to start mapping._")
     else:
         page_count = _page_count(total)
         lines.append(
-            f"🗂 **Categories** — {total} · page {page + 1}/{page_count}"
+            f"{sym.ICON_CATEGORY} **Categories** — {total} · page {page + 1}/{page_count}"
         )
         for i in range(0, len(rows), 2):
             pair = []
@@ -371,10 +370,6 @@ async def _render_categories(
                     break
                 row = rows[j]
                 name = _truncate(str(row.get("name") or "?"))
-                if cat_service.is_custom_category(row):
-                    # the 🧩 marker is rendered from the explicit row TYPE,
-                    # never inferred from the name (ROADMAP §26)
-                    name = f"🧩 {name}"
                 label = f"{name} · {_count_label(counts, row.get('id'))}"
                 pair.append((label, f"panel:{_CATEGORY_PANEL}:{page}:{j}"))
             builder.add_buttons(*pair)
@@ -382,10 +377,9 @@ async def _render_categories(
             builder.add_buttons(
                 ("◀", f"panel:{_CATEGORIES_PANEL}:{page - 1}" if page else f"panel:{_CATEGORIES_PANEL}"),
                 (f"{page + 1}/{page_count}", f"panel:{_CATEGORIES_PANEL}:{page}"),
-                ("▶", f"panel:{_CATEGORIES_PANEL}:{page + 1}"),
+                (sym.OP_RESUME, f"panel:{_CATEGORIES_PANEL}:{page + 1}"),
             )
-    builder.add_row("＋ New category", "action:emoji_cat_new")
-    builder.add_row("🧩 New custom category", "action:emoji_cat_new_custom")
+    builder.add_row(sym.label(sym.OP_CREATE, "New category"), "action:emoji_cat_new")
     return "Categories", "\n".join(lines), builder.build()
 
 
@@ -407,10 +401,8 @@ async def _category_page_handler(event, extra: str) -> tuple[str, str, list] | N
         )
     cid = row.get("id")
     count_label = _count_label(counts, cid)
-    custom = cat_service.is_custom_category(row)
-    sources = cat_service.category_sources(row) if custom else []
     lines = [
-        f"{'🧩' if custom else '🗂'} **{row.get('name') or '?'}**",
+        f"{sym.ICON_CATEGORY} **{row.get('name') or '?'}**",
         "",
         (
             f"{count_label} mapping(s)"
@@ -418,23 +410,10 @@ async def _category_page_handler(event, extra: str) -> tuple[str, str, list] | N
             else "_Mapping count unknown — storage read failed._"
         ),
     ]
-    if custom:
-        lines.append(
-            f"Composed snapshot — {len(sources)} source(s), in precedence order."
-        )
-        lines.append(
-            "_Add sources below, then Compose. The snapshot never follows "
-            "source edits until you Refresh it._"
-            if not sources
-            else "_Source edits do not move the snapshot until you Refresh it._"
-        )
     builder = InlinePanelBuilder()
-    builder.add_row("🗺 Mappings", f"panel:{_MAPPINGS_PANEL}:{cid}:0")
-    if custom:
-        builder.add_row("🧩 Compose / sources", f"panel:{_COMPOSE_PANEL}:{cid}")
-        builder.add_row("🔄 Refresh snapshot", f"action:emoji_refresh:{cid}")
-    builder.add_row("✏️ Rename", f"action:emoji_cat_rename:{cid}")
-    builder.add_row("🗑 Delete", f"action:emoji_cat_del:{cid}")
+    builder.add_row(sym.label(sym.ICON_MAPPING, "Mappings"), f"panel:{_MAPPINGS_PANEL}:{cid}:0")
+    builder.add_row(sym.label(sym.OP_EDIT, "Rename"), f"action:emoji_cat_rename:{cid}")
+    builder.add_row(sym.label(sym.OP_DELETE, "Delete"), f"action:emoji_cat_del:{cid}", PRIMARY)
     return "Category", "\n".join(lines), builder.build()
 
 
@@ -449,7 +428,7 @@ async def _cat_new_action(event, extra: str, chat_id: int) -> tuple[str, str, li
         inline_chat_id=chat_id or 0, inline_msg_id=0,
     )
     builder = InlinePanelBuilder()
-    builder.add_row("← Back", f"panel:{_CATEGORIES_PANEL}")
+    builder.add_row(sym.label(sym.OP_BACK, "Back"), f"panel:{_CATEGORIES_PANEL}")
     return "New Category", "Send the category name as your next message.", builder.build()
 
 
@@ -467,52 +446,6 @@ async def _category_create_input_handler(
             "New Category",
             _category_error_text(result.get("error"), result.get("category")),
             "action:emoji_cat_new",
-        )
-    await _edit_inline(inline_chat_id, inline_msg_id, title, body, buttons)
-    await _delete_owner_message(chat_id, msg_id)
-
-
-async def _cat_new_custom_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
-    """Create a Custom Category (§26): explicit type metadata, empty until
-    the owner composes it from source categories."""
-    owner = get_owner_id()
-    prompt = (
-        "**New Custom Category**\n\nSend the name as your next message.\n\n"
-        "The category starts empty — you pick its source categories next."
-    )
-    set_pending(
-        owner, _MAIN_PANEL, _custom_category_create_input_handler,
-        chat_id, prompt,
-        inline_chat_id=chat_id or 0, inline_msg_id=0,
-    )
-    builder = InlinePanelBuilder()
-    builder.add_row("← Back", f"panel:{_CATEGORIES_PANEL}")
-    return (
-        "New Custom Category",
-        "Send the category name as your next message.",
-        builder.build(),
-    )
-
-
-async def _custom_category_create_input_handler(
-    text, chat_id, msg_id, inline_chat_id, inline_msg_id,
-):
-    from backend.helper.inline_engine import _owner_id
-
-    owner = _owner_id
-    result = await cat_service.create_category(owner, text, is_custom=True)
-    category = result.get("category") or {}
-    if result.get("ok") and isinstance(category.get("id"), int):
-        _set_draft(owner, kind="compose", category_id=category["id"], source_ids=[])
-        title, body, buttons = await _render_compose(
-            owner, category["id"],
-            notice="✓ Custom category created — add its source categories.",
-        )
-    else:
-        title, body, buttons = _error_panel(
-            "New Custom Category",
-            _category_error_text(result.get("error"), category),
-            "action:emoji_cat_new_custom",
         )
     await _edit_inline(inline_chat_id, inline_msg_id, title, body, buttons)
     await _delete_owner_message(chat_id, msg_id)
@@ -558,7 +491,7 @@ async def _cat_rename_action(event, extra: str, chat_id: int) -> tuple[str, str,
         inline_chat_id=chat_id or 0, inline_msg_id=0,
     )
     builder = InlinePanelBuilder()
-    builder.add_row("← Back", f"panel:{_CATEGORIES_PANEL}")
+    builder.add_row(sym.label(sym.OP_BACK, "Back"), f"panel:{_CATEGORIES_PANEL}")
     return "Rename Category", "Send the new name as your next message.", builder.build()
 
 
@@ -610,18 +543,13 @@ async def _cat_del_action(event, extra: str, chat_id: int) -> tuple[str, str, li
     count_text = str(count) if count is not None else "unknown number of"
     _set_draft(owner, kind="delete", category_id=cid, name=category.get("name"))
     body = (
-        f"⚠️ **Delete category “{category.get('name')}”?**\n\n"
+        f"{sym.STATE_WARNING} **Delete category “{category.get('name')}”?**\n\n"
         f"{count_text} mapping(s) will be removed with it.\n"
         "Library entries are NOT deleted."
     )
-    if cat_service.is_custom_category(category):
-        body += (
-            "\n\n_🧩 Composed category: its snapshot mappings are removed; "
-            "the source categories themselves are untouched._"
-        )
     builder = InlinePanelBuilder()
-    builder.add_row("🗑 Delete", "action:emoji_cat_delgo")
-    builder.add_row("✗ Cancel", f"panel:{_CATEGORIES_PANEL}:0")
+    builder.add_row(sym.label(sym.OP_DELETE, "Delete"), "action:emoji_cat_delgo", SUCCESS)
+    builder.add_row(sym.label(sym.STATE_FAILED, "Cancel"), f"panel:{_CATEGORIES_PANEL}:0", DANGER)
     return "Delete Category", body, builder.build()
 
 
@@ -637,7 +565,7 @@ async def _cat_delgo_action(event, extra: str, chat_id: int) -> tuple[str, str, 
     _clear_draft(owner)
     if result.get("ok"):
         notice = (
-            f"✓ Category deleted — {result.get('removed_mappings', 0)} mapping(s) "
+            f"{sym.OP_SAVE} Category deleted — {result.get('removed_mappings', 0)} mapping(s) "
             "removed. Library entries kept."
         )
         return await _render_categories(owner, "0", notice=notice)
@@ -649,11 +577,11 @@ async def _cat_delgo_action(event, extra: str, chat_id: int) -> tuple[str, str, 
         )
     if result.get("category_deleted"):
         notice = (
-            "✗ Category row could not be deleted — storage failed. "
+            f"{sym.STATE_FAILED} Category row could not be deleted — storage failed. "
             f"{result.get('removed_mappings', 0)} mapping(s) were already removed."
         )
     else:
-        notice = "✗ Delete failed — storage error. Nothing was changed."
+        notice = f"{sym.STATE_FAILED} Delete failed — storage error. Nothing was changed."
     return _error_panel("Delete Category", notice, f"panel:{_CATEGORIES_PANEL}")
 
 
@@ -687,27 +615,19 @@ async def _render_mappings(
     page_count = _page_count(total)
     wid = intw(cid)
     builder = InlinePanelBuilder()
-    custom = cat_service.is_custom_category(category)
     if notice:
-        lines: list[str] = [notice, "", f"🗺 **{category.get('name')}** — {total}"]
+        lines: list[str] = [notice, "", f"{sym.ICON_MAPPING} **{category.get('name')}** — {total}"]
     elif not rows:
         lines = [
-            f"🗺 **{category.get('name')}** — {total}", "",
-            "_No mappings yet — compose it from sources._" if custom
-            else "_No mappings yet. Add one below._",
+            f"{sym.ICON_MAPPING} **{category.get('name')}** — {total}", "",
+            "_No mappings yet. Add one below._",
         ]
     else:
         lines = [
-            f"🗺 **{category.get('name')}** — {total} · page {page + 1}/{page_count}",
+            f"{sym.ICON_MAPPING} **{category.get('name')}** — {total} · page {page + 1}/{page_count}",
             "",
             "_simple → premium:_",
         ]
-    if custom:
-        lines.extend([
-            "",
-            "_🧩 Composed category — this set is a snapshot of its sources; "
-            "Refresh rebuilds it._",
-        ])
     for j, row in enumerate(rows):
         entry = await cat_service._resolve_library_entry(
             owner, row.get("document_id")
@@ -731,13 +651,9 @@ async def _render_mappings(
         builder.add_buttons(
             ("◀", prev_data),
             (f"{page + 1}/{page_count}", f"panel:{_MAPPINGS_PANEL}::{page}:{wid}"),
-            ("▶", f"panel:{_MAPPINGS_PANEL}::{page + 1}:{wid}"),
+            (sym.OP_RESUME, f"panel:{_MAPPINGS_PANEL}::{page + 1}:{wid}"),
         )
-    if custom:
-        builder.add_row("🧩 Compose / sources", f"panel:{_COMPOSE_PANEL}:{cid}")
-        builder.add_row("🔄 Refresh snapshot", f"action:emoji_refresh:{cid}")
-    else:
-        builder.add_row("＋ Add mapping", f"action:emoji_map_new:{wid}")
+    builder.add_row(sym.label(sym.OP_CREATE, "Add mapping"), f"action:emoji_map_new:{wid}")
     return "Mappings", "\n".join(lines), builder.build()
 
 
@@ -767,16 +683,8 @@ async def _mapping_page_handler(event, extra: str) -> tuple[str, str, list] | No
     if entry_row is None:
         lines.append("_Library entry no longer exists._")
     builder = InlinePanelBuilder()
-    category = await cat_service.get_category(get_owner_id(), cid)
-    if cat_service.is_custom_category(category):
-        lines.append(
-            "_🧩 Composed category — manual mapping edits are disabled; "
-            "compose its sources and Refresh instead._"
-        )
-        builder.add_row("🧩 Compose / sources", f"panel:{_COMPOSE_PANEL}:{cid}")
-        return "Mapping", "\n".join(lines), builder.build()
-    builder.add_row("✏️ Change", f"action:emoji_map_edit:{row.get('simple_emoji')}:{wid}")
-    builder.add_row("🗑 Remove", f"action:emoji_map_del:{row.get('simple_emoji')}:{wid}")
+    builder.add_row(sym.label(sym.OP_EDIT, "Change"), f"action:emoji_map_edit:{row.get('simple_emoji')}:{wid}")
+    builder.add_row(sym.label(sym.OP_DELETE, "Remove"), f"action:emoji_map_del:{row.get('simple_emoji')}:{wid}", PRIMARY)
     return "Mapping", "\n".join(lines), builder.build()
 
 
@@ -797,21 +705,11 @@ async def _map_new_action(event, extra: str, chat_id: int) -> tuple[str, str, li
             "Add Mapping", "Category not found — it may have been deleted.",
             f"panel:{_CATEGORIES_PANEL}",
         )
-    if cat_service.is_custom_category(category):
-        # Snapshot coherence (§26): a composed category is edited by
-        # composing its sources, never by hand-written mappings that a
-        # Refresh would silently discard.
-        return _error_panel(
-            "Add Mapping",
-            "This is a composed category — add sources and Compose/Refresh "
-            "instead. Manual mapping edits are disabled.",
-            f"panel:{_COMPOSE_PANEL}:{cid}",
-        )
     _set_draft(owner, kind="map_emoji", category_id=cid)
     prompt = (
         "**Add Mapping — Step 1/2**\n\n"
         f"Category: **{category.get('name')}**\n\n"
-        "Send the SIMPLE emoji to be mapped (e.g. 🗑)."
+        f"Send the SIMPLE emoji to be mapped (e.g. {sym.OP_DELETE})."
     )
     set_pending(
         owner, _MAIN_PANEL, _map_emoji_input_handler,
@@ -819,7 +717,7 @@ async def _map_new_action(event, extra: str, chat_id: int) -> tuple[str, str, li
         inline_chat_id=chat_id or 0, inline_msg_id=0,
     )
     builder = InlinePanelBuilder()
-    builder.add_row("← Back", f"panel:{_MAPPINGS_PANEL}::0:{intw(cid)}")
+    builder.add_row(sym.label(sym.OP_BACK, "Back"), f"panel:{_MAPPINGS_PANEL}::0:{intw(cid)}")
     return "Add Mapping", "Send the simple emoji as your next message.", builder.build()
 
 
@@ -881,7 +779,7 @@ async def _render_picker(owner: int, extra: str) -> tuple[str, str, list]:
         )
     page_count = _page_count(total)
     builder = InlinePanelBuilder()
-    lines = [f"📚 **Pick premium emoji** for {emoji} · page {page + 1}/{page_count}"]
+    lines = [f"{sym.ICON_LIBRARY} **Pick premium emoji** for {emoji} · page {page + 1}/{page_count}"]
     for i in range(0, len(rows), 2):
         pair = []
         for j in (i, i + 1):
@@ -897,7 +795,7 @@ async def _render_picker(owner: int, extra: str) -> tuple[str, str, list]:
         builder.add_buttons(
             ("◀", f"panel:{_PICKER_PANEL}:{seed}:{page - 1}" if page else f"panel:{_PICKER_PANEL}:{seed}:0"),
             (f"{page + 1}/{page_count}", f"panel:{_PICKER_PANEL}:{seed}:{page}"),
-            ("▶", f"panel:{_PICKER_PANEL}:{seed}:{page + 1}"),
+            (sym.OP_RESUME, f"panel:{_PICKER_PANEL}:{seed}:{page + 1}"),
         )
     return "Pick Emoji", "\n".join(lines), builder.build()
 
@@ -937,7 +835,7 @@ async def _map_pick_action(event, extra: str, chat_id: int) -> tuple[str, str, l
     if result.get("ok"):
         _clear_draft(owner)
         return await _render_mappings(
-            owner, cid, 0, notice=f"✓ {emoji} mapped to {_entry_visual(result.get('new_entry'))}",
+            owner, cid, 0, notice=f"{sym.OP_SAVE} {emoji} mapped to {_entry_visual(result.get('new_entry'))}",
         )
     if result.get("conflict"):
         _set_draft(
@@ -965,15 +863,15 @@ def _render_conflict(
     current_entry = result.get("current_entry")
     new_entry = result.get("new_entry")
     body = (
-        "⚠️ **Mapping conflict**\n\n"
+        f"{sym.STATE_WARNING} **Mapping conflict**\n\n"
         f"{emoji} is already defined in this category:\n"
         f"**Current:** {_entry_visual(current_entry)}\n"
         f"**New:**     {_entry_visual(new_entry)}\n\n"
         "_Nothing has been overwritten._"
     )
     builder = InlinePanelBuilder()
-    builder.add_row("🔁 Replace", f"action:emoji_map_repl:{wid}:{emoji}")
-    builder.add_row("✗ Cancel", f"panel:{_MAPPINGS_PANEL}::0:{wid}")
+    builder.add_row(sym.label(sym.ICON_REACTION, "Replace"), f"action:emoji_map_repl:{wid}:{emoji}")
+    builder.add_row(sym.label(sym.STATE_FAILED, "Cancel"), f"panel:{_MAPPINGS_PANEL}::0:{wid}", DANGER)
     return "Mapping Conflict", body, builder.build()
 
 
@@ -1001,7 +899,7 @@ async def _map_repl_action(event, extra: str, chat_id: int) -> tuple[str, str, l
     if result.get("ok"):
         return await _render_mappings(
             owner, draft.get("category_id"), 0,
-            notice=f"✓ {emoji} now maps to #{draft.get('document_id')}",
+            notice=f"{sym.OP_SAVE} {emoji} now maps to #{draft.get('document_id')}",
         )
     if result.get("error") == cat_service.E_LIBRARY_MISSING:
         return _error_panel(
@@ -1044,14 +942,6 @@ async def _map_edit_action(event, extra: str, chat_id: int) -> tuple[str, str, l
             "Change Mapping", "Mapping not found — it may have been deleted.",
             f"panel:{_MAPPINGS_PANEL}::0:{wid}",
         )
-    category = await cat_service.get_category(owner, cid)
-    if cat_service.is_custom_category(category):
-        return _error_panel(
-            "Change Mapping",
-            "This is a composed category — change its sources and Refresh "
-            "instead. Manual mapping edits are disabled.",
-            f"panel:{_COMPOSE_PANEL}:{cid}",
-        )
     _set_draft(
         owner, kind="map_library", category_id=cid, simple_emoji=emoji,
     )
@@ -1071,18 +961,10 @@ async def _map_del_action(event, extra: str, chat_id: int) -> tuple[str, str, li
             "Remove Mapping", "Category not found — it may have been deleted.",
             f"panel:{_CATEGORIES_PANEL}",
         )
-    category = await cat_service.get_category(owner, cid)
-    if cat_service.is_custom_category(category):
-        return _error_panel(
-            "Remove Mapping",
-            "This is a composed category — change its sources and Refresh "
-            "instead. Manual mapping edits are disabled.",
-            f"panel:{_COMPOSE_PANEL}:{cid}",
-        )
     result = await cat_service.delete_mapping(owner, cid, emoji)
     if result.get("ok"):
         return await _render_mappings(
-            owner, cid, 0, notice=f"✓ {emoji} removed — the library entry was kept.",
+            owner, cid, 0, notice=f"{sym.OP_SAVE} {emoji} removed — the library entry was kept.",
         )
     if result.get("error") == cat_service.E_NOT_FOUND:
         return _error_panel(
@@ -1092,465 +974,6 @@ async def _map_del_action(event, extra: str, chat_id: int) -> tuple[str, str, li
     return _error_panel(
         "Remove Mapping", "Invalid emoji key.", f"panel:{_MAPPINGS_PANEL}::0:{wid}",
     )
-
-
-# ── composition UI (Phase 5, ROADMAP §26) ─────────────────────────────────
-
-
-def _compose_draft_sources(owner: int, cid: int) -> list[int] | None:
-    """The in-progress source selection for ONE custom category, or None when
-    no compose flow is armed (the panel then shows the PERSISTED sources)."""
-    draft = _get_draft(owner)
-    if not draft or draft.get("kind") != "compose" or draft.get("category_id") != cid:
-        return None
-    return [sid for sid in (draft.get("source_ids") or []) if isinstance(sid, int)]
-
-
-async def _source_candidates(
-    owner: int, cid: int, page: int,
-) -> tuple[list[dict[str, Any]], int, int]:
-    """Owner-scoped candidate sources for one page (2×5 grid), newest-first —
-    the same ordering the categories panel uses. The composed category itself
-    is excluded so it can never be its own source; already-selected sources
-    stay VISIBLE (marked) so grid positions never shift under the owner."""
-    rows, total, _counts = await cat_service.list_categories(
-        owner, limit=_PAGE_SIZE, offset=0,
-    )
-    page_count = max(1, (total + _PAGE_SIZE - 1) // _PAGE_SIZE)
-    page = max(0, min(page, page_count - 1))
-    if page:
-        rows, _total, _counts = await cat_service.list_categories(
-            owner, limit=_PAGE_SIZE, offset=page * _PAGE_SIZE,
-        )
-    return [row for row in rows if row.get("id") != cid], page, total
-
-
-async def _render_compose(
-    owner: int, cid: int, notice: str | None = None,
-) -> tuple[str, str, list]:
-    """The composition panel for ONE Custom Category.
-
-    Sources are rendered in PRECEDENCE ORDER — the first source wins every
-    shared simple emoji — from the in-progress draft when a flow is armed,
-    otherwise from the persisted composition. Nothing here decides a
-    composition: the service does, and the snapshot is never live.
-    """
-    category = await cat_service.get_category(owner, cid) if isinstance(cid, int) and cid > 0 else None
-    if category is None or not cat_service.is_custom_category(category):
-        return _error_panel(
-            "Compose", "Custom category not found — it may have been deleted.",
-            f"panel:{_CATEGORIES_PANEL}",
-        )
-    source_ids = _compose_draft_sources(owner, cid)
-    if source_ids is None:
-        source_ids = cat_service.category_sources(category)
-
-    names: dict[int, str] = {}
-    rows, _total, _counts = await cat_service.list_categories(
-        owner, limit=_PAGE_SIZE, offset=0,
-    )
-    for row in rows:
-        names[row.get("id")] = str(row.get("name") or "?")
-    for sid in source_ids:
-        if sid not in names:
-            row = await cat_service.get_category(owner, sid)
-            names[sid] = str((row or {}).get("name") or f"#{sid}") if row else f"#{sid} (missing)"
-
-    count = await cat_service.category_mapping_count(owner, cid)
-    lines = [
-        f"🧩 **{category.get('name') or '?'}**",
-        "",
-        f"Snapshot: {count if count is not None else '?'} mapping(s)",
-        "",
-        "_Sources (order = precedence — the first source wins a shared emoji):_",
-    ]
-    if not source_ids:
-        lines.append("_No sources yet._")
-    else:
-        for i, sid in enumerate(source_ids, start=1):
-            lines.append(f"{i}. {names[sid]}")
-    if notice:
-        lines.append("")
-        lines.append(notice)
-
-    builder = InlinePanelBuilder()
-    builder.add_row("➕ Add source", f"action:emoji_compose_add:{cid}")
-    for sid in source_ids:
-        builder.add_row(
-            _truncate(f"✖ Remove {names[sid]}"),
-            f"action:emoji_compose_rm:{cid}:{sid}",
-        )
-    builder.add_row("✅ Compose snapshot", f"action:emoji_compose_apply:{cid}")
-    builder.add_row("🔄 Refresh from sources", f"action:emoji_refresh:{cid}")
-    builder.add_row("🗺 Mappings", f"panel:{_MAPPINGS_PANEL}:{cid}:0")
-    builder.add_row("← Back", f"panel:{_CATEGORIES_PANEL}")
-    return "Compose", "\n".join(lines), builder.build()
-
-
-async def _render_source_picker(
-    owner: int, cid: int, page: int, notice: str | None = None,
-) -> tuple[str, str, list]:
-    category = await cat_service.get_category(owner, cid) if isinstance(cid, int) and cid > 0 else None
-    if category is None or not cat_service.is_custom_category(category):
-        return _error_panel(
-            "Add Source", "Custom category not found — it may have been deleted.",
-            f"panel:{_CATEGORIES_PANEL}",
-        )
-    candidates, page, total = await _source_candidates(owner, cid, page)
-    selected = _compose_draft_sources(owner, cid)
-    if selected is None:
-        selected = cat_service.category_sources(category)
-    if total <= 1 or not candidates:
-        return _error_panel(
-            "Add Source", "No other categories exist to use as sources.",
-            f"panel:{_COMPOSE_PANEL}:{cid}",
-        )
-
-    builder = InlinePanelBuilder()
-    lines = [
-        f"➕ **Add source** — page {page + 1}/{_page_count(total)}",
-        "",
-        "_Tap a category to append it as the next source._",
-    ]
-    if notice:
-        lines.extend(["", notice])
-    for i in range(0, len(candidates), 2):
-        pair = []
-        for j in (i, i + 1):
-            if j >= len(candidates):
-                break
-            row = candidates[j]
-            name = _truncate(str(row.get("name") or "?"), 18)
-            if cat_service.is_custom_category(row):
-                name = f"🧩 {name}"
-            if row.get("id") in selected:
-                name = f"✓ {name}"
-            pair.append((name, f"action:emoji_compose_add:{cid}:{page}:{j}"))
-        builder.add_buttons(*pair)
-    page_count = _page_count(total)
-    if page_count > 1:
-        builder.add_buttons(
-            ("◀", f"panel:{_SOURCE_PICKER_PANEL}:{cid}:{max(0, page - 1)}"),
-            (f"{page + 1}/{page_count}", f"panel:{_SOURCE_PICKER_PANEL}:{cid}:{page}"),
-            ("▶", f"panel:{_SOURCE_PICKER_PANEL}:{cid}:{page + 1}"),
-        )
-    builder.add_row("✅ Compose now", f"action:emoji_compose_apply:{cid}")
-    builder.add_row("← Back", f"panel:{_COMPOSE_PANEL}:{cid}")
-    return "Add Source", "\n".join(lines), builder.build()
-
-
-def _render_compose_conflicts(
-    cid: int, result: dict[str, Any], op: str,
-) -> tuple[str, str, list]:
-    """Explicit conflict resolution (§26): the reported precedence is the
-    owner's source order, and nothing is written until it is confirmed."""
-    conflicts = result.get("conflicts") or []
-    lines = [
-        "⚠️ **Composition conflicts**",
-        "",
-        "More than one source defines the same simple emoji. Precedence is the "
-        "source order — the FIRST source wins:",
-        "",
-    ]
-    for record in conflicts[:8]:
-        kept = record.get("kept") or {}
-        dropped = record.get("dropped") or []
-        lines.append(
-            f"{record.get('simple_emoji')} → source `#{kept.get('source_id')}` "
-            f"(doc #{kept.get('document_id')}) · dropped "
-            + ", ".join(f"`#{d.get('source_id')}`" for d in dropped)
-        )
-    if len(conflicts) > 8:
-        lines.append(f"… and {len(conflicts) - 8} more")
-    lines.extend(["", "_Nothing has been written yet._"])
-
-    builder = InlinePanelBuilder()
-    builder.add_row(
-        "✅ Confirm (first source wins)",
-        f"action:emoji_compose_confirm:{op}:{cid}",
-    )
-    builder.add_row("✗ Cancel", f"panel:{_COMPOSE_PANEL}:{cid}")
-    return "Composition Conflicts", "\n".join(lines), builder.build()
-
-
-async def _render_composition_result(
-    owner: int, cid: int, result: dict[str, Any], *, op: str,
-) -> tuple[str, str, list]:
-    """Render one composition/refresh outcome honestly — success, conflicts,
-    or the exact reason nothing changed."""
-    if result.get("ok"):
-        _clear_draft(owner)
-        parts = [
-            f"✓ {'Composed' if op == 'compose' else 'Refreshed'} — "
-            f"{len(result.get('mappings') or [])} mapping(s) from "
-            f"{len(result.get('sources') or [])} source(s)."
-        ]
-        if result.get("conflicts"):
-            parts.append(
-                f"{len(result['conflicts'])} conflict(s) resolved by source order."
-            )
-        if result.get("removed_sources"):
-            parts.append(
-                "Dropped missing source(s): "
-                + ", ".join(f"#{sid}" for sid in result["removed_sources"])
-                + "."
-            )
-        if result.get("empty_sources"):
-            parts.append(f"{len(result['empty_sources'])} source(s) had no mappings.")
-        if result.get("unresolvable"):
-            parts.append(
-                f"{result['unresolvable']} mapping(s) reference a missing item "
-                "— kept and shown as unavailable."
-            )
-        return await _render_compose(owner, cid, notice=" ".join(parts))
-
-    error = result.get("error")
-    if error == cat_service.E_CONFLICT:
-        return _render_compose_conflicts(cid, result, op)
-    if error == cat_service.E_MAPPING_LIST_INCOMPLETE:
-        return _error_panel(
-            "Compose",
-            "A source's mappings could not be read completely — nothing was changed.",
-            f"panel:{_COMPOSE_PANEL}:{cid}",
-        )
-    if error == cat_service.E_SNAPSHOT_INCOMPLETE:
-        return _error_panel(
-            "Compose",
-            f"Snapshot updated but {len(result.get('stale') or [])} old mapping(s) "
-            "could not be removed — Refresh again before relying on it.",
-            f"panel:{_COMPOSE_PANEL}:{cid}",
-        )
-    if error == cat_service.E_STORAGE:
-        return _error_panel(
-            "Compose", "Storage failed — the previous snapshot is unchanged.",
-            f"panel:{_COMPOSE_PANEL}:{cid}",
-        )
-    if error == cat_service.E_SOURCE_MISSING:
-        missing = ", ".join(f"#{sid}" for sid in (result.get("missing_sources") or []))
-        return _error_panel(
-            "Compose",
-            f"Source category not found ({missing or '?'}) — nothing was changed.",
-            f"panel:{_COMPOSE_PANEL}:{cid}",
-        )
-    if error == cat_service.E_SOURCE_CYCLE:
-        return _error_panel(
-            "Compose",
-            "That would create a circular composition — rejected. Nothing was changed.",
-            f"panel:{_COMPOSE_PANEL}:{cid}",
-        )
-    if error == cat_service.E_SOURCE_SELF:
-        return _error_panel(
-            "Compose", "A category cannot compose itself — nothing was changed.",
-            f"panel:{_COMPOSE_PANEL}:{cid}",
-        )
-    if error == cat_service.E_SOURCE_DUPLICATE:
-        return _error_panel(
-            "Compose",
-            "The same source category is selected twice — nothing was changed.",
-            f"panel:{_COMPOSE_PANEL}:{cid}",
-        )
-    if error == cat_service.E_TOO_MANY_SOURCES:
-        return _error_panel(
-            "Compose",
-            f"At most {cat_service.MAX_SOURCE_CATEGORIES} source categories.",
-            f"panel:{_COMPOSE_PANEL}:{cid}",
-        )
-    if error == cat_service.E_NO_SOURCES:
-        return _error_panel(
-            "Compose", "No sources selected — add at least one source first.",
-            f"panel:{_COMPOSE_PANEL}:{cid}",
-        )
-    if error == cat_service.E_NOT_CUSTOM:
-        return _error_panel(
-            "Compose", "This category is not a composed (custom) category.",
-            f"panel:{_CATEGORIES_PANEL}",
-        )
-    if error == cat_service.E_NOT_FOUND:
-        return _error_panel(
-            "Compose", "Custom category not found — it may have been deleted.",
-            f"panel:{_CATEGORIES_PANEL}",
-        )
-    return _error_panel(
-        "Compose", "Composition failed — nothing was changed.",
-        f"panel:{_COMPOSE_PANEL}:{cid}",
-    )
-
-
-async def _compose_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
-    owner = get_owner_id()
-    if not owner:
-        return _error_panel("Compose", "Owner is not set.", f"panel:{_MAIN_PANEL}")
-    try:
-        cid = int(extra.split(":")[0])
-    except (TypeError, ValueError, IndexError):
-        cid = 0
-    return await _render_compose(owner, cid)
-
-
-async def _source_picker_handler(event, extra: str) -> tuple[str, str, list] | None:
-    owner = get_owner_id()
-    if not owner:
-        return _error_panel("Add Source", "Owner is not set.", f"panel:{_MAIN_PANEL}")
-    cid_s, _, page_s = extra.partition(":")
-    try:
-        cid = int(cid_s)
-        page = max(0, int(page_s or 0))
-    except (TypeError, ValueError):
-        return _error_panel(
-            "Add Source", "Flow out of date — start again.", f"panel:{_CATEGORIES_PANEL}"
-        )
-    return await _render_source_picker(owner, cid, page)
-
-
-async def _compose_add_action(event, extra: str, chat_id: int):
-    """`extra: <wid>` opens the picker; ``<wid>:<page>:<idx>`` appends ONE
-    owner-scoped source. Every id is re-validated against the owner — the
-    callback payload is never authorization."""
-    owner = get_owner_id()
-    parts = str(extra).split(":")
-    try:
-        cid = int(parts[0])
-    except (TypeError, ValueError, IndexError):
-        return _error_panel(
-            "Add Source", "Flow out of date — start again.", f"panel:{_CATEGORIES_PANEL}"
-        )
-    category = await cat_service.get_category(owner, cid)
-    if category is None or not cat_service.is_custom_category(category):
-        return _error_panel(
-            "Add Source", "Custom category not found — it may have been deleted.",
-            f"panel:{_CATEGORIES_PANEL}",
-        )
-    if len(parts) == 1:
-        if _compose_draft_sources(owner, cid) is None:
-            _set_draft(owner, kind="compose", category_id=cid, source_ids=[])
-        return await _render_source_picker(owner, cid, 0)
-    try:
-        page, idx = int(parts[1]), int(parts[2])
-    except (TypeError, ValueError, IndexError):
-        return _error_panel(
-            "Add Source", "Flow out of date — start again.",
-            f"panel:{_COMPOSE_PANEL}:{cid}",
-        )
-    candidates, page, _total = await _source_candidates(owner, cid, page)
-    picked = candidates[idx] if 0 <= idx < len(candidates) else None
-    if picked is None:
-        return _error_panel(
-            "Add Source", "List changed — pick again.",
-            f"panel:{_SOURCE_PICKER_PANEL}:{cid}:{page}",
-        )
-    selected = _compose_draft_sources(owner, cid)
-    if selected is None:
-        # no flow armed yet: start from the persisted composition
-        selected = cat_service.category_sources(category)
-    source_id = picked.get("id")
-    name = _truncate(str(picked.get("name") or "?"))
-    if source_id in selected:
-        return await _render_source_picker(
-            owner, cid, page,
-            notice=f"“{name}” is already a source (it keeps its precedence position).",
-        )
-    if len(selected) >= cat_service.MAX_SOURCE_CATEGORIES:
-        return await _render_source_picker(
-            owner, cid, page,
-            notice=f"At most {cat_service.MAX_SOURCE_CATEGORIES} sources.",
-        )
-    selected.append(source_id)
-    _set_draft(owner, kind="compose", category_id=cid, source_ids=selected)
-    return await _render_compose(
-        owner, cid, notice=f"✓ Added “{name}” as source #{len(selected)}.",
-    )
-
-
-async def _compose_rm_action(event, extra: str, chat_id: int):
-    """`extra: <wid>:<source_id>`` — remove one source from the draft."""
-    owner = get_owner_id()
-    wid, _, sid_s = str(extra).partition(":")
-    try:
-        cid, source_id = int(wid), int(sid_s)
-    except (TypeError, ValueError):
-        return _error_panel(
-            "Compose", "Flow out of date — start again.", f"panel:{_CATEGORIES_PANEL}"
-        )
-    category = await cat_service.get_category(owner, cid)
-    if category is None or not cat_service.is_custom_category(category):
-        return _error_panel(
-            "Compose", "Custom category not found — it may have been deleted.",
-            f"panel:{_CATEGORIES_PANEL}",
-        )
-    selected = _compose_draft_sources(owner, cid)
-    if selected is None:
-        selected = cat_service.category_sources(category)
-    if source_id not in selected:
-        return await _render_compose(
-            owner, cid, notice="Source not in this composition — nothing changed.",
-        )
-    selected = [sid for sid in selected if sid != source_id]
-    _set_draft(owner, kind="compose", category_id=cid, source_ids=selected)
-    return await _render_compose(
-        owner, cid, notice=f"✖ Source `#{source_id}` removed from the selection.",
-    )
-
-
-async def _compose_apply_action(event, extra: str, chat_id: int):
-    """Run the composition from the armed draft — the service decides; the
-    UI only renders its report."""
-    owner = get_owner_id()
-    try:
-        cid = int(str(extra).split(":")[0])
-    except (TypeError, ValueError, IndexError):
-        return _error_panel(
-            "Compose", "Flow out of date — start again.", f"panel:{_CATEGORIES_PANEL}"
-        )
-    selected = _compose_draft_sources(owner, cid)
-    if selected is None:
-        return _error_panel(
-            "Compose", "Flow out of date — open the category again.",
-            f"panel:{_COMPOSE_PANEL}:{cid}",
-        )
-    result = await cat_service.compose_category(owner, cid, selected)
-    return await _render_composition_result(owner, cid, result, op="compose")
-
-
-async def _refresh_action(event, extra: str, chat_id: int):
-    """Explicit Refresh: rebuild the snapshot from the PERSISTED sources."""
-    owner = get_owner_id()
-    try:
-        cid = int(str(extra).split(":")[0])
-    except (TypeError, ValueError, IndexError):
-        return _error_panel(
-            "Refresh", "Flow out of date — start again.", f"panel:{_CATEGORIES_PANEL}"
-        )
-    result = await cat_service.refresh_category(owner, cid)
-    return await _render_composition_result(owner, cid, result, op="refresh")
-
-
-async def _compose_confirm_action(event, extra: str, chat_id: int):
-    """The ONLY path that turns reported conflicts into stored precedence."""
-    owner = get_owner_id()
-    op, _, wid = str(extra).partition(":")
-    try:
-        cid = int(wid)
-    except (TypeError, ValueError):
-        return _error_panel(
-            "Compose", "Flow out of date — start again.", f"panel:{_CATEGORIES_PANEL}"
-        )
-    if op == "refresh":
-        result = await cat_service.refresh_category(owner, cid, confirm_conflicts=True)
-    elif op == "compose":
-        selected = _compose_draft_sources(owner, cid)
-        if selected is None:
-            return _error_panel(
-                "Compose", "Flow out of date — open the category again.",
-                f"panel:{_COMPOSE_PANEL}:{cid}",
-            )
-        result = await cat_service.compose_category(
-            owner, cid, selected, confirm_conflicts=True,
-        )
-    else:
-        return _error_panel(
-            "Compose", "Flow out of date — start again.", f"panel:{_CATEGORIES_PANEL}"
-        )
-    return await _render_composition_result(owner, cid, result, op=op)
 
 
 # ── registration ──────────────────────────────────────────────────────────
@@ -1600,7 +1023,7 @@ async def _render_replacement(
         if ctx is not None and ctx.kind == "reply" and ctx.reply_chat_id:
             target_chat = ctx.reply_chat_id
 
-    lines = [f"Replacement: {'✅ ON' if enabled else '❌ OFF'}", ""]
+    lines = [f"Replacement: {sym.STATE_COMPLETED} ON" if enabled else f"Replacement: {sym.STATE_FAILED} OFF", ""]
 
     default_name = _category_name_of(rows, default_id)
     lines.append(
@@ -1635,18 +1058,18 @@ async def _render_replacement(
 
     builder = InlinePanelBuilder()
     builder.add_row(
-        "🔘 Turn OFF" if enabled else "🔘 Turn ON",
+        sym.label(sym.ICON_SELECT, "Turn OFF") if enabled else sym.label(sym.ICON_SELECT, "Turn ON"),
         "action:emoji_state_toggle",
     )
-    builder.add_row("🌐 Set global default", "action:emoji_state_global_pick")
+    builder.add_row(sym.label(sym.ICON_WEB, "Set global default"), "action:emoji_state_global_pick")
     if target_chat:
         seed = f"override:{target_chat}"
         builder.add_row(
-            "📍 Set chat override", f"action:emoji_state_override_pick:{target_chat}"
+            sym.label(sym.ICON_PIN, "Set chat override"), f"action:emoji_state_override_pick:{target_chat}"
         )
-        builder.add_row("✖ Clear chat override", f"action:emoji_state_clear:{target_chat}")
-    builder.add_row("🗂 Manage categories", f"panel:{_CATEGORIES_PANEL}")
-    builder.add_row("← Back", f"panel:{_MAIN_PANEL}")
+        builder.add_row(sym.label(sym.OP_CLOSE, "Clear chat override"), f"action:emoji_state_clear:{target_chat}")
+    builder.add_row(sym.label(sym.ICON_CATEGORY, "Manage categories"), f"panel:{_CATEGORIES_PANEL}")
+    builder.add_row(sym.label(sym.OP_BACK, "Back"), f"panel:{_MAIN_PANEL}")
     return "Emoji Replacement", "\n".join(lines), builder.build()
 
 
@@ -1729,9 +1152,9 @@ async def _render_state_picker(owner: int, extra: str) -> tuple[str, str, list]:
         builder.add_buttons(
             ("◀", f"panel:{_STATE_SCOPE_PICKER_PANEL}:{seed}:{page - 1}" if page else f"panel:{_STATE_SCOPE_PICKER_PANEL}:{seed}:0"),
             (f"{page + 1}/{page_count}", f"panel:{_STATE_SCOPE_PICKER_PANEL}:{seed}:{page}"),
-            ("▶", f"panel:{_STATE_SCOPE_PICKER_PANEL}:{seed}:{page + 1}"),
+            (sym.OP_RESUME, f"panel:{_STATE_SCOPE_PICKER_PANEL}:{seed}:{page + 1}"),
         )
-    builder.add_row("← Back", f"panel:{_REPLACEMENT_PANEL}")
+    builder.add_row(sym.label(sym.OP_BACK, "Back"), f"panel:{_REPLACEMENT_PANEL}")
     return title, "Pick the category to activate:", builder.build()
 
 
@@ -1759,9 +1182,9 @@ async def _state_choose_action(event, extra: str, chat_id: int):
     if scope == "global":
         ok = await state_service.set_global_default_category(owner, cid)
         notice = (
-            "✓ Global default set."
+            f"{sym.OP_SAVE} Global default set."
             if ok
-            else "✗ Category not found (or storage failed) — nothing changed."
+            else f"{sym.STATE_FAILED} Category not found (or storage failed) — nothing changed."
         )
     elif scope == "override":
         if not target_chat:
@@ -1771,9 +1194,9 @@ async def _state_choose_action(event, extra: str, chat_id: int):
             )
         ok = await state_service.set_chat_override(owner, target_chat, cid)
         notice = (
-            f"✓ Override set for chat `{target_chat}`."
+            f"{sym.OP_SAVE} Override set for chat `{target_chat}`."
             if ok
-            else "✗ Category not found (or storage failed) — nothing changed."
+            else f"{sym.STATE_FAILED} Category not found (or storage failed) — nothing changed."
         )
     else:
         return _error_panel(
@@ -1791,11 +1214,11 @@ async def _state_toggle_action(event, extra: str, chat_id: int):
         # distinguish a genuine OFF result from a degraded write
         enabled_now = await state_service.replacement_enabled(owner)
         if enabled_now:
-            notice = "✗ Could not save the toggle — storage failed. Still OFF."
+            notice = f"{sym.STATE_FAILED} Could not save the toggle — storage failed. Still OFF."
         else:
-            notice = "🔘 Replacement is OFF."
+            notice = f"{sym.ICON_SELECT} Replacement is OFF."
     else:
-        notice = f"✅ Replacement is ON." if new_value else "🔘 Replacement is OFF."
+        notice = f"{sym.STATE_COMPLETED} Replacement is ON." if new_value else f"{sym.ICON_SELECT} Replacement is OFF."
     return await _render_replacement(owner, "", notice)
 
 
@@ -1810,10 +1233,10 @@ async def _state_clear_action(event, extra: str, chat_id: int):
         )
     ok = await state_service.clear_chat_override(owner, target_chat)
     notice = (
-        f"✓ Override cleared for chat `{target_chat}` — the global default "
+        f"{sym.OP_SAVE} Override cleared for chat `{target_chat}` — the global default "
         "applies again."
         if ok
-        else "✗ Could not clear the override — storage failed. Nothing changed."
+        else f"{sym.STATE_FAILED} Could not clear the override — storage failed. Nothing changed."
     )
     return await _render_replacement(owner, "", notice)
 
@@ -1866,13 +1289,13 @@ def _reaction_from_reply(reply_msg, text: str) -> tuple[dict | None, str]:
 def _render_reaction_result(result: dict, target_id: int) -> tuple[str, str, list]:
     """Honest outcome panel: the applied reaction, or the exact failure."""
     builder = InlinePanelBuilder()
-    builder.add_row("💬 React to another message", "action:emoji_react")
+    builder.add_row(sym.label(sym.ICON_REACTION, "React to another message"), "action:emoji_react")
     if result.get("ok"):
         label = reaction_service.reaction_label(result.get("reaction"))
-        return "React", f"✓ Reacted with {label}\n\nto message `#{target_id}`", builder.build()
+        return "React", f"{sym.OP_SAVE} Reacted with {label}\n\nto message `#{target_id}`", builder.build()
     detail = result.get("detail") or "the reaction was not applied"
     code = result.get("error") or "?"
-    return "React", f"✗ {detail}\n\n`{code}` · message `#{target_id}`", builder.build()
+    return "React", f"{sym.STATE_FAILED} {detail}\n\n`{code}` · message `#{target_id}`", builder.build()
 
 
 async def _react_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
@@ -2037,8 +1460,8 @@ _PREMIUM_INLINE_NOTICE = (
 
 def _premium_inline_buttons() -> list:
     builder = InlinePanelBuilder()
-    builder.add_row("✨ Send Premium Emoji", f"action:{_INLINE_ACTION}")
-    builder.add_row("💬 React to a message", "action:emoji_react")
+    builder.add_row(sym.label(sym.ICON_PREMIUM, "Send Premium Emoji"), f"action:{_INLINE_ACTION}")
+    builder.add_row(sym.label(sym.ICON_REACTION, "React to a message"), "action:emoji_react")
     return builder.build()
 
 
@@ -2231,8 +1654,8 @@ _PROBE_TIMEOUT_S = 90.0
 
 def _probe_buttons() -> list:
     builder = InlinePanelBuilder()
-    builder.add_row("💬 Set Reaction Emoji", f"action:{_PROBE_ACTION}")
-    builder.add_row("💬 React to a message", "action:emoji_react")
+    builder.add_row(sym.label(sym.ICON_REACTION, "Set Reaction Emoji"), f"action:{_PROBE_ACTION}")
+    builder.add_row(sym.label(sym.ICON_REACTION, "React to a message"), "action:emoji_react")
     return builder.build()
 
 
@@ -2373,7 +1796,7 @@ async def _react_premium_reply_handler(
     entity = outcome.get("entity") or {}
     if outcome.get("ok"):
         body = (
-            f"✓ Telegram accepted the helper bot's message "
+            f"{sym.OP_SAVE} Telegram accepted the helper bot's message "
             f"`#{outcome.get('message_id')}` carrying a REAL custom-emoji "
             f"entity for document `#{entity.get('document_id')}` "
             f"(offset {entity.get('offset')}, length {entity.get('length')}).\n\n"
@@ -2388,7 +1811,7 @@ async def _react_premium_reply_handler(
         return
 
     body = (
-        f"✗ {outcome.get('detail')}\n\n"
+        f"{sym.STATE_FAILED} {outcome.get('detail')}\n\n"
         f"`{outcome.get('error')}` · the custom-emoji entity "
         f"(document `#{found['document_id']}`) was NOT rendered by the helper bot.\n\n"
         f"Diagnosis `{outcome.get('diagnosis')}`."
@@ -2430,8 +1853,8 @@ _DIRECT_TIMEOUT_S = 180.0
 
 def _premium_direct_buttons() -> list:
     builder = InlinePanelBuilder()
-    builder.add_row("🧪 Live test · direct self-chat", f"action:{_DIRECT_ACTION}")
-    builder.add_row("✨ Send Premium Emoji", f"action:{_INLINE_ACTION}")
+    builder.add_row(sym.label(sym.ICON_DIAGNOSTIC, "Live test · direct self-chat"), f"action:{_DIRECT_ACTION}")
+    builder.add_row(sym.label(sym.ICON_PREMIUM, "Send Premium Emoji"), f"action:{_INLINE_ACTION}")
     return builder.build()
 
 
@@ -2664,8 +2087,205 @@ async def _premium_direct_reply_handler(
     outcome = await premium_direct_service.send_premium_emoji_direct(
         client, chat_id, found["document_id"], found["span_text"], owner
     )
-    title = "Direct Emoji Test ✓" if outcome.get("verified") else "Direct Emoji Test"
+    title = f"Direct Emoji Test {sym.OP_SAVE}" if outcome.get("verified") else "Direct Emoji Test"
     await _finish(title, _premium_direct_report(outcome), _premium_direct_buttons())
+
+
+# ── the ONE traceable Emoji diagnostic workflow ────────────────────────────
+#
+# The panel's primary action. It runs the REAL production inline route
+# (``premium_emoji_inline_service.send_premium_emoji_via_inline``) and renders
+# a step-by-step trace of what actually happened — which stage succeeded,
+# where execution stopped and why. The trace is built from the service's own
+# outcome record by ``backend.services.premium_emoji_diagnostics``; nothing is
+# simulated, and submission is never conflated with verified success.
+#
+# It is a diagnostic ENTRY POINT over the existing production route: it adds no
+# second client, listener, scheduler or executor, and it never fabricates a
+# Telegram operation. One run per owner at a time — a duplicate callback cannot
+# drive a duplicate Telegram operation.
+
+#: The ONE primary action of the Emoji panel.
+_DIAGNOSTICS_ACTION = "emoji_diagnostics"
+
+#: The exact English label the primary panel must expose.
+_DIAGNOSTICS_LABEL = sym.label(sym.ICON_DIAGNOSTIC, "Run Emoji Diagnostics")
+
+#: Plain words only — the selection message is sent by the owner's own account.
+_DIAGNOSTICS_PROMPT = (
+    "Reply to this message with the Premium Emoji to diagnose.\n"
+    "Only a reply to THIS message is accepted."
+)
+
+#: The whole flow (reply read + inline query + the send + read-back) runs
+#: inside this handler; every Telegram call it makes is bounded on its own.
+_DIAGNOSTICS_TIMEOUT_S = 180.0
+
+
+def _diagnostics_buttons() -> list:
+    """The single application-level button this panel exposes."""
+    builder = InlinePanelBuilder()
+    builder.add_row(_DIAGNOSTICS_LABEL, f"action:{_DIAGNOSTICS_ACTION}")
+    return builder.build()
+
+
+def _diag_error(message: str) -> tuple[str, str, list]:
+    """An honest error view — still exactly the ONE application-level button."""
+    return _DIAGNOSTICS_LABEL, f"! {message}", _diagnostics_buttons()
+
+
+async def _diagnostics_action(event, extra: str, chat_id: int) -> tuple[str, str, list]:
+    """Send the selection message to Saved Messages and arm reply mode."""
+    client = get_self_client()
+    owner = get_owner_id()
+    if client is None:
+        return _diag_error("Self client is not connected.")
+    if not owner:
+        return _diag_error("Owner is not set.")
+    if diag_service.is_running(owner):
+        return _diag_error(
+            "A diagnostic run is already in progress — wait for it to finish."
+        )
+
+    try:
+        selection = await client.send_message("me", _DIAGNOSTICS_PROMPT)
+    except Exception as exc:
+        logger.warning("[EMOJI_UI] diagnostics: selection message not created: %s", exc)
+        return _diag_error(
+            f"Could not create the Saved Messages selection message: {exc}"
+        )
+
+    selection_id = getattr(selection, "id", 0) or 0
+    selection_chat = getattr(selection, "chat_id", 0) or 0
+    if (
+        not isinstance(selection_id, int)
+        or isinstance(selection_id, bool)
+        or selection_id <= 0
+        or not selection_chat
+    ):
+        return _diag_error(
+            "The selection message could not be created — nothing was armed."
+        )
+
+    set_pending(
+        owner, _DIAGNOSTICS_ACTION, _diagnostics_reply_handler, selection_chat,
+        _DIAGNOSTICS_PROMPT,
+        inline_chat_id=chat_id,
+        inline_msg_id=getattr(event, "message_id", 0) or 0,
+        extra=str(selection_id),
+        timeout=_DIAGNOSTICS_TIMEOUT_S,
+    )
+    logger.info(
+        "[EMOJI_UI] diagnostics: selection message #%s sent to Saved Messages",
+        selection_id,
+    )
+    body = (
+        "A selection message was sent to **Saved Messages**.\n\n"
+        "Reply to THAT message with the Premium Emoji to diagnose.\n"
+        f"Only a reply to message `#{selection_id}` is accepted.\n\n"
+        "Your own account then sends it through the inline bot, and the run's "
+        "step-by-step trace is shown here."
+    )
+    return _DIAGNOSTICS_LABEL, body, _diagnostics_buttons()
+
+
+async def _diagnostics_reply_handler(
+    text,
+    chat_id,
+    msg_id,
+    inline_chat_id,
+    inline_msg_id,
+    extra: str = "",
+) -> None:
+    """Resolve the EXACT selection-message reply, then run the real workflow."""
+    client = get_self_client()
+    owner = get_owner_id()
+
+    async def _finish(title: str, body: str, buttons: list) -> None:
+        await _edit_inline(inline_chat_id, inline_msg_id, title, body, buttons)
+
+    async def _fail(message: str) -> None:
+        await _finish(_DIAGNOSTICS_LABEL, f"! {message}", _diagnostics_buttons())
+
+    selection_id = int(extra) if isinstance(extra, str) and extra.isdigit() else 0
+    if client is None:
+        await _fail("Self client is not connected.")
+        return
+    if not selection_id:
+        await _fail("The selection message is no longer known — start the action again.")
+        return
+
+    try:
+        reply = await client.get_messages(chat_id, ids=msg_id)
+    except Exception as exc:
+        logger.warning("[EMOJI_UI] diagnostics: cannot read the reply: %s", exc)
+        reply = None
+    if reply is None:
+        await _fail("Could not read your reply message — please try again.")
+        return
+
+    header = getattr(reply, "reply_to", None)
+    if getattr(header, "reply_to_peer_id", None) is not None:
+        await _fail("That reply targets another chat.\nReply in Saved Messages.")
+        return
+
+    target_id = getattr(reply, "reply_to_msg_id", None) or getattr(
+        header, "reply_to_msg_id", None
+    )
+    if not isinstance(target_id, int) or isinstance(target_id, bool) or target_id <= 0:
+        await _fail(
+            f"Your message was not a reply.\nReply TO selection message `#{selection_id}`."
+        )
+        return
+    if target_id != selection_id:
+        await _fail(
+            f"That reply targets message `#{target_id}`, not the selection "
+            f"message `#{selection_id}`."
+        )
+        return
+
+    # The source entity is read from the reply's OWN entity (document id +
+    # UTF-16 span), never its visible glyph. A reply that carries no genuine
+    # custom-emoji entity still runs the workflow and produces a real trace.
+    found = premium_inline_service.inspect_source_message(reply)
+
+    if not diag_service.begin_run(owner):
+        await _fail("A diagnostic run is already in progress — wait for it to finish.")
+        return
+
+    started_at = time.monotonic()
+    try:
+        outcome = await premium_inline_service.send_premium_emoji_via_inline(
+            client, chat_id, found["document_id"], found["span_text"], owner
+        )
+    except Exception as exc:
+        logger.exception("[EMOJI_UI] diagnostics: run failed unexpectedly: %s", exc)
+        outcome = {
+            "ok": False,
+            "verified": False,
+            "error": "E_DIAG",
+            "detail": f"the diagnostic run raised {type(exc).__name__}: {exc}",
+            "diagnosis": None,
+            "run_id": None,
+            "payload": None,
+            "inline_result": {},
+            "readback": {},
+            "eligibility": {},
+        }
+    finally:
+        diag_service.end_run(owner, outcome=outcome)
+
+    from backend.helper.client import get_bot_id
+
+    trace = diag_service.build_trace(
+        outcome, started_at=started_at, helper_bot_id=get_bot_id()
+    )
+    logger.info(
+        "[EMOJI_UI] diagnostics: run %s -> %s (reached %s)",
+        trace.get("run_id"), trace.get("outcome_class"), trace.get("stage"),
+    )
+    title = f"Emoji Diagnostics {sym.OP_SAVE}" if trace.get("outcome_class") == "verified" else "Emoji Diagnostics"
+    await _finish(title, diag_service.render_trace(trace), _diagnostics_buttons())
 
 
 # ── registration ──────────────────────────────────────────────────────────
@@ -2673,6 +2293,10 @@ async def _premium_direct_reply_handler(
 
 def register(client, owner_id: int) -> None:
     register_panel(_MAIN_PANEL, _emoji_panel_handler, parent="menu", title="Emoji")
+    # The primary Emoji panel must expose EXACTLY ONE application-level button
+    # (the diagnostics action), so it opts out of the automatic Back/Home/Close
+    # navigation row. All other emoji panels keep the standard navigation.
+    set_panel_nav_free(_MAIN_PANEL, True)
     register_panel(
         _LIBRARY_PANEL, _library_page_handler, parent=_MAIN_PANEL, title="Library"
     )
@@ -2702,16 +2326,9 @@ def register(client, owner_id: int) -> None:
         _STATE_SCOPE_PICKER_PANEL, _state_scope_picker_handler,
         parent=_REPLACEMENT_PANEL, title="Pick Category",
     )
-    register_panel(
-        _COMPOSE_PANEL, _compose_panel_handler,
-        parent=_CATEGORY_PANEL, title="Compose",
-    )
-    register_panel(
-        _SOURCE_PICKER_PANEL, _source_picker_handler,
-        parent=_COMPOSE_PANEL, title="Add Source",
-    )
     register_action("emoji_import", _import_action)
     register_action("emoji_react", _react_action)
+    register_action(_DIAGNOSTICS_ACTION, _diagnostics_action)
     register_action(_INLINE_ACTION, _premium_inline_action)
     register_inline_builder(
         premium_inline_service.INLINE_QUERY_KEY, _premium_inline_builder
@@ -2724,13 +2341,6 @@ def register(client, owner_id: int) -> None:
     register_action("emoji_state_choose", _state_choose_action)
     register_action("emoji_state_clear", _state_clear_action)
     register_action("emoji_cat_new", _cat_new_action)
-    register_action("emoji_cat_new_custom", _cat_new_custom_action)
-    register_action("emoji_compose", _compose_panel_handler)
-    register_action("emoji_compose_add", _compose_add_action)
-    register_action("emoji_compose_rm", _compose_rm_action)
-    register_action("emoji_compose_apply", _compose_apply_action)
-    register_action("emoji_compose_confirm", _compose_confirm_action)
-    register_action("emoji_refresh", _refresh_action)
     register_action("emoji_cat_rename", _cat_rename_action)
     register_action("emoji_cat_del", _cat_del_action)
     register_action("emoji_cat_delgo", _cat_delgo_action)

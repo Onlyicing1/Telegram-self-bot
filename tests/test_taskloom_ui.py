@@ -147,7 +147,7 @@ def test_list_panel_summary_excludes_deleted_tasks(registered, repo):
     # deleted tasks are terminal: they never inflate active/paused/closed
     assert "● 1 active" in body
     assert "∥ 0 paused" in body
-    assert "× 0 closed" in body
+    assert "✓ 0 closed" in body
     texts = " ".join(_button_texts(buttons))
     assert "doomed" not in texts
 

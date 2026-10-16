@@ -44,6 +44,7 @@ from telethon.tl.types import MessageMediaDocument
 from backend.ai.semantic_delete import normalize_text as _persian_normalize
 from backend.db import client as db_client
 from backend.diagnostics import record_event
+from backend.helper import symbols as sym
 from backend.services import save_service
 
 logger = logging.getLogger(__name__)
@@ -74,20 +75,20 @@ def _type_icon(row: dict) -> str:
     media = (row.get("media_type") or "").lower()
     mime = (row.get("mime_type") or "").lower()
     if "photo" in media or "image" in mime or media == "photo":
-        return "🖼"
+        return sym.MEDIA_PHOTO
     if "video" in media or "video" in mime:
-        return "🎬"
+        return sym.MEDIA_VIDEO
     if "audio" in media or "audio" in mime:
-        return "🎵"
+        return sym.MEDIA_AUDIO
     if "voice" in media:
-        return "🎤"
+        return sym.MEDIA_VOICE
     if "sticker" in media:
-        return "🎯"
+        return sym.MEDIA_STICKER
     if "gif" in media or "animation" in media:
-        return "🎞"
+        return sym.MEDIA_ANIMATION
     if "document" in media or "file" in mime or mime:
-        return "📎"
-    return "📦"
+        return sym.MEDIA_DOCUMENT
+    return sym.MEDIA_UNKNOWN
 
 
 def _display_name(row: dict) -> str:
@@ -181,9 +182,9 @@ async def do_preview(self_client, owner_id: int, save_code: str) -> str:
     try:
         row = await load_saved_item(save_code, owner_id)
     except Exception as exc:
-        return f"❌ DB error: {exc}"
+        return f"{sym.STATE_FAILED} DB error: {exc}"
     if not row:
-        return f"❌ No item found for `{save_code}`"
+        return f"{sym.STATE_FAILED} No item found for `{save_code}`"
     await db_client.log(owner_id, "INFO", f"Preview {save_code}", {"save_code": save_code})
     return format_preview(row)
 
@@ -199,19 +200,19 @@ async def do_retrieve(self_client, owner_id: int, save_code: str, target_chat: i
     except Exception as exc:
         logger.error("retrieve db error: %s", exc)
         record_event("database", "query_save", 0, "ERROR", str(exc))
-        return f"❌ DB error: {exc}"
+        return f"{sym.STATE_FAILED} DB error: {exc}"
     # Owner isolation, identical to do_rename/do_move/do_delete: checked
     # BEFORE any Telegram side effect (entity resolution / forwarding) and
     # reported with the same not-found wording so another owner's item is
     # never distinguishable from a missing one.
     if not row or row.get("owner_id") != owner_id:
-        return f"❌ No item found for `{save_code}`"
+        return f"{sym.STATE_FAILED} No item found for `{save_code}`"
 
     saved_chat_id = row.get("saved_chat_id")
     saved_msg_id = row.get("saved_msg_id")
     origin_chat_id = row.get("origin_chat_id")
     if not saved_chat_id or not saved_msg_id:
-        return "❌ Saved location data is missing for this entry."
+        return f"{sym.STATE_FAILED} Saved location data is missing for this entry."
 
     logger.info("[RETRIEVE] save_code=%s", save_code)
     logger.info("[RETRIEVE] origin_chat_id=%s", origin_chat_id)
@@ -225,7 +226,7 @@ async def do_retrieve(self_client, owner_id: int, save_code: str, target_chat: i
         traceback.print_exc()
         logger.error("[RETRIEVE] failed IDs: saved_chat_id=%s target_chat=%s", saved_chat_id, target_chat)
         record_event("retrieve", "get_input_entity", 0, "ERROR", f"saved_chat_id={saved_chat_id}: {exc}")
-        return f"❌ Could not resolve saved chat (id={saved_chat_id}): {exc}"
+        return f"{sym.STATE_FAILED} Could not resolve saved chat (id={saved_chat_id}): {exc}"
 
     try:
         dest_peer = await self_client.get_input_entity(target_chat)
@@ -235,7 +236,7 @@ async def do_retrieve(self_client, owner_id: int, save_code: str, target_chat: i
         traceback.print_exc()
         logger.error("[RETRIEVE] failed IDs: saved_chat_id=%s target_chat=%s", saved_chat_id, target_chat)
         record_event("retrieve", "get_input_entity", 0, "ERROR", f"target_chat={target_chat}: {exc}")
-        return f"❌ Could not resolve destination chat (id={target_chat}): {exc}"
+        return f"{sym.STATE_FAILED} Could not resolve destination chat (id={target_chat}): {exc}"
 
     logger.info("[RETRIEVE] entity=%s %r", type(dest_peer).__name__, dest_peer)
     logger.info("[RETRIEVE] from_peer=%s %r", type(source_peer).__name__, source_peer)
@@ -260,7 +261,7 @@ async def do_retrieve(self_client, owner_id: int, save_code: str, target_chat: i
         )
         logger.error("[RETRIEVE] failed IDs: saved_chat_id=%s target_chat=%s", saved_chat_id, target_chat)
         record_event("retrieve", "forward_messages", 0, "ERROR", str(exc))
-        return f"❌ Forward failed: {exc}"
+        return f"{sym.STATE_FAILED} Forward failed: {exc}"
 
     fwd_msg = messages[0] if isinstance(messages, list) else messages
     original_caption = row.get("caption") or ""
@@ -277,7 +278,7 @@ async def do_retrieve(self_client, owner_id: int, save_code: str, target_chat: i
         "save_code": save_code,
         "target_chat": target_chat,
     })
-    return f"✅ Retrieved `{save_code}` to this chat."
+    return f"{sym.OP_SAVE} Retrieved `{save_code}` to this chat."
 
 
 async def do_send(self_client, owner_id: int, save_code: str, target_chat: int) -> str:
@@ -303,21 +304,21 @@ async def do_rename(owner_id: int, save_code: str, new_name: str) -> str:
     try:
         name = save_service.normalize_display_name(new_name)
     except ValueError as exc:
-        return f"⚠️ Nothing was renamed: {exc}"
+        return f"{sym.STATE_WARNING} Nothing was renamed: {exc}"
     if name is None:
-        return "⚠️ Nothing was renamed: send a name for the item."
+        return f"{sym.STATE_WARNING} Nothing was renamed: send a name for the item."
 
     row, error = await _load_for_management(owner_id, code)
     if error:
         return error
     if row is None:
-        return f"❌ No item found for `{code}`"
+        return f"{sym.STATE_FAILED} No item found for `{code}`"
 
     failure = await _write_metadata(owner_id, code, "display_name", name, name)
     if failure:
         return failure
     await db_client.log(owner_id, "INFO", f"Renamed {code}", {"display_name": name})
-    return f"✅ Renamed `{code}` to **{name}**"
+    return f"{sym.OP_SAVE} Renamed `{code}` to **{name}**"
 
 
 async def do_move(owner_id: int, save_code: str, folder: str) -> str:
@@ -325,16 +326,16 @@ async def do_move(owner_id: int, save_code: str, folder: str) -> str:
     folder = folder.strip() or "Unfiled"
     row = await db_client.query_save(save_code)
     if not row or row.get("owner_id") != owner_id:
-        return f"❌ No item found for `{save_code}`"
+        return f"{sym.STATE_FAILED} No item found for `{save_code}`"
     await db_client.log(owner_id, "INFO", f"Moved {save_code}", {"folder": folder})
-    return f"✅ Moved to `{folder}`"
+    return f"{sym.OP_SAVE} Moved to `{folder}`"
 
 
 async def do_delete(self_client, owner_id: int, save_code: str) -> str:
     save_code = save_code.upper().strip()
     row = await db_client.query_save(save_code)
     if not row or row.get("owner_id") != owner_id:
-        return f"❌ No item found for `{save_code}`"
+        return f"{sym.STATE_FAILED} No item found for `{save_code}`"
     saved_chat_id = row.get("saved_chat_id")
     saved_msg_id = row.get("saved_msg_id")
     sc = row.get("save_code")
@@ -352,7 +353,7 @@ async def do_delete(self_client, owner_id: int, save_code: str) -> str:
         except Exception as exc:
             logger.warning("delete telegram msg failed: %s", exc)
     await db_client.log(owner_id, "INFO", f"Deleted {save_code}", {"save_code": save_code})
-    return f"✅ Deleted `{save_code}`"
+    return f"{sym.OP_SAVE} Deleted `{save_code}`"
 
 
 # ── Saved-item resolver (Save V2 Part 3 — deterministic 0/1/N) ────────────
@@ -502,13 +503,13 @@ def format_resolution(resolution: SavedItemResolution) -> str:
     """Owner-facing rendering of a resolution (no model instructions)."""
     if resolution.status == RESOLUTION_NOT_FOUND:
         return (
-            f"🔍 No saved item matches `{resolution.query}`. "
+            f"{sym.OP_SEARCH} No saved item matches `{resolution.query}`. "
             "Try the saved name, one of its tags, or its save code."
         )
     if resolution.status == RESOLUTION_UNIQUE:
-        header = f"✅ One saved item matches `{resolution.query}`:"
+        header = f"{sym.OP_SAVE} One saved item matches `{resolution.query}`:"
     else:
-        header = f"🔍 Multiple saved items match `{resolution.query}`:"
+        header = f"{sym.OP_SEARCH} Multiple saved items match `{resolution.query}`:"
     lines = [header]
     for i, candidate in enumerate(resolution.candidates, start=1):
         lines.append(format_candidate(i, candidate))
@@ -775,7 +776,7 @@ async def resolve_management_target(
             return ManagementTarget(status=TARGET_INVALID, message=error)
         if row is None:
             return ManagementTarget(
-                status=TARGET_NOT_FOUND, message=f"❌ No item found for `{code}`"
+                status=TARGET_NOT_FOUND, message=f"{sym.STATE_FAILED} No item found for `{code}`"
             )
         return ManagementTarget(status=TARGET_OK, save_code=code)
 
@@ -810,7 +811,7 @@ async def _load_for_management(owner_id: int, save_code: str) -> tuple[dict | No
     try:
         return await load_saved_item(save_code, owner_id), ""
     except Exception as exc:  # noqa: BLE001
-        return None, f"❌ DB error: {exc}"
+        return None, f"{sym.STATE_FAILED} DB error: {exc}"
 
 
 def _stored_matches(stored, expected) -> bool:
@@ -839,19 +840,19 @@ async def _sync_saved_caption(client, row: dict, new_caption: str) -> str:
     """
     if len(new_caption) > MAX_CAPTION_CHARS:
         return (
-            f"❌ The saved message was not updated: the caption would be "
+            f"{sym.STATE_FAILED} The saved message was not updated: the caption would be "
             f"{len(new_caption)} characters and Telegram allows {MAX_CAPTION_CHARS}."
         )
     saved_chat_id = row.get("saved_chat_id")
     saved_msg_id = row.get("saved_msg_id")
     if not saved_chat_id or not saved_msg_id:
-        return "❌ Saved location data is missing for this entry."
+        return f"{sym.STATE_FAILED} Saved location data is missing for this entry."
     try:
         peer = await client.get_input_entity(saved_chat_id)
         await client.edit_message(peer, saved_msg_id, new_caption)
     except Exception as exc:  # noqa: BLE001
         logger.warning("saved caption sync failed for %s: %s", row.get("save_code"), exc)
-        return f"❌ The saved message could not be updated ({exc})."
+        return f"{sym.STATE_FAILED} The saved message could not be updated ({exc})."
     return ""
 
 
@@ -870,7 +871,7 @@ async def _write_metadata_fields(
         await db_client.update_save_fields(owner_id, save_code, fields)
     except Exception as exc:  # noqa: BLE001
         logger.warning("saved-item metadata write failed for %s: %s", save_code, exc)
-        return f"❌ Could not save the change ({exc})."
+        return f"{sym.STATE_FAILED} Could not save the change ({exc})."
     return await _confirm_metadata(owner_id, save_code, expected)
 
 
@@ -880,7 +881,7 @@ async def _write_metadata(owner_id: int, save_code: str, field: str, value, expe
         await db_client.update_save_field(owner_id, save_code, field, value)
     except Exception as exc:  # noqa: BLE001
         logger.warning("saved-item metadata write failed for %s: %s", save_code, exc)
-        return f"❌ Could not save the change ({exc})."
+        return f"{sym.STATE_FAILED} Could not save the change ({exc})."
     return await _confirm_metadata(owner_id, save_code, {field: expected})
 
 
@@ -893,12 +894,12 @@ async def _confirm_metadata(owner_id: int, save_code: str, expected: dict) -> st
     try:
         row = await load_saved_item(save_code, owner_id)
     except Exception as exc:  # noqa: BLE001
-        return f"❌ DB error while confirming the change: {exc}"
+        return f"{sym.STATE_FAILED} DB error while confirming the change: {exc}"
     if row is None:
-        return f"❌ No item found for `{save_code}`"
+        return f"{sym.STATE_FAILED} No item found for `{save_code}`"
     if all(_stored_matches(row.get(field), value) for field, value in expected.items()):
         return ""
-    return "❌ The change was not stored — the saved item is unchanged."
+    return f"{sym.STATE_FAILED} The change was not stored — the saved item is unchanged."
 
 
 async def _caption_base(client, row: dict) -> tuple[str, str]:
@@ -918,9 +919,9 @@ async def _caption_base(client, row: dict) -> tuple[str, str]:
         peer = await client.get_input_entity(row.get("saved_chat_id"))
         message = await client.get_messages(peer, ids=row.get("saved_msg_id"))
     except Exception as exc:  # noqa: BLE001
-        return "", f"❌ Could not read the saved message ({exc})."
+        return "", f"{sym.STATE_FAILED} Could not read the saved message ({exc})."
     if message is None:
-        return "", "❌ The saved message could not be found."
+        return "", f"{sym.STATE_FAILED} The saved message could not be found."
     return str(getattr(message, "message", None) or ""), ""
 
 
@@ -951,19 +952,19 @@ async def do_edit_tags(
     code = str(save_code or "").upper().strip()
     operation = str(op or "").strip().lower()
     if operation not in TAG_OPS:
-        return "⚠️ Nothing was changed: unknown tag operation."
+        return f"{sym.STATE_WARNING} Nothing was changed: unknown tag operation."
     try:
         incoming = save_service.normalize_tags(tags)
     except ValueError as exc:
-        return f"⚠️ Nothing was changed: {exc}"
+        return f"{sym.STATE_WARNING} Nothing was changed: {exc}"
     if operation != TAG_OP_REPLACE and not incoming:
-        return "⚠️ Nothing was changed: send at least one tag."
+        return f"{sym.STATE_WARNING} Nothing was changed: send at least one tag."
 
     row, error = await _load_for_management(owner_id, code)
     if error:
         return error
     if row is None:
-        return f"❌ No item found for `{code}`"
+        return f"{sym.STATE_FAILED} No item found for `{code}`"
 
     current = _owner_tags(row)
     if operation == TAG_OP_ADD:
@@ -972,7 +973,7 @@ async def do_edit_tags(
         removal = {t.casefold() for t in incoming}
         merged = tuple(t for t in current if t.casefold() not in removal)
         if merged == current:
-            return f"⚠️ Nothing was changed: `{code}` has none of those tags."
+            return f"{sym.STATE_WARNING} Nothing was changed: `{code}` has none of those tags."
     else:
         merged = incoming
     # The RESULT must obey the same shared rules (count bound included), so an
@@ -980,7 +981,7 @@ async def do_edit_tags(
     try:
         merged = save_service.normalize_tags(merged)
     except ValueError as exc:
-        return f"⚠️ Nothing was changed: {exc}"
+        return f"{sym.STATE_WARNING} Nothing was changed: {exc}"
 
     stored = _legacy_tags(row) + list(merged)
 
@@ -1005,7 +1006,7 @@ async def do_edit_tags(
         "tags": list(merged),
     })
     rendered = ", ".join(merged) if merged else "no tags"
-    return f"✅ Tags for `{code}`: {rendered}"
+    return f"{sym.OP_SAVE} Tags for `{code}`: {rendered}"
 
 
 async def do_change_file_name(
@@ -1034,45 +1035,45 @@ async def do_change_file_name(
     try:
         name = save_service.normalize_file_name(new_file_name)
     except ValueError as exc:
-        return f"⚠️ Nothing was renamed: {exc}"
+        return f"{sym.STATE_WARNING} Nothing was renamed: {exc}"
 
     if client is None:
-        return "❌ Cannot change the saved file name: no Telegram client available."
+        return f"{sym.STATE_FAILED} Cannot change the saved file name: no Telegram client available."
 
     row, error = await _load_for_management(owner_id, code)
     if error:
         return error
     if row is None:
-        return f"❌ No item found for `{code}`"
+        return f"{sym.STATE_FAILED} No item found for `{code}`"
 
     saved_chat_id = row.get("saved_chat_id")
     saved_msg_id = row.get("saved_msg_id")
     if not saved_chat_id or not saved_msg_id:
-        return "❌ Saved location data is missing for this entry."
+        return f"{sym.STATE_FAILED} Saved location data is missing for this entry."
 
     try:
         peer = await client.get_input_entity(saved_chat_id)
         current = await client.get_messages(peer, ids=saved_msg_id)
     except Exception as exc:  # noqa: BLE001
         logger.warning("saved file-name read failed for %s: %s", code, exc)
-        return f"❌ Could not read the saved message ({exc}). Nothing was renamed."
+        return f"{sym.STATE_FAILED} Could not read the saved message ({exc}). Nothing was renamed."
     if current is None:
-        return "❌ The saved message could not be found. Nothing was renamed."
+        return f"{sym.STATE_FAILED} The saved message could not be found. Nothing was renamed."
 
     media = getattr(current, "media", None)
     if not isinstance(media, MessageMediaDocument):
         return (
-            "❌ This saved item's Telegram media has no file name to change — "
+            f"{sym.STATE_FAILED} This saved item's Telegram media has no file name to change — "
             "only a saved document carries one. Nothing was renamed."
         )
     current_name = save_service.extract_file_name(media)
     if not current_name:
         return (
-            "❌ This saved item's Telegram document carries no file name to "
+            f"{sym.STATE_FAILED} This saved item's Telegram document carries no file name to "
             "change. Nothing was renamed."
         )
     if current_name == name:
-        return f"⚠️ Nothing was renamed: `{code}` is already named `{name}`."
+        return f"{sym.STATE_WARNING} Nothing was renamed: `{code}` is already named `{name}`."
 
     caption, error = await _caption_base(client, row)
     if error:
@@ -1088,9 +1089,9 @@ async def do_change_file_name(
             await client.download_media(current, file=tmp_path)
         except Exception as exc:  # noqa: BLE001
             logger.warning("saved file-name download failed for %s: %s", code, exc)
-            return f"❌ Could not download the saved media ({exc}). Nothing was renamed."
+            return f"{sym.STATE_FAILED} Could not download the saved media ({exc}). Nothing was renamed."
         if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) == 0:
-            return "❌ The downloaded saved media is empty. Nothing was renamed."
+            return f"{sym.STATE_FAILED} The downloaded saved media is empty. Nothing was renamed."
 
         # The SAME media handling Deep Save uses, with the new filename: the
         # document's other attributes and its MIME type are carried over, so a
@@ -1105,12 +1106,12 @@ async def do_change_file_name(
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("saved file-name re-upload failed for %s: %s", code, exc)
-            return f"❌ Could not re-upload the saved media ({exc}). The saved item is unchanged."
+            return f"{sym.STATE_FAILED} Could not re-upload the saved media ({exc}). The saved item is unchanged."
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
     if sent is None or getattr(sent, "id", None) is None:
-        return "❌ The replacement saved message was not created. The saved item is unchanged."
+        return f"{sym.STATE_FAILED} The replacement saved message was not created. The saved item is unchanged."
 
     new_file_id, new_mime, new_size = save_service._extract_uploaded_metadata(sent)
     fields = {
@@ -1142,9 +1143,9 @@ async def do_change_file_name(
         logger.warning("old saved message cleanup failed for %s: %s", code, exc)
         await db_client.log(owner_id, "INFO", f"Renamed file {code}", {"file_name": name})
         return (
-            f"✅ File name for `{code}` is now **{name}** — the previous copy could "
+            f"{sym.OP_SAVE} File name for `{code}` is now **{name}** — the previous copy could "
             "not be removed from Saved Messages."
         )
 
     await db_client.log(owner_id, "INFO", f"Renamed file {code}", {"file_name": name})
-    return f"✅ File name for `{code}` is now **{name}**"
+    return f"{sym.OP_SAVE} File name for `{code}` is now **{name}**"

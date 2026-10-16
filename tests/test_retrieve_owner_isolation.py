@@ -95,7 +95,7 @@ async def test_owner_can_retrieve_own_saved_item():
 
     result = await retrieve_service.do_retrieve(client, OWNER, CODE, CHAT)
 
-    assert result.startswith("✅")
+    assert result.startswith("✓")
     client.forward_messages.assert_awaited_once()
 
 
@@ -109,7 +109,7 @@ async def test_cross_owner_retrieve_fails_without_telegram_side_effects():
 
     result = await retrieve_service.do_retrieve(client, OWNER, CODE, CHAT)
 
-    assert result.startswith("❌")
+    assert result.startswith("×")
     assert "No item found" in result
     # Fail closed: no entity resolution, no forwarding, no caption edit.
     client.get_input_entity.assert_not_awaited()
@@ -129,7 +129,7 @@ async def test_missing_owner_information_fails_closed():
 
     result = await retrieve_service.do_retrieve(client, OWNER, CODE, CHAT)
 
-    assert result.startswith("❌")
+    assert result.startswith("×")
     client.get_input_entity.assert_not_awaited()
     client.forward_messages.assert_not_awaited()
 
@@ -142,7 +142,7 @@ async def test_unknown_code_fails_without_telegram_side_effects():
 
     result = await retrieve_service.do_retrieve(client, OWNER, "S9999", CHAT)
 
-    assert result.startswith("❌")
+    assert result.startswith("×")
     client.get_input_entity.assert_not_awaited()
     client.forward_messages.assert_not_awaited()
 
@@ -155,9 +155,9 @@ async def test_cross_owner_message_is_indistinguishable_from_missing():
     missing = await retrieve_service.do_retrieve(MagicMock(), OWNER, "S9999", CHAT)
     # Same failure template, no data leak (no mime/media/sender in either).
     for message in (result, missing):
-        assert message.startswith("❌ No item found for `")
+        assert message.startswith("× No item found for `")
         assert "Photo" not in message and "image" not in message
-    assert result == f"❌ No item found for `{CODE}`"
+    assert result == f"× No item found for `{CODE}`"
 
 
 # ── tool/executor-level destination protection unchanged ────────────────────
@@ -227,7 +227,7 @@ async def test_service_failure_mapping_unchanged():
     client = MagicMock()
     client.get_input_entity = AsyncMock()
     result = await retrieve_service.do_retrieve(client, OWNER, CODE, CHAT)
-    assert result == "❌ Saved location data is missing for this entry."
+    assert result == "× Saved location data is missing for this entry."
     client.get_input_entity.assert_not_awaited()
 
 

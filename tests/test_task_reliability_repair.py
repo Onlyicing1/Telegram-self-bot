@@ -369,7 +369,7 @@ def test_wizard_back_is_always_a_step_action_and_never_a_panel_pop(registered):
         rows = _rows(buttons)
         data = [value for row in rows for _, value in row]
         assert "panel:_nav:back" not in data, f"{step} exposes a panel-stack Back"
-        back_rows = [pairs for pairs in rows if pairs and pairs[0][0].startswith("← Back")]
+        back_rows = [pairs for pairs in rows if pairs and pairs[0][0].startswith("❮ Back")]
         if step == taskloom.STEP_ACTION:
             # The first step has no Back at all: Cancel is the explicit exit.
             assert back_rows == []

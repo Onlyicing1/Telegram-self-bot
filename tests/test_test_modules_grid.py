@@ -10,6 +10,7 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from backend.helper import symbols as sym
 
 from backend.bot.handlers import ai as ai_module
 from backend.bot.handlers import ai_test_progress
@@ -163,9 +164,9 @@ def test_active_runtime_model_is_marked_in_place_not_duplicated():
     payload = _payload({"groq": ["m1", "m2"]})
     body, buttons = ai_module._render_test_results(payload, current=("groq", "m2"))
 
-    assert "◉ `m2`" in body
-    assert "• `m1`" in body
-    marks = [label for label in _labels(buttons) if label.startswith("◉ ")]
+    assert f"{sym.MEDIA_VOICE} `m2`" in body
+    assert f"{sym.BULLET} `m1`" in body
+    marks = [label for label in _labels(buttons) if label.startswith(f"{sym.MEDIA_VOICE} ")]
     assert len(marks) == 1
     assert any("m2" in label for label in marks)
     # Exactly one button per model — the mark is not a duplicate.
@@ -177,9 +178,9 @@ def test_active_runtime_model_is_marked_in_place_not_duplicated():
 def test_non_active_results_keep_the_plain_usable_marker():
     payload = _payload({"groq": ["m1"]})
     body, buttons = ai_module._render_test_results(payload, current=("openai", "gpt-4o"))
-    assert "• `m1`" in body
-    assert "◉" not in body
-    assert all(not label.startswith("◉ ") for label in _labels(buttons))
+    assert f"{sym.BULLET} `m1`" in body
+    assert sym.MEDIA_VOICE not in body
+    assert all(not label.startswith(f"{sym.MEDIA_VOICE} ") for label in _labels(buttons))
 
 
 # ── Requirement: adaptive 2/3-column grid ──
@@ -297,7 +298,7 @@ def test_grid_keeps_the_summary_and_existing_actions_without_emoji():
     body, buttons = ai_module._render_test_results(payload, current=("groq", "m1"))
     datas = _flatten(buttons)
 
-    assert "✓ 1" in body
+    assert f"{sym.OP_SAVE} 1" in body
     assert "action:ai_test_models" in datas
     assert "action:ai_test_details" in datas
     assert "panel:ai_model" in datas

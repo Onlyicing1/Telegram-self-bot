@@ -26,6 +26,7 @@ A failure surfaces as a failed ``ToolResult`` carrying the boundary's bounded,
 already-sanitized reason — never a raw provider error and never a credential.
 """
 from __future__ import annotations
+from backend.helper import symbols as sym
 
 import logging
 from typing import Any
@@ -198,7 +199,7 @@ class SpeakTool(Tool):
         return ToolResult(
             success=True,
             message=(
-                f"🔊 Spoke {clip.characters} character"
+                f"{sym.ICON_SPEAK} Spoke {clip.characters} character"
                 f"{'s' if clip.characters != 1 else ''} as a voice message."
             ),
             data={

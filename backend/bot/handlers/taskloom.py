@@ -54,6 +54,8 @@ from backend.ai.task_wizard import (
     TaskDraft,
     TaskWizardError,
 )
+from backend.helper.styles import DANGER
+from backend.helper import symbols as sym
 
 logger = logging.getLogger(__name__)
 
@@ -68,21 +70,8 @@ _drafts: dict[int, TaskDraft] = {}
 _DEFAULT_TZ = "UTC"
 _WIZARD_PANEL = "taskloom_new"
 
-_STATUS_ICON = {
-    "active": "●",
-    "paused": "∥",
-    "completed": "✓",
-    "failed": "×",
-    "expired": "×",
-    "deleted": "×",
-}
-_SCHEDULE_ICON = {
-    "once": "·",
-    "interval": "⟳",
-    "daily": "◷",
-    "weekly": "◷",
-    "event": "⚡",
-}
+_STATUS_ICON = {k: v.glyph for k, v in sym.TASK_STATE_SYMBOLS.items()}
+_SCHEDULE_ICON = {k: v.glyph for k, v in sym.SCHEDULE_SYMBOLS.items()}
 
 
 def _service(owner_id: int):
@@ -109,8 +98,8 @@ def _task_row(task) -> tuple[str, str]:
 
 def _nav(builder: InlinePanelBuilder) -> None:
     builder.add_buttons(
-        ("← Back", "panel:_nav:back"),
-        ("⌂ Home", "panel:_nav:home"),
+        (sym.label(sym.OP_BACK, "Back"), "panel:_nav:back"),
+        (sym.label(sym.OP_HOME, "Home"), "panel:_nav:home"),
     )
 
 
@@ -129,10 +118,10 @@ def _wizard_footer(builder: InlinePanelBuilder, *, editing: bool = False) -> Non
     to the Taskloom list. Back never cancels and never discards the draft.
     """
     if editing:
-        builder.add_row("✕ Cancel edit", "action:taskloom_wizard:cancel")
+        builder.add_row(sym.label(sym.OP_CLOSE, "Discard changes"), "action:taskloom_wizard:cancel", DANGER)
     else:
-        builder.add_row("✕ Cancel", "panel:taskloom")
-    builder.add_row("❌ Close", "panel:_nav:close")
+        builder.add_row(sym.label(sym.OP_CLOSE, "Cancel"), "panel:taskloom", DANGER)
+    builder.add_row(sym.label(sym.OP_CLOSE, "Close"), "panel:_nav:close")
 
 
 async def _taskloom_panel(event, extra: str) -> tuple[str, str, list] | None:
@@ -164,12 +153,14 @@ async def _taskloom_panel(event, extra: str) -> tuple[str, str, list] | None:
     done = counts.get("completed", 0) + counts.get("failed", 0) + counts.get("expired", 0)
 
     lines = [
-        "▦ **Taskloom**",
-        f"● {active} active · ∥ {paused} paused · × {done} closed",
+        f"{sym.PANEL_HEADING} **Taskloom**",
+        f"{sym.STATE_ACTIVE} {active} active {sym.SEPARATOR} "
+        f"{sym.STATE_PAUSED} {paused} paused {sym.SEPARATOR} "
+        f"{sym.STATE_COMPLETED} {done} closed",
         "",
     ]
     builder = InlinePanelBuilder()
-    builder.add_row("＋ New task", f"panel:{_WIZARD_PANEL}:new")
+    builder.add_row(sym.label(sym.OP_CREATE, "New task"), f"panel:{_WIZARD_PANEL}:new")
 
     if not tasks:
         if snapshot.fallback_active:
@@ -188,15 +179,15 @@ async def _taskloom_panel(event, extra: str) -> tuple[str, str, list] | None:
             builder.add_row(text, cb)
         if page_count > 1:
             builder.add_row(
-                "❮" if page > 0 else "·",
+                sym.OP_PREV if page > 0 else sym.SEPARATOR,
                 f"panel:taskloom:{page - 1}" if page > 0 else "panel:taskloom",
             )
             builder.add_row(
-                f"{page + 1} / {page_count}",
+                f"{sym.PAGE_CURRENT} {page + 1} / {page_count}",
                 f"panel:taskloom:{page + 1}" if page + 1 < page_count else f"panel:taskloom:{page}",
             )
             if page + 1 < page_count:
-                builder.add_row("❯", f"panel:taskloom:{page + 1}")
+                builder.add_row(sym.OP_NEXT, f"panel:taskloom:{page + 1}")
         if snapshot.fallback_active:
             # The rows above are a NON-DURABLE view: say so instead of letting
             # a memory-only list look authoritative.
@@ -221,15 +212,15 @@ async def _task_detail_panel(event, extra: str) -> tuple[str, str, list] | None:
     try:
         task_id = int(extra)
     except (TypeError, ValueError):
-        return "Taskloom", "× Invalid task id.", []
+        return "Taskloom", f"{sym.STATE_FAILED} Invalid task id.", []
 
     service = _service(_owner_id)
     view = await service.inspect(task_id, occurrence_limit=_MAX_INSPECT_OCC)
     if view is None:
-        return "Taskloom", "× Task not found.", []
+        return "Taskloom", f"{sym.STATE_FAILED} Task not found.", []
 
     task, occurrences = view.task, view.occurrences
-    icon = _STATUS_ICON.get(task.status, "×")
+    icon = _STATUS_ICON.get(task.status, sym.STATE_FAILED)
     destination = task.notification_destination or {}
     destination_label = destination.get("chat_title") or (
         "Current chat" if destination.get("chat_id") else "Unavailable"
@@ -238,8 +229,8 @@ async def _task_detail_panel(event, extra: str) -> tuple[str, str, list] | None:
         f"{icon} **Task {task.id}**",
         f"`{task.label[:60]}`",
         "",
-        f"**Schedule:** {_SCHEDULE_ICON.get(task.schedule_type, '·')} {task.schedule_type} · v{task.version}",
-        f"**Destination:** ◉ {destination_label}",
+        f"**Schedule:** {_SCHEDULE_ICON.get(task.schedule_type, sym.SEPARATOR)} {task.schedule_type} {sym.SEPARATOR} v{task.version}",
+        f"**Destination:** {sym.DESTINATION} {destination_label}",
         f"**Timezone:** {task.timezone}",
         f"**Next run:** {_fmt_dt(task.next_run_at)}",
         f"**Updated:** {_fmt_dt(task.updated_at)}",
@@ -250,27 +241,28 @@ async def _task_detail_panel(event, extra: str) -> tuple[str, str, list] | None:
         name = a.get("name", "?")
         args = a.get("arguments", {})
         brief = ", ".join(f"{k}={str(v)[:24]}" for k, v in list(args.items())[:2])
-        lines.append(f"  • `{name}`({brief})")
+        lines.append(f"  {sym.SEPARATOR} `{name}`({brief})")
 
     if occurrences:
         lines += ["", "**Recent occurrences:**"]
         for occ in occurrences[:5]:
-            oicon = _STATUS_ICON.get(occ.status, "×")
+            oicon = _STATUS_ICON.get(occ.status, sym.STATE_FAILED)
             lines.append(
-                f"  {oicon} {_fmt_dt(occ.scheduled_for)} · {occ.status} · try {occ.attempt}"
+                f"  {oicon} {_fmt_dt(occ.scheduled_for)} {sym.SEPARATOR} {occ.status} "
+                f"{sym.SEPARATOR} try {occ.attempt}"
             )
 
     builder = InlinePanelBuilder()
     if task.status == "active":
-        builder.add_row("∥ Pause", f"action:taskloom_pause:{task.id}:{task.version}")
+        builder.add_row(sym.label(sym.OP_PAUSE, "Pause task"), f"action:taskloom_pause:{task.id}:{task.version}")
     elif task.status == "paused":
-        builder.add_row("● Resume", f"action:taskloom_resume:{task.id}:{task.version}")
+        builder.add_row(sym.label(sym.OP_RESUME, "Resume task"), f"action:taskloom_resume:{task.id}:{task.version}")
     if task.status not in ("completed", "deleted", "expired"):
-        builder.add_row("✓ Complete", f"action:taskloom_complete:{task.id}:{task.version}")
-    builder.add_row("✎ Edit", f"panel:{_WIZARD_PANEL}:edit:{task.id}")
+        builder.add_row(sym.label(sym.OP_SAVE, "Complete task"), f"action:taskloom_complete:{task.id}:{task.version}")
+    builder.add_row(sym.label(sym.OP_EDIT, "Edit task"), f"panel:{_WIZARD_PANEL}:edit:{task.id}")
     if task.status not in ("deleted",):
-        builder.add_row("⌫ Delete", f"action:taskloom_delete:{task.id}:{task.version}")
-    builder.add_row("⟳ Refresh", f"panel:taskloom_task:{task.id}")
+        builder.add_row(sym.label(sym.OP_DELETE, "Delete task"), f"action:taskloom_delete:{task.id}:{task.version}")
+    builder.add_row(sym.label(sym.OP_REFRESH, "Refresh"), f"panel:taskloom_task:{task.id}")
     _nav(builder)
     return f"Task #{task.id}", "\n".join(lines), builder.build()
 
@@ -301,17 +293,17 @@ async def _mutate(event, extra: str, verb: str) -> tuple[str, str, list] | None:
     from backend.helper.inline_engine import _owner_id
     parsed = _parse_action_extra(extra)
     if parsed is None:
-        return "Taskloom", "× Invalid action arguments.", []
+        return "Taskloom", f"{sym.STATE_FAILED} Invalid action arguments.", []
     task_id, version = parsed
     service = _service(_owner_id)
     try:
         task = await getattr(service, verb)(task_id, version)
     except Exception:
         logger.exception("Taskloom %s failed for task %s", verb, task_id)
-        return f"Task #{task_id}", "× Operation failed; no change was confirmed.", []
+        return f"Task #{task_id}", f"{sym.STATE_FAILED} Operation failed; no change was confirmed.", []
     if task is None:
-        return f"Task #{task_id}", "× Task not found, ownership check failed, or version is stale.", []
-    notice = f"✓ {verb}d task #{task.id} · v{task.version}\n\n"
+        return f"Task #{task_id}", f"{sym.STATE_FAILED} Task not found, ownership check failed, or version is stale.", []
+    notice = f"{sym.OP_SAVE} {verb}d task #{task.id} {sym.SEPARATOR} v{task.version}\n\n"
     result = await _task_detail_panel(event, str(task_id))
     if result is None:
         return f"Task #{task_id}", notice.rstrip(), []
@@ -344,14 +336,14 @@ async def _delete_action(event, extra: str, chat_id: int):
 
     parsed = _parse_action_extra(extra)
     if parsed is None:
-        return "Taskloom", "× Invalid action arguments.", []
+        return "Taskloom", f"{sym.STATE_FAILED} Invalid action arguments.", []
     task_id, version = parsed
     service = _service(_owner_id)
     try:
         result = await service.delete(task_id, version)
     except Exception:
         logger.exception("Taskloom delete failed for task %s", task_id)
-        return f"Task #{task_id}", "× Operation failed; no change was confirmed.", []
+        return f"Task #{task_id}", f"{sym.STATE_FAILED} Operation failed; no change was confirmed.", []
     if not result.deleted:
         if result.fallback_backend:
             from backend.ai.database.task_repository import FALLBACK_REASON_LOCAL_RESOURCE
@@ -359,18 +351,18 @@ async def _delete_action(event, extra: str, chat_id: int):
             if getattr(result, "fallback_reason", "") == FALLBACK_REASON_LOCAL_RESOURCE:
                 return (
                     f"Task #{task_id}",
-                    "× Local resource error; the durable store was not reached, "
+                    f"{sym.STATE_FAILED} Local resource error; the durable store was not reached, "
                     "so nothing durable was deleted.",
                     [],
                 )
-            return f"Task #{task_id}", "× Supabase unavailable; nothing durable was deleted.", []
+            return f"Task #{task_id}", f"{sym.STATE_FAILED} Supabase unavailable; nothing durable was deleted.", []
         if result.outcome == DELETION_STALE:
-            return f"Task #{task_id}", "× Version is stale; nothing was deleted.", []
-        return f"Task #{task_id}", "× Task not found or ownership check failed.", []
+            return f"Task #{task_id}", f"{sym.STATE_FAILED} Version is stale; nothing was deleted.", []
+        return f"Task #{task_id}", f"{sym.STATE_FAILED} Task not found or ownership check failed.", []
     notice = (
-        f"✓ Deleted task #{task_id}\n\n"
+        f"{sym.OP_SAVE} Deleted task #{task_id}\n\n"
         if result.durable
-        else f"✓ Deleted task #{task_id} (memory only — not durable)\n\n"
+        else f"{sym.OP_SAVE} Deleted task #{task_id} (memory only — not durable)\n\n"
     )
     refreshed = await _taskloom_panel(event, "")
     if refreshed is None:
@@ -451,9 +443,9 @@ def _wizard_render(draft: TaskDraft, owner_id: int | None = None) -> tuple[str, 
     step = draft.step or STEP_ACTION
     index, label = _step_position(step)
     if draft.editing_task_id:
-        header = f"**✎ Editing task #{draft.editing_task_id} · {label}**"
+        header = f"**{sym.OP_EDIT} Editing task #{draft.editing_task_id} {sym.SEPARATOR} {label}**"
     else:
-        header = f"**Step {index}/4 · {label}**"
+        header = f"**{sym.STEP_CURRENT} Step {index}/4 {sym.SEPARATOR} {label}**"
     lines = [header, ""]
     if draft.notice:
         lines.insert(0, draft.notice)
@@ -471,32 +463,32 @@ def _wizard_render(draft: TaskDraft, owner_id: int | None = None) -> tuple[str, 
         lines.append(f"**Schedule:** {_schedule_line(draft)}")
         if draft.content_mode == AI_MODE:
             lines.append(
-                "**Content:** ✨ AI-generated · source "
-                f"{draft.source or 'Any'} · language "
+                f"**Content:** {sym.CONTENT_AI} AI-generated {sym.SEPARATOR} source "
+                f"{draft.source or 'Any'} {sym.SEPARATOR} language "
                 f"{task_wizard.LANGUAGE_WORDS.get(draft.language) or 'Any'}"
                 + (
-                    f" · show source {'Yes' if draft.show_source else 'No'}"
+                    f" {sym.SEPARATOR} show source {'Yes' if draft.show_source else 'No'}"
                     if draft.action == "bio" and draft.source
                     else ""
                 )
             )
         else:
-            lines.append(f"**Content:** ✍ `{draft.text.strip() or '— not set —'}`")
+            lines.append(f"**Content:** {sym.CONTENT_STATIC} `{draft.text.strip() or '— not set —'}`")
             if definition is not None and definition.key == "message":
                 lines.append(f"**Font:** {task_wizard.font_label(draft.font)}")
-        builder.add_row("✎ Content", f"action:taskloom_wizard:step:{STEP_DETAILS}")
-        builder.add_row("⟳ Schedule", f"action:taskloom_wizard:step:{STEP_SCHEDULE}")
-        builder.add_row("✔ Review & save", f"action:taskloom_wizard:step:{STEP_REVIEW}")
+        builder.add_row(sym.label(sym.OP_EDIT, "Edit content"), f"action:taskloom_wizard:step:{STEP_DETAILS}")
+        builder.add_row(sym.label(sym.SCHEDULE_DAILY, "Schedule"), f"action:taskloom_wizard:step:{STEP_SCHEDULE}")
+        builder.add_row(sym.label(sym.OP_SAVE, "Review changes"), f"action:taskloom_wizard:step:{STEP_REVIEW}")
         # Explicit, user-chosen discard: re-prefill from the stored task (and
         # adopt its current version after a stale save) without ever doing it
         # silently.
-        builder.add_row("⟳ Reload from task", "action:taskloom_wizard:reload")
+        builder.add_row(sym.label(sym.OP_REFRESH, "Reload from task"), "action:taskloom_wizard:reload")
         # The edit hub's parent surface is the edited task's DETAIL view, so its
         # Back LEAVES the editor there with the pending draft intact. It is an
         # action (rendered in place), so the nav stack is untouched and the
         # detail view keeps its own Back. "✕ Cancel edit" below stays the only
         # control that discards.
-        builder.add_row("← Back", "action:taskloom_wizard:leave")
+        builder.add_row(sym.label(sym.OP_BACK, "Back"), "action:taskloom_wizard:leave")
     elif step == STEP_ACTION:
         lines.append("What should this task do?")
         for key in ACTION_ORDER:
@@ -504,16 +496,16 @@ def _wizard_render(draft: TaskDraft, owner_id: int | None = None) -> tuple[str, 
             builder.add_row(definition.button, f"action:taskloom_wizard:set:action:{key}")
     elif step == STEP_CONTENT:
         lines.append("How should the content be produced each run?")
-        builder.add_row("✨ AI-generated (fresh each run)", "action:taskloom_wizard:set:mode:ai")
-        builder.add_row("✍ Static text (same every run)", "action:taskloom_wizard:set:mode:static")
+        builder.add_row(sym.label(sym.CONTENT_AI, "AI-generated (fresh each run)"), "action:taskloom_wizard:set:mode:ai")
+        builder.add_row(sym.label(sym.CONTENT_STATIC, "Static text (same every run)"), "action:taskloom_wizard:set:mode:static")
         builder.add_row(
-            "← Back",
+            sym.label(sym.OP_BACK, "Back"),
             f"action:taskloom_wizard:step:{_wizard_back_step(draft, STEP_ACTION)}",
         )
     elif step == STEP_DETAILS:
         definition = ACTION_DEFINITIONS.get(draft.action)
         if definition is not None and draft.content_mode == AI_MODE:
-            lines.append(f"{definition.title} · generated content. Optional constraints;")
+            lines.append(f"{definition.title} {sym.SEPARATOR} generated content. Optional constraints;")
             lines.append("anything left unset imposes no constraint.")
             lines.append("")
             lines.append(f"Source: {draft.source or 'Any'}")
@@ -557,14 +549,14 @@ def _wizard_render(draft: TaskDraft, owner_id: int | None = None) -> tuple[str, 
                     builder.add_row(
                         "Clear font", "action:taskloom_wizard:set:font:default"
                     )
-        builder.add_row("Next: schedule →", f"action:taskloom_wizard:step:{STEP_SCHEDULE}")
+        builder.add_row(f"Next: schedule {sym.OP_NEXT}", f"action:taskloom_wizard:step:{STEP_SCHEDULE}")
         back_step = (
             STEP_CONTENT
             if (definition is not None and definition.supports_ai and draft.content_mode)
             else STEP_ACTION
         )
         builder.add_row(
-            "← Back",
+            sym.label(sym.OP_BACK, "Back"),
             f"action:taskloom_wizard:step:{_wizard_back_step(draft, back_step)}",
         )
     elif step == STEP_SCHEDULE:
@@ -577,12 +569,12 @@ def _wizard_render(draft: TaskDraft, owner_id: int | None = None) -> tuple[str, 
         builder.add_row("Timezone…", f"input:{_WIZARD_PANEL}:tz")
         problem = task_wizard.missing_requirement(draft, reference=datetime.now(timezone.utc))
         if problem is None:
-            builder.add_row("Review →", f"action:taskloom_wizard:step:{STEP_REVIEW}")
+            builder.add_row(sym.label(sym.OP_SAVE, "Review changes"), f"action:taskloom_wizard:step:{STEP_REVIEW}")
         else:
             lines.append("")
             lines.append(f"_Cannot continue yet: {problem}_")
         builder.add_row(
-            "← Back",
+            sym.label(sym.OP_BACK, "Back"),
             f"action:taskloom_wizard:step:{_wizard_back_step(draft, STEP_DETAILS)}",
         )
     elif step == STEP_REVIEW:
@@ -597,17 +589,17 @@ def _wizard_render(draft: TaskDraft, owner_id: int | None = None) -> tuple[str, 
             lines.append(f"**{key}:** {value}")
         if rows:
             builder.add_row(
-                "✔ Save changes" if draft.editing_task_id else "✔ Create task",
+                sym.label(sym.OP_SAVE, "Save changes") if draft.editing_task_id else sym.label(sym.OP_SAVE, "Create task"),
                 "action:taskloom_wizard:create",
             )
         builder.add_row(
-            "← Back",
+            sym.label(sym.OP_BACK, "Back"),
             f"action:taskloom_wizard:step:{_wizard_back_step(draft, STEP_SCHEDULE)}",
         )
         # Cancel lives in the shared footer and is mode-aware there.
 
     _wizard_footer(builder, editing=bool(draft.editing_task_id))
-    title = f"✎ Edit task #{draft.editing_task_id}" if draft.editing_task_id else "＋ New task"
+    title = f"{sym.OP_EDIT} Edit task #{draft.editing_task_id}" if draft.editing_task_id else sym.label(sym.OP_CREATE, "New task")
     return title, "\n".join(lines), builder.build()
 
 
@@ -686,14 +678,14 @@ async def _start_edit(raw_task_id: str) -> tuple[str, str, list]:
     try:
         task_id = int(raw_task_id)
     except (TypeError, ValueError):
-        return "Taskloom", "× Invalid task id.", []
+        return "Taskloom", f"{sym.STATE_FAILED} Invalid task id.", []
     view = await _service(owner).inspect(task_id, occurrence_limit=1)
     if view is None:
-        return "Taskloom", "× Task not found.", []
+        return "Taskloom", f"{sym.STATE_FAILED} Task not found.", []
     try:
         draft = task_wizard.draft_from_task(view.task, step=STEP_EDIT)
     except TaskWizardError as exc:
-        return f"Task #{task_id}", f"× {exc}", []
+        return f"Task #{task_id}", f"{sym.STATE_FAILED} {exc}", []
     draft = draft.updated(
         notice=f"Editing task #{task_id} · v{view.task.version}"
     )
@@ -709,7 +701,7 @@ async def _wizard_inline_builder(event, extra: str) -> list:
 def _wizard_set_action(draft: TaskDraft, key: str) -> TaskDraft:
     definition = ACTION_DEFINITIONS.get(key)
     if definition is None:
-        return draft.updated(notice="× Unknown action.")
+        return draft.updated(notice=f"{sym.STATE_FAILED} Unknown action.")
     return draft.updated(
         action=key,
         content_mode="" if definition.supports_ai else STATIC_MODE,
@@ -764,7 +756,7 @@ def _wizard_apply(draft: TaskDraft, field: str, raw: str) -> TaskDraft:
             return draft.updated(source="", show_source=False, notice="")
         raise TaskWizardError("unknown setting")
     except TaskWizardError as exc:
-        return draft.updated(notice=f"× {exc}")
+        return draft.updated(notice=f"{sym.STATE_FAILED} {exc}")
 
 
 async def _wizard_create(draft: TaskDraft, chat_id: int) -> tuple[str, str, list]:
@@ -776,7 +768,7 @@ async def _wizard_create(draft: TaskDraft, chat_id: int) -> tuple[str, str, list
     effective_chat = 0 if draft.editing_task_id else chat_id
     problem = task_wizard.missing_requirement(draft, effective_chat, now)
     if problem is not None:
-        return _wizard_render(draft.updated(step=STEP_REVIEW, notice=f"× {problem}"))
+        return _wizard_render(draft.updated(step=STEP_REVIEW, notice=f"{sym.STATE_FAILED} {problem}"))
     try:
         from backend.ai.task_candidate import TaskCandidate
         from backend.ai.database.manager import get_repository_manager
@@ -801,9 +793,9 @@ async def _wizard_create(draft: TaskDraft, chat_id: int) -> tuple[str, str, list
                     draft.updated(
                         step=STEP_REVIEW,
                         notice=(
-                            "× The task changed since the form was opened "
+                            f"{sym.STATE_FAILED} The task changed since the form was opened "
                             "(stale version); nothing was saved. "
-                            "← Back → ⟳ Reload from task to adopt the current version."
+                            f"{sym.OP_BACK} Back {sym.OP_NEXT} {sym.OP_REFRESH} Reload from task to adopt the current version."
                         ),
                     )
                 )
@@ -814,13 +806,13 @@ async def _wizard_create(draft: TaskDraft, chat_id: int) -> tuple[str, str, list
     except Exception as exc:  # noqa: BLE001
         logger.exception("Taskloom wizard persistence failed")
         return _wizard_render(
-            draft.updated(step=STEP_REVIEW, notice=f"× Save failed ({type(exc).__name__}); nothing durable was written.")
+            draft.updated(step=STEP_REVIEW, notice=f"{sym.STATE_FAILED} Save failed ({type(exc).__name__}); nothing durable was written.")
         )
     _drafts.pop(owner, None)
     note = (
-        f"✓ Task #{task.id} updated · v{task.version}"
+        f"{sym.OP_SAVE} Task #{task.id} updated {sym.SEPARATOR} v{task.version}"
         if draft.editing_task_id
-        else f"✓ Task #{task.id} created — {task.label}"
+        else f"{sym.OP_SAVE} Task #{task.id} created — {task.label}"
     )
     fallback_backend = getattr(task, "fallback_backend", None)
     if fallback_backend:
@@ -850,11 +842,11 @@ async def _wizard_cancel(draft: TaskDraft) -> tuple[str, str, list]:
         detail = await _task_detail_panel(None, str(draft.editing_task_id))
         if detail is not None:
             return detail
-        return f"Task #{draft.editing_task_id}", "× Edit cancelled; nothing was saved.", []
+        return f"Task #{draft.editing_task_id}", f"{sym.STATE_FAILED} Edit cancelled; nothing was saved.", []
     listed = await _taskloom_panel(None, "")
     if listed is not None:
         return listed
-    return "Taskloom", "× Cancelled.", []
+    return "Taskloom", f"{sym.STATE_FAILED} Cancelled.", []
 
 
 async def _wizard_reload(draft: TaskDraft) -> tuple[str, str, list]:
@@ -957,7 +949,7 @@ def _wizard_input_handler(field: str):
                 if problem:
                     raise TaskWizardError(problem)
                 draft = trial
-                notice = f"✓ Source: {source}" if source else "✓ Source cleared"
+                notice = f"{sym.OP_SAVE} Source: {source}" if source else f"{sym.OP_SAVE} Source cleared"
             elif field == "maxlen":
                 value = task_wizard.parse_max_length(text)
                 trial = draft.updated(max_length=value)
@@ -965,7 +957,7 @@ def _wizard_input_handler(field: str):
                 if problem:
                     raise TaskWizardError(problem)
                 draft = trial
-                notice = f"✓ Maximum length: at most {value} characters" if value else "✓ Maximum length cleared"
+                notice = f"{sym.OP_SAVE} Maximum length: at most {value} characters" if value else f"{sym.OP_SAVE} Maximum length cleared"
             elif field == "text":
                 value = text.strip()
                 if not value:
@@ -973,43 +965,43 @@ def _wizard_input_handler(field: str):
                 if len(value) > task_wizard.MAX_TEXT_CHARS:
                     raise TaskWizardError("text is too long")
                 draft = draft.updated(text=value)
-                notice = "✓ Text saved"
+                notice = f"{sym.OP_SAVE} Text saved"
             elif field == "interval":
                 minutes = task_wizard.parse_interval_minutes(text)
                 draft = draft.updated(schedule_type="interval", interval_minutes=minutes)
-                notice = f"✓ Every {minutes} minutes"
+                notice = f"{sym.OP_SAVE} Every {minutes} minutes"
             elif field == "daily":
                 hour, minute = task_wizard.parse_clock(text)
                 draft = draft.updated(schedule_type="daily", clock=f"{hour:02d}:{minute:02d}")
-                notice = f"✓ Daily at {hour:02d}:{minute:02d}"
+                notice = f"{sym.OP_SAVE} Daily at {hour:02d}:{minute:02d}"
             elif field == "weekly":
                 weekday, clock = _parse_weekly(text)
                 draft = draft.updated(schedule_type="weekly", weekday=weekday, clock=clock)
-                notice = f"✓ Weekly on {WEEKDAYS[weekday]} at {clock}"
+                notice = f"{sym.OP_SAVE} Weekly on {WEEKDAYS[weekday]} at {clock}"
             elif field == "once":
                 at = task_wizard.parse_once_at(text)
                 draft = draft.updated(schedule_type="once", once_at=at)
-                notice = f"✓ Once at {at.replace('T', ' ')[:16]}"
+                notice = f"{sym.OP_SAVE} Once at {at.replace('T', ' ')[:16]}"
             elif field == "font":
                 key = " ".join((text or "").split()).lower()
                 if key in ("", "none", "default", "clear", "off", "-"):
                     draft = draft.updated(font="default")
-                    notice = "✓ Font: Default"
+                    notice = f"{sym.OP_SAVE} Font: Default"
                 else:
                     if not task_wizard.valid_font_key(key):
                         raise TaskWizardError("unknown font key")
                     draft = draft.updated(font=key)
-                    notice = f"✓ Font: {task_wizard.font_label(key)}"
+                    notice = f"{sym.OP_SAVE} Font: {task_wizard.font_label(key)}"
             elif field == "tz":
                 zone = " ".join((text or "").split())
                 if not task_wizard.valid_timezone(zone):
                     raise TaskWizardError("enter a valid IANA timezone like Asia/Tehran")
                 draft = draft.updated(timezone=zone)
-                notice = f"✓ Timezone: {zone}"
+                notice = f"{sym.OP_SAVE} Timezone: {zone}"
             else:
                 raise TaskWizardError("unknown input")
         except TaskWizardError as exc:
-            notice = f"× {exc}"
+            notice = f"{sym.STATE_FAILED} {exc}"
         draft = draft.updated(notice=notice)
         _store(draft)
         await _wizard_finish(notice, chat_id, msg_id, inline_chat_id, inline_msg_id)
@@ -1057,7 +1049,7 @@ def register(client, owner_id: int, tz_str: str) -> None:
     global _DEFAULT_TZ
     _DEFAULT_TZ = tz_str if task_wizard.valid_timezone(tz_str or "") else "UTC"
     try:
-        register_panel("taskloom", _taskloom_panel, parent="ai", title="▦ Taskloom")
+        register_panel("taskloom", _taskloom_panel, parent="ai", title=sym.label(sym.ICON_LIBRARY, "Taskloom"))
         register_inline_builder("taskloom", _taskloom_inline_builder)
         register_panel("taskloom_task", _task_detail_panel, parent="taskloom", title="Task")
         register_inline_builder("taskloom_task", _task_detail_inline_builder)
@@ -1065,7 +1057,7 @@ def register(client, owner_id: int, tz_str: str) -> None:
         register_action("taskloom_resume", _resume_action)
         register_action("taskloom_complete", _complete_action)
         register_action("taskloom_delete", _delete_action)
-        register_panel(_WIZARD_PANEL, _wizard_panel, parent="taskloom", title="＋ New task")
+        register_panel(_WIZARD_PANEL, _wizard_panel, parent="taskloom", title=sym.label(sym.OP_CREATE, "New task"))
         register_inline_builder(_WIZARD_PANEL, _wizard_inline_builder)
         register_action("taskloom_wizard", _wizard_action)
         for field, prompt in _INPUT_PROMPTS.items():
@@ -1078,7 +1070,7 @@ def register(client, owner_id: int, tz_str: str) -> None:
                 # explicit Cancel row really DISCARDS the draft — mode-aware in
                 # the handler (edit → the task's detail view, create → the
                 # Taskloom list).
-                "extra_rows": (("✕ Cancel", "action:taskloom_wizard:cancel"),),
+                "extra_rows": ((sym.label(sym.STATE_FAILED, "Cancel"), "action:taskloom_wizard:cancel", DANGER),),
             })
         logger.info("Taskloom panels registered OK")
     except Exception as exc:

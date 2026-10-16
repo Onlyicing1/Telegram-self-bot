@@ -16,6 +16,7 @@ no provider plumbing — all of that is owned by the history service, the histor
 AI service and the existing provider architecture.
 """
 from __future__ import annotations
+from backend.helper import symbols as sym
 
 import logging
 from typing import Any
@@ -196,7 +197,7 @@ class TranslateHistoryTool(Tool):
             )
             return ToolResult(
                 success=False,
-                message=f"❌ Translation failed: {type(exc).__name__}: {exc}",
+                message=f"{sym.STATE_FAILED} Translation failed: {type(exc).__name__}: {exc}",
             )
         logger.info(
             "AI_EXEC_TRACE request_id=%s stage=tool_result tool=%s success=%s",
@@ -287,7 +288,7 @@ class SummarizeHistoryTool(Tool):
             )
             return ToolResult(
                 success=False,
-                message=f"❌ Summarization failed: {type(exc).__name__}: {exc}",
+                message=f"{sym.STATE_FAILED} Summarization failed: {type(exc).__name__}: {exc}",
             )
         logger.info(
             "AI_EXEC_TRACE request_id=%s stage=tool_result tool=%s success=%s",

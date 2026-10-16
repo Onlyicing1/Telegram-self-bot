@@ -34,6 +34,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from backend.helper import symbols as sym
 
 from backend.bot.handlers import emoji
 from backend.db import client as db_client
@@ -327,17 +328,19 @@ def test_ui_registers_replacement_panels_and_actions():
         assert get_action(action_id) is not None, action_id
 
 
-def test_main_panel_shows_replacement_state_and_row():
+def test_main_panel_shows_replacement_state_and_exactly_one_button():
     _run(state_service.set_replacement_enabled(OWNER, True))
     title, body, buttons = _run(emoji._emoji_panel_handler(None, ""))
-    assert "Replacement: ✅ ON" in body
+    assert f"Replacement: {sym.STATE_COMPLETED} ON" in body
     datas = _datas(buttons)
-    assert "panel:emoji_replacement" in datas
+    # State is shown as TEXT; the panel still exposes exactly ONE button.
+    assert datas == [f"action:{emoji._DIAGNOSTICS_ACTION}"]
+    assert "panel:emoji_replacement" not in datas
 
 
 def test_main_panel_shows_replacement_off_by_default():
     title, body, _buttons = _run(emoji._emoji_panel_handler(None, ""))
-    assert "Replacement: ❌ OFF" in body
+    assert f"Replacement: {sym.STATE_FAILED} OFF" in body
 
 
 def test_replacement_panel_shows_full_state():
@@ -350,7 +353,7 @@ def test_replacement_panel_shows_full_state():
     _run(state_service.set_chat_override(OWNER, CHAT, cat_o["id"]))
 
     title, body, _buttons = _run(emoji._replacement_panel_handler(None, ""))
-    assert "Replacement: ✅ ON" in body
+    assert f"Replacement: {sym.STATE_COMPLETED} ON" in body
     assert "Global default: Global" in body
     assert f"Override for chat `{CHAT}`: PerChat" in body
     assert "Effective here: PerChat" in body
@@ -388,7 +391,7 @@ def test_replacement_panel_off_shows_honest_effective_none():
     )
     _run(state_service.set_global_default_category(OWNER, cat_g["id"]))
     _title, body, _buttons = _run(emoji._replacement_panel_handler(None, ""))
-    assert "Replacement: ❌ OFF" in body
+    assert f"Replacement: {sym.STATE_FAILED} OFF" in body
     assert "none — replacement is OFF" in body
 
 

@@ -20,6 +20,7 @@ from backend.helper import (
     to_edit_buttons,
 )
 from backend.helper.client import get_client
+from backend.helper import symbols as sym
 
 logger = logging.getLogger(__name__)
 
@@ -65,20 +66,20 @@ async def _find_input_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_
 
 async def _find_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
     builder = InlinePanelBuilder()
-    builder.add_row("Enter Search Text", "input:find:query")
+    builder.add_row(sym.label(sym.OP_SEARCH, "Enter Search Text"), "input:find:query")
     return "Search", "Enter search text:", builder.build()
 
 
 async def _find_inline_builder(event, extra: str) -> list:
     builder = InlinePanelBuilder()
-    builder.add_row("Enter Search Text", "input:find:query")
+    builder.add_row(sym.label(sym.OP_SEARCH, "Enter Search Text"), "input:find:query")
     return [render("Search", "Enter search text:", builder.build())]
 
 
 def register(client, owner_id: int, tz_str: str):
 
-    register_panel("list", _list_panel_handler, parent="menu", title="📋 List")
-    register_panel("find", _find_panel_handler, parent="menu", title="🔍 Find")
+    register_panel("list", _list_panel_handler, parent="menu", title="List")
+    register_panel("find", _find_panel_handler, parent="menu", title="Find")
     register_inline_builder("list", _list_inline_builder)
     register_inline_builder("find", _find_inline_builder)
     register_input("find", "query", {

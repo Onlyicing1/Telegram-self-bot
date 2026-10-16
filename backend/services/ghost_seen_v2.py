@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
+from backend.helper import symbols as sym
+
 logger = logging.getLogger(__name__)
 
 PAGE_SIZE = 5
@@ -633,12 +635,12 @@ def render_chat_row(chat: PrivateChat, now: datetime | None = None) -> str:
     if chat.unread_count > 0:
         right = f"{right}  {chat.unread_count}".strip()
     available = max(8, 56 - len(right))
-    return f"💬 {_truncate_name(chat.display_name)}\n   {truncate_preview(chat.preview, available):<{available}}  {right}".rstrip()
+    return f"{sym.OP_CHAT} {_truncate_name(chat.display_name)}\n   {truncate_preview(chat.preview, available):<{available}}  {right}".rstrip()
 
 
 def render_browser(chats: Iterable[PrivateChat], page: int = 1, query: str = "", watcher_count: int = 0, now: datetime | None = None) -> tuple[str, BrowserPage]:
     view = page_items(chats, page, query)
-    lines = ["Private whispers, only where you let me watch.", f"● {max(0, int(watcher_count))} allowed", "", "👻 Ghost is peeking through the walls...", "If someone whispers, I'll let you know.", ""]
+    lines = ["Private whispers, only where you let me watch.", f"{sym.STATE_ACTIVE} {max(0, int(watcher_count))} allowed", "", "Ghost is peeking through the walls...", "If someone whispers, I'll let you know.", ""]
     if view.query:
         lines.extend([f"Search: {truncate_preview(view.query, 32)}", ""])
     if not view.chats:
@@ -650,9 +652,9 @@ def render_browser(chats: Iterable[PrivateChat], page: int = 1, query: str = "",
 
 def render_message_viewer(name: str, viewer: MessageViewerPage, now: datetime | None = None) -> str:
     suffix = f" · {len(viewer.selected_ids)} selected" if viewer.selected_ids else ""
-    lines = ["👀 Ghost Seen", f"💬 {_truncate_name(name)}{suffix}", "", "Ghost is quietly watching the walls.", ""]
+    lines = ["Ghost Seen", f"{sym.OP_CHAT} {_truncate_name(name)}{suffix}", "", "Ghost is quietly watching the walls.", ""]
     if not viewer.messages:
-        lines.append("👻 Ghost found nothing to see...")
+        lines.append("Ghost found nothing to see...")
     else:
         for item in viewer.messages:
             stamp = format_time(item.timestamp, now)

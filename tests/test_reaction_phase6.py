@@ -31,6 +31,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from backend.helper import symbols as sym
 from telethon.tl.functions.messages import SendReactionRequest
 from telethon.tl.types import (
     MessageEntityCustomEmoji,
@@ -571,12 +572,15 @@ def test_reaction_label_is_never_fabricated():
 # ── 9. UI: registration + arming reply mode ─────────────────────────────────
 
 
-def test_the_react_action_is_registered_and_reachable_from_the_panel():
+def test_the_react_action_is_registered_and_no_longer_on_the_primary_panel():
     emoji.register(client=None, owner_id=OWNER)
     assert panels.get_action("emoji_react") is not None
     _title, _body, buttons = _run(emoji._emoji_panel_handler(None, ""))
-    assert "action:emoji_react" in _datas(buttons)
-    assert any("React" in text for text in _texts(buttons))
+    # The reaction capability is preserved (action still registered) but the
+    # primary panel now exposes EXACTLY ONE application-level button.
+    datas = _datas(buttons)
+    assert datas == [f"action:{emoji._DIAGNOSTICS_ACTION}"]
+    assert "action:emoji_react" not in datas
 
 
 def test_react_callback_data_stays_bounded():
@@ -722,7 +726,7 @@ def test_the_reply_flow_reports_an_invalid_reaction_value(monkeypatch):
     client = _wired_reply_client(_reply(text="a b"))
     edit = _run_reply_handler(client, monkeypatch, text="a b")
     assert client.calls == []
-    assert "✗" in edit[3]
+    assert sym.STATE_FAILED in edit[3]
     assert reaction_service.ERROR_REACTION in edit[3]
 
 
@@ -732,7 +736,7 @@ def test_the_reply_flow_reports_a_telegram_rejection_honestly(monkeypatch):
     )
     edit = _run_reply_handler(client, monkeypatch, text="👍")
     assert len(client.calls) == 1
-    assert "✗" in edit[3]
+    assert sym.STATE_FAILED in edit[3]
     assert reaction_service.ERROR_TELEGRAM in edit[3]
     assert "REACTION_INVALID" in edit[3]
 

@@ -15,13 +15,14 @@ Public interface preserved for callers:
 """
 
 from backend.db import client as db_client
+from backend.helper import symbols as sym
 from backend.profile.engine import ProfileEngine
 
 _engine = ProfileEngine(
     name="username",
     field="first_name",
     state_key="last_name",
-    default_template="{time} | {mood}",
+    default_template=sym.USERNAME_DEFAULT_TEMPLATE,
     get_state=db_client.get_username_state,
     update_state=db_client.update_username_state,
 )

@@ -14,6 +14,7 @@ returned — they are private/internal identifiers no LifeOS intent needs.
 No Telegram internals or secrets are ever exposed to the AI.
 """
 from __future__ import annotations
+from backend.helper import symbols as sym
 
 from typing import Any
 
@@ -141,6 +142,6 @@ class AccountShowTool(Tool):
                 lines.append(f"   Username: @{value}" if value else "   Username: —")
             else:
                 lines.append(f"   {_FIELD_LABELS[f]}: {value or '—'}")
-        message = "👤 " + "\n".join(lines) if lines else "👤 Account identity"
+        message = sym.label(sym.ICON_PROFILE, "") + "\n".join(lines) if lines else sym.label(sym.ICON_PROFILE, "Account identity")
 
         return ToolResult(success=True, message=message, data=data)

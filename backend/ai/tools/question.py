@@ -21,6 +21,7 @@ the correlated reply is durably consumed. Until then the chain stays parked
 on ``waiting_answer`` and this run record stays ``pending``.
 """
 from __future__ import annotations
+from backend.helper import symbols as sym
 
 from typing import Any
 
@@ -132,7 +133,7 @@ class AskOwnerTool(Tool):
             )
         return ToolResult(
             success=True,
-            message="❓ Asked and waiting for the answer.",
+            message=f"{sym.ICON_ASK} Asked and waiting for the answer.",
             data={
                 "question": text,
                 QUESTION_CHAT_ID_KEY: int(sent_chat) if isinstance(sent_chat, int) else int(chat_id),

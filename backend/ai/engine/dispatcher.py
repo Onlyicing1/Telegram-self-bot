@@ -29,6 +29,7 @@ The only pre-provider steps are the confirmation round-trip and the isolated
 media boundary, neither of which routes natural-language intent.
 """
 from __future__ import annotations
+from backend.helper import symbols as sym
 
 import asyncio
 import json
@@ -797,7 +798,7 @@ class Dispatcher:
                         continue
                     # Record EVERY tool outcome (success or failure) so tool
                     # failures never silently disappear from history.
-                    marker = "✅" if er.success else "❌"
+                    marker = sym.OP_SAVE if er.success else sym.STATE_FAILED
                     detail = er.message or er.error or "no message"
                     self._conversation.add_tool_result(
                         owner_id=request.owner_id,
@@ -996,7 +997,7 @@ class Dispatcher:
                         all_tool_results.append(er.as_dict())
                         if er.needs_confirmation:
                             continue
-                        marker = "✅" if er.success else "❌"
+                        marker = sym.OP_SAVE if er.success else sym.STATE_FAILED
                         detail = er.message or er.error or "no message"
                         self._conversation.add_tool_result(
                             owner_id=request.owner_id,
@@ -1329,7 +1330,7 @@ class Dispatcher:
             text = confirmation_request_text(tool_name, arguments)
             if extra_blocked:
                 text = (
-                    f"{text}\n\n⚠️ {extra_blocked} additional owner-only "
+                    f"{text}\n\n{sym.STATE_WARNING} {extra_blocked} additional owner-only "
                     "action(s) were requested at the same time and were NOT "
                     "scheduled — approve the action above first, then ask again."
                 )
@@ -1401,7 +1402,7 @@ class Dispatcher:
                 "AI_CONFIRMATION_EXEC_FAILED id=%s tool=%s error=%s",
                 rid or "-", entry.tool_name, exc,
             )
-            text = f"❌ The confirmed action could not be executed: {exc}"
+            text = f"{sym.STATE_FAILED} The confirmed action could not be executed: {exc}"
             return self._build_fast_path_result(
                 request, rid, start, metadata, success=True, text=text,
                 action=entry.tool_name, kind="confirmed_error", target="",
@@ -1410,7 +1411,7 @@ class Dispatcher:
         result_dict = er.as_dict()
         metadata["tool_results"] = [result_dict]
         metadata["confirmation_consumed"] = True
-        marker = "✅" if er.success else "❌"
+        marker = sym.OP_SAVE if er.success else sym.STATE_FAILED
         detail = er.message or er.error or "no message"
         self._conversation.add_tool_result(
             owner_id=request.owner_id,
@@ -1516,7 +1517,7 @@ class Dispatcher:
             )
             return self._build_fast_path_result(
                 request, rid, start, metadata, success=False,
-                text="\u274c I can't read this media: no Telegram connection is available.",
+                text=f"{sym.STATE_FAILED} I can't read this media: no Telegram connection is available.",
                 action="media_analysis", kind="executable", target="media",
             )
 
@@ -1527,7 +1528,7 @@ class Dispatcher:
             pass
         if status_callback is not None:
             try:
-                await status_callback("\U0001f4c4 Reading media...")
+                await status_callback(f"{sym.MEDIA_DOCUMENT} Reading media...")
             except Exception as exc:
                 logger.debug("Dispatcher: media status callback failed: %s", exc)
         logger.info(
@@ -1568,7 +1569,7 @@ class Dispatcher:
             )
             return self._build_fast_path_result(
                 request, rid, start, metadata, success=False,
-                text=f"\u274c Media processing failed: {reason}",
+                text=f"{sym.STATE_FAILED} Media processing failed: {reason}",
                 action="media_analysis", kind="executable", target="media",
             )
         except Exception as exc:  # noqa: BLE001 — the media route keeps its identity
@@ -1588,7 +1589,7 @@ class Dispatcher:
             )
             return self._build_fast_path_result(
                 request, rid, start, metadata, success=False,
-                text=f"\u274c Media processing failed: {reason}",
+                text=f"{sym.STATE_FAILED} Media processing failed: {reason}",
                 action="media_analysis", kind="executable", target="media",
             )
 
@@ -1729,14 +1730,14 @@ class Dispatcher:
                 "AI_ACTION_VALIDATION id=%s result=rejected error=%s",
                 rid or "-", result.error,
             )
-            return replace(response, text=f"❌ {result.error}", metadata=meta)
+            return replace(response, text=f"{sym.STATE_FAILED} {result.error}", metadata=meta)
 
         if result.kind == "unsupported":
             logger.info(
                 "AI_ACTION_VALIDATION id=%s result=unsupported action=%s",
                 rid or "-", result.action,
             )
-            return replace(response, text=f"❌ Unsupported action: {result.action}", metadata=meta)
+            return replace(response, text=f"{sym.STATE_FAILED} Unsupported action: {result.action}", metadata=meta)
 
         logger.info("AI_ACTION_VALIDATION id=%s result=ok action=%s", rid or "-", result.action)
         logger.info(
@@ -1831,7 +1832,7 @@ class Dispatcher:
             if text:
                 lines.append(f"[{m.get('id')}] {sender}: {text}")
             else:
-                media = " 📎" if m.get("has_media") else ""
+                media = f" {sym.MEDIA_DOCUMENT}" if m.get("has_media") else ""
                 lines.append(f"[{m.get('id')}] {sender}: (no text){media}")
         return "\n".join(lines)
 

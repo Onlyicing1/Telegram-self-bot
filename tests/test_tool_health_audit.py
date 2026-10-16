@@ -22,6 +22,7 @@ from backend.ai.tools.base import PermissionLevel
 from backend.ai.tools.context import ToolContext
 from backend.ai.tools.executor import ToolExecutor
 from backend.ai.tools.registry import ToolRegistry, create_default_registry
+from backend.helper import symbols as sym
 
 
 OWNER = 777
@@ -274,7 +275,7 @@ EXECUTOR_CASES = {
     "delete_message_by_id": ({"message_id": 5}, "success"),
     "delete_messages_by_ids": ({"message_ids": [55]}, "success"),
     "list_recent_messages": ({"limit": 5}, "success"),
-    "bio_set_template": ({"template": "🕒 {time}"}, "success"),
+    "bio_set_template": ({"template": f"{sym.META_TIME} {{time}}"}, "success"),
     "bio_set_text": ({"text": "t"}, "success"),
     "bio_set_mood": ({"mood": "m"}, "success"),
     "bio_on": ({}, "success"),
@@ -489,7 +490,7 @@ async def test_get_bio_failure_is_never_masked_as_empty():
         )
     r = results[0]
     assert r.success is False
-    assert r.message != "📝 Bio: —"
+    assert r.message != f"{sym.OP_EDIT} Bio: —"
 
 
 # ─────────────────── Layer 4: deterministic argument validation ───────────────────
@@ -612,7 +613,7 @@ async def test_create_task_fails_honestly_without_interpretation_capability():
 @pytest.mark.parametrize(
     "tool_name, service_kwargs",
     [
-        ("bio_set_template", {"template": "🕒 {time} | 💭 {mood}"}),
+        ("bio_set_template", {"template": sym.BIO_DEFAULT_TEMPLATE}),
         ("bio_set_text", {"text": "focus"}),
         ("bio_set_mood", {"mood": "calm"}),
         ("bio_show", {}),
@@ -647,7 +648,7 @@ async def test_bio_engine_tools_execute_through_real_services(tool_name, service
         bio_guardian.reset_window_for_tests()
     r = results[0]
     assert r.success is True, f"{tool_name}: {r.message}"
-    assert r.message.startswith(("✅", "**Bio", "📝"))
+    assert r.message.startswith((sym.OP_SAVE, "**Bio", sym.OP_EDIT))
 
 
 @pytest.mark.asyncio
@@ -699,7 +700,7 @@ async def test_get_bio_result_is_delivered_verbatim_by_dispatcher():
 
     tool_calls = [{"name": "get_bio", "arguments": {}}]
     exec_results = [
-        ToolExecutionResult(tool_name="get_bio", success=True, message="📝 Bio: real bio")
+        ToolExecutionResult(tool_name="get_bio", success=True, message=f"{sym.OP_EDIT} Bio: real bio")
     ]
     assert Dispatcher._read_results_authoritative(tool_calls, exec_results) is True
 
@@ -707,7 +708,7 @@ async def test_get_bio_result_is_delivered_verbatim_by_dispatcher():
     failed = [ToolExecutionResult(tool_name="get_bio", success=False, message="x")]
     assert Dispatcher._read_results_authoritative(tool_calls, failed) is False
     mixed = [
-        ToolExecutionResult(tool_name="get_bio", success=True, message="📝 Bio: x"),
+        ToolExecutionResult(tool_name="get_bio", success=True, message=f"{sym.OP_EDIT} Bio: x"),
         ToolExecutionResult(tool_name="search", success=True, message="y"),
     ]
     assert Dispatcher._read_results_authoritative(tool_calls, mixed) is False

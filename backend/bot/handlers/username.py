@@ -40,17 +40,19 @@ from backend.helper import (
     render,
 )
 from backend.helper.client import get_client
+from backend.helper.styles import DANGER, PRIMARY
+from backend.helper import symbols as sym
 
 logger = logging.getLogger(__name__)
 
 
 _USERNAME_VARS = [
     ("{time}", "Current time in HH:MM format", "14:30"),
-    ("{mood}", "Current mood value", "😊"),
+    ("{mood}", "Current mood value", sym.ICON_MOOD),
     ("{text}", "Custom freeform text", "Working"),
 ]
 
-_DEFAULT_TEMPLATE = "{time} | {mood}"
+_DEFAULT_TEMPLATE = sym.USERNAME_DEFAULT_TEMPLATE
 
 _builder_buffers: dict[int, str] = {}
 
@@ -77,14 +79,14 @@ def _render_preview(buf: str) -> str:
 
 def _build_username_main_buttons() -> list:
     builder = InlinePanelBuilder()
-    builder.add_row("✅ Enable Sync", "panel:usernamehelp:cmd:on")
-    builder.add_row("⏹ Disable Sync", "panel:usernamehelp:cmd:off")
-    builder.add_row("👁 Show State", "panel:username:state")
-    builder.add_row("🏗 Template Builder", "panel:usernamehelp:builder")
-    builder.add_row("💬 Set Text", "panel:username:text")
-    builder.add_row("💭 Set Mood", "panel:username:mood")
-    builder.add_row("🔧 Variables", "panel:usernamehelp:vars")
-    builder.add_row("📋 Commands", "panel:usernamehelp:cmds")
+    builder.add_row(sym.label(sym.OP_SAVE, "Enable Sync"), "panel:usernamehelp:cmd:on")
+    builder.add_row(sym.label(sym.OP_STOP, "Disable Sync"), "panel:usernamehelp:cmd:off")
+    builder.add_row(sym.label(sym.ICON_PROFILE, "Show State"), "panel:username:state")
+    builder.add_row(sym.label(sym.OP_EDIT, "Template Builder"), "panel:usernamehelp:builder")
+    builder.add_row(sym.label(sym.OP_EDIT, "Set Text"), "panel:username:text")
+    builder.add_row(sym.label(sym.ICON_MOOD, "Set Mood"), "panel:username:mood")
+    builder.add_row(sym.label(sym.ICON_VARIABLE, "Variables"), "panel:usernamehelp:vars")
+    builder.add_row(sym.label(sym.CONTENT_STATIC, "Commands"), "panel:usernamehelp:cmds")
     return builder.build()
 
 
@@ -100,7 +102,7 @@ async def _username_panel_handler(event, extra: str) -> tuple[str, str, list] | 
         state = await db_client.get_or_create_username_state(_owner_id)
         current = state.get("custom_text") or "—"
         builder = InlinePanelBuilder()
-        builder.add_row("💬 Enter New Text", "input:username:text")
+        builder.add_row(sym.label(sym.OP_EDIT, "Enter New Text"), "input:username:text")
         return "Set Text", f"**Current text:** {current}\n\nTap the button below, then reply with the new text value.", builder.build()
 
     if extra == "mood":
@@ -108,7 +110,7 @@ async def _username_panel_handler(event, extra: str) -> tuple[str, str, list] | 
         state = await db_client.get_or_create_username_state(_owner_id)
         current = state.get("mood") or "—"
         builder = InlinePanelBuilder()
-        builder.add_row("💭 Enter New Mood", "input:username:mood")
+        builder.add_row(sym.label(sym.ICON_MOOD, "Enter New Mood"), "input:username:mood")
         return "Set Mood", f"**Current mood:** {current}\n\nTap the button below, then reply with the new mood value.", builder.build()
 
     return "Username Engine", "Choose an action:", _build_username_main_buttons()
@@ -123,19 +125,19 @@ async def _username_inline_builder(event, extra: str) -> list:
 
 def _build_username_help_menu_buttons() -> list:
     builder = InlinePanelBuilder()
-    builder.add_row("🔧 Variables", "panel:usernamehelp:vars")
-    builder.add_row("📋 Commands", "panel:usernamehelp:cmds")
-    builder.add_row("🏗 Template Builder", "panel:usernamehelp:builder")
+    builder.add_row(sym.label(sym.ICON_VARIABLE, "Variables"), "panel:usernamehelp:vars")
+    builder.add_row(sym.label(sym.CONTENT_STATIC, "Commands"), "panel:usernamehelp:cmds")
+    builder.add_row(sym.label(sym.OP_EDIT, "Template Builder"), "panel:usernamehelp:builder")
     return builder.build()
 
 
 def _build_username_commands_menu_buttons() -> list:
     builder = InlinePanelBuilder()
-    builder.add_row("💬 Set Text", "panel:usernamehelp:cmd:text")
-    builder.add_row("💭 Set Mood", "panel:usernamehelp:cmd:mood")
-    builder.add_row("✅ Enable Sync", "panel:usernamehelp:cmd:on")
-    builder.add_row("⏹ Disable Sync", "panel:usernamehelp:cmd:off")
-    builder.add_row("👁 Show State", "panel:usernamehelp:cmd:show")
+    builder.add_row(sym.label(sym.OP_EDIT, "Set Text"), "panel:usernamehelp:cmd:text")
+    builder.add_row(sym.label(sym.ICON_MOOD, "Set Mood"), "panel:usernamehelp:cmd:mood")
+    builder.add_row(sym.label(sym.OP_SAVE, "Enable Sync"), "panel:usernamehelp:cmd:on")
+    builder.add_row(sym.label(sym.OP_STOP, "Disable Sync"), "panel:usernamehelp:cmd:off")
+    builder.add_row(sym.label(sym.ICON_PROFILE, "Show State"), "panel:usernamehelp:cmd:show")
     return builder.build()
 
 
@@ -144,17 +146,17 @@ def _build_builder_buttons() -> list:
     for var_token, _, _ in _USERNAME_VARS:
         builder.add_row(f"+ {var_token}", f"action:username_builder_add:{var_token}")
     builder.add_row("␣ Space", "action:username_builder_space")
-    builder.add_row("🗑 Clear", "action:username_builder_clear")
-    builder.add_row("↩ Reset", "action:username_builder_reset")
-    builder.add_row("✅ Apply Template", "action:username_builder_apply")
-    builder.add_row("📝 Reply to Edit", "action:username_reply_mode")
+    builder.add_row(sym.label(sym.OP_DELETE, "Clear"), "action:username_builder_clear", PRIMARY)
+    builder.add_row(sym.label(sym.OP_REFRESH, "Reset"), "action:username_builder_reset", PRIMARY)
+    builder.add_row(sym.label(sym.OP_SAVE, "Apply Template"), "action:username_builder_apply", PRIMARY)
+    builder.add_row(sym.label(sym.OP_EDIT, "Reply to Edit"), "action:username_reply_mode")
     return builder.build()
 
 
 def _build_applied_buttons() -> list:
     builder = InlinePanelBuilder()
-    builder.add_row("👁 Show State", "panel:username:state")
-    builder.add_row("🏗 Back to Builder", "panel:usernamehelp:builder")
+    builder.add_row(sym.label(sym.ICON_PROFILE, "Show State"), "panel:username:state")
+    builder.add_row(sym.label(sym.OP_BACK, "Back to Builder"), "panel:usernamehelp:builder")
     return builder.build()
 
 
@@ -184,11 +186,11 @@ async def _usernamehelp_panel_handler(event, extra: str) -> tuple[str, str, list
         sub = extra[4:]
         if sub == "on":
             builder = InlinePanelBuilder()
-            builder.add_row("✅ Enable Now", "action:username_on")
+            builder.add_row(sym.label(sym.OP_SAVE, "Enable Now"), "action:username_on")
             return "Enable Sync", "Start the username cron — auto-updates your first name every minute.", builder.build()
         if sub == "off":
             builder = InlinePanelBuilder()
-            builder.add_row("⏹ Disable Now", "action:username_off")
+            builder.add_row(sym.label(sym.OP_STOP, "Disable Now"), "action:username_off")
             return "Disable Sync", "Stop the username cron. Your first name will no longer auto-update.", builder.build()
         if sub == "show":
             from backend.helper.inline_engine import _owner_id
@@ -200,14 +202,14 @@ async def _usernamehelp_panel_handler(event, extra: str) -> tuple[str, str, list
             state = await db_client.get_or_create_username_state(_owner_id)
             current = state.get("custom_text") or "—"
             builder = InlinePanelBuilder()
-            builder.add_row("💬 Enter New Text", "input:usernamehelp:text")
+            builder.add_row(sym.label(sym.OP_EDIT, "Enter New Text"), "input:usernamehelp:text")
             return "Set Text", f"**Current text:** {current}\n\nTap the button below, then reply with the new text value.", builder.build()
         if sub == "mood":
             from backend.helper.inline_engine import _owner_id
             state = await db_client.get_or_create_username_state(_owner_id)
             current = state.get("mood") or "—"
             builder = InlinePanelBuilder()
-            builder.add_row("💭 Enter New Mood", "input:usernamehelp:mood")
+            builder.add_row(sym.label(sym.ICON_MOOD, "Enter New Mood"), "input:usernamehelp:mood")
             return "Set Mood", f"**Current mood:** {current}\n\nTap the button below, then reply with the new mood value.", builder.build()
         return "Username Commands", "Unknown command.", _build_username_commands_menu_buttons()
 
@@ -247,7 +249,7 @@ _CUSTOM_BODY = (
 
 def _build_custom_buttons() -> list:
     builder = InlinePanelBuilder()
-    builder.add_row("Cancel", "panel:usernamehelp:builder")
+    builder.add_row("Cancel", "panel:usernamehelp:builder", DANGER)
     return builder.build()
 
 
@@ -351,9 +353,9 @@ async def _username_builder_apply_action(event, extra: str, chat_id: int) -> tup
     from backend.helper.inline_engine import _owner_id
     buf = _get_buf(_owner_id)
     if not buf:
-        return "Template Builder", "⚠️ Nothing to apply — build a template first.", _build_builder_buttons()
+        return "Template Builder", f"{sym.STATE_WARNING} Nothing to apply — build a template first.", _build_builder_buttons()
     result = await username_service.do_template(_owner_id, buf)
-    if not result.startswith("✅"):
+    if not result.startswith(sym.OP_SAVE):
         return "Template Builder", result, _build_builder_buttons()
     return "Template Applied", result, _build_applied_buttons()
 
@@ -365,8 +367,8 @@ async def _username_on_action(event, extra: str, chat_id: int) -> tuple[str, str
     from backend.bot.handlers.misc import _resolve_tz
     result = await username_service.do_on(_self_client, _owner_id, _resolve_tz())
     builder = InlinePanelBuilder()
-    builder.add_row("⏹ Disable Sync", "panel:usernamehelp:cmd:off")
-    builder.add_row("👁 Show State", "panel:username:state")
+    builder.add_row(sym.label(sym.OP_STOP, "Disable Sync"), "panel:usernamehelp:cmd:off")
+    builder.add_row(sym.label(sym.ICON_PROFILE, "Show State"), "panel:username:state")
     return "Username Engine", result, builder.build()
 
 
@@ -374,8 +376,8 @@ async def _username_off_action(event, extra: str, chat_id: int) -> tuple[str, st
     from backend.helper.inline_engine import _owner_id
     result = await username_service.do_off(_owner_id)
     builder = InlinePanelBuilder()
-    builder.add_row("✅ Enable Sync", "panel:usernamehelp:cmd:on")
-    builder.add_row("👁 Show State", "panel:username:state")
+    builder.add_row(sym.label(sym.OP_SAVE, "Enable Sync"), "panel:usernamehelp:cmd:on")
+    builder.add_row(sym.label(sym.ICON_PROFILE, "Show State"), "panel:username:state")
     return "Username Engine", result, builder.build()
 
 
@@ -421,7 +423,7 @@ async def _username_mood_input_handler(text, chat_id, msg_id, inline_chat_id, in
 
 def register(client, owner_id: int, tz_str: str):
 
-    register_panel("username", _username_panel_handler, parent="profile", title="👤 Username")
+    register_panel("username", _username_panel_handler, parent="profile", title="Username")
     register_panel("usernamehelp", _usernamehelp_panel_handler, parent="username", title="Username Help")
     register_inline_builder("username", _username_inline_builder)
     register_inline_builder("usernamehelp", _usernamehelp_inline_builder)

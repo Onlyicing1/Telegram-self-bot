@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from backend.helper import symbols as sym
 
 from backend.bot.handlers import tasks
 
@@ -59,7 +60,7 @@ async def test_management_commands_delegate_with_id_and_version(command):
         with patch.object(tasks, "_management", return_value=service):
             await client.handler(event)
         method.assert_awaited_once_with(12, 4)
-        assert "✅" in event.edits[-1]
+        assert sym.OP_SAVE in event.edits[-1]
 
 
 @pytest.mark.asyncio
@@ -81,7 +82,7 @@ async def test_stale_or_missing_mutation_is_not_reported_as_success():
     service = SimpleNamespace(pause=AsyncMock(return_value=None))
     with patch.object(tasks, "_management", return_value=service):
         await client.handler(event)
-    assert "✅" not in event.edits[-1]
+    assert sym.OP_SAVE not in event.edits[-1]
     assert "stale" in event.edits[-1]
 
 

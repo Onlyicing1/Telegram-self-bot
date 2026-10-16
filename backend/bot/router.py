@@ -19,6 +19,7 @@ from backend.bot.handlers import (
     ai_credentials,
     ai_stt_settings,
     ai_tts_settings,
+    auto_reaction,
     emoji,
     emoji_replacement,
     tasks,
@@ -105,6 +106,11 @@ def register_all(client, owner_id: int, tz_str: str):
         ("taskloom", lambda: taskloom.register(client, owner_id, tz_str)),
         ("task_events", lambda: task_events.register(client, owner_id, tz_str)),
         ("todo", lambda: todo.register(client, owner_id, tz_str)),
+        # Auto-Reaction runs before the replacement pipeline: the reaction is
+        # applied to the ORIGINAL message id, and the replacement pipeline
+        # (which deletes the original) runs LAST so every other handler keeps
+        # its first claim on the owner's message.
+        ("auto_reaction", lambda: auto_reaction.register(client, owner_id)),
         # The replacement pipeline runs LAST: every existing handler keeps its
         # first claim on the owner's message, and only then is the message
         # reconstructed (delivered + deleted) as the documented Phase 4 step.

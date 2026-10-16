@@ -2,7 +2,7 @@
 must never be presented as authoritative.
 
 Live symptom this file locks down: a task reported as created
-(``✅ Task #3 created``) was missing from the task list requested two minutes
+(the success notice from a created task) was missing from the task list requested two minutes
 later, which showed an older durable task (#27) instead. The created task
 carried a FRESH LOW id although the durable table already held #27, which is
 the signature of a write that degraded into the process-local in-memory
@@ -28,6 +28,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+from backend.helper import symbols as sym
 
 from backend.ai.database import manager as dbm
 from backend.ai.database.task_repository import InMemoryTaskRepository, SupabaseTaskRepository

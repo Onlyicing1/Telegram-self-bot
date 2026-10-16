@@ -5,6 +5,7 @@ These tools let the AI manage the bio engine: set template, set text,
 set mood, turn on/off, and show current state.
 """
 from __future__ import annotations
+from backend.helper import symbols as sym
 
 from typing import Any
 
@@ -294,8 +295,8 @@ class BioGetTool(Tool):
         # account ID, session, or other account metadata.
         bio = (bio or "").strip()
         if not bio:
-            return ToolResult(success=True, message="📝 Bio: —", data={"bio": ""})
-        return ToolResult(success=True, message=f"📝 Bio: {bio}", data={"bio": bio})
+            return ToolResult(success=True, message=f"{sym.OP_EDIT} Bio: —", data={"bio": ""})
+        return ToolResult(success=True, message=f"{sym.OP_EDIT} Bio: {bio}", data={"bio": bio})
 
 
 class BioShowTool(Tool):

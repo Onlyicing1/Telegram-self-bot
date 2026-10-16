@@ -19,6 +19,7 @@ from backend.helper import (
     to_edit_buttons,
 )
 from backend.helper.client import get_client
+from backend.helper import symbols as sym
 
 logger = logging.getLogger(__name__)
 
@@ -44,23 +45,23 @@ async def _db_vacuum_action(event, extra: str, chat_id: int) -> tuple[str, str, 
 
 async def _db_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
     builder = InlinePanelBuilder()
-    builder.add_row("🧹 Clean Orphans", "action:db_clean")
-    builder.add_row("📊 Statistics", "action:db_stats")
-    builder.add_row("⚡ Optimize Database", "action:db_vacuum")
+    builder.add_row(sym.label(sym.OP_REFRESH, "Clean Orphans"), "action:db_clean")
+    builder.add_row(sym.label(sym.CONTENT_STATIC, "Statistics"), "action:db_stats")
+    builder.add_row(sym.label(sym.OP_EDIT, "Optimize Database"), "action:db_vacuum")
     return "Database", "Choose an action:", builder.build()
 
 
 async def _db_inline_builder(event, extra: str) -> list:
     builder = InlinePanelBuilder()
-    builder.add_row("🧹 Clean Orphans", "action:db_clean")
-    builder.add_row("📊 Statistics", "action:db_stats")
-    builder.add_row("⚡ Optimize Database", "action:db_vacuum")
+    builder.add_row(sym.label(sym.OP_REFRESH, "Clean Orphans"), "action:db_clean")
+    builder.add_row(sym.label(sym.CONTENT_STATIC, "Statistics"), "action:db_stats")
+    builder.add_row(sym.label(sym.OP_EDIT, "Optimize Database"), "action:db_vacuum")
     return [render("Database", "Choose an action:", builder.build())]
 
 
 def register(client, owner_id: int, tz_str: str):
 
-    register_panel("db", _db_panel_handler, parent="menu", title="🗄 Database")
+    register_panel("db", _db_panel_handler, parent="menu", title="Database")
     register_inline_builder("db", _db_inline_builder)
     register_action("db_clean", _db_clean_action)
     register_action("db_stats", _db_stats_action)

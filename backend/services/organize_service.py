@@ -8,6 +8,7 @@ import logging
 
 from backend.db import client as db_client
 from backend.diagnostics import record_event
+from backend.helper import symbols as sym
 from backend.services import settings_service
 
 logger = logging.getLogger(__name__)
@@ -31,13 +32,13 @@ async def do_list(owner_id: int) -> str:
 
         lines = [
             "**LifeOS Status**\n",
-            f"📦 **Saves**",
+            f"{sym.MEDIA_UNKNOWN} **Saves**",
             f"  Total: `{total}`",
             f"  Forward: `{fwd}`",
             f"  Deep: `{deep}`\n",
-            f"📋 **Logs**",
+            f"{sym.CONTENT_STATIC} **Logs**",
             f"  Entries: `{logs}`\n",
-            f"🧬 **Bio Engine**",
+            f"{sym.CONTENT_AI} **Bio Engine**",
             f"  Status: `{bio_status}`",
             f"  Template: `{bio_template}`",
         ]
@@ -45,7 +46,7 @@ async def do_list(owner_id: int) -> str:
     except Exception as exc:
         logger.error("organize list failed: %s", exc)
         record_event("organize", "list", 0, "ERROR", str(exc))
-        return f"❌ Error: {exc}"
+        return f"{sym.STATE_FAILED} Error: {exc}"
 
 
 async def do_clean(owner_id: int) -> str:
@@ -54,8 +55,8 @@ async def do_clean(owner_id: int) -> str:
         days = settings_service.log_retention_days()
         deleted = await db_client.clean_logs(owner_id, days=days)
         record_event("organize", "clean", (asyncio.get_event_loop().time() - t0) * 1000, "SUCCESS")
-        return f"🧹 Cleaned `{deleted}` log entries older than {days} days."
+        return f"{sym.OP_REFRESH} Cleaned `{deleted}` log entries older than {days} days."
     except Exception as exc:
         logger.error("organize clean failed: %s", exc)
         record_event("organize", "clean", 0, "ERROR", str(exc))
-        return f"❌ Error: {exc}"
+        return f"{sym.STATE_FAILED} Error: {exc}"

@@ -30,7 +30,7 @@ Architecture:
    - A default + validator + typed accessor here
    No panel code needs to change.
 
-## Settings (11 columns on panel_settings)
+## Settings (columns on panel_settings)
 
 | Column                  | Type    | Default | Range/Constraint        |
 |-------------------------|---------|---------|-------------------------|
@@ -46,6 +46,8 @@ Architecture:
 | debug_callbacks        | bool    | false   | must be boolean         |
 | owner_only              | bool    | true    | must be boolean         |
 | dashboard_font          | str     | "default" | one of DASHBOARD_FONTS  |
+| auto_reaction_enabled   | bool    | false   | must be boolean         |
+| auto_reaction_emoji     | str     | ""      | non-empty string (a Telegram reaction emoji) |
 """
 import logging
 from typing import Any, Callable
@@ -76,6 +78,8 @@ _DEFAULTS: dict[str, Any] = {
     "debug_callbacks": False,
     "owner_only": True,
     "dashboard_font": "default",
+    "auto_reaction_enabled": False,
+    "auto_reaction_emoji": "",
 }
 
 _cache: dict[str, Any] = {}
@@ -120,6 +124,8 @@ _VALIDATORS: dict[str, ValidatorFn] = {
     "debug_callbacks": _validate_bool,
     "owner_only": _validate_bool,
     "dashboard_font": _validate_dashboard_font,
+    "auto_reaction_enabled": _validate_bool,
+    "auto_reaction_emoji": _validate_nonempty_str,
 }
 
 
@@ -335,3 +341,37 @@ def dashboard_font() -> str:
 
 def set_dashboard_font(value: str) -> bool:
     return set_setting("dashboard_font", value)
+
+
+def is_auto_reaction_enabled() -> bool:
+    """Whether the owner has enabled automatic reactions to their own
+    outgoing messages. This is the SETTING only — the reaction engine that
+    would consume it is a later stage and is NOT activated here."""
+    _ensure_loaded()
+    return bool(_cache.get("auto_reaction_enabled", False))
+
+
+def set_auto_reaction_enabled(enabled: bool) -> bool:
+    return set_setting("auto_reaction_enabled", bool(enabled))
+
+
+def toggle_auto_reaction() -> bool:
+    """Flip the setting and return its NEW value (mirrors toggle_auto_close)."""
+    new_val = not is_auto_reaction_enabled()
+    set_auto_reaction_enabled(new_val)
+    return new_val
+
+
+def auto_reaction_emoji() -> str:
+    """The owner's selected auto-reaction emoji, or "" when none is set.
+
+    The value is the EXACT emoji string Telegram exposed in its
+    available-reaction catalog — the setting never invents or normalizes it,
+    so it stays directly usable by the reaction execution path."""
+    _ensure_loaded()
+    value = _cache.get("auto_reaction_emoji", "")
+    return value if isinstance(value, str) else ""
+
+
+def set_auto_reaction_emoji(emoji: str) -> bool:
+    return set_setting("auto_reaction_emoji", emoji)

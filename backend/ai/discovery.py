@@ -33,6 +33,7 @@ classification, and the ``validated`` flag. The line is sanitized: it never
 contains the API key, request headers, or a response body.
 """
 from __future__ import annotations
+from backend.helper import symbols as sym
 
 import asyncio
 import logging
@@ -99,7 +100,7 @@ _PROVIDERS: list[dict[str, Any]] = [
         "base_url_env": ["AI_OPENROUTER_BASE_URL", "OPENROUTER_BASE_URL"],
         "default_base_url": "https://openrouter.ai/api/v1",
         "default_model": "openrouter/auto",
-        "icon": "🟢",
+        "icon": sym.ICON_P_OPENROUTER,
     },
     {
         "name": "groq",
@@ -109,7 +110,7 @@ _PROVIDERS: list[dict[str, Any]] = [
         "base_url_env": [],
         "default_base_url": "https://api.groq.com/openai/v1",
         "default_model": "llama-3.3-70b-versatile",
-        "icon": "⚡",
+        "icon": sym.ICON_P_GROQ,
     },
     {
         "name": "gemini",
@@ -119,7 +120,7 @@ _PROVIDERS: list[dict[str, Any]] = [
         "base_url_env": [],
         "default_base_url": "https://generativelanguage.googleapis.com/v1beta",
         "default_model": "gemini-2.0-flash",
-        "icon": "💎",
+        "icon": sym.ICON_P_GEMINI,
     },
     {
         "name": "openai",
@@ -129,7 +130,7 @@ _PROVIDERS: list[dict[str, Any]] = [
         "base_url_env": ["AI_OPENAI_BASE_URL", "OPENAI_BASE_URL"],
         "default_base_url": "https://api.openai.com/v1",
         "default_model": "gpt-4o",
-        "icon": "🧠",
+        "icon": sym.ICON_P_OPENAI,
     },
     {
         "name": "mistral",
@@ -139,7 +140,7 @@ _PROVIDERS: list[dict[str, Any]] = [
         "base_url_env": [],
         "default_base_url": "https://api.mistral.ai/v1",
         "default_model": "mistral-large-latest",
-        "icon": "🌬",
+        "icon": sym.ICON_P_MISTRAL,
     },
     {
         "name": "cerebras",
@@ -149,7 +150,7 @@ _PROVIDERS: list[dict[str, Any]] = [
         "base_url_env": [],
         "default_base_url": "https://api.cerebras.ai/v1",
         "default_model": "llama-3.3-70b",
-        "icon": "🔥",
+        "icon": sym.ICON_P_CEREBRAS,
     },
     {
         "name": "zai",
@@ -159,7 +160,7 @@ _PROVIDERS: list[dict[str, Any]] = [
         "base_url_env": ["AI_ZAI_BASE_URL", "ZAI_BASE_URL"],
         "default_base_url": "https://api.z.ai/api/paas/v4",
         "default_model": "glm-4.5-flash",
-        "icon": "🧿",
+        "icon": sym.ICON_P_ZAI,
     },
     {
         "name": "sambanova",
@@ -169,7 +170,7 @@ _PROVIDERS: list[dict[str, Any]] = [
         "base_url_env": ["AI_SAMBANOVA_BASE_URL", "SAMBANOVA_BASE_URL"],
         "default_base_url": "https://api.sambanova.ai/v1",
         "default_model": "DeepSeek-V3-0324",
-        "icon": "🟠",
+        "icon": sym.ICON_P_SAMBANOVA,
     },
     {
         "name": "nvidia",
@@ -179,7 +180,7 @@ _PROVIDERS: list[dict[str, Any]] = [
         "base_url_env": ["AI_NVIDIA_BASE_URL", "NVIDIA_BASE_URL"],
         "default_base_url": "https://integrate.api.nvidia.com/v1",
         "default_model": "qwen/qwen2.5-72b-instruct",
-        "icon": "🟩",
+        "icon": sym.ICON_P_NVIDIA,
     },
     {
         "name": "cohere",
@@ -189,7 +190,7 @@ _PROVIDERS: list[dict[str, Any]] = [
         "base_url_env": ["AI_COHERE_BASE_URL", "COHERE_BASE_URL"],
         "default_base_url": "https://api.cohere.com/compatibility/v1",
         "default_model": "command-r-plus",
-        "icon": "🔷",
+        "icon": sym.ICON_P_COHERE,
     },
     {
         "name": "siliconflow",
@@ -199,7 +200,7 @@ _PROVIDERS: list[dict[str, Any]] = [
         "base_url_env": ["AI_SILICONFLOW_BASE_URL", "SILICONFLOW_BASE_URL"],
         "default_base_url": "https://api.siliconflow.cn/v1",
         "default_model": "Qwen/Qwen2.5-72B-Instruct",
-        "icon": "🌊",
+        "icon": sym.ICON_P_SILICONFLOW,
     },
     {
         "name": "fireworks",
@@ -209,7 +210,7 @@ _PROVIDERS: list[dict[str, Any]] = [
         "base_url_env": ["AI_FIREWORKS_BASE_URL", "FIREWORKS_BASE_URL"],
         "default_base_url": "https://api.fireworks.ai/inference/v1",
         "default_model": "accounts/fireworks/models/llama-v3p3-70b-instruct",
-        "icon": "🎆",
+        "icon": sym.ICON_P_FIREWORKS,
     },
     {
         "name": "nararouter",
@@ -219,7 +220,7 @@ _PROVIDERS: list[dict[str, Any]] = [
         "base_url_env": ["AI_NARAROUTER_BASE_URL", "NARAROUTER_BASE_URL"],
         "default_base_url": "https://router.bynara.id/v1",
         "default_model": "deepseek-v4-flash",
-        "icon": "🌐",
+        "icon": sym.ICON_P_NARAROUTER,
     },
     {
         "name": "you",
@@ -229,7 +230,7 @@ _PROVIDERS: list[dict[str, Any]] = [
         "base_url_env": [],
         "default_base_url": "https://ydc-index.io",
         "default_model": "",
-        "icon": "🔎",
+        "icon": sym.ICON_P_YOU,
         "capability_kind": "web_search",
         "capabilities": ["web_search"],
     },

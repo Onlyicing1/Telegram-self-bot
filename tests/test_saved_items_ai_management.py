@@ -221,7 +221,7 @@ async def test_preview_save_failure_paths_are_honest():
     # Unknown item — the service's honest failure is not masked as success.
     with patch.object(
         retrieve_service, "do_preview",
-        AsyncMock(return_value="❌ No item found for `S9999`"),
+        AsyncMock(return_value="× No item found for `S9999`"),
     ):
         unknown = await run_tool(executor, ctx, "preview_save", {"save_code": "S9999"})
     assert unknown.success is False and "No item found" in unknown.message
@@ -244,7 +244,7 @@ async def test_delete_save_removes_the_item_through_the_service():
     registry, ctx, executor = make_chain()
     with patch.object(
         retrieve_service, "do_delete",
-        AsyncMock(return_value="✅ Deleted `S0001`"),
+        AsyncMock(return_value="✓ Deleted `S0001`"),
     ) as svc:
         result = await run_tool(executor, ctx, "delete_save", {"save_code": "s0001"})
 
@@ -262,7 +262,7 @@ async def test_delete_save_is_not_the_message_deletion_path():
 
     registry, ctx, executor = make_chain()
     with patch.object(
-        retrieve_service, "do_delete", AsyncMock(return_value="✅ Deleted `S0001`")
+        retrieve_service, "do_delete", AsyncMock(return_value="✓ Deleted `S0001`")
     ):
         with patch.object(
             delete_service, "delete_verified_self_messages",
@@ -285,7 +285,7 @@ async def test_delete_save_owner_comes_from_context_not_arguments():
 
     registry, ctx, executor = make_chain()
     with patch.object(
-        retrieve_service, "do_delete", AsyncMock(return_value="✅ Deleted `S0001`")
+        retrieve_service, "do_delete", AsyncMock(return_value="✓ Deleted `S0001`")
     ) as svc:
         await run_tool(
             executor, ctx, "delete_save",
@@ -300,7 +300,7 @@ async def test_delete_save_failure_paths_are_honest():
 
     registry, ctx, executor = make_chain()
 
-    with patch.object(retrieve_service, "do_delete", AsyncMock(return_value="✅ ok")) as svc:
+    with patch.object(retrieve_service, "do_delete", AsyncMock(return_value="✓ ok")) as svc:
         missing = await run_tool(executor, ctx, "delete_save", {})
         malformed = await run_tool(executor, ctx, "delete_save", {"save_code": "S 001"})
     svc.assert_not_awaited()
@@ -309,7 +309,7 @@ async def test_delete_save_failure_paths_are_honest():
 
     with patch.object(
         retrieve_service, "do_delete",
-        AsyncMock(return_value="❌ No item found for `S9999`"),
+        AsyncMock(return_value="× No item found for `S9999`"),
     ):
         unknown = await run_tool(executor, ctx, "delete_save", {"save_code": "S9999"})
     assert unknown.success is False and "No item found" in unknown.message
@@ -327,7 +327,7 @@ async def test_delete_save_without_a_client_is_an_honest_failure():
 
     registry, ctx, executor = make_chain(with_client=False)
     with patch.object(
-        retrieve_service, "do_delete", AsyncMock(return_value="✅ Deleted `S0001`")
+        retrieve_service, "do_delete", AsyncMock(return_value="✓ Deleted `S0001`")
     ) as svc:
         result = await run_tool(executor, ctx, "delete_save", {"save_code": "S0001"})
     svc.assert_not_awaited()
@@ -449,7 +449,7 @@ async def test_preview_never_reveals_another_owners_item():
     ):
         text = await retrieve_service.do_preview(None, OWNER, "S0001")
 
-    assert text == "❌ No item found for `S0001`"
+    assert text == "× No item found for `S0001`"
     assert "Someone Else" not in text
     log.assert_not_awaited()
 
@@ -463,7 +463,7 @@ async def test_preview_refuses_a_row_whose_code_is_not_the_requested_code():
     with patch.object(db_client, "query_save", AsyncMock(return_value=dict(_OTHER_CODE_ROW))):
         text = await retrieve_service.do_preview(None, OWNER, "S0001")
 
-    assert text == "❌ No item found for `S0001`"
+    assert text == "× No item found for `S0001`"
     assert "Other Item" not in text
 
 
@@ -475,7 +475,7 @@ async def test_preview_of_a_missing_item_stays_honest():
     with patch.object(db_client, "query_save", AsyncMock(return_value=None)):
         text = await retrieve_service.do_preview(None, OWNER, "S9999")
 
-    assert text == "❌ No item found for `S9999`"
+    assert text == "× No item found for `S9999`"
 
 
 @pytest.mark.asyncio
@@ -510,5 +510,5 @@ async def test_preview_tool_queries_the_canonical_code_with_the_trusted_owner():
 # before any provider round — the replied content is never handed to the
 # model and the decision is never the model's.
 
-_CONFIRMATION = "✅ **Saved Successfully**\n\n**Code:** `S0001`\n**Type:** Photo"
+_CONFIRMATION = "✓ **Saved Successfully**\n\n**Code:** `S0001`\n**Type:** Photo"
 _METADATA_BLOCK = "**LifeOS** `S0007`\n**Saved** 2026-09-15 10:08"

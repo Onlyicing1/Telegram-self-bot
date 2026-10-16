@@ -20,6 +20,7 @@ production callback edit path with its unchanged-content skip) so behavior
 matches every other panel, with or without a separate helper bot.
 """
 from __future__ import annotations
+from backend.helper import symbols as sym
 
 import asyncio
 import logging
@@ -40,7 +41,7 @@ def render_progress_bar(fraction: float) -> str:
     """Exactly five segments; each segment covers 20 percentage points."""
     fraction = min(max(fraction, 0.0), 1.0)
     filled = min(_SEGMENTS, int(fraction * _SEGMENTS + 1e-9))
-    return "".join("▰" if i < filled else "▱" for i in range(_SEGMENTS))
+    return "".join(sym.PAGE_CURRENT if i < filled else sym.PAGE_EMPTY for i in range(_SEGMENTS))
 
 
 def render_progress_view(
@@ -60,9 +61,9 @@ def render_progress_view(
     lines: list[str] = [current_line] if current_line else []
     lines.append(f"{render_progress_bar(fraction)}  {done}/{total}")
     if last_item:
-        mark = "✓" if last_item.get("status") == "AVAILABLE" else "×"
+        mark = sym.OP_SAVE if last_item.get("status") == "AVAILABLE" else sym.STATE_FAILED
         lines.append(
-            f"◇ {last_item.get('provider', '?')} · {last_item.get('model', '?')} {mark}"
+            f"{sym.ICON_MODEL} {last_item.get('provider', '?')} · {last_item.get('model', '?')} {mark}"
         )
     return "\n".join(lines)
 
@@ -209,7 +210,7 @@ async def run_streaming_test(owner_id: int, event) -> None:
             logger.exception("Streaming model test run failed")
             title, built = render_edit(
                 "Test Modules",
-                f"× Test run failed — {type(exc).__name__}",
+                f"{sym.STATE_FAILED} Test run failed — {type(exc).__name__}",
                 _progress_buttons(),
             )
             guardian.submit(title, built, terminal=True)

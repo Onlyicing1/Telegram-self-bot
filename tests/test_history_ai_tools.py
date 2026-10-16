@@ -30,6 +30,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import pytest
+from backend.helper import symbols as sym
 
 from backend.ai.context.provenance import AI_PROVENANCE_MARKER
 from backend.ai.conversation.telegram_context import MAX_CONTEXT_MESSAGES
@@ -322,7 +323,7 @@ async def test_translate_history_failure_is_reported_not_treated_as_empty():
     result = await _run_translate(_manager(provider), _FailingClient(), {"count": 10})
 
     assert result.success is False
-    assert result.message.startswith("❌")
+    assert result.message.startswith(sym.STATE_FAILED)
     assert result.data["error"] == history_ai_service.ERROR_HISTORY
     assert provider.calls == 0
 
@@ -363,7 +364,7 @@ async def test_translate_provider_failure_is_honest():
     result = await _run_translate(_manager(provider), _FakeClient(_conversation(3)), {"count": 3})
 
     assert result.success is False
-    assert result.message.startswith("❌")
+    assert result.message.startswith(sym.STATE_FAILED)
     assert result.data["error"] == history_ai_service.ERROR_PROVIDER
     assert "TR:" not in result.message
 
@@ -564,7 +565,7 @@ async def test_summarize_history_failure_is_reported_not_treated_as_empty():
     result = await _run_summarize(_manager(provider), _FailingClient(), {"count": 10})
 
     assert result.success is False
-    assert result.message.startswith("❌")
+    assert result.message.startswith(sym.STATE_FAILED)
     assert result.data["error"] == history_ai_service.ERROR_HISTORY
 
 
@@ -630,7 +631,7 @@ async def test_missing_ai_engine_is_reported():
     )
 
     assert ok is False
-    assert text.startswith("❌")
+    assert text.startswith(sym.STATE_FAILED)
     assert data["error"] in {
         history_ai_service.ERROR_ENGINE, history_ai_service.ERROR_PROVIDER,
     }

@@ -21,6 +21,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from backend.helper import symbols as sym
 
 from backend.ai.tools.base import PermissionLevel, ToolResult
 from backend.ai.tools.context import ToolContext
@@ -247,7 +248,7 @@ async def test_service_propagates_reason_on_unexpected_error():
     )
     ok, text, data = await svc.do_web_search("q", provider_manager=manager)
     assert ok is False
-    assert text.startswith("❌ Web search failed:")
+    assert text.startswith(sym.STATE_FAILED) and "Web search failed:" in text
     assert "RuntimeError: connection reset" in text
     assert data == {}
 
@@ -262,7 +263,7 @@ async def test_tool_propagates_reason_on_service_crash():
         result = await WebSearchTool(ctx).execute(ctx, {"query": "q"})
 
     assert result.success is False
-    assert result.message.startswith("❌ Web search failed:")
+    assert result.message.startswith(sym.STATE_FAILED) and "Web search failed:" in result.message
     assert "RuntimeError: engine exploded" in result.message
 
 
@@ -277,4 +278,4 @@ async def test_provider_dict_error_path_unchanged():
     )
     ok, text, _ = await svc.do_web_search("q", provider_manager=manager)
     assert ok is False
-    assert "⚠️ Web search failed: Web search request timed out." == text
+    assert f"{sym.STATE_WARNING} Web search failed: Web search request timed out." == text

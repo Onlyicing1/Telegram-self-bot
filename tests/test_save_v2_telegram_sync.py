@@ -262,11 +262,11 @@ def _without_tags_line(text: str) -> str:
 def test_with_additional_tags_adds_replaces_and_removes_only_that_line():
     base = _caption()
     added = save_service.with_additional_tags(base, ["university", "semester-2"])
-    assert "🏷 Additional tags: #university #semester-2" in added.split("\n")
+    assert "▩ Additional tags: #university #semester-2" in added.split("\n")
     assert added != base
 
     replaced = save_service.with_additional_tags(added, ["archive"])
-    assert "🏷 Additional tags: #archive" in replaced.split("\n")
+    assert "▩ Additional tags: #archive" in replaced.split("\n")
     assert "university" not in replaced
 
     removed = save_service.with_additional_tags(added, [])
@@ -285,9 +285,9 @@ def test_caption_transforms_preserve_the_hashtags_and_the_source_text():
         assert "#saved" in caption
         assert caption.endswith("\n\nsource text the owner saved")
         assert "#saved_document" in caption
-    assert "📄 New_Name.pdf" in renamed.split("\n")
+    assert "▤ New_Name.pdf" in renamed.split("\n")
     assert "University_Week_2.pdf" not in renamed
-    assert "🏷 Additional tags: #university" in renamed.split("\n")
+    assert "▩ Additional tags: #university" in renamed.split("\n")
     # The header line keeps its own icon — only the file-name SECTION moved.
     assert renamed.split("\n")[0] == base.split("\n")[0]
 
@@ -297,12 +297,12 @@ def test_a_source_text_line_that_looks_like_metadata_is_never_rewritten():
         save_code="S0001", sender="S", chat_id=1, msg_id=2,
         dt=__import__("datetime").datetime(2026, 9, 15), media_type="Document",
         mime="application/pdf", file_size=10, file_name="a.pdf", tags=["#saved"],
-    ) + "\n\n🏷 Additional tags: #not-ours\n📄 not-ours.pdf"
+    ) + "\n\n▩ Additional tags: #not-ours\n▤ not-ours.pdf"
     updated = save_service.with_additional_tags(base, ["mine"])
 
-    assert updated.endswith("🏷 Additional tags: #not-ours\n📄 not-ours.pdf")
+    assert updated.endswith("▩ Additional tags: #not-ours\n▤ not-ours.pdf")
     lines = updated.split("\n")
-    assert lines.count("🏷 Additional tags: #mine") == 1
+    assert lines.count("▩ Additional tags: #mine") == 1
 
 
 def test_the_caption_transforms_are_idempotent():
@@ -322,7 +322,7 @@ def test_a_saved_item_caption_separates_owner_tags_from_system_hashtags():
         owner_tags=["university", "semester-2"],
     )
     lines = caption.split("\n")
-    assert "🏷 Additional tags: #university #semester-2" in lines
+    assert "▩ Additional tags: #university #semester-2" in lines
     assert any("#saved_document" in line for line in lines)
     # The owner section is its own line — never merged into the hashtag line.
     assert "#university" not in next(l for l in lines if l.strip().startswith("#saved"))
@@ -356,12 +356,12 @@ async def test_execute_save_writes_the_owner_section_and_keeps_tags_owner_only()
 
     assert "Saved Successfully" in result
     caption = sent_captions[-1]
-    assert "🏷 Additional tags: #university" in caption.split("\n")
+    assert "▩ Additional tags: #university" in caption.split("\n")
     assert "the source text" in caption
     row = _stored(row_code(result))
     assert save_service.normalize_tags(row["tags"]) == ("university",)
     assert not any(str(t).startswith("#") for t in row["tags"])
-    assert "🏷 Additional tags: #university" in row["caption"]
+    assert "▩ Additional tags: #university" in row["caption"]
     assert "#saved" in row["caption"]
 
 
@@ -382,10 +382,10 @@ async def test_adding_owner_tags_edits_only_the_additional_tags_section():
         OWNER, "S0001", retrieve_service.TAG_OP_ADD, ["semester-2"], client=client
     )
 
-    assert result.startswith("✅")
+    assert result.startswith("✓")
     assert len(client.edits) == 1
     edited = client.edits[0]["text"]
-    assert "🏷 Additional tags: #university #semester-2" in edited.split("\n")
+    assert "▩ Additional tags: #university #semester-2" in edited.split("\n")
     # Only that section moved: every other line is byte-identical.
     assert _without_tags_line(edited) == _without_tags_line(before)
     assert edited != before
@@ -405,7 +405,7 @@ async def test_replacing_and_clearing_owner_tags_rewrite_only_that_section():
     await retrieve_service.do_edit_tags(
         OWNER, "S0001", retrieve_service.TAG_OP_REPLACE, ["archive"], client=client
     )
-    assert "🏷 Additional tags: #archive" in client.edits[-1]["text"].split("\n")
+    assert "▩ Additional tags: #archive" in client.edits[-1]["text"].split("\n")
     assert "university" not in client.edits[-1]["text"]
 
     await retrieve_service.do_edit_tags(
@@ -428,9 +428,9 @@ async def test_a_tag_edit_uses_the_live_caption_when_the_row_stores_none():
 
     edited = client.edits[-1]["text"]
     # Built from the message's own caption — never from nothing.
-    assert "📄 University_Week_2.pdf" in edited
+    assert "▤ University_Week_2.pdf" in edited
     assert "#saved" in edited
-    assert "🏷 Additional tags: #archive" in edited.split("\n")
+    assert "▩ Additional tags: #archive" in edited.split("\n")
     assert edited.endswith("source text the owner saved")
 
 
@@ -445,7 +445,7 @@ async def test_a_tag_edit_refuses_rather_than_writing_when_the_message_cannot_be
         OWNER, "S0001", retrieve_service.TAG_OP_REPLACE, ["archive"], client=client
     )
 
-    assert result.startswith("❌")
+    assert result.startswith("×")
     assert retrieve_service._owner_tags(_stored("S0001")) == ("university",)
     assert _stored("S0001")["caption"] == before
 
@@ -458,7 +458,7 @@ async def test_a_tag_edit_without_a_client_changes_only_the_stored_metadata():
         OWNER, "S0001", retrieve_service.TAG_OP_REPLACE, ["archive"]
     )
 
-    assert result.startswith("✅")
+    assert result.startswith("✓")
     assert retrieve_service._owner_tags(_stored("S0001")) == ("archive",)
 
 
@@ -491,7 +491,7 @@ async def test_owner_tag_normalization_and_bounds_are_the_save_rules():
     refused = await retrieve_service.do_edit_tags(
         OWNER, "S0001", retrieve_service.TAG_OP_REPLACE, ["x" * 41], client=client
     )
-    assert refused.startswith("⚠️")
+    assert refused.startswith("◬")
     assert retrieve_service._owner_tags(_stored("S0001")) == ("University", "semester-2")
 
 
@@ -506,14 +506,14 @@ async def test_the_file_name_change_reuploads_with_the_new_filename_attribute():
         client, OWNER, "S0001", "University_Weekly_Schedule_Semester_2.pdf"
     )
 
-    assert result.startswith("✅")
+    assert result.startswith("✓")
     assert "University_Weekly_Schedule_Semester_2.pdf" in result
     upload = client.uploads[0]
     names = [a.file_name for a in upload["attributes"] if isinstance(a, DocumentAttributeFilename)]
     assert names == ["University_Weekly_Schedule_Semester_2.pdf"]
     assert upload["caption"] is not None
     assert _stored("S0001")["file_name"] == "University_Weekly_Schedule_Semester_2.pdf"
-    assert "📄 University_Weekly_Schedule_Semester_2.pdf" in _stored("S0001")["caption"]
+    assert "▤ University_Weekly_Schedule_Semester_2.pdf" in _stored("S0001")["caption"]
 
 
 @pytest.mark.asyncio
@@ -550,8 +550,8 @@ async def test_the_file_name_change_keeps_the_owner_tags_section():
     await retrieve_service.do_change_file_name(client, OWNER, "S0001", "New.pdf")
 
     caption = client.uploads[0]["caption"]
-    assert "🏷 Additional tags: #university" in caption.split("\n")
-    assert "📄 New.pdf" in caption.split("\n")
+    assert "▩ Additional tags: #university" in caption.split("\n")
+    assert "▤ New.pdf" in caption.split("\n")
     assert caption.endswith("\n\nsource text the owner saved")
     assert "#saved_document" in caption
 
@@ -585,7 +585,7 @@ async def test_the_row_is_repointed_and_the_old_message_is_deleted_last():
             client, OWNER, "S0001", "Renamed.pdf"
         )
 
-    assert result.startswith("✅")
+    assert result.startswith("✓")
     assert order == ["send_file", "db_update", "delete_old"]
     row = _stored("S0001")
     assert row["saved_msg_id"] == NEW_MSG_ID
@@ -600,7 +600,7 @@ async def test_a_failed_reupload_preserves_the_original_message_and_row():
 
     result = await retrieve_service.do_change_file_name(client, OWNER, "S0001", "Renamed.pdf")
 
-    assert result.startswith("❌")
+    assert result.startswith("×")
     assert client.deletes == []
     row = _stored("S0001")
     assert row["saved_msg_id"] == OLD_MSG_ID
@@ -614,7 +614,7 @@ async def test_a_failed_download_preserves_the_original_message_and_row():
 
     result = await retrieve_service.do_change_file_name(client, OWNER, "S0001", "Renamed.pdf")
 
-    assert result.startswith("❌")
+    assert result.startswith("×")
     assert client.uploads == [] and client.deletes == []
     assert _stored("S0001")["file_name"] == "University_Week_2.pdf"
 
@@ -629,7 +629,7 @@ async def test_a_row_that_cannot_be_confirmed_keeps_the_original_message():
             client, OWNER, "S0001", "Renamed.pdf"
         )
 
-    assert result.startswith("❌")
+    assert result.startswith("×")
     assert client.deletes == []
     assert _stored("S0001")["saved_msg_id"] == OLD_MSG_ID
     assert _stored("S0001")["file_name"] == "University_Week_2.pdf"
@@ -648,7 +648,7 @@ async def test_a_photo_or_a_document_without_a_file_name_is_refused():
     client = FakeSavedClient(photo_message)
 
     refused = await retrieve_service.do_change_file_name(client, OWNER, "S0001", "x.jpg")
-    assert refused.startswith("❌")
+    assert refused.startswith("×")
     assert client.uploads == [] and client.deletes == []
 
     bare_message = type("Msg", (), {
@@ -660,7 +660,7 @@ async def test_a_photo_or_a_document_without_a_file_name_is_refused():
     })()
     client = FakeSavedClient(bare_message)
     refused = await retrieve_service.do_change_file_name(client, OWNER, "S0001", "x.ogg")
-    assert refused.startswith("❌")
+    assert refused.startswith("×")
     assert client.uploads == []
 
 
@@ -671,7 +671,7 @@ async def test_a_file_name_change_reports_when_the_old_copy_could_not_be_removed
 
     result = await retrieve_service.do_change_file_name(client, OWNER, "S0001", "Renamed.pdf")
 
-    assert result.startswith("✅")
+    assert result.startswith("✓")
     assert "could not be removed" in result
     assert _stored("S0001")["saved_msg_id"] == NEW_MSG_ID
 
@@ -684,12 +684,12 @@ async def test_an_unchanged_or_invalid_file_name_changes_nothing():
     same = await retrieve_service.do_change_file_name(
         client, OWNER, "S0001", "University_Week_2.pdf"
     )
-    assert same.startswith("⚠️")
+    assert same.startswith("◬")
     assert client.uploads == []
 
     for bad in ("", "   ", "a/b.pdf", "a\\b.pdf", "x" * 121):
         refused = await retrieve_service.do_change_file_name(client, OWNER, "S0001", bad)
-        assert refused.startswith("⚠️"), bad
+        assert refused.startswith("◬"), bad
     assert client.uploads == []
     assert _stored("S0001")["file_name"] == "University_Week_2.pdf"
 
@@ -702,8 +702,8 @@ async def test_the_file_name_change_is_owner_scoped():
     foreign = await retrieve_service.do_change_file_name(client, OWNER, "S0001", "Mine.pdf")
     missing = await retrieve_service.do_change_file_name(client, OWNER, "S9999", "Mine.pdf")
 
-    assert foreign == "❌ No item found for `S0001`"
-    assert missing == "❌ No item found for `S9999`"
+    assert foreign == "× No item found for `S0001`"
+    assert missing == "× No item found for `S9999`"
     assert client.downloads == [] and client.uploads == [] and client.deletes == []
     assert _stored("S0001")["file_name"] == "University_Week_2.pdf"
 
@@ -715,7 +715,7 @@ async def test_a_display_name_rename_stays_metadata_only():
 
     result = await retrieve_service.do_rename(OWNER, "S0001", "Semester Two")
 
-    assert result.startswith("✅")
+    assert result.startswith("✓")
     row = _stored("S0001")
     assert row["display_name"] == "Semester Two"
     # The Telegram layer is untouched: the display name is not a file name.
@@ -757,8 +757,8 @@ async def test_the_ai_rename_tool_reports_both_layers_independently():
     )
 
     assert result.success is False
-    assert "❌" in result.message
-    assert "✅" in result.message  # the label half still succeeded
+    assert "×" in result.message
+    assert "✓" in result.message  # the label half still succeeded
     assert _stored("S0001")["display_name"] == "New"
     assert _stored("S0001")["file_name"] == "University_Week_2.pdf"
 
@@ -791,7 +791,7 @@ async def test_the_ai_tag_tool_synchronizes_the_saved_message_caption():
 
     assert result.success is True
     assert len(client.edits) == 1
-    assert "🏷 Additional tags: #university #semester-2" in client.edits[0]["text"].split("\n")
+    assert "▩ Additional tags: #university #semester-2" in client.edits[0]["text"].split("\n")
     assert client.uploads == []  # a tag change never re-uploads
 
 
@@ -958,7 +958,7 @@ async def test_the_manual_tag_input_synchronizes_the_saved_caption(engine, helpe
     )
 
     assert retrieve_service._owner_tags(_stored("S0001")) == ("archive", "semester-2")
-    assert "🏷 Additional tags: #archive #semester-2" in engine.edits[-1]["text"].split("\n")
+    assert "▩ Additional tags: #archive #semester-2" in engine.edits[-1]["text"].split("\n")
     assert engine.uploads == []
 
 

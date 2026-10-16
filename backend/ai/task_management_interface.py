@@ -1,10 +1,12 @@
 """Presentation helpers for the user-facing task management boundary."""
 from __future__ import annotations
+from backend.helper import symbols as sym
 
 from datetime import timezone
 from zoneinfo import ZoneInfo
 
 from backend.ai.task_management import TaskListSnapshot, TaskManagementService, TaskView
+from backend.helper import symbols as _sym
 
 MAX_LINES = 20
 
@@ -17,7 +19,7 @@ DISPLAY_TIMEZONE = "Asia/Tehran"
 # of the durable tasks, and a fallback WRITE is not durable at all. Either way
 # the owner must never be told this state is authoritative.
 FALLBACK_NOTE = (
-    "⚠️ Memory fallback — Supabase unavailable "
+    f"{_sym.STATE_WARNING} Memory fallback — Supabase unavailable "
     "(tasks may be missing, and anything created now is not durable)."
 )
 # Truthful counterpart for a LOCAL resource failure: the durable store may be
@@ -25,7 +27,7 @@ FALLBACK_NOTE = (
 # surface must never claim a Supabase outage. The non-durable semantics are
 # identical — only the attribution changes.
 FALLBACK_RESOURCE_NOTE = (
-    "⚠️ Memory fallback — a local resource error prevented the durable store "
+    f"{_sym.STATE_WARNING} Memory fallback — a local resource error prevented the durable store "
     "from being reached (tasks may be missing, and anything created now is "
     "not durable)."
 )
@@ -45,25 +47,25 @@ def fallback_note(reason: str) -> str:
     return FALLBACK_NOTE
 
 _STATUS_LABELS = {
-    "active": ("▶️", "Active"),
-    "paused": ("⏸", "Paused"),
-    "completed": ("✅", "Completed"),
-    "failed": ("❌", "Failed"),
-    "expired": ("⌛", "Expired"),
-    "deleted": ("🗑", "Deleted"),
-    "claimed": ("◷", "Claimed"),
-    "running": ("⟳", "Running"),
-    "succeeded": ("✅", "Succeeded"),
-    "retry_pending": ("↻", "Retry pending"),
-    "cancelled": ("⊘", "Cancelled"),
-    "interrupted": ("⚠️", "Interrupted"),
+    "active": (_sym.STATE_ACTIVE, "Active"),
+    "paused": (_sym.STATE_PAUSED, "Paused"),
+    "completed": (_sym.STATE_COMPLETED, "Completed"),
+    "failed": (_sym.STATE_FAILED, "Failed"),
+    "expired": (_sym.STATE_EXPIRED, "Expired"),
+    "deleted": (_sym.STATE_DELETED, "Deleted"),
+    "claimed": (_sym.SCHEDULE_DAILY, "Claimed"),
+    "running": (_sym.SCHEDULE_INTERVAL, "Running"),
+    "succeeded": (_sym.STATE_COMPLETED, "Succeeded"),
+    "retry_pending": (_sym.OP_REFRESH, "Retry pending"),
+    "cancelled": (_sym.STATE_DELETED, "Cancelled"),
+    "interrupted": (_sym.STATE_WARNING, "Interrupted"),
 }
 
 
 def _status_text(status: object) -> str:
     value = str(status or "").strip()
     icon, label = _STATUS_LABELS.get(
-        value.casefold(), ("•", value.replace("_", " ").title() or "Unknown")
+        value.casefold(), (sym.BULLET, value.replace("_", " ").title() or "Unknown")
     )
     return f"{icon} {label}"
 
@@ -167,7 +169,7 @@ def steps_block_text(
         return "\n".join(lines)
     lines.append("Steps:")
     for index, step in enumerate(steps, start=1):
-        mark = "✓" if str(getattr(step, "status", "")) == "completed" else "○"
+        mark = _sym.STATE_COMPLETED if str(getattr(step, "status", "")) == "completed" else _sym.SCHEDULE_ONCE
         step_title = " ".join(str(getattr(step, "title", "") or "").split()) or "Untitled"
         lines.append(f"{mark} {index}. {step_title}")
     next_step = getattr(progress, "next_step", None)
@@ -267,7 +269,7 @@ async def inspect_text(service: TaskManagementService, task_id: int) -> str:
             occurrence_blocks.append(
                 "\n".join(
                     [
-                        f"• {item.occurrence_key}",
+                        f"{sym.BULLET} {item.occurrence_key}",
                         f"  Status: {_status_text(item.status)}",
                         f"  Scheduled: {_format_datetime(item.scheduled_for, empty='Not scheduled')}",
                         f"  Attempt: {item.attempt}",

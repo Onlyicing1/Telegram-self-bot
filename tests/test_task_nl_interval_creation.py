@@ -28,6 +28,8 @@ from unittest.mock import patch
 
 import pytest
 
+from backend.helper import symbols as sym
+
 from backend.ai.preparation_policy import (
     PreparationPolicyError,
     derive_policy,
@@ -322,7 +324,7 @@ async def test_bio_guardian_still_limits_mutations_to_one_per_window():
     profile_scheduler._client = MagicMock(side_effect=_rpc)
     try:
         first = await bio_service.do_text(9, "first", tz_str="UTC")
-        assert first.startswith("✅"), first
+        assert first.startswith(sym.OP_SAVE), first
         second = await bio_service.do_text(9, "second", tz_str="UTC")
         assert "NOT updated" in second, second
     finally:

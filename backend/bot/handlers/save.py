@@ -28,6 +28,8 @@ from backend.helper import (
     render,
 )
 from backend.helper.client import get_client
+from backend.helper.styles import PRIMARY
+from backend.helper import symbols as sym
 
 logger = logging.getLogger(__name__)
 
@@ -35,14 +37,14 @@ logger = logging.getLogger(__name__)
 async def _save_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
     if extra.startswith("type:"):
         builder = InlinePanelBuilder()
-        builder.add_row("💬 Reply Mode", "action:save_reply")
-        builder.add_row("✏️ Name & tags", "input:save:meta")
-        builder.add_row("🔗 Save using a link", "input:save:link")
+        builder.add_row(sym.label(sym.OP_CHAT, "Reply Mode"), "action:save_reply", PRIMARY)
+        builder.add_row(sym.label(sym.OP_EDIT, "Name & tags"), "input:save:meta", PRIMARY)
+        builder.add_row(sym.label(sym.OP_SAVE, "Save using a link"), "input:save:link", PRIMARY)
         return "Deep Save", "Choose a source. Name & tags are optional.", builder.build()
 
     builder = InlinePanelBuilder()
-    builder.add_row("⬇️ Deep Save", "panel:save:type:d")
-    builder.add_row("🔍 Retrieve", "panel:retrieve")
+    builder.add_row(sym.label(sym.OP_SAVE, "Deep Save"), "panel:save:type:d", PRIMARY)
+    builder.add_row(sym.label(sym.OP_SEARCH, "Retrieve"), "panel:retrieve", PRIMARY)
     return (
         "Save",
         "Deep Save downloads the message and re-uploads it as a new Saved Messages message.",
@@ -53,14 +55,14 @@ async def _save_panel_handler(event, extra: str) -> tuple[str, str, list] | None
 async def _save_inline_builder(event, extra: str) -> list:
     if extra.startswith("type:"):
         builder = InlinePanelBuilder()
-        builder.add_row("💬 Reply Mode", "action:save_reply")
-        builder.add_row("✏️ Name & tags", "input:save:meta")
-        builder.add_row("🔗 Save using a link", "input:save:link")
+        builder.add_row(sym.label(sym.OP_CHAT, "Reply Mode"), "action:save_reply", PRIMARY)
+        builder.add_row(sym.label(sym.OP_EDIT, "Name & tags"), "input:save:meta", PRIMARY)
+        builder.add_row(sym.label(sym.OP_SAVE, "Save using a link"), "input:save:link", PRIMARY)
         return [render("Deep Save", "Choose a source. Name & tags are optional.", builder.build())]
 
     builder = InlinePanelBuilder()
-    builder.add_row("⬇️ Deep Save", "panel:save:type:d")
-    builder.add_row("🔍 Retrieve", "panel:retrieve")
+    builder.add_row(sym.label(sym.OP_SAVE, "Deep Save"), "panel:save:type:d", PRIMARY)
+    builder.add_row(sym.label(sym.OP_SEARCH, "Retrieve"), "panel:retrieve", PRIMARY)
     return [
         render(
             "Save",
@@ -77,7 +79,7 @@ async def _save_reply_action(event, extra: str, chat_id: int) -> tuple[str, str,
     owner_id = _owner_id
 
     if not chat_id:
-        return "Deep Save", "⚠️ Could not determine the current chat. Please try again.", []
+        return "Deep Save", f"{sym.STATE_WARNING} Could not determine the current chat. Please try again.", []
 
     wait_text = (
         "**Deep Save — Reply Mode**\n\n"
@@ -195,7 +197,7 @@ async def _save_metadata_input_handler(text, chat_id, msg_id, inline_chat_id, in
     try:
         metadata = parse_metadata_line(text)
     except ValueError as exc:
-        result, buttons = await _deep_save_panel_with_notice(f"⚠️ {exc}")
+        result, buttons = await _deep_save_panel_with_notice(f"{sym.STATE_WARNING} {exc}")
     else:
         wait_text = (
             "**Deep Save — Reply Mode**\n\n"
@@ -243,18 +245,18 @@ async def _save_reply_wait_handler(
             target_id = reply_msg.reply_to_msg_id
             target_msg = await client.get_messages(chat_id, ids=target_id)
             if target_msg is None:
-                result = "⚠️ The replied message no longer exists."
+                result = f"{sym.STATE_WARNING} The replied message no longer exists."
             else:
                 result = await save_service.execute_save(
                     client, owner_id, target_msg, os.getenv("TZ", "Asia/Tehran"),
                     metadata=metadata,
                 )
         elif reply_msg:
-            result = "⚠️ Your message was not a reply. Please reply to a message to select what to save."
+            result = f"{sym.STATE_WARNING} Your message was not a reply. Please reply to a message to select what to save."
         else:
-            result = "⚠️ Could not find your reply message. Please try again."
+            result = f"{sym.STATE_WARNING} Could not find your reply message. Please try again."
     except Exception as exc:
-        result = f"❌ Deep Save failed: {exc}"
+        result = f"{sym.STATE_FAILED} Deep Save failed: {exc}"
 
     helper = get_client()
     if helper and inline_chat_id and inline_msg_id:
@@ -280,7 +282,7 @@ async def _save_link_input_handler(text, chat_id, msg_id, inline_chat_id, inline
 
     link = text.strip()
     if not link:
-        result = "⚠️ Link cannot be empty."
+        result = f"{sym.STATE_WARNING} Link cannot be empty."
     else:
         result = await save_service.execute_link_save(
             client, owner_id, link, os.getenv("TZ", "Asia/Tehran")
@@ -303,7 +305,7 @@ async def _save_link_input_handler(text, chat_id, msg_id, inline_chat_id, inline
 
 
 def register(client, owner_id: int, tz_str: str) -> None:
-    register_panel("save", _save_panel_handler, parent="menu", title="📥 Save")
+    register_panel("save", _save_panel_handler, parent="menu", title="Save")
     register_inline_builder("save", _save_inline_builder)
     register_action("save_reply", _save_reply_action)
     register_input("save", "meta", {

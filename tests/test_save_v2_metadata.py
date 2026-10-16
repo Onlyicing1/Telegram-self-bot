@@ -193,7 +193,7 @@ async def test_an_invalid_name_refuses_before_any_transfer():
 
     result = await save_service.execute_save(client, OWNER, _doc_message(), "UTC", metadata=oversize)
 
-    assert result.startswith("⚠️ Nothing was saved")
+    assert result.startswith("◬ Nothing was saved")
     assert client.calls == []  # no download, no upload, no Telegram side effect
     assert db_client._fallback["saved_items"] == []
 
@@ -255,7 +255,7 @@ async def test_legacy_rows_keep_their_hashtags_and_stay_readable():
         "owner_id": OWNER,
         "media_type": "Document",
         "tags": ["#saved", "#saved_document", "#saved_2026"],
-        "caption": "📄 S0900 · DEEP",
+        "caption": "▤ S0900 · DEEP",
         "created_at": "2026-01-01T00:00:00+00:00",
     }
     db_client._fallback["saved_items"].append(legacy)
@@ -374,7 +374,7 @@ def test_migration_preserves_existing_rows_codes_and_tags():
             "save_type": "deep",
             "owner_id": OWNER,
             "tags": ["#saved", "#saved_photo"],
-            "caption": "🖼 S0001 · DEEP",
+            "caption": "▢ S0001 · DEEP",
         },
     )
     schema.insert_row(
@@ -384,7 +384,7 @@ def test_migration_preserves_existing_rows_codes_and_tags():
             "save_type": "deep",
             "owner_id": OTHER_OWNER,
             "tags": [],
-            "caption": "📄 SAXCK · DEEP",
+            "caption": "▤ SAXCK · DEEP",
         },
     )
 
@@ -396,7 +396,7 @@ def test_migration_preserves_existing_rows_codes_and_tags():
     assert rows[1]["tags"] == []
     assert [r["owner_id"] for r in rows] == [OWNER, OTHER_OWNER]
     assert [r.get("display_name") for r in rows] == [None, None]
-    assert [r["caption"] for r in rows] == ["🖼 S0001 · DEEP", "📄 SAXCK · DEEP"]
+    assert [r["caption"] for r in rows] == ["▢ S0001 · DEEP", "▤ SAXCK · DEEP"]
 
 
 def test_migration_reruns_safely_on_a_database_that_already_has_the_column():

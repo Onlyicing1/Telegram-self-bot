@@ -63,6 +63,7 @@ one cohesive unit and the AI panel module is already at the file-tool size
 limit — exactly the reason ``ai_test_progress.py`` exists.
 """
 from __future__ import annotations
+from backend.helper import symbols as sym
 
 import logging
 import re
@@ -354,7 +355,7 @@ async def _media_stt_body_and_buttons(config: dict) -> tuple[str, list]:
             builder.add_row(*row[0])
         else:
             builder.add_buttons(*row)
-    builder.add_row("\u2699 STT Settings", "panel:ai_media_stt_settings")
+    builder.add_row(sym.label(sym.OP_MANAGE, "STT Settings"), "panel:ai_media_stt_settings")
     _nav_buttons(builder)
     return "\n".join(lines), builder.build()
 
@@ -373,7 +374,7 @@ async def _ai_media_stt_settings_panel_handler(event, extra: str) -> tuple[str, 
     unreadable = _unreadable(config)
     plane = parse_stt_config({} if unreadable else config)
 
-    lines = ["**\u2699 STT Settings**", ""]
+    lines = [f"**{sym.OP_MANAGE} STT Settings**", ""]
     if unreadable:
         lines.append("! Current settings unavailable (database read failed).")
     lines.append(f"Language · {plane.language or 'Auto'}")
@@ -429,10 +430,10 @@ async def _ai_stt_select_candidate_action(event, extra: str, chat_id: int) -> tu
     """
     candidate = get_candidate(extra)
     if candidate is None:
-        return await _stt_panel_with_notice("× Unknown transcription candidate — nothing changed.")
+        return await _stt_panel_with_notice(f"{sym.STATE_FAILED} Unknown transcription candidate — nothing changed.")
     if not candidate.implemented:
         return await _stt_panel_with_notice(
-            f"× {candidate.label} is registered but not available on this runtime yet."
+            f"{sym.STATE_FAILED} {candidate.label} is registered but not available on this runtime yet."
         )
 
     from backend.ai.config_store import update_setting
@@ -440,7 +441,7 @@ async def _ai_stt_select_candidate_action(event, extra: str, chat_id: int) -> tu
     owner = await _owner_id()
     await update_setting(owner, STORAGE_KEY_ACTIVE, storage_value(candidate.candidate_id))
     await apply_stt_settings_now(owner)
-    return await _stt_panel_with_notice(f"✓ Speech-to-Text now uses {candidate.label}")
+    return await _stt_panel_with_notice(f"{sym.OP_SAVE} Speech-to-Text now uses {candidate.label}")
 
 
 # ── Provider probe (ONE global test action, one bounded request per candidate) ──
@@ -457,13 +458,13 @@ def _candidate_line(result: "stt_provider_probe.SttTestResult") -> str:
     name = candidate.label if candidate else (result.candidate_id or "candidate")
     state = stt_provider_probe.SttTestState
     if result.state == state.PASSED.value:
-        return f"\u2713 {name} · {result.summary()}"
+        return f"{sym.OP_SAVE} {name} · {result.summary()}"
     if result.state == state.CREDENTIAL_MISSING.value:
         return f"! {name} · {result.summary()} — nothing was sent."
     if result.state == state.NOT_IMPLEMENTED.value:
         return f"! {name} · {result.state_label()} on this runtime."
     detail = f" — {result.detail}" if result.detail else ""
-    return f"\u00d7 {name} · {result.summary()}{detail}"
+    return f"{sym.STATE_FAILED} {name} · {result.summary()}{detail}"
 
 
 def test_notice(result: "stt_provider_probe.SttTestResult") -> str:
@@ -481,7 +482,7 @@ def test_all_notice(results: list) -> str:
     good transcription of real speech.
     """
     if not results:
-        return "\u00d7 No registered candidate could be tested."
+        return f"{sym.STATE_FAILED} No registered candidate could be tested."
     count = len(results)
     lines = [f"Provider test · {count} candidate{'s' if count != 1 else ''}", ""]
     lines.extend(_candidate_line(result) for result in results)
@@ -524,13 +525,13 @@ async def _ai_stt_language_input(text, chat_id, msg_id, inline_chat_id, inline_m
     ):
         await update_setting(owner, STORAGE_KEY_LANGUAGE, "")
         await apply_stt_settings_now(owner)
-        result = "✓ Transcription language set to automatic."
+        result = f"{sym.OP_SAVE} Transcription language set to automatic."
     elif not _STT_LANGUAGE_RE.match(value):
-        result = "× Enter a language code like fa-IR, or 'auto'."
+        result = f"{sym.STATE_FAILED} Enter a language code like fa-IR, or 'auto'."
     else:
         await update_setting(owner, STORAGE_KEY_LANGUAGE, value)
         await apply_stt_settings_now(owner)
-        result = f"✓ Transcription language set to `{value}`"
+        result = f"{sym.OP_SAVE} Transcription language set to `{value}`"
     await _finish_input(
         result, _ai_media_stt_panel_handler,
         chat_id, msg_id, inline_chat_id, inline_msg_id,
@@ -552,14 +553,14 @@ async def _ai_stt_passes_input(text, chat_id, msg_id, inline_chat_id, inline_msg
     try:
         passes = int(text.strip())
     except ValueError:
-        result = "× Enter a whole number: 1, 2 or 3."
+        result = f"{sym.STATE_FAILED} Enter a whole number: 1, 2 or 3."
     else:
         if 1 <= passes <= STT_MAX_PASSES:
             await update_setting(owner, STORAGE_KEY_PASSES, passes)
             await apply_stt_settings_now(owner)
-            result = f"✓ Voice recognition passes set to {passes}"
+            result = f"{sym.OP_SAVE} Voice recognition passes set to {passes}"
         else:
-            result = f"× Passes must be 1, 2 or 3 — refused {passes}. 1 is the fastest."
+            result = f"{sym.STATE_FAILED} Passes must be 1, 2 or 3 — refused {passes}. 1 is the fastest."
     await _finish_input(
         result, _ai_media_stt_panel_handler,
         chat_id, msg_id, inline_chat_id, inline_msg_id,

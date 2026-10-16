@@ -18,6 +18,7 @@ deterministic resolver (``resolve_management_target``); an ambiguous target
 is NEVER narrowed by the model — it is reported back and the owner chooses.
 """
 from __future__ import annotations
+from backend.helper import symbols as sym
 
 from typing import Any
 
@@ -236,14 +237,14 @@ class RenameSaveTool(Tool):
                     )
                 )
             except Exception as exc:  # noqa: BLE001
-                results.append(f"❌ File name change failed: {exc}")
+                results.append(f"{sym.STATE_FAILED} File name change failed: {exc}")
         if name:
             try:
                 results.append(
                     await retrieve_service.do_rename(context.owner_id, target.save_code, name)
                 )
             except Exception as exc:  # noqa: BLE001
-                results.append(f"❌ Rename failed: {exc}")
+                results.append(f"{sym.STATE_FAILED} Rename failed: {exc}")
 
         data = {"save_code": target.save_code}
         if name:

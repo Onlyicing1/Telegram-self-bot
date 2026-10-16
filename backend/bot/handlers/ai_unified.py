@@ -40,6 +40,7 @@ import logging
 import os
 import time
 from typing import Any
+from backend.helper import symbols as sym
 
 from telethon import events
 
@@ -84,7 +85,7 @@ _PREFETCHED_CONFIG: contextvars.ContextVar[dict | None] = contextvars.ContextVar
 # sent (helper bot unavailable): the owner still needs an actionable path to
 # the SAME structured creation flow.
 _WIZARD_UNAVAILABLE_HINT = (
-    "Open **Menu → Taskloom → ＋ New task** to set this up with structured options."
+    f"Open **Menu → Taskloom → {sym.OP_CREATE} New task** to set this up with structured options."
 )
 _ai_semaphore: asyncio.Semaphore | None = None
 
@@ -158,13 +159,13 @@ def _wizard_notice(signal: dict) -> str:
     reason = str(signal.get("wizard_reason") or "").strip()
     capability = " ".join(str(signal.get("capability") or "").split())[:80]
     if reason == "unsupported_capability" and capability:
-        return f"⚠ `{capability}` cannot be scheduled as one sentence — choose the options below."
+        return f"{sym.STATE_WARNING} `{capability}` cannot be scheduled as one sentence — choose the options below."
     if reason == "incomplete_request":
         return (
-            "⚠ This task needs a schedule (and content details) the request "
+            f"{sym.STATE_WARNING} This task needs a schedule (and content details) the request "
             "did not fully specify — choose them below."
         )
-    return "⚠ I need a few structured choices for this task — fill them in below."
+    return f"{sym.STATE_WARNING} I need a few structured choices for this task — fill them in below."
 
 
 async def _open_task_wizard(event, client, owner_id: int, signal: dict) -> bool:
@@ -362,7 +363,7 @@ def _media_failure_notice(metadata: dict, raw: str) -> str:
 
     stage = str(metadata.get("media_failure_stage") or "").strip() or "media"
     reason = str(metadata.get("media_failure_reason") or "").strip() or bounded_reason(raw)
-    return "\n".join(["✕ Couldn't process this media", f"{stage}: {reason}"])
+    return "\n".join([f"{sym.STATE_FAILED} Couldn't process this media", f"{stage}: {reason}"])
 
 
 def _failure_notice(result) -> str:
@@ -394,11 +395,11 @@ def _failure_notice(result) -> str:
         recovery.append(f"{retries} retr{'y' if retries == 1 else 'ies'}")
     if metadata.get("fallback_used"):
         recovery.append("backup tried")
-    lines = ["✕ Couldn't get a response", reason]
+    lines = [f"{sym.STATE_FAILED} Couldn't get a response", reason]
     if ftype == "auth":
         lines.append("Check your API key configuration.")
     if recovery:
-        lines.append(f"↻ {' · '.join(recovery)}")
+        lines.append(f"{sym.OP_REFRESH} {' · '.join(recovery)}")
     return "\n".join(lines)
 
 
@@ -834,7 +835,7 @@ async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
             if result.metadata.get("tool_rounds_exhausted"):
                 pending = len(result.metadata.get("pending_tool_calls", []))
                 response_text = (
-                    f"{response_text}\n\n⚠️ Tool round limit reached — "
+                    f"{response_text}\n\n{sym.STATE_WARNING} Tool round limit reached — "
                     f"{pending} pending tool call(s) were not executed."
                 )
             # Secondary status under the answer — never a diagnostic block.
@@ -846,7 +847,7 @@ async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
             from backend.ai.engine.telemetry import compact_telemetry_line, telemetry
             notes: list[str] = []
             if result.metadata.get("fallback_used"):
-                notes.append("_↻ Backup model used_")
+                notes.append(f"_{sym.OP_REFRESH} Backup model used_")
             if telemetry.get_telemetry_pref(owner_id):
                 line = compact_telemetry_line(telemetry.last())
                 if line:

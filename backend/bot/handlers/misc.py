@@ -28,6 +28,8 @@ from backend.helper import (
 )
 from backend.helper.client import get_client
 from backend.helper.rpc_timeout import rpc_await
+from backend.helper.styles import PRIMARY
+from backend.helper import symbols as sym
 
 _RPC_T = 30.0
 
@@ -45,38 +47,174 @@ logger = logging.getLogger(__name__)
 
 
 def _build_general_buttons() -> list:
+    from backend.services import settings_service
+
     builder = InlinePanelBuilder()
-    builder.add_row("Ping", "action:general_ping")
-    builder.add_row("Chat & Msg IDs", "action:general_id")
-    builder.add_row("Health Dashboard", "action:general_health")
+    builder.add_row("Ping", "action:general_ping", PRIMARY)
+    builder.add_row("Chat & Msg IDs", "action:general_id", PRIMARY)
+    builder.add_row("Health Dashboard", "action:general_health", PRIMARY)
+    # Label reflects the ACTUAL stored setting (never a hardcoded/stale value);
+    # the setting is read through the existing settings_service cache.
+    auto = settings_service.is_auto_reaction_enabled()
+    builder.add_row(
+        f"Auto-Reaction: {sym.label(sym.OP_SAVE, 'ON') if auto else sym.label(sym.OP_CLOSE, 'OFF')}",
+        "action:general_toggle_auto_reaction",
+        PRIMARY,
+    )
+    builder.add_row("Select Reaction", f"panel:{_REACTION_PANEL}", PRIMARY)
     return builder.build()
 
 
 async def _general_body() -> str:
+    from backend.services import settings_service
+
+    auto = settings_service.is_auto_reaction_enabled()
+    emoji = settings_service.auto_reaction_emoji()
+    selected = emoji if emoji else "— none —"
     return (
         "**General**\n\n"
-        "Tap a button to execute instantly."
+        "Tap a button to execute instantly.\n\n"
+        f"Auto-Reaction: {sym.label(sym.OP_SAVE, 'ON') if auto else sym.label(sym.OP_CLOSE, 'OFF')}\n"
+        f"Selected reaction: {selected}"
+    )
+
+
+# ── Auto-Reaction selector (Emoji Stage 2) ────────────────────────────────
+#: The reaction picker is a sub-panel of General, so the shared renderer
+#: injects the standard Back/Home/Close navigation row for it.
+_REACTION_PANEL = "general_reactions"
+_REACTION_PAGE_SIZE = 10
+
+
+def _reaction_page_of(extra: str) -> int:
+    page_s = str(extra or "").lstrip(":")
+    try:
+        return max(0, int(page_s or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+async def _render_reaction_picker(
+    page: int, *, notice: str | None = None, force: bool = False,
+) -> tuple[str, str, list]:
+    """Render the Auto-Reaction selector from Telegram's own catalog.
+
+    The catalog is read cache-first (a fresh cache serves without a request;
+    a stale/empty cache re-reads Telegram) unless ``force`` is set (the
+    explicit Refresh action). Every option is a real Telegram reaction; the
+    selection is persisted as the EXACT emoji value Telegram exposed, and
+    the option INDEX (never the raw emoji) travels in the callback data so
+    the payload stays within Telegram's bound while the underlying value is
+    resolved server-side from the same catalog.
+    """
+    from backend.services import reaction_source_service, settings_service
+    from backend.helper.inline_engine import get_self_client
+
+    result = await reaction_source_service.load_reactions(get_self_client(), force=force)
+    options = result.get("options") or []
+    current = settings_service.auto_reaction_emoji()
+    auto = settings_service.is_auto_reaction_enabled()
+
+    page_count = max(1, (len(options) + _REACTION_PAGE_SIZE - 1) // _REACTION_PAGE_SIZE)
+    page = max(0, min(page, page_count - 1))
+    start = page * _REACTION_PAGE_SIZE
+    window = options[start:start + _REACTION_PAGE_SIZE]
+
+    lines = [
+        "**Auto-Reaction**",
+        "",
+        f"Toggle: {sym.label(sym.OP_SAVE, 'ON') if auto else sym.label(sym.OP_CLOSE, 'OFF')}",
+        f"Selected: {current if current else '— none —'}",
+    ]
+    if notice:
+        lines.extend(["", notice])
+    if not result.get("ok"):
+        lines.extend(["", f"{sym.STATE_WARNING} {result.get('detail') or 'Reactions unavailable.'}"])
+    elif not options:
+        lines.extend(["", "_Telegram returned no usable reactions for this account._"])
+    else:
+        lines.extend(["", f"_{len(options)} reaction(s) available · page {page + 1}/{page_count}_"])
+
+    builder = InlinePanelBuilder()
+    for offset in range(0, len(window), 2):
+        pair = []
+        for j in (offset, offset + 1):
+            if j >= len(window):
+                break
+            option = window[j]
+            idx = start + j
+            mark = f"{sym.OP_SAVE} " if option.get("emoji") == current else ""
+            pair.append((
+                f"{mark}{reaction_source_service.option_label(option)}",
+                f"action:general_reaction_set:{idx}",
+            ))
+        builder.add_buttons(*pair)
+    if page_count > 1:
+        builder.add_buttons(
+            (sym.OP_PREV, f"panel:{_REACTION_PANEL}:{max(0, page - 1)}"),
+            (f"{sym.PAGE_CURRENT} {page + 1}/{page_count}", f"panel:{_REACTION_PANEL}:{page}"),
+            (sym.OP_NEXT, f"panel:{_REACTION_PANEL}:{min(page_count - 1, page + 1)}"),
+        )
+    builder.add_row(sym.label(sym.OP_REFRESH, "Refresh"), "action:general_reaction_refresh")
+    builder.add_row(sym.label(sym.OP_BACK, "Back"), "panel:general")
+    return "Auto-Reaction", "\n".join(lines), builder.build()
+
+
+async def _reaction_picker_handler(event, extra: str) -> tuple[str, str, list] | None:
+    return await _render_reaction_picker(_reaction_page_of(extra))
+
+
+async def _general_reaction_refresh_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    """Explicit Refresh: re-read the catalog from Telegram, bypassing cache."""
+    return await _render_reaction_picker(0, notice=f"{sym.OP_REFRESH} Refreshed from Telegram.", force=True)
+
+
+async def _general_reaction_set_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    """Persist the reaction at the given INDEX of the cached catalog.
+
+    The index is resolved against the SAME catalog the picker rendered, and
+    the persisted value is the exact emoji Telegram exposed — never the
+    callback payload and never a substituted glyph. An out-of-range index or
+    a missing catalog fails closed without changing the setting.
+    """
+    from backend.services import reaction_source_service, settings_service
+
+    try:
+        idx = int(str(extra).lstrip(":"))
+    except (TypeError, ValueError):
+        idx = -1
+    options = reaction_source_service.cached_options()
+    if not options or idx < 0 or idx >= len(options):
+        return await _render_reaction_picker(
+            0, notice="Selection out of date — the list changed. Try again.",
+        )
+    emoji = options[idx].get("emoji")
+    if not settings_service.set_auto_reaction_emoji(emoji):
+        return await _render_reaction_picker(
+            0, notice=f"{sym.STATE_FAILED} Could not save the selection — storage failed.",
+        )
+    return await _render_reaction_picker(
+        idx // _REACTION_PAGE_SIZE, notice=f"{sym.OP_SAVE} Reaction set to {emoji}.",
     )
 
 
 def _build_menu_buttons() -> list:
     builder = InlinePanelBuilder()
     builder.add_buttons(
-        ("Save", "panel:save"),
-        ("Delete", "panel:del"),
+        ("Save", "panel:save", PRIMARY),
+        ("Delete", "panel:del", PRIMARY),
     )
     builder.add_buttons(
-        ("Profile", "panel:profile"),
-        ("Database", "panel:db"),
+        ("Profile", "panel:profile", PRIMARY),
+        ("Database", "panel:db", PRIMARY),
     )
     builder.add_buttons(
-        ("General", "panel:general"),
-        ("Settings", "panel:settings"),
-        ("👻 Ghost Seen", "panel:ghost_seen_v2"),
+        ("General", "panel:general", PRIMARY),
+        ("Settings", "panel:settings", PRIMARY),
+        ("Ghost Seen", "panel:ghost_seen_v2", PRIMARY),
     )
-    builder.add_row("📋 Todo", "panel:todo")
-    builder.add_row("🧠 AI", "panel:ai")
-    builder.add_row("😀 Emoji", "panel:emoji")
+    builder.add_row("Todo", "panel:todo", PRIMARY)
+    builder.add_row("AI", "panel:ai", PRIMARY)
     return builder.build()
 
 
@@ -98,15 +236,15 @@ async def _general_inline_builder(event, extra: str) -> list:
 
 async def _profile_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
     builder = InlinePanelBuilder()
-    builder.add_row("Bio", "panel:bio")
-    builder.add_row("Username", "panel:username")
+    builder.add_row("Bio", "panel:bio", PRIMARY)
+    builder.add_row("Username", "panel:username", PRIMARY)
     return "Profile", "Choose a section:", builder.build()
 
 
 async def _profile_inline_builder(event, extra: str) -> list:
     builder = InlinePanelBuilder()
-    builder.add_row("Bio", "panel:bio")
-    builder.add_row("Username", "panel:username")
+    builder.add_row("Bio", "panel:bio", PRIMARY)
+    builder.add_row("Username", "panel:username", PRIMARY)
     return [render("Profile", "Choose a section:", builder.build())]
 
 
@@ -153,14 +291,14 @@ def _font_panel_page(current_key: str) -> tuple[str, str, list]:
     page = min(max(_font_page, 0), len(pages) - 1) if pages else 0
     builder = InlinePanelBuilder()
     for key in pages[page] if pages else ():
-        mark = "✓" if key == current_key else "·"
+        mark = sym.STATE_COMPLETED if key == current_key else sym.SEPARATOR
         # Each option demonstrates itself in its own style.
         builder.add_row(f"{mark} {font_option_label(key)}", f"action:font_set:{key}")
     if len(pages) > 1:
         builder.add_buttons(
-            ("◀ Prev", "action:font_page:prev"),
-            (f"{page + 1}/{len(pages)}", "panel:_nav:noop"),
-            ("Next ▶", "action:font_page:next"),
+            (sym.label(sym.OP_PREV, "Prev"), "action:font_page:prev"),
+            (f"{sym.PAGE_CURRENT} {page + 1}/{len(pages)}", "panel:_nav:noop"),
+            (f"Next {sym.OP_NEXT}", "action:font_page:next"),
         )
     label = _FONT_BY_KEY[current_key].label
     body = (
@@ -204,17 +342,17 @@ async def _font_page_action(event, extra: str, chat_id: int) -> tuple[str, str, 
 
 async def _settings_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
     builder = InlinePanelBuilder()
-    builder.add_row("Toggle Auto-close", "action:settings_toggle_autoclose")
-    builder.add_row("Toggle Debug Callbacks", "action:settings_toggle_debug_callbacks")
-    builder.add_row("Toggle Owner Only", "action:settings_toggle_owner_only")
-    builder.add_row("Toggle Multiple Panels", "action:settings_toggle_multiple_panels")
-    builder.add_row("Toggle Reuse Panel", "action:settings_toggle_reuse_panel")
-    builder.add_row("Set Auto-close Delay", "input:settings:auto_close_delay")
-    builder.add_row("Set Max Deep Save", "input:settings:max_deep_save_mb")
-    builder.add_row("Set Delete Batch Size", "input:settings:delete_batch_size")
-    builder.add_row("Set Log Retention", "input:settings:log_retention_days")
-    builder.add_row("Set Panel Timeout", "input:settings:panel_timeout_seconds")
-    builder.add_row("🔤 Font", "panel:font")
+    builder.add_row("Toggle Auto-close", "action:settings_toggle_autoclose", PRIMARY)
+    builder.add_row("Toggle Debug Callbacks", "action:settings_toggle_debug_callbacks", PRIMARY)
+    builder.add_row("Toggle Owner Only", "action:settings_toggle_owner_only", PRIMARY)
+    builder.add_row("Toggle Multiple Panels", "action:settings_toggle_multiple_panels", PRIMARY)
+    builder.add_row("Toggle Reuse Panel", "action:settings_toggle_reuse_panel", PRIMARY)
+    builder.add_row("Set Auto-close Delay", "input:settings:auto_close_delay", PRIMARY)
+    builder.add_row("Set Max Deep Save", "input:settings:max_deep_save_mb", PRIMARY)
+    builder.add_row("Set Delete Batch Size", "input:settings:delete_batch_size", PRIMARY)
+    builder.add_row("Set Log Retention", "input:settings:log_retention_days", PRIMARY)
+    builder.add_row("Set Panel Timeout", "input:settings:panel_timeout_seconds", PRIMARY)
+    builder.add_row("Font", "panel:font", PRIMARY)
     return "Settings", await _build_settings_body(), builder.build()
 
 
@@ -388,6 +526,11 @@ def _register_panels() -> None:
     register_inline_builder("settings", _settings_inline_builder)
     register_panel("general", _general_panel_handler, parent="menu", title="General")
     register_inline_builder("general", _general_inline_builder)
+    register_panel(
+        _REACTION_PANEL, _reaction_picker_handler, parent="general", title="Auto-Reaction",
+    )
+    register_action("general_reaction_refresh", _general_reaction_refresh_action)
+    register_action("general_reaction_set", _general_reaction_set_action)
     register_panel("font", _font_panel_handler, parent="settings", title="Font")
     register_action("font_set", _font_set_action)
     register_action("font_page", _font_page_action)
@@ -399,6 +542,7 @@ def _register_panels() -> None:
     register_action("general_ping", _general_ping_action)
     register_action("general_id", _general_id_action)
     register_action("general_health", _general_health_action)
+    register_action("general_toggle_auto_reaction", _general_toggle_auto_reaction_action)
     register_input("settings", "auto_close_delay", {
         "handler": _settings_auto_close_delay_handler,
         "prompt": "**Auto-close Delay**\n\nEnter delay in seconds (5-3600):\n\n_Reply below._",
@@ -423,6 +567,23 @@ def _register_panels() -> None:
 
 async def _general_ping_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     return "General", "PONG", _build_general_buttons()
+
+
+async def _general_toggle_auto_reaction_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    """Toggle the Auto-Reaction SETTING and re-render the General panel.
+
+    This flips the persisted setting only — no reaction engine exists yet, so
+    nothing reacts to any message as a side effect of this toggle.
+    """
+    from backend.services import settings_service
+
+    settings_service.toggle_auto_reaction()
+    enabled = settings_service.is_auto_reaction_enabled()
+    notice = (
+        f"**General**\n\nAuto-Reaction is now "
+        f"{sym.label(sym.OP_SAVE, 'ON') if enabled else sym.label(sym.OP_CLOSE, 'OFF')}."
+    )
+    return "General", notice, _build_general_buttons()
 
 
 async def _general_id_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
@@ -587,7 +748,7 @@ async def _context_panel_handler(event, extra: str) -> tuple[str, str, list] | N
     except Exception as exc:
         body_lines.append(f"Error: {exc}")
     builder = InlinePanelBuilder()
-    builder.add_row("⬇️ Deep Save", "action:save_reply")
+    builder.add_row(sym.label(sym.OP_SAVE, "Deep Save"), "action:save_reply", PRIMARY)
     return "Context Panel", "\n".join(body_lines), builder.build()
 
 

@@ -31,6 +31,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 from backend.diagnostics import record_event
+from backend.helper import symbols as sym
 
 logger = logging.getLogger(__name__)
 
@@ -889,8 +890,8 @@ def _get_or_create_bio_state_sync(owner_id: int) -> dict:
 
     default = {
         "owner_id": owner_id,
-        "template": "🕒 {time} | 💭 {mood}",
-        "mood": "😊",
+        "template": sym.BIO_DEFAULT_TEMPLATE,
+        "mood": sym.ICON_MOOD,
         "custom_text": "",
         "is_active": False,
         "last_bio": "",
@@ -923,8 +924,8 @@ async def get_or_create_bio_state(owner_id: int) -> dict:
         logger.error("[SAVE_DB] get_or_create_bio_state FAILED: %s", exc)
         return _fallback["bio_state"].get(owner_id) or {
             "owner_id": owner_id,
-            "template": "🕒 {time} | 💭 {mood}",
-            "mood": "😊",
+            "template": sym.BIO_DEFAULT_TEMPLATE,
+            "mood": sym.ICON_MOOD,
             "custom_text": "",
             "is_active": False,
             "last_bio": "",
@@ -991,7 +992,7 @@ def _get_or_create_username_state_sync(owner_id: int) -> dict:
     default = {
         "owner_id": owner_id,
         "template": "{time} | {mood}",
-        "mood": "😊",
+        "mood": sym.ICON_MOOD,
         "custom_text": "",
         "is_active": False,
         "last_name": "",
@@ -1029,7 +1030,7 @@ async def get_or_create_username_state(owner_id: int) -> dict:
         return _fallback["username_state"].get(owner_id) or {
             "owner_id": owner_id,
             "template": "{time} | {mood}",
-            "mood": "😊",
+            "mood": sym.ICON_MOOD,
             "custom_text": "",
             "is_active": False,
             "last_name": "",
@@ -1421,56 +1422,6 @@ async def update_emoji_category(
     except Exception as exc:
         logger.error("[EMOJI_DB] update_emoji_category FAILED: %s", exc)
         return None
-
-
-def _set_emoji_category_sources_sync(
-    owner_id: int, category_id: int, source_ids: list,
-) -> bool:
-    now = datetime.now(timezone.utc).isoformat()
-    db = get_db()
-    if db is None:
-        for row in _fallback["emoji_categories"]:
-            if row.get("owner_id") == owner_id and row.get("id") == category_id:
-                row["source_category_ids"] = list(source_ids)
-                row["updated_at"] = now
-                return True
-        return False
-    try:
-        result = (
-            db.table("emoji_categories")
-            .update({"source_category_ids": list(source_ids), "updated_at": now})
-            .eq("owner_id", owner_id)
-            .eq("id", category_id)
-            .execute()
-        )
-        return bool(result.data)
-    except Exception as exc:
-        logger.error("[EMOJI_DB] set_emoji_category_sources ERROR: %s", exc, exc_info=True)
-        record_event("database", "update emoji_categories", 0, "ERROR", str(exc))
-        return False
-
-
-async def set_emoji_category_sources(
-    owner_id: int, category_id: int, source_ids: list,
-) -> bool:
-    """Persist one category's composition source list (ROADMAP §26).
-
-    Only ever called for a Custom Category — ordinary categories are never
-    written with this field, so Phase 2 behavior is untouched. False on
-    failure or a missing row: the ``source_category_ids`` column is
-    MANUAL-ONLY (IMPLEMENTATION_REPORT.md), so a Supabase without the
-    documented change reports an honest failure instead of silently dropping
-    the composition. Never raises.
-    """
-    if not isinstance(source_ids, list):
-        return False
-    try:
-        return await _run_sync(
-            _set_emoji_category_sources_sync, owner_id, category_id, source_ids,
-        )
-    except Exception as exc:
-        logger.error("[EMOJI_DB] set_emoji_category_sources FAILED: %s", exc)
-        return False
 
 
 def _delete_emoji_category_sync(owner_id: int, category_id: int) -> bool:
