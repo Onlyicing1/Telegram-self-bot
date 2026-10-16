@@ -1243,6 +1243,27 @@ Current truth after the Phase 0–6 code slices:
 
 ---
 
+## 37. Concurrent feature status — LifeOS Guide Website (Phase 1)
+
+> **NOT part of the Emoji & Reaction roadmap.** The sections above are
+> unchanged. This bounded block exists only so the roadmap reflects the status
+> of the concurrently delivered guide website (Phase 1 of its delivery task);
+> it is a status record, never a changelog. Canonical record:
+> `docs/implementation/lifeos-guide-website-phase-1.md`.
+
+| Item | Status |
+|---|---|
+| Feature | Persian-first (RTL) public guide website for LifeOS, architecturally separate from the self-bot runtime |
+| Status | **COMPLETE (Phase 1)** — site, tests, documentation. **No browser/visual verification performed; nothing was deployed** |
+| Location | `guide/` — standalone static site (HTML + CSS + ES modules), no build step, no framework, no new dependency |
+| Serving | read-only `StaticFiles` mount at `/guide` in `backend/web/app.py`, registered before the SPA catch-all; also serves from any plain static host |
+| Content | Six categories (getting started · fonts · media & files · AI · workflows · troubleshooting/FAQ). Every article carries `data-evidence` source paths that the test suite resolves on disk, so undocumented or invented features cannot ship |
+| Files changed | `guide/index.html`, `guide/styles.css`, `guide/search.js`, `guide/guide.js`, `guide/README.md`, `tests/test_69_guide_site.py` (NEW), `docs/implementation/lifeos-guide-website-phase-1.md` (NEW), `backend/web/app.py` (additive static mount), `AGENTS.md`, this section |
+| Boundaries kept | no Telethon/session/update-loop change, no second scheduler/dispatcher/executor, no provider/`ToolRegistry`/`ToolExecutor`/`RuntimeSupervisor` change, no Supabase schema or SQL, no new API/auth/DB dependency, no env or deployment change, no README rewrite, no frontend framework added |
+| Known limitations | Latin identifiers with Persian prose (the guide is not translated to RTL English); browser rendering was not visually verified in this workspace; the `/guide` route is reachable wherever the FastAPI app runs from this checkout — **not** verified against a live Render URL |
+
+---
+
 *Roadmap established from repository investigation at commit `eb4d852`
 (branch `main` worktree, Telethon 1.34.0 verified in the active venv);
 Phase 0 code slice landed on top of the merged `0c60363` state (see

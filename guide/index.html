@@ -1,0 +1,684 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>راهنمای LifeOS — راهنمای فارسی کاربر</title>
+    <meta
+      name="description"
+      content="راهنمای فارسی LifeOS: شروع کار، فونت‌ها و استایل متن، رسانه و فایل‌ها، هوش مصنوعی، گردش‌کارها و رفع اشکال. یک وب‌سایت ایستا، بدون نیاز به هیچ کلید یا اتصال تلگرام."
+    />
+    <meta name="color-scheme" content="dark" />
+    <meta name="theme-color" content="#0b0a12" />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#main">پرش به محتوای اصلی</a>
+
+    <header class="site-header" id="top">
+      <div class="shell header-inner">
+        <a class="brand" href="#top" aria-label="LifeOS — راهنمای کاربر">
+          <span class="brand-mark" aria-hidden="true">◈</span>
+          <span class="brand-text">
+            <span class="brand-name">LifeOS</span>
+            <span class="brand-sub">راهنمای فارسی کاربر</span>
+          </span>
+        </a>
+
+        <button
+          class="nav-toggle"
+          id="nav-toggle"
+          type="button"
+          aria-expanded="false"
+          aria-controls="category-nav"
+        >
+          <span aria-hidden="true">≡</span>
+          <span>دسته‌ها</span>
+        </button>
+
+        <nav class="site-nav" id="category-nav" aria-label="ناوبری دسته‌های راهنما">
+          <ul class="nav-list">
+            <li><a class="nav-link" href="#cat-getting-started">شروع کار</a></li>
+            <li><a class="nav-link" href="#cat-fonts">فونت‌ها</a></li>
+            <li><a class="nav-link" href="#cat-media">رسانه و فایل</a></li>
+            <li><a class="nav-link" href="#cat-ai">هوش مصنوعی</a></li>
+            <li><a class="nav-link" href="#cat-workflows">گردش‌کارها</a></li>
+            <li><a class="nav-link" href="#cat-troubleshooting">رفع اشکال</a></li>
+          </ul>
+        </nav>
+
+        <form class="site-search" id="search-form" role="search" novalidate>
+          <label class="visually-hidden" for="search-input">جست‌وجو در راهنمای LifeOS</label>
+          <input
+            class="search-input"
+            id="search-input"
+            type="search"
+            name="q"
+            placeholder="جست‌وجو: فونت، ذخیره، Nova …"
+            autocomplete="off"
+            aria-describedby="search-hint"
+          />
+          <button class="search-submit" type="submit">جست‌وجو</button>
+          <button class="search-clear" id="search-clear" type="button" hidden>پاک کردن</button>
+        </form>
+      </div>
+      <p class="shell search-hint" id="search-hint">
+        کلید <kbd>/</kbd> را بزن تا در جست‌وجو بپری و با <kbd>Esc</kbd> آن را پاک کن.
+      </p>
+    </header>
+
+    <main id="main">
+      <section class="hero shell" id="hero" aria-labelledby="hero-title">
+        <p class="eyebrow">مستندات کاربر — نسخه‌ی نخست</p>
+        <h1 id="hero-title">
+          <span class="gradient-text">LifeOS</span>
+          را قدم‌به‌قدم یاد بگیر
+        </h1>
+        <p class="hero-lead">
+          LifeOS یک <strong>سلف‌بات تلگرام</strong> است: حساب شخصی خودت را به یک
+          سیستم‌عامل شخصی تبدیل می‌کند و همه‌کارها از طریق پنل‌های دکمه‌ای انجام
+          می‌شود. این راهنما فارسی است، راست‌به‌چپ نوشته شده و فقط چیزهایی را
+          توضیح می‌دهد که در کد همین پروژه تأیید شده‌اند.
+        </p>
+
+        <div class="hero-actions">
+          <a class="button button-primary" href="#cat-getting-started">شروع سریع</a>
+          <a class="button button-ghost" href="#categories">مرور دسته‌بندی‌ها</a>
+        </div>
+
+        <ul class="hero-facts" aria-label="آمار راهنما">
+          <li><strong>۶</strong><span>دسته‌ی راهنما</span></li>
+          <li><strong>۲۷</strong><span>استایل فونت</span></li>
+          <li><strong>Menu</strong><span>تنها فرمان متنی</span></li>
+          <li><strong>۰</strong><span>کلید لازم برای خواندن این سایت</span></li>
+        </ul>
+
+        <aside class="callout callout-info" aria-label="درباره‌ی این سایت">
+          <p>
+            این وب‌سایت کاملاً <strong>ایستا</strong> است: برای دیدن آن به هیچ
+            StringSession، توکن ربات، کلید دیتابیس یا سرور رمزی نیاز نداری.
+          </p>
+        </aside>
+      </section>
+
+      <section class="shell block" id="categories" aria-labelledby="categories-title">
+        <h2 id="categories-title">دسته‌بندی راهنما</h2>
+        <p class="section-lead">
+          شش دسته‌ی اصلی؛ هر دسته یک مقاله‌ی کامل با مراحل و مثال‌های واقعی است.
+        </p>
+        <ul class="category-grid">
+          <li>
+            <a class="category-card" href="#cat-getting-started" data-category-link="cat-getting-started">
+              <span class="card-icon" aria-hidden="true">🚀</span>
+              <span class="card-title">شروع کار با LifeOS</span>
+              <span class="card-desc">پیش‌نیازها، اولین اجرا، نقشه‌ی پنل مادر و قواعد جاری.</span>
+              <span class="card-count">۴ بخش</span>
+            </a>
+          </li>
+          <li>
+            <a class="category-card" href="#cat-fonts" data-category-link="cat-fonts">
+              <span class="card-icon" aria-hidden="true">✒️</span>
+              <span class="card-title">فونت‌ها و استایل متن</span>
+              <span class="card-desc">۲۷ استایل یونیکد، مسیر پنل فونت و محدودیت‌های واقعی.</span>
+              <span class="card-count">۵ بخش</span>
+            </a>
+          </li>
+          <li>
+            <a class="category-card" href="#cat-media" data-category-link="cat-media">
+              <span class="card-icon" aria-hidden="true">📥</span>
+              <span class="card-title">رسانه و فایل‌ها</span>
+              <span class="card-desc">ذخیره‌ی عمیق، لینک، کد ذخیره، بازیابی و حذف.</span>
+              <span class="card-count">۵ بخش</span>
+            </a>
+          </li>
+          <li>
+            <a class="category-card" href="#cat-ai" data-category-link="cat-ai">
+              <span class="card-icon" aria-hidden="true">🧠</span>
+              <span class="card-title">هوش مصنوعی</span>
+              <span class="card-desc">فعال‌سازی با تریگر، اجرای واقعی ابزارها و انتخاب provider.</span>
+              <span class="card-count">۵ بخش</span>
+            </a>
+          </li>
+          <li>
+            <a class="category-card" href="#cat-workflows" data-category-link="cat-workflows">
+              <span class="card-icon" aria-hidden="true">♾️</span>
+              <span class="card-title">گردش‌کارها و خودکارسازی</span>
+              <span class="card-desc">بیو و نام خودکار، وظایف زمان‌بندی‌شده و تنظیمات عمومی.</span>
+              <span class="card-count">۴ بخش</span>
+            </a>
+          </li>
+          <li>
+            <a class="category-card" href="#cat-troubleshooting" data-category-link="cat-troubleshooting">
+              <span class="card-icon" aria-hidden="true">🛠️</span>
+              <span class="card-title">رفع اشکال و پرسش‌های متداول</span>
+              <span class="card-desc">پنل باز نمی‌شود؟ داده‌ها گم می‌شوند؟ پاسخ‌های کوتاه و دقیق.</span>
+              <span class="card-count">۸ پرسش</span>
+            </a>
+          </li>
+        </ul>
+      </section>
+
+      <section
+        class="shell block search-region"
+        id="search-region"
+        aria-labelledby="search-region-title"
+        hidden
+      >
+        <h2 id="search-region-title">نتایج جست‌وجو</h2>
+        <p class="search-status" id="search-status" role="status" aria-live="polite"></p>
+        <ul class="search-results" id="search-results" aria-label="مقاله‌های یافته‌شده"></ul>
+        <div class="empty-state" id="no-results" hidden>
+          <p class="empty-title">موردی پیدا نشد</p>
+          <p>
+            املای عبارت را بررسی کن یا یکی از این کلیدواژه‌ها را امتحان کن:
+            <code>فونت</code>، <code>ذخیره</code>، <code>Nova</code>،
+            <code>بیو</code>، <code>Supabase</code>.
+          </p>
+          <p class="empty-actions">
+            <button class="button button-ghost" id="no-results-reset" type="button">
+              نمایش همه‌ی دسته‌ها
+            </button>
+          </p>
+        </div>
+      </section>
+
+      <article
+        class="shell block guide-article"
+        id="cat-getting-started"
+        data-category="شروع کار با LifeOS"
+        data-title="شروع کار با LifeOS"
+        data-keywords="شروع نصب راه اندازی اجرا string session stringsession api_id api_hash bot_owner_id menu پنل مادر مالک owner پنل دکمه ای glass ui پنل glass health متغیر محیطی تایم زون tehran پیش نیاز"
+        data-evidence="backend/config.py backend/main.py backend/bot/handlers/misc.py backend/bot/handlers/guard.py backend/web/app.py"
+        tabindex="-1"
+      >
+        <h2>شروع کار با LifeOS</h2>
+        <p class="article-lead">
+          LifeOS یک <strong>سلف‌بات</strong> (یوزربات) تلگرام است که روی حساب
+          شخصی خودت اجرا می‌شود. یک پروسه‌ی <code>asyncio</code> هم Telethon، هم
+          وب‌سرور FastAPI و هم زمان‌بند پروفایل را اداره می‌کند؛ پس نه وبهوکی
+          لازم داری و نه ورود تعاملی.
+        </p>
+
+        <h3>پیش‌نیازهای اجرا</h3>
+        <p>
+          فایل <code>backend/config.py</code> این چهار متغیر را الزامی می‌داند و
+          اگر یکی از آن‌ها نباشد، اجرا با خطای واضح متوقف می‌شود:
+        </p>
+        <ul class="plain-list">
+          <li><code>API_ID</code> و <code>API_HASH</code> — شناسه‌ی اپ تلگرام.</li>
+          <li><code>SESSION_STRING</code> — سشن رشته‌ای (StringSession) که بیرون از برنامه ساخته می‌شود.</li>
+          <li><code>BOT_OWNER_ID</code> — شناسه‌ی عددی مالک؛ تنها کسی که ربات به او پاسخ می‌دهد.</li>
+        </ul>
+        <p>
+          بقیه‌ی متغیرها اختیاری‌اند: <code>SUPABASE_URL</code> و
+          <code>SUPABASE_SERVICE_ROLE_KEY</code> (خالی بمانند، حافظه‌ی موقت
+          جایگزین می‌شود)، <code>BOT_TOKEN</code> (ربات کمکی برای دکمه‌های شیشه‌ای)،
+          <code>TZ</code> (پیش‌فرض <code>Asia/Tehran</code>) و <code>PORT</code>
+          (پیش‌فرض <code>8000</code>).
+        </p>
+
+        <h3>گام‌های اولین اجرا</h3>
+        <ol class="steps">
+          <li>سشن رشته‌ای را به‌صورت آفلاین بساز و در <code>SESSION_STRING</code> بگذار.</li>
+          <li>متغیرهای محیطی را تنظیم کن (حداقل چهار مورد الزامی بالا).</li>
+          <li>برنامه را با <code>python -m backend.main</code> اجرا کن.</li>
+          <li>در چت <strong>Saved Messages</strong> یک پیام بفرست که دقیقاً کلمه‌ی <code>Menu</code> باشد.</li>
+          <li>برای اطمینان، <code>/health</code> را باز کن؛ پاسخ <code>{"status": "ok"}</code> است.</li>
+        </ol>
+
+        <h3>تنها فرمان متنی: <code>Menu</code></h3>
+        <p>
+          کل رابط کاربری پنل‌محور است. تنها فرمان متنی، کلمه‌ی <code>Menu</code>
+          است و مقایسه برابری دقیق روی متن خام انجام می‌شود؛ نه نقطه لازم دارد و
+          نه حساس به فونت نمایشی است. فرمان‌های قدیمی مثل <code>.menu</code>،
+          <code>.save</code> و <code>.bio</code> از کد حذف شده‌اند.
+        </p>
+
+        <h3>نقشه‌ی پنل مادر</h3>
+        <div class="table-wrap">
+          <table>
+            <caption>دکمه‌های پنل مادر و کاربردشان (منبع: <code>_build_menu_buttons</code>)</caption>
+            <thead>
+              <tr><th scope="col">پنل</th><th scope="col">کاربرد</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><strong>Save</strong></td><td>ذخیره‌ی عمیق پیام، لینک و بازیابی ذخیره‌ها</td></tr>
+              <tr><td><strong>Delete</strong></td><td>حذف پیام‌ها با حالت‌های پاسخ / تعداد / شناسه</td></tr>
+              <tr><td><strong>Profile</strong></td><td>ورود به Bio و Username</td></tr>
+              <tr><td><strong>Database</strong></td><td>نگهداری دیتابیس: آمار، پاک‌سازی</td></tr>
+              <tr><td><strong>General</strong></td><td>وضعیت کلی، پینگ، شناسه، سلامت</td></tr>
+              <tr><td><strong>Settings</strong></td><td>تنظیمات پنل‌ها، فونت نمایشی و زبان</td></tr>
+              <tr><td><strong>Ghost Seen</strong></td><td>مشاهده‌ی بی‌ردپا</td></tr>
+              <tr><td><strong>Todo</strong></td><td>فهرست کارهای زمان‌بندی‌شده</td></tr>
+              <tr><td><strong>AI</strong></td><td>ارائه‌دهنده، مدل، وضعیت، عیب‌یابی و تنظیم تریگر</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>قواعد جاری</h3>
+        <ul class="plain-list">
+          <li>هر هندلر اول <code>is_owner</code> را بررسی می‌کند؛ پیام دیگران بی‌صدا نادیده گرفته می‌شود.</li>
+          <li>پاسخ‌ها در همان پیام ویرایش می‌شوند (بدون اسپم پیام جدید).</li>
+          <li>ربات کمکی اختیاری است؛ بدون <code>BOT_TOKEN</code> پنل‌ها به حالت متنی ویرایش‌در‌جا برمی‌گردند.</li>
+        </ul>
+        <p class="evidence">شواهد کد: <code>backend/config.py</code>، <code>backend/bot/handlers/misc.py</code>، <code>backend/bot/handlers/guard.py</code></p>
+      </article>
+
+      <article
+        class="shell block guide-article"
+        id="cat-fonts"
+        data-category="فونت‌ها و استایل متن"
+        data-title="فونت‌ها و استایل متن"
+        data-keywords="فونت فونت نمایشی استایل متن یونیکد font dashboard_font settings ظاهر دکمه برچسب لاتین ارقام italic script fraktur circled underline strike نمایشی زیبا"
+        data-evidence="backend/helper/font_style.py backend/bot/handlers/misc.py backend/helper/panel_render.py backend/services/settings_service.py src/App.tsx"
+        tabindex="-1"
+      >
+        <h2>فونت‌ها و استایل متن</h2>
+        <p class="article-lead">
+          LifeOS یک رجیستری فونت نمایشی دارد: متن‌ها با تبدیل کاراکترهای یونیکد
+          استایل می‌شوند (فایل فونت دانلود نمی‌شود). مقدار انتخابی در کل پنل‌ها و
+          داشبورد اعمال می‌شود.
+        </p>
+
+        <h3>مسیر پنل فونت</h3>
+        <p>
+          <code dir="ltr">Menu → Settings → Font</code>
+        </p>
+        <ul class="plain-list">
+          <li>هر صفحه ۸ استایل نشان می‌دهد؛ با <strong>Next</strong> و <strong>Prev</strong> جابه‌جا شو.</li>
+          <li>با انتخاب هر استایل، مقدار در تنظیمات پنل ذخیره می‌شود.</li>
+          <li>مقدار نامعتبر رد می‌شود و مقدار قبلی دست‌نخورده می‌ماند.</li>
+        </ul>
+
+        <h3>۲۷ استایل موجود</h3>
+        <p>
+          نمونه‌های زیر دقیقاً خروجی همین رجیستری برای رشته‌ی
+          <code dir="ltr">LifeOS 24</code> هستند.
+        </p>
+        <div class="table-wrap">
+          <table>
+            <caption>کلید، نام و نمونه‌ی هر استایل (به ترتیب رجیستری)</caption>
+            <thead>
+              <tr><th scope="col">نام</th><th scope="col">کلید</th><th scope="col">نمونه</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Default (system)</td><td><code>default</code></td><td><code dir="ltr">LifeOS 24</code></td></tr>
+              <tr><td>Serif Bold</td><td><code>serif_bold</code></td><td><code dir="ltr">𝐋𝐢𝐟𝐞𝐎𝐒 𝟐𝟒</code></td></tr>
+              <tr><td>Serif Italic</td><td><code>serif_italic</code></td><td><code dir="ltr">𝐿𝑖𝑓𝑒𝑂𝑆 24</code></td></tr>
+              <tr><td>Serif Bold Italic</td><td><code>serif_bold_italic</code></td><td><code dir="ltr">𝑳𝒊𝒇𝒆𝑶𝑺 24</code></td></tr>
+              <tr><td>Sans</td><td><code>sans</code></td><td><code dir="ltr">𝖫𝗂𝖿𝖾𝖮𝖲 𝟤𝟦</code></td></tr>
+              <tr><td>Sans Bold</td><td><code>sans_bold</code></td><td><code dir="ltr">𝗟𝗶𝗳𝗲𝗢𝗦 𝟮𝟰</code></td></tr>
+              <tr><td>Sans Italic</td><td><code>sans_italic</code></td><td><code dir="ltr">𝘓𝘪𝘧𝘦𝘖𝘚 24</code></td></tr>
+              <tr><td>Sans Bold Italic</td><td><code>sans_bold_italic</code></td><td><code dir="ltr">𝙇𝙞𝙛𝙚𝙊𝙎 24</code></td></tr>
+              <tr><td>Script</td><td><code>script</code></td><td><code dir="ltr">ℒ𝒾𝒻ℯ𝒪𝒮 24</code></td></tr>
+              <tr><td>Script Bold</td><td><code>script_bold</code></td><td><code dir="ltr">𝓛𝓲𝓯𝓮𝓞𝓢 24</code></td></tr>
+              <tr><td>Fraktur</td><td><code>fraktur</code></td><td><code dir="ltr">𝔏𝔦𝔣𝔢𝔒𝔖 24</code></td></tr>
+              <tr><td>Fraktur Bold</td><td><code>fraktur_bold</code></td><td><code dir="ltr">𝕷𝖎𝖋𝖊𝕺𝕾 24</code></td></tr>
+              <tr><td>Double-Struck</td><td><code>double_struck</code></td><td><code dir="ltr">𝕃𝕚𝕗𝕖𝕆𝕊 𝟚𝟜</code></td></tr>
+              <tr><td>Monospace</td><td><code>mono</code></td><td><code dir="ltr">𝙻𝚒𝚏𝚎𝙾𝚂 𝟸𝟺</code></td></tr>
+              <tr><td>Small Caps</td><td><code>small_caps</code></td><td><code dir="ltr">ʟɪꜰᴇᴏꜱ 24</code></td></tr>
+              <tr><td>Circled</td><td><code>circled</code></td><td><code dir="ltr">ⓁⓘⓕⓔⓄⓈ ②④</code></td></tr>
+              <tr><td>Dark Circled</td><td><code>circled_dark</code></td><td><code dir="ltr">🅛🅘🅕🅔🅞🅢 ❷❹</code></td></tr>
+              <tr><td>Wide</td><td><code>fullwidth</code></td><td><code dir="ltr">ＬｉｆｅＯＳ ２４</code></td></tr>
+              <tr><td>Parenthesized</td><td><code>parenthesized</code></td><td><code dir="ltr">⒧⒤⒡⒠⒪⒮ 24</code></td></tr>
+              <tr><td>Underline</td><td><code>underline</code></td><td><code dir="ltr">L̲i̲f̲e̲O̲S̲ ̲2̲4̲</code></td></tr>
+              <tr><td>Strikethrough</td><td><code>strikethrough</code></td><td><code dir="ltr">L̶i̶f̶e̶O̶S̶ ̶2̶4̶</code></td></tr>
+              <tr><td>Overline</td><td><code>overline</code></td><td><code dir="ltr">L̅i̅f̅e̅O̅S̅ ̅2̅4̅</code></td></tr>
+              <tr><td>Wavy Underline</td><td><code>wavy_underline</code></td><td><code dir="ltr">L̰ḭf̰ḛO̰S̰ ̰2̰4̰</code></td></tr>
+              <tr><td>Double Underline</td><td><code>double_underline</code></td><td><code dir="ltr">L̳i̳f̳e̳O̳S̳ ̳2̳4̳</code></td></tr>
+              <tr><td>Slashed</td><td><code>slash_through</code></td><td><code dir="ltr">L̸i̸f̸e̸O̸S̸ ̸2̸4̸</code></td></tr>
+              <tr><td>Tilde Overlay</td><td><code>tilde_overlay</code></td><td><code dir="ltr">L̴i̴f̴e̴O̴S̴ ̴2̴4̴</code></td></tr>
+              <tr><td>Dotted</td><td><code>dot_above</code></td><td><code dir="ltr">L̇i̇ḟėȮṠ ̇2̇4̇</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>فونت روی چه چیزی اعمال می‌شود؟</h3>
+        <ul class="plain-list">
+          <li>عنوان و متن پنل‌ها و برچسب دکمه‌ها.</li>
+          <li>فونت داشبورد وب (متغیر CSS با نام <code>--app-font</code>).</li>
+          <li>
+            داده‌ها هرگز تغییر نمی‌کنند: متن دکمه‌ی داده (callback data)، کدها،
+            لینک‌ها، شناسه‌ها، نام‌کاربری و پیام‌های ورودی دست‌نخورده می‌مانند.
+          </li>
+        </ul>
+
+        <h3>محدودیت‌ها</h3>
+        <ul class="plain-list">
+          <li>تبدیل‌ها روی <strong>حروف لاتین و ارقام مستقل</strong> کار می‌کنند؛ متن فارسی و عربی بدون تغییر می‌ماند.</li>
+          <li>خانواده‌هایی که یونیکد برایشان رقم رزرو نکرده (مثل Italic، Script و Fraktur) ارقام را با فونت سیستم نشان می‌دهند.</li>
+          <li>این‌ها تبدیل کاراکتری‌اند، نه فایل فونت؛ پس همه‌ی گیرنده‌ها بسته به پشتیبانی فونت خودشان آن را می‌بینند.</li>
+        </ul>
+        <p class="evidence">شواهد کد: <code>backend/helper/font_style.py</code>، <code>backend/helper/panel_render.py</code>، <code>backend/services/settings_service.py</code></p>
+      </article>
+
+      <article
+        class="shell block guide-article"
+        id="cat-media"
+        data-category="رسانه و فایل‌ها"
+        data-title="رسانه و فایل‌ها"
+        data-keywords="ذخیره ذخیره عمیق save deep save رسانه فایل عکس ویدیو سند لینک کد ذخیره s0001 بازیابی retrieve حذف delete محدودیت حجم مگابایت برچسب tag نام فایل فوروارد forward saved messages"
+        data-evidence="backend/services/save_service.py backend/bot/handlers/save.py backend/bot/handlers/retrieve.py backend/bot/handlers/delete.py backend/services/settings_service.py backend/db/client.py"
+        tabindex="-1"
+      >
+        <h2>رسانه و فایل‌ها</h2>
+        <p class="article-lead">
+          سیستم ذخیره‌سازی LifeOS فقط <strong>ذخیره‌ی عمیق</strong> است: پیام
+          مبدأ دانلود می‌شود و به‌عنوان یک پیام <em>تازه</em> در Saved Messages
+          آپلود می‌شود. هیچ‌جا فوروارد رخ نمی‌دهد.
+        </p>
+
+        <h3>چه اتفاقی می‌افتد؟</h3>
+        <ol class="steps">
+          <li>رسانه‌ی پیام مبدأ در بافر امن دانلود می‌شود.</li>
+          <li>دانلود اعتبارسنجی می‌شود (خالی نباشد و از سقف حجم رد نشود).</li>
+          <li>رسانه به‌عنوان پیام جدید در Saved Messages آپلود می‌شود.</li>
+          <li>فراداده‌ی پیام جدید (چت و شناسه‌ی پیام) استخراج می‌شود.</li>
+          <li>رکورد در دیتابیس ذخیره می‌شود — بعد از آپلود موفق، نه قبل از آن.</li>
+        </ol>
+        <p>
+          چون مسیر ذخیره‌سازی «دانلود و آپلود مجدد» است، چت‌هایی که فوروارد را
+          می‌بندند مانعی ایجاد نمی‌کنند؛ و اگر ذخیره شکست بخورد، هرگز به‌صورت
+          خاموش به فوروارد تبدیل نمی‌شود.
+        </p>
+
+        <h3>مسیر انجام در پنل</h3>
+        <p><code dir="ltr">Menu → Save → Deep Save</code> و سپس یکی از سه گزینه:</p>
+        <ul class="plain-list">
+          <li><strong>Reply Mode</strong> — به هر پیامی پاسخ بده؛ همان پیام ذخیره می‌شود و منتظر ماندن برای فایل‌های بزرگ سقف زمانی ندارد.</li>
+          <li><strong>Name &amp; tags</strong> — نام و برچسب‌های دلخواه را از قبل وارد کن، بعد حالت پاسخ را فعال کن.</li>
+          <li><strong>Save using a link</strong> — ذخیره‌ی یک لینک یا متن بدون انتقال رسانه (پیام متنی تازه ساخته می‌شود).</li>
+        </ul>
+
+        <h3>محدودیت‌ها و سقف‌ها</h3>
+        <div class="table-wrap">
+          <table>
+            <caption>مقادیر پیش‌فرض از <code>settings_service</code> و <code>save_service</code></caption>
+            <thead>
+              <tr><th scope="col">مورد</th><th scope="col">مقدار</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>سقف حجم ذخیره‌ی عمیق</td><td><code>max_deep_save_mb</code> — پیش‌فرض ۵۰ مگابایت (قابل تنظیم ۱ تا ۵۰۰)</td></tr>
+              <tr><td>تعداد برچسب‌ها</td><td>حداکثر ۱۰ برچسب</td></tr>
+              <tr><td>طول هر برچسب</td><td>حداکثر ۴۰ کاراکتر</td></tr>
+              <tr><td>نام نمایشی</td><td>حداکثر ۱۲۰ کاراکتر</td></tr>
+              <tr><td>نام فایل</td><td>حداکثر ۱۲۰ کاراکتر</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>کد ذخیره</h3>
+        <p>
+          هر ذخیره یک کد کوتاه و خوانا می‌گیرد: حرف <code>S</code> و چهار کاراکتر
+          (مثل <code>S0001</code>). اگر شماره تکراری شود، یک کد تصادفی در همان
+          قالب انتخاب می‌شود. تولید کد با قفل <code>asyncio</code> انجام می‌شود
+          و یکتا بودنش پیش از بازگشت بررسی می‌شود.
+        </p>
+
+        <h3>بازیابی و حذف</h3>
+        <ul class="plain-list">
+          <li><strong>Retrieve</strong> — مسیر <code dir="ltr">Menu → Save → Retrieve</code>: فهرست ذخیره‌ها، جزئیات یک آیتم و بازیابی با کد.</li>
+          <li>ارسال مجدد یک ذخیره به چت فقط از همین مسیر انجام می‌شود.</li>
+          <li><strong>Delete</strong> — <code dir="ltr">Menu → Delete</code>: حذف با پاسخ، با تعداد، یا با شناسه‌ی دستی.</li>
+        </ul>
+        <p class="evidence">شواهد کد: <code>backend/services/save_service.py</code>، <code>backend/bot/handlers/save.py</code>، <code>backend/bot/handlers/retrieve.py</code>، <code>backend/bot/handlers/delete.py</code></p>
+      </article>
+
+      <article
+        class="shell block guide-article"
+        id="cat-ai"
+        data-category="قابلیت‌های هوش مصنوعی"
+        data-title="هوش مصنوعی و نحوه‌ی استفاده"
+        data-keywords="هوش مصنوعی ای آی ai nova تریگر trigger دستیار ابزار tool provider gemini openai openrouter groq cerebras mistral zai sambanova nvidia cohere siliconflow fireworks nararouter you جست و جوی وب web search ydc_api_key ocr stt tts voice"
+        data-evidence="backend/bot/handlers/ai_unified.py backend/bot/handlers/ai.py backend/ai/config_store.py backend/ai/providers/factory.py backend/ai/tools/websearch.py README.md"
+        tabindex="-1"
+      >
+        <h2>هوش مصنوعی و نحوه‌ی استفاده</h2>
+        <p class="article-lead">
+          دستیار LifeOS فقط چت‌بات نیست: درخواست طبیعی تو را به یک
+          <strong>فراخوانی ابزار واقعی</strong> تبدیل می‌کند و نتیجه‌ی واقعی را
+          گزارش می‌دهد. تصمیم درباره‌ی اینکه کدام قابلیت لازم است، فقط با مدل است
+          — کد محلی پیام تو را برای انتخاب قابلیت نمی‌خواند.
+        </p>
+
+        <h3>فعال‌سازی</h3>
+        <p>
+          کلمه‌ی تریگر پیش‌فرض <code>Nova</code> است (قابل تغییر از پنل AI). سه
+          حالت پشتیبانی می‌شود:
+        </p>
+        <ol class="steps">
+          <li>پیام با تریگر شروع شود: <code dir="ltr">Nova این پیام را ذخیره کن</code> — بخش بعد از تریگر، درخواست تو است.</li>
+          <li>پاسخ به یک پیام همراه با تریگر: محتوای پیام پاسخ‌داده‌شده به‌عنوان زمینه اضافه می‌شود.</li>
+          <li>پاسخ به یک پیام شناخته‌شده‌ی دستیار با متن ساده: گفت‌وگو ادامه پیدا می‌کند.</li>
+        </ol>
+
+        <h3>اجرای واقعی، نه پاسخ تزئینی</h3>
+        <ul class="plain-list">
+          <li>مدل یک <strong>tool call</strong> واقعی تولید می‌کند؛ تعاریف ابزارها در قالب استاندارد به provider داده می‌شود.</li>
+          <li>کد مسیر پیشنهاد را اعتبارسنجی و محدود می‌کند، سپس آن را از طریق رجیستری و اجراکننده‌ی ابزار به لایه‌ی سرویس‌ها می‌رساند.</li>
+          <li>ابزارهای طولانی‌مدت (مثل ذخیره‌ی عمیق) از سقف زمانی عمومی ابزارها مستثنا هستند.</li>
+        </ul>
+
+        <h3>پنل AI</h3>
+        <p><code dir="ltr">Menu → AI</code> و زیرپنل‌های آن:</p>
+        <ul class="plain-list">
+          <li><strong>Provider</strong> و <strong>Model</strong> — انتخاب ارائه‌دهنده و مدل.</li>
+          <li><strong>Setup</strong> — راه‌اندازی گام‌به‌گام.</li>
+          <li><strong>Settings</strong> / <strong>Advanced</strong> — رفتار دستیار و تنظیم تریگر.</li>
+          <li><strong>Usage</strong>، <strong>Health</strong>، <strong>Details</strong>، <strong>Diagnostics</strong> — مصرف، سلامت و عیب‌یابی.</li>
+          <li><strong>Media Analysis</strong> — تبدیل گفتار به متن، تشخیص متن تصویر و تبدیل متن به گفتار.</li>
+        </ul>
+
+        <h3>ارائه‌دهنده‌ها</h3>
+        <p>
+          ماژول‌های provider در پروژه شامل این‌ها هستند:
+          <code>dummy</code>، <code>gemini</code>، <code>openai</code>،
+          <code>openrouter</code>، <code>groq</code>، <code>cerebras</code>،
+          <code>mistral</code>، <code>zai</code>، <code>sambanova</code>،
+          <code>nvidia</code>، <code>cohere</code>، <code>siliconflow</code>،
+          <code>fireworks</code>، <code>nararouter</code> و <code>you</code>.
+        </p>
+        <ul class="plain-list">
+          <li>هر provider کلید خودش را از متغیرهای محیطی می‌خواند (مثل <code>AI_GEMINI_API_KEY</code>).</li>
+          <li><code>you</code> یک <strong>قابلیت جست‌وجوی وب</strong> است، نه موتور استدلال؛ فقط از طریق ابزار جست‌وجوی وب استفاده می‌شود و کلید آن <code>YDC_API_KEY</code> است. اگر این کلید خالی باشد، قابلیت جست‌وجو ثبت نمی‌شود.</li>
+          <li><code>dummy</code> برای زمانی است که هیچ کلیدی تنظیم نشده باشد.</li>
+        </ul>
+        <p class="evidence">شواهد کد: <code>backend/bot/handlers/ai_unified.py</code>، <code>backend/bot/handlers/ai.py</code>، <code>backend/ai/config_store.py</code>، <code>backend/ai/providers/factory.py</code></p>
+      </article>
+
+      <article
+        class="shell block guide-article"
+        id="cat-workflows"
+        data-category="گردش‌کارها و خودکارسازی"
+        data-title="گردش‌کارها و خودکارسازی"
+        data-keywords="گردش کار خودکارسازی بیو bio نام کاربری username about first_name قالب template زمان بند scheduler هر دقیقه وظیفه ماندگار task scheduler تکرار شرط پرسش تایمر تنظیمات todo"
+        data-evidence="backend/profile/engine.py backend/profile/scheduler.py backend/bio/engine.py backend/username/engine.py backend/ai/task_scheduler.py backend/ai/task_execution.py backend/bot/handlers/todo.py"
+        tabindex="-1"
+      >
+        <h2>گردش‌کارها و خودکارسازی</h2>
+        <p class="article-lead">
+          دو خانواده‌ی خودکارسازی وجود دارد: <strong>به‌روزرسانی پروفایل</strong>
+          (بیو و نام) و <strong>وظایف ماندگار</strong> که با درخواست طبیعی به
+          دستیار ساخته می‌شوند.
+        </p>
+
+        <h3>بیو و نام کاربری خودکار</h3>
+        <p>
+          هر دو موتور روی یک موتور مشترک سوارند و از یک زمان‌بند مشترک استفاده
+          می‌کنند که در هر مرز دقیقه کار می‌کند:
+        </p>
+        <ul class="plain-list">
+          <li><strong>Bio</strong> فیلد <code>about</code> را تغییر می‌دهد؛ قالب پیش‌فرض <code dir="ltr">🕒 {time} | 💭 {mood}</code>.</li>
+          <li><strong>Username</strong> فیلد <code>first_name</code> را تغییر می‌دهد؛ قالب پیش‌فرض <code dir="ltr">{time} | {mood}</code>.</li>
+          <li><code>{time}</code> با ساعت و دقیقه و <code>{mood}</code> با حالت انتخابی جایگزین می‌شود.</li>
+          <li>خاموش کردن یکی، دیگری را متوقف نمی‌کند؛ زمان‌بند تنها وقتی می‌ایستد که هیچ موتوری فعال نباشد.</li>
+        </ul>
+        <p>
+          مسیر: <code dir="ltr">Menu → Profile → Bio</code> یا
+          <code dir="ltr">Menu → Profile → Username</code>؛ هر پنل دکمه‌های
+          روشن/خاموش، حالت پاسخ و سازنده‌ی قالب دارد.
+        </p>
+        <p>
+          برای فعال‌سازی خودکار هنگام راه‌اندازی، دو متغیر اختیاری وجود دارد:
+          <code>BIO_UPDATE_ENABLED</code> و <code>USERNAME_UPDATE_ENABLED</code>
+          (پیش‌فرض هر دو <code>false</code>).
+        </p>
+
+        <h3>وظایف ماندگار</h3>
+        <p>
+          می‌توانی به دستیار بگویی کاری را برای آینده یا به‌صورت تکرارشونده انجام
+          دهد. یک زمان‌بند واحد، اجرای هر نوبت را به هماهنگ‌کننده‌ی اجرا می‌سپارد
+          و اجرا همیشه از همان اجراکننده‌ی ابزار عبور می‌کند. ویژگی‌های تأییدشده:
+        </p>
+        <ul class="plain-list">
+          <li>هر نوبت با کلید قطعی یکتا شناخته می‌شود، پس اجرای دوباره ممکن نیست.</li>
+          <li>تلاش‌های ناموفق محدود است (حداکثر ۳ تلاش).</li>
+          <li>برای وظایف تکرارشونده، اقدام بعدی کمی پیش از موعد آماده و اعتبارسنجی می‌شود و در لحظه‌ی موعد دوباره بازبینی و <em>یک بار</em> اجرا می‌شود.</li>
+          <li>اقدام‌های یک وظیفه به‌ترتیب اجرا می‌شوند؛ شکست یک اقدام، زنجیره را متوقف می‌کند.</li>
+          <li>می‌توان یک اقدام را مشروط کرد یا اجرایش را به زمانی در آینده موکول کرد.</li>
+          <li>می‌توان پرسشی از مالک پرسید؛ اجرا تا پاسخ او منتظر می‌ماند و پاسخ فقط از طریق پاسخ‌دادن به همان پیام پرسش پذیرفته می‌شود.</li>
+        </ul>
+        <p>
+          فهرست کارهای زمان‌بندی‌شده از پنل <strong>Todo</strong>
+          (<code dir="ltr">Menu → Todo</code>) در دسترس است.
+        </p>
+
+        <h3>تنظیمات عمومی مرتبط</h3>
+        <ul class="plain-list">
+          <li>پنل <strong>Settings</strong> مواردی مثل بستن خودکار پنل، سقف حجم ذخیره‌ی عمیق، نگهداری لاگ‌ها و زبان را نشان می‌دهد.</li>
+          <li>پنل <strong>General</strong> وضعیت کلی، پینگ، شناسه و سلامت را نشان می‌دهد.</li>
+        </ul>
+        <p class="evidence">شواهد کد: <code>backend/profile/engine.py</code>، <code>backend/profile/scheduler.py</code>، <code>backend/ai/task_execution.py</code>، <code>backend/bot/handlers/todo.py</code></p>
+      </article>
+
+      <article
+        class="shell block guide-article"
+        id="cat-troubleshooting"
+        data-category="رفع اشکال و پرسش‌های متداول"
+        data-title="رفع اشکال و پرسش‌های متداول"
+        data-keywords="رفع اشکال خطا مشکل سوال متداول faq پنل باز نمی شود دکمه کار نمی کند داده گم شده ری استارت supabase حافظه قطعی اتصال فونت اعمال نمی شود حجم زیاد ai پاسخ نمی دهد کد ذخیره"
+        data-evidence="README.md backend/db/client.py backend/helper/font_style.py backend/services/save_service.py backend/bot/handlers/misc.py backend/runtime/supervisor.py backend/web/app.py"
+        tabindex="-1"
+      >
+        <h2>رفع اشکال و پرسش‌های متداول</h2>
+        <p class="article-lead">
+          پاسخ‌های کوتاه و مبتنی بر کد همین پروژه. اگر پاسخ اینجا نبود، بخش‌های
+          پیشین همین راهنما را ببین.
+        </p>
+
+        <div class="faq">
+          <details>
+            <summary>پنلی باز نمی‌شود؛ با فرستادن <code>Menu</code> هیچ اتفاقی نمی‌افتد.</summary>
+            <p>
+              <code>Menu</code> باید <strong>دقیقاً</strong> همین کلمه باشد (بدون
+              نقطه، بدون متن اضافه) و از حساب مالک فرستاده شود. اگر
+              <code>BOT_TOKEN</code> تنظیم نشده باشد، ربات کمکی غیرفعال است؛ در
+              این حالت پنل‌ها به‌صورت متن ویرایش‌در‌جا نشان داده می‌شوند و
+              دکمه‌های شیشه‌ای کار نمی‌کنند — این یک وضعیت معتبر است، نه خرابی.
+            </p>
+          </details>
+
+          <details>
+            <summary>داده‌ها بعد از ری‌استارت گم می‌شوند.</summary>
+            <p>
+              اگر <code>SUPABASE_URL</code> و
+              <code>SUPABASE_SERVICE_ROLE_KEY</code> تنظیم نشده باشند، LifeOS از
+              حافظه‌ی موقت درون‌برنامه‌ای استفاده می‌کند؛ در این حالت ربات کار
+              می‌کند اما داده‌ها پایدار نمی‌مانند. برای پایداری، دیتابیس را
+              تنظیم کن.
+            </p>
+          </details>
+
+          <details>
+            <summary>در لاگ‌ها خطای دیتابیس می‌بینم.</summary>
+            <p>
+              هر فراخوانی دیتابیس در یک <code>try/except</code> پیچیده شده است:
+              در صورت خطا یک هشدار ثبت می‌شود و همان مسیر با حافظه‌ی موقت ادامه
+              می‌یابد. ربات به‌خاطر خطای دیتابیس از کار نمی‌افتد؛ اما اگر خطا
+              تکرار می‌شود، تنظیمات Supabase و اجرای مهاجرت‌ها را بررسی کن.
+            </p>
+          </details>
+
+          <details>
+            <summary>فونت انتخابی روی متن فارسی اثر نمی‌گذارد.</summary>
+            <p>
+              این کار عمدی است. تبدیل‌های فونت نمایشی فقط روی حروف لاتین و ارقام
+              مستقل کار می‌کنند؛ متن فارسی و عربی عیناً حفظ می‌شود. اگر فونت روی
+              متن لاتین هم اثر ندارد، مطمئن شو مقدار پنل فونت یک کلید معتبر
+              رجیستری است؛ مقدار نامعتبر رد می‌شود و مقدار قبلی می‌ماند.
+            </p>
+          </details>
+
+          <details>
+            <summary>ذخیره‌ی یک فایل بزرگ رد می‌شود.</summary>
+            <p>
+              سقف پیش‌فرض ذخیره‌ی عمیق ۵۰ مگابایت است. این مقدار از پنل تنظیمات
+              قابل تغییر است (بین ۱ تا ۵۰۰). پیام خطا مقدار واقعی فایل و سقف فعلی
+              را نشان می‌دهد.
+            </p>
+          </details>
+
+          <details>
+            <summary>فایل محافظت‌شده را نمی‌توان ذخیره کرد؟</summary>
+            <p>
+              مسیر ذخیره‌سازی «دانلود و آپلود مجدد» است و هیچ فورواردی انجام
+              نمی‌شود؛ بنابراین محدودیت فوروارد مانع آن نیست. اگر دانلود از سمت
+              تلگرام رد شود، خطا صادقانه گزارش می‌شود و هیچ پیام نصفه‌ونیمه‌ای ثبت
+              نمی‌شود.
+            </p>
+          </details>
+
+          <details>
+            <summary>دستیار پاسخ نمی‌دهد.</summary>
+            <p>
+              حداقل یک کلید provider را تنظیم کن و پیام را با تریگر شروع کن
+              (پیش‌فرض <code>Nova</code>). بدون هیچ کلیدی، provider آزمایشی
+              <code>dummy</code> فقط یک پاسخ نمونه می‌دهد. وضعیت و عیب‌یابی را در
+              پنل <code dir="ltr">Menu → AI → Health / Diagnostics</code> ببین.
+            </p>
+          </details>
+
+          <details>
+            <summary>اتصال مرتب قطع می‌شود؛ باید چه کار کنم؟</summary>
+            <p>
+              نیازی به دخالت نیست: یک ناظر اجرایی واحد، قطعی‌ها را تشخیص می‌دهد و
+              اتصال را بازسازی می‌کند (ضربان، نگه‌داشت زنده و محافظ نهایی).
+              تعداد ری‌استارت‌ها و آخرین دلیل بازسازی در پنل Health Dashboard
+              دیده می‌شود. سلامت سرویس وب هم از <code>/health</code> قابل بررسی
+              است.
+            </p>
+          </details>
+        </div>
+        <p class="evidence">شواهد کد: <code>backend/db/client.py</code>، <code>backend/helper/font_style.py</code>، <code>backend/services/save_service.py</code>، <code>backend/runtime/supervisor.py</code>، <code>backend/web/app.py</code></p>
+      </article>
+    </main>
+
+    <footer class="site-footer">
+      <div class="shell footer-inner">
+        <div>
+          <p class="footer-brand">LifeOS — راهنمای فارسی کاربر</p>
+          <p class="footer-note">
+            این سایت ایستا و مستقل از ران‌تایم سلف‌بات است: بدون سشن، بدون توکن و
+            بدون دیتابیس رندر می‌شود.
+          </p>
+        </div>
+        <nav aria-label="پیوندهای راهنما">
+          <ul class="footer-links">
+            <li><a href="#categories">دسته‌بندی‌ها</a></li>
+            <li><a href="#cat-troubleshooting">رفع اشکال</a></li>
+            <li><a href="#top">بازگشت به بالا</a></li>
+          </ul>
+        </nav>
+      </div>
+    </footer>
+
+    <noscript>
+      <p class="shell noscript-note">
+        جست‌وجو به جاوااسکریپت نیاز دارد؛ اما همه‌ی مقاله‌ها بدون آن هم کامل
+        خوانده می‌شوند.
+      </p>
+    </noscript>
+
+    <script type="module" src="guide.js"></script>
+  </body>
+</html>

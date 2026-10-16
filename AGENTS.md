@@ -112,8 +112,14 @@ backend/
 ├── health.py                        # runtime health timestamps/telemetry
 ├── diagnostics.py                   # runtime diagnostics helpers
 ├── observability/                   # stats, health snapshot, crash report, maintenance
-└── web/app.py                       # FastAPI: /health, /api/*, static SPA
+└── web/app.py                       # FastAPI: /health, /api/*, static SPA, /guide
 ```
+
+`guide/` (repository root) is the **public guide website** — a standalone
+static site (`index.html`, `styles.css`, `search.js`, `guide.js`) that renders
+with no build step, no credential and no backend call. It is documentation
+only and is deliberately outside the runtime: nothing in `backend/` depends on
+it beyond the read-only `/guide` static mount in `backend/web/app.py`.
 
 ---
 
@@ -486,6 +492,7 @@ React app; the dashboard reads through the backend API).
 | GET | `/api/saves/{save_code}` | Single item or 404 |
 | GET | `/api/bio` | Bio state (plus username state where present) |
 | GET | `/api/logs` | Recent logs |
+| GET | `/guide/*` | LifeOS guide website (static, no build step; mounted before the SPA fallback) |
 | GET | `/` | React SPA (if `dist/` exists) or API status |
 | GET | `/{path}` / `/assets/*` | SPA fallback + static assets |
 

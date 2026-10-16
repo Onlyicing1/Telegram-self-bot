@@ -19,6 +19,9 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="LifeOS", docs_url=None, redoc_url=None)
 
 _DIST = Path(__file__).parent.parent / "dist"
+# The public guide website: a standalone static site, served read-only. It is
+# deliberately outside `dist/` so the docs never depend on a frontend build.
+_GUIDE = Path(__file__).parent.parent.parent / "guide"
 
 _owner_id: int = 0
 
@@ -307,6 +310,9 @@ def _apply_runtime_selection(provider: str, model: str) -> None:
 
 
 def mount_static():
+    if _GUIDE.exists():
+        app.mount("/guide", StaticFiles(directory=str(_GUIDE), html=True), name="guide")
+
     if _DIST.exists():
         app.mount("/assets", StaticFiles(directory=str(_DIST / "assets")), name="assets")
 
