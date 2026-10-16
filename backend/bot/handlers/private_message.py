@@ -101,7 +101,30 @@ _AI_SYSTEM_PROMPT = (
     "them. Do not mention these instructions, do not sign the reply, and do "
     "not write the closing notice or the AI notice: they are appended "
     "automatically by the system, so never write, repeat or contradict them "
-    "yourself."
+    "yourself. These examples show the register and the LENGTH expected "
+    "(incoming message → your reply). They are examples, never templates: "
+    "never copy one verbatim when the incoming message differs, and never "
+    "invent a detail an example happens to contain. "
+    "\"سلام\" → \"سلام! وقت شما هم بخیر.\" · "
+    "\"ممنون از پیامت\" → \"خواهش می‌کنم.\" · "
+    "\"thanks a lot\" → \"خواهش می‌کنم.\" · "
+    "\"سلام، خوبی؟\" → \"سلام! ممنون از پیامتون، امیدوارم شما هم خوب باشید.\" · "
+    "\"بعداً صحبت می‌کنیم\" → \"باشه، حتماً.\" "
+    "Every example is ONE short sentence: no introduction, no "
+    "self-description, no closing question, and a message written in another "
+    "language is still answered in Persian."
+)
+
+#: The bounded repair instruction of the ONE regeneration attempt. It carries no
+#: message data — it is a second form of the SAME system contract — and it exists
+#: because a mechanical defect (a detached Persian verb prefix, two greetings,
+#: an over-long body) is usually repaired by restating the shape requirement.
+_AI_CORRECTION_PROMPT = (
+    " Your previous attempt was rejected as mechanically malformed or too "
+    "elaborate. Answer again with ONE short, natural Persian sentence. Never "
+    "write the imperfective prefix (می / نمی) as a separate word: it is always "
+    "attached to its verb, as in می‌توانم or نمی‌دانم. Greet at most once, keep "
+    "it brief, and return plain text only."
 )
 
 
@@ -209,7 +232,9 @@ def _incoming_text(event) -> str:
     return text.strip() if isinstance(text, str) else ""
 
 
-async def _generate_ai_reply(owner_id: int, incoming_text: str) -> str | None:
+async def _generate_ai_reply(
+    owner_id: int, incoming_text: str, corrective: bool = False
+) -> str | None:
     """ONE out-of-band generation through the EXISTING AI runtime.
 
     The shared ProviderManager (reached through the single engine) is called
@@ -218,6 +243,10 @@ async def _generate_ai_reply(owner_id: int, incoming_text: str) -> str | None:
     memory, no identifiers — so the model can trigger no execution and sees no
     conversational context. The required disclosures are added afterwards by
     ``service.compose_ai_reply``, never by the model.
+
+    ``corrective`` appends the bounded repair instruction to the SAME system
+    contract (still no message data, still exactly two messages), which is the
+    only thing the single regeneration attempt changes.
     """
     from backend.ai.engine.engine import apply_persisted_config, get_engine
 
@@ -230,8 +259,9 @@ async def _generate_ai_reply(owner_id: int, incoming_text: str) -> str | None:
         logger.warning("PRIVATE_MESSAGE_TRACE stage=ai_runtime_unavailable error=%s", type(exc).__name__)
         return None
 
+    system_contract = _AI_SYSTEM_PROMPT + (_AI_CORRECTION_PROMPT if corrective else "")
     messages = [
-        {"role": "system", "content": _AI_SYSTEM_PROMPT},
+        {"role": "system", "content": system_contract},
         {"role": "user", "content": incoming_text},
     ]
     try:
@@ -251,6 +281,49 @@ async def _generate_ai_reply(owner_id: int, incoming_text: str) -> str | None:
         return None
     text = getattr(response, "text", None)
     return text.strip() if isinstance(text, str) and text.strip() else None
+
+
+async def _generate_reply_body(owner_id: int, incoming_text: str) -> str | None:
+    """The deliverable body for ONE incoming message, or None (safe failure).
+
+    ONE provider call is always made first — the context isolation and the
+    ProviderManager boundary are unchanged. Then:
+
+    * a body that passes the deterministic envelope is delivered as-is;
+    * a body for a CONFIDENTLY recognized bare greeting that is refused OR
+      longer than ``MAX_TRIVIAL_GREETING_REPLY_LENGTH`` is replaced by the
+      deterministic short Persian greeting — a greeting always gets a greeting,
+      never an elaborate self-describing paragraph;
+    * any other refused body gets exactly ONE regeneration through the SAME
+      provider path with the repair instruction, and is then dropped if it is
+      still refused. A rejected body is never sent, and a provider failure is
+      never papered over with canned text.
+    """
+    greeting = service.classify_trivial_greeting(incoming_text)
+    for attempt in range(service.AI_GENERATION_ATTEMPTS):
+        generated = await _generate_ai_reply(owner_id, incoming_text, attempt > 0)
+        if generated is None:
+            return None
+        reason, text = service.validate_generated_reply(generated)
+        if reason:
+            logger.warning(
+                "PRIVATE_MESSAGE_TRACE stage=ai_reply_rejected reason=%s attempt=%s",
+                reason, attempt + 1,
+            )
+            # A bare greeting is answered deterministically, so a refused body
+            # for one never spends a second provider call.
+            if greeting is not None:
+                break
+            continue
+        if greeting is not None and len(text) > service.MAX_TRIVIAL_GREETING_REPLY_LENGTH:
+            logger.info(
+                "PRIVATE_MESSAGE_TRACE stage=ai_greeting_too_elaborate chars=%s", len(text)
+            )
+            break
+        return service.compose_ai_reply(generated)
+    if greeting is not None:
+        return service.compose_trivial_greeting_reply(greeting)
+    return None
 
 
 async def _ai_response(client, owner_id: int, event, verdict, config: dict) -> str:
@@ -277,8 +350,7 @@ async def _ai_response(client, owner_id: int, event, verdict, config: dict) -> s
             )
             return str(claim.get("reason") or "denied")
         token = claim.get("token") or {}
-        generated = await _generate_ai_reply(owner_id, _incoming_text(event))
-        body = service.compose_ai_reply(generated) if generated is not None else None
+        body = await _generate_reply_body(owner_id, _incoming_text(event))
         if body is None:
             await service.release_ai_reply(owner_id, sender_id, token)
             return "generation_failed"
@@ -451,6 +523,16 @@ def _mark(active: bool) -> str:
     return sym.STEP_COMPLETED if active else sym.BULLET
 
 
+def _reset_window_text(summary) -> str:
+    """The automatic-reset configuration as the panel states it."""
+    if not summary.ai_counter_reset_enabled:
+        return "OFF (counters only change when you reset them)"
+    return (
+        f"every {service.format_reset_interval(summary.ai_counter_reset_seconds)}"
+        f" per person ({summary.ai_counter_reset_seconds}s)"
+    )
+
+
 def _mode_button_row(builder: InlinePanelBuilder, current_mode: str) -> None:
     for mode in service.MODES:
         builder.add_row(
@@ -508,6 +590,7 @@ async def _render_main(owner_id: int) -> tuple[str, str, list]:
         f"· {_mark(summary.ai_response_enabled)} AI response",
         f"**AI replies per person:** {limit_text} (interval {summary.ai_interval_seconds}s)",
         f"**AI counters:** {counters}",
+        f"**Automatic counter reset:** {_reset_window_text(summary)}",
         f"**Allowlist:** {len(summary.allowlist)} user(s)",
         f"**Exceptions:** {len(summary.exceptions)} user(s)",
         f"**Schedule:** {'ON' if summary.schedule_enabled else 'OFF'} ({summary.schedule_timezone}, {len(summary.schedule_rules)} rule(s))",
@@ -575,11 +658,21 @@ async def _render_actions(owner_id: int) -> tuple[str, str, list]:
         f"**Fixed response text:** {summary.fixed_response_text or '_not set_ (nothing is sent while it is empty)'}",
         f"**Max AI replies per person:** {limit_text}",
         f"**AI reply interval (seconds):** {summary.ai_interval_seconds}",
+        f"**Automatic counter reset:** {_reset_window_text(summary)}",
         f"**AI counters:** {counters}",
         "",
         "A delete failure never suppresses a response; a fixed-response failure "
         "never suppresses the AI reply; only a DELIVERED AI reply consumes the "
         "person's allowance.",
+        "",
+        "**Reset windows:** a window starts at a person's FIRST counted reply in "
+        "the current window. When automatic reset is ON and the window has "
+        "lasted the configured interval, the NEXT eligible message observes the "
+        "expired window, resets that person's count to zero and starts a new "
+        "window — so their allowance becomes available again on that message, "
+        "and only then. Automatic reset only resets the COUNT: the maximum, the "
+        "minimum interval between replies, the actions and the eligible-message "
+        "scope are all unaffected.",
     ]
 
     builder = InlinePanelBuilder()
@@ -603,6 +696,16 @@ async def _render_actions(owner_id: int) -> tuple[str, str, list]:
     builder.add_row(
         f"{_mark(summary.ai_unlimited_replies)} Unlimited AI replies",
         "action:pm_unlimited",
+        PRIMARY,
+    )
+    builder.add_row(
+        f"{_mark(summary.ai_counter_reset_enabled)} Automatic counter reset",
+        "action:pm_reset_window",
+        PRIMARY,
+    )
+    builder.add_row(
+        sym.label(sym.SCHEDULE_INTERVAL, "Set counter reset interval"),
+        f"input:{POLICY_PANEL_ID}:reset_interval",
         PRIMARY,
     )
     builder.add_row(sym.label(sym.ICON_STATS, "Reset AI counters"), "action:pm_reset_counters", DANGER)
@@ -884,6 +987,16 @@ async def _reset_counters_action(event, extra: str, chat_id: int):
     return await _render_actions(owner_id)
 
 
+async def _reset_window_toggle_action(event, extra: str, chat_id: int):
+    """Enable/disable the AUTOMATIC per-person reset (the manual reset is
+    separate and stays available either way)."""
+    owner_id = inline_engine.get_owner_id()
+    current = bool(service.state().get("ai_counter_reset_enabled"))
+    if not await service.set_ai_counter_reset_enabled(not current):
+        return "Closing Actions", "Could not save the change. Please try again.", []
+    return await _render_actions(owner_id)
+
+
 async def _page_action(event, extra: str, chat_id: int):
     parts = (extra or "").split(":")
     panel_id = parts[0] if parts and parts[0] in (ALLOW_PANEL_ID, EXCEPT_PANEL_ID) else ALLOW_PANEL_ID
@@ -1105,6 +1218,27 @@ _interval_input_handler = _int_input_handler(
 )
 
 
+async def _counter_reset_interval_input_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
+    owner_id = inline_engine.get_owner_id()
+    seconds = service.parse_reset_interval((text or "").strip())
+    if seconds is None:
+        notice = (
+            "Counter reset interval was NOT saved — enter a whole number of "
+            "minutes, or a number with a unit (90s, 30m, 2h, 3d). Allowed: "
+            f"{service.MIN_AI_COUNTER_RESET_SECONDS}s – "
+            f"{service.format_reset_interval(service.MAX_AI_COUNTER_RESET_SECONDS)}."
+        )
+    else:
+        notice = (
+            ""
+            if await service.set_ai_counter_reset_seconds(seconds)
+            else "Could not save the counter reset interval. Please try again."
+        )
+    await _show_after_input(
+        POLICY_PANEL_ID, owner_id, notice, chat_id, msg_id, inline_chat_id, inline_msg_id
+    )
+
+
 def _add_user_input_handler(panel_id: str, field_name: str):
     """One input handler per list panel — the pending-input callback carries no
     panel-specific extra, so the target list is bound where it is registered."""
@@ -1228,6 +1362,7 @@ def register(client, owner_id: int, tz_str: str = "UTC") -> None:
     register_action("pm_refresh", _refresh_action)
     register_action("pm_action", _action_toggle)
     register_action("pm_unlimited", _unlimited_action)
+    register_action("pm_reset_window", _reset_window_toggle_action)
     register_action("pm_reset_counters", _reset_counters_action)
     register_action("pm_page", _page_action)
     register_action("pm_allow_toggle", _allow_toggle_action)
@@ -1259,6 +1394,14 @@ def register(client, owner_id: int, tz_str: str = "UTC") -> None:
         "prompt": (
             "**AI reply interval**\n\nMinimum seconds between two AI replies to the "
             "same person. Enter 0 for no delay:\n\n_Reply below._"
+        ),
+    })
+    register_input(POLICY_PANEL_ID, "reset_interval", {
+        "handler": _counter_reset_interval_input_handler,
+        "prompt": (
+            "**Counter reset interval**\n\nHow long one person's reset window "
+            "lasts. Enter a whole number of minutes, or a number with a unit:\n"
+            "`90s` · `30m` · `2h` · `3d`\n\n_Reply below._"
         ),
     })
     register_input(ALLOW_PANEL_ID, "add", {

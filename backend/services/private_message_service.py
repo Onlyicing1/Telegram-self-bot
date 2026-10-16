@@ -42,15 +42,29 @@ Boundaries kept on purpose
   the model can neither remove nor override them.
 * **Deterministic reply envelope.** The model's own body is validated before it
   can be delivered (:func:`validate_generated_reply`): empty, over-long,
-  letter-less, non-Persian-script, Latin-dominant and clearly Arabic bodies are
-  refused, and an echoed notice line is de-duplicated so each disclosure lands
-  exactly once. The verdict is computed from the GENERATED text alone — never
-  from the incoming message — and a refused body is dropped, never repaired.
+  letter-less, non-Persian-script, Latin-dominant, clearly Arabic and
+  mechanically malformed bodies (a detached Persian verb prefix written as its
+  own word, a repeated greeting) are refused, and an echoed notice line is
+  de-duplicated so
+  each disclosure lands exactly once. The verdict is computed from the GENERATED
+  text alone — never from the incoming message — and a refused body is dropped,
+  never repaired. These checks enforce the message SHAPE; they are not a Persian
+  grammar detector, and a body that passes them is "not provably malformed",
+  never "proven fluent" (:func:`classify_trivial_greeting` below is the one place
+  a reply is deterministic).
+* **Deterministic greeting answer.** A message that is CONFIDENTLY nothing but a
+  bare greeting is answered by one short idiomatic Persian greeting
+  (:func:`classify_trivial_greeting` / :func:`compose_trivial_greeting_reply`)
+  whenever the model's own body for it is missing, refused or longer than
+  :data:`MAX_TRIVIAL_GREETING_REPLY_LENGTH`. It is one narrow class of messages —
+  never a canned reply replacing general AI answers.
 * **Durable allowance.** The per-person AI reply limit and interval are
   enforced by ONE conditional (CAS) write per reply into
   ``private_message_senders`` (with the documented in-memory fallback when
-  Supabase is absent, which keeps enforcing the SAME quota). Counters are never
-  reset implicitly — a restart cannot hand anyone a fresh allowance.
+  Supabase is absent, which keeps enforcing the SAME quota). Every claim also
+  carries the person's reset window, so an expired window is rolled ATOMICALLY
+  with the claim. Counters are never reset implicitly otherwise: a restart
+  cannot hand anyone a fresh allowance.
 
 Precedence (deterministic, and shown in the panel)
 --------------------------------------------------
@@ -150,11 +164,25 @@ _STATE_VERSION = 2
 MAX_AI_REPLIES_PER_PERSON = 10000
 MAX_AI_INTERVAL_SECONDS = 86400
 
+#: Automatic per-person counter reset bounds. When automatic reset is enabled,
+#: every person's used count lives in a ROLLING WINDOW anchored to their first
+#: counted reply in the current window; the window is only ever rolled in the
+#: incoming-message quota path (no scheduler, no ticker). The panel validates
+#: against these bounds and the table's CHECK constraint mirrors them.
+MIN_AI_COUNTER_RESET_SECONDS = 60
+MAX_AI_COUNTER_RESET_SECONDS = 365 * 24 * 60 * 60
+DEFAULT_AI_COUNTER_RESET_SECONDS = 24 * 60 * 60
+
 #: Bounded generation envelope for ONE AI reply, and Telegram's practical text
 #: ceiling: the disclosures are appended by the application, so a reply that
 #: would not fit is REFUSED instead of being truncated.
 AI_REPLY_TIMEOUT_S = 60.0
 MAX_DELIVERED_TEXT_LENGTH = 4000
+
+#: Exactly ONE bounded regeneration when the model's first body is refused,
+#: through the SAME provider path and the SAME context isolation. The failing
+#: instruction is added to the system contract of the retry only.
+AI_GENERATION_ATTEMPTS = 2
 
 #: The legacy Phase-1 ``bot_settings`` row. It is READ ONLY, once, to import an
 #: existing configuration into the dedicated tables; the feature never writes it
@@ -272,6 +300,8 @@ def _default_state() -> dict[str, Any]:
         "ai_max_replies_per_person": 10,
         "ai_unlimited_replies": False,
         "ai_interval_seconds": 0,
+        "ai_counter_reset_enabled": False,
+        "ai_counter_reset_seconds": DEFAULT_AI_COUNTER_RESET_SECONDS,
         "allowlist": [],
         "exceptions": [],
         "temporary": None,
@@ -313,6 +343,54 @@ def parse_hhmm(value: Any) -> clock_time | None:
 
 def format_hhmm(value: clock_time) -> str:
     return f"{value.hour:02d}:{value.minute:02d}"
+
+
+#: The units the counter-reset interval accepts. A bare number is MINUTES, so
+#: `30` and `30m` mean the same thing while `90s`, `2h` and `3d` are explicit.
+_RESET_INTERVAL_UNITS: dict[str, int] = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+
+
+def parse_reset_interval(value: Any) -> int | None:
+    """Seconds from an owner-typed counter-reset interval, or None when unusable.
+
+    Accepts a whole number of minutes (`30`) or a number with an explicit unit
+    (`90s`, `30m`, `2h`, `3d`), case-insensitively. Anything else — negative or
+    signed numbers, fractions, unknown units, empty text, an overflowing value
+    or a value outside ``MIN_AI_COUNTER_RESET_SECONDS``..
+    ``MAX_AI_COUNTER_RESET_SECONDS`` — is refused (None), never clamped.
+    """
+    number: str
+    factor: int
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        number, factor = str(value), 60
+    else:
+        text = str(value).strip().lower()
+        if not text:
+            return None
+        unit = text[-1]
+        if unit in _RESET_INTERVAL_UNITS:
+            number, factor = text[:-1].strip(), _RESET_INTERVAL_UNITS[unit]
+        else:
+            number, factor = text, 60
+    if not number.isdigit():
+        return None
+    seconds = int(number) * factor
+    if not (MIN_AI_COUNTER_RESET_SECONDS <= seconds <= MAX_AI_COUNTER_RESET_SECONDS):
+        return None
+    return seconds
+
+
+def format_reset_interval(seconds: Any) -> str:
+    """The configured interval in the largest whole unit that fits exactly."""
+    if isinstance(seconds, bool) or not isinstance(seconds, int) or seconds <= 0:
+        return "—"
+    for unit, size in (("day", 86400), ("hour", 3600), ("minute", 60)):
+        if seconds % size == 0:
+            count = seconds // size
+            return f"{count} {unit}" if count == 1 else f"{count} {unit}s"
+    return f"{seconds} seconds"
 
 
 def _sanitize_list(value: Any) -> list[int]:
@@ -430,6 +508,15 @@ def sanitize_state(raw: Any) -> dict[str, Any]:
     interval = raw.get("ai_interval_seconds")
     if isinstance(interval, int) and not isinstance(interval, bool) and 0 <= interval <= MAX_AI_INTERVAL_SECONDS:
         state["ai_interval_seconds"] = interval
+    if isinstance(raw.get("ai_counter_reset_enabled"), bool):
+        state["ai_counter_reset_enabled"] = raw["ai_counter_reset_enabled"]
+    reset_seconds = raw.get("ai_counter_reset_seconds")
+    if (
+        isinstance(reset_seconds, int)
+        and not isinstance(reset_seconds, bool)
+        and MIN_AI_COUNTER_RESET_SECONDS <= reset_seconds <= MAX_AI_COUNTER_RESET_SECONDS
+    ):
+        state["ai_counter_reset_seconds"] = reset_seconds
     state["allowlist"] = _sanitize_list(raw.get("allowlist"))
     state["exceptions"] = _sanitize_list(raw.get("exceptions"))
     state["temporary"] = _sanitize_temporary(raw.get("temporary"))
@@ -1075,6 +1162,8 @@ async def claim_ai_reply(owner: int, sender_id: int, config: dict[str, Any]) -> 
         max_replies=int(config.get("ai_max_replies_per_person") or 0),
         unlimited=bool(config.get("ai_unlimited_replies")),
         interval_seconds=int(config.get("ai_interval_seconds") or 0),
+        reset_enabled=bool(config.get("ai_counter_reset_enabled")),
+        reset_seconds=int(config.get("ai_counter_reset_seconds") or 0),
         now_iso=now_iso,
     )
 
@@ -1210,6 +1299,175 @@ def is_clearly_arabic(text: str) -> bool:
     return arabic_forms * 2 >= len(arabic)
 
 
+# ── Persian reply quality (deterministic half of the contract) ──
+#
+# Two DIFFERENT things are kept apart on purpose:
+#
+# * what deterministic code can ENFORCE — the message shape (not empty, within
+#   the length envelope, Persian script, not Latin-dominant, not Arabic, no
+#   detached verb prefix, no repeated greeting) and the deterministic reply for
+#   a confidently recognized bare greeting below;
+# * what only the provider can produce — actual grammatical and semantic
+#   quality of an arbitrary sentence. No keyword list is claimed to be a Persian
+#   grammar detector; a body that passes the checks below is "not provably
+#   malformed", never "proven fluent".
+
+#: A recognized bare greeting is answered by ONE short idiomatic Persian
+#: greeting — a longer body is not what the incoming message asked for. This is
+#: the envelope a greeting reply must fit to be delivered as-is.
+MAX_TRIVIAL_GREETING_REPLY_LENGTH = 80
+
+#: The longest inbound text still considered a bare greeting (after folding).
+_TRIVIAL_GREETING_MAX_LENGTH = 64
+_TRIVIAL_GREETING_MAX_TOKENS = 4
+
+_GREETING_GENERIC = "generic"
+_GREETING_MORNING = "morning"
+_GREETING_NOON = "noon"
+_GREETING_EVENING = "evening"
+_GREETING_NIGHT = "night"
+
+#: The inbound texts that are CONFIDENTLY nothing but a greeting, keyed by their
+#: folded form. Exact membership only: "سلام خوبی؟" is a greeting PLUS a
+#: question, so it stays a general AI request. English greetings are included
+#: because the answer is still Persian — the incoming language is never mirrored.
+_TRIVIAL_GREETINGS: dict[str, str] = {
+    "سلام": _GREETING_GENERIC,
+    "سلام علیکم": _GREETING_GENERIC,
+    "علیکم السلام": _GREETING_GENERIC,
+    "السلام علیکم": _GREETING_GENERIC,
+    "درود": _GREETING_GENERIC,
+    "وقت بخیر": _GREETING_GENERIC,
+    "روز بخیر": _GREETING_GENERIC,
+    "سلام وقت بخیر": _GREETING_GENERIC,
+    "صبح بخیر": _GREETING_MORNING,
+    "سلام صبح بخیر": _GREETING_MORNING,
+    "ظهر بخیر": _GREETING_NOON,
+    "عصر بخیر": _GREETING_EVENING,
+    "شب بخیر": _GREETING_NIGHT,
+    "سلام شب بخیر": _GREETING_NIGHT,
+    "hi": _GREETING_GENERIC,
+    "hey": _GREETING_GENERIC,
+    "hello": _GREETING_GENERIC,
+    "hi there": _GREETING_GENERIC,
+}
+
+#: The deterministic body for each recognized greeting kind. Short, everyday
+#: Iranian Persian; nothing is claimed about the owner (no identity, name, job,
+#: religion, ability or biography) and no question is asked.
+_TRIVIAL_GREETING_BODIES: dict[str, str] = {
+    _GREETING_GENERIC: "سلام! وقت شما هم بخیر.",
+    _GREETING_MORNING: "سلام! صبح شما هم بخیر.",
+    _GREETING_NOON: "سلام! ظهر شما هم بخیر.",
+    _GREETING_EVENING: "سلام! عصر شما هم بخیر.",
+    _GREETING_NIGHT: "سلام! شب شما هم بخیر.",
+}
+
+#: Arabic yeh/kaf and the alef variants folded onto their Persian forms, so an
+#: Arabic keyboard still matches the greetings above. Matching only — nothing is
+#: rewritten in a reply.
+_GREETING_FOLDS = {
+    "\u064A": "\u06CC", "\u0649": "\u06CC", "\u0643": "\u06A9",
+    "\u0622": "\u0627", "\u0623": "\u0627", "\u0625": "\u0627", "\u0671": "\u0627",
+}
+
+#: Zero-width joiners and directional/invisible marks are removed before
+#: matching, and the run of punctuation a greeting is dressed in is stripped from
+#: both ends — but a ZWNJ INSIDE a word is preserved everywhere else.
+_GREETING_STRIP = "\u200c\u200d\u200e\u200f\u202a\u202b\u202c\u202d\u202e\ufeff"
+_TRIVIAL_GREETING_PUNCTUATION = "\u060c\u061b\u061f!?.,:;\"'()[]{}<>\u00ab\u00bb\u2026-\u2014\u0640"
+
+#: The Persian imperfective prefix (می / نمی) is ALWAYS written attached to its
+#: verb (میتوانم) or joined with a ZWNJ (میتوانم) — never as its own word. A
+#: whitespace-delimited token that is EXACTLY the bare prefix is therefore
+#: mechanical, non-Persian word separation, which is the defect in the reported
+#: reply ("چگونه می توانم به شما کمک کنم؟").
+_DETACHED_VERB_PREFIXES = frozenset({"می", "نمی"})
+
+#: Greeting words, used ONLY to refuse a reply that greets more than once. A
+#: bounded list for one narrow defect class, not a grammar check.
+_GREETING_WORDS = frozenset({"سلام", "درود", "مرحبا"})
+
+
+def _reply_tokens(text: str) -> list[str]:
+    """Whitespace-delimited words with surrounding punctuation stripped.
+
+    A ZWNJ is NOT a separator: "میکنم" must stay ONE token, otherwise the
+    detached-prefix check below would fire on perfectly correct Persian.
+    """
+    tokens: list[str] = []
+    for raw in text.split():
+        token = raw.strip(_TRIVIAL_GREETING_PUNCTUATION).strip(_GREETING_STRIP)
+        if token:
+            tokens.append(token)
+    return tokens
+
+
+def detached_verb_prefixes(text: str) -> tuple[str, ...]:
+    """The bare Persian verb prefixes written as their own word (usually none)."""
+    if not isinstance(text, str) or not text:
+        return ()
+    return tuple(token for token in _reply_tokens(text) if token in _DETACHED_VERB_PREFIXES)
+
+
+def repeated_greeting_words(text: str) -> tuple[str, ...]:
+    """Greeting words the body uses more than once (usually none)."""
+    if not isinstance(text, str) or not text:
+        return ()
+    counts: dict[str, int] = {}
+    for token in _reply_tokens(text):
+        if token in _GREETING_WORDS:
+            counts[token] = counts.get(token, 0) + 1
+    return tuple(sorted(word for word, count in counts.items() if count > 1))
+
+
+def _fold_greeting(text: str) -> str:
+    folded = "".join(_GREETING_FOLDS.get(ch, ch) for ch in text)
+    return " ".join(folded.split())
+
+
+def normalize_trivial_greeting(value: Any) -> str:
+    """The comparable form of a candidate bare greeting (or "" for a non-string)."""
+    if not isinstance(value, str):
+        return ""
+    cleaned = "".join(ch for ch in value if ch not in _GREETING_STRIP)
+    cleaned = cleaned.strip().strip(_TRIVIAL_GREETING_PUNCTUATION)
+    return _fold_greeting(cleaned.strip().lower())
+
+
+def classify_trivial_greeting(value: Any) -> str | None:
+    """The greeting KIND when the whole message is confidently a bare greeting.
+
+    Deliberately narrow: the ENTIRE message (after folding, lower-casing and
+    trimming punctuation) must be one of the known greetings, within the length
+    and word bounds. Anything else — a greeting that carries a question, a
+    request or any extra content — is None and stays an ordinary AI request.
+    """
+    normalized = normalize_trivial_greeting(value)
+    if not normalized or len(normalized) > _TRIVIAL_GREETING_MAX_LENGTH:
+        return None
+    if len(normalized.split()) > _TRIVIAL_GREETING_MAX_TOKENS:
+        return None
+    return _TRIVIAL_GREETINGS.get(normalized)
+
+
+def trivial_greeting_body(kind: str) -> str:
+    """The deterministic Persian greeting body for a recognized greeting kind."""
+    return _TRIVIAL_GREETING_BODIES.get(kind, _TRIVIAL_GREETING_BODIES[_GREETING_GENERIC])
+
+
+def compose_trivial_greeting_reply(kind: str) -> str | None:
+    """The deterministic greeting body with BOTH disclosures appended once.
+
+    Application-owned text, so a greeting can never be answered with the
+    disclosures missing, duplicated or rewritten.
+    """
+    body = f"{trivial_greeting_body(kind)}\n\n{CLOSED_NOTICE}\n{AI_NOTICE}"
+    if len(body) > MAX_DELIVERED_TEXT_LENGTH:
+        return None
+    return body
+
+
 def _strip_owned_notices(text: str) -> tuple[str, bool]:
     """Remove the application-owned notice LINES from a model body.
 
@@ -1235,9 +1493,12 @@ def validate_generated_reply(generated: Any) -> tuple[str, str]:
     The checks, in order: a non-empty plain string, the application-owned notice
     lines removed, a length inside the short-reply envelope, actual letters
     present, Persian/Arabic script present (an English answer is refused), not
-    Latin-dominant, and not clearly Arabic. The incoming text is NEVER consulted
-    — the required output language is always Persian, whatever arrived — and a
-    refused body is dropped, never repaired into a fabricated reply.
+    Latin-dominant, not clearly Arabic, and not mechanically malformed (a
+    detached Persian verb prefix, a repeated greeting). The incoming text is
+    NEVER consulted — the required output language is always Persian, whatever
+    arrived — and a refused body is dropped, never repaired into a fabricated
+    reply. "Not provably malformed" is the strongest claim these checks make:
+    they cannot certify that an arbitrary generated sentence is fluent.
     """
     if not isinstance(generated, str) or not generated.strip():
         return "empty", ""
@@ -1260,6 +1521,10 @@ def validate_generated_reply(generated: Any) -> tuple[str, str]:
         return "not_persian_script", ""
     if is_clearly_arabic(text):
         return "arabic", ""
+    if detached_verb_prefixes(text):
+        return "malformed_persian_prefix", ""
+    if repeated_greeting_words(text):
+        return "repetitive_greeting", ""
     return "", text
 
 
@@ -1349,6 +1614,29 @@ async def set_ai_interval_seconds(value: Any) -> bool:
         return False
     return await _mutate(
         lambda candidate: candidate.__setitem__("ai_interval_seconds", value)
+    )
+
+
+async def set_ai_counter_reset_enabled(value: bool) -> bool:
+    if not isinstance(value, bool):
+        return False
+    return await _mutate(
+        lambda candidate: candidate.__setitem__("ai_counter_reset_enabled", value)
+    )
+
+
+async def set_ai_counter_reset_seconds(value: Any) -> bool:
+    """The automatic per-person reset interval, in seconds.
+
+    Refuses anything outside the documented bounds instead of clamping it, so
+    the stored value is always one the panel and the table agree on.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return False
+    if not (MIN_AI_COUNTER_RESET_SECONDS <= value <= MAX_AI_COUNTER_RESET_SECONDS):
+        return False
+    return await _mutate(
+        lambda candidate: candidate.__setitem__("ai_counter_reset_seconds", value)
     )
 
 
@@ -1488,6 +1776,8 @@ class StatusSummary:
     ai_max_replies_per_person: int
     ai_unlimited_replies: bool
     ai_interval_seconds: int
+    ai_counter_reset_enabled: bool = False
+    ai_counter_reset_seconds: int = DEFAULT_AI_COUNTER_RESET_SECONDS
     allowlist: tuple[int, ...] = ()
     exceptions: tuple[int, ...] = ()
     temporary: dict[str, Any] | None = None
@@ -1513,6 +1803,10 @@ def summarize(state_doc: dict[str, Any], now: datetime) -> StatusSummary:
         ai_max_replies_per_person=int(state_doc.get("ai_max_replies_per_person") or 0),
         ai_unlimited_replies=bool(state_doc.get("ai_unlimited_replies")),
         ai_interval_seconds=int(state_doc.get("ai_interval_seconds") or 0),
+        ai_counter_reset_enabled=bool(state_doc.get("ai_counter_reset_enabled")),
+        ai_counter_reset_seconds=int(
+            state_doc.get("ai_counter_reset_seconds") or DEFAULT_AI_COUNTER_RESET_SECONDS
+        ),
         allowlist=tuple(state_doc.get("allowlist") or []),
         exceptions=tuple(state_doc.get("exceptions") or []),
         temporary=temporary_mode(state_doc, now),

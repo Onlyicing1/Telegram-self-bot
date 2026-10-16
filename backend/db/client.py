@@ -2136,10 +2136,18 @@ async def upsert_emoji_chat_override(
 #
 # The AI-reply allowance is enforced by ONE CAS write (claim → compensate):
 # ``claim_private_message_ai_reply`` increments ONLY while the row still holds
-# the value it just read, so a limit can never be exceeded by a racing update,
-# and ``release_private_message_ai_reply`` puts the exact previous pair back
-# after a generation/delivery failure, so a reply that was never delivered can
-# never consume a person's allowance.
+# the values it just read — the used count AND the reset window — so a limit can
+# never be exceeded by a racing update and two claims at a window boundary can
+# never both roll the same expired window, and
+# ``release_private_message_ai_reply`` puts the exact previous triple back after
+# a generation/delivery failure, so a reply that was never delivered can never
+# consume a person's allowance.
+#
+# The automatic per-person reset is a ROLLING WINDOW anchored to the person's
+# first counted reply in the current window (``window_started_at``). It is
+# evaluated and applied INSIDE the same claim: no scheduler, no ticker, no
+# second write. An expired window is rolled by the claim itself, which is why
+# its identity is part of the CAS filter.
 
 #: Bounded CAS attempts for one quota claim (a lost CAS means a concurrent
 #: writer moved the row; the claim re-reads instead of overwriting it).
@@ -2156,6 +2164,8 @@ _PM_CONFIG_COLUMNS: tuple[str, ...] = (
     "ai_max_replies_per_person",
     "ai_unlimited_replies",
     "ai_interval_seconds",
+    "ai_counter_reset_enabled",
+    "ai_counter_reset_seconds",
     "allowlist",
     "exceptions",
     "temporary",
@@ -2199,18 +2209,85 @@ def _pm_claim_result(
     return {"ok": ok, "claimed": claimed, "reason": reason, "used": used, "token": token}
 
 
-def _pm_claim_denial(
-    used: int, last, now_epoch: float, max_replies: int, unlimited: bool,
-    interval_seconds: int,
-) -> dict | None:
-    """The limit/interval veto for a claim, or None when the claim may proceed."""
-    if not unlimited and used >= max_replies:
-        return _pm_claim_result(True, claimed=False, reason="limit_reached", used=used)
-    if interval_seconds > 0 and used > 0 and last is not None:
-        last_epoch = _pm_epoch(last)
-        if last_epoch is not None and now_epoch - last_epoch < interval_seconds:
-            return _pm_claim_result(True, claimed=False, reason="interval_not_elapsed", used=used)
-    return None
+def _pm_claim_decision(
+    row: dict | None, now_epoch: float, now_iso: str, max_replies: int,
+    unlimited: bool, interval_seconds: int, reset_enabled: bool,
+    reset_seconds: int,
+) -> tuple[dict | None, dict | None]:
+    """``(denial, token)`` for ONE allowance claim — exactly one is returned.
+
+    The person's reset window is resolved here, so the caller and every store
+    share ONE decision:
+
+    * ``window_started_at`` is the instant of the first counted reply in the
+      current window; it is written by the claim when the row has none yet.
+    * With automatic reset ENABLED and a window at least ``reset_seconds`` old,
+      the window has expired: the count resets to zero for this very claim and a
+      NEW window starts now. The pre-reset triple is carried in the token, so a
+      release puts the expired window back instead of silently restarting it.
+    * With automatic reset DISABLED nothing ever expires; the window is still
+      maintained (a restart cannot lose it) but is never rolled.
+
+    The token carries three groups of values: ``read_*`` is the identity the
+    claim conditionally replaces (the CAS filter), ``used``/``last``/``window``
+    are what the claim writes (the release conditions on them), and
+    ``restore_*`` is the pre-claim triple the release puts back.
+    """
+    used = int(row.get("ai_replies_used") or 0) if row else 0
+    last = row.get("last_ai_reply_at") if row else None
+    window = row.get("window_started_at") if row else None
+    window_epoch = _pm_epoch(window)
+    expired = (
+        reset_enabled
+        and reset_seconds > 0
+        and window_epoch is not None
+        and now_epoch - window_epoch >= reset_seconds
+    )
+    effective_used = 0 if expired else used
+    if not unlimited and effective_used >= max_replies:
+        return (
+            _pm_claim_result(
+                True, claimed=False, reason="limit_reached", used=effective_used
+            ),
+            None,
+        )
+    # The interval is a SEPARATE anti-spam floor, so it is read from the last
+    # delivered reply regardless of the window: a reset rolls the COUNT, it never
+    # shortens the minimum delay between two replies to the same person.
+    last_epoch = _pm_epoch(last)
+    if interval_seconds > 0 and last_epoch is not None and now_epoch - last_epoch < interval_seconds:
+        return (
+            _pm_claim_result(
+                True, claimed=False, reason="interval_not_elapsed", used=effective_used
+            ),
+            None,
+        )
+    token = {
+        "read_used": used,
+        "read_window": window,
+        "used": effective_used + 1,
+        "last": now_iso,
+        "window": now_iso if (expired or window is None) else window,
+        "restore_used": used,
+        "restore_last": last,
+        "restore_window": window,
+        "window_expired": expired,
+    }
+    return None, token
+
+
+def _pm_cas_filters(token: dict) -> list[tuple[str, object]]:
+    """The CAS identity of a claim: the values it read and is replacing.
+
+    ``window_started_at`` is only part of the filter when the row had one — a
+    row without a window cannot expire, so there is nothing to double-roll. A
+    PostgreSQL ``timestamptz`` equality is a timestamp comparison, so the value
+    read from the row round-trips exactly.
+    """
+    filters: list[tuple[str, object]] = [("ai_replies_used", token["read_used"])]
+    if token["read_window"] is not None:
+        filters.append(("window_started_at", token["read_window"]))
+    return filters
 
 
 def _get_private_message_config_sync(owner_id: int) -> dict | None:
@@ -2355,9 +2432,28 @@ async def list_private_message_senders(owner_id: int, limit: int = 200) -> list 
         return None
 
 
+def _pm_note_window_reset(owner_id: int, sender_id: int, token: dict) -> None:
+    """One honest log line when a claim rolled an expired reset window."""
+    if token.get("window_expired"):
+        logger.info(
+            "[PM_DB] counter window expired, count reset: owner=%s sender=%s was=%s",
+            owner_id, sender_id, token["read_used"],
+        )
+
+
+def _pm_token_payload(token: dict, now_iso: str) -> dict:
+    """What a claim writes (and what a release therefore conditions on)."""
+    return {
+        "ai_replies_used": token["used"],
+        "last_ai_reply_at": token["last"],
+        "window_started_at": token["window"],
+        "updated_at": now_iso,
+    }
+
+
 def _claim_private_message_ai_reply_sync(
     owner_id: int, sender_id: int, max_replies: int, unlimited: bool,
-    interval_seconds: int, now_iso: str,
+    interval_seconds: int, reset_enabled: bool, reset_seconds: int, now_iso: str,
 ) -> dict:
     now_epoch = _pm_epoch(now_iso)
     if now_epoch is None:
@@ -2365,27 +2461,23 @@ def _claim_private_message_ai_reply_sync(
     db = get_db()
     if db is None:
         row = _pm_sender_row(owner_id, sender_id)
-        used = int(row.get("ai_replies_used") or 0) if row else 0
-        last = row.get("last_ai_reply_at") if row else None
-        denial = _pm_claim_denial(used, last, now_epoch, max_replies, unlimited, interval_seconds)
+        denial, token = _pm_claim_decision(
+            row, now_epoch, now_iso, max_replies, unlimited, interval_seconds,
+            reset_enabled, reset_seconds,
+        )
         if denial is not None:
             return denial
-        token = {"used": used + 1, "last": now_iso, "restore_used": used, "restore_last": last}
+        _pm_note_window_reset(owner_id, sender_id, token)
+        written = _pm_token_payload(token, now_iso)
         if row is None:
             _fallback["private_message_senders"].append({
                 "owner_id": owner_id,
                 "sender_id": sender_id,
-                "ai_replies_used": used + 1,
-                "last_ai_reply_at": now_iso,
-                "updated_at": now_iso,
+                **written,
             })
         else:
-            row.update({
-                "ai_replies_used": used + 1,
-                "last_ai_reply_at": now_iso,
-                "updated_at": now_iso,
-            })
-        return _pm_claim_result(True, claimed=True, used=used + 1, token=token)
+            row.update(written)
+        return _pm_claim_result(True, claimed=True, used=token["used"], token=token)
     for _attempt in range(_PM_CAS_ATTEMPTS):
         try:
             result = (
@@ -2402,37 +2494,35 @@ def _claim_private_message_ai_reply_sync(
             return _pm_claim_result(False, reason="claim_read_failed")
         rows = getattr(result, "data", None) or []
         row = rows[0] if rows else None
-        used = int(row.get("ai_replies_used") or 0) if row else 0
-        last = row.get("last_ai_reply_at") if row else None
-        denial = _pm_claim_denial(used, last, now_epoch, max_replies, unlimited, interval_seconds)
+        denial, token = _pm_claim_decision(
+            row, now_epoch, now_iso, max_replies, unlimited, interval_seconds,
+            reset_enabled, reset_seconds,
+        )
         if denial is not None:
             return denial
-        token = {"used": used + 1, "last": now_iso, "restore_used": used, "restore_last": last}
-        payload = {
-            "ai_replies_used": used + 1,
-            "last_ai_reply_at": now_iso,
-            "updated_at": now_iso,
-        }
+        payload = _pm_token_payload(token, now_iso)
         try:
             if row is None:
                 db.table("private_message_senders").insert(
                     {"owner_id": owner_id, "sender_id": sender_id, **payload}
                 ).execute()
             else:
-                written = (
+                builder = (
                     db.table("private_message_senders")
                     .update(payload)
                     .eq("owner_id", owner_id)
                     .eq("sender_id", sender_id)
-                    .eq("ai_replies_used", used)
-                    .execute()
                 )
+                for column, value in _pm_cas_filters(token):
+                    builder = builder.eq(column, value)
+                written = builder.execute()
                 if not (getattr(written, "data", None) or []):
                     continue
         except Exception as exc:
             logger.warning("[PM_DB] claim write lost/failed, re-reading: %s", exc)
             continue
-        return _pm_claim_result(True, claimed=True, used=used + 1, token=token)
+        _pm_note_window_reset(owner_id, sender_id, token)
+        return _pm_claim_result(True, claimed=True, used=token["used"], token=token)
     logger.error("[PM_DB] claim contended for owner=%s sender=%s", owner_id, sender_id)
     record_event("database", "private_message claim", 0, "ERROR", "cas contended")
     return _pm_claim_result(False, reason="claim_contended")
@@ -2440,7 +2530,7 @@ def _claim_private_message_ai_reply_sync(
 
 async def claim_private_message_ai_reply(
     owner_id: int, sender_id: int, *, max_replies: int, unlimited: bool,
-    interval_seconds: int, now_iso: str,
+    interval_seconds: int, reset_enabled: bool, reset_seconds: int, now_iso: str,
 ) -> dict:
     """Atomically claim ONE AI reply from a person's durable allowance.
 
@@ -2450,12 +2540,17 @@ async def claim_private_message_ai_reply(
     "used": n}`` when the configured limit/interval vetoes it, and
     ``{"ok": False, "reason": ...}`` when the store could not be read or the
     CAS stayed contended — the caller fails closed and sends nothing.
+
+    When automatic reset is enabled and the person's window has expired, the
+    count is reset to zero and a NEW window starts as part of this very claim
+    (one conditional write, no separate step), so the reset and the allowance
+    can never disagree.
     """
     try:
         return await _run_sync(
             _claim_private_message_ai_reply_sync,
             owner_id, sender_id, int(max_replies), bool(unlimited),
-            int(interval_seconds), now_iso,
+            int(interval_seconds), bool(reset_enabled), int(reset_seconds), now_iso,
         )
     except Exception as exc:
         logger.error("[PM_DB] claim_private_message_ai_reply FAILED: %s", exc)
@@ -2467,30 +2562,42 @@ def _release_private_message_ai_reply_sync(
 ) -> bool:
     used = token.get("used")
     last = token.get("last")
+    window = token.get("window")
     if not isinstance(used, int) or isinstance(used, bool):
         return False
+    # The pre-claim triple — INCLUDING the window. Restoring the expired window a
+    # rolled claim replaced is what keeps a failed generation from silently
+    # restarting the person's window.
     payload = {
         "ai_replies_used": token.get("restore_used", 0),
         "last_ai_reply_at": token.get("restore_last"),
+        "window_started_at": token.get("restore_window"),
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     db = get_db()
     if db is None:
         row = _pm_sender_row(owner_id, sender_id)
-        if row is None or row.get("ai_replies_used") != used or row.get("last_ai_reply_at") != last:
+        if (
+            row is None
+            or row.get("ai_replies_used") != used
+            or row.get("last_ai_reply_at") != last
+            or row.get("window_started_at") != window
+        ):
             return False
         row.update(payload)
         return True
     try:
-        written = (
+        builder = (
             db.table("private_message_senders")
             .update(payload)
             .eq("owner_id", owner_id)
             .eq("sender_id", sender_id)
             .eq("ai_replies_used", used)
             .eq("last_ai_reply_at", last)
-            .execute()
         )
+        if window is not None:
+            builder = builder.eq("window_started_at", window)
+        written = builder.execute()
         return bool(getattr(written, "data", None))
     except Exception as exc:
         logger.error("[PM_DB] release_private_message_ai_reply FAILED: %s", exc)
@@ -2533,9 +2640,10 @@ def _reset_private_message_counters_sync(owner_id: int) -> bool:
 
 
 async def reset_private_message_counters(owner_id: int) -> bool:
-    """The ONE counter-reset edge: the owner's explicit reset action. Nothing
-    else ever clears the counters, so a restart cannot hand a person a fresh
-    allowance."""
+    """The owner's explicit reset: every tracked person of THIS owner loses both
+    their used count and their reset window (the row carries both). Nothing else
+    ever clears the counters, so a restart cannot hand a person a fresh
+    allowance; an automatic reset only rolls one person's own window."""
     try:
         return await _run_sync(_reset_private_message_counters_sync, owner_id)
     except Exception as exc:

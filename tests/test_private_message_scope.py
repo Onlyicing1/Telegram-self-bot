@@ -832,6 +832,9 @@ def test_the_prompt_requires_brevity_and_natural_persian_over_translation():
 _PERSIAN_REPLY = "سلام! چطور می‌تونم کمکت کنم؟"
 _ARABIC_REPLY = "أهلاً بك! كيف يمكنني مساعدتك اليوم؟"
 _ENGLISH_REPLY = "Hello, thank you for your message."
+#: A general Persian request — NOT a bare greeting, so it always takes the
+#: provider path and the safe-failure contract applies to it unchanged.
+_GENERAL_REQUEST = "میشه کمکم کنی؟"
 
 
 def test_the_reply_validator_refuses_empty_and_whitespace_only_bodies():
@@ -1335,11 +1338,14 @@ def test_the_incoming_language_never_changes_the_contract(db, client, monkeypatc
 
 
 def test_an_arabic_or_english_reply_is_never_sent_and_the_claim_is_given_back(db, monkeypatch):
+    # The incoming text is deliberately NOT a bare greeting: a bare greeting is
+    # answered deterministically (see the Persian-quality section), so the
+    # safe-failure contract is pinned on a general request instead.
     for message_id, reply in ((113, _ARABIC_REPLY), (114, _ENGLISH_REPLY)):
         client = _RecordingClient()
         handler, _calls = _counting_ai_handler(db, client, monkeypatch, reply_text=reply)
 
-        _run(handler(_event(STRANGER, STRANGER, message_id=message_id, text="سلام")))
+        _run(handler(_event(STRANGER, STRANGER, message_id=message_id, text=_GENERAL_REQUEST)))
 
         assert client.sent == [], reply
         assert all(row.get("ai_replies_used", 0) == 0 for row in db.senders), reply
@@ -1350,7 +1356,7 @@ def test_an_over_long_reply_takes_the_safe_failure_path_and_releases_the_claim(d
         db, client, monkeypatch, reply_text="سلام " + "خیلی طولانی " * 200
     )
 
-    _run(handler(_event(STRANGER, STRANGER, message_id=115, text="سلام")))
+    _run(handler(_event(STRANGER, STRANGER, message_id=115, text=_GENERAL_REQUEST)))
 
     assert client.sent == []
     assert all(row.get("ai_replies_used", 0) == 0 for row in db.senders)
@@ -1444,3 +1450,680 @@ def test_the_accounts_own_sent_reply_is_never_an_incoming_human_message(db, clie
     assert calls == []
     assert client.sent == [] and client.deleted == []
     assert db.senders == []
+
+
+class _StaleReadDB:
+    """``private_message_senders`` whose first ``stale_reads`` SELECTs return the
+    state as it was BEFORE any claim — a second process that read the row before
+    the first process wrote it — while every conditional UPDATE matches against
+    the LIVE rows, which is exactly PostgREST's semantics (an ``update`` returns
+    only the rows its filters matched).
+    """
+
+    def __init__(self, senders, stale_reads: int = 1):
+        self.senders = [dict(row) for row in senders]
+        self._snapshot = [dict(row) for row in senders]
+        self._stale_reads = int(stale_reads)
+        self._reads = 0
+        self._op = None
+        self._payload = None
+        self._filters: list[tuple[str, object]] = []
+
+    def table(self, name):
+        assert name == "private_message_senders", name
+        self._op, self._payload = None, None
+        self._filters = []
+        return self
+
+    def select(self, columns="*"):
+        self._op = "select"
+        return self
+
+    def insert(self, payload):
+        self._op, self._payload = "insert", payload
+        return self
+
+    def update(self, payload):
+        self._op, self._payload = "update", payload
+        return self
+
+    def eq(self, column, value):
+        self._filters.append((column, value))
+        return self
+
+    def limit(self, count):
+        return self
+
+    def execute(self):
+        if self._op == "select":
+            self._reads += 1
+            source = self._snapshot if self._reads <= self._stale_reads else self.senders
+            return _Result([dict(row) for row in source])
+        if self._op == "insert":
+            self.senders.append(dict(self._payload))
+            return _Result([dict(self._payload)])
+        wanted = dict(self._filters)
+        matched = [
+            row for row in self.senders
+            if all(row.get(key) == value for key, value in wanted.items())
+        ]
+        for row in matched:
+            row.update(self._payload)
+        return _Result([dict(row) for row in matched])
+
+
+def _mutable_ai_handler(db, client, monkeypatch):
+    """The end-to-end harness whose provider body can be swapped between
+    messages, so a failure and the following success use the SAME path."""
+    import backend.ai.engine.engine as engine_module
+
+    state = {"body": _PERSIAN_REPLY, "calls": 0}
+
+    class _Response:
+        success = True
+
+        @property
+        def text(self):
+            return state["body"]
+
+    class _Providers:
+        async def chat(self, messages, **kwargs):
+            state["calls"] += 1
+            return _Response()
+
+    class _Engine:
+        provider_manager = _Providers()
+
+    async def _apply(owner_id):
+        return True
+
+    monkeypatch.setattr(engine_module, "get_engine", lambda: _Engine())
+    monkeypatch.setattr(engine_module, "apply_persisted_config", _apply)
+    _restricted(db, ai_response_enabled=True)
+    _run(svc.set_ai_max_replies_per_person(10))
+    _run(svc.set_ai_interval_seconds(0))
+    return _handler(client), state
+
+
+# ── Persian reply quality: the reported defect and the two halves of the fix ──
+#
+# What deterministic code enforces here is the message SHAPE plus the ONE
+# deterministic greeting answer. Fluency of an arbitrary generated sentence is
+# NOT provable offline — these tests pin what is genuinely guaranteed and never
+# claim more.
+
+#: The EXACT body the owner reported as unacceptable. It is Persian script and
+#: passed every script-level check the previous fix had, which is why the defect
+#: survived: `می توانم` writes the imperfective prefix as its own word, and
+#: `من در خدمت شما هستم` is a self-descriptive ceremonial opener.
+REPORTED_MALFORMED_REPLY = (
+    "سلام، من در خدمت شما هستم. لطفاً حرفی به شما میادی میکنم. "
+    "چگونه می توانم به شما کمک کنم؟"
+)
+
+
+def test_the_reported_malformed_persian_reply_is_refused():
+    """The exact reported output must be refused, and refused for the REAL
+    reason — not as a side effect of a script or length check."""
+    assert any("\u0600" <= ch <= "\u06ff" for ch in REPORTED_MALFORMED_REPLY)
+    assert svc.is_clearly_arabic(REPORTED_MALFORMED_REPLY) is False
+    assert len(REPORTED_MALFORMED_REPLY) < svc.MAX_AI_GENERATED_LENGTH
+
+    reason, body = svc.validate_generated_reply(REPORTED_MALFORMED_REPLY)
+    assert reason == "malformed_persian_prefix"
+    assert body == ""
+    assert svc.compose_ai_reply(REPORTED_MALFORMED_REPLY) is None
+
+
+def test_a_detached_persian_verb_prefix_is_refused_but_attached_forms_are_not():
+    for malformed in ("چگونه می توانم کمکت کنم؟", "نمی دانم.", "من می توانم"):
+        assert svc.validate_generated_reply(malformed)[0] == "malformed_persian_prefix", malformed
+    assert svc.detached_verb_prefixes("چگونه می توانم") == ("می",)
+    # A ZWNJ keeps the prefix inside ONE token, so correct Persian is never hit.
+    assert svc.detached_verb_prefixes("می‌تونم") == ()
+    assert svc.detached_verb_prefixes("می‌کنم") == ()
+    for correct in ("می‌تونم کمکت کنم.", "نمی‌دونم.", "می‌کنم"):
+        assert svc.validate_generated_reply(correct)[0] == "", correct
+
+
+def test_a_reply_that_greets_twice_is_refused():
+    assert svc.repeated_greeting_words("سلام! سلام، خوبی؟") == ("سلام",)
+    assert svc.validate_generated_reply("سلام! سلام، خوبی؟")[0] == "repetitive_greeting"
+    assert svc.repeated_greeting_words("سلام! وقت شما هم بخیر.") == ()
+    assert svc.validate_generated_reply("سلام! وقت شما هم بخیر.")[0] == ""
+
+
+def test_only_a_bare_greeting_is_classified_as_a_trivial_greeting():
+    for bare in ("سلام", "  سلام!  ", "سلام؟", "درود", "hello", "Hi There", "وقت بخیر"):
+        assert svc.classify_trivial_greeting(bare) is not None, bare
+    # Arabic keyboard spellings of the same greeting match after folding.
+    assert svc.classify_trivial_greeting("السلام عليكم") is not None
+    for not_bare in (
+        "", "   ", None, 7, ["سلام"],
+        "سلام خوبی؟",              # a greeting PLUS a question
+        "سلام، پیامم رو دیدی؟",     # extra content
+        _GENERAL_REQUEST,
+        "سلام " + "و " * 5,        # too many words
+        "س" * 80,                  # too long
+        "سلام سلام سلام سلام سلام دوباره",
+    ):
+        assert svc.classify_trivial_greeting(not_bare) is None, not_bare
+    assert svc.trivial_greeting_body(svc.classify_trivial_greeting("صبح بخیر")) == (
+        "سلام! صبح شما هم بخیر."
+    )
+
+
+def test_the_deterministic_greeting_is_short_natural_and_carries_both_disclosures_once():
+    for probe in ("سلام", "صبح بخیر", "شب بخیر"):
+        kind = svc.classify_trivial_greeting(probe)
+        body = svc.compose_trivial_greeting_reply(kind)
+        assert body is not None
+        assert body.count(svc.CLOSED_NOTICE) == 1 and body.count(svc.AI_NOTICE) == 1
+        assert body.endswith(f"{svc.CLOSED_NOTICE}\n{svc.AI_NOTICE}")
+        spoken = body.split("\n")[0]
+        assert len(spoken) <= svc.MAX_TRIVIAL_GREETING_REPLY_LENGTH
+        assert svc.validate_generated_reply(spoken) == ("", spoken)
+        # Nothing about the owner or the assistant is invented: no first-person
+        # self-description, no claim of identity, role, ability or biography.
+        assert "من " not in spoken
+        for forbidden in ("هستم", "کارمند", "معلم", "مسلمان", "متولد"):
+            assert forbidden not in spoken, forbidden
+
+
+def test_the_prompt_carries_idiomatic_few_shot_examples_without_weakening_the_contract():
+    """The examples are part of the SAME system contract (never extra messages),
+    and every previous requirement is still stated."""
+    prompt = pm._AI_SYSTEM_PROMPT
+    for example in (
+        '"سلام" → "سلام! وقت شما هم بخیر."',
+        '"ممنون از پیامت" → "خواهش می\u200cکنم."',
+        '"thanks a lot" → "خواهش می\u200cکنم."',
+        '"سلام، خوبی؟" → "سلام! ممنون از پیامتون، امیدوارم شما هم خوب باشید."',
+        '"بعداً صحبت می\u200cکنیم" → "باشه، حتماً."',
+    ):
+        assert example in prompt, example
+    lowered = prompt.lower()
+    assert "examples, never templates" in lowered
+    assert "never copy one verbatim" in lowered
+    # The greeting example must be answered by Persian even when the message is
+    # written in another language.
+    assert "still answered in persian" in lowered
+    assert "never invent" in lowered
+    # The repair instruction is a SEPARATE constant, so the first attempt always
+    # sends exactly the base contract.
+    assert pm._AI_CORRECTION_PROMPT not in prompt
+    assert "never write the imperfective prefix" in pm._AI_CORRECTION_PROMPT.lower()
+    assert svc.AI_GENERATION_ATTEMPTS == 2
+
+
+def test_the_reported_malformed_reply_makes_a_bare_greeting_get_the_short_greeting(db, client, monkeypatch):
+    """The reported case, end to end: the provider is still asked through the
+    unchanged boundary, its broken body is never delivered, and the person gets
+    one short idiomatic Persian greeting instead of broken text."""
+    handler, calls = _counting_ai_handler(
+        db, client, monkeypatch, reply_text=REPORTED_MALFORMED_REPLY
+    )
+
+    _run(handler(_event(STRANGER, STRANGER, message_id=130, text="سلام")))
+
+    assert len(calls) == 1
+    assert calls[0]["kwargs"] == {"tools": []}
+    assert [message["role"] for message in calls[0]["messages"]] == ["system", "user"]
+    assert calls[0]["messages"][0]["content"] == pm._AI_SYSTEM_PROMPT
+    assert calls[0]["messages"][1]["content"] == "سلام"
+
+    assert len(client.sent) == 1
+    delivered = client.sent[0][1]
+    assert delivered == svc.compose_trivial_greeting_reply(
+        svc.classify_trivial_greeting("سلام")
+    )
+    assert REPORTED_MALFORMED_REPLY not in delivered
+    assert "میادی" not in delivered
+    assert db.senders[0]["ai_replies_used"] == 1  # a delivered reply consumes one
+
+
+def test_an_elaborate_but_valid_reply_to_a_greeting_is_replaced_by_the_short_greeting(db, client, monkeypatch):
+    """A greeting gets a greeting, not a self-describing paragraph — even when
+    the paragraph is grammatical enough to pass every shape check."""
+    elaborate = "سلام " + "خیلی ممنون که پیام دادید و امیدوارم حالتان خوب باشد " * 3
+    assert svc.validate_generated_reply(elaborate)[0] == ""
+    assert len(elaborate.split("\n")[0]) > svc.MAX_TRIVIAL_GREETING_REPLY_LENGTH
+    handler, _calls = _counting_ai_handler(db, client, monkeypatch, reply_text=elaborate)
+
+    _run(handler(_event(STRANGER, STRANGER, message_id=131, text="سلام")))
+
+    assert len(client.sent) == 1
+    assert client.sent[0][1].startswith("سلام! وقت شما هم بخیر.")
+    assert "خیلی ممنون که پیام دادید" not in client.sent[0][1]
+
+
+def test_a_provider_failure_never_produces_a_canned_reply(db, client, monkeypatch):
+    """The deterministic greeting is a FALLBACK FOR A BAD BODY, never a
+    substitute for a failed generation: an unavailable provider still takes the
+    ordinary safe-failure path and releases the claim."""
+    import backend.ai.engine.engine as engine_module
+
+    class _Providers:
+        async def chat(self, messages, **kwargs):
+            raise RuntimeError("provider down")
+
+    class _Engine:
+        provider_manager = _Providers()
+
+    async def _apply(owner_id):
+        return True
+
+    monkeypatch.setattr(engine_module, "get_engine", lambda: _Engine())
+    monkeypatch.setattr(engine_module, "apply_persisted_config", _apply)
+    _restricted(db, ai_response_enabled=True)
+    _run(svc.set_ai_max_replies_per_person(10))
+    _run(svc.set_ai_interval_seconds(0))
+    handler = _handler(client)
+
+    _run(handler(_event(STRANGER, STRANGER, message_id=132, text="سلام")))
+
+    assert client.sent == []
+    assert all(row.get("ai_replies_used", 0) == 0 for row in db.senders)
+
+
+def test_a_refused_body_for_a_general_request_is_regenerated_once_then_dropped(db, client, monkeypatch):
+    """Bounded regeneration: exactly ONE retry, through the SAME provider path
+    and the SAME context isolation, and nothing is sent when it fails too."""
+    handler, calls = _counting_ai_handler(db, client, monkeypatch, reply_text=_ENGLISH_REPLY)
+
+    _run(handler(_event(STRANGER, STRANGER, message_id=133, text=_GENERAL_REQUEST)))
+
+    assert len(calls) == 2  # bounded: never a third attempt
+    retry = calls[1]
+    assert retry["kwargs"] == {"tools": []}
+    assert [message["role"] for message in retry["messages"]] == ["system", "user"]
+    assert retry["messages"][0]["content"] == pm._AI_SYSTEM_PROMPT + pm._AI_CORRECTION_PROMPT
+    assert retry["messages"][1]["content"] == _GENERAL_REQUEST
+    joined = json.dumps(retry["messages"], ensure_ascii=False)
+    assert str(OWNER) not in joined and str(STRANGER) not in joined
+
+    assert client.sent == []
+    assert all(row.get("ai_replies_used", 0) == 0 for row in db.senders)
+
+
+def test_the_bounded_regeneration_delivers_a_good_second_attempt(db, client, monkeypatch):
+    """The retry is a real repair path, not a no-op: a good second body ships."""
+    import backend.ai.engine.engine as engine_module
+
+    bodies = iter([REPORTED_MALFORMED_REPLY, "ممنون از پیامتون."])
+
+    class _Response:
+        success = True
+
+        def __init__(self, text):
+            self.text = text
+
+    class _Providers:
+        async def chat(self, messages, **kwargs):
+            return _Response(next(bodies))
+
+    class _Engine:
+        provider_manager = _Providers()
+
+    async def _apply(owner_id):
+        return True
+
+    monkeypatch.setattr(engine_module, "get_engine", lambda: _Engine())
+    monkeypatch.setattr(engine_module, "apply_persisted_config", _apply)
+    _restricted(db, ai_response_enabled=True)
+    _run(svc.set_ai_max_replies_per_person(10))
+    _run(svc.set_ai_interval_seconds(0))
+    handler = _handler(client)
+
+    _run(handler(_event(STRANGER, STRANGER, message_id=134, text=_GENERAL_REQUEST)))
+
+    assert [text for _chat, text in client.sent] == [
+        f"ممنون از پیامتون.\n\n{svc.CLOSED_NOTICE}\n{svc.AI_NOTICE}"
+    ]
+    assert db.senders[0]["ai_replies_used"] == 1
+
+
+def test_the_disclosures_land_exactly_once_on_every_delivery_path(db, monkeypatch):
+    for message_id, text, reply in (
+        (135, "سلام", _PERSIAN_REPLY),           # the model's own short body
+        (136, "سلام", REPORTED_MALFORMED_REPLY),  # the deterministic greeting
+        (137, _GENERAL_REQUEST, _PERSIAN_REPLY),  # a general request
+    ):
+        client = _RecordingClient()   # one registration per fresh client
+        handler, _calls = _counting_ai_handler(db, client, monkeypatch, reply_text=reply)
+        _run(handler(_event(STRANGER, STRANGER, message_id=message_id, text=text)))
+        assert len(client.sent) == 1, (message_id, text)
+        delivered = client.sent[0][1]
+        assert delivered.count(svc.CLOSED_NOTICE) == 1, message_id
+        assert delivered.count(svc.AI_NOTICE) == 1, message_id
+        assert delivered.endswith(f"{svc.CLOSED_NOTICE}\n{svc.AI_NOTICE}"), message_id
+
+
+# ── the configurable automatic per-person reset ──────────────────────────────
+
+
+def _quota_handler(db, client, monkeypatch, *, max_replies=1, interval=0, reset=None):
+    """The end-to-end harness with the quota configured (reset optional)."""
+    handler, calls = _counting_ai_handler(db, client, monkeypatch)
+    _run(svc.set_ai_max_replies_per_person(max_replies))
+    _run(svc.set_ai_interval_seconds(interval))
+    if reset is not None:
+        assert _run(svc.set_ai_counter_reset_enabled(True)) is True
+        assert _run(svc.set_ai_counter_reset_seconds(reset)) is True
+    return handler, calls
+
+
+def _age_window(db, sender_id: int, seconds: int) -> str:
+    """Move ONE person's stored window start into the past (a real elapsed
+    window) and return the instant it now holds."""
+    aged = (datetime.now(timezone.utc) - timedelta(seconds=seconds)).isoformat()
+    for row in db.senders:
+        if row.get("sender_id") == sender_id:
+            row["window_started_at"] = aged
+    return aged
+
+
+def test_automatic_reset_is_off_by_default_and_nothing_is_ever_rolled(db, client, monkeypatch):
+    handler, _calls = _quota_handler(db, client, monkeypatch, max_replies=1)
+    assert svc.state()["ai_counter_reset_enabled"] is False
+
+    _run(handler(_event(STRANGER, STRANGER, message_id=140, text=_GENERAL_REQUEST)))
+    assert len(client.sent) == 1
+    assert db.senders[0]["ai_replies_used"] == 1
+    assert db.senders[0]["window_started_at"] is not None  # durable anchor
+
+    _age_window(db, STRANGER, 30 * 86400)
+    _run(handler(_event(STRANGER, STRANGER, message_id=141, text=_GENERAL_REQUEST)))
+    assert len(client.sent) == 1                            # still denied
+    assert db.senders[0]["ai_replies_used"] == 1
+
+
+def test_the_first_reply_starts_the_window_and_the_limit_holds_inside_it(db, client, monkeypatch):
+    handler, _calls = _quota_handler(db, client, monkeypatch, max_replies=2, reset=86400)
+
+    _run(handler(_event(STRANGER, STRANGER, message_id=150, text=_GENERAL_REQUEST)))
+    first_window = db.senders[0]["window_started_at"]
+    assert db.senders[0]["ai_replies_used"] == 1
+
+    _run(handler(_event(STRANGER, STRANGER, message_id=151, text=_GENERAL_REQUEST)))
+    assert len(client.sent) == 2
+    assert db.senders[0]["window_started_at"] == first_window  # not restarted per reply
+
+    _run(handler(_event(STRANGER, STRANGER, message_id=152, text=_GENERAL_REQUEST)))
+    assert len(client.sent) == 2                               # the ceiling holds
+    assert db.senders[0]["window_started_at"] == first_window
+
+
+def test_the_same_person_becomes_eligible_again_only_after_the_window_expires(db, client, monkeypatch):
+    handler, _calls = _quota_handler(db, client, monkeypatch, max_replies=1, reset=3600)
+
+    _run(handler(_event(STRANGER, STRANGER, message_id=160, text=_GENERAL_REQUEST)))
+    first_window = db.senders[0]["window_started_at"]
+    _age_window(db, STRANGER, 3599)                            # one second short
+    _run(handler(_event(STRANGER, STRANGER, message_id=161, text=_GENERAL_REQUEST)))
+    assert len(client.sent) == 1
+    assert db.senders[0]["window_started_at"] != first_window  # the age is what we set
+    assert db.senders[0]["ai_replies_used"] == 1
+
+    _age_window(db, STRANGER, 3601)                            # just past it
+    _run(handler(_event(STRANGER, STRANGER, message_id=162, text=_GENERAL_REQUEST)))
+    assert len(client.sent) == 2                               # available again
+    assert db.senders[0]["ai_replies_used"] == 1               # the COUNT restarted
+    assert db.senders[0]["window_started_at"] != first_window
+
+    _run(handler(_event(STRANGER, STRANGER, message_id=163, text=_GENERAL_REQUEST)))
+    assert len(client.sent) == 2                               # the new window limits again
+
+
+def test_two_people_keep_independent_reset_windows(db, client, monkeypatch):
+    handler, _calls = _quota_handler(db, client, monkeypatch, max_replies=1, reset=3600)
+
+    _run(handler(_event(STRANGER, STRANGER, message_id=170, text=_GENERAL_REQUEST)))
+    _run(handler(_event(OTHER, OTHER, message_id=171, text=_GENERAL_REQUEST)))
+    assert len(client.sent) == 2
+
+    _age_window(db, STRANGER, 3601)   # only STRANGER's window expired
+    _run(handler(_event(STRANGER, STRANGER, message_id=172, text=_GENERAL_REQUEST)))
+    assert len(client.sent) == 3
+    _run(handler(_event(OTHER, OTHER, message_id=173, text=_GENERAL_REQUEST)))
+    assert len(client.sent) == 3      # the other person is untouched
+
+    windows = {row["sender_id"]: row["window_started_at"] for row in db.senders}
+    assert set(windows) == {STRANGER, OTHER}
+
+
+def test_a_manual_reset_clears_the_counts_and_the_windows(db, client, monkeypatch):
+    handler, _calls = _quota_handler(db, client, monkeypatch, max_replies=1, reset=86400)
+    _run(handler(_event(STRANGER, STRANGER, message_id=180, text=_GENERAL_REQUEST)))
+    _run(handler(_event(OTHER, OTHER, message_id=181, text=_GENERAL_REQUEST)))
+    assert len(db.senders) == 2
+
+    assert _run(svc.reset_counters(OWNER)) is True
+    assert db.senders == []                     # counts AND windows are gone
+
+    _run(handler(_event(STRANGER, STRANGER, message_id=182, text=_GENERAL_REQUEST)))
+    _run(handler(_event(OTHER, OTHER, message_id=183, text=_GENERAL_REQUEST)))
+    assert len(client.sent) == 4                # both people start fresh windows
+    assert len(db.senders) == 2
+
+
+def test_unlimited_mode_bypasses_the_ceiling_but_keeps_the_minimum_interval(db, client, monkeypatch):
+    handler, _calls = _quota_handler(db, client, monkeypatch, max_replies=1, interval=0, reset=60)
+    assert _run(svc.set_ai_unlimited_replies(True)) is True
+
+    _run(handler(_event(STRANGER, STRANGER, message_id=190, text=_GENERAL_REQUEST)))
+    _run(handler(_event(STRANGER, STRANGER, message_id=191, text=_GENERAL_REQUEST)))
+    assert len(client.sent) == 2                   # the count ceiling is gone
+    assert db.senders[0]["ai_replies_used"] == 2
+
+    # The minimum interval is a SEPARATE floor: unlimited never disables it, and
+    # an expired window does not shorten it either — it is read from the last
+    # DELIVERED reply, independently of the window.
+    assert _run(svc.set_ai_interval_seconds(600)) is True
+    _age_window(db, STRANGER, 3600)
+    _run(handler(_event(STRANGER, STRANGER, message_id=192, text=_GENERAL_REQUEST)))
+    assert len(client.sent) == 2
+    assert db.senders[0]["ai_replies_used"] == 2   # a denied claim writes nothing
+
+
+def test_an_out_of_scope_event_never_creates_or_rolls_a_reset_window(db, client, monkeypatch):
+    """The scope gate precedes the claim, so a bot, a group or an unresolvable
+    sender can neither create a window nor roll an expired one — even with
+    automatic reset widened in the configuration."""
+    handler, calls = _quota_handler(db, client, monkeypatch, max_replies=1, reset=60)
+    expired = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    db.senders.append({
+        "owner_id": OWNER, "sender_id": STRANGER, "ai_replies_used": 1,
+        "last_ai_reply_at": expired, "window_started_at": expired,
+    })
+    bot = _bot_entity(STRANGER)
+
+    _run(handler(_event(STRANGER, STRANGER, message_id=230, chat_entity=bot, sender_entity=bot)))
+    _run(handler(_event(-1001234567890, STRANGER, message_id=231, is_private=False, is_group=True)))
+
+    assert calls == []
+    assert client.sent == [] and client.deleted == []
+    assert db.senders[0]["ai_replies_used"] == 1          # nothing was claimed
+    assert db.senders[0]["window_started_at"] == expired  # nothing was rolled
+
+
+def test_a_counter_store_failure_at_a_reset_boundary_fails_closed(db, client, monkeypatch):
+    handler, _calls = _quota_handler(db, client, monkeypatch, max_replies=1, reset=60)
+    db.senders.append({
+        "owner_id": OWNER, "sender_id": STRANGER, "ai_replies_used": 1,
+        "last_ai_reply_at": (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat(),
+        "window_started_at": (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat(),
+    })
+    db.fail_counter_read = True
+
+    _run(handler(_event(STRANGER, STRANGER, message_id=200, text=_GENERAL_REQUEST)))
+
+    assert client.sent == []
+    assert db.senders[0]["ai_replies_used"] == 1   # the expired window was not rolled
+
+
+def test_a_failed_generation_restores_the_expired_window_instead_of_restarting_it(db, client, monkeypatch):
+    handler, state = _mutable_ai_handler(db, client, monkeypatch)
+    _run(svc.set_ai_counter_reset_enabled(True))
+    _run(svc.set_ai_counter_reset_seconds(60))
+    expired = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    db.senders.append({
+        "owner_id": OWNER, "sender_id": STRANGER, "ai_replies_used": 4,
+        "last_ai_reply_at": expired, "window_started_at": expired,
+    })
+
+    state["body"] = _ENGLISH_REPLY
+    _run(handler(_event(STRANGER, STRANGER, message_id=201, text=_GENERAL_REQUEST)))
+    assert client.sent == []
+    assert db.senders[0]["ai_replies_used"] == 4
+    assert db.senders[0]["window_started_at"] == expired
+
+    state["body"] = _PERSIAN_REPLY
+    _run(handler(_event(STRANGER, STRANGER, message_id=202, text=_GENERAL_REQUEST)))
+    assert len(client.sent) == 1
+    assert db.senders[0]["ai_replies_used"] == 1        # the window rolled ONCE
+    assert db.senders[0]["window_started_at"] != expired
+
+
+def test_the_window_survives_a_restart(db, client, monkeypatch):
+    """A process restart must not hand anyone a fresh allowance or restart
+    every person's window: both live in the durable row."""
+    handler, _calls = _quota_handler(db, client, monkeypatch, max_replies=1, reset=86400)
+    _run(handler(_event(STRANGER, STRANGER, message_id=210, text=_GENERAL_REQUEST)))
+    window = db.senders[0]["window_started_at"]
+
+    svc.reset_in_memory()                               # restart: memory is gone
+    svc.configure_owner(OWNER)
+    _run(svc.ensure_loaded_async())
+
+    _run(handler(_event(STRANGER, STRANGER, message_id=211, text=_GENERAL_REQUEST)))
+    assert len(client.sent) == 1                        # still denied
+    assert db.senders[0]["window_started_at"] == window  # the window was not restarted
+
+
+def test_concurrent_messages_at_a_reset_boundary_do_not_bypass_the_quota(db, client, monkeypatch):
+    handler, _calls = _quota_handler(db, client, monkeypatch, max_replies=1, reset=60)
+    expired = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    db.senders.append({
+        "owner_id": OWNER, "sender_id": STRANGER, "ai_replies_used": 1,
+        "last_ai_reply_at": expired, "window_started_at": expired,
+    })
+
+    async def _both():
+        await asyncio.gather(
+            handler(_event(STRANGER, STRANGER, message_id=220, text=_GENERAL_REQUEST)),
+            handler(_event(STRANGER, STRANGER, message_id=221, text=_GENERAL_REQUEST)),
+        )
+
+    _run(_both())
+
+    assert len(client.sent) == 1                        # the reset handed out no extra reply
+    assert db.senders[0]["ai_replies_used"] == 1
+    assert db.senders[0]["window_started_at"] != expired
+
+
+def test_the_persistence_contract_itself_closes_the_window_race(db, monkeypatch):
+    """The CAS identity at the boundary, driven through the REAL db contract.
+
+    Two claims that both observed the SAME expired window (the second read
+    happened before the first write) must not both roll it: the loser's
+    conditional update matches no row and its re-read is denied by the freshly
+    started window. Without the window in the filter the loser's condition
+    (`ai_replies_used = 1`) would still match the rolled row and hand out a
+    second reply.
+    """
+    expired = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    fake = _StaleReadDB(
+        [{
+            "owner_id": OWNER, "sender_id": STRANGER, "ai_replies_used": 1,
+            "last_ai_reply_at": expired, "window_started_at": expired,
+        }],
+        stale_reads=2,
+    )
+    monkeypatch.setattr("backend.db.client.get_db", lambda: fake)
+    from backend.db import client as db_client
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    async def _claim():
+        return await db_client.claim_private_message_ai_reply(
+            OWNER, STRANGER, max_replies=1, unlimited=False, interval_seconds=0,
+            reset_enabled=True, reset_seconds=60, now_iso=now_iso,
+        )
+
+    first = _run(_claim())
+    second = _run(_claim())
+
+    assert first["ok"] is True and first["claimed"] is True
+    assert first["token"]["read_window"] == expired
+    assert first["token"]["window_expired"] is True
+    assert second["ok"] is True and second["claimed"] is False, second
+    assert second["reason"] == "limit_reached"
+    assert fake.senders[0]["ai_replies_used"] == 1
+    assert fake.senders[0]["window_started_at"] != expired
+
+
+def test_the_reset_window_is_part_of_the_claim_cas_identity():
+    from backend.db import client as db_client
+
+    token = {
+        "read_used": 1,
+        "read_window": "2026-10-16T10:00:00+00:00",
+        "used": 1,
+        "last": "2026-10-16T12:00:00+00:00",
+        "window": "2026-10-16T12:00:00+00:00",
+        "restore_used": 1,
+        "restore_last": None,
+        "restore_window": "2026-10-16T10:00:00+00:00",
+        "window_expired": True,
+    }
+    assert db_client._pm_cas_filters(token) == [
+        ("ai_replies_used", 1),
+        ("window_started_at", "2026-10-16T10:00:00+00:00"),
+    ]
+    # A row with no window has nothing to double-roll, so it is not filtered on.
+    assert db_client._pm_cas_filters(dict(token, read_window=None)) == [
+        ("ai_replies_used", 1)
+    ]
+
+
+def test_the_reset_configuration_is_validated_and_never_half_applied(db):
+    assert svc.state()["ai_counter_reset_seconds"] == svc.DEFAULT_AI_COUNTER_RESET_SECONDS
+    assert svc.state()["ai_counter_reset_enabled"] is False
+
+    for bad in (0, -60, True, "3600", 1.5, None, svc.MIN_AI_COUNTER_RESET_SECONDS - 1,
+                svc.MAX_AI_COUNTER_RESET_SECONDS + 1, 10 ** 20):
+        assert _run(svc.set_ai_counter_reset_seconds(bad)) is False, bad
+    for bad in (1, 0, None, "yes"):
+        assert _run(svc.set_ai_counter_reset_enabled(bad)) is False, bad
+    assert svc.state()["ai_counter_reset_seconds"] == svc.DEFAULT_AI_COUNTER_RESET_SECONDS
+
+    assert _run(svc.set_ai_counter_reset_seconds(7200)) is True
+    assert _run(svc.set_ai_counter_reset_enabled(True)) is True
+    stored = db.config[OWNER]
+    assert stored["ai_counter_reset_seconds"] == 7200
+    assert stored["ai_counter_reset_enabled"] is True
+
+    # A stored value outside the bounds falls back to the default, never to a
+    # dangerous one (an interval of 0 would expire every window instantly).
+    assert svc.sanitize_state({"ai_counter_reset_seconds": 0})["ai_counter_reset_seconds"] == (
+        svc.DEFAULT_AI_COUNTER_RESET_SECONDS
+    )
+
+
+def test_the_reset_interval_input_accepts_units_and_refuses_anything_else():
+    assert svc.parse_reset_interval("30") == 1800
+    assert svc.parse_reset_interval("30m") == 1800
+    assert svc.parse_reset_interval(" 90s ") == 90
+    assert svc.parse_reset_interval("2H") == 7200
+    assert svc.parse_reset_interval("3d") == 259200
+    assert svc.parse_reset_interval(45) == 2700
+    for bad in ("", "   ", "-5", "-5m", "nope", "1.5h", "5x", "1e9", "0", "0m",
+                "59s", "366d", "999999999999999999999m", None, True, 0):
+        assert svc.parse_reset_interval(bad) is None, bad
+    assert svc.format_reset_interval(86400) == "1 day"
+    assert svc.format_reset_interval(172800) == "2 days"
+    assert svc.format_reset_interval(3600) == "1 hour"
+    assert svc.format_reset_interval(1800) == "30 minutes"
+    assert svc.format_reset_interval(90) == "90 seconds"
+    assert svc.format_reset_interval(0) == "—" and svc.format_reset_interval(None) == "—"

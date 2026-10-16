@@ -415,6 +415,7 @@ def test_every_panel_action_and_input_is_registered(registered):
         "pm_refresh",
         "pm_action",
         "pm_unlimited",
+        "pm_reset_window",
         "pm_reset_counters",
         "pm_page",
         "pm_allow_toggle",
@@ -434,6 +435,7 @@ def test_every_panel_action_and_input_is_registered(registered):
     assert get_input("pm_policy", "fixed_text") is not None
     assert get_input("pm_policy", "max_replies") is not None
     assert get_input("pm_policy", "interval") is not None
+    assert get_input("pm_policy", "reset_interval") is not None
     assert get_input("pm_allow", "add") is not None
     assert get_input("pm_except", "add") is not None
     assert get_input("pm_rule", "start") is not None
@@ -551,6 +553,67 @@ def test_the_restarted_panel_renders_the_state_the_database_holds(registered, db
 
 
 # ── the independent closing actions ────────────────────────────────────────
+
+
+def test_the_actions_panel_carries_exactly_one_control_per_setting(registered, db):
+    """Every control exists once, and the reset controls are distinct: the
+    AUTOMATIC reset (toggle + interval) is not the manual reset action."""
+    _title, _body, buttons = _panel("pm_policy")
+    datas = _datas(buttons)
+    for data in (
+        "input:pm_policy:max_replies",
+        "input:pm_policy:interval",
+        "input:pm_policy:reset_interval",
+        "action:pm_unlimited",
+        "action:pm_reset_window",
+        "action:pm_reset_counters",
+    ):
+        assert datas.count(data) == 1, (data, datas.count(data))
+
+
+def test_the_panel_shows_the_reset_configuration_including_when_it_is_disabled(registered, db):
+    _title, body, _buttons = _panel("pm")
+    assert "Automatic counter reset:** OFF" in body
+
+    _action("pm_reset_window")
+    assert svc.state()["ai_counter_reset_enabled"] is True
+    assert _stored_config(db)["ai_counter_reset_enabled"] is True
+    assert _stored_config(db)["ai_counter_reset_seconds"] == svc.DEFAULT_AI_COUNTER_RESET_SECONDS
+
+    _title, body, _buttons = _panel("pm")
+    assert "OFF" not in body.split("Automatic counter reset:**")[1].splitlines()[0]
+    assert "1 day" in body
+
+    _input("pm_policy", "reset_interval", "2h")
+    assert svc.state()["ai_counter_reset_seconds"] == 7200
+    assert _stored_config(db)["ai_counter_reset_seconds"] == 7200
+    _title, body, _buttons = _panel("pm")
+    assert "2 hours" in body
+
+    _action("pm_reset_window")
+    assert svc.state()["ai_counter_reset_enabled"] is False
+    _title, body, _buttons = _panel("pm")
+    assert "counters only change when you reset them" in body
+
+
+def test_the_reset_interval_input_validates_and_states_the_window_semantics(registered, db, helper):
+    _title, body, _buttons = _panel("pm_policy")
+    assert "Automatic counter reset:** OFF" in body
+    # The panel documents exactly when a window starts and when the allowance
+    # becomes available again.
+    assert "window starts at a person's FIRST counted reply" in body
+    assert "the NEXT eligible message observes the expired window" in body
+    assert "only resets the COUNT" in body
+
+    _input("pm_policy", "reset_interval", "30m")
+    assert svc.state()["ai_counter_reset_seconds"] == 1800
+    assert _stored_config(db)["ai_counter_reset_seconds"] == 1800
+
+    for bad in ("nope", "-5", "5s", "400d", "", "0"):
+        _input("pm_policy", "reset_interval", bad)
+        assert svc.state()["ai_counter_reset_seconds"] == 1800, bad
+        assert "NOT saved" in _edited_text(helper), bad
+    assert _stored_config(db)["ai_counter_reset_seconds"] == 1800
 
 
 def test_the_actions_panel_lists_the_three_independent_actions(registered, db):

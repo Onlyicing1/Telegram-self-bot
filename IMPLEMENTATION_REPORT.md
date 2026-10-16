@@ -1,312 +1,407 @@
-# IMPLEMENTATION_REPORT.md — Private Message Management: reply quality, deterministic validation and duplicate protection
+# IMPLEMENTATION_REPORT.md — Private Message Management: Persian reply quality + configurable automatic counter reset
 
 > This file describes ONLY the current state of the repository after this task. It
-> **replaces every previous report in full**. The Persian-language-policy report
-> (`e8dd2c8`), the Phase-2 report (scope gate, independent actions, dedicated
-> persistence, per-person allowance, `e3548dd`), the Phase-1 report ("Private
-> Message Management — Phase 1, panel-first, no AI", `bf89042`), the emoji
-> implementation (`977247e`), the checkpoint-2 fixes (`e13deee`, `9633c0b`), the
-> via-bot feasibility study (`b04cb41`), the `98c2825` audit, the boundary-tracing
-> task (`a54877b`), the callback-receipt task (`1bd843d`), the premium-emoji
-> inline verification (`39de9cc`, `b463552`, `219c873`, `2eaaf93`) and the LifeOS
-> guide website (`58aebac`) are preserved in git history and referenced here only
-> by commit id.
+> **replaces every previous report in full**. The previous Private Message
+> Management reports (Phase 1 `bf89042`, the scope/action/persistence phase
+> `e3548dd`, the Persian-language policy `e8dd2c8`, the validation + duplicate
+> protection `702c1d1`), the emoji reports, the colored-button work, the font
+> registry work and the LifeOS guide website remain readable in git history and
+> are referenced here only by commit id.
 
 | Item | Value |
 |---|---|
-| Task | Closed-PV AI reply: Persian reply quality, deterministic pre-send validation, and duplicate-reply protection |
+| Task | Repair the unnatural closed-PV AI replies, and add a configurable per-person automatic counter reset |
 | Project | LifeOS Telegram self-bot (`Onlyicing1/Telegram-self-bot`) |
-| Branch / base revision | `main` at `e8dd2c8c662c92ea0dc41359b18faa0a544ea3b9` (the commit named in the request) |
-| Outcome | **FIXED + unit-TESTED offline.** The prompt no longer invites invented identity/facts or word-for-word prose, malformed/foreign/over-long model output can no longer be delivered, an echoed disclosure is de-duplicated so each notice lands exactly once, and the duplicate mark is now released when enforcement fails before acting. |
-| Supabase | **NOT touched — no SQL was executed, no database was modified, no schema changed.** `DATABASE_ARCHITECTURE.md` was NOT edited (nothing in it became inaccurate). |
-| Live provider verification | **No** (no provider call in this workspace); see §6. |
-| Live Telegram verification | **No** (no live session in this workspace); see §6. |
+| Branch / base revision | `main`, branched from `702c1d1fb4e018709f6ede90af5695357e54e613` (verified `= origin/main`, fetched at task start) |
+| Outcome | **Repaired and offline-TESTED.** The reported malformed body is now refused instead of delivered, a bare greeting can no longer receive an elaborate self-describing paragraph (it gets one short idiomatic Persian greeting), and the per-person allowance gains a configurable, durable, atomic automatic reset. |
+| Supabase | **NOT touched — no SQL was executed, no database was modified.** `DATABASE_ARCHITECTURE.md` was NOT edited (it stays as the owner approved it). The required schema change is a **repository-only SQL proposal awaiting the owner's manual application** (§5). |
+| Live provider verification | **No** — no provider credentials in this workspace (§7). |
+| Live Telegram verification | **No** — no live session in this workspace (§7). |
 
 ---
 
-## 1. Root causes — what the source actually establishes
+## 1. Persian response quality — what changed
 
-The path was traced end to end:
-incoming update → `backend/bot/handlers/task_events.py` handler →
-`private_message.enforce_incoming` → `_apply_actions` → `_ai_response` →
-`_generate_ai_reply` → `ProviderManager.chat(messages, tools=[])` →
-`service.compose_ai_reply` → `client.send_message`.
+### 1.1 Why the previous fix could not be enough
 
-### 1.1 ESTABLISHED: the prompt was the quality defect
-
-The previous contract required Persian but said nothing about not inventing
-facts. The reported outputs are exactly what that allows: a reply that claims a
-religion/profession ("من مسیحیان است که به عنوان مساعد ذكاء صناعي … کار میکنم")
-invents facts the incoming message never stated; others are stiff,
-translation-flavoured or repeat the greeting back. The prompt also ordered "do
-not ask questions" absolutely (now qualified) and never required brevity or a
-plain greeting for a greeting. Source inspection also confirms `_generate_ai_reply`
-passes **only** the system contract plus the incoming text (`tools=[]`,
-`apply_persisted_config` first), so the model has no history, no sender and no
-facts — whatever it writes about itself is invented by construction.
-
-### 1.2 ESTABLISHED: no delivery-side filter existed
-
-`compose_ai_reply` accepted **any** non-empty string, appended the two notices
-and sent it. Consequences proven by the new tests:
-
-* a reply written entirely in **Arabic** was delivered;
-* a reply written entirely in **English** was delivered;
-* a 4,000-character wall of text was delivered up to the delivery ceiling;
-* if a model **echoed** the two notice lines, the delivered message carried each
-  of them **twice** — the application cannot detect that today because nothing
-  inspects the model's body for its own notice lines.
-
-### 1.3 ESTABLISHED: one verified update has exactly ONE action path
-
-* `enforce_incoming` is called by exactly one handler (`task_events`), which is
-  registered exactly once per client instance (`router.register_all`);
-  `_trigger_reconnect()` re-uses the same client (Telegram handlers are not
-  re-registered), and the failsafe full reset builds a **new** client and
-  registers on it — never twice on the same client.
-* `private_message.register` registers panels/actions/inputs only — **no**
-  message handler of its own.
-* Structurally there is one `await _apply_actions(`, one `await _ai_response(`,
-  one `await _generate_ai_reply(` and one `service.already_handled(` call site
-  (asserted by a new structural test), and `_ai_response` claims the allowance
-  through ONE CAS write under the per-sender lock before generating.
-* The account's own outgoing messages cannot re-enter: `enforce_incoming`
-  returns immediately when `event.out is True`, and the AI reply is sent by the
-  account itself, so its own update is outgoing.
-* The fixed response and the AI response are independent flags (own column, own
-  control) and BOTH run, in the documented delete → fixed → AI order; a repeat
-  of the same message is suppressed by the (chat, message) mark, so the pair is
-  never mistaken for a duplicate execution.
-
-### 1.4 NOT ESTABLISHED: the cause of the repeated disclosures
-
-The evidence in the request **cannot** be resolved by source inspection, and it
-is not asserted here. What the source does say:
-
-* three *different* bodies were observed. Three different bodies can be produced
-  by three separate incoming messages — and the bodies read as answers to three
-  different inputs — but a sampling provider can also vary the wording of one
-  input, so this is **not** proof either way;
-* the only *duplication* mechanism the source can explain is the echo case in
-  §1.2 (notices twice inside ONE reply). A duplicate *send* is not possible
-  without either a Telegram redelivery of the same update (suppressed by the
-  bounded `(chat, message)` mark, which was already in place) or a failure that
-  left the mark set while the actions never ran (now released — §2.3);
-* the honest conclusion is: **root cause not established from source**. The
-  production log lines `PRIVATE_MESSAGE_TRACE stage=unauthorized …`,
-  `stage=duplicate …` and `stage=ai_reply_rejected reason=…` now make it
-  decidable from the owner's own logs: three `stage=unauthorized` lines with
-  three different `message_id`s = three separate messages; a `stage=duplicate`
-  line at the same `message_id` = a redelivery.
-
----
-
-## 2. Changes made
-
-### 2.1 The system contract (`backend/bot/handlers/private_message.py`)
-
-Still exactly ONE system message and ONE user message — the context isolation is
-untouched (no names, ids, history, memory, media, reply context). Added to
-`_AI_SYSTEM_PROMPT`:
-
-* **no invention**: "Never invent or add an identity, name, age, job, religion,
-  nationality, biography, ability or any other fact the incoming message does not
-  state, and never describe yourself or your own situation";
-* **brevity and directness**: "Keep it brief and directly about the incoming
-  message: a simple greeting gets a short Persian greeting, nothing more";
-* **no echo**: "do not repeat the incoming message back";
-* **natural Persian, not translation**: "Write the way one Iranian writes to
-  another: contemporary, everyday Persian … not a word-for-word translation, not
-  an Arabic sentence … and never an Arabic expression";
-* **questions only when needed**: "Do not ask a question unless answering
-  genuinely requires one";
-* the previously verified Persian requirements, the Arabic/Arabic-expression
-  prohibitions, the plain-text-only rule and the "the notices are appended by
-  the system" rule are all preserved.
-
-### 2.2 Deterministic pre-send validation (`backend/services/private_message_service.py`)
-
-`validate_generated_reply(generated) -> (reason, body)` is the ONE verdict, and
-`compose_ai_reply` now runs it before composing. Reasons (all proven by tests):
-`empty`, `notices_only`, `too_long`, `no_letters`, `not_persian_script`,
-`arabic` — and `""` (deliverable). A refusal means **no send** and the ordinary
-safe-failure path: the claimed allowance is released (only a DELIVERED reply
-consumes it). A refused body is dropped, never repaired or paraphrased.
-
-* **Empty/whitespace-only** and non-string bodies → `empty`.
-* **Over-long** bodies (> `MAX_AI_GENERATED_LENGTH` = 1200 chars, a documented
-  short-reply envelope; the existing 4,000-char delivery ceiling still applies
-  to the composed text) → `too_long`.
-* **Letter-less** bodies (punctuation/emoji/digits only) → `no_letters`.
-* **Foreign script**: no Persian/Arabic-script letters at all, or Latin letters
-  outnumbering them (an English answer) → `not_persian_script`.
-* **Clearly Arabic** → `arabic`, using the deliberately asymmetric check in
-  §5: it needs Arabic evidence AND the total absence of Persian evidence.
-* **Echoed notices**: the two application-owned notice LINES are removed from
-  the model's body before composing (line-exact, logged), so each notice appears
-  exactly once; a body that is only the notices → `notices_only`.
-
-### 2.3 Duplicate protection (`enforce_incoming`)
-
-* The guard is the existing stable key: the **verified** `(chat_id, message_id)`
-  pair from the scope gate, marked BEFORE the actions run.
-* The check and the mark are **synchronous**, so two coroutines racing on the
-  same update cannot both pass it (the concurrency test proves it), and the
-  per-sender lock plus the durable CAS claim still bound what one person can
-  spend.
-* **New**: `service.release_handled(chat_id, message_id)` — the mark is released
-  again when enforcement failed BEFORE the actions ran, so a message the feature
-  never actually handled is not remembered as done. A completed enforcement
-  keeps its mark, and each individual step (delete/fixed/AI) still fails
-  independently without suppressing the others — the existing action semantics
-  are unchanged.
-* No new scheduler, executor, client, listener, loop or parallel runtime; no
-  unbounded structure (the registry stays bounded, TTL 900 s, max 512 entries,
-  process-local as before).
-
----
-
-## 3. Files changed and why
+The previous change (`702c1d1`) added a prompt contract plus a deterministic
+validator. The reported body proves the gap:
 
 ```
-backend/bot/handlers/private_message.py    edit — the tightened system contract; the release-on-failure
-                                                  duplicate mark; docstrings for both
-backend/services/private_message_service.py edit — MAX_AI_GENERATED_LENGTH, the script/vocabulary evidence
-                                                  tables, is_clearly_arabic, validate_generated_reply,
-                                                  notice de-duplication, release_handled, module docstring
-tests/test_private_message_scope.py        edit — the prompt contract tests, the validator tests, the
-                                                  duplicate/concurrency/action-independence/outgoing tests,
-                                                  the structural single-path test; existing harness texts
-                                                  updated to valid Persian bodies
+سلام، من در خدمت شما هستم. لطفاً حرفی به شما میادی میکنم. چگونه می توانم به شما کمک کنم؟
 ```
 
-No unrelated refactor, no dependency added (`unicodedata` is stdlib, already used
-elsewhere in this repository), no environment variable added, no schema change,
-no SQL executed, `DATABASE_ARCHITECTURE.md` untouched, no second AI runtime and
-no change to any other feature's behaviour (the constant and the validator are
-local to this feature — asserted by the existing locality test).
+It is **Persian script**, has letters, is inside the length envelope, is not
+Latin-dominant and is not classified as Arabic — so it passed every check that
+existed and was delivered. The specific mechanical defect is `می توانم`: Persian
+writes the imperfective prefix **attached** to its verb (`میتوانم`, joined with
+a ZWNJ, or `میتوانم`). A whitespace-delimited token that is exactly the bare
+prefix is not Persian word formation — it is the mark of mechanically generated
+pseudo-Persian. (`من در خدمت شما هستم` is a separate, non-deterministic problem:
+a stiff ceremonial opener; that half is addressed by the contract, §1.3.)
+
+### 1.2 Changes (`backend/services/private_message_service.py`)
+
+1. **A new deterministic refusal: `malformed_persian_prefix`.** A
+   whitespace-delimited word that is exactly `می` or `نمی` refuses the body. The
+   ZWNJ is deliberately **not** a separator, so `میتوانم` / `نمیدانم` stay ONE
+   token and correct Persian is never hit (proven by tests).
+2. **A new deterministic refusal: `repetitive_greeting`.** A body that uses the
+   same greeting word more than once (`سلام! سلام، خوبی؟`) is refused — the
+   "repetitive greetings" class from the request. The word list is three
+   greetings long and is documented as one narrow defect class, not a grammar
+   check.
+3. **A deterministic answer path for a confidently recognized bare greeting.**
+   `classify_trivial_greeting()` matches the ENTIRE incoming message (after
+   removing invisibles, trimming punctuation, folding Arabic yeh/kaf and alef
+   variants, lower-casing, and bounding the length and word count) against a
+   small documented greeting list (`سلام`, `سلام علیکم`, `السلام علیکم`, `درود`,
+   `وقت بخیر`, `صبح/ظهر/عصر/شب بخیر`, `hi`, `hello`, …). A message with any extra
+   content — a question, a request, a name — is **not** trivial and stays an
+   ordinary AI request.
+4. **`MAX_TRIVIAL_GREETING_REPLY_LENGTH = 80`** and
+   `compose_trivial_greeting_reply()`. If the model's body for a recognized bare
+   greeting is refused **or** longer than that envelope, the delivered body is
+   the short idiomatic Persian greeting for that greeting's time of day
+   (`سلام! وقت شما هم بخیر.` / `صبح شما هم بخیر.` / …). Nothing about the owner or
+   the assistant is claimed in it, and no question is asked.
+5. **`validate_generated_reply` documents its own limit** ("not provably
+   malformed", never "proven fluent"). No claim of a Persian grammar detector is
+   made anywhere.
+
+### 1.3 Changes (`backend/bot/handlers/private_message.py`)
+
+1. **Few-shot examples inside the existing system contract** (not extra
+   messages — the request shape stays exactly `[system, user]`), covering a
+   greeting, thanks, a Latin-script message, a simple social question and a
+   message that needs no elaborate answer. They state the register and the
+   expected LENGTH, are explicitly "examples, never templates", and every
+   previously asserted prompt requirement is preserved verbatim (verified by the
+   existing prompt tests, which still pass unchanged).
+2. **A bounded regeneration: exactly ONE retry** (`AI_GENERATION_ATTEMPTS = 2`)
+   for a **general** request whose body was refused. It reuses the same provider
+   path (`ProviderManager.chat(messages, tools=[])`), the same context isolation
+   (still exactly two messages, still no history/name/id/context), and appends a
+   repair instruction (`_AI_CORRECTION_PROMPT`) to the **system** contract. A
+   second refusal is dropped: nothing is sent and the claimed allowance is
+   released. A bare greeting never spends a second provider call — it is answered
+   deterministically (§1.2).
+3. **The provider is still always called first for every eligible AI-response
+   message.** The deterministic greeting is a *fallback for a bad body*, never a
+   substitute for generation: if the provider fails outright (exception,
+   timeout, `success=False`, empty text) the ordinary safe-failure path runs —
+   no canned text is sent and the claim is released.
 
 ---
 
-## 4. Tests run and exact outcomes
+## 2. Deterministic code vs provider quality — the honest split
+
+**Guaranteed by deterministic code (offline-proven):**
+
+* the reported malformed body is refused, with reason `malformed_persian_prefix`
+  — it can never be delivered again;
+* a body with a detached `می`/`نمی` prefix, or that greets twice, is refused;
+* empty, whitespace-only, letter-less, over-long, English/Latin-dominant and
+  clearly Arabic bodies are refused (pre-existing checks, unchanged);
+* a recognized bare greeting is answered by **one** short idiomatic Persian
+  greeting, never by an elaborate or self-describing paragraph, even when the
+  model proposes one;
+* both application-owned disclosures are appended exactly once, outside the
+  model's body, on every delivery path (model body, deterministic greeting, and
+  after a successful regeneration);
+* no refused body is ever sent; a refusal/failure releases the claim and consumes
+  nothing;
+* the context isolation is unchanged: exactly the system contract (plus, on the
+  retry only, the repair sentence) and the incoming message text reach the
+  provider — asserted by tests on the exact message list, roles and kwargs.
+
+**NOT guaranteed by deterministic code — provider-quality dependent:**
+
+* whether an arbitrary, non-greeting Persian sentence a provider produces is
+  genuinely fluent, grammatical and idiomatic. Nothing here is a Persian grammar
+  or semantics checker; the deterministic checks certify **shape**, and the
+  greeting path is the only place a final body is fully deterministic.
+* whether the model respects the contract's prohibition on inventing biography,
+  identity, religion, profession or abilities. There is no deterministic way to
+  prove a sentence invents nothing (the earlier attempt at keyword lists is
+  exactly what this task forbids re-doing). It is enforced by the contract, by
+  the few-shot examples (none of which contains an invented fact), and by the
+  deterministic greeting body, which contains no self-description at all.
+* fluency of a **general** request's reply that survived validation. The bounded
+  regeneration raises the chance of a good result; it does not certify one.
+
+---
+
+## 3. Automatic per-person counter reset — semantics
+
+**Configurable.** Two settings on the existing Private Message Management panel:
+`ai_counter_reset_enabled` (default **OFF**) and `ai_counter_reset_seconds`
+(default **86400** = one day, allowed range **60 s … 365 days**).
+
+**Window semantics (rolling, deterministic, restart-safe):**
+
+* Each person's used count lives in a **rolling window anchored to their first
+  counted reply in the current window** (`private_message_senders.window_started_at`).
+* The window is **only ever rolled in the incoming-message quota path**. There is
+  **no periodic task, scheduler, background loop, worker or new runtime**; the
+  same is true for the whole feature.
+* When automatic reset is ON and `now − window_started_at ≥
+  ai_counter_reset_seconds`, the **next eligible incoming message** observes the
+  expired window, resets that person's count to zero and starts a new window
+  **inside the same claim**. That message is the first reply of the new window, so
+  the person's allowance becomes available again exactly then — and the ceiling
+  applies again immediately.
+* The reset is evaluated and applied **atomically with the counter claim**: it is
+  the same conditional write. There is no separate step that could disagree with
+  the allowance.
+* When automatic reset is **OFF**, nothing ever expires (a manual reset is the
+  only edge) — but the window anchor is still maintained, so enabling the feature
+  later never loses a person's position.
+* A **process restart cannot reset a counter or restart a window**: both are
+  durable columns.
+* An automatic reset **resets the count only**. The maximum, the minimum interval
+  between replies, the three action flags and eligible-message scope are
+  unaffected.
+* The **minimum interval (`ai_interval_seconds`) is a separate floor** read from
+  the last *delivered* reply, independently of the window — so a reset never
+  shortens the anti-spam delay.
+* **Human-private eligibility still precedes everything**: the scope gate runs
+  first and fails closed, so a bot, group, supergroup, channel, linked discussion
+  group, outgoing message, unresolved sender or contradictory event never
+  creates a window, never rolls one, never claims and never spends anything.
+
+### 3.1 Panel controls (`Menu → Private Messages → Closing actions`)
+
+| Control | Kind | Effect |
+|---|---|---|
+| `Automatic counter reset` | toggle (`action:pm_reset_window`) | enables/disables the automatic reset; the rendered mark and the stored value agree |
+| `Set counter reset interval` | input (`input:pm_policy:reset_interval`) | accepts a whole number of **minutes** or an explicit unit (`90s`, `30m`, `2h`, `3d`, case-insensitive); rejects malformed, negative, fractional, unknown-unit, overflowing and out-of-range input **without changing anything**, and says so |
+| `Max AI replies per person` | input (pre-existing) | unchanged |
+| `Unlimited AI replies` | toggle (pre-existing) | unchanged |
+| `Set AI reply interval` | input (pre-existing) | unchanged |
+| `Reset AI counters` | action (pre-existing) | manual reset, unchanged |
+
+The panel reports the current reset configuration in **both** the main panel and
+the Closing Actions panel, including the explicit `OFF (counters only change when
+you reset them)` state, and the Closing Actions panel documents the window
+semantics in the same text the owner's question is answered with (when a window
+starts, when the allowance returns, and that only the count is reset). All
+symbols come from the existing registry (`sym.SCHEDULE_INTERVAL`, `sym.ICON_STATS`,
+`_mark`) — no emoji literal and no variation-selector glyph was introduced.
+
+---
+
+## 4. Manual reset and unlimited mode — unchanged behaviour, re-verified
+
+* **Manual reset** (`Reset AI counters`, `action:pm_reset_counters`): deletes that
+  owner's counter rows, which clears the used count **and** the reset window for
+  every tracked person of this owner, with truthful success/failure reporting (a
+  failed delete reports failure and the panel says so).
+* **Unlimited mode**: bypasses the maximum-count ceiling only. It does **not**
+  disable the separate `ai_interval_seconds` floor, and it does not change the
+  window/eligibility rules.
+* **A delivered reply consumes one reply** under limited mode; a failed or
+  rejected generation/delivery releases its claim (including restoring the
+  expired window it had rolled, so a failure cannot silently hand out a fresh
+  window).
+* The delete / fixed-response / AI-response actions remain independent and keep
+  their fixed order.
+
+---
+
+## 5. Schema change required — MANUAL SUPABASE ACTION
+
+The existing tables do **not** contain the necessary fields, so this feature
+needs a schema change. It is provided as a repository artifact only:
+
+```
+supabase/migrations/20261016000001_add_private_message_counter_reset.sql
+```
+
+| Object | Change | Why |
+|---|---|---|
+| `private_message_config.ai_counter_reset_enabled` | `boolean NOT NULL DEFAULT false` | the automatic-reset switch; OFF by default so applying the file can never start resetting anything |
+| `private_message_config.ai_counter_reset_seconds` | `integer NOT NULL DEFAULT 86400`, `CHECK (BETWEEN 60 AND 31536000)` | the window length; the CHECK mirrors the panel's own bounds |
+| `private_message_senders.window_started_at` | `timestamptz` (nullable) | the person's window anchor. NULL means "no window recorded yet" and the next counted reply starts one — deliberately not `NOT NULL DEFAULT now()`, which would backfill everyone with an artificial instant this migration cannot know |
+
+Pure `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` / constraint swap: additive,
+idempotent, no table created or dropped, no row touched, no RLS/grant change, no
+counter reset, no allowance handed out. It is **not** part of the ONE setup block
+in `DATABASE_ARCHITECTURE.md` §31.3 (that document is protected and was not
+edited), so **the owner must apply it manually in the Supabase SQL editor**.
+
+**Consequences until it is applied (stated honestly):** the configuration write
+names the two new columns, so on a database without them Supabase rejects the
+statement, the service keeps the previous in-memory state and every Private
+Message setting save reports failure instead of pretending to be stored. No
+automatic reset can run. **Automatic reset is therefore NOT claimed operational
+until the owner applies the SQL and verifies it.**
+
+**CAS dependency to be aware of:** the claim's conditional write now includes the
+window (`ai_replies_used` **and** `window_started_at`), which is what closes the
+boundary race described in §3. The filter is only added when the row actually has
+a window, and a PostgreSQL `timestamptz` equality is a timestamp comparison, so
+the value read from the row round-trips exactly (the same pattern the existing
+release CAS already used for `last_ai_reply_at`). This is the one behaviour that
+has to be confirmed against the real Supabase project after the migration is
+applied.
+
+---
+
+## 6. Files changed and why
+
+```
+backend/bot/handlers/private_message.py             edit — few-shot examples in the system contract,
+                                                            _AI_CORRECTION_PROMPT, _generate_reply_body
+                                                            (bounded regeneration + greeting envelope),
+                                                            the two reset controls (toggle + input),
+                                                            panel status text and window documentation
+backend/services/private_message_service.py         edit — reset config fields + bounds + parse/format
+                                                            helpers + setters + summary fields; the greeting
+                                                            classifier, the deterministic greeting reply, the
+                                                            two new validator refusals; module docstring
+backend/db/client.py                                edit — window-aware claim decision, the window in the
+                                                            CAS identity, the window in the release
+                                                            compensation, the two new config columns
+supabase/migrations/20261016000001_add_private_message_counter_reset.sql
+                                                    new  — the reviewable, additive SQL proposal (§5);
+                                                            NOT executed
+tests/test_private_message_scope.py                 edit — 27 new tests (quality + quota/reset, end to end
+                                                            through the real handler and the real db contract);
+                                                            2 existing tests re-pointed at a non-greeting input
+tests/test_private_message_panel.py                 edit — 3 new tests (registration, rendered status +
+                                                            window documentation, toggle/input validation)
+```
+
+No other file was touched: no new scheduler/worker/event handler/Telegram
+client/executor/AI runtime, no dependency added, no environment variable added,
+no SQL executed, no other feature's behaviour changed (`_AI_SYSTEM_PROMPT` is
+still referenced by this module only — asserted by the pre-existing locality
+test), and the request-shape structural counts are unchanged (one
+`_apply_actions`, one `_ai_response`, one `_generate_ai_reply`, one
+`already_handled`, two `_send_text` call sites).
+
+---
+
+## 7. Tests run and exact outcomes
 
 | Command | Result |
 |---|---|
-| `pytest tests/test_private_message_scope.py -q` | **90 passed** (68 before this task; 22 new) |
-| `pytest tests/test_private_message_management.py -q` | **38 passed** |
-| `pytest tests/test_private_message_panel.py -q` | **47 passed** |
-| `pytest … scope + management + panel + canonical schema + setup order + symbols -q` | **261 passed** |
-| Full offline suite, run in 6 chunks (6294 collected): chunk 1 / chunk 2+3 / chunk 4+5+6 | 1221 + 1947 + 3059 passed = **6227 passed, 27 skipped, 40 failed** |
-| Full offline suite **excluding `tests/test_colored_buttons.py`** (the failing file) | **6215 passed, 27 skipped, 0 failed** |
-| `python3 -m py_compile` on both changed Python files + the test file | clean |
-| `git diff --check` | clean |
+| `pytest tests/test_private_message_scope.py -q` | **117 passed** (90 before → +27) |
+| `pytest tests/test_private_message_management.py -q` | **38 passed** (unchanged) |
+| `pytest tests/test_private_message_panel.py -q` | **50 passed** (47 before → +3) |
+| the three files together | **205 passed** |
+| `tests/test_database_setup_order.py` + `tests/test_canonical_schema_reconciliation.py` + `tests/test_symbols.py` | **87 passed** (the new migration file is additive and undocumented in §31, as designed) |
+| full offline suite, this tree | **6258 passed, 27 skipped, 40 failed** (6325 collected) |
+| full offline suite, pristine base revision `702c1d1` | **6228 passed, 27 skipped, 40 failed** (6295 collected) |
+| failure-set diff (base vs this tree) | **identical — zero new failures**, +30 passed |
+| `python -m py_compile` on the three changed modules + both changed test modules | clean |
+| `git diff --check` (worktree and staged) | clean |
 
 The 40 failures are **entirely** `tests/test_colored_buttons.py`
 (`Button style 'primary' rejected by Telethon`): this sandbox has Telethon
-1.34.0 while the repository pins 1.43.0. Pre-existing, unrelated to this task —
-every other test file passes.
+**1.34.0** while the repository pins 1.43.0. They were reproduced unchanged on
+the pristine base revision — pre-existing and unrelated to this task.
 
-New tests (all offline, driving the REAL `task_events` → `enforce_incoming` path
-with real Telethon entities, a recording Telegram client and a recording
+**One pre-existing time-dependent test flaw (not touched, not mine):**
+`tests/test_private_message_panel.py::test_the_schedule_panel_names_the_next_transition`
+fails whenever the wall clock is inside the rule it creates (22:00–23:00 UTC),
+because the panel then correctly reports the rule's *end* as the next transition
+while the test asserts the *start*. It failed on the pristine base revision at
+22:55 UTC and passed in both trees after 23:00 UTC — i.e. it is a wall-clock
+dependent test, unrelated to this change (and fixed by nothing here).
+
+New tests (all offline; they drive the real `task_events → enforce_incoming`
+path with real Telethon entities, a recording Telegram client and a recording
 provider):
 
 | Requirement | Test |
 |---|---|
-| `سلام` → one Persian reply, notices once | `test_a_simple_greeting_is_answered_once_in_persian_with_one_copy_of_each_notice` |
-| Arabic/English input never changes the contract | `test_the_incoming_language_never_changes_the_contract` |
-| Prompt forbids invented facts/self-description | `test_the_prompt_forbids_inventing_facts_and_describing_itself` |
-| Prompt requires brevity/natural Persian | `test_the_prompt_requires_brevity_and_natural_persian_over_translation` |
-| Empty / whitespace-only rejected | `test_the_reply_validator_refuses_empty_and_whitespace_only_bodies` |
-| Malformed & foreign script rejected | `test_the_reply_validator_refuses_letterless_and_foreign_script_bodies` |
-| Clearly Arabic rejected (7 samples) | `test_the_reply_validator_refuses_clearly_arabic_bodies` |
-| Valid everyday Persian accepted (13 samples) | `test_the_reply_validator_keeps_valid_persian_and_the_ambiguous_greeting` |
-| Over-long → safe failure path + claim released | `test_the_reply_validator_refuses_an_over_long_body`, `test_an_over_long_reply_takes_the_safe_failure_path_and_releases_the_claim` |
-| Validation reads only the generated text | `test_the_reply_validator_reads_only_the_generated_text` |
-| Disclosures exactly once (incl. model echo) | `test_the_disclosures_are_appended_exactly_once_even_when_the_model_echoes_them`, `test_the_ai_reply_carries_both_disclosures_exactly_once`, `test_a_body_that_is_only_the_notices_is_refused` |
-| Duplicate update cannot answer twice | `test_a_duplicate_delivery_of_one_message_answers_once` |
-| Concurrent duplicates cannot bypass the guard | `test_concurrent_deliveries_of_one_message_answer_once` |
-| Same sender, different message still answered | `test_a_different_message_from_the_same_sender_is_still_answered` |
-| Fixed + AI both run once, not mistaken for duplicates | `test_both_independent_responses_run_once_for_one_message` |
-| Failed validation/generation/delivery releases the claim | above + the existing `test_only_a_delivered_reply_consumes_the_allowance`, `test_a_failed_delivery_gives_the_claim_back`, `test_an_unreadable_counter_store_fails_closed` |
-| Failed enforcement is not remembered as handled | `test_a_failure_before_the_actions_does_not_remember_the_message_as_handled`, `test_a_completed_enforcement_keeps_the_duplicate_mark` |
-| The account's own outgoing reply is never incoming | `test_the_accounts_own_sent_reply_is_never_an_incoming_human_message` |
-| One action path per update (structural) | `test_one_incoming_message_has_exactly_one_action_path` |
-| Eligibility boundary unchanged | every pre-existing bot/group/channel/supergroup/unresolved-entity test still passes |
+| the exact reported malformed body | `test_the_reported_malformed_persian_reply_is_refused` |
+| detached verb prefix refused, attached forms kept | `test_a_detached_persian_verb_prefix_is_refused_but_attached_forms_are_not` |
+| repetitive greeting refused | `test_a_reply_that_greets_twice_is_refused` |
+| only a bare greeting is trivial | `test_only_a_bare_greeting_is_classified_as_a_trivial_greeting` |
+| the deterministic greeting is short, natural, discloses once, invents nothing | `test_the_deterministic_greeting_is_short_natural_and_carries_both_disclosures_once` |
+| few-shot examples exist without weakening the contract | `test_the_prompt_carries_idiomatic_few_shot_examples_without_weakening_the_contract` |
+| the reported case end to end (provider still asked; broken body never sent) | `test_the_reported_malformed_reply_makes_a_bare_greeting_get_the_short_greeting` |
+| elaborate-but-valid greeting reply replaced | `test_an_elaborate_but_valid_reply_to_a_greeting_is_replaced_by_the_short_greeting` |
+| provider failure never yields canned text | `test_a_provider_failure_never_produces_a_canned_reply` |
+| bounded regeneration (exactly one, same isolation) then drop | `test_a_refused_body_for_a_general_request_is_regenerated_once_then_dropped` |
+| the regeneration is a real repair path | `test_the_bounded_regeneration_delivers_a_good_second_attempt` |
+| disclosures exactly once on every path | `test_the_disclosures_land_exactly_once_on_every_delivery_path` |
+| automatic reset disabled | `test_automatic_reset_is_off_by_default_and_nothing_is_ever_rolled` |
+| first reply starts the window; ceiling holds inside it | `test_the_first_reply_starts_the_window_and_the_limit_holds_inside_it` |
+| eligible again only after expiry | `test_the_same_person_becomes_eligible_again_only_after_the_window_expires` |
+| two people, independent windows | `test_two_people_keep_independent_reset_windows` |
+| manual reset clears counts and windows | `test_a_manual_reset_clears_the_counts_and_the_windows` |
+| unlimited bypasses the ceiling, keeps the interval | `test_unlimited_mode_bypasses_the_ceiling_but_keeps_the_minimum_interval` |
+| counter-store failure fails closed at a boundary | `test_a_counter_store_failure_at_a_reset_boundary_fails_closed` |
+| failure restores the expired window | `test_a_failed_generation_restores_the_expired_window_instead_of_restarting_it` |
+| restart keeps the window | `test_the_window_survives_a_restart` |
+| concurrent messages at the boundary | `test_concurrent_messages_at_a_reset_boundary_do_not_bypass_the_quota` |
+| the persistence contract closes the boundary race (real db path, stale read) | `test_the_persistence_contract_itself_closes_the_window_race` |
+| the window is part of the CAS identity | `test_the_reset_window_is_part_of_the_claim_cas_identity` |
+| out-of-scope events touch no window | `test_an_out_of_scope_event_never_creates_or_rolls_a_reset_window` |
+| reset config validated, never half applied | `test_the_reset_configuration_is_validated_and_never_half_applied` |
+| interval input: units accepted, junk refused | `test_the_reset_interval_input_accepts_units_and_refuses_anything_else` |
+| one control per setting, no duplicates | `test_the_actions_panel_carries_exactly_one_control_per_setting` |
+| rendered status agrees with storage, ON and OFF | `test_the_panel_shows_the_reset_configuration_including_when_it_is_disabled` |
+| input validation + documented semantics in the panel | `test_the_reset_interval_input_validates_and_states_the_window_semantics` |
+
+All pre-existing eligibility (bot / group / supergroup / channel / discussion
+group / unresolved sender / outgoing), duplicate-update, action-independence,
+context-isolation and ProviderManager-usage regressions still pass unchanged —
+except the **two** tests whose input had to change: they asserted that an
+Arabic/over-long model body is never sent, and they used `سلام` as the input,
+which is now (deliberately) a deterministic greeting rather than a provider body.
+Their input is now a general Persian request, so the assertion keeps its exact
+original meaning.
 
 ---
 
-## 5. Persian-output validation: what it catches, what it does not
+## 8. Live verification — what remains
 
-`is_clearly_arabic` is a **bounded deterministic heuristic**, not language
-detection:
+**NOT verified live.** This workspace has no `API_ID`/`API_HASH`/`SESSION_STRING`
+and no AI provider credentials, so **no provider was called and no Telegram
+request of any kind was made**. Specifically **not** claimed: that the configured
+provider now returns fluent Persian for arbitrary inputs, and that the automatic
+reset behaves correctly against the real Supabase project.
 
-* **Never rejects a shared code point.** `سلام` alone — the exact ambiguous
-  greeting from the report — is accepted (`_persian_evidence` finds nothing and
-  `_arabic_tokens` finds nothing, so the Arabic verdict is impossible).
-* **Arabic evidence** = Arabic-only letter forms (`ك ي ة ى`), Arabic-only
-  vocabulary tokens (`في`, `على`, `كيف`, `حالك`, `شكرا`, `مرحبا`, `السلام`,
-  `عليكم`, … matched as whole tokens after diacritic removal and alef folding).
-* **Persian evidence** = Persian-only letters (`پ چ ژ گ`), Persian kaf/yeh
-  (`ک ی`), Persian function words as whole tokens (`را`, `که`, `این`, `از`,
-  `شما`, `چطور`, `کنم`, …) and Persian morphology (the `می`/`نمی` prefix and the
-  `است` copula suffix).
-* **Verdict rule**: Arabic verdict = (≥2 Arabic tokens) OR (≥1 Arabic token AND
-  an Arabic-only letter form) OR (half the letters are Arabic-only forms) AND
-  **no** Persian evidence at all.
-* **Verified behaviour**: 13 everyday Persian replies (including ones with no
-  Persian-only letter: `سلام`, `وقت بخیر، الان پاسخ می‌دم.`, `بله، حتماً`) are
-  accepted, and 7 Arabic replies are rejected.
-
-**Honest limitations** (measured, not hidden): `أنا هنا لمساعدتك` was accepted
-before the alef folding was added and is rejected now, but the heuristic remains
-conservative by design — an Arabic sentence of unlisted vocabulary can pass, and
-a Persian sentence typed entirely with Arabic-form letters (`ك`/`ي`) and none of
-the listed Persian words would be rejected. The validator also **cannot** judge
-fluency: two of the three reported outputs are technically Persian and are
-accepted — the prompt is the tool for those, not the validator. No claim of
-perfect language detection is made anywhere in this change.
-
----
-
-## 6. Duplicate protection: guarantees and limitations
-
-**Guaranteed (offline-proven):** for ONE verified incoming human private-chat
-message, exactly one enforcement runs per process: one provider generation and
-one AI send; a redelivery of the same `(chat, message)` pair and a concurrent
-second delivery of it are both suppressed; the fixed response and the AI response
-still each run once when both are enabled; different messages from the same
-person are still answered under the ordinary quota/interval rules; and an
-enforcement that failed before its actions ran is not remembered as handled.
-Outgoing (self-account) messages can never enter the path.
-
-**Limitations:** the mark lives in the same bounded, TTL'd, **process-local**
-registry as before (a restart or a second process instance forgets it — durable
-per-message dedup would need a new table, which this task was explicitly
-forbidden from adding), and the per-person interval/limit remains the durable
-backstop for that case. Telegram redelivery is already bounded by the TTL.
-
----
-
-## 7. Live verification — what remains
-
-**NOT verified live:** no provider was called and no Telegram session exists in
-this workspace, so "actual Persian fluency from the configured provider" is NOT
-claimed. The checks proven here are the prompt contract, the request
-construction, the validation/safety behaviour and the duplicate semantics.
-
-The exact acceptance test for the owner (after deploying `main`; Supabase needs
-no change for this task):
+The exact owner acceptance steps (after deploying `main` **and applying the SQL in
+§5**):
 
 1. `Menu` → **Private Messages → Closing actions** → mode **Closed** → enable
    **Send AI response**, interval `0`, a limit ≥ 3.
-2. From a second human account send `سلام`. Expect **one** short Persian reply,
-   ending with each notice exactly once.
-3. Send an Arabic message (`كيف حالك؟`) and an English one (`hello`). Expect two
-   Persian replies (the incoming language never decides the reply language).
-4. Send several messages from a different account and confirm no reply repeats,
-   and that the AI counter advances once per delivered reply.
-5. If a reply ever looks wrong, `PRIVATE_MESSAGE_TRACE` now names it:
-   `stage=ai_reply_rejected reason=<empty|notices_only|too_long|no_letters|not_persian_script|arabic>`,
-   `stage=duplicate message_id=…`, or `stage=unauthorized … message_id=…` — these
-   lines distinguish "one bad reply" from "the same message answered twice"
-   without reading message contents.
+2. From a second human account send `سلام`. Expect **one** short Persian
+   greeting (not an elaborate paragraph), ending with each notice exactly once.
+3. Send a general request (e.g. `میشه کمکم کنی؟`). Expect a short Persian reply;
+   if the model returns a broken body it is refused and retried once, and nothing
+   is sent if the retry also fails (the counter does **not** advance).
+4. In **Closing actions**, enable **Automatic counter reset** and set the interval
+   to `2m`. Send enough messages to hit the limit, wait past two minutes from the
+   person's first reply in the window, then send another: it must be answered
+   again (the counter restarts at 1) — before the interval elapses it must not be.
+5. Use **Reset AI counters** and confirm counts *and* windows are cleared; toggle
+   **Unlimited AI replies** and confirm the ceiling is gone while the reply
+   interval still throttles.
+6. Useful log lines: `PRIVATE_MESSAGE_TRACE stage=ai_reply_rejected reason=<…>
+   attempt=<1|2>`, `stage=ai_greeting_too_elaborate`, and
+   `[PM_DB] counter window expired, count reset: owner=… sender=… was=…`.
+
+---
+
+## 9. Delivery state
+
+Delivered as **one commit on `main`** carrying the code, the SQL proposal, the
+tests and this report; it is pushed fast-forward to `origin/main` only because
+the branch was verified to be exactly the remote's ancestor (no rebase, no
+force-push, no history rewrite, no unrelated file staged). The verified remote
+SHA, the `merge-base --is-ancestor` result and the final working-tree state are
+re-verified with the commands below after the push and reported to the owner:
+
+```
+git fetch origin
+git rev-parse origin/main
+git merge-base --is-ancestor <sha> origin/main
+git status --short
+```
