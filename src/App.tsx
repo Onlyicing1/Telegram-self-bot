@@ -8,11 +8,14 @@ import AIConfigPanel from './components/AIConfigPanel';
 
 type Tab = 'saves' | 'bio' | 'ai' | 'logs';
 
+// Every key must be a key of the backend allow-list (backend/helper/font_style.py):
+// the settings endpoint rejects anything else, so an off-registry key could never
+// persist. Labels name the CSS family this selector applies, not the registry style.
 const DASHBOARD_FONT_OPTIONS: { key: string; label: string; stack: string }[] = [
   { key: 'default', label: 'Default', stack: "'Inter', 'SF Pro Display', -apple-system, system-ui, sans-serif" },
-  { key: 'system', label: 'System', stack: "system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif" },
+  { key: 'sans', label: 'Sans', stack: "system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif" },
   { key: 'mono', label: 'Monospace', stack: "ui-monospace, 'SF Mono', 'Cascadia Code', Menlo, Consolas, monospace" },
-  { key: 'serif', label: 'Serif', stack: "Georgia, 'Times New Roman', serif" },
+  { key: 'serif_bold', label: 'Serif', stack: "Georgia, 'Times New Roman', serif" },
 ];
 
 function applyFont(key: string) {

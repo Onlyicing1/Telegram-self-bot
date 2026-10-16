@@ -207,7 +207,9 @@ _FONT_REGISTRY["parenthesized"] = FontDef(
     "parenthesized", "Parenthesized", _offset_family(0x249C, 0x249C),
 )
 # Combining-mark styles apply their mark per character, so digits are
-# underlined/struck equally — readable and consistent.
+# underlined/struck equally — readable and consistent. Each mark is a
+# distinct decoration (horizontal / diagonal / overlay / above), never an
+# alias of another style.
 _FONT_REGISTRY["underline"] = FontDef(
     "underline", "Underline", _combining("\u0332"), has_digit_glyphs=True,
 )
@@ -219,6 +221,19 @@ _FONT_REGISTRY["overline"] = FontDef(
 )
 _FONT_REGISTRY["wavy_underline"] = FontDef(
     "wavy_underline", "Wavy Underline", _combining("\u0330"), has_digit_glyphs=True,
+)
+_FONT_REGISTRY["double_underline"] = FontDef(
+    "double_underline", "Double Underline", _combining("\u0333"),
+    has_digit_glyphs=True,
+)
+_FONT_REGISTRY["slash_through"] = FontDef(
+    "slash_through", "Slashed", _combining("\u0338"), has_digit_glyphs=True,
+)
+_FONT_REGISTRY["tilde_overlay"] = FontDef(
+    "tilde_overlay", "Tilde Overlay", _combining("\u0334"), has_digit_glyphs=True,
+)
+_FONT_REGISTRY["dot_above"] = FontDef(
+    "dot_above", "Dotted", _combining("\u0307"), has_digit_glyphs=True,
 )
 
 #: All valid font keys, in registry order (default first).

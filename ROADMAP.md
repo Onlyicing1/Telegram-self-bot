@@ -1197,6 +1197,30 @@ Current truth after the Phase 0–6 code slices:
 
 ---
 
+## 36. Concurrent feature status — Display-Font Registry Expansion
+
+> **NOT part of the Emoji & Reaction roadmap.** The sections above are
+> unchanged. This bounded block exists only so the roadmap reflects the status
+> of the concurrently delivered font feature (§7 of its delivery task); it is a
+> status record, never a changelog, and it does not accumulate a second
+> feature's architecture. Canonical record:
+> `docs/implementation/font-style-registry-expansion.md`.
+
+| Item | Status |
+|---|---|
+| Feature | Expand the existing code-defined display-font registry with additional useful Unicode styles |
+| Status | **COMPLETE** (code, tests, documentation) — **live Telegram rendering NOT verified** |
+| Registry | `backend/helper/font_style.py` — **23 → 27 keys**, append-only |
+| Added styles | `double_underline` (Double Underline), `slash_through` (Slashed), `tilde_overlay` (Tilde Overlay), `dot_above` (Dotted) |
+| Why these | All 13 Unicode mathematical letter families and all 5 digit runs were already implemented; the genuinely missing, technically distinct styles were decorative combining marks. Enclosed-letter candidates were rejected (uppercase-only, or would have changed the existing `parenthesized` style) |
+| Files changed | `backend/helper/font_style.py`, `src/App.tsx` (dashboard option keys were off-registry: `system`/`serif` rejected by the validator → now `sans`/`serif_bold`), `tests/test_68_font_registry_expansion.py` (NEW, 64 tests), `docs/implementation/font-style-registry-expansion.md` (NEW), this section |
+| Tests | focused file 64 passed; font suites 209 passed / 23 pre-existing skips; full suite **5958 passed, 27 skipped, EXIT 0** (+64 vs the 5894 baseline, 0 regressions); `compileall` OK; `tsc -p tsconfig.app.json` exit 0; `git diff --check` clean |
+| Compatibility | default font, invalid-key fallback, persisted selections, style order and every pre-existing style's output are unchanged; the Font panel, settings validator, AI send-tool enum and task wizard all follow the single registry |
+| Known limitation | `panel_settings_dashboard_font_check` still enumerates the previous 23 keys (no migration was allowed by the task), so a new key cannot persist across a restart until the owner applies the documented manual SQL; `DATABASE_ARCHITECTURE.md` and `supabase/` were deliberately left untouched |
+| Unicode limitation | Latin letters + standalone digits only; Persian/Arabic and every non-ASCII letter are preserved untouched (no Persian styling is claimed); the styles are Unicode character transforms, not downloadable fonts |
+
+---
+
 *Roadmap established from repository investigation at commit `eb4d852`
 (branch `main` worktree, Telethon 1.34.0 verified in the active venv);
 Phase 0 code slice landed on top of the merged `0c60363` state (see
