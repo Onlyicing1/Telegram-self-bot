@@ -1,4 +1,60 @@
-# Emoji & Reaction Feature Roadmap
+# Feature Roadmap — LifeOS
+
+## 0. Private Message Management — current feature (Phase 2: scope, actions, AI)
+
+> **Status: IMPLEMENTED and unit-TESTED offline. NOT verified against live
+> Telegram. The schema is WRITTEN but NOT APPLIED.** Phase 2 is the stage named
+> by the authoritative `IMPLEMENTATION_REPORT.md` of the previous task ("Phase 1
+> — panel-first, no AI"), so the stage number is derived, not invented.
+
+### 0.1 Objective
+
+Make the closed-PV policy act ONLY on genuine human users in direct private
+chats with the owner's account, give each closing action its own switch, persist
+the feature in its own tables, and add an AI response with an enforced
+per-person allowance.
+
+### 0.2 The hard scope boundary (the acceptance criterion)
+
+An incoming update is eligible ONLY when the chat half and the sender half are
+both proven from the event's resolved entities: a `PeerUser` chat plus a real
+Telethon `User` sender whose own `bot` flag is a real `false`, with chat, sender,
+peer and message ids agreeing. Bots, groups, supergroups, channels, channel
+posts, linked discussion groups, outgoing messages, the owner's own chat,
+unresolved/malformed entities and any contradictory event are rejected BEFORE
+any action — no delete, no response, no AI request, no counter, no record. The
+gate is not configurable.
+
+### 0.3 Workstreams and status
+
+| Workstream | Status |
+|---|---|
+| Hard scope gate (`private_message_service.classify_scope` + the handler's entity resolution) | IMPLEMENTED + unit-TESTED |
+| Independent actions (`delete_incoming`, `fixed_response_enabled`, `ai_response_enabled`) with the documented order delete → fixed → AI | IMPLEMENTED + unit-TESTED |
+| Dedicated persistence (`private_message_config`, `private_message_senders`) | IMPLEMENTED + unit-TESTED (SQL WRITTEN, NOT APPLIED) |
+| One-time backfill from the Phase-1 `bot_settings` document | IMPLEMENTED + unit-TESTED |
+| AI response through the existing ProviderManager (`tools=[]`), both disclosures appended by the application | IMPLEMENTED + unit-TESTED (no live provider call) |
+| Durable per-person allowance (finite max, unlimited option, interval incl. 0) | IMPLEMENTED + unit-TESTED |
+| Panel (`Closing actions`: three toggles, fixed text, max replies, interval, unlimited, counters, reset) | IMPLEMENTED + unit-TESTED |
+| Migration + manual SQL handoff + rollback (`DATABASE_ARCHITECTURE.md` §31.3 part 10, §33) | WRITTEN, NOT APPLIED |
+| Live Telegram verification | NOT VERIFIED |
+
+### 0.4 Not done / deferred
+
+* **Manual owner action required:** apply the §31.3 block (part 10) before the
+  feature can persist anything; until then it is INERT by design.
+* **Not verified live:** the gate, the action order, the allowance and the panel
+  were exercised offline only.
+* **Deferred:** per-person allowlists/exceptions beyond the existing
+  allowlist/exception lists, and any media/caption-driven AI response (the AI
+  path deliberately uses the incoming TEXT only).
+* **Previous feature's open items are preserved** in the Emoji & Reaction
+  roadmap below, including its custom-emoji inline entitlement limits and its
+  manual schema application — nothing there is relabelled as done.
+
+---
+
+# Emoji & Reaction Feature Roadmap (previous feature — preserved record)
 
 > **Current-feature execution roadmap.** This file is NOT a changelog and NOT a
 > permanent historical record. It contains only the roadmap and current

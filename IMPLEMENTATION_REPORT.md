@@ -1,262 +1,337 @@
-# IMPLEMENTATION_REPORT.md — Private Message Management, Phase 1 (panel-first, no AI)
+# IMPLEMENTATION_REPORT.md — Private Message Management, Phase 2
 
-This file describes ONLY the current state of the repository after this task. It
-**replaces every previous report in full**. Earlier reports — the emoji feature
-implementation (`977247e`), the checkpoint-2 fixes (`e13deee`, `9633c0b`), the
-via-bot feasibility study (`b04cb41`), the `98c2825` audit, the boundary-tracing
-task (`a54877b`), the callback-receipt task (`1bd843d`), the premium-emoji inline
-verification (`39de9cc`, `b463552`, `219c873`, `2eaaf93`) and the LifeOS guide
-website (`58aebac`) — are preserved in git history and referenced here only by
-commit id.
+> This file describes ONLY the current state of the repository after this task. It
+> **replaces every previous report in full**. The Phase-1 report ("Private
+> Message Management — Phase 1, panel-first, no AI", commit `bf89042`), the emoji
+> implementation (`977247e`), the checkpoint-2 fixes (`e13deee`, `9633c0b`), the
+> via-bot feasibility study (`b04cb41`), the `98c2825` audit, the boundary-tracing
+> task (`a54877b`), the callback-receipt task (`1bd843d`), the premium-emoji
+> inline verification (`39de9cc`, `b463552`, `219c873`, `2eaaf93`) and the LifeOS
+> guide website (`58aebac`) are preserved in git history and referenced here only
+> by commit id.
 
 | Item | Value |
 |---|---|
-| Task | Implement Private Message Management in the LifeOS panel — Phase 1, before AI integration |
+| Task | Private Message Management — Phase 2: the hard human-private scope, independent actions, dedicated persistence and the AI response |
 | Project | LifeOS Telegram self-bot (`Onlyicing1/Telegram-self-bot`) |
-| Branch / base revision | feature branch **based on `origin/main` = `58aebac`** (the report is pushed to `origin/main`) |
-| Outcome | **IMPLEMENTED + TESTED offline.** A real panel (`Menu → Private Messages`) drives real, validated, persisted state; the existing all-messages handler consults that state before processing an incoming private message and applies the configured policy. **No AI tool was added** (Phase 2). |
-| Supabase | **Not touched** — no SQL, no schema change, no migration, no `DATABASE_ARCHITECTURE.md` change |
-| Live Telegram verification | **No** (no live session in this workspace); see §7 |
+| Branch / base revision | the task branch **based on `origin/main` = `bf89042`** (the Phase-1 commit) |
+| Outcome | **IMPLEMENTED + unit-TESTED offline.** A strict entity-proven scope gate, three independent closing actions with a deterministic order, dedicated tables with a one-time backfill of the Phase-1 document, and an AI reply with an enforced per-person allowance. |
+| Supabase | **NOT touched — no SQL was executed, no database was modified.** The migration and the §31.3 part-10 handoff are WRITTEN, NOT APPLIED. |
+| Live Telegram verification | **No** (no live session in this workspace); see §6. |
 
 ---
 
-## 1. Architecture findings (all verified in the current source)
+## 1. Findings from the source inspection
 
-| Area | Path | What the implementation uses |
+1. **The previous task's implementation was the true starting point.** The base
+   commit already contained Phase 1 (`backend/services/private_message_service.py`,
+   `backend/bot/handlers/private_message.py`, `backend/helper/symbols.py`, the
+   `pm_*` panel family, `tests/test_private_message_management.py`,
+   `tests/test_private_message_panel.py`), and the Phase-1 report explicitly
+   deferred "AI integration" to **Phase 2**. The stage number used here is that
+   one, not an invented one.
+2. **`event.is_private` alone is not a scope check — it is the defect.**
+   Telethon's `EventCommon.is_private` is `isinstance(self._chat_peer, PeerUser)`
+   (verified against the installed **Telethon 1.34.0** source), so **a private
+   chat with a BOT passes it**. The same source shows `is_group` is `PeerChat`
+   or a non-broadcast `PeerChannel` (so a supergroup and a linked discussion
+   group pass too) and `is_channel` is `PeerChannel` (true for a broadcast
+   channel AND for every megagroup). The authoritative bot signal is the
+   sender/channel entity's own `bot` boolean on a resolved `User` — never a
+   name, username, numeric id or message text.
+3. **Phase 1's scope fallback was weaker than its primary check.**
+   `_is_private_event` fell back to "positive `chat_id` equal to `sender_id`"
+   when `is_private` was not a bool — exactly the weaker check the task forbids.
+   A `chat_id == sender_id` pair is also true for a bot dialog.
+4. **The action model was mutually exclusive.** One `policy` value
+   (`ignore` / `delete` / `autoreply`) chose ONE action, so delete + fixed
+   response + AI could not be combined; the auto-reply also carried a 5-minute
+   **in-memory** cooldown, which a restart reset (the task forbids relying on
+   in-memory quota state).
+5. **The persistence was a generic JSON document.** The Phase-1 state lived in
+   ONE `bot_settings` row (`key = 'private_message_management'`). The task
+   requires dedicated persistence with owner scoping, constraints and a safe
+   backfill — so the state moved into dedicated tables while the legacy document
+   is preserved as the one-time import source.
+6. **The AI boundary that had to be reused.** The engine's conversation runtime
+   is single-session-per-owner, so calling `Engine.execute` for a closed-PV reply
+   would inject the owner's assistant history into the prompt and write this
+   reply into that history — a direct violation of the context-isolation rule.
+   The repository already has the sanctioned out-of-band generation pattern
+   (`backend/ai/task_execution.py`: the shared ProviderManager with
+   `tools=[]`), and this feature follows it exactly.
+
+---
+
+## 2. Implemented changes
+
+### 2.1 The scope gate (the acceptance criterion)
+
+`backend/services/private_message_service.classify_scope(...)` is the ONE gate;
+`backend/bot/handlers/private_message.resolve_scope(...)` gathers the event's own
+peer/flags and resolves BOTH entities through the existing self client
+(`get_chat()`, `get_sender()`), and `enforce_incoming` consults the gate FIRST.
+The verdict requires, in order: the owner id is a real user id; `is_group is not
+True`; `is_channel is not True`; `is_private is True` with **both** group flags
+explicitly `False` (an unknown `None` fails closed); a real `types.PeerUser`
+peer; positive `chat_id`, `sender_id`, `message_id`, `peer.user_id` that all
+agree; the chat is not the owner's own id; both entities resolved and each
+independently proven to be a `types.User` with a matching id and a **real
+boolean** `bot` flag that is `False`; and no `deleted` flag. Rejections are
+named (`bot_sender`, `group_conversation`, `channel_conversation`,
+`chat_type_unknown`, `not_private_chat`, `inconsistent_event`, `chat_unresolved`,
+`sender_unresolved`, `sender_not_a_user`, `sender_type_unknown`,
+`deleted_sender`, `own_account_chat`) and **no action of any kind follows them**.
+No configuration can widen the boundary.
+
+### 2.2 Independent actions and their deterministic order
+
+`delete_incoming`, `fixed_response_enabled` and `ai_response_enabled` are three
+independent booleans (own column, own control, own write); enabling one never
+enables another. The order is fixed and tested: **delete → fixed response → AI
+response**. A delete failure is recorded and does NOT suppress the responses; a
+fixed-response failure never suppresses the AI reply; the fixed response has its
+own explicit switch and its own text input.
+
+### 2.3 Dedicated persistence with a safe backfill
+
+`private_message_config` (ONE owner-scoped row: master switch, `mode`, the three
+action flags, `fixed_response_text`, `ai_max_replies_per_person`,
+`ai_unlimited_replies`, `ai_interval_seconds`, plus the access state the panel
+already edited — `allowlist`, `exceptions`, `temporary`, `schedule`) and
+`private_message_senders` (durable per-person counters, `PRIMARY KEY (owner_id,
+sender_id)`). One index, RLS, SELECT-only `anon`/`authenticated` policies,
+comments, `NOTIFY pgrst`, verification queries and a read-only legacy probe.
+The service writes the whole document through the dedicated row and **imports the
+Phase-1 document exactly once** when that row does not exist yet (the legacy
+single `policy` value maps onto the independent flags; `enabled`, `mode`,
+`allowlist`, `exceptions`, `temporary` and `schedule` carry over unchanged), so
+nothing previously configured is discarded and the legacy row is never modified.
+
+### 2.4 AI response, disclosures and the per-person allowance
+
+ONE generation through the shared `ProviderManager` (`tools=[]`) with a message
+list of exactly `[system contract, incoming text]` — no history, no memory, no
+reply context, no identifiers, no names — and the two required disclosures are
+appended by the APPLICATION after generation (plain Unicode, never emoji), so the
+model can neither remove nor override them:
+
+```
+این پی‌وی در حال حاضر بسته است.
+این پیام توسط هوش مصنوعی تولید و ارسال شده است.
+```
+
+The allowance is claimed by ONE conditional (CAS) increment BEFORE generation and
+released by a compensating CAS when nothing was delivered, so only a DELIVERED
+reply consumes it; a finite max, an explicit unlimited option and an interval
+(including `0`) are all supported, per person, durable across restarts, with the
+owner's explicit reset as the only clearing edge. A per-person lock plus an
+exact `(chat, message)` duplicate guard make concurrent and duplicate updates
+unable to spend one allowance twice.
+
+### 2.5 Panel
+
+`Menu → Private Messages → Closing actions`: three independent toggles, the fixed
+text input, max-replies input, interval input, unlimited toggle, the live counter
+summary and the reset action, plus a scope statement ("genuine human users in
+direct private chats only; bots, groups, supergroups, channels, channel posts and
+linked discussion groups are never affected"). Every glyph comes from
+`backend/helper/symbols.py` — no emoji literal is introduced. Every action
+reports what was actually persisted, and a refused write says so.
+
+---
+
+## 3. Tests and validation actually executed
+
+| Command | Result |
+|---|---|
+| `python3 -m pytest tests/test_private_message_scope.py -q` | **62 passed** |
+| `python3 -m pytest tests/test_private_message_management.py tests/test_private_message_panel.py -q` | **85 passed** |
+| `python3 -m pytest tests/test_canonical_schema_reconciliation.py tests/test_database_setup_order.py tests/test_symbols.py -q` | **87 passed** |
+| `python3 -m pytest tests/ -q` (full suite) | **6199 passed, 41 failed, 27 skipped** — every failure is the pre-existing `tests/test_colored_buttons.py` environment mismatch (the repo pins `telethon==1.43.0`, this sandbox has **1.34.0**, and 1.34.0 rejects the inline-button `style` field: `Button style 'primary' rejected by Telethon`). No private-message, schema or symbols test fails. |
+| `python3 -m py_compile` on every changed/added Python file | clean |
+| `git diff --check` | clean |
+
+What the new suite proves through the REAL enforcement entry point (the existing
+`task_events` handler → `enforce_incoming`), with real Telethon entities and a
+recording Telegram spy: a human private message is eligible and runs the enabled
+actions; a bot in a private chat is rejected with **every** action enabled and
+unlimited, and touches no delete/send/AI/counter path; groups, supergroups,
+channel posts and linked discussion groups are never touched; a missing chat or
+sender entity, an entity that is not a `User`, a missing/non-boolean `bot` flag
+and a deleted account are rejected; `get_chat()`/`get_sender()` raising is
+rejected; a disagreeing peer/sender/chat id, an outgoing message, the owner's own
+chat and an invalid owner are rejected; a message-less event is rejected;
+repeated rejected events consume nothing (a following human message still gets
+its first allowance); the delete/fixed/AI order is asserted; the finite limit,
+the unlimited option, a `0` interval and a positive interval all behave as
+configured and per person; a failed generation or delivery gives the claim back;
+an unreadable counter store fails closed; duplicate and concurrent messages are
+enforced once; the counters survive a restart and only the explicit reset clears
+them; the AI payload is exactly two messages with `tools=[]`, no identifiers and
+no display names, and the two disclosures are appended; the module adds no second
+client, loop, scheduler or executor; the migration is additive and creates
+exactly the two tables whose columns cover every configured setting.
+
+**Not verified:** no test, and no part of this task, executed SQL, contacted
+Supabase, started a live Telegram session or made a live provider call.
+
+---
+
+## 4. Confirmation: bots, groups, supergroups and channels are excluded
+
+| Conversation / sender | Gate verdict | Actions performed |
 |---|---|---|
-| Glass UI panels | `backend/helper/panel_registry.py`, `backend/helper/panels.py`, `backend/helper/panel_render.py` | `register_panel` / `register_action` / `register_input` + `InlinePanelBuilder`; `panel:*`, `action:*`, `input:*` callback prefixes dispatched by `panels.py::register_callback_handlers`. The new panels are ordinary registrations (parent `menu`). |
-| Mother panel | `backend/bot/handlers/misc.py::_build_menu_buttons` | One new row: `Private Messages → panel:pm` (styled `PRIMARY` like every other menu row). |
-| Pending inputs | `backend/helper/input_state.py` + `backend/helper/inline_sender.py::register_input_listener` | The owner's reply to an `input:*` prompt is routed to the registered handler; the handler re-renders the owning panel and deletes the owner's reply (the established Bio/Settings input pattern). |
-| Persistence | `backend/db/client.py` (singleton Supabase client, optional), `bot_settings` table | ONE JSON document in the **existing** `bot_settings` key/value row `private_message_management` — the same store `backend/services/ghost_seen_v2.py` already writes (`value_type = 'str'`), created on first write. **No new table, no new column.** Bounded `asyncio.to_thread` round trips (`wait_for`, 5 s). |
-| Settings conventions | `backend/services/panel_settings_repository.py`, `backend/services/settings_service.py`, `AGENTS.md` §8 | The panel never touches Supabase directly: repository-style access lives in the service, `TZ` stays the authoritative runtime timezone (`os.getenv("TZ", "Asia/Tehran")`, as in `misc.py`/`telemetry.py`/`save.py`), and the missing-database case is the documented in-memory fallback. |
-| Incoming messages | `backend/bot/handlers/task_events.py` — the only handler registered on `events.NewMessage()` (all directions) | The policy is applied **inside that existing handler**, before the task-event dispatcher and the answer resolver. No second listener, no second client, no second update loop. |
-| Scheduling | `backend/profile/scheduler.py` (minute-boundary profile cron), `backend/ai/task_scheduler.py` (task occurrences) | **Neither is a general policy ticker**, and none was added. A mode is a pure function of `(now, persisted state)`, so the effective policy is recomputed on every incoming message and every panel render — a boundary has nothing to do except change how the *next* message is treated, so a ticker would be dead code. This is the documented gap and the smallest compatible answer (§7). |
-| Telegram user resolution | `backend/telegram_api/entities.py::get_entity` (timeout-bounded, typed), `backend/services/ghost_seen_v2.py::load_manage_directory` / `manage_page_items` | Allowlist/exception candidates are the owner's real private chats (bounded, cached directory — no repeated dialog enumeration); the `Add` input resolves a reference through the typed entity layer and refuses anything that is not a real user. Only the numeric user id is stored. |
-| UI conventions | `backend/helper/symbols.py`, `backend/helper/styles.py`, `tests/test_symbols.py` | Every glyph comes from the symbol registry (no emoji literals — enforced by `test_symbols.py`), and buttons carry `PRIMARY`/`DANGER` per the documented style rules. |
+| Genuine human, direct private chat | `eligible` | as configured |
+| **Bot account, direct private chat** | `bot_sender` | **none** (proved with every action enabled + unlimited) |
+| Group (`PeerChat`) | `group_conversation` | none |
+| Supergroup / megagroup | `group_conversation` | none |
+| Linked discussion group | `group_conversation` | none |
+| Channel post (broadcast) | `channel_conversation` | none |
+| Unknown chat type / flag | `chat_type_unknown` | none |
+| Peer that is not `PeerUser` | `not_private_chat` | none |
+| Missing chat/sender entity | `chat_unresolved` / `sender_unresolved` | none |
+| Entity resolution raised | `chat_unresolved` / `sender_unresolved` | none |
+| Sender is not a `User` entity | `sender_not_a_user` | none |
+| `bot` flag missing or non-boolean | `sender_type_unknown` | none |
+| Deleted account | `deleted_sender` | none |
+| Contradictory ids / outgoing / own chat | `inconsistent_event` / (skipped) / `own_account_chat` | none |
+
+For every rejected row the suite asserts zero deletions, zero sends, zero
+generation calls and zero counter rows, **including with the feature enabled and
+all three actions on**.
 
 ---
 
-## 2. Implemented (user-visible controls → real state)
+## 5. Database migration status and the manual SQL required
 
-### 2.1 Panel surface (`Menu → Private Messages`)
+* **Status: WRITTEN, NEVER EXECUTED.** `supabase/migrations/20260929000001_create_private_message_tables.sql`
+  exists and is embedded verbatim as **part 10 of 10** of the ONE setup block in
+  `DATABASE_ARCHITECTURE.md` §31.3; §33 documents the tables, the claim/compensate
+  contract, the reset policy, the backfill, the security model and the reversal.
+  **No SQL was run, no Supabase connection was opened and no database was
+  modified by this task.**
+* **Behaviour until it is applied:** the configuration read degrades to "no row",
+  which the service treats as **disabled** — nothing is deleted, no response is
+  sent, no AI request is made, no counter is consumed, and the panel reports the
+  refused write honestly. The feature is INERT, never partially active.
+* **Manual action (owner, Supabase SQL Editor as `postgres`):** run the §31.3
+  block (part 10 carries this migration's statements). The block's own queries
+  verify both tables and their columns; the final read-only probe
+  (`SELECT key FROM bot_settings WHERE key LIKE 'private_message%'`) shows the
+  Phase-1 document, if the owner ever had one, which the application then imports
+  on first read (nothing to backfill by hand).
+* **Rollback SQL (manual, never executed):**
 
-| Control | Effect (all persisted) |
+```sql
+-- Manual Supabase SQL — NOT EXECUTED BY AI. Destroys this feature's
+-- configuration and counters only; the Phase-1 bot_settings document survives.
+DROP TABLE IF EXISTS private_message_senders;
+DROP TABLE IF EXISTS private_message_config;
+```
+
+* **Backfill:** every Phase-1 value survives (mapped as described in §2.3); no
+  rule is discarded and the legacy document is left untouched.
+
+---
+
+## 6. What remains unverified / deferred / blocked
+
+1. **NOT VERIFIED LIVE.** The gate, the action order, the allowance and the panel
+   were proven offline only. Whether live Telegram always delivers the entities
+   the gate needs (a resolution failure fails closed BY DESIGN and would make the
+   feature silent for that event) can only be confirmed on the live account.
+2. **BLOCKED on the owner:** applying the §31.3 block (part 10); until then the
+   feature is deliberately inert.
+3. **DEFERRED:** per-person allowlists/exceptions beyond the existing lists, and
+   any media/caption-based AI response (a message without text still gets the
+   delete/fixed actions, and the AI step consumes nothing).
+4. **Known limitation (documented, not hidden):** the release after a failed
+   generation/delivery is itself a CAS write; if that compensation fails (the
+   store goes down between the claim and the failure) the claim stays consumed
+   and the service logs it honestly rather than answering twice.
+5. **PRE-EXISTING, UNRELATED:** `tests/test_colored_buttons.py` (40 tests) fails
+   in this environment because the installed Telethon is 1.34.0 while the
+   repository pins 1.43.0; this task neither caused nor addressed it.
+
+---
+
+## 7. Files changed and why
+
+```
+backend/services/private_message_service.py                       edit — scope gate, independent action flags,
+                                                                        AI config + disclosures, dedicated
+                                                                        persistence with the legacy import,
+                                                                        durable claim/release/reset wrappers
+backend/bot/handlers/private_message.py                           edit — entity-proven gate, deterministic
+                                                                        action order, AI reply through the
+                                                                        existing ProviderManager, reworked panel
+backend/db/client.py                                              edit — dedicated config read/write, legacy
+                                                                        document read, CAS claim/release/reset,
+                                                                        counter listing + in-memory fallbacks
+supabase/migrations/20260929000001_create_private_message_tables.sql new — the two tables (WRITTEN, NOT APPLIED)
+tests/test_private_message_scope.py                               new  — the scope/action/limit/failure regressions
+tests/test_private_message_management.py                          edit — the new contract (actions, dedicated row,
+                                                                        legacy import) with Phase-1 mode/schedule coverage kept
+tests/test_private_message_panel.py                               edit — the real entities, the actions panel, the
+                                                                        bot/unresolved-sender enforcement cases and the
+                                                                        AI disclosure test
+tests/test_canonical_schema_reconciliation.py                     edit — the two tables classified as successor tables
+tests/test_database_setup_order.py                                edit — ten-part block, part-10 verification, counts
+DATABASE_ARCHITECTURE.md                                          edit — §33, the part-10 embed, audit/status updates
+ROADMAP.md                                                        edit — §0 for the current feature (Emoji record preserved)
+IMPLEMENTATION_REPORT.md                                          edit — this report (replaced in full)
+```
+
+No unrelated refactor, no other feature's behaviour changed, no dependency added,
+no environment variable added, no second client/loop/scheduler/executor, and no
+destructive or unrelated command run.
+
+---
+
+## 8. Commit, push and remote verification
+
+| Step | Status |
 |---|---|
-| **Mode: Open / Whitelist only / Closed** | `action:pm_mode:{mode}` → `private_message_service.set_mode` → `bot_settings`. The current mode carries the registry's `✓` mark. |
-| **Pause / Enable enforcement** | Master switch. OFF performs **no policy action at all** (identical to the pre-feature behaviour) while still displaying the configured mode. |
-| **Unauthorized policy** | `Ignore` / `Delete the message` / `Auto-reply once (rate limited)`, plus an `Auto-reply text` input (validated: non-empty, ≤512 chars). An auto-reply policy with no text falls back to **Ignore**. |
-| **Allowlist** | Paginated (8/page) list of the owner's private chats with `ON`/`OFF` marks; one tap adds/removes; `Add user` input resolves `@username`/id through Telegram first. |
-| **Exceptions** | The same workflow for the explicit exceptions used by **Closed** mode, kept independent of the allowlist. |
-| **Temporary** | One-tap overrides (`Open`/`Whitelist only`/`Closed` × 30 m / 8 h) plus **Clear temporary**; shows activation, expiry and the live remaining time. |
-| **Schedule** | Enable/disable, IANA timezone (validated), rules list with per-rule edit/delete, and a draft-based rule builder (day toggles, start/end `HH:MM` inputs, mode cycle, save/cancel). Shows the next transition and the precedence rule. |
-| **Status block** | Effective mode, **control source** (manual / temporary override / schedule), remaining time when temporary, unauthorized policy, allowlist and exception counts, schedule state + timezone + rule count, **next scheduled transition**, and the storage line (`database` / `memory only (no database configured)`). |
-| **Refresh** | Re-reads the persisted document (`reload_async`) instead of trusting the cache. |
+| `git diff --check` | Clean |
+| Python compilation of every changed file | Clean |
+| Focused suites | 62 + 85 + 87 passed |
+| Full offline suite | 6199 passed, 27 skipped, 41 pre-existing colored-button failures (Telethon version) |
+| Commit | ONE commit for this task (all of the files above) |
+| Push | To `origin/main` (the repository connected to this workspace) |
+| Remote verification | `git fetch origin` → `git rev-parse origin/main` → `git merge-base --is-ancestor <sha> origin/main` |
 
-### 2.2 Policy engine (`backend/services/private_message_service.py`)
-
-* **Modes** — `open` (nobody is restricted), `whitelist_only` (only allow-listed senders bypass), `closed` (only explicitly listed exceptions bypass).
-* **Precedence, deterministic** — `temporary` (while not expired) → `schedule` (enabled + a rule matches the local wall clock) → manually stored `mode`. When several rules match, the **last** matching rule wins (rules keep the owner's order).
-* **Schedule semantics** — per-day rules (`Mon`…`Sun`), `HH:MM` start/end in an explicit IANA timezone. A window whose end is at or before its start **spans midnight and belongs to the day it starts on**. Boundaries are evaluated on the local wall clock, so a DST day is deterministic (pinned by a test on the 2026-11-01 `America/New_York` transition).
-* **Next transition** — computed from the temporary expiry and the schedule boundaries in a bounded 8-day window; a boundary is reported **only when the effective mode really changes** across it (a schedule flip hidden under an active temporary override is never promised).
-* **Temporary expiry is enforced server-side** — the stored record stops applying the moment it expires (no frontend timer, no reliance on a tick), and the expired record is persisted away on the panel path (`drop_expired_temporary`).
-* **Validation at the boundary** — modes, policies, timezones (`ZoneInfo`), `HH:MM` (strict two-digit form), day sets, rule limits (12), list limits (200), autoreply length, and temporary durations (1 min – 7 days) are all validated **before** any write; an invalid value leaves both memory and storage untouched.
-* **Write-failure safety** — a candidate state is built and validated as a copy and only committed to memory **after** the database accepted it, so memory and storage can never disagree.
-* **Restart correctness** — the document is loaded once (single-flight) and **awaited on first use** (the first incoming message, the first panel render), so a message arriving during startup is never judged against the in-memory default.
-* **Backward compatibility** — an absent/`garbage`/partially-malformed document sanitizes to `open` + `ignore` with no allowlist, exceptions, temporary override or schedule: the pre-feature behaviour.
-* **Auto-reply rate limit** — one answer per unauthorized sender per 5 minutes, with the recent-sender map pruned on every decision.
-
-### 2.3 Incoming-message hook (`backend/bot/handlers/private_message.py::enforce_incoming`)
-
-Called first, unconditionally, by the existing `task_events` handler:
-
-* **Scope** — incoming **private** messages only. Group/channel messages and the owner's own messages are never touched (the owner can still answer the bot's questions, and the answer resolver is unaffected).
-* **Ignore** — nothing is sent or deleted; the message is simply not processed further (it never reaches the event-task dispatcher).
-* **Delete** — the message the Self Bot received is deleted through the self client (`delete_messages(chat_id, [id], revoke=True)`, 15 s bound). A failed delete is logged and the message is still not processed.
-* **Auto-reply** — the configured text is sent to the sender through the self client, rate-limited as above.
-* **Failure mode** — an internal error leaves the message permitted (exactly the pre-feature behaviour) and is logged with bounded identifiers only (`sender_id`, `chat_id`, mode, source, action; never message content).
+A commit cannot contain its own SHA: the commit carrying this report is the
+task's single commit, created and pushed in this task, and its SHA is verified
+against `origin/main` with the three commands above. Its parent is
+`bf890423cb7450ed4d4733c715d545103b48559c` (the Phase-1 implementation this
+report replaces). The stale local implementation written before this task
+realised the true base (`pm-phase2-local-full`) was NOT pushed.
 
 ---
 
-## 3. Files changed
+## 9. The exact next test the owner must run after deployment
 
-| File | Change |
-|---|---|
-| `backend/services/private_message_service.py` | **NEW** — state document, validation, `bot_settings` persistence, effective-mode/precedence resolution, schedule evaluation and next-transition computation, authorization + decision, summary/formatting helpers. |
-| `backend/bot/handlers/private_message.py` | **NEW** — the Glass UI panel family (`pm`, `pm_policy`, `pm_allow`, `pm_except`, `pm_temp`, `pm_sched`, `pm_rule`), its actions/inputs, and `enforce_incoming`. |
-| `backend/bot/handlers/task_events.py` | The existing all-messages handler consults `enforce_incoming` first (docstring updated). |
-| `backend/bot/router.py` | Registers `private_message` before `task_events`. |
-| `backend/bot/handlers/misc.py` | One mother-panel row (`panel:pm`). |
-| `tests/test_private_message_management.py` | **NEW** — 35 tests for the policy engine. |
-| `tests/test_private_message_panel.py` | **NEW** — 39 tests for the panel surface and the enforcement hook. |
+1. Apply the §31.3 block in Supabase (part 10 creates the two tables). Without it
+   the feature is inert.
+2. Deploy `main`, open Telegram, send `Menu` in **Saved Messages**, open
+   **Private Messages → Closing actions**, and set the mode to **Closed**.
+3. Enable **Delete incoming message** only, then send a direct message from a
+   **second human account**. Expected: that message is deleted and nothing is
+   sent back.
+4. Enable **Send fixed response** and set its text. Repeat step 3. Expected: the
+   message is deleted AND the text arrives.
+5. From a **bot account** (any bot's private chat — still a private chat). Send a
+   message. Expected: **nothing** happens at all, and no counter moves.
+6. In a **group**, in a **supergroup** and in a **channel** where the owner is a
+   member, post a message. Expected: nothing happens.
+7. Enable **Send AI response** with **max replies per person = 2** and
+   **interval = 0**; send three direct messages from one human account. Expected:
+   the first two get an AI reply ending with both disclosures, the third is
+   refused by the limit, and the counter line shows 2 used by 1 person.
+8. Tap **Reset AI counters** and send one more message: the AI answers again.
 
-**Unchanged on purpose:** no AI tool, no provider contract, no scheduler, no
-dispatcher, no second listener/client/executor, no Supabase schema, no
-`DATABASE_ARCHITECTURE.md`/`ROADMAP.md` change, no unrelated refactor.
-
----
-
-## 4. Tests and verification
-
-All commands from the worktree root (`.venv` from the parent checkout); exit
-statuses preserved.
-
-| Check | Command | Result |
-|---|---|---|
-| Compile | `.venv/bin/python -m compileall -q backend/` | exit 0 (**COMPILE_ALL_OK**) |
-| Focused (policy engine) | `python -m pytest tests/test_private_message_management.py -q` | **35 passed** |
-| Focused (panel + enforcement) | `python -m pytest tests/test_private_message_panel.py -q` | **39 passed** |
-| Conformance touched by the new panel | `python -m pytest tests/test_symbols.py -q` | **24 passed** |
-| Full suite (this branch) | `timeout 560 python -m pytest tests/ -q -p no:randomly` | **6125 passed, 40 failed, 27 skipped** in 123 s |
-| Full suite (pristine `origin/main`, same environment) | same command in a clean worktree at `58aebac` | **6051 passed, 40 failed, 27 skipped** in 123 s |
-| Failure-set comparison | `diff` of the two `FAILED ...` lists | **identical** — the 40 failures are the pre-existing `tests/test_colored_buttons.py` group (the installed Telethon lacks the button-`style` support those tests assert), i.e. **0 regressions** and exactly **+74 tests** |
-
-Both full-suite runs and the focused suites above were re-executed **after the
-final source edit** (they are not carried over from an earlier revision). The
-pre-existing failure group was confirmed independently by running
-`tests/test_colored_buttons.py` alone in the pristine `58aebac` worktree:
-**40 failed, 12 passed** — identical to this branch.
-| Whitespace / diff sanity | `git diff --check` | exit 0 |
-
-What the tests actually cover: OPEN/WHITELIST_ONLY/CLOSED decisions; authorized
-vs unauthorized senders; owner and group-message exemptions; the master switch;
-ignore/delete/auto-reply decisions including the empty-text fallback and the
-per-sender cooldown; allowlist add/remove/view with `bot_settings` round trips;
-invalid identifiers and invalid settings (mode, policy, timezone, times, days,
-durations, limits) changing nothing; temporary activation, deterministic
-expiry, fallback and persistence cleanup; manual mode having no expiry;
-per-day and per-timezone schedule matching; overnight windows; DST determinism;
-the disabled schedule; last-rule-wins; the temporary → schedule → manual
-precedence; next-transition computation (including boundaries that change
-nothing and those hidden by an override); malformed/absent stored documents;
-persistence failure reverting the in-memory state; concurrent mutations
-serializing; restart/reload restoring the effective policy; the panel rendering
-the persisted (not local) state, its pagination, every action/input, and the
-enforcement hook deleting / ignoring / auto-replying / permitting exactly as
-the persisted policy dictates — with and without a task dispatcher wired.
-
-**Distinctions:** these are **unit + offline integration tests** (fake
-`bot_settings`, fake self client, fake helper bot). There is **no live Telegram
-verification** (see §7).
-
----
-
-## 5. Delivery
-
-| Step | Value |
-|---|---|
-| Commit | ONE commit for this task: `backend/services/private_message_service.py`, `backend/bot/handlers/private_message.py`, `backend/bot/handlers/task_events.py`, `backend/bot/router.py`, `backend/bot/handlers/misc.py`, `tests/test_private_message_management.py`, `tests/test_private_message_panel.py`, `IMPLEMENTATION_REPORT.md` |
-| Push | pushed to `origin/main` from the task branch created at `origin/main` (fast-forward; no rebase, no force-push, no history rewrite) |
-| Remote verification | `git fetch origin` → `git rev-parse origin/main` → `git merge-base --is-ancestor <commit> origin/main` (exit 0) |
-| Final working tree | the main checkout is untouched: its pre-existing uncommitted `INVESTIGATION.md` change and the untracked `.m14/` worktree are preserved exactly as found |
-
-A commit cannot contain its own hash: the commit SHA and the verified
-`origin/main` SHA are reported in this task's delivery response.
-
----
-
-## 6. Implementation status vocabulary
-
-| Item | Status |
-|---|---|
-| Panel UI (mode, policy, allowlist, exceptions, temporary, schedule, status) | **IMPLEMENTED, TESTED** |
-| Real backend settings + `bot_settings` persistence + in-memory fallback | **IMPLEMENTED, TESTED** |
-| Incoming-message policy on the existing event path | **IMPLEMENTED, TESTED** |
-| Allowlist + exceptions with validated Telegram resolution | **IMPLEMENTED, TESTED** |
-| Temporary + manual modes with deterministic expiry | **IMPLEMENTED, TESTED** |
-| Scheduling (days, time window, timezone, precedence, next transition) | **IMPLEMENTED, TESTED** |
-| Live Telegram behaviour (real delete / real auto-reply against real senders) | **DEFERRED — NOT VERIFIED LIVE** |
-| AI integration (tool, registry, executor) | **DEFERRED to Phase 2 (by instruction)** |
-| Telegram account-level privacy / delivery blocking | **NOT IMPLEMENTED — not supported by the account API** |
-
----
-
-## 7. Limitations (explicit, and honest)
-
-1. **No live Telegram verification.** This workspace has no `API_ID`/`API_HASH`/
-   `SESSION_STRING`/`BOT_OWNER_ID`, no `.env` and no live session, so no request
-   was made to Telegram and the panel was never opened on a real account. The
-   delete/auto-reply calls are exercised against a fake client only.
-2. **This feature is application-side.** It never changes the account's Telegram
-   privacy settings and **cannot prevent anyone from sending a private
-   message**; `closed`/`whitelist_only` describe what the Self Bot does with a
-   message Telegram has already delivered. No transport-level blocking is
-   claimed anywhere, in the code or in the panel text.
-3. **The delete policy deletes a received message** (`revoke=True`), so the
-   sender can also lose it. Its success depends on the account's own
-   permissions and on Telegram; a failure is logged and the message is still
-   not processed.
-4. **The auto-reply is a single fixed text per policy**, rate-limited to one per
-   sender per 5 minutes; there is no per-user message, no schedule-aware text and
-   no AI-written reply (Phase 2 is a separate decision).
-5. **No background ticker by design.** A schedule boundary is applied when the
-   next message arrives (or when the panel renders). Nothing is "due" at the
-   boundary itself, so no message is ever delayed or replayed — but a mode
-   change is never observable before the next message.
-6. **Storage**: with no Supabase configured the state lives in this process only;
-   the panel says so (`memory only (no database configured)`) instead of implying
-   durability.
-7. **Not verified live:** the inline rendering of the new panels through the
-   optional helper bot (the helper is absent here), and the exact appearance of
-   button colours (the installed Telethon build in this workspace rejects the
-   `style=` argument and falls back to an unstyled button — a pre-existing
-   environment condition that also fails 40 pre-existing tests, see §4).
-
----
-
-## 8. Supabase / database
-
-**Untouched.** No SQL was executed, no schema or migration was changed, no
-Supabase request was made, and `DATABASE_ARCHITECTURE.md` was not modified.
-
-**No manual database action is required for this feature.** It stores ONE row in
-the **existing** `bot_settings` table (`key = 'private_message_management'`,
-`value` = JSON, `value_type = 'str'`), created on the first panel write exactly
-like the Ghost Seen allow-list row. The canonical schema already covers that
-table, so there is nothing to apply.
-
----
-
-## 9. Phase roadmap (preserved sequence)
-
-### PHASE 1 — PANEL-FIRST IMPLEMENTATION — **this task (DONE: implemented + tested offline)**
-Panel UI · real backend settings and persistence · incoming-message policy
-integration · allowlist and exceptions · temporary/manual modes · scheduling on
-the verified existing architecture · focused tests and documentation.
-
-### PHASE 2 — AI INTEGRATION — **NEXT, NOT STARTED (by instruction)**
-Source-grounded plan, using only the existing AI architecture:
-
-1. Add **one** stateless tool module under `backend/ai/tools/` (e.g.
-   `private_message.py`) wrapping the existing service — never a second
-   executor, never direct Telegram/SQL access from the model.
-2. Register it in `ToolRegistry` with explicit, bounded arguments: `mode`,
-   `policy`, `autoreply_text`, `list_action` (`add`/`remove`/`list`),
-   `user` (resolved id or reference), `temporary_minutes`, and read-only
-   `status`/`schedule` views. Give it `consumable_output_fields` only if a later
-   action genuinely needs to consume an output (e.g. the effective mode).
-3. Extend the action vocabulary in `backend/ai/actions.py` so the model's
-   proposal resolves to that tool (`validate_action` → `resolve_tool_calls`),
-   with the same fail-closed validation already used for save/delete/task
-   actions; nothing keyword-matched, nothing model-authored beyond the
-   arguments.
-4. Execution stays in `ToolExecutor` (the owner's message is the authorization
-   in this single-owner bot); destructive steps (delete policy, clearing the
-   allowlist) keep their confirmation semantics.
-5. Update the prompt template with the Phase-2 capability description, and add
-   AI integration tests (tool arguments rejected when malformed; the service
-   called exactly once; the persisted state the panel later shows is the state
-   the tool wrote).
-
-### PHASE 3 — HARDENING AND VERIFICATION — **PLANNED**
-Regression coverage for the interaction between the policy gate and the event
-dispatcher; permission/security review of the delete + auto-reply paths; runtime
-and restart behaviour under recovery/rebuild; a live Telegram verification pass
-(delete, auto-reply, panel rendering through the helper bot); documentation and
-deployment verification.
-
-**Note on `ROADMAP.md`:** it is the repository's *current-feature* roadmap
-(Emoji & Reaction) and was deliberately left untouched, because this task's
-instruction named the implementation report as the document to update and the
-contract records the phase sequence here. Replacing `ROADMAP.md` with Phase 1–3
-of Private Message Management is a one-line decision for the owner if the
-repository-wide convention should switch to this feature.
+If a step behaves differently, the log line `PRIVATE_MESSAGE_TRACE` names the gate
+verdict (`stage=out_of_scope reason=…`) or the enforcement step
+(`stage=unauthorized … actions=delete:…,fixed:…,ai:…`, `stage=ai_denied
+reason=…`), so the exact boundary that applied is always identifiable.

@@ -1,11 +1,12 @@
-"""Private Message Management — Phase 1 policy engine (panel-first, no AI).
+"""Private Message Management — the policy engine + the dedicated persistence.
 
 Drives the REAL ``backend/services/private_message_service`` module: the
-persisted ``bot_settings`` document, the validated mutations, the deterministic
-effective-mode resolution (temporary → schedule → manual) and the incoming
-message decision. Everything runs offline: the database is a fake
-``bot_settings`` table and time is passed IN, so no wall clock, no Telegram and
-no AI are involved.
+dedicated ``private_message_config`` row (with the legacy ``bot_settings``
+document as the one-time backfill source), the validated mutations, the
+deterministic effective-mode resolution (temporary → schedule → manual), the
+INDEPENDENT action flags and the incoming-message decision. Everything runs
+offline: the database is a fake table pair and time is passed IN, so no wall
+clock, no Telegram and no AI are involved.
 """
 from __future__ import annotations
 
@@ -29,80 +30,108 @@ class _FakeResult:
         self.data = data
 
 
-class _FakeBotSettingsDB:
-    """Chainable fake for the exact ``bot_settings`` access chains used here."""
+class _FakeDB:
+    """Chainable fake for the two configuration stores: the dedicated
+    ``private_message_config`` row and the legacy ``bot_settings`` document."""
 
-    def __init__(self, rows: dict[str, str] | None = None, fail_writes: bool = False):
-        self.rows = dict(rows or {})
+    def __init__(self, legacy: dict[str, str] | None = None, fail_writes: bool = False):
+        self.legacy = dict(legacy or {})
+        self.config: dict[int, dict] = {}
         self.fail_writes = fail_writes
         self.inserts: list[dict] = []
         self.updates: list[dict] = []
-        self._key: str | None = None
-        self._selecting_value = False
+        self._table = None
+        self._op = None
+        self._payload = None
+        self._filters: list[tuple[str, object]] = []
         self._single = False
-        self._pending_update: dict | None = None
-        self._pending_insert: dict | None = None
 
     def table(self, name):
-        assert name == "bot_settings"
+        assert name in ("bot_settings", "private_message_config"), name
+        self._table, self._op, self._payload = name, None, None
+        self._filters, self._single = [], False
         return self
 
-    def select(self, columns):
-        self._selecting_value = str(columns).strip() == "value"
-        self._single = False
+    def select(self, columns="*"):
+        self._op = "select"
         return self
 
-    def eq(self, column, key):
-        assert column == "key"
-        self._key = key
+    def update(self, payload):
+        if self.fail_writes:
+            raise RuntimeError("write rejected")
+        self._op, self._payload = "update", payload
+        return self
+
+    def insert(self, payload):
+        if self.fail_writes:
+            raise RuntimeError("write rejected")
+        self._op, self._payload = "insert", payload
+        return self
+
+    def eq(self, column, value):
+        self._filters.append((column, value))
+        return self
+
+    def limit(self, count):
+        return self
+
+    def order(self, column, desc=False):
         return self
 
     def maybe_single(self):
         self._single = True
         return self
 
-    def update(self, payload):
-        if self.fail_writes:
-            raise RuntimeError("write rejected")
-        self._pending_update = payload
-        return self
-
-    def insert(self, payload):
-        if self.fail_writes:
-            raise RuntimeError("write rejected")
-        self._pending_insert = payload
-        return self
-
     def execute(self):
-        assert self._key is not None
-        if self._pending_insert is not None:
-            payload, self._pending_insert = self._pending_insert, None
-            self.rows[payload["key"]] = payload["value"]
-            self.inserts.append(payload)
-            return _FakeResult([payload])
-        if self._pending_update is not None:
-            payload, self._pending_update = self._pending_update, None
-            self.rows[self._key] = payload["value"]
-            self.updates.append({"key": self._key, **payload})
+        if self._table == "bot_settings":
+            return self._legacy_execute()
+        return self._config_execute()
+
+    def _legacy_execute(self):
+        key = self._filters[0][1] if self._filters else None
+        if self._op == "insert":
+            self.legacy[self._payload["key"]] = self._payload["value"]
+            return _FakeResult([self._payload])
+        if self._op == "update":
+            self.legacy[key] = self._payload["value"]
             return _FakeResult([])
-        value = self.rows.get(self._key)
-        if self._selecting_value:
-            if self._single:
-                return _FakeResult({"value": value} if value is not None else {})
-            return _FakeResult([{"value": value}] if value is not None else [])
-        return _FakeResult([{"key": self._key}] if value is not None else [])
+        value = self.legacy.get(key)
+        if self._single:
+            return _FakeResult({"value": value} if value is not None else {})
+        return _FakeResult([{"value": value}] if value is not None else [])
+
+    def _config_execute(self):
+        owner = None
+        for column, value in self._filters:
+            if column == "owner_id":
+                owner = int(value)
+        row = self.config.get(owner)
+        if self._op == "insert":
+            self.config[int(self._payload["owner_id"])] = {
+                key: value for key, value in self._payload.items() if key != "owner_id"
+            }
+            self.inserts.append(dict(self._payload))
+            return _FakeResult([])
+        if self._op == "update":
+            if row is None:
+                return _FakeResult([])
+            row.update(self._payload)
+            self.updates.append({**self._payload, "owner_id": owner})
+            return _FakeResult([dict(row)])
+        return _FakeResult([dict(row)] if row is not None else [])
 
 
 @pytest.fixture(autouse=True)
 def _clean_state():
     svc.reset_in_memory()
+    svc.configure_owner(OWNER)
     yield
     svc.reset_in_memory()
 
 
 @pytest.fixture()
 def db(monkeypatch):
-    fake = _FakeBotSettingsDB()
+    fake = _FakeDB()
     monkeypatch.setattr("backend.db.client.get_db", lambda: fake)
     return fake
 
@@ -118,6 +147,11 @@ def _state(**overrides) -> dict:
     return state
 
 
+def _stored(db: _FakeDB) -> dict:
+    """The dedicated configuration row the service actually persisted."""
+    return db.config.get(OWNER, {})
+
+
 def _decide(state_doc, *, sender=STRANGER, private=True, at=NOW, owner=False):
     return svc.decide_incoming(
         state_doc, sender_id=sender, is_private=private, is_owner=owner, now=at
@@ -131,15 +165,18 @@ def _rule(days, start, end, mode):
 # ── default / backward compatibility ─────────────────────────────────────────
 
 
-def test_absent_configuration_is_open_and_performs_no_policy_action():
+def test_absent_configuration_is_open_and_performs_no_action():
     state = svc.state()
     assert state["mode"] == svc.MODE_OPEN
-    assert state["policy"] == svc.POLICY_IGNORE
+    for field_name in svc.ACTION_FIELDS:
+        assert state[field_name] is False, "every action is independently OFF"
+    assert state["ai_max_replies_per_person"] == 10
+    assert state["ai_unlimited_replies"] is False
+    assert state["ai_interval_seconds"] == 0
     assert state["allowlist"] == [] and state["exceptions"] == []
     assert state["temporary"] is None
     decision = _decide(state)
     assert decision.permitted is True
-    assert decision.action == svc.ACTION_ALLOW
     assert decision.reason == "open mode"
     assert svc.summarize(state, NOW).mode == svc.MODE_OPEN
 
@@ -157,120 +194,194 @@ def test_a_malformed_stored_document_falls_back_to_safe_defaults():
     )
     assert state["enabled"] is True  # the invalid value never disables enforcement
     assert state["mode"] == svc.MODE_OPEN
-    assert state["policy"] == svc.POLICY_IGNORE
+    for field_name in svc.ACTION_FIELDS:
+        assert state[field_name] is False
+    assert state["ai_max_replies_per_person"] == 10  # the invalid value fell back
     assert state["allowlist"] == [42]
     assert state["temporary"] is None
     assert state["schedule"]["timezone"] == svc.default_timezone()
     assert state["schedule"]["rules"] == []
 
 
-def test_garbage_json_in_the_row_is_ignored(db):
-    db.rows[svc.STATE_ROW_KEY] = "{not json"
+def test_garbage_json_in_the_legacy_document_is_ignored(db):
+    db.legacy[svc.LEGACY_STATE_ROW_KEY] = "{not json"
     asyncio.run(svc.ensure_loaded_async())
     assert svc.state()["mode"] == svc.MODE_OPEN
+    assert db.config == {}  # nothing was imported from an unusable document
+
+
+# ── the Phase-1 backfill (one-time import of the legacy document) ────────────
+
+
+def test_a_phase1_document_is_imported_into_the_dedicated_row(db):
+    """Every configured rule survives: the import happens exactly once."""
+    db.legacy[svc.LEGACY_STATE_ROW_KEY] = json.dumps({
+        "enabled": True,
+        "mode": "closed",
+        "policy": "autoreply",
+        "autoreply_text": "  busy  ",
+        "allowlist": [FRIEND],
+        "exceptions": [STRANGER],
+        "schedule": {"enabled": True, "timezone": "UTC", "rules": [
+            {"days": [0, 1], "start": "09:00", "end": "17:00", "mode": "open"},
+        ]},
+    })
+    asyncio.run(svc.ensure_loaded_async())
+
+    state = svc.state()
+    assert state["mode"] == svc.MODE_CLOSED
+    assert state[svc.ACTION_FIXED] is True and state["fixed_response_text"] == "busy"
+    assert state[svc.ACTION_DELETE] is False
+    assert state["allowlist"] == [FRIEND] and state["exceptions"] == [STRANGER]
+    assert state["schedule"]["enabled"] is True
+    stored = _stored(db)
+    assert stored["mode"] == svc.MODE_CLOSED
+    assert stored[svc.ACTION_FIXED] is True and stored["fixed_response_text"] == "busy"
+    assert stored["allowlist"] == [FRIEND]
+    assert stored["schedule"]["rules"][0]["start"] == "09:00"
+
+
+def test_a_phase1_delete_policy_becomes_the_delete_action(db):
+    db.legacy[svc.LEGACY_STATE_ROW_KEY] = json.dumps({"mode": "whitelist_only", "policy": "delete"})
+    asyncio.run(svc.ensure_loaded_async())
+    assert svc.state()[svc.ACTION_DELETE] is True
+    assert svc.state()[svc.ACTION_FIXED] is False
+    assert _stored(db)[svc.ACTION_DELETE] is True
+
+
+def test_an_imported_document_is_never_reinterpreted_again(db):
+    """Once the dedicated row exists it is the authority, flags included."""
+    db.config[OWNER] = {"mode": "open", svc.ACTION_DELETE: False, "policy_legacy": "delete"}
+    db.legacy[svc.LEGACY_STATE_ROW_KEY] = json.dumps({"mode": "closed", "policy": "delete"})
+    asyncio.run(svc.ensure_loaded_async())
+    assert svc.state()["mode"] == svc.MODE_OPEN
+    assert svc.state()[svc.ACTION_DELETE] is False
 
 
 # ── modes: open / whitelist_only / closed ────────────────────────────────────
 
 
 def test_open_mode_permits_everyone():
-    state = _state(mode=svc.MODE_OPEN, policy=svc.POLICY_DELETE)
+    state = _state(mode=svc.MODE_OPEN, **{svc.ACTION_DELETE: True})
     decision = _decide(state)
-    assert decision.permitted is True and decision.action == svc.ACTION_ALLOW
+    assert decision.permitted is True
+    assert decision.delete is False and decision.fixed_response is False
+    assert decision.ai_response is False
 
 
 def test_whitelist_only_permits_the_allowlist_and_restricts_others():
-    state = _state(mode=svc.MODE_WHITELIST_ONLY, policy=svc.POLICY_DELETE, allowlist=[FRIEND])
+    state = _state(mode=svc.MODE_WHITELIST_ONLY, allowlist=[FRIEND], **{svc.ACTION_DELETE: True})
     allowed = _decide(state, sender=FRIEND)
     denied = _decide(state, sender=STRANGER)
     assert allowed.permitted is True and allowed.reason == "authorized sender"
-    assert denied.permitted is False and denied.action == svc.POLICY_DELETE
+    assert denied.permitted is False and denied.delete is True
     assert denied.mode == svc.MODE_WHITELIST_ONLY
 
 
 def test_closed_mode_permits_only_the_exceptions():
-    state = _state(mode=svc.MODE_CLOSED, policy=svc.POLICY_IGNORE, exceptions=[FRIEND], allowlist=[STRANGER])
+    state = _state(mode=svc.MODE_CLOSED, exceptions=[FRIEND], allowlist=[STRANGER])
     assert _decide(state, sender=FRIEND).permitted is True
     assert _decide(state, sender=STRANGER).permitted is False
 
 
 def test_group_messages_and_the_owner_are_never_restricted():
-    state = _state(mode=svc.MODE_CLOSED, policy=svc.POLICY_DELETE)
+    state = _state(mode=svc.MODE_CLOSED, **{svc.ACTION_DELETE: True})
     assert _decide(state, sender=STRANGER, private=False).permitted is True
     assert _decide(state, sender=OWNER, owner=True).permitted is True
 
 
-def test_the_master_switch_disables_every_policy_action():
-    state = _state(enabled=False, mode=svc.MODE_CLOSED, policy=svc.POLICY_DELETE)
+def test_the_master_switch_disables_every_action():
+    state = _state(enabled=False, mode=svc.MODE_CLOSED, **{svc.ACTION_DELETE: True})
     decision = _decide(state)
     assert decision.permitted is True
     assert decision.reason == "feature disabled"
+    assert decision.delete is False and decision.ai_response is False
     assert decision.mode == svc.MODE_CLOSED  # the configured mode is still shown
 
 
 def test_an_unauthorized_sender_with_an_unusable_id_is_restricted_not_permitted():
-    state = _state(mode=svc.MODE_CLOSED, policy=svc.POLICY_IGNORE)
+    state = _state(mode=svc.MODE_CLOSED)
     assert _decide(state, sender=None).permitted is False
     assert _decide(state, sender=True).permitted is False
     assert _decide(state, sender=0).permitted is False
 
 
-# ── unauthorized policy ──────────────────────────────────────────────────────
+# ── the independent closing actions ────────────────────────────────────────
 
 
-def test_autoreply_without_text_falls_back_to_ignoring():
-    state = _state(mode=svc.MODE_CLOSED, policy=svc.POLICY_AUTOREPLY, autoreply_text="   ")
+def test_an_enabled_fixed_response_without_text_has_nothing_to_send():
+    state = _state(mode=svc.MODE_CLOSED, **{svc.ACTION_FIXED: True})
     decision = _decide(state)
     assert decision.permitted is False
-    assert decision.action == svc.POLICY_IGNORE
-    assert decision.autoreply_text == ""
+    assert decision.fixed_response is False
+    assert decision.fixed_response_text == ""
+    assert decision.delete is False and decision.ai_response is False
 
 
-def test_autoreply_text_travels_with_the_decision():
-    state = _state(mode=svc.MODE_CLOSED, policy=svc.POLICY_AUTOREPLY, autoreply_text="  busy  ")
+def test_the_configured_fixed_text_travels_with_the_decision_trimmed():
+    state = _state(
+        mode=svc.MODE_CLOSED,
+        **{svc.ACTION_FIXED: True},
+        fixed_response_text="  busy  ",
+    )
     decision = _decide(state)
-    assert decision.action == svc.POLICY_AUTOREPLY
-    assert decision.autoreply_text == "busy"
+    assert decision.fixed_response is True
+    assert decision.fixed_response_text == "busy"
+    assert decision.delete is False and decision.ai_response is False
 
 
-def test_autoreply_slots_are_rate_limited_per_sender_and_pruned():
-    svc.reset_in_memory()
-    assert svc.consume_autoreply_slot(STRANGER, 1000.0) is True
-    assert svc.consume_autoreply_slot(STRANGER, 1000.5) is False
-    assert svc.consume_autoreply_slot(OTHER_SENDER := STRANGER + 1, 1000.5) is True
-    assert svc.autoreply_seconds_remaining(STRANGER, 1010.0) == int(svc.AUTOREPLY_COOLDOWN_SECONDS - 10)
-    # Past the cooldown the slot is free again, and the mapping is pruned.
-    later = 1000.0 + svc.AUTOREPLY_COOLDOWN_SECONDS + 1
-    assert svc.consume_autoreply_slot(STRANGER, later) is True
-    assert OTHER_SENDER not in svc._autoreply_slots
+def test_every_action_combination_is_expressed_independently():
+    for combination in (
+        {svc.ACTION_DELETE: True},
+        {svc.ACTION_FIXED: True},
+        {svc.ACTION_AI: True},
+        {svc.ACTION_DELETE: True, svc.ACTION_FIXED: True},
+        {svc.ACTION_DELETE: True, svc.ACTION_AI: True},
+        {svc.ACTION_FIXED: True, svc.ACTION_AI: True},
+        {svc.ACTION_DELETE: True, svc.ACTION_FIXED: True, svc.ACTION_AI: True},
+    ):
+        state = _state(
+            mode=svc.MODE_CLOSED, fixed_response_text="closed", **combination
+        )
+        decision = _decide(state)
+        assert decision.permitted is False
+        assert decision.delete is bool(combination.get(svc.ACTION_DELETE))
+        assert decision.ai_response is bool(combination.get(svc.ACTION_AI))
+        assert decision.fixed_response is bool(combination.get(svc.ACTION_FIXED))
 
 
 # ── mutations + persistence ──────────────────────────────────────────────────
 
 
-def test_mutations_insert_then_update_the_bot_settings_row(db):
+def test_mutations_insert_then_update_the_dedicated_row(db):
     assert asyncio.run(svc.set_mode(svc.MODE_CLOSED)) is True
-    assert db.inserts and db.inserts[0]["key"] == svc.STATE_ROW_KEY
-    assert db.inserts[0]["value_type"] == "str"
-    assert json.loads(db.inserts[0]["value"])["mode"] == svc.MODE_CLOSED
-    assert asyncio.run(svc.set_policy(svc.POLICY_DELETE)) is True
-    assert db.updates and db.updates[-1]["key"] == svc.STATE_ROW_KEY
-    stored = json.loads(db.updates[-1]["value"])
-    assert stored["mode"] == svc.MODE_CLOSED and stored["policy"] == svc.POLICY_DELETE
+    assert db.inserts and db.inserts[0]["owner_id"] == OWNER
+    assert db.inserts[0]["mode"] == svc.MODE_CLOSED
+    assert asyncio.run(svc.set_action(svc.ACTION_DELETE, True)) is True
+    assert db.updates and db.updates[-1]["owner_id"] == OWNER
+    stored = _stored(db)
+    assert stored["mode"] == svc.MODE_CLOSED
+    assert stored[svc.ACTION_DELETE] is True
+    # The independent flags never write each other.
+    assert stored[svc.ACTION_FIXED] is False and stored[svc.ACTION_AI] is False
+    assert "policy" not in stored and "autoreply_text" not in stored
 
 
 def test_allowlist_add_and_remove_round_trip_through_the_row(db):
     assert asyncio.run(svc.add_list_entry("allowlist", FRIEND)) is True
     assert asyncio.run(svc.add_list_entry("allowlist", STRANGER)) is True
-    assert json.loads(db.rows[svc.STATE_ROW_KEY])["allowlist"] == sorted([FRIEND, STRANGER])
+    assert _stored(db)["allowlist"] == sorted([FRIEND, STRANGER])
     assert asyncio.run(svc.remove_list_entry("allowlist", FRIEND)) is True
-    assert json.loads(db.rows[svc.STATE_ROW_KEY])["allowlist"] == [STRANGER]
+    assert _stored(db)["allowlist"] == [STRANGER]
     assert svc.state()["allowlist"] == [STRANGER]
 
 
 def test_the_effective_policy_survives_a_restart(db):
     assert asyncio.run(svc.set_mode(svc.MODE_CLOSED)) is True
-    assert asyncio.run(svc.set_policy(svc.POLICY_DELETE)) is True
+    assert asyncio.run(svc.set_action(svc.ACTION_DELETE, True)) is True
+    assert asyncio.run(svc.set_action(svc.ACTION_AI, True)) is True
+    assert asyncio.run(svc.set_ai_max_replies_per_person(3)) is True
+    assert asyncio.run(svc.set_ai_interval_seconds(60)) is True
     assert asyncio.run(svc.add_list_entry("exceptions", FRIEND)) is True
 
     svc.reset_in_memory()  # a fresh process: nothing in memory, one row in the DB
@@ -279,9 +390,13 @@ def test_the_effective_policy_survives_a_restart(db):
     asyncio.run(svc.ensure_loaded_async())
     restored = svc.state()
     assert restored["mode"] == svc.MODE_CLOSED
-    assert restored["policy"] == svc.POLICY_DELETE
+    assert restored[svc.ACTION_DELETE] is True and restored[svc.ACTION_AI] is True
+    assert restored[svc.ACTION_FIXED] is False
+    assert restored["ai_max_replies_per_person"] == 3
+    assert restored["ai_interval_seconds"] == 60
     assert restored["exceptions"] == [FRIEND]
-    assert _decide(restored, sender=STRANGER).action == svc.POLICY_DELETE
+    decision = _decide(restored, sender=STRANGER)
+    assert decision.delete is True and decision.ai_response is True
     assert _decide(restored, sender=FRIEND).permitted is True
 
 
@@ -294,14 +409,15 @@ def test_concurrent_mutations_are_serialized(db):
 
     assert asyncio.run(_both()) == [True, True]
     assert svc.state()["allowlist"] == sorted([FRIEND, STRANGER])
-    assert json.loads(db.rows[svc.STATE_ROW_KEY])["allowlist"] == sorted([FRIEND, STRANGER])
+    assert _stored(db)["allowlist"] == sorted([FRIEND, STRANGER])
 
 
 def test_a_failed_write_leaves_the_state_unchanged(monkeypatch):
-    fake = _FakeBotSettingsDB(fail_writes=True)
+    fake = _FakeDB(fail_writes=True)
     monkeypatch.setattr("backend.db.client.get_db", lambda: fake)
     assert asyncio.run(svc.set_mode(svc.MODE_CLOSED)) is False
     assert svc.state()["mode"] == svc.MODE_OPEN
+    assert fake.config == {}
 
 
 def test_without_a_database_the_state_is_memory_only_and_the_panel_text_says_so(no_db):
@@ -316,9 +432,17 @@ def test_without_a_database_the_state_is_memory_only_and_the_panel_text_says_so(
 def test_invalid_settings_are_rejected_and_change_nothing(db):
     before = svc.state()
     assert asyncio.run(svc.set_mode("blocked")) is False
-    assert asyncio.run(svc.set_policy("nuke")) is False
-    assert asyncio.run(svc.set_autoreply_text("")) is False
-    assert asyncio.run(svc.set_autoreply_text("x" * (svc.MAX_AUTOREPLY_LENGTH + 1))) is False
+    assert asyncio.run(svc.set_action("nuke", True)) is False
+    assert asyncio.run(svc.set_action(svc.ACTION_DELETE, "yes")) is False
+    assert asyncio.run(svc.set_fixed_response_text("")) is False
+    assert asyncio.run(svc.set_fixed_response_text("x" * (svc.MAX_FIXED_RESPONSE_LENGTH + 1))) is False
+    assert asyncio.run(svc.set_ai_max_replies_per_person(0)) is False
+    assert asyncio.run(svc.set_ai_max_replies_per_person(svc.MAX_AI_REPLIES_PER_PERSON + 1)) is False
+    assert asyncio.run(svc.set_ai_max_replies_per_person("10")) is False
+    assert asyncio.run(svc.set_ai_interval_seconds(-1)) is False
+    assert asyncio.run(svc.set_ai_interval_seconds(svc.MAX_AI_INTERVAL_SECONDS + 1)) is False
+    assert asyncio.run(svc.set_ai_unlimited_replies("yes")) is False
+    assert asyncio.run(svc.set_ai_interval_seconds(0)) is True  # zero IS supported
     assert asyncio.run(svc.set_schedule_timezone("Mars/Olympus")) is False
     assert asyncio.run(svc.add_list_entry("allowlist", -5)) is False
     assert asyncio.run(svc.add_list_entry("allowlist", "ali")) is False
@@ -332,7 +456,13 @@ def test_invalid_settings_are_rejected_and_change_nothing(db):
     assert asyncio.run(svc.save_schedule_rule(_rule([0], "9:0", "18:00", "closed"))) is False
     assert asyncio.run(svc.save_schedule_rule(_rule([0], "09:00", "18:00", "blocked"))) is False
     assert svc.state() == before
-    assert db.rows == {}
+    # The ONLY accepted write is the supported `interval = 0`; every rejected
+    # value left memory AND the stored row untouched.
+    stored = _stored(db)
+    assert stored["ai_interval_seconds"] == 0
+    assert stored["mode"] == svc.MODE_OPEN
+    assert stored[svc.ACTION_DELETE] is False and stored[svc.ACTION_AI] is False
+    assert stored["updated_at"]
 
 
 def test_schedule_rules_can_be_edited_deleted_and_are_bounded(db):
@@ -396,7 +526,7 @@ def test_expired_temporary_override_is_persisted_away(db):
     }
     assert asyncio.run(svc.drop_expired_temporary()) is True
     assert svc.state()["temporary"] is None
-    assert json.loads(db.rows[svc.STATE_ROW_KEY])["temporary"] is None
+    assert _stored(db)["temporary"] is None
     # Nothing left to drop.
     assert asyncio.run(svc.drop_expired_temporary()) is False
 
@@ -551,15 +681,22 @@ def test_no_transition_is_promised_when_enforcement_is_off_or_nothing_is_schedul
 def test_summary_reports_the_effective_state_the_panel_renders():
     state = _state(
         mode=svc.MODE_CLOSED,
-        policy=svc.POLICY_AUTOREPLY,
-        autoreply_text="busy",
+        **{svc.ACTION_DELETE: True, svc.ACTION_AI: True},
+        fixed_response_text="busy",
+        ai_max_replies_per_person=6,
+        ai_interval_seconds=30,
         allowlist=[FRIEND],
         schedule={"enabled": True, "timezone": "Asia/Tehran", "rules": [_rule([4], "09:00", "18:00", "open")]},
     )
     summary = svc.summarize(state, NOW)  # NOW is Friday 15:30 Tehran → inside the rule
     assert summary.mode == svc.MODE_OPEN and summary.source == svc.SOURCE_SCHEDULE
     assert summary.enabled is True
-    assert summary.policy == svc.POLICY_AUTOREPLY and summary.autoreply_text == "busy"
+    assert summary.delete_incoming is True and summary.ai_response_enabled is True
+    assert summary.fixed_response_enabled is False
+    assert summary.fixed_response_text == "busy"
+    assert summary.ai_max_replies_per_person == 6
+    assert summary.ai_unlimited_replies is False
+    assert summary.ai_interval_seconds == 30
     assert summary.allowlist == (FRIEND,)
     assert summary.schedule_enabled is True and summary.schedule_timezone == "Asia/Tehran"
     assert len(summary.schedule_rules) == 1

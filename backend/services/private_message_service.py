@@ -21,9 +21,30 @@ Boundaries kept on purpose
   boundary needs no ticker: there is nothing to change at a boundary except how
   the *next* message is handled. Recomputing on every message and every panel
   render is also what makes a restart correct without replaying missed ticks.
-* **No new table.** State is ONE JSON document in the existing ``bot_settings``
-  key/value row (the store ``ghost_seen_v2`` already uses), with the documented
-  in-memory fallback when Supabase is absent.
+* **Dedicated persistence.** The state lives in the feature's own tables
+  (``private_message_config`` / ``private_message_senders``,
+  DATABASE_ARCHITECTURE.md §33) instead of the generic ``bot_settings`` JSON
+  document. A document written by Phase 1 is still understood and is imported
+  into the dedicated row on first read (no configured rule is ever discarded).
+* **Hard scope.** The scope gate (:func:`classify_scope`) admits ONLY genuine
+  human users in direct private chats with the owner's account: a bot, a
+  group, a supergroup, a channel, a linked discussion group, an unresolved or
+  malformed entity and any contradictory event are rejected BEFORE any action
+  (delete, fixed response, AI response, counter claim, enforcement record).
+  No configuration can widen it.
+* **Independent actions.** Deleting the message, sending the configured fixed
+  response and generating an AI response are three separately enabled actions,
+  executed in that fixed order; enabling one never enables another.
+* **No second AI runtime.** The AI response is generated through the existing
+  shared ``ProviderManager`` (``tools=[]``), like the durable-task preparation
+  path, and receives NOTHING but the incoming message text. Both required
+  disclosures are plain-Unicode application text appended after generation, so
+  the model can neither remove nor override them.
+* **Durable allowance.** The per-person AI reply limit and interval are
+  enforced by ONE conditional (CAS) write per reply into
+  ``private_message_senders`` (with the documented in-memory fallback when
+  Supabase is absent, which keeps enforcing the SAME quota). Counters are never
+  reset implicitly — a restart cannot hand anyone a fresh allowance.
 
 Precedence (deterministic, and shown in the panel)
 --------------------------------------------------
@@ -40,8 +61,8 @@ import copy
 import json
 import logging
 import os
-import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import date, datetime, time as clock_time, timedelta, timezone
 from typing import Any, Callable
@@ -56,12 +77,42 @@ MODE_WHITELIST_ONLY = "whitelist_only"
 MODE_CLOSED = "closed"
 MODES: tuple[str, ...] = (MODE_OPEN, MODE_WHITELIST_ONLY, MODE_CLOSED)
 
-POLICY_IGNORE = "ignore"
-POLICY_DELETE = "delete"
-POLICY_AUTOREPLY = "autoreply"
-POLICIES: tuple[str, ...] = (POLICY_IGNORE, POLICY_DELETE, POLICY_AUTOREPLY)
+#: The three INDEPENDENT closing actions. Each has its own enable flag, its own
+#: control and its own execution step; enabling one never enables another.
+ACTION_DELETE = "delete_incoming"
+ACTION_FIXED = "fixed_response_enabled"
+ACTION_AI = "ai_response_enabled"
+ACTION_FIELDS: tuple[str, ...] = (ACTION_DELETE, ACTION_FIXED, ACTION_AI)
 
-ACTION_ALLOW = "allow"
+ACTION_LABELS: dict[str, str] = {
+    ACTION_DELETE: "Delete incoming message",
+    ACTION_FIXED: "Send fixed response",
+    ACTION_AI: "Send AI response",
+}
+
+#: Legacy Phase-1 mutually exclusive policy values. They are read ONLY to import
+#: an existing document into the independent flags (backfill), never again as a
+#: control surface.
+LEGACY_POLICY_IGNORE = "ignore"
+LEGACY_POLICY_DELETE = "delete"
+LEGACY_POLICY_AUTOREPLY = "autoreply"
+
+# ── Scope verdicts (the hard execution boundary) ──
+
+SCOPE_ELIGIBLE = "eligible"
+SCOPE_NOT_INCOMING = "not_incoming"
+SCOPE_GROUP = "group_conversation"
+SCOPE_CHANNEL = "channel_conversation"
+SCOPE_CHAT_UNKNOWN = "chat_type_unknown"
+SCOPE_NOT_PRIVATE = "not_private_chat"
+SCOPE_INCONSISTENT = "inconsistent_event"
+SCOPE_CHAT_UNRESOLVED = "chat_unresolved"
+SCOPE_SENDER_UNRESOLVED = "sender_unresolved"
+SCOPE_SENDER_NOT_USER = "sender_not_a_user"
+SCOPE_SENDER_TYPE_UNKNOWN = "sender_type_unknown"
+SCOPE_BOT = "bot_sender"
+SCOPE_DELETED = "deleted_sender"
+SCOPE_SELF = "own_account_chat"
 
 SOURCE_MANUAL = "manual"
 SOURCE_TEMPORARY = "temporary"
@@ -73,12 +124,6 @@ MODE_LABELS: dict[str, str] = {
     MODE_CLOSED: "Closed (exceptions only)",
 }
 
-POLICY_LABELS: dict[str, str] = {
-    POLICY_IGNORE: "Ignore (do nothing)",
-    POLICY_DELETE: "Delete the message",
-    POLICY_AUTOREPLY: "Auto-reply once (rate limited)",
-}
-
 SOURCE_LABELS: dict[str, str] = {
     SOURCE_MANUAL: "manual mode",
     SOURCE_TEMPORARY: "temporary override",
@@ -87,22 +132,53 @@ SOURCE_LABELS: dict[str, str] = {
 
 WEEKDAY_LABELS: tuple[str, ...] = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 
-#: One automatic answer per unauthorized sender per window. The mapping stays
-#: bounded by the distinct senders inside the window (pruned on every decision).
-AUTOREPLY_COOLDOWN_SECONDS = 300.0
-MAX_AUTOREPLY_LENGTH = 512
+MAX_FIXED_RESPONSE_LENGTH = 512
 MAX_LIST_ENTRIES = 200
 MAX_SCHEDULE_RULES = 12
 _TRANSITION_HORIZON_DAYS = 8
-_STATE_VERSION = 1
+_STATE_VERSION = 2
 
-#: The ``bot_settings`` row this feature owns (created on first write, like the
-#: Ghost Seen allow-list row — deliberately not seeded by the canonical schema).
-STATE_ROW_KEY = "private_message_management"
+#: Per-person AI allowance bounds (the panel validates against these and the
+#: dedicated table's constraints mirror them).
+MAX_AI_REPLIES_PER_PERSON = 10000
+MAX_AI_INTERVAL_SECONDS = 86400
 
-#: Every database round trip is bounded so a slow/unreachable store can never
-#: stall the Telegram event path (the load is awaited once, on first use).
-DB_TIMEOUT_SECONDS = 5.0
+#: Bounded generation envelope for ONE AI reply, and Telegram's practical text
+#: ceiling: the disclosures are appended by the application, so a reply that
+#: would not fit is REFUSED instead of being truncated.
+AI_REPLY_TIMEOUT_S = 60.0
+MAX_DELIVERED_TEXT_LENGTH = 4000
+
+#: The legacy Phase-1 ``bot_settings`` row. It is READ ONLY, once, to import an
+#: existing configuration into the dedicated tables; the feature never writes it
+#: again (nothing is deleted either — the document stays as the owner left it).
+LEGACY_STATE_ROW_KEY = "private_message_management"
+
+#: The two required disclosures. Application-controlled plain Unicode text —
+#: appended by :func:`compose_ai_reply` AFTER generation, so the model can never
+#: remove, weaken or override them.
+CLOSED_NOTICE = "این پی‌وی در حال حاضر بسته است."
+AI_NOTICE = "این پیام توسط هوش مصنوعی تولید و ارسال شده است."
+
+#: Bounded duplicate-update guard: an exact (chat, message) pair is enforced
+#: once, so a Telegram redelivery can never delete twice, answer twice or spend
+#: two allowances.
+_HANDLED_MAX = 512
+_HANDLED_TTL_S = 900.0
+_handled: "OrderedDict[tuple[int, int], float]" = OrderedDict()
+
+#: One lock per (owner, sender) serialises the enforcement of ONE person, so two
+#: concurrent messages from the same person cannot run two generations or spend
+#: one allowance twice.
+_LOCKS_MAX = 512
+_locks: dict[tuple[int, int], asyncio.Lock] = {}
+
+#: Set by ``configure_owner`` (the handler's ``register``); the fallback reads
+#: the runtime's configured owner so a service call outside registration still
+#: knows whose row it is writing.
+_owner: int | None = None
+
+
 
 
 # ── State shape ──
@@ -133,8 +209,13 @@ def _default_state() -> dict[str, Any]:
         "version": _STATE_VERSION,
         "enabled": True,
         "mode": MODE_OPEN,
-        "policy": POLICY_IGNORE,
-        "autoreply_text": "",
+        "delete_incoming": False,
+        "fixed_response_enabled": False,
+        "fixed_response_text": "",
+        "ai_response_enabled": False,
+        "ai_max_replies_per_person": 10,
+        "ai_unlimited_replies": False,
+        "ai_interval_seconds": 0,
         "allowlist": [],
         "exceptions": [],
         "temporary": None,
@@ -277,18 +358,152 @@ def sanitize_state(raw: Any) -> dict[str, Any]:
         return state
     if raw.get("mode") in MODES:
         state["mode"] = str(raw["mode"])
-    if raw.get("policy") in POLICIES:
-        state["policy"] = str(raw["policy"])
     if isinstance(raw.get("enabled"), bool):
         state["enabled"] = raw["enabled"]
-    text = raw.get("autoreply_text")
+    for field_name in ACTION_FIELDS:
+        if isinstance(raw.get(field_name), bool):
+            state[field_name] = raw[field_name]
+    text = raw.get("fixed_response_text")
     if isinstance(text, str):
-        state["autoreply_text"] = text.strip()[:MAX_AUTOREPLY_LENGTH]
+        state["fixed_response_text"] = text.strip()[:MAX_FIXED_RESPONSE_LENGTH]
+    limit = raw.get("ai_max_replies_per_person")
+    if isinstance(limit, int) and not isinstance(limit, bool) and 1 <= limit <= MAX_AI_REPLIES_PER_PERSON:
+        state["ai_max_replies_per_person"] = limit
+    if isinstance(raw.get("ai_unlimited_replies"), bool):
+        state["ai_unlimited_replies"] = raw["ai_unlimited_replies"]
+    interval = raw.get("ai_interval_seconds")
+    if isinstance(interval, int) and not isinstance(interval, bool) and 0 <= interval <= MAX_AI_INTERVAL_SECONDS:
+        state["ai_interval_seconds"] = interval
     state["allowlist"] = _sanitize_list(raw.get("allowlist"))
     state["exceptions"] = _sanitize_list(raw.get("exceptions"))
     state["temporary"] = _sanitize_temporary(raw.get("temporary"))
     state["schedule"] = _sanitize_schedule(raw.get("schedule"), state["schedule"]["timezone"])
+    _import_legacy_actions(state, raw)
     return state
+
+
+def _import_legacy_actions(state: dict[str, Any], raw: dict[str, Any]) -> None:
+    """Backfill from a Phase-1 document, whose single ``policy`` value chose ONE
+    action for every unauthorized sender.
+
+    The mapping preserves what the owner configured: ``delete`` enables the
+    delete action, ``autoreply`` enables the fixed response with its text
+    (including the empty-text case, which Phase 1 itself treated as ignore) and
+    ``ignore`` enables nothing. An explicit Phase-2 flag always wins, so a
+    document that has already been migrated is never re-interpreted.
+    """
+    if any(field_name in raw for field_name in ACTION_FIELDS):
+        return
+    legacy = raw.get("policy")
+    if legacy == LEGACY_POLICY_DELETE:
+        state[ACTION_DELETE] = True
+    elif legacy == LEGACY_POLICY_AUTOREPLY:
+        text = raw.get("autoreply_text")
+        if isinstance(text, str) and text.strip():
+            state[ACTION_FIXED] = True
+            state["fixed_response_text"] = text.strip()[:MAX_FIXED_RESPONSE_LENGTH]
+
+
+# ── Scope (the hard execution boundary) ──
+
+
+@dataclass(frozen=True)
+class ScopeVerdict:
+    eligible: bool
+    reason: str
+    chat_id: int = 0
+    sender_id: int = 0
+    message_id: int = 0
+
+    @property
+    def identity(self) -> tuple[int, int]:
+        return (self.chat_id, self.message_id)
+
+
+def _valid_owner(owner_id: Any) -> bool:
+    """A real Telegram user id — never a bool, never zero/negative."""
+    return isinstance(owner_id, int) and not isinstance(owner_id, bool) and owner_id > 0
+
+
+def _positive_id(value: Any) -> int | None:
+    """A positive Telegram id, or None (bools and non-ints are never ids)."""
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    return None
+
+
+def _bot_flag(entity: Any) -> bool | None:
+    """Telegram's authoritative bot flag as a real bool, or None when the
+    entity carries no usable value — an unknown entity is never assumed human."""
+    flag = getattr(entity, "bot", None)
+    return flag if isinstance(flag, bool) else None
+
+
+def classify_scope(
+    *,
+    owner_id: Any,
+    is_private: Any,
+    is_group: Any,
+    is_channel: Any,
+    chat_id: Any,
+    sender_id: Any,
+    message_id: Any,
+    peer_user_id: Any,
+    chat_is_user: bool,
+    sender_is_user: bool,
+    chat_entity: Any = None,
+    sender_entity: Any = None,
+) -> ScopeVerdict:
+    """The ONE scope gate: is this event a genuine human private message?
+
+    Both halves are proven independently and must agree — the chat half from the
+    event's peer type plus the resolved chat entity, the sender half from the
+    resolved sender entity's own bot flag. ``is_private`` alone is NOT enough:
+    a private chat with a BOT is a private chat, and a linked discussion group
+    or a megagroup is a ``PeerChannel``. Everything unresolved, malformed or
+    contradictory fails closed, and the caller performs NO action whatsoever on
+    a rejection (no delete, no response, no AI request, no counter, no record).
+    """
+    if not _valid_owner(owner_id):
+        return ScopeVerdict(False, SCOPE_INCONSISTENT)
+    if is_group is True:
+        return ScopeVerdict(False, SCOPE_GROUP)
+    if is_channel is True:
+        return ScopeVerdict(False, SCOPE_CHANNEL)
+    if is_private is not True or is_group is not False or is_channel is not False:
+        return ScopeVerdict(False, SCOPE_CHAT_UNKNOWN)
+
+    chat = _positive_id(chat_id)
+    sender = _positive_id(sender_id)
+    message = _positive_id(message_id)
+    peer = _positive_id(peer_user_id)
+    if chat is None or sender is None or message is None or peer is None:
+        return ScopeVerdict(False, SCOPE_INCONSISTENT)
+    if not (peer == chat == sender):
+        return ScopeVerdict(False, SCOPE_INCONSISTENT)
+    if chat == owner_id:
+        return ScopeVerdict(False, SCOPE_SELF)
+    if not chat_is_user:
+        return ScopeVerdict(False, SCOPE_NOT_PRIVATE)
+    if chat_entity is None:
+        return ScopeVerdict(False, SCOPE_CHAT_UNRESOLVED)
+    if sender_entity is None:
+        return ScopeVerdict(False, SCOPE_SENDER_UNRESOLVED)
+    if not sender_is_user:
+        return ScopeVerdict(False, SCOPE_SENDER_NOT_USER)
+    if _positive_id(getattr(chat_entity, "id", None)) != chat:
+        return ScopeVerdict(False, SCOPE_INCONSISTENT)
+    if _positive_id(getattr(sender_entity, "id", None)) != chat:
+        return ScopeVerdict(False, SCOPE_INCONSISTENT)
+    for entity in (chat_entity, sender_entity):
+        flag = _bot_flag(entity)
+        if flag is None:
+            return ScopeVerdict(False, SCOPE_SENDER_TYPE_UNKNOWN)
+        if flag:
+            return ScopeVerdict(False, SCOPE_BOT)
+        if getattr(entity, "deleted", False) is True:
+            return ScopeVerdict(False, SCOPE_DELETED)
+    return ScopeVerdict(True, SCOPE_ELIGIBLE, chat, sender, message)
 
 
 # ── In-memory cache + persistence ──
@@ -299,9 +514,7 @@ _load_task: asyncio.Task | None = None
 _load_task_loop: Any = None
 _state_lock: asyncio.Lock | None = None
 _state_lock_loop: Any = None
-_persist_lock = threading.Lock()
 _locally_mutated = False
-_autoreply_slots: dict[int, float] = {}
 
 
 def _mutation_lock() -> asyncio.Lock:
@@ -343,39 +556,65 @@ def reset_in_memory() -> None:
     _load_task = None
     _load_task_loop = None
     _locally_mutated = False
-    _autoreply_slots.clear()
+    _handled.clear()
+    _locks.clear()
 
 
-async def _read_state_row() -> str | None:
-    from backend.db.client import get_db
+def configure_owner(owner_id: Any) -> None:
+    """Bind the owner this process serves (called by the handler's register)."""
+    global _owner
+    _owner = owner_id if _valid_owner(owner_id) else None
 
-    db = get_db()
-    if db is None:
+
+def owner_id() -> int | None:
+    """The owner whose row the feature reads/writes, or None when unknown."""
+    if _owner is not None:
+        return _owner
+    try:
+        from backend.helper.inline_engine import get_owner_id
+        value = get_owner_id()
+    except Exception:
         return None
+    return value if _valid_owner(value) else None
 
-    def _read_sync() -> Any:
-        row = (
-            db.table("bot_settings")
-            .select("value")
-            .eq("key", STATE_ROW_KEY)
-            .maybe_single()
-            .execute()
-        )
-        return getattr(row, "data", None)
 
-    data = await asyncio.wait_for(asyncio.to_thread(_read_sync), timeout=DB_TIMEOUT_SECONDS)
-    if isinstance(data, dict):
-        value = data.get("value")
-        if isinstance(value, str) and value.strip():
-            return value
-    return None
+async def _read_state_document() -> tuple[dict[str, Any] | None, bool]:
+    """``(document, is_legacy)`` for this owner.
+
+    The DEDICATED row is authoritative. Only when it does not exist yet is the
+    legacy Phase-1 ``bot_settings`` document read — once — as the backfill
+    source; :func:`sanitize_state` maps its single ``policy`` value onto the
+    independent flags, so an existing configuration is imported, never lost.
+    """
+    from backend.db import client as db_client
+
+    current = owner_id()
+    if current is None:
+        return None, False
+    row = await db_client.get_private_message_config(current)
+    if isinstance(row, dict):
+        return row, False
+    legacy = await db_client.get_legacy_private_message_state(current)
+    if not isinstance(legacy, str) or not legacy.strip():
+        return None, False
+    try:
+        parsed = json.loads(legacy)
+    except Exception as exc:
+        logger.warning("private_message: legacy configuration is not usable JSON: %s", exc)
+        return None, False
+    if not isinstance(parsed, dict):
+        return None, False
+    logger.info(
+        "private_message: importing the legacy settings document into the dedicated tables"
+    )
+    return parsed, True
 
 
 async def _load_task_body() -> None:
-    global _loaded
+    global _loaded, _locally_mutated
     _loaded = True
     try:
-        raw = await _read_state_row()
+        raw, is_legacy = await _read_state_document()
     except asyncio.CancelledError:
         raise
     except Exception as exc:
@@ -383,11 +622,7 @@ async def _load_task_body() -> None:
         return
     if raw is None:
         return
-    try:
-        loaded = sanitize_state(json.loads(raw))
-    except Exception as exc:
-        logger.warning("private_message: stored state is not usable JSON: %s", exc)
-        return
+    loaded = sanitize_state(raw)
     async with _mutation_lock():
         # A local change made while the read was in flight has already been
         # written, so the stored value it produced is newer than this snapshot.
@@ -395,6 +630,17 @@ async def _load_task_body() -> None:
             return
         _state.clear()
         _state.update(loaded)
+    if is_legacy:
+        # One-time backfill: the imported configuration is written to the
+        # dedicated row, so the legacy document is read at most once and the
+        # feature is durable from here on. A failed write keeps the imported
+        # state in memory and the read is retried on the next start.
+        try:
+            await _write_state_row(loaded)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("private_message: legacy import write failed: %s", exc)
 
 
 async def ensure_loaded_async() -> None:
@@ -425,33 +671,23 @@ async def reload_async() -> None:
 
 
 async def _write_state_row(candidate: dict[str, Any]) -> bool:
-    from backend.db.client import get_db
+    """Persist the whole configuration document into the dedicated table.
 
-    db = get_db()
-    if db is None:
+    ``False`` means the durable write did not land; :func:`_mutate` then leaves
+    the in-memory state untouched, so memory and storage can never disagree.
+    """
+    from backend.db import client as db_client
+
+    current = owner_id()
+    if current is None:
+        logger.warning("private_message: no owner configured — state kept in memory only")
+        return True
+    if not persistence_available():
         # No database: the change applies to this process only. The panel shows
         # that explicitly instead of claiming durable storage.
         logger.warning("private_message: no database — state kept in memory only")
         return True
-
-    def _write_sync() -> None:
-        with _persist_lock:
-            value = json.dumps(candidate, sort_keys=True)
-            existing = (
-                db.table("bot_settings").select("key").eq("key", STATE_ROW_KEY).execute()
-            )
-            rows = getattr(existing, "data", None) or []
-            if rows:
-                db.table("bot_settings").update({"value": value}).eq("key", STATE_ROW_KEY).execute()
-            else:
-                db.table("bot_settings").insert({
-                    "key": STATE_ROW_KEY,
-                    "value": value,
-                    "value_type": "str",
-                }).execute()
-
-    await asyncio.wait_for(asyncio.to_thread(_write_sync), timeout=DB_TIMEOUT_SECONDS)
-    return True
+    return await db_client.save_private_message_config(current, candidate)
 
 
 async def _mutate(mutator: Callable[[dict[str, Any]], None]) -> bool:
@@ -659,11 +895,20 @@ def is_authorized(state_doc: dict[str, Any], sender_id: Any, mode: str) -> bool:
 
 @dataclass(frozen=True)
 class IncomingDecision:
+    """What the owner configured for ONE incoming private message.
+
+    The three actions are NOT alternatives: each one is present exactly when its
+    own flag is enabled, and the handler executes them in the documented order
+    (delete, then the fixed response, then the AI response).
+    """
+
     permitted: bool
     mode: str
     source: str
-    action: str
-    autoreply_text: str = ""
+    delete: bool = False
+    fixed_response: bool = False
+    fixed_response_text: str = ""
+    ai_response: bool = False
     reason: str = ""
 
 
@@ -680,53 +925,146 @@ def decide_incoming(
     Non-private chats and the owner's own messages are always permitted: this
     feature manages *incoming private* messages only, so the owner can still be
     answered by the bot and the owner's replies keep reaching the existing
-    handlers untouched.
+    handlers untouched. Every rejection by the scope gate happens BEFORE this
+    function is consulted (:func:`classify_scope`), so a bot, group, channel or
+    unverifiable event never reaches an action at all.
     """
     policy = resolve_policy(state_doc, now)
     if not is_private:
-        return IncomingDecision(True, policy.mode, policy.source, ACTION_ALLOW, reason="not a private chat")
+        return IncomingDecision(True, policy.mode, policy.source, reason="not a private chat")
     if is_owner:
-        return IncomingDecision(True, policy.mode, policy.source, ACTION_ALLOW, reason="owner")
+        return IncomingDecision(True, policy.mode, policy.source, reason="owner")
     if not policy.enforced:
-        return IncomingDecision(True, policy.mode, policy.source, ACTION_ALLOW, reason="feature disabled")
+        return IncomingDecision(True, policy.mode, policy.source, reason="feature disabled")
     if policy.mode == MODE_OPEN:
-        return IncomingDecision(True, policy.mode, policy.source, ACTION_ALLOW, reason="open mode")
+        return IncomingDecision(True, policy.mode, policy.source, reason="open mode")
     if is_authorized(state_doc, sender_id, policy.mode):
-        return IncomingDecision(True, policy.mode, policy.source, ACTION_ALLOW, reason="authorized sender")
+        return IncomingDecision(True, policy.mode, policy.source, reason="authorized sender")
 
-    configured = str(state_doc.get("policy") or POLICY_IGNORE)
-    text = str(state_doc.get("autoreply_text") or "").strip()
-    if configured == POLICY_AUTOREPLY and text:
-        action = POLICY_AUTOREPLY
-    elif configured == POLICY_DELETE:
-        action = POLICY_DELETE
-    else:
-        # An auto-reply with no text configured falls back to ignoring: an
-        # empty message is never sent to anyone.
-        action = POLICY_IGNORE
+    text = str(state_doc.get("fixed_response_text") or "").strip()
+    fixed_enabled = bool(state_doc.get(ACTION_FIXED)) and bool(text)
     return IncomingDecision(
-        False, policy.mode, policy.source, action, autoreply_text=text, reason="unauthorized sender"
+        False,
+        policy.mode,
+        policy.source,
+        delete=bool(state_doc.get(ACTION_DELETE)),
+        fixed_response=fixed_enabled,
+        # An enabled fixed response with no configured text has nothing to send,
+        # so the panel's text input is the only way to make it reachable.
+        fixed_response_text=text if fixed_enabled else "",
+        ai_response=bool(state_doc.get(ACTION_AI)),
+        reason="unauthorized sender",
     )
 
 
-def consume_autoreply_slot(sender_id: int, monotonic_now: float | None = None) -> bool:
-    """Whether this unauthorized sender may receive an auto-reply right now."""
+# ── Durable per-person allowance (one CAS claim per AI reply) ──
+
+
+def _sender_lock(owner: int, sender_id: int) -> asyncio.Lock:
+    key = (owner, sender_id)
+    lock = _locks.get(key)
+    if lock is None:
+        while len(_locks) >= _LOCKS_MAX:
+            _locks.pop(next(iter(_locks)))
+        lock = asyncio.Lock()
+        _locks[key] = lock
+    return lock
+
+
+def already_handled(chat_id: int, message_id: int, monotonic_now: float | None = None) -> bool:
+    """True when this exact (chat, message) pair was already enforced.
+
+    A Telegram redelivery of the SAME update must never delete twice, answer
+    twice or spend two allowances; the registry is bounded and time-limited.
+    """
     now = time.monotonic() if monotonic_now is None else monotonic_now
-    cutoff = now - AUTOREPLY_COOLDOWN_SECONDS
-    for key in [key for key, seen in _autoreply_slots.items() if seen < cutoff]:
-        _autoreply_slots.pop(key, None)
-    if _autoreply_slots.get(sender_id, 0.0) > cutoff:
+    for stale in [key for key, stamp in _handled.items() if now - stamp > _HANDLED_TTL_S]:
+        _handled.pop(stale, None)
+    key = (chat_id, message_id)
+    if key in _handled:
+        _handled[key] = now
+        return True
+    _handled[key] = now
+    while len(_handled) > _HANDLED_MAX:
+        _handled.popitem(last=False)
+    return False
+
+
+async def claim_ai_reply(owner: int, sender_id: int, config: dict[str, Any]) -> dict[str, Any]:
+    """Claim ONE AI reply from this person's durable allowance.
+
+    The claim is ONE atomic conditional write performed BEFORE the model is
+    asked anything, so concurrent/duplicate updates can never spend the same
+    reply. The returned envelope is honest: ``ok=False`` means the store could
+    not answer and the caller must send nothing (fail closed), ``claimed=False``
+    means the configured limit or interval vetoed it.
+    """
+    from backend.db import client as db_client
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    return await db_client.claim_private_message_ai_reply(
+        owner,
+        sender_id,
+        max_replies=int(config.get("ai_max_replies_per_person") or 0),
+        unlimited=bool(config.get("ai_unlimited_replies")),
+        interval_seconds=int(config.get("ai_interval_seconds") or 0),
+        now_iso=now_iso,
+    )
+
+
+async def release_ai_reply(owner: int, sender_id: int, token: Any) -> bool:
+    """Give a claimed reply back when generation or delivery failed, so a reply
+    that was never delivered can never consume the person's allowance."""
+    from backend.db import client as db_client
+
+    return await db_client.release_private_message_ai_reply(owner, sender_id, token)
+
+
+async def reset_counters(owner: int) -> bool:
+    """The owner's explicit reset — the ONLY edge that clears the counters.
+
+    Counters never reset implicitly (no TTL, no restart, no configuration
+    change), so a process restart can never hand anyone a fresh allowance.
+    """
+    from backend.db import client as db_client
+
+    if not _valid_owner(owner):
         return False
-    _autoreply_slots[sender_id] = now
-    return True
+    return await db_client.reset_private_message_counters(owner)
 
 
-def autoreply_seconds_remaining(sender_id: int, monotonic_now: float | None = None) -> int:
-    now = time.monotonic() if monotonic_now is None else monotonic_now
-    seen = _autoreply_slots.get(sender_id)
-    if seen is None:
-        return 0
-    return max(0, int(AUTOREPLY_COOLDOWN_SECONDS - (now - seen)))
+async def counter_rows(owner: int) -> list[dict[str, Any]] | None:
+    """Bounded per-person counter rows (newest first), or None when the store
+    could not be read — an unreadable store is never shown as an empty one."""
+    from backend.db import client as db_client
+
+    if not _valid_owner(owner):
+        return None
+    return await db_client.list_private_message_senders(owner)
+
+
+def compose_ai_reply(generated: Any) -> str | None:
+    """The generated text PLUS both required disclosures, or None when the
+    result cannot be delivered within Telegram's text ceiling.
+
+    The disclosures are appended here, after generation, as
+    application-controlled plain Unicode: the model can never remove, weaken or
+    override them, and an over-long reply is refused rather than truncated.
+    """
+    if not isinstance(generated, str) or not generated.strip():
+        return None
+    body = f"{generated.strip()}\n\n{CLOSED_NOTICE}\n{AI_NOTICE}"
+    if len(body) > MAX_DELIVERED_TEXT_LENGTH:
+        logger.warning(
+            "private_message: AI reply refused — %d chars exceeds the delivery ceiling", len(body)
+        )
+        return None
+    return body
+
+
+def sender_lock(owner: int, sender_id: int) -> asyncio.Lock:
+    """The per-person lock serialising ONE person's AI enforcement."""
+    return _sender_lock(owner, sender_id)
 
 
 # ── Mutations (validated, persisted) ──
@@ -742,17 +1080,50 @@ async def set_mode(mode: str) -> bool:
     return await _mutate(lambda candidate: candidate.__setitem__("mode", mode))
 
 
-async def set_policy(policy: str) -> bool:
-    if policy not in POLICIES:
+async def set_action(field_name: str, value: bool) -> bool:
+    """Enable/disable ONE action. Independent by construction: this writes a
+    single flag and never touches another action's flag."""
+    if field_name not in ACTION_FIELDS or not isinstance(value, bool):
         return False
-    return await _mutate(lambda candidate: candidate.__setitem__("policy", policy))
+    return await _mutate(lambda candidate: candidate.__setitem__(field_name, value))
 
 
-async def set_autoreply_text(text: str) -> bool:
+async def set_fixed_response_text(text: str) -> bool:
     cleaned = (text or "").strip()
-    if not cleaned or len(cleaned) > MAX_AUTOREPLY_LENGTH:
+    if not cleaned or len(cleaned) > MAX_FIXED_RESPONSE_LENGTH:
         return False
-    return await _mutate(lambda candidate: candidate.__setitem__("autoreply_text", cleaned))
+    return await _mutate(
+        lambda candidate: candidate.__setitem__("fixed_response_text", cleaned)
+    )
+
+
+async def set_ai_max_replies_per_person(value: Any) -> bool:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return False
+    if not (1 <= value <= MAX_AI_REPLIES_PER_PERSON):
+        return False
+    return await _mutate(
+        lambda candidate: candidate.__setitem__("ai_max_replies_per_person", value)
+    )
+
+
+async def set_ai_unlimited_replies(value: bool) -> bool:
+    if not isinstance(value, bool):
+        return False
+    return await _mutate(
+        lambda candidate: candidate.__setitem__("ai_unlimited_replies", value)
+    )
+
+
+async def set_ai_interval_seconds(value: Any) -> bool:
+    """Minimum seconds between two AI replies to the SAME person (0 = no delay)."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return False
+    if not (0 <= value <= MAX_AI_INTERVAL_SECONDS):
+        return False
+    return await _mutate(
+        lambda candidate: candidate.__setitem__("ai_interval_seconds", value)
+    )
 
 
 async def add_list_entry(field_name: str, user_id: Any) -> bool:
@@ -884,8 +1255,13 @@ class StatusSummary:
     enabled: bool
     mode: str
     source: str
-    policy: str
-    autoreply_text: str
+    delete_incoming: bool
+    fixed_response_enabled: bool
+    fixed_response_text: str
+    ai_response_enabled: bool
+    ai_max_replies_per_person: int
+    ai_unlimited_replies: bool
+    ai_interval_seconds: int
     allowlist: tuple[int, ...] = ()
     exceptions: tuple[int, ...] = ()
     temporary: dict[str, Any] | None = None
@@ -904,8 +1280,13 @@ def summarize(state_doc: dict[str, Any], now: datetime) -> StatusSummary:
         enabled=bool(state_doc.get("enabled", True)),
         mode=policy.mode,
         source=policy.source,
-        policy=str(state_doc.get("policy") or POLICY_IGNORE),
-        autoreply_text=str(state_doc.get("autoreply_text") or ""),
+        delete_incoming=bool(state_doc.get(ACTION_DELETE)),
+        fixed_response_enabled=bool(state_doc.get(ACTION_FIXED)),
+        fixed_response_text=str(state_doc.get("fixed_response_text") or ""),
+        ai_response_enabled=bool(state_doc.get(ACTION_AI)),
+        ai_max_replies_per_person=int(state_doc.get("ai_max_replies_per_person") or 0),
+        ai_unlimited_replies=bool(state_doc.get("ai_unlimited_replies")),
+        ai_interval_seconds=int(state_doc.get("ai_interval_seconds") or 0),
         allowlist=tuple(state_doc.get("allowlist") or []),
         exceptions=tuple(state_doc.get("exceptions") or []),
         temporary=temporary_mode(state_doc, now),

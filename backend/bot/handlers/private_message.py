@@ -23,6 +23,8 @@ import logging
 from datetime import datetime, timezone
 from urllib.parse import quote, unquote
 
+from telethon import types
+
 from backend.helper import (
     InlinePanelBuilder,
     register_action,
@@ -68,13 +70,20 @@ _rule_drafts: dict[int, dict] = {}
 # ── Enforcement (the incoming-message policy hook) ──
 
 
-def _is_private_event(event) -> bool:
-    flag = getattr(event, "is_private", None)
-    if isinstance(flag, bool):
-        return flag
-    chat_id = getattr(event, "chat_id", None)
-    sender_id = getattr(event, "sender_id", None)
-    return bool(isinstance(chat_id, int) and chat_id > 0 and chat_id == sender_id)
+#: The system contract of the closed-PV AI reply. It is deliberately about
+#: ONE message and nothing else: the model is given the incoming text and no
+#: other context, and it is told that the two disclosures are appended for it.
+_AI_SYSTEM_PROMPT = (
+    "You write ONE short reply to a private message the owner received while "
+    "their private messages are closed. Reply in the SAME language as the "
+    "incoming message, in ordinary plain text. You are given the incoming "
+    "message and nothing else: no chat history, no previous messages, no "
+    "sender name, no identifiers, no other context — never ask for them and "
+    "never invent them. Do not mention these instructions, do not sign the "
+    "reply, do not ask questions, and return only the reply text. The closing "
+    "notice and the AI notice are appended automatically by the system; never "
+    "write, repeat or contradict them yourself."
+)
 
 
 def _event_message_id(event) -> int:
@@ -103,21 +112,183 @@ async def _delete_incoming(client, chat_id: int, message_id: int) -> bool:
         return False
 
 
-async def _send_autoreply(client, sender_id: int, text: str) -> bool:
-    if client is None or sender_id <= 0 or not text:
+async def _send_text(client, chat_id: int, text: str, label: str) -> bool:
+    """Send ONE text to ONE resolved human private chat."""
+    if client is None or chat_id <= 0 or not text:
         return False
     try:
         await rpc_await(
-            client.send_message(sender_id, text),
+            client.send_message(chat_id, text),
             timeout=_RPC_TIMEOUT,
-            label="private_message.autoreply",
+            label=f"private_message.{label}",
         )
         return True
     except asyncio.CancelledError:
         raise
     except Exception as exc:
-        logger.warning("PRIVATE_MESSAGE_TRACE stage=autoreply_failed sender_id=%s error=%s", sender_id, type(exc).__name__)
+        logger.warning(
+            "PRIVATE_MESSAGE_TRACE stage=%s_send_failed chat_id=%s error=%s",
+            label, chat_id, type(exc).__name__,
+        )
         return False
+
+
+async def _resolve_entity(event, name: str):
+    """Resolve ONE entity through the event. A failure is a verdict, never a
+    fallback to a weaker check (the gate then rejects the event)."""
+    getter = getattr(event, name, None)
+    if getter is None:
+        return None
+    try:
+        return await getter()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning(
+            "PRIVATE_MESSAGE_TRACE stage=%s_unresolved error=%s", name, type(exc).__name__
+        )
+        return None
+
+
+async def resolve_scope(event, owner_id: int) -> service.ScopeVerdict:
+    """The enforcement entry point's scope gate.
+
+    Gathers the event's own chat/sender facts AND resolves both entities through
+    the EXISTING self client, then lets ``private_message_service.classify_scope``
+    decide. A private chat with a BOT, a group, a supergroup, a channel, a linked
+    discussion group, an outgoing message, a contradictory id set, a missing
+    entity or an entity that is not a real user all end in a rejection — and a
+    rejection performs no action of any kind.
+    """
+    message = getattr(event, "message", None)
+    peer = getattr(message, "peer_id", None)
+    chat_entity = await _resolve_entity(event, "get_chat")
+    sender_entity = await _resolve_entity(event, "get_sender")
+    return service.classify_scope(
+        owner_id=owner_id,
+        is_private=getattr(event, "is_private", None),
+        is_group=getattr(event, "is_group", None),
+        is_channel=getattr(event, "is_channel", None),
+        chat_id=getattr(event, "chat_id", None),
+        sender_id=getattr(event, "sender_id", None),
+        message_id=_event_message_id(event),
+        peer_user_id=getattr(peer, "user_id", None),
+        chat_is_user=isinstance(chat_entity, types.User),
+        sender_is_user=isinstance(sender_entity, types.User),
+        chat_entity=chat_entity,
+        sender_entity=sender_entity,
+    )
+
+
+def _incoming_text(event) -> str:
+    """The incoming message's OWN plain text — never media, never a caption of
+    another message, never anything the model was not given."""
+    message = getattr(event, "message", None)
+    text = getattr(message, "message", None)
+    if not isinstance(text, str) or not text.strip():
+        text = getattr(message, "text", "")
+    return text.strip() if isinstance(text, str) else ""
+
+
+async def _generate_ai_reply(owner_id: int, incoming_text: str) -> str | None:
+    """ONE out-of-band generation through the EXISTING AI runtime.
+
+    The shared ProviderManager (reached through the single engine) is called
+    with ``tools=[]`` and a message list of exactly [system contract, incoming
+    text] — no session, no history, no reply context, no Telegram window, no
+    memory, no identifiers — so the model can trigger no execution and sees no
+    conversational context. The required disclosures are added afterwards by
+    ``service.compose_ai_reply``, never by the model.
+    """
+    from backend.ai.engine.engine import apply_persisted_config, get_engine
+
+    try:
+        await apply_persisted_config(owner_id)
+        providers = get_engine().provider_manager
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning("PRIVATE_MESSAGE_TRACE stage=ai_runtime_unavailable error=%s", type(exc).__name__)
+        return None
+
+    messages = [
+        {"role": "system", "content": _AI_SYSTEM_PROMPT},
+        {"role": "user", "content": incoming_text},
+    ]
+    try:
+        response = await asyncio.wait_for(
+            providers.chat(messages, tools=[]), timeout=service.AI_REPLY_TIMEOUT_S
+        )
+    except asyncio.CancelledError:
+        raise
+    except asyncio.TimeoutError:
+        logger.warning("PRIVATE_MESSAGE_TRACE stage=ai_timeout")
+        return None
+    except Exception as exc:
+        logger.warning("PRIVATE_MESSAGE_TRACE stage=ai_failed error=%s", type(exc).__name__)
+        return None
+    if not getattr(response, "success", False):
+        logger.warning("PRIVATE_MESSAGE_TRACE stage=ai_unsuccessful")
+        return None
+    text = getattr(response, "text", None)
+    return text.strip() if isinstance(text, str) and text.strip() else None
+
+
+async def _ai_response(client, owner_id: int, event, verdict, config: dict) -> str:
+    """Claim → generate → send, giving the claim back when nothing was sent.
+
+    The allowance is claimed by ONE atomic conditional write BEFORE the model is
+    asked anything, so two concurrent (or duplicate) updates can never spend the
+    same reply; a generation, length or delivery failure releases the exact
+    claimed pair, so only a DELIVERED reply consumes the person's allowance.
+    """
+    sender_id = verdict.sender_id
+    async with service.sender_lock(owner_id, sender_id):
+        claim = await service.claim_ai_reply(owner_id, sender_id, config)
+        if not isinstance(claim, dict) or not claim.get("ok"):
+            logger.warning(
+                "PRIVATE_MESSAGE_TRACE stage=ai_counter_unavailable sender_id=%s reason=%s",
+                sender_id, (claim or {}).get("reason"),
+            )
+            return "counter_unavailable"
+        if not claim.get("claimed"):
+            logger.info(
+                "PRIVATE_MESSAGE_TRACE stage=ai_denied reason=%s used=%s sender_id=%s",
+                claim.get("reason"), claim.get("used"), sender_id,
+            )
+            return str(claim.get("reason") or "denied")
+        token = claim.get("token") or {}
+        generated = await _generate_ai_reply(owner_id, _incoming_text(event))
+        body = service.compose_ai_reply(generated) if generated is not None else None
+        if body is None:
+            await service.release_ai_reply(owner_id, sender_id, token)
+            return "generation_failed"
+        if not await _send_text(client, verdict.chat_id, body, "ai_response"):
+            await service.release_ai_reply(owner_id, sender_id, token)
+            return "send_failed"
+        return "sent"
+
+
+async def _apply_actions(client, owner_id: int, event, verdict, decision) -> None:
+    """The deterministic action order: delete, fixed response, AI response.
+
+    Each step is independent: a delete failure never suppresses a response (it
+    is logged), a fixed-response failure never suppresses the AI reply, and only
+    a DELIVERED AI reply consumes the person's allowance.
+    """
+    if decision.delete:
+        await _delete_incoming(client, verdict.chat_id, verdict.message_id)
+    if decision.fixed_response and decision.fixed_response_text:
+        await _send_text(
+            client, verdict.chat_id, decision.fixed_response_text, "fixed_response"
+        )
+    if decision.ai_response:
+        if _incoming_text(event):
+            await _ai_response(client, owner_id, event, verdict, service.state())
+        else:
+            logger.info(
+                "PRIVATE_MESSAGE_TRACE stage=ai_skipped_no_text sender_id=%s", verdict.sender_id
+            )
 
 
 async def enforce_incoming(client, event, owner_id: int) -> bool:
@@ -127,52 +298,61 @@ async def enforce_incoming(client, event, owner_id: int) -> bool:
     ``False`` when it was handled as unauthorized (so nothing else processes
     it). Never raises into the Telegram event path: an internal failure leaves
     the message permitted, which is exactly the behaviour that existed before
-    this feature, and is therefore the safe failure mode.
+    this feature.
+
+    The scope gate runs FIRST and fails closed: unless the event is a genuine
+    human user in a direct private chat with the owner's account, this function
+    returns before any action — no delete, no fixed response, no AI request, no
+    counter, no enforcement record. Nothing in the configuration can widen that
+    boundary (it is not configurable).
     """
     try:
-        if getattr(event, "out", False):
-            return True
-        if not _is_private_event(event):
+        if getattr(event, "out", None) is True:
             return True
 
         # The persisted policy is resolved before the FIRST decision, so a
         # restart never evaluates a message against the in-memory default.
         await service.ensure_loaded_async()
 
-        sender_id = getattr(event, "sender_id", None)
-        chat_id = getattr(event, "chat_id", 0) or 0
-        message_id = _event_message_id(event)
+        verdict = await resolve_scope(event, owner_id)
+        if not verdict.eligible:
+            logger.debug(
+                "PRIVATE_MESSAGE_TRACE stage=out_of_scope reason=%s", verdict.reason
+            )
+            return True
+
         decision = service.decide_incoming(
             service.state(),
-            sender_id=sender_id,
+            sender_id=verdict.sender_id,
             is_private=True,
-            is_owner=sender_id == owner_id,
+            is_owner=verdict.sender_id == owner_id,
             now=datetime.now(timezone.utc),
         )
         if decision.permitted:
             return True
+        if service.already_handled(verdict.chat_id, verdict.message_id):
+            logger.debug(
+                "PRIVATE_MESSAGE_TRACE stage=duplicate sender_id=%s message_id=%s",
+                verdict.sender_id, verdict.message_id,
+            )
+            return False
 
         logger.info(
-            "PRIVATE_MESSAGE_TRACE stage=unauthorized mode=%s source=%s action=%s sender_id=%s chat_id=%s",
-            decision.mode, decision.source, decision.action, sender_id, chat_id,
+            "PRIVATE_MESSAGE_TRACE stage=unauthorized mode=%s source=%s "
+            "actions=delete:%s,fixed:%s,ai:%s sender_id=%s chat_id=%s",
+            decision.mode, decision.source, decision.delete,
+            decision.fixed_response, decision.ai_response,
+            verdict.sender_id, verdict.chat_id,
         )
-        if decision.action == service.POLICY_DELETE:
-            await _delete_incoming(client, int(chat_id or 0), message_id)
-        elif decision.action == service.POLICY_AUTOREPLY:
-            ok = isinstance(sender_id, int) and sender_id > 0 and service.consume_autoreply_slot(sender_id)
-            if ok:
-                await _send_autoreply(client, int(sender_id), decision.autoreply_text)
-            else:
-                logger.info(
-                    "PRIVATE_MESSAGE_TRACE stage=autoreply_suppressed sender_id=%s retry_in=%ss",
-                    sender_id,
-                    service.autoreply_seconds_remaining(sender_id) if isinstance(sender_id, int) else 0,
-                )
+        await _apply_actions(client, owner_id, event, verdict, decision)
         return False
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # noqa: BLE001 — never poison the event path
-        logger.warning("PRIVATE_MESSAGE_TRACE stage=handler_error exception=%s", type(exc).__name__)
+        logger.warning(
+            "PRIVATE_MESSAGE_TRACE stage=handler_error exception=%s", type(exc).__name__,
+            exc_info=logger.isEnabledFor(logging.DEBUG),
+        )
         return True
 
 
@@ -243,10 +423,34 @@ def _mode_button_row(builder: InlinePanelBuilder, current_mode: str) -> None:
         )
 
 
+async def _counter_line(owner_id: int) -> str:
+    """The durable per-person AI counters, or an honest "unavailable"."""
+    try:
+        rows = await service.counter_rows(owner_id)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        rows = None
+    if rows is None:
+        return "unavailable (the counter store could not be read)"
+    used = 0
+    for row in rows:
+        value = row.get("ai_replies_used") if isinstance(row, dict) else None
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            used += value
+    return f"{used} AI reply(ies) used by {len(rows)} person(s)"
+
+
 async def _render_main(owner_id: int) -> tuple[str, str, list]:
     now = datetime.now(timezone.utc)
     state_doc = service.state()
     summary = service.summarize(state_doc, now)
+    counters = await _counter_line(owner_id)
+    limit_text = (
+        "unlimited"
+        if summary.ai_unlimited_replies
+        else str(summary.ai_max_replies_per_person)
+    )
 
     control = service.SOURCE_LABELS.get(summary.source, summary.source)
     if summary.temporary is not None:
@@ -261,8 +465,12 @@ async def _render_main(owner_id: int) -> tuple[str, str, list]:
     lines = [
         f"**Effective mode:** {service.MODE_LABELS.get(summary.mode, summary.mode)}",
         f"**Control:** {control}",
-        f"**Enforcement:** {'ON' if summary.enabled else 'OFF (no policy action)'}",
-        f"**Unauthorized policy:** {service.POLICY_LABELS.get(summary.policy, summary.policy)}",
+        f"**Enforcement:** {'ON' if summary.enabled else 'OFF (no action applied)'}",
+        f"**Closing actions:** {_mark(summary.delete_incoming)} delete incoming "
+        f"· {_mark(summary.fixed_response_enabled)} fixed response "
+        f"· {_mark(summary.ai_response_enabled)} AI response",
+        f"**AI replies per person:** {limit_text} (interval {summary.ai_interval_seconds}s)",
+        f"**AI counters:** {counters}",
         f"**Allowlist:** {len(summary.allowlist)} user(s)",
         f"**Exceptions:** {len(summary.exceptions)} user(s)",
         f"**Schedule:** {'ON' if summary.schedule_enabled else 'OFF'} ({summary.schedule_timezone}, {len(summary.schedule_rules)} rule(s))",
@@ -282,11 +490,16 @@ async def _render_main(owner_id: int) -> tuple[str, str, list]:
         "it has already received. It does not change your Telegram privacy "
         "settings and cannot stop someone from sending a message."
     )
+    lines.append(
+        "**Scope:** genuine human users in **direct private chats** only. Bot "
+        "accounts, groups, supergroups, channels, channel posts and linked "
+        "discussion groups are never affected."
+    )
 
     builder = InlinePanelBuilder()
     _mode_button_row(builder, summary.mode)
     builder.add_buttons(
-        (sym.label(sym.STATE_WARNING, "Unauthorized policy"), f"panel:{POLICY_PANEL_ID}", PRIMARY),
+        (sym.label(sym.STATE_WARNING, "Closing actions"), f"panel:{POLICY_PANEL_ID}", PRIMARY),
         (sym.label(sym.ICON_SELECT, "Allowlist"), f"panel:{ALLOW_PANEL_ID}", PRIMARY),
     )
     builder.add_buttons(
@@ -307,34 +520,56 @@ async def _render_main(owner_id: int) -> tuple[str, str, list]:
 
 
 
-async def _render_policy(owner_id: int) -> tuple[str, str, list]:
+async def _render_actions(owner_id: int) -> tuple[str, str, list]:
+    """The INDEPENDENT closing actions and the AI-reply limits."""
     state_doc = service.state()
-    policy = str(state_doc.get("policy") or service.POLICY_IGNORE)
-    text = str(state_doc.get("autoreply_text") or "")
+    summary = service.summarize(state_doc, datetime.now(timezone.utc))
+    counters = await _counter_line(owner_id)
+    limit_text = "unlimited" if summary.ai_unlimited_replies else str(summary.ai_max_replies_per_person)
     body = [
-        f"**Current policy:** {service.POLICY_LABELS.get(policy, policy)}",
+        "Every action below is independent: enable any combination. They are "
+        "applied to an unauthorized message in this fixed order: **delete → "
+        "fixed response → AI response**.",
         "",
-        "Applies only to messages from senders who are NOT authorized in the "
-        "current mode.",
-        "· **Ignore** — the message is left untouched and not processed.",
-        "· **Delete** — the Self Bot deletes the message it received.",
-        "· **Auto-reply** — the Self Bot answers once, then stays silent for "
-        f"{int(service.AUTOREPLY_COOLDOWN_SECONDS)}s per sender.",
+        f"{_mark(summary.delete_incoming)} **Delete incoming message** — the Self Bot deletes the message it received.",
+        f"{_mark(summary.fixed_response_enabled)} **Send fixed response** — the configured text below.",
+        f"{_mark(summary.ai_response_enabled)} **Send AI response** — generated by AI, with the closure and AI disclosures.",
+        "",
+        f"**Fixed response text:** {summary.fixed_response_text or '_not set_ (nothing is sent while it is empty)'}",
+        f"**Max AI replies per person:** {limit_text}",
+        f"**AI reply interval (seconds):** {summary.ai_interval_seconds}",
+        f"**AI counters:** {counters}",
+        "",
+        "A delete failure never suppresses a response; a fixed-response failure "
+        "never suppresses the AI reply; only a DELIVERED AI reply consumes the "
+        "person's allowance.",
     ]
-    if text:
-        body.append(f"\n**Auto-reply text:** {text}")
-    else:
-        body.append("\n**Auto-reply text:** _not set — an auto-reply policy without text is treated as Ignore_")
 
     builder = InlinePanelBuilder()
-    for candidate in service.POLICIES:
+    for field_name in service.ACTION_FIELDS:
         builder.add_row(
-            f"{_mark(candidate == policy)} {service.POLICY_LABELS[candidate]}",
-            f"action:pm_policy:{candidate}",
+            f"{_mark(bool(state_doc.get(field_name)))} {service.ACTION_LABELS[field_name]}",
+            f"action:pm_action:{field_name}",
             PRIMARY,
         )
-    builder.add_row(sym.label(sym.OP_EDIT, "Set auto-reply text"), f"input:{POLICY_PANEL_ID}:autoreply", PRIMARY)
-    return "Unauthorized Policy", "\n".join(body), builder.build()
+    builder.add_row(sym.label(sym.OP_EDIT, "Set fixed response text"), f"input:{POLICY_PANEL_ID}:fixed_text", PRIMARY)
+    builder.add_row(
+        sym.label(sym.ICON_SELECT, "Set max AI replies per person"),
+        f"input:{POLICY_PANEL_ID}:max_replies",
+        PRIMARY,
+    )
+    builder.add_row(
+        sym.label(sym.ICON_SELECT, "Set AI reply interval"),
+        f"input:{POLICY_PANEL_ID}:interval",
+        PRIMARY,
+    )
+    builder.add_row(
+        f"{_mark(summary.ai_unlimited_replies)} Unlimited AI replies",
+        "action:pm_unlimited",
+        PRIMARY,
+    )
+    builder.add_row(sym.label(sym.ICON_STATS, "Reset AI counters"), "action:pm_reset_counters", DANGER)
+    return "Closing Actions", "\n".join(body), builder.build()
 
 
 async def _render_members(owner_id: int, panel_id: str, extra: str) -> tuple[str, str, list]:
@@ -544,7 +779,7 @@ async def _panel_result(panel_id: str, extra: str, owner_id: int) -> tuple[str, 
     if panel_id == PANEL_ID:
         return await _render_main(owner_id)
     if panel_id == POLICY_PANEL_ID:
-        return await _render_policy(owner_id)
+        return await _render_actions(owner_id)
     if panel_id in (ALLOW_PANEL_ID, EXCEPT_PANEL_ID):
         return await _render_members(owner_id, panel_id, extra)
     if panel_id == TEMP_PANEL_ID:
@@ -585,10 +820,31 @@ async def _refresh_action(event, extra: str, chat_id: int):
     return await _render_main(inline_engine.get_owner_id())
 
 
-async def _policy_action(event, extra: str, chat_id: int):
-    if not await service.set_policy(extra.strip()):
-        return "Unauthorized Policy", "That policy is not valid — nothing changed.", []
-    return await _render_policy(inline_engine.get_owner_id())
+async def _action_toggle(event, extra: str, chat_id: int):
+    field_name = (extra or "").strip()
+    owner_id = inline_engine.get_owner_id()
+    if field_name not in service.ACTION_FIELDS:
+        return "Closing Actions", "That action is not valid — nothing changed.", []
+    current = bool(service.state().get(field_name))
+    if not await service.set_action(field_name, not current):
+        return "Closing Actions", "Could not save the change. Please try again.", []
+    return await _render_actions(owner_id)
+
+
+async def _unlimited_action(event, extra: str, chat_id: int):
+    owner_id = inline_engine.get_owner_id()
+    current = bool(service.state().get("ai_unlimited_replies"))
+    if not await service.set_ai_unlimited_replies(not current):
+        return "Closing Actions", "Could not save the change. Please try again.", []
+    return await _render_actions(owner_id)
+
+
+async def _reset_counters_action(event, extra: str, chat_id: int):
+    owner_id = inline_engine.get_owner_id()
+    owner = service.owner_id() or owner_id
+    if not await service.reset_counters(owner):
+        return "Closing Actions", "The AI counters were NOT reset. Please try again.", []
+    return await _render_actions(owner_id)
 
 
 async def _page_action(event, extra: str, chat_id: int):
@@ -770,16 +1026,46 @@ async def _show_after_input(panel_id: str, owner_id: int, notice: str, chat_id, 
             pass
 
 
-async def _autoreply_input_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
+async def _fixed_text_input_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
     owner_id = inline_engine.get_owner_id()
     cleaned = (text or "").strip()
     if not cleaned:
-        notice = "The auto-reply text cannot be empty."
-    elif len(cleaned) > service.MAX_AUTOREPLY_LENGTH:
-        notice = f"The auto-reply text must be at most {service.MAX_AUTOREPLY_LENGTH} characters."
+        notice = "The fixed response text cannot be empty."
+    elif len(cleaned) > service.MAX_FIXED_RESPONSE_LENGTH:
+        notice = f"The fixed response text must be at most {service.MAX_FIXED_RESPONSE_LENGTH} characters."
     else:
-        notice = "" if await service.set_autoreply_text(cleaned) else "Could not save the text. Please try again."
+        notice = "" if await service.set_fixed_response_text(cleaned) else "Could not save the text. Please try again."
     await _show_after_input(POLICY_PANEL_ID, owner_id, notice, chat_id, msg_id, inline_chat_id, inline_msg_id)
+
+
+def _int_input_handler(setter, label: str, low: int, high: int):
+    async def _handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
+        owner_id = inline_engine.get_owner_id()
+        raw = (text or "").strip()
+        value = int(raw) if raw.isdigit() else None
+        if value is None or not (low <= value <= high):
+            notice = f"{label} was NOT saved — enter a whole number between {low} and {high}."
+        else:
+            notice = "" if await setter(value) else f"Could not save {label}. Please try again."
+        await _show_after_input(
+            POLICY_PANEL_ID, owner_id, notice, chat_id, msg_id, inline_chat_id, inline_msg_id
+        )
+
+    return _handler
+
+
+_max_replies_input_handler = _int_input_handler(
+    service.set_ai_max_replies_per_person,
+    "Max AI replies per person",
+    1,
+    service.MAX_AI_REPLIES_PER_PERSON,
+)
+_interval_input_handler = _int_input_handler(
+    service.set_ai_interval_seconds,
+    "AI reply interval",
+    0,
+    service.MAX_AI_INTERVAL_SECONDS,
+)
 
 
 def _add_user_input_handler(panel_id: str, field_name: str):
@@ -864,6 +1150,10 @@ async def _timezone_input_handler(text, chat_id, msg_id, inline_chat_id, inline_
 
 
 def register(client, owner_id: int, tz_str: str = "UTC") -> None:
+    # Bind the owner whose dedicated configuration and counters this feature
+    # reads and writes (the service persists through it).
+    service.configure_owner(owner_id)
+
     # Preload the persisted state in the background so the common case never
     # waits on a database read. The gate and the panel both await the same
     # single-flight load, so registration order is an optimization, not a
@@ -881,7 +1171,7 @@ def register(client, owner_id: int, tz_str: str = "UTC") -> None:
             pass
 
     register_panel(PANEL_ID, lambda event, extra: _panel_result(PANEL_ID, extra, owner_id), parent="menu", title="Private Messages")
-    register_panel(POLICY_PANEL_ID, lambda event, extra: _panel_result(POLICY_PANEL_ID, extra, owner_id), parent=PANEL_ID, title="Unauthorized Policy")
+    register_panel(POLICY_PANEL_ID, lambda event, extra: _panel_result(POLICY_PANEL_ID, extra, owner_id), parent=PANEL_ID, title="Closing Actions")
     register_panel(ALLOW_PANEL_ID, lambda event, extra: _panel_result(ALLOW_PANEL_ID, extra, owner_id), parent=PANEL_ID, title="Allowlist")
     register_panel(EXCEPT_PANEL_ID, lambda event, extra: _panel_result(EXCEPT_PANEL_ID, extra, owner_id), parent=PANEL_ID, title="Exceptions")
     register_panel(TEMP_PANEL_ID, lambda event, extra: _panel_result(TEMP_PANEL_ID, extra, owner_id), parent=PANEL_ID, title="Temporary Mode")
@@ -899,7 +1189,9 @@ def register(client, owner_id: int, tz_str: str = "UTC") -> None:
     register_action("pm_mode", _mode_action)
     register_action("pm_toggle_enabled", _toggle_enabled_action)
     register_action("pm_refresh", _refresh_action)
-    register_action("pm_policy", _policy_action)
+    register_action("pm_action", _action_toggle)
+    register_action("pm_unlimited", _unlimited_action)
+    register_action("pm_reset_counters", _reset_counters_action)
     register_action("pm_page", _page_action)
     register_action("pm_allow_toggle", _allow_toggle_action)
     register_action("pm_except_toggle", _except_toggle_action)
@@ -914,9 +1206,23 @@ def register(client, owner_id: int, tz_str: str = "UTC") -> None:
     register_action("pm_rule_mode", _rule_mode_action)
     register_action("pm_rule_save", _rule_save_action)
 
-    register_input(POLICY_PANEL_ID, "autoreply", {
-        "handler": _autoreply_input_handler,
-        "prompt": "**Auto-reply text**\n\nEnter the message one unauthorized sender receives (once per cooldown):\n\n_Reply below._",
+    register_input(POLICY_PANEL_ID, "fixed_text", {
+        "handler": _fixed_text_input_handler,
+        "prompt": "**Fixed response text**\n\nEnter the message a human sender receives while this policy is closed:\n\n_Reply below._",
+    })
+    register_input(POLICY_PANEL_ID, "max_replies", {
+        "handler": _max_replies_input_handler,
+        "prompt": (
+            "**Max AI replies per person**\n\nEnter a whole number between 1 and "
+            f"{service.MAX_AI_REPLIES_PER_PERSON}:\n\n_Reply below._"
+        ),
+    })
+    register_input(POLICY_PANEL_ID, "interval", {
+        "handler": _interval_input_handler,
+        "prompt": (
+            "**AI reply interval**\n\nMinimum seconds between two AI replies to the "
+            "same person. Enter 0 for no delay:\n\n_Reply below._"
+        ),
     })
     register_input(ALLOW_PANEL_ID, "add", {
         "handler": _add_user_input_handler(ALLOW_PANEL_ID, "allowlist"),

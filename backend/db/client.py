@@ -47,6 +47,9 @@ _fallback: dict = {
     "emoji_mappings": [],
     "emoji_state": {},
     "emoji_chat_overrides": [],
+    "bot_settings": {},
+    "private_message_config": {},
+    "private_message_senders": [],
 }
 _save_code_lock = asyncio.Lock()
 _initialised = False
@@ -2117,4 +2120,424 @@ async def upsert_emoji_chat_override(
         )
     except Exception as exc:
         logger.error("[EMOJI_DB] upsert_emoji_chat_override FAILED: %s", exc)
+        return False
+
+
+# ── Private Message Management (private_message_config / private_message_senders) ──
+#
+# Private Message Management (DATABASE_ARCHITECTURE.md §33) persists THREE
+# things: the owner's enforcement configuration, the access state the panel
+# edits (allowlist, exceptions, temporary override, schedule) and ONE durable
+# counter row per human sender. Both tables degrade to the in-memory fallback
+# exactly like every other store in this module — a durable failure returns
+# False / None / an explicit ``ok=False`` envelope and is logged + record_event'ed,
+# never raised. The fallback keeps enforcing the SAME per-person quota in
+# memory: only durability degrades, never the limit itself.
+#
+# The AI-reply allowance is enforced by ONE CAS write (claim → compensate):
+# ``claim_private_message_ai_reply`` increments ONLY while the row still holds
+# the value it just read, so a limit can never be exceeded by a racing update,
+# and ``release_private_message_ai_reply`` puts the exact previous pair back
+# after a generation/delivery failure, so a reply that was never delivered can
+# never consume a person's allowance.
+
+#: Bounded CAS attempts for one quota claim (a lost CAS means a concurrent
+#: writer moved the row; the claim re-reads instead of overwriting it).
+_PM_CAS_ATTEMPTS = 3
+
+#: The configuration columns, in the order the state document is written.
+_PM_CONFIG_COLUMNS: tuple[str, ...] = (
+    "enabled",
+    "mode",
+    "delete_incoming",
+    "fixed_response_enabled",
+    "fixed_response_text",
+    "ai_response_enabled",
+    "ai_max_replies_per_person",
+    "ai_unlimited_replies",
+    "ai_interval_seconds",
+    "allowlist",
+    "exceptions",
+    "temporary",
+    "schedule",
+)
+
+
+def _pm_epoch(value) -> float | None:
+    """Epoch seconds of a stored/observed ISO-8601 instant, or None."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def _pm_config_payload(document: dict) -> dict:
+    """The writable half of a state document (unknown keys are never written)."""
+    payload = {column: document[column] for column in _PM_CONFIG_COLUMNS if column in document}
+    payload["updated_at"] = datetime.now(timezone.utc).isoformat()
+    return payload
+
+
+def _pm_sender_row(owner_id: int, sender_id: int) -> dict | None:
+    for row in _fallback["private_message_senders"]:
+        if row.get("owner_id") == owner_id and row.get("sender_id") == sender_id:
+            return row
+    return None
+
+
+def _pm_claim_result(
+    ok: bool, *, claimed: bool = False, reason: str = "", used: int = 0,
+    token: dict | None = None,
+) -> dict:
+    return {"ok": ok, "claimed": claimed, "reason": reason, "used": used, "token": token}
+
+
+def _pm_claim_denial(
+    used: int, last, now_epoch: float, max_replies: int, unlimited: bool,
+    interval_seconds: int,
+) -> dict | None:
+    """The limit/interval veto for a claim, or None when the claim may proceed."""
+    if not unlimited and used >= max_replies:
+        return _pm_claim_result(True, claimed=False, reason="limit_reached", used=used)
+    if interval_seconds > 0 and used > 0 and last is not None:
+        last_epoch = _pm_epoch(last)
+        if last_epoch is not None and now_epoch - last_epoch < interval_seconds:
+            return _pm_claim_result(True, claimed=False, reason="interval_not_elapsed", used=used)
+    return None
+
+
+def _get_private_message_config_sync(owner_id: int) -> dict | None:
+    db = get_db()
+    if db is None:
+        row = _fallback["private_message_config"].get(owner_id)
+        return dict(row) if row else None
+    try:
+        result = (
+            db.table("private_message_config")
+            .select("*")
+            .eq("owner_id", owner_id)
+            .limit(1)
+            .execute()
+        )
+        rows = getattr(result, "data", None) or []
+        return rows[0] if rows else None
+    except Exception as exc:
+        logger.error("[PM_DB] get_private_message_config FAILED: %s", exc)
+        return None
+
+
+async def get_private_message_config(owner_id: int) -> dict | None:
+    """The owner's dedicated configuration row, or None when no row exists yet
+    OR the store could not be read. Both resolve to the fail-closed default in
+    the service (a missing row means the feature is OFF)."""
+    try:
+        return await _run_sync(_get_private_message_config_sync, owner_id)
+    except Exception as exc:
+        logger.error("[PM_DB] get_private_message_config FAILED: %s", exc)
+        return None
+
+
+def _get_legacy_private_message_state_sync(owner_id: int, key: str) -> str | None:
+    """READ ONLY: the Phase-1 ``bot_settings`` document, used once as the
+    backfill source when the dedicated row does not exist yet."""
+    db = get_db()
+    if db is None:
+        row = _fallback.get("bot_settings", {}).get(key)
+        return row if isinstance(row, str) else None
+    try:
+        result = db.table("bot_settings").select("value").eq("key", key).maybe_single().execute()
+        data = getattr(result, "data", None)
+        if isinstance(data, dict):
+            value = data.get("value")
+            return value if isinstance(value, str) and value.strip() else None
+        if isinstance(data, list) and data:
+            value = data[0].get("value")
+            return value if isinstance(value, str) and value.strip() else None
+        return None
+    except Exception as exc:
+        logger.error("[PM_DB] legacy private_message state read FAILED: %s", exc)
+        return None
+
+
+async def get_legacy_private_message_state(
+    owner_id: int, key: str = "private_message_management",
+) -> str | None:
+    """The legacy Phase-1 document, read at most once for the import."""
+    try:
+        return await _run_sync(_get_legacy_private_message_state_sync, owner_id, key)
+    except Exception as exc:
+        logger.error("[PM_DB] legacy private_message state read FAILED: %s", exc)
+        return None
+
+
+def _save_private_message_config_sync(owner_id: int, document: dict) -> bool:
+    payload = _pm_config_payload(document)
+    db = get_db()
+    if db is None:
+        row = dict(_fallback["private_message_config"].get(owner_id) or {"owner_id": owner_id})
+        row.update(payload)
+        _fallback["private_message_config"][owner_id] = row
+        return True
+    try:
+        existing = (
+            db.table("private_message_config")
+            .select("owner_id")
+            .eq("owner_id", owner_id)
+            .limit(1)
+            .execute()
+        )
+        if getattr(existing, "data", None):
+            db.table("private_message_config").update(payload).eq(
+                "owner_id", owner_id
+            ).execute()
+        else:
+            db.table("private_message_config").insert(
+                {"owner_id": owner_id, **payload}
+            ).execute()
+        return True
+    except Exception as exc:
+        logger.error("[PM_DB] save_private_message_config FAILED: %s", exc)
+        record_event("database", "save private_message_config", 0, "ERROR", str(exc))
+        return False
+
+
+async def save_private_message_config(owner_id: int, document: dict) -> bool:
+    """Write the whole configuration document into the dedicated row.
+
+    Returns True only when the durable write landed, so the panel never reports
+    a setting as saved when it was not.
+    """
+    try:
+        return await _run_sync(_save_private_message_config_sync, owner_id, document)
+    except Exception as exc:
+        logger.error("[PM_DB] save_private_message_config FAILED: %s", exc)
+        return False
+
+
+def _list_private_message_senders_sync(owner_id: int, limit: int) -> list | None:
+    db = get_db()
+    if db is None:
+        rows = [
+            dict(row) for row in _fallback["private_message_senders"]
+            if row.get("owner_id") == owner_id
+        ]
+        return rows[:limit]
+    try:
+        result = (
+            db.table("private_message_senders")
+            .select("*")
+            .eq("owner_id", owner_id)
+            .order("updated_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        return list(getattr(result, "data", None) or [])
+    except Exception as exc:
+        logger.error("[PM_DB] list_private_message_senders FAILED: %s", exc)
+        return None
+
+
+async def list_private_message_senders(owner_id: int, limit: int = 200) -> list | None:
+    """Bounded per-person counter rows (newest first), or None when the store
+    could not be read — the caller must not present an unreadable store as an
+    empty one."""
+    try:
+        return await _run_sync(_list_private_message_senders_sync, owner_id, max(1, int(limit)))
+    except Exception as exc:
+        logger.error("[PM_DB] list_private_message_senders FAILED: %s", exc)
+        return None
+
+
+def _claim_private_message_ai_reply_sync(
+    owner_id: int, sender_id: int, max_replies: int, unlimited: bool,
+    interval_seconds: int, now_iso: str,
+) -> dict:
+    now_epoch = _pm_epoch(now_iso)
+    if now_epoch is None:
+        return _pm_claim_result(False, reason="invalid_timestamp")
+    db = get_db()
+    if db is None:
+        row = _pm_sender_row(owner_id, sender_id)
+        used = int(row.get("ai_replies_used") or 0) if row else 0
+        last = row.get("last_ai_reply_at") if row else None
+        denial = _pm_claim_denial(used, last, now_epoch, max_replies, unlimited, interval_seconds)
+        if denial is not None:
+            return denial
+        token = {"used": used + 1, "last": now_iso, "restore_used": used, "restore_last": last}
+        if row is None:
+            _fallback["private_message_senders"].append({
+                "owner_id": owner_id,
+                "sender_id": sender_id,
+                "ai_replies_used": used + 1,
+                "last_ai_reply_at": now_iso,
+                "updated_at": now_iso,
+            })
+        else:
+            row.update({
+                "ai_replies_used": used + 1,
+                "last_ai_reply_at": now_iso,
+                "updated_at": now_iso,
+            })
+        return _pm_claim_result(True, claimed=True, used=used + 1, token=token)
+    for _attempt in range(_PM_CAS_ATTEMPTS):
+        try:
+            result = (
+                db.table("private_message_senders")
+                .select("*")
+                .eq("owner_id", owner_id)
+                .eq("sender_id", sender_id)
+                .limit(1)
+                .execute()
+            )
+        except Exception as exc:
+            logger.error("[PM_DB] claim read FAILED: %s", exc)
+            record_event("database", "private_message claim read", 0, "ERROR", str(exc))
+            return _pm_claim_result(False, reason="claim_read_failed")
+        rows = getattr(result, "data", None) or []
+        row = rows[0] if rows else None
+        used = int(row.get("ai_replies_used") or 0) if row else 0
+        last = row.get("last_ai_reply_at") if row else None
+        denial = _pm_claim_denial(used, last, now_epoch, max_replies, unlimited, interval_seconds)
+        if denial is not None:
+            return denial
+        token = {"used": used + 1, "last": now_iso, "restore_used": used, "restore_last": last}
+        payload = {
+            "ai_replies_used": used + 1,
+            "last_ai_reply_at": now_iso,
+            "updated_at": now_iso,
+        }
+        try:
+            if row is None:
+                db.table("private_message_senders").insert(
+                    {"owner_id": owner_id, "sender_id": sender_id, **payload}
+                ).execute()
+            else:
+                written = (
+                    db.table("private_message_senders")
+                    .update(payload)
+                    .eq("owner_id", owner_id)
+                    .eq("sender_id", sender_id)
+                    .eq("ai_replies_used", used)
+                    .execute()
+                )
+                if not (getattr(written, "data", None) or []):
+                    continue
+        except Exception as exc:
+            logger.warning("[PM_DB] claim write lost/failed, re-reading: %s", exc)
+            continue
+        return _pm_claim_result(True, claimed=True, used=used + 1, token=token)
+    logger.error("[PM_DB] claim contended for owner=%s sender=%s", owner_id, sender_id)
+    record_event("database", "private_message claim", 0, "ERROR", "cas contended")
+    return _pm_claim_result(False, reason="claim_contended")
+
+
+async def claim_private_message_ai_reply(
+    owner_id: int, sender_id: int, *, max_replies: int, unlimited: bool,
+    interval_seconds: int, now_iso: str,
+) -> dict:
+    """Atomically claim ONE AI reply from a person's durable allowance.
+
+    Returns an envelope: ``{"ok": True, "claimed": True, "used": n,
+    "token": {...}}`` when the reply may be generated, ``{"ok": True,
+    "claimed": False, "reason": "limit_reached"|"interval_not_elapsed",
+    "used": n}`` when the configured limit/interval vetoes it, and
+    ``{"ok": False, "reason": ...}`` when the store could not be read or the
+    CAS stayed contended — the caller fails closed and sends nothing.
+    """
+    try:
+        return await _run_sync(
+            _claim_private_message_ai_reply_sync,
+            owner_id, sender_id, int(max_replies), bool(unlimited),
+            int(interval_seconds), now_iso,
+        )
+    except Exception as exc:
+        logger.error("[PM_DB] claim_private_message_ai_reply FAILED: %s", exc)
+        return _pm_claim_result(False, reason="claim_failed")
+
+
+def _release_private_message_ai_reply_sync(
+    owner_id: int, sender_id: int, token: dict,
+) -> bool:
+    used = token.get("used")
+    last = token.get("last")
+    if not isinstance(used, int) or isinstance(used, bool):
+        return False
+    payload = {
+        "ai_replies_used": token.get("restore_used", 0),
+        "last_ai_reply_at": token.get("restore_last"),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    db = get_db()
+    if db is None:
+        row = _pm_sender_row(owner_id, sender_id)
+        if row is None or row.get("ai_replies_used") != used or row.get("last_ai_reply_at") != last:
+            return False
+        row.update(payload)
+        return True
+    try:
+        written = (
+            db.table("private_message_senders")
+            .update(payload)
+            .eq("owner_id", owner_id)
+            .eq("sender_id", sender_id)
+            .eq("ai_replies_used", used)
+            .eq("last_ai_reply_at", last)
+            .execute()
+        )
+        return bool(getattr(written, "data", None))
+    except Exception as exc:
+        logger.error("[PM_DB] release_private_message_ai_reply FAILED: %s", exc)
+        record_event("database", "release private_message claim", 0, "ERROR", str(exc))
+        return False
+
+
+async def release_private_message_ai_reply(
+    owner_id: int, sender_id: int, token: dict,
+) -> bool:
+    """Give a claimed AI reply back when generation or delivery failed. The CAS
+    restores exactly the pair the claim replaced; False means the compensation
+    itself did not land (logged honestly by the caller)."""
+    if not isinstance(token, dict):
+        return False
+    try:
+        return await _run_sync(
+            _release_private_message_ai_reply_sync, owner_id, sender_id, token,
+        )
+    except Exception as exc:
+        logger.error("[PM_DB] release_private_message_ai_reply FAILED: %s", exc)
+        return False
+
+
+def _reset_private_message_counters_sync(owner_id: int) -> bool:
+    db = get_db()
+    if db is None:
+        _fallback["private_message_senders"] = [
+            row for row in _fallback["private_message_senders"]
+            if row.get("owner_id") != owner_id
+        ]
+        return True
+    try:
+        db.table("private_message_senders").delete().eq("owner_id", owner_id).execute()
+        return True
+    except Exception as exc:
+        logger.error("[PM_DB] reset_private_message_counters FAILED: %s", exc)
+        record_event("database", "reset private_message counters", 0, "ERROR", str(exc))
+        return False
+
+
+async def reset_private_message_counters(owner_id: int) -> bool:
+    """The ONE counter-reset edge: the owner's explicit reset action. Nothing
+    else ever clears the counters, so a restart cannot hand a person a fresh
+    allowance."""
+    try:
+        return await _run_sync(_reset_private_message_counters_sync, owner_id)
+    except Exception as exc:
+        logger.error("[PM_DB] reset_private_message_counters FAILED: %s", exc)
         return False

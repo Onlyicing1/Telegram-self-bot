@@ -32,15 +32,16 @@ TTS_SETTINGS = "20260923000001_add_ai_config_tts_settings.sql"
 TODO_SCHEDULE_TYPE = "20260926000001_add_todo_schedule_type.sql"
 TODO_STEPS = "20260927000001_add_todo_steps.sql"
 EMOJI_TABLES = "20260928000001_create_emoji_reaction_tables.sql"
+PRIVATE_MESSAGE_TABLES = "20260929000001_create_private_message_tables.sql"
 
 #: The order §31 documents — verified against the sources, not assumed. The TTS
-#: settings migration, the Todo schedule type, the Todo steps table and the
-#: Emoji & Reaction tables are LATER additive schema changes, so they are
-#: appended last, newest last (the documented rule: a later change never edits
-#: the snapshot).
+#: settings migration, the Todo schedule type, the Todo steps table, the Emoji &
+#: Reaction tables and the Private Message Management tables are LATER additive
+#: schema changes, so they are appended last, newest last (the documented rule:
+#: a later change never edits the snapshot).
 DOCUMENTED_ORDER = (
     RECONCILE, VAULT_PART1, VAULT_PART2, DISPLAY_NAME, SEARCH_INDEXES, TTS_SETTINGS,
-    TODO_SCHEDULE_TYPE, TODO_STEPS, EMOJI_TABLES,
+    TODO_SCHEDULE_TYPE, TODO_STEPS, EMOJI_TABLES, PRIVATE_MESSAGE_TABLES,
 )
 
 #: The banner that marks the ONE complete deployment block.
@@ -276,12 +277,44 @@ def test_the_todo_steps_part_carries_the_whole_table_before_the_newest_change():
     )
 
 
-def test_the_emoji_part_is_last_and_carries_the_five_tables():
-    """The Emoji & Reaction persistence is the newest additive change: last."""
+def test_the_private_message_part_is_last_and_carries_the_two_tables():
+    """The Private Message Management tables are the newest additive change, so
+    they close the block; the Emoji & Reaction part sits immediately before."""
     spans = _part_spans(_setup_block())
-    assert list(spans)[-1] == EMOJI_TABLES, (
+    assert list(spans)[-1] == PRIVATE_MESSAGE_TABLES, (
         "the most recent additive migration must close the block"
     )
+    assert list(spans)[-2] == EMOJI_TABLES, (
+        "the Emoji & Reaction part must stay immediately before it"
+    )
+    part = spans[PRIVATE_MESSAGE_TABLES]
+    for table in ("private_message_config", "private_message_senders"):
+        assert f"CREATE TABLE IF NOT EXISTS {table}" in part, (
+            f"the Private Message part is missing the {table} table"
+        )
+    for guarantee in (
+        "ai_max_replies_per_person",
+        "ai_unlimited_replies",
+        "ai_interval_seconds",
+        "delete_incoming",
+        "fixed_response_enabled",
+        "ai_response_enabled",
+        "PRIMARY KEY (owner_id, sender_id)",
+        "idx_private_message_senders_owner_updated",
+        "ENABLE ROW LEVEL SECURITY",
+        "anon_select_private_message_config",
+        "anon_select_private_message_senders",
+        "NOTIFY pgrst, 'reload schema'",
+        "FROM information_schema.tables",
+        "FROM information_schema.columns",
+        "FROM bot_settings",
+    ):
+        assert guarantee in part, f"the Private Message part is missing {guarantee!r}"
+
+
+def test_the_emoji_part_carries_the_five_tables():
+    """The Emoji & Reaction persistence keeps all five of its tables."""
+    spans = _part_spans(_setup_block())
     part = spans[EMOJI_TABLES]
     for table in (
         "emoji_library",
@@ -381,7 +414,7 @@ def test_the_audited_order_is_recorded_in_the_audit_table():
     """
     section = _section_31()
     audit = section[: section.index("### 31.2")]
-    assert "all 31 migrations" in _flat(audit) or "31 files" in audit, (
+    assert "all 32 migrations" in _flat(audit) or "32 files" in audit, (
         "the audit must state that every repository migration was classified"
     )
     embedded_table = audit[audit.index("| Order | Migration") :]
@@ -400,10 +433,12 @@ def test_the_documented_deviations_are_stated_explicitly():
     flat = _flat(_section_31())
     assert "display_name" in flat
     assert "42703" in flat, "the failure the ordering prevents must be named"
-    assert "nine migrations" in flat, "the six later migrations must be acknowledged"
+    assert "ten migrations" in flat, "the later migrations must be acknowledged"
     assert "add_todo_schedule_type" in flat, "the Todo schedule type must be acknowledged"
     assert "add_todo_steps" in flat, "the Todo steps table must be acknowledged"
     assert "create_emoji_reaction_tables" in flat, "the Emoji & Reaction tables must be acknowledged"
+    assert "create_private_message_tables" in flat, "the Private Message tables must be acknowledged"
+    assert "private_message_senders" in flat, "the per-person counters must be acknowledged"
     assert "tts_provider" in flat, "the TTS settings columns must be acknowledged"
 
 
