@@ -3,6 +3,12 @@
 This handler rides the EXISTING Telethon update path (no second update
 loop). Every new message is normalized into a bounded event context and:
 
+  0. offered to the Private Message Management policy
+     (``backend/bot/handlers/private_message.py::enforce_incoming``), which is
+     the ONE place an incoming private message can be stopped before any
+     processing. An unauthorized message is handled by the owner's configured
+     policy (ignore / delete / rate-limited auto-reply) and returns here, so it
+     never reaches the paths below. No separate listener exists for this;
   1. given to the supervisor-configured ``TaskEventDispatcher``, which
      performs deterministic trigger matching and hands matched occurrences
      to the shared ``TaskExecutionCoordinator``;
@@ -55,6 +61,14 @@ def register(client, owner_id: int, tz_str: str) -> None:
 
     @client.on(events.NewMessage())
     async def _task_event_handler(event):
+        # Private-message policy FIRST and unconditionally: the gate must apply
+        # even when no task dispatcher or answer resolver is wired (the panel's
+        # delete/auto-reply behaviour is independent of the AI runtime).
+        from backend.bot.handlers.private_message import enforce_incoming
+
+        if not await enforce_incoming(client, event, owner_id):
+            return
+
         dispatcher = _dispatcher
         resolver = _answer_resolver
         if dispatcher is None and resolver is None:

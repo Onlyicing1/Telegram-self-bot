@@ -22,6 +22,7 @@ from backend.bot.handlers import (
     auto_reaction,
     emoji,
     emoji_replacement,
+    private_message,
     tasks,
     taskloom,
     task_events,
@@ -104,6 +105,10 @@ def register_all(client, owner_id: int, tz_str: str):
         ("ai_unified", lambda: ai_unified.register(client, owner_id, tz_str)),
         ("tasks", lambda: tasks.register(client, owner_id, tz_str)),
         ("taskloom", lambda: taskloom.register(client, owner_id, tz_str)),
+        # The private-message policy panel registers BEFORE the all-messages
+        # handler that consults it, so the state preload is already in flight
+        # when the first incoming message is evaluated.
+        ("private_message", lambda: private_message.register(client, owner_id, tz_str)),
         ("task_events", lambda: task_events.register(client, owner_id, tz_str)),
         ("todo", lambda: todo.register(client, owner_id, tz_str)),
         # Auto-Reaction runs before the replacement pipeline: the reaction is

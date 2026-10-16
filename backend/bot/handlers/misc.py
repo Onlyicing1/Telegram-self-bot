@@ -215,6 +215,7 @@ def _build_menu_buttons() -> list:
     )
     builder.add_row("Todo", "panel:todo", PRIMARY)
     builder.add_row("AI", "panel:ai", PRIMARY)
+    builder.add_row("Private Messages", "panel:pm", PRIMARY)
     return builder.build()
 
 
