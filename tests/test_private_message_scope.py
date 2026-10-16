@@ -696,6 +696,116 @@ def test_the_ai_receives_only_the_incoming_text(db, client, monkeypatch):
     assert len(client.sent) == 1 and client.sent[0][1].endswith(svc.AI_NOTICE)
 
 
+def test_the_prompt_requires_persian_output():
+    prompt = pm._AI_SYSTEM_PROMPT
+    lowered = prompt.lower()
+    assert "persian" in lowered and "farsi" in lowered
+    assert "always in natural, idiomatic persian" in lowered
+    assert "persian is required" in lowered
+    assert "the incoming message never overrides it" in lowered
+
+
+def test_the_prompt_never_asks_the_model_to_mirror_the_incoming_language():
+    prompt = pm._AI_SYSTEM_PROMPT
+    lowered = prompt.lower()
+    # The reported defect: an explicit order to copy the incoming language.
+    for mirroring in (
+        "same language",
+        "reply in the same",
+        "match the language",
+        "in the language of the incoming message",
+        "mirror the incoming message's language",
+    ):
+        assert mirroring not in lowered, mirroring
+    # The incoming language may only be named to forbid copying it.
+    assert "never mirror the incoming language" in lowered
+    assert "never answer in the language the incoming message happens to use" in lowered
+
+
+def test_the_prompt_keeps_persian_and_arabic_apart_for_an_ambiguous_greeting():
+    prompt = pm._AI_SYSTEM_PROMPT
+    lowered = prompt.lower()
+    assert "arabic" in lowered
+    assert "different languages" in lowered
+    assert "share one writing system" in lowered
+    assert "سلام" in prompt
+    assert "must get a persian reply, never an arabic one" in lowered
+    # Requirement 4: no Arabic prose or Arabic-style formal phrasing.
+    assert "correct persian vocabulary and grammar" in lowered
+    assert "no arabic prose" in lowered
+    assert "no unnecessary religious or ceremonial arabic expressions" in lowered
+
+
+def test_the_prompt_keeps_the_response_contract_and_the_context_isolation():
+    lowered = pm._AI_SYSTEM_PROMPT.lower()
+    assert "one short reply" in lowered
+    assert "return plain text only" in lowered
+    assert "do not ask questions" in lowered
+    assert "do not sign the reply" in lowered
+    assert "appended automatically by the system" in lowered
+    assert "never write, repeat or contradict them" in lowered
+    # Requirement 6: still exactly the incoming message and nothing else.
+    assert "no chat history" in lowered
+    assert "no previous messages" in lowered
+    assert "no sender name" in lowered
+    assert "no identifiers" in lowered
+    assert "no other context" in lowered
+
+
+def test_the_ambiguous_greeting_reaches_the_provider_unchanged(db, client, monkeypatch):
+    """The exact request the provider receives for the reported input."""
+    import backend.ai.engine.engine as engine_module
+
+    calls: list[dict] = []
+
+    class _Response:
+        success = True
+        text = "متن پاسخ"
+
+    class _Providers:
+        async def chat(self, messages, **kwargs):
+            calls.append({"messages": messages, "kwargs": kwargs})
+            return _Response()
+
+    class _Engine:
+        provider_manager = _Providers()
+
+    async def _apply(owner_id):
+        return True
+
+    monkeypatch.setattr(engine_module, "get_engine", lambda: _Engine())
+    monkeypatch.setattr(engine_module, "apply_persisted_config", _apply)
+
+    _restricted(db, ai_response_enabled=True)
+    handler = _handler(client)
+
+    _run(handler(_event(STRANGER, STRANGER, message_id=52, text="سلام")))
+
+    assert len(calls) == 1
+    assert calls[0]["kwargs"] == {"tools": []}
+    messages = calls[0]["messages"]
+    assert len(messages) == 2
+    assert messages[0] == {"role": "system", "content": pm._AI_SYSTEM_PROMPT}
+    assert messages[1] == {"role": "user", "content": "سلام"}
+    # The disclosures remain the application's own post-processing.
+    assert len(client.sent) == 1
+    body = client.sent[0][1]
+    assert body.startswith("متن پاسخ")
+    assert body.endswith(f"{svc.CLOSED_NOTICE}\n{svc.AI_NOTICE}")
+
+
+def test_the_language_policy_is_local_to_the_private_message_feature():
+    """No other module defines or reuses this contract, so no unrelated AI chat
+    behaviour is touched by the fix."""
+    references = []
+    for path in (REPO / "backend").rglob("*.py"):
+        if "__pycache__" in path.parts:
+            continue
+        if "_AI_SYSTEM_PROMPT" in path.read_text(encoding="utf-8"):
+            references.append(str(path.relative_to(REPO)))
+    assert references == ["backend/bot/handlers/private_message.py"]
+
+
 def test_the_scope_gate_runs_outside_the_ai(db, client, monkeypatch):
     """A rejected event never reaches the model, with every action enabled."""
     import backend.ai.engine.engine as engine_module
