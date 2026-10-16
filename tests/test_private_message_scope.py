@@ -1947,6 +1947,32 @@ def test_an_out_of_scope_event_never_creates_or_rolls_a_reset_window(db, client,
     assert db.senders[0]["window_started_at"] == expired  # nothing was rolled
 
 
+def test_a_counter_row_that_predates_the_window_column_is_not_silently_forgiven(db, client, monkeypatch):
+    """A counter row that already sits at its ceiling with NO recorded window has
+    no counted reply to anchor a window to, so enabling automatic reset does not
+    hand it a fresh allowance: the window is written by the first COUNTED reply
+    and cannot expire before one exists. This is a deliberate fail-closed choice
+    (the feature never grants an allowance it cannot justify) and it is stated in
+    the migration header; the owner's manual reset stays the escape hatch.
+    """
+    handler, _calls = _quota_handler(db, client, monkeypatch, max_replies=1, reset=60)
+    db.senders.append({
+        "owner_id": OWNER, "sender_id": STRANGER, "ai_replies_used": 1,
+        "last_ai_reply_at": (datetime.now(timezone.utc) - timedelta(days=30)).isoformat(),
+        "window_started_at": None,
+    })
+
+    _run(handler(_event(STRANGER, STRANGER, message_id=240, text=_GENERAL_REQUEST)))
+    assert client.sent == []
+    assert db.senders[0]["ai_replies_used"] == 1
+    assert db.senders[0]["window_started_at"] is None   # nothing was rolled
+
+    assert _run(svc.reset_counters(OWNER)) is True      # the documented escape hatch
+    _run(handler(_event(STRANGER, STRANGER, message_id=241, text=_GENERAL_REQUEST)))
+    assert len(client.sent) == 1
+    assert db.senders[0]["window_started_at"] is not None  # the live window starts here
+
+
 def test_a_counter_store_failure_at_a_reset_boundary_fails_closed(db, client, monkeypatch):
     handler, _calls = _quota_handler(db, client, monkeypatch, max_replies=1, reset=60)
     db.senders.append({

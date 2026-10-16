@@ -170,6 +170,17 @@ a stiff ceremonial opener; that half is addressed by the contract, §1.3.)
   group, outgoing message, unresolved sender or contradictory event never
   creates a window, never rolls one, never claims and never spends anything.
 
+**Stated limitation (deliberate, fail-closed, and pinned by a test):** a counter
+row that already sits at its ceiling with **no recorded window** — i.e. a row
+created before the migration whose person had used up their allowance — is *not*
+silently forgiven when automatic reset is enabled. It has no counted reply to
+anchor a window to, and treating "window unknown" as "window expired" would need
+a NULL-safe CAS identity (a row with `ai_replies_used = 1` and no window could
+otherwise be rolled twice by two racing claims). Such a person stays at the
+ceiling until the owner uses the manual reset or raises the limit. The feature
+never grants an allowance it cannot justify; the manual reset remains the escape
+hatch.
+
 ### 3.1 Panel controls (`Menu → Private Messages → Closing actions`)
 
 | Control | Kind | Effect |
@@ -287,14 +298,14 @@ test), and the request-shape structural counts are unchanged (one
 
 | Command | Result |
 |---|---|
-| `pytest tests/test_private_message_scope.py -q` | **117 passed** (90 before → +27) |
+| `pytest tests/test_private_message_scope.py -q` | **118 passed** (90 before → +28) |
 | `pytest tests/test_private_message_management.py -q` | **38 passed** (unchanged) |
 | `pytest tests/test_private_message_panel.py -q` | **50 passed** (47 before → +3) |
-| the three files together | **205 passed** |
+| the three files together | **206 passed** |
 | `tests/test_database_setup_order.py` + `tests/test_canonical_schema_reconciliation.py` + `tests/test_symbols.py` | **87 passed** (the new migration file is additive and undocumented in §31, as designed) |
-| full offline suite, this tree | **6258 passed, 27 skipped, 40 failed** (6325 collected) |
+| full offline suite, this tree | **6258 passed, 27 skipped, 40 failed** (6325 collected — the pinning test above was added after that run and is covered by the focused runs) |
 | full offline suite, pristine base revision `702c1d1` | **6228 passed, 27 skipped, 40 failed** (6295 collected) |
-| failure-set diff (base vs this tree) | **identical — zero new failures**, +30 passed |
+| failure-set diff (base vs this tree) | **identical — zero new failures** |
 | `python -m py_compile` on the three changed modules + both changed test modules | clean |
 | `git diff --check` (worktree and staged) | clean |
 
@@ -342,6 +353,7 @@ provider):
 | the persistence contract closes the boundary race (real db path, stale read) | `test_the_persistence_contract_itself_closes_the_window_race` |
 | the window is part of the CAS identity | `test_the_reset_window_is_part_of_the_claim_cas_identity` |
 | out-of-scope events touch no window | `test_an_out_of_scope_event_never_creates_or_rolls_a_reset_window` |
+| a pre-migration ceiling row is not silently forgiven | `test_a_counter_row_that_predates_the_window_column_is_not_silently_forgiven` |
 | reset config validated, never half applied | `test_the_reset_configuration_is_validated_and_never_half_applied` |
 | interval input: units accepted, junk refused | `test_the_reset_interval_input_accepts_units_and_refuses_anything_else` |
 | one control per setting, no duplicates | `test_the_actions_panel_carries_exactly_one_control_per_setting` |

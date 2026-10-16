@@ -20,6 +20,14 @@ current window:
   counted reply in that window. A row created before this migration has no
   window (NULL); the next counted reply starts one. A NULL window can never
   expire, so nothing changes for a person until they are answered again.
+  Consequently a counter row that ALREADY sits at its ceiling with no recorded
+  window is not silently forgiven by enabling this feature: it has no counted
+  reply to anchor a window to, and a claim that reads NULL must not be allowed to
+  treat "window unknown" as "window expired" without a NULL-safe CAS identity
+  (a row with `ai_replies_used = 1` and no window could otherwise be rolled twice
+  by two racing claims). Such a person stays at the ceiling until the owner uses
+  the manual **Reset AI counters** action or raises the limit — a deliberate
+  fail-closed choice: the feature never grants an allowance it cannot justify.
 - When `ai_counter_reset_enabled` is TRUE and `now() - window_started_at` is at
   or past `ai_counter_reset_seconds`, the window has expired. The NEXT eligible
   incoming message observes the expired window, resets `ai_replies_used` to zero
