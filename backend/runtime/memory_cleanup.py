@@ -50,6 +50,26 @@ async def _cleanup_loop() -> None:
             if footprint > 500:
                 logger.warning("Memory cleanup: permanent memory token footprint=%d exceeds soft cap 500", footprint)
 
+            # Anti-Edit / Anti-Delete expiry rides this EXISTING periodic
+            # worker (no second scheduler): transient snapshots and durable
+            # archive rows outside the configured retention are deleted, with
+            # their stored binaries, even when the bot is otherwise idle.
+            try:
+                from backend.services import anti_edit_delete_service
+
+                stats = await anti_edit_delete_service.cleanup_expired()
+                if stats.get("archive_deleted") or stats.get("snapshots_deleted"):
+                    logger.info(
+                        "Archive cleanup: expired %d record(s), %d snapshot(s), %d binary object(s)",
+                        stats.get("archive_deleted", 0),
+                        stats.get("snapshots_deleted", 0),
+                        stats.get("objects_deleted", 0),
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("Archive cleanup hook error: %s", type(exc).__name__)
+
         except asyncio.CancelledError:
             raise
         except Exception as exc:
