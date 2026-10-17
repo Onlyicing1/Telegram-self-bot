@@ -17,6 +17,7 @@ from backend.bot.handlers import misc, save, retrieve, delete, bio, discover, da
 from backend.bot.handlers import (
     ai_unified,
     ai_credentials,
+    anti_edit_delete,
     ai_stt_settings,
     ai_tts_settings,
     auto_reaction,
@@ -120,6 +121,12 @@ def register_all(client, owner_id: int, tz_str: str):
         # first claim on the owner's message, and only then is the message
         # reconstructed (delivered + deleted) as the documented Phase 4 step.
         ("emoji_replacement", lambda: emoji_replacement.register(client, owner_id)),
+        # Anti-Edit / Anti-Delete registers its own NewMessage, MessageEdited
+        # and MessageDeleted handlers on this SAME client. It is last so the
+        # snapshot/capture read never delays the existing handlers' first claim
+        # on an update; a capture that cannot finish is an honest miss, never a
+        # block on unrelated behaviour.
+        ("anti_edit_delete", lambda: anti_edit_delete.register(client, owner_id, tz_str)),
     ]
 
     for name, fn in handlers:
