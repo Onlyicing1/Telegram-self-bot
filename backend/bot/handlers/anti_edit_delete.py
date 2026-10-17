@@ -1,0 +1,443 @@
+"""Anti-Edit / Anti-Delete — Glass UI panels + the capture event handlers.
+
+Registers, on the ONE shared self-client (through ``backend.bot.router``):
+
+  * an ``events.NewMessage`` handler that records a bounded snapshot of an
+    eligible private message WHILE its content is present — this snapshot is
+    what makes a later deletion recoverable at all;
+  * an ``events.MessageEdited`` handler that records each edit version;
+  * an ``events.MessageDeleted`` handler that records the deletion event and
+    marks it recoverable ONLY when the content was captured beforehand.
+
+Everything is registered LAST so a capture read never delays another handler's
+first claim on an update; a capture that cannot finish is an honest miss, never
+a block on unrelated behaviour. No second client, update loop, scheduler or
+executor is introduced: the archive expires through the EXISTING memory-cleanup
+worker, which calls ``backend.services.anti_edit_delete_service.cleanup_expired``.
+
+Business logic and persistence live in the service; these handlers are thin.
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+
+from telethon import events
+
+from backend.bot.handlers.guard import is_owner
+from backend.helper import (
+    InlinePanelBuilder,
+    register_action,
+    register_inline_builder,
+    register_input,
+    register_panel,
+    render,
+)
+from backend.helper import inline_engine
+from backend.helper import symbols as sym
+from backend.helper.styles import DANGER, PRIMARY
+from backend.services import anti_edit_delete_service as service
+
+logger = logging.getLogger(__name__)
+
+PANEL_ID = "archive"
+LIST_ID = "archive_list"
+ITEM_ID = "archive_item"
+CATS_ID = "archive_cats"
+CONFIRM_ID = "archive_confirm"
+
+_PAGE_SIZE = service.PAGE_SIZE
+_BODY_PREVIEW = 160
+
+_CATEGORY_LABELS = {
+    service.CATEGORY_TEXT: "Text",
+    service.CATEGORY_CAPTIONS: "Captions",
+    service.CATEGORY_PHOTOS: "Photos",
+    service.CATEGORY_VIDEOS: "Videos",
+    service.CATEGORY_VOICE: "Voice",
+    service.CATEGORY_DOCUMENTS: "Documents",
+    service.CATEGORY_OTHER: "Other",
+}
+
+
+# ── Rendering helpers ────────────────────────────────────────────────────────
+
+def _mark(value: bool) -> str:
+    return sym.STATE_COMPLETED if value else sym.STATE_FAILED
+
+
+def _category_glyph(category: str) -> str:
+    return {
+        service.CATEGORY_TEXT: sym.MEDIA_TEXT,
+        service.CATEGORY_CAPTIONS: sym.MEDIA_TEXT,
+        service.CATEGORY_PHOTOS: sym.MEDIA_PHOTO,
+        service.CATEGORY_VIDEOS: sym.MEDIA_VIDEO,
+        service.CATEGORY_VOICE: sym.MEDIA_VOICE,
+        service.CATEGORY_DOCUMENTS: sym.MEDIA_DOCUMENT,
+        service.CATEGORY_OTHER: sym.MEDIA_UNKNOWN,
+    }.get(category, sym.MEDIA_UNKNOWN)
+
+
+def _kind_glyph(kind: str) -> str:
+    return {
+        service.KIND_SNAPSHOT: sym.OP_SAVE,
+        service.KIND_EDIT: sym.OP_EDIT,
+        service.KIND_DELETE: sym.STATE_DELETED,
+    }.get(kind, sym.STATE_DELETED)
+
+
+def _truncate(value: str, limit: int = _BODY_PREVIEW) -> str:
+    text = (value or "").strip().replace("\n", " ")
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _parse_list_extra(extra: str) -> tuple[int, str, str]:
+    """Decode ``p=<page>&c=<category>&q=<query>`` from panel navigation state."""
+    from urllib.parse import unquote
+
+    page, category, query = 1, "", ""
+    for part in (extra or "").split("&"):
+        key, separator, value = part.partition("=")
+        if not separator:
+            continue
+        if key == "p" and value.isdigit():
+            page = max(1, int(value))
+        elif key == "c":
+            category = unquote(value)
+        elif key == "q":
+            query = unquote(value)
+    return page, category, query
+
+
+def _encode_list_extra(page: int, category: str, query: str) -> str:
+    from urllib.parse import quote
+
+    return f"p={page}&c={quote(category, safe='')}&q={quote(query, safe='')}"
+
+
+async def _render_main(owner_id: int) -> tuple[str, str, list]:
+    await service.ensure_loaded_async()
+    summary = service.summary()
+    body = [
+        f"{sym.PANEL_HEADING} Private conversations are archived when enabled.",
+        "",
+        f"{_mark(summary['enabled'])} Enabled",
+        f"{sym.ICON_CATEGORY} Categories: {len(summary['categories'])}/{len(service.CATEGORIES)}",
+        f"{sym.SCHEDULE_INTERVAL} Retention: {summary['retention_days']} day(s)",
+        f"{_mark(summary['media_storage'])} Durable media storage"
+        + ("" if summary["media_storage"] else " (metadata only)"),
+        "",
+        "A deletion is recoverable only if the message was captured while present.",
+    ]
+    builder = InlinePanelBuilder()
+    builder.add_row(
+        sym.label(sym.OP_PAUSE if summary["enabled"] else sym.OP_RESUME,
+                  "Disable archiving" if summary["enabled"] else "Enable archiving"),
+        "action:aed_toggle_enabled",
+        PRIMARY,
+    )
+    builder.add_row(sym.label(sym.OP_MANAGE, "Browse archive"), f"panel:{LIST_ID}", PRIMARY)
+    builder.add_row(sym.label(sym.ICON_CATEGORY, "Categories"), f"panel:{CATS_ID}", PRIMARY)
+    builder.add_row(sym.label(sym.SCHEDULE_INTERVAL, "Set retention"), f"input:{PANEL_ID}:retention", PRIMARY)
+    builder.add_row(sym.label(sym.OP_REFRESH, "Refresh"), "action:aed_refresh", PRIMARY)
+    builder.add_row(sym.label(sym.OP_DELETE, "Clear archive"), f"panel:{CONFIRM_ID}", DANGER)
+    return "Anti-Edit / Anti-Delete", "\n".join(body), builder.build()
+
+
+async def _render_categories(owner_id: int) -> tuple[str, str, list]:
+    await service.ensure_loaded_async()
+    configured = set(service.categories())
+    builder = InlinePanelBuilder()
+    for category in service.CATEGORIES:
+        builder.add_row(
+            sym.label(sym.OP_SAVE if category in configured else sym.OP_CREATE,
+                      _CATEGORY_LABELS[category]),
+            f"action:aed_category:{category}",
+            PRIMARY,
+        )
+    body = (
+        f"{sym.ICON_CATEGORY} Choose the content categories to archive.\n\n"
+        "At least one category must stay enabled."
+    )
+    return "Archive Categories", body, builder.build()
+
+
+async def _render_list(owner_id: int, extra: str) -> tuple[str, str, list]:
+    page, category, query = _parse_list_extra(extra)
+    rows = await service.load_rows_async()
+    if rows is None:
+        return "Archive", f"{sym.STATE_WARNING} The archive store could not be read.", []
+    filtered = service.filter_rows(rows, category=category, query=query)
+    items, page, pages = service.page_of(filtered, page)
+    builder = InlinePanelBuilder()
+    if not items:
+        builder.add_row(sym.label(sym.OP_CREATE, "Nothing archived yet"), "action:aed_noop", PRIMARY)
+    for row in items:
+        label = (
+            f"{_kind_glyph(row.get('kind'))} {_category_glyph(row.get('category'))} "
+            f"{_truncate(row.get('body') or row.get('media_name') or '(no content)')}"
+        )
+        builder.add_row(
+            label,
+            f"panel:{ITEM_ID}:{row.get('id')}",
+            PRIMARY,
+        )
+    if pages > 1:
+        builder.add_buttons(
+            (sym.label(sym.OP_PREV, "Prev"), f"action:aed_page:{max(1, page - 1)}", PRIMARY),
+            (f"{sym.PAGE_CURRENT} {page}/{pages}", "action:aed_noop", PRIMARY),
+            (sym.label(sym.OP_NEXT, "Next"), f"action:aed_page:{min(pages, page + 1)}", PRIMARY),
+        )
+    active = category or "all"
+    body = (
+        f"{sym.ICON_STATS} {len(filtered)} item(s) · filter: {active} · page {page}/{pages}\n\n"
+        "Select an item to view or delete it."
+    )
+    return "Archive", body, builder.build()
+
+
+async def _render_item(owner_id: int, extra: str) -> tuple[str, str, list]:
+    archive_id = (extra or "").strip()
+    rows = await service.load_rows_async()
+    if rows is None:
+        return "Archive Item", f"{sym.STATE_WARNING} The archive store could not be read.", []
+    row = service.get_row(rows, archive_id)
+    if row is None:
+        return "Archive Item", f"{sym.STATE_WARNING} That item is no longer in the archive.", []
+    versions = service.versions_for(rows, row.get("chat_id"), row.get("message_id"))
+    kind = row.get("kind")
+    body = [
+        f"{_kind_glyph(kind)} Kind: {kind}",
+        f"{_category_glyph(row.get('category'))} Category: {row.get('category')}",
+        f"{sym.OP_CHAT} Chat: {row.get('chat_id')} · Message: {row.get('message_id')}",
+        f"{sym.META_TIME} Captured: {row.get('captured_at')}",
+    ]
+    if row.get("edited_at"):
+        body.append(f"{sym.OP_EDIT} Edited: {row.get('edited_at')}")
+    if row.get("has_media"):
+        body.append(
+            f"{sym.META_MEDIA} Media: {row.get('media_type') or 'unknown'}"
+            + (f" · {row.get('media_name')}" if row.get("media_name") else "")
+            + ("" if row.get("media_stored") else " (metadata only)")
+        )
+    if kind == service.KIND_DELETE:
+        if row.get("recoverable"):
+            body.append(f"{sym.STATE_COMPLETED} Recoverable from a pre-deletion snapshot.")
+        else:
+            body.append(f"{sym.STATE_WARNING} Content was never captured — not recoverable.")
+    if row.get("body"):
+        body.append("")
+        body.append(_truncate(row.get("body"), 600))
+    body.append("")
+    body.append(f"{sym.ICON_STATS} {len(versions)} observed version(s) of this message.")
+    builder = InlinePanelBuilder()
+    builder.add_row(sym.label(sym.OP_BACK, "Back to list"), f"panel:{LIST_ID}", PRIMARY)
+    builder.add_row(
+        sym.label(sym.OP_DELETE, "Delete this item"),
+        f"action:aed_delete:{archive_id}",
+        DANGER,
+    )
+    return "Archive Item", "\n".join(body), builder.build()
+
+
+async def _render_confirm(owner_id: int) -> tuple[str, str, list]:
+    body = (
+        f"{sym.STATE_WARNING} This permanently removes EVERY archived item of this "
+        "account, including pre-deletion snapshots. It cannot be undone."
+    )
+    builder = InlinePanelBuilder()
+    builder.add_row(sym.label(sym.OP_DELETE, "Confirm clear archive"), "action:aed_clear_confirm", DANGER)
+    builder.add_row(sym.label(sym.OP_BACK, "Cancel"), f"panel:{PANEL_ID}", PRIMARY)
+    return "Clear Archive", body, builder.build()
+
+
+async def _panel_result(panel_id: str, extra: str, owner_id: int) -> tuple[str, str, list]:
+    await service.ensure_loaded_async()
+    if panel_id == PANEL_ID:
+        return await _render_main(owner_id)
+    if panel_id == LIST_ID:
+        return await _render_list(owner_id, extra)
+    if panel_id == ITEM_ID:
+        return await _render_item(owner_id, extra)
+    if panel_id == CATS_ID:
+        return await _render_categories(owner_id)
+    if panel_id == CONFIRM_ID:
+        return await _render_confirm(owner_id)
+    return await _render_main(owner_id)
+
+
+def _inline_builder(panel_id: str, owner_id: int):
+    async def _builder(event, extra: str) -> list:
+        title, body, buttons = await _panel_result(panel_id, extra, owner_id)
+        return [render(title, body, buttons)]
+
+    return _builder
+
+
+# ── Actions ──────────────────────────────────────────────────────────────────
+
+async def _toggle_enabled_action(event, extra: str, chat_id: int):
+    await service.ensure_loaded_async()
+    if not await service.set_enabled(not service.is_enabled()):
+        return "Anti-Edit / Anti-Delete", "Could not save the change. Please try again.", []
+    return await _render_main(inline_engine.get_owner_id())
+
+
+async def _refresh_action(event, extra: str, chat_id: int):
+    await service.reload_async()
+    return await _render_main(inline_engine.get_owner_id())
+
+
+async def _category_action(event, extra: str, chat_id: int):
+    await service.ensure_loaded_async()
+    category = (extra or "").strip()
+    if category not in service.CATEGORIES:
+        return "Archive Categories", "That category is not valid — nothing changed.", []
+    enabled = category not in set(service.categories())
+    if not await service.set_category(category, enabled):
+        return (
+            "Archive Categories",
+            f"{sym.STATE_WARNING} At least one category must stay enabled — nothing changed.",
+            [],
+        )
+    return await _render_categories(inline_engine.get_owner_id())
+
+
+async def _page_action(event, extra: str, chat_id: int):
+    page = (extra or "").strip()
+    return await _render_list(inline_engine.get_owner_id(), f"p={page}" if page.isdigit() else "")
+
+
+async def _delete_action(event, extra: str, chat_id: int):
+    archive_id = (extra or "").strip()
+    if not await service.delete_row(archive_id):
+        return "Archive", f"{sym.STATE_WARNING} That item could not be deleted.", []
+    return await _render_list(inline_engine.get_owner_id(), "")
+
+
+async def _clear_confirm_action(event, extra: str, chat_id: int):
+    removed = await service.clear_archive()
+    if removed < 0:
+        return "Archive", f"{sym.STATE_WARNING} The archive could not be cleared.", []
+    return await _render_list(inline_engine.get_owner_id(), "")
+
+
+async def _noop_action(event, extra: str, chat_id: int):
+    return await _render_list(inline_engine.get_owner_id(), "")
+
+
+# ── Input ────────────────────────────────────────────────────────────────────
+
+async def _retention_input_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
+    from backend.helper.client import get_client
+    from backend.helper.input_state import clear_pending
+
+    raw = (text or "").strip()
+    days = int(raw) if raw.isdigit() else None
+    if days is None or not await service.set_retention_days(days):
+        notice = (
+            f"{sym.STATE_WARNING} Enter a whole number of days between "
+            f"{service.MIN_RETENTION_DAYS} and {service.MAX_RETENTION_DAYS}. Nothing changed."
+        )
+    else:
+        notice = f"{sym.OP_SAVE} Retention set to {days} day(s)."
+    clear_pending(0)
+    helper = get_client()
+    if helper and inline_chat_id and inline_msg_id:
+        try:
+            await helper.edit_message(inline_chat_id, inline_msg_id, notice)
+        except Exception as exc:
+            logger.warning("aed retention inline edit failed: %s", exc)
+    client = inline_engine.get_self_client()
+    if client is not None and msg_id:
+        try:
+            await client.delete_messages(chat_id, [msg_id])
+        except Exception:
+            pass
+
+
+# ── Event capture ────────────────────────────────────────────────────────────
+
+def register(client, owner_id: int, tz_str: str = "UTC") -> None:
+    service.configure_owner(owner_id)
+
+    # Preload the configuration in the background so the common case never waits
+    # on a database read on the event path.
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+    else:
+        try:
+            from backend.runtime.task_guard import guarded_create_task
+
+            guarded_create_task(service.ensure_loaded_async(), name="anti_edit_delete:preload_state")
+        except Exception:
+            pass
+
+    @client.on(events.NewMessage())
+    async def _aed_new_message(event):
+        try:
+            if not service.is_enabled():
+                return
+            msg = getattr(event, "message", None)
+            if msg is None or getattr(msg, "action", None) is not None:
+                return
+            await service.record_message(msg=msg, kind=service.KIND_SNAPSHOT, owner=owner_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("[AED] snapshot capture failed: %s", type(exc).__name__)
+
+    @client.on(events.MessageEdited())
+    async def _aed_message_edited(event):
+        try:
+            if not service.is_enabled():
+                return
+            msg = getattr(event, "message", None)
+            if msg is None:
+                return
+            await service.record_message(msg=msg, kind=service.KIND_EDIT, owner=owner_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("[AED] edit capture failed: %s", type(exc).__name__)
+
+    @client.on(events.MessageDeleted())
+    async def _aed_message_deleted(event):
+        try:
+            if not service.is_enabled():
+                return
+            await service.record_deletion(event=event, owner=owner_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("[AED] deletion capture failed: %s", type(exc).__name__)
+
+    register_panel(PANEL_ID, lambda event, extra: _panel_result(PANEL_ID, extra, owner_id), parent="menu", title="Anti-Edit / Anti-Delete")
+    register_panel(LIST_ID, lambda event, extra: _panel_result(LIST_ID, extra, owner_id), parent=PANEL_ID, title="Archive")
+    register_panel(ITEM_ID, lambda event, extra: _panel_result(ITEM_ID, extra, owner_id), parent=LIST_ID, title="Archive Item")
+    register_panel(CATS_ID, lambda event, extra: _panel_result(CATS_ID, extra, owner_id), parent=PANEL_ID, title="Categories")
+    register_panel(CONFIRM_ID, lambda event, extra: _panel_result(CONFIRM_ID, extra, owner_id), parent=PANEL_ID, title="Clear Archive")
+
+    register_inline_builder(PANEL_ID, _inline_builder(PANEL_ID, owner_id))
+    register_inline_builder(LIST_ID, _inline_builder(LIST_ID, owner_id))
+    register_inline_builder(ITEM_ID, _inline_builder(ITEM_ID, owner_id))
+    register_inline_builder(CATS_ID, _inline_builder(CATS_ID, owner_id))
+    register_inline_builder(CONFIRM_ID, _inline_builder(CONFIRM_ID, owner_id))
+
+    register_action("aed_toggle_enabled", _toggle_enabled_action)
+    register_action("aed_refresh", _refresh_action)
+    register_action("aed_category", _category_action)
+    register_action("aed_page", _page_action)
+    register_action("aed_delete", _delete_action)
+    register_action("aed_clear_confirm", _clear_confirm_action)
+    register_action("aed_noop", _noop_action)
+
+    register_input(PANEL_ID, "retention", {
+        "handler": _retention_input_handler,
+        "prompt": (
+            "**Archive retention**\n\nEnter a whole number of days between "
+            f"{service.MIN_RETENTION_DAYS} and {service.MAX_RETENTION_DAYS}:\n\n_Reply below._"
+        ),
+    })

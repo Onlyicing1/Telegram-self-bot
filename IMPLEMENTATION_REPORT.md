@@ -1,129 +1,114 @@
-# IMPLEMENTATION_REPORT.md — Anti-Edit & Anti-Delete: Status
+# IMPLEMENTATION_REPORT.md — Anti-Edit & Anti-Delete
 
 > This file describes ONLY the current state of the Anti-Edit / Anti-Delete task
-> and **replaces its previous contents in full** (the earlier Private Message
-> Management report — Persian reply quality + configurable automatic counter
-> reset, commits `2c758d3` / `30ced36`, building on `bf89042` / `e3548dd` /
-> `e8dd2c8` / `702c1d1` — and every older report remain readable in git history
-> and are referenced here only by commit id). Nothing from them is contradicted
-> here. The dedicated, evidence-level investigation record lives in
+> and **replaces its previous contents in full**. The earlier reports — the
+> Private Message Management report (commits `2c758d3` / `30ced36`, building on
+> `bf89042` / `e3548dd` / `e8dd2c8` / `702c1d1`) and the inspection-only
+> anti-edit report (commit `cbeb6c1`) — remain readable in git history. Nothing
+> from them is contradicted here; the still-relevant findings are carried forward
+> in §4. The evidence-level investigation record lives in
 > `docs/investigations/anti-edit-delete-status.md`.
 
 | Item | Value |
 |---|---|
-| Stage | **Inspect / document** (no feature code written; no fix applied) |
+| Stage | **Implementation — complete** |
 | Date | 2026-10-17 |
 | Project / remote | LifeOS Telegram self-bot, `Onlyicing1/Telegram-self-bot` (`origin` = `https://github.com/Onlyicing1/Telegram-self-bot.git`) |
 | Branch | `main` |
-| Local HEAD | `330ef39f12dd7b908653af26109d2b218c4f8091` (`feat(archive): register anti-edit/anti-delete on the shared client and menu`) |
-| `origin/main` | `330ef39f12dd7b908653af26109d2b218c4f8091` — verified equal via `git fetch origin` + `git rev-parse origin/main`; `git merge-base --is-ancestor HEAD origin/main` exit 0 |
-| Working tree | Only this report and the new investigation record are modified/added (documentation). No application code, test, config or migration change. |
-| Clone type | Shallow (grafted); history was deepened during the earlier inspection only to search ancestry — no object was rewritten |
-| Outcome | **Confirmed: the feature is incomplete and the bot cannot start.** `backend/bot/router.py` imports a handler module `anti_edit_delete` that does not exist in this repository, and `backend/services/anti_edit_delete_service.py` is likewise missing. |
+| Base commit | `cbeb6c11cdb0bce48a7b5cfd18a2a0b299a19050` (`docs(archive): document anti-edit-delete implementation status`) |
+| Clone type | Shallow (grafted) |
+| Outcome | **Fixed.** The two missing modules now exist; the startup `ImportError` is gone; the feature captures, archives, browses and expires; the full repository test suite passes. |
 
 ---
 
-## 1. What exists in the current source
+## 1. Root cause (verified, unchanged)
 
-* `backend/bot/router.py`:
-  * **line 20** — `anti_edit_delete,` in the `from backend.bot.handlers import (...)`
-    block.
-  * **line 129** — `("anti_edit_delete", lambda: anti_edit_delete.register(client, owner_id, tz_str)),`
-    in the handler table.
-* `backend/runtime/memory_cleanup.py`:
-  * **line 58** — `from backend.services import anti_edit_delete_service`.
-  * **line 60** — `stats = await anti_edit_delete_service.cleanup_expired()`,
-    inside the existing periodic cleanup worker, wrapped in `try/except` that
-    logs `"Archive cleanup hook error: …"` on failure.
-* `backend/runtime/supervisor.py`:
-  * **line 51** — `from backend.bot.router import register_all` (loads the router,
-    and therefore the failing import, at startup).
-* Two commits on `main` that reference the feature but do not create its modules:
-  * `dfca937` — `feat(archive): route archive expiry through the existing memory-cleanup worker`
-    (`backend/runtime/memory_cleanup.py`, +20).
-  * `330ef39` — `feat(archive): register anti-edit/anti-delete on the shared client and menu`
-    (`backend/bot/router.py`, +7).
+The wiring commits `dfca937` (memory-cleanup hook) and `330ef39` (router import +
+registration) reached `main`, but the modules they reference were never
+committed:
 
-## 2. What is missing or broken
+* `backend/bot/router.py` line 20 imports `anti_edit_delete` from
+  `backend.bot.handlers`, and line 129 registers
+  `anti_edit_delete.register(client, owner_id, tz_str)`.
+* `backend/runtime/memory_cleanup.py` line 58 imports
+  `backend.services.anti_edit_delete_service` and line 60 calls
+  `anti_edit_delete_service.cleanup_expired()`.
+* `backend/runtime/supervisor.py` imports the router at load time, so startup
+  raised `ImportError: cannot import name 'anti_edit_delete' from
+  'backend.bot.handlers'` before any handler registered.
 
-* `backend/bot/handlers/anti_edit_delete.py` — **does not exist** (no file of
-  that name anywhere; `backend/bot/handlers/__init__.py` re-exports nothing).
-* `backend/services/anti_edit_delete_service.py` — **does not exist**.
-* The mother-menu row that `330ef39`'s message claims ("`misc.py` adds the
-  mother-menu row") is **absent**: `grep -in "anti\|archive" backend/bot/handlers/misc.py`
-  → no matches; `grep -rni "archive" backend/helper/` → no matches.
-* **Startup is broken.** Reproduced in this workspace:
+This was a **missing-module** failure — not a wrong import path and not a
+circular import.
 
-```
-$ python -c "from backend.bot.handlers import anti_edit_delete"
-ImportError: cannot import name 'anti_edit_delete' from 'backend.bot.handlers'
-  (/workspace/project/Telegram-self-bot/backend/bot/handlers/__init__.py)
-```
+## 2. What was implemented
 
-  `python -m py_compile backend/bot/router.py` is clean, so this is an
-  import-time name error, not a syntax error.
+| File | Change |
+|---|---|
+| `backend/bot/handlers/anti_edit_delete.py` | **New.** The `register(client, owner_id, tz_str)` entry point (the exact symbol the router imports). Registers three Telethon handlers on the ONE shared self-client — `events.NewMessage` (bounded content snapshot while present), `events.MessageEdited` (each edit version) and `events.MessageDeleted` (deletion event) — plus the Glass UI panels `archive` / `archive_list` / `archive_item` / `archive_cats` / `archive_confirm`, the `aed_*` actions, and the `retention` input. Handlers are thin; all logic lives in the service. |
+| `backend/services/anti_edit_delete_service.py` | **New.** The single owner of archive state: config load/sanitize/persist, the scope gate, category classification, idempotent capture (deterministic `sha1` archive ids), honest deletion recording, bounded browsing/filter/pagination, row delete/clear, `cleanup_expired()` (the symbol `memory_cleanup` calls), and optional media-object storage. |
+| `backend/db/client.py` | **Appended** (`+162`): `aed_get_document`, `aed_put_document`, `aed_load_archive`, `aed_save_archive` — durable JSON persistence in the EXISTING `bot_settings` table, with the same bounded-executor + in-memory-fallback discipline as every other db helper. |
+| `backend/bot/handlers/misc.py` | **`+1` line**: the mother-menu row `("Anti-Edit / Anti-Delete", "panel:archive", PRIMARY)` (the row `330ef39` claimed but never delivered). |
+| `tests/test_anti_edit_delete.py` | **New.** 36 tests: the startup import contract, the full registration surface, configuration, the scope gate, snapshot/edit/deletion capture, honest recoverability, browsing, retention cleanup, media honesty, and every panel/action/input. |
 
-## 3. Cause (verified)
+## 3. Design decisions (and their evidence)
 
-The wiring commits (`dfca937`, `330ef39`) reached `origin/main`, but the modules
-they reference were never committed. Because `supervisor.py` imports the router
-at load time, the bot raises the `ImportError` above before any handler
-registers. This is a **missing-module** failure — not a wrong import path (the
-package name matches the repository convention) and not a circular import.
+* **No new database table and no new migration.** `DATABASE_ARCHITECTURE.md` is a
+  protected, documented contract, and
+  `tests/test_canonical_schema_reconciliation.py::test_no_migration_creates_a_table_that_the_documentation_does_not_classify`
+  asserts that every `CREATE TABLE` in `supabase/migrations/` is classified in
+  that document. A new archive table would therefore have required editing the
+  protected document and adding a migration part — outside the smallest safe
+  change set. The archive instead reuses the **existing** `bot_settings`
+  key/value table (the same store `ghost_seen_v2` uses), as JSON documents split
+  across a small, fixed number of shards so no read/write grows without bound.
+* **Deletion recoverability is honest.** A deletion row is `recoverable=True`
+  only when the content was actually observed and stored beforehand (its
+  snapshot); otherwise the row records the event with an empty body and
+  `recoverable=False`. Nothing is ever fabricated.
+* **Scope is applied everywhere** (capture, browse, cleanup): private
+  user-to-user chats only — groups/supergroups/channels (negative ids), Saved
+  Messages (`chat_id == owner_id`) and inline-bot-origin messages are excluded.
+* **Media durability is a documented limitation.** No durable media store exists
+  in this repository (`save_service` deletes its temp download; no Supabase
+  Storage bucket is used anywhere). Media is therefore metadata-only by default;
+  when the owner provisions a bucket and sets `ARCHIVE_MEDIA_BUCKET`, a bounded
+  snapshot is uploaded and its object path recorded. The service never claims
+  durable media archival it cannot deliver.
+* **Retention rides the existing worker.** `cleanup_expired()` is called by
+  `backend/runtime/memory_cleanup.py`; no second scheduler or task was added.
+* **Default is OFF**, matching the repository convention for capture-style
+  features; enabling is an explicit owner action.
 
-## 4. Tests actually executed and results
+## 4. Findings carried forward (still relevant)
 
-* **No anti-edit tests exist** (`grep -rln "anti_edit" tests/` → none), so no
-  feature test was run.
-* The test tooling is **not installed** in this workspace (`python -c "import pytest"`
-  → `ModuleNotFoundError`; `python -c "import telethon"` → `ModuleNotFoundError`),
-  so the repository suite could not be executed here.
-* Only two checks were executed, both clean/negative:
-  * `python -m py_compile backend/bot/router.py` → clean (compiles).
-  * `python -c "from backend.bot.handlers import anti_edit_delete"` → reproduces
-    the `ImportError` (see §2).
+* The feature was wired but unimplemented at `cbeb6c1`; the two modules were
+  missing and the bot could not start.
+* `backend/bot/handlers/__init__.py` is a comment-only file and re-exports
+  nothing — the `from backend.bot.handlers import anti_edit_delete` form works
+  because it imports the submodule by name, which is why adding the module is the
+  correct fix and no `__init__.py` change is needed.
+* `INVESTIGATION.md` (tracked) documents a **different, completed** task (Inline
+  Button Color Semantics, commit `2805a88`); it was not touched.
+* `docs/investigations/anti-edit-delete-status.md` and older reports remain in
+  place and unmodified.
 
-## 5. What was NOT tested or verified
+## 5. Verification actually executed
 
-* No live Telegram, no deployment, no Render shell, no SQL, no Supabase call —
-  none was performed (no credentials/`.env` available; out of scope for this
-  documentation stage).
-* No end-to-end run of the bot (blocked by the missing module and by the absent
-  `telethon` package).
-* Whether an archive table/migration exists in Supabase — not investigated (not
-  needed to explain the import failure).
+* `python -c "import backend.runtime.supervisor"` → **OK** (previously raised the
+  `ImportError`; this is the startup path).
+* `python -m py_compile` on every changed module → clean.
+* `python -m pytest tests/test_anti_edit_delete.py -q` → **36 passed**.
+* `python -m pytest tests/ -q` → **6335 passed, 27 skipped, 0 failed** (full
+  repository suite; requires `pytest-asyncio`, which the STT/TTS tests rely on).
 
-## 6. Is the implementation incomplete?
+## 6. Not done / out of scope
 
-**Yes.** The feature is wired but unimplemented: the handler and service modules
-are missing, and the application cannot import its router. The two call sites are
-the only contract available today:
-`register(client, owner_id, tz_str)` and
-`await cleanup_expired() -> dict` (consuming at least `archive_deleted`,
-`snapshots_deleted`, `objects_deleted`).
+* No live Telegram, no deployment, no Render shell, no SQL, no Supabase call.
+* No database migration was added and no Supabase schema was modified.
+* The optional `ARCHIVE_MEDIA_BUCKET` storage path is **not exercised** against a
+  real bucket (none is provisioned); its code path is inert without one.
 
-## 7. Remaining blockers and next stage
+## 7. Next stage
 
-* **Blocker (startup):** missing `backend/bot/handlers/anti_edit_delete.py`.
-* **Blocker (feature):** missing `backend/services/anti_edit_delete_service.py`
-  (the `memory_cleanup.py` hook only logs a warning until it exists).
-* **Prerequisite:** owner-confirmed feature intent/acceptance criteria, since the
-  source that would document it is exactly the missing module.
-* **Next stage:** `Implementation` — add the two missing modules (and, only if in
-  scope, the mother-menu row), with no change to `router.py`'s import path.
-
-## 8. Documentation and Git state for this task
-
-* **No unpushed commits existed.** `HEAD` and `origin/main` were both
-  `330ef39f12dd7b908653af26109d2b218c4f8091` at the start of this task; the only
-  local change was an uncommitted edit to `IMPLEMENTATION_REPORT.md`.
-* **No previous anti-edit report existed in the repository.** The canonical
-  `INVESTIGATION.md` is committed, identical to `HEAD`, and documents a
-  **different, completed** task (Inline Button Color Semantics, commit
-  `2805a88`). It was therefore **not overwritten**; the anti-edit investigation
-  is recorded separately in `docs/investigations/anti-edit-delete-status.md`.
-* Files changed by this documentation task: `IMPLEMENTATION_REPORT.md`
-  (rewritten) and `docs/investigations/anti-edit-delete-status.md` (new). No
-  application code, tests, configuration, migrations, database, deployment,
-  commit or push is claimed here beyond the documentation commit described in
-  the task's delivery.
+`Complete`. Any future enhancement — a normalized archive table with a documented
+migration, or a provisioned media bucket — is a separate, owner-authorized task.

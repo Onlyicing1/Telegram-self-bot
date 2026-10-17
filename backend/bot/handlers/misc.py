@@ -216,6 +216,7 @@ def _build_menu_buttons() -> list:
     builder.add_row("Todo", "panel:todo", PRIMARY)
     builder.add_row("AI", "panel:ai", PRIMARY)
     builder.add_row("Private Messages", "panel:pm", PRIMARY)
+    builder.add_row("Anti-Edit / Anti-Delete", "panel:archive", PRIMARY)
     return builder.build()
 
 

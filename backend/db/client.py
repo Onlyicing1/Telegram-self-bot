@@ -2649,3 +2649,165 @@ async def reset_private_message_counters(owner_id: int) -> bool:
     except Exception as exc:
         logger.error("[PM_DB] reset_private_message_counters FAILED: %s", exc)
         return False
+
+
+# ── Anti-Edit / Anti-Delete archive persistence ──────────────────────────────
+#
+# The archive is stored as JSON documents in the EXISTING ``bot_settings`` table
+# (the same durable key/value store ``ghost_seen_v2`` uses). No new table and no
+# migration are introduced: the canonical schema is documented in the protected
+# ``DATABASE_ARCHITECTURE.md``, and a table created by a migration would not be
+# classified there. The configuration lives in one bounded document; the archive
+# rows are chunked across a small, fixed set of shard documents so neither a read
+# nor a write grows without bound.
+#
+# Every function returns ``None``/``False`` on failure (never raises), so the
+# service can fail closed and never mistake an unreadable store for an empty one.
+
+_AED_CONFIG_KEY = "anti_edit_delete_config"
+_AED_SHARD_PREFIX = "anti_edit_delete_archive_shard:"
+
+
+def _bot_settings_get_sync(key: str) -> str | None:
+    db = get_db()
+    if db is None:
+        row = _fallback.get("bot_settings", {}).get(key)
+        return row if isinstance(row, str) else None
+    try:
+        result = db.table("bot_settings").select("value").eq("key", key).maybe_single().execute()
+        data = getattr(result, "data", None)
+        if isinstance(data, dict):
+            value = data.get("value")
+            return value if isinstance(value, str) and value.strip() else None
+        if isinstance(data, list) and data:
+            value = data[0].get("value")
+            return value if isinstance(value, str) and value.strip() else None
+        return None
+    except Exception as exc:
+        logger.error("[AED_DB] read %s FAILED: %s", key, exc)
+        return None
+
+
+async def aed_get_document(key: str) -> str | None:
+    """Read one JSON document from ``bot_settings``. ``None`` means missing OR
+    unreadable — the caller resolves both to its fail-closed default."""
+    try:
+        return await _run_sync(_bot_settings_get_sync, key)
+    except Exception as exc:
+        logger.error("[AED_DB] read %s FAILED: %s", key, exc)
+        return None
+
+
+def _bot_settings_put_sync(key: str, value: str) -> bool:
+    db = get_db()
+    if db is None:
+        _fallback["bot_settings"][key] = value
+        return True
+    try:
+        existing = db.table("bot_settings").select("key").eq("key", key).limit(1).execute()
+        if getattr(existing, "data", None):
+            db.table("bot_settings").update({"value": value}).eq("key", key).execute()
+        else:
+            db.table("bot_settings").insert(
+                {"key": key, "value": value, "value_type": "str"}
+            ).execute()
+        return True
+    except Exception as exc:
+        logger.error("[AED_DB] write %s FAILED: %s", key, exc)
+        record_event("database", "write anti_edit_delete document", 0, "ERROR", str(exc))
+        return False
+
+
+async def aed_put_document(key: str, value: str) -> bool:
+    """Upsert one JSON document into ``bot_settings``. True only when the durable
+    write landed, so the service never reports a setting as saved when it was not."""
+    try:
+        return await _run_sync(_bot_settings_put_sync, key, value)
+    except Exception as exc:
+        logger.error("[AED_DB] write %s FAILED: %s", key, exc)
+        return False
+
+
+def _aed_load_shards_sync(shard_keys: list[str]) -> list[list] | None:
+    """Read every archive shard document. ``None`` means the store could not be
+    read (an unreadable store is never shown as an empty one)."""
+    import json
+
+    db = get_db()
+    rows: dict[str, str] = {}
+    if db is None:
+        for key in shard_keys:
+            value = _fallback.get("bot_settings", {}).get(key)
+            if isinstance(value, str):
+                rows[key] = value
+    else:
+        try:
+            result = (
+                db.table("bot_settings")
+                .select("key, value")
+                .like("key", f"{_AED_SHARD_PREFIX}%")
+                .execute()
+            )
+            for row in getattr(result, "data", None) or []:
+                if isinstance(row, dict) and isinstance(row.get("key"), str):
+                    rows[row["key"]] = row.get("value") or "[]"
+        except Exception as exc:
+            logger.error("[AED_DB] shard read FAILED: %s", exc)
+            return None
+
+    shards: list[list] = []
+    for key in shard_keys:
+        raw = rows.get(key)
+        if not raw:
+            shards.append([])
+            continue
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            logger.warning("[AED_DB] shard %s is not valid JSON — treated as empty", key)
+            parsed = []
+        shards.append(parsed if isinstance(parsed, list) else [])
+    return shards
+
+
+async def aed_load_archive(shard_keys: list[str]) -> list[list] | None:
+    """Load all archive shards (each a bounded list of rows), newest last."""
+    try:
+        return await _run_sync(_aed_load_shards_sync, list(shard_keys))
+    except Exception as exc:
+        logger.error("[AED_DB] shard load FAILED: %s", exc)
+        return None
+
+
+def _aed_save_shards_sync(shard_keys: list[str], shards: list[list]) -> bool:
+    import json
+
+    db = get_db()
+    for index, key in enumerate(shard_keys):
+        rows = shards[index] if index < len(shards) else []
+        value = json.dumps(rows, separators=(",", ":"), default=str)
+        if db is None:
+            _fallback["bot_settings"][key] = value
+            continue
+        try:
+            existing = db.table("bot_settings").select("key").eq("key", key).limit(1).execute()
+            if getattr(existing, "data", None):
+                db.table("bot_settings").update({"value": value}).eq("key", key).execute()
+            else:
+                db.table("bot_settings").insert(
+                    {"key": key, "value": value, "value_type": "str"}
+                ).execute()
+        except Exception as exc:
+            logger.error("[AED_DB] shard %s write FAILED: %s", key, exc)
+            record_event("database", "write anti_edit_delete shard", 0, "ERROR", str(exc))
+            return False
+    return True
+
+
+async def aed_save_archive(shard_keys: list[str], shards: list[list]) -> bool:
+    """Persist every archive shard. True only when every write landed."""
+    try:
+        return await _run_sync(_aed_save_shards_sync, list(shard_keys), list(shards))
+    except Exception as exc:
+        logger.error("[AED_DB] shard save FAILED: %s", exc)
+        return False
