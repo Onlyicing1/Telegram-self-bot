@@ -31,9 +31,11 @@ service never claims durable media archival it cannot deliver.
 
 ## Scope (applied identically to capture, browsing and cleanup)
 
-Only genuine private (user-to-user) chats are archived. Group/supergroup/channel
-chats (negative chat ids), Saved Messages (``chat_id == owner_id``) and messages
-sent via an inline bot are excluded everywhere.
+Only genuine private (user-to-user) conversations with HUMAN accounts are
+archived. Group/supergroup/channel chats (negative chat ids), Saved Messages
+(``chat_id == owner_id``), messages sent via an inline bot, and Telegram BOT
+accounts — decided by the RESOLVED peer entity's real ``User.bot`` flag, never
+by a username/name heuristic — are excluded everywhere.
 """
 from __future__ import annotations
 
@@ -170,6 +172,7 @@ def reset_in_memory() -> None:
     _lock_loop = None
     _owner_id = 0
     _handled.clear()
+    _peer_bot_cache.clear()
 
 
 # ── Config ───────────────────────────────────────────────────────────────────
@@ -311,11 +314,24 @@ async def set_category(category: str, enabled: bool) -> bool:
 
 # ── Scope ────────────────────────────────────────────────────────────────────
 
-def eligible(*, owner: Any, chat_id: Any, is_private: Any, via_bot_id: Any = None) -> tuple[bool, str]:
+def eligible(
+    *,
+    owner: Any,
+    chat_id: Any,
+    is_private: Any,
+    via_bot_id: Any = None,
+    peer_is_bot: Any = None,
+) -> tuple[bool, str]:
     """The ONE scope gate, shared by capture, browse and cleanup.
 
     A private chat id is the other user's POSITIVE id; groups/supergroups/
     channels are negative, and Saved Messages is the owner's own id.
+
+    ``peer_is_bot`` is TRI-STATE: ``True`` only when the peer's RESOLVED
+    Telegram ``User`` entity carries the real ``bot`` flag — a positive chat id
+    alone is NOT proof of a human. ``None``/``False`` (entity missing or
+    unresolved) never blocks here; callers keep their documented safe fallback
+    rather than guessing an unclassified peer's humanity.
     """
     if not isinstance(owner, int) or isinstance(owner, bool) or owner <= 0:
         return False, "invalid_owner"
@@ -327,7 +343,79 @@ def eligible(*, owner: Any, chat_id: Any, is_private: Any, via_bot_id: Any = Non
         return False, "saved_messages"
     if via_bot_id:
         return False, "via_bot"
+    if peer_is_bot is True:
+        return False, "peer_is_bot"
     return True, "eligible"
+
+
+# ── Peer bot classification (the RESOLVED entity, never a heuristic) ─────────
+
+_PEER_BOT_CACHE_MAX = 512
+_peer_bot_cache: dict[int, bool] = {}
+
+
+def is_bot_entity(entity: Any) -> bool:
+    """True ONLY for a resolved Telegram ``User`` entity whose real ``bot``
+    flag is set. A missing, unresolved, or non-User entity returns False —
+    absence of evidence is never evidence either way, so callers keep their
+    existing safe fallback (documented in the capture handlers) instead of
+    guessing a peer's humanity from usernames, names or id patterns.
+    """
+    if entity is None or type(entity).__name__ != "User":
+        return False
+    return getattr(entity, "bot", None) is True
+
+
+def _cache_peer_bot(chat_id: int, value: bool) -> None:
+    while len(_peer_bot_cache) >= _PEER_BOT_CACHE_MAX:
+        _peer_bot_cache.pop(next(iter(_peer_bot_cache)))
+    _peer_bot_cache[chat_id] = value
+
+
+async def peer_bot_status(client: Any, chat_id: Any) -> bool:
+    """The peer's real bot flag for one archive chat id, or ``False`` (UNKNOWN).
+
+    ``True`` requires a RESOLVED bot ``User`` entity; anything else — no client,
+    an unresolvable peer, an unresolved entity — stays False and is treated as
+    unknown (rows are kept, never guessed human). Results are cached per chat id
+    (bounded) so a browse page costs at most one resolution per unique peer over
+    the process lifetime.
+    """
+    if not isinstance(chat_id, int) or isinstance(chat_id, bool) or chat_id <= 0 or client is None:
+        return False
+    if chat_id in _peer_bot_cache:
+        return _peer_bot_cache[chat_id]
+    try:
+        entity = await client.get_entity(int(chat_id))
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.debug("[AED] peer bot resolution failed: %s", type(exc).__name__)
+        return False
+    flagged = is_bot_entity(entity)
+    _cache_peer_bot(chat_id, flagged)
+    return flagged
+
+
+async def filter_bot_items(client: Any, items: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+    """Hide persisted archive items whose peer RESOLVES to a Telegram bot.
+
+    Rows captured before the bot exclusion (or on a cold capture) carry no bot
+    metadata, so the live entity check is the only reliable classification at
+    browse time. Without a client, or when a peer cannot be resolved, the item
+    is KEPT (the existing safe fallback) — the limitation is documented in the
+    capture handlers. Returns ``(filtered_items, number_hidden)``.
+    """
+    if client is None or not items:
+        return list(items), 0
+    result: list[dict[str, Any]] = []
+    hidden = 0
+    for item in items:
+        if await peer_bot_status(client, item.get("chat_id")):
+            hidden += 1
+            continue
+        result.append(item)
+    return result, hidden
 
 
 # ── Content classification ───────────────────────────────────────────────────
@@ -577,6 +665,7 @@ async def record_message(
     kind: str,
     owner: int | None = None,
     identity: dict[str, Any] | None = None,
+    peer_is_bot: Any = None,
 ) -> dict[str, Any] | None:
     """Record a snapshot (new message) or edit version. Returns the row, or None
     when out of scope / disabled / duplicate / not persisted.
@@ -584,6 +673,9 @@ async def record_message(
     ``identity`` is the bounded peer metadata the handler resolved from the
     event's own chat entity (``{"peer_id", "username", "name"}``). It is
     optional: when absent the row is still captured, only without a username.
+
+    ``peer_is_bot`` is the handler's classification from the SAME resolved
+    entity (tri-state; only a confirmed ``True`` blocks inside ``eligible``).
     """
     owner = owner or _owner_id
     await ensure_loaded_async()
@@ -598,6 +690,7 @@ async def record_message(
         chat_id=chat_id,
         is_private=_is_private_chat(msg),
         via_bot_id=getattr(msg, "via_bot_id", None),
+        peer_is_bot=peer_is_bot,
     )
     if not ok:
         return None
@@ -661,12 +754,20 @@ async def record_message(
     return row
 
 
-async def record_deletion(*, event: Any, owner: int | None = None) -> list[dict[str, Any]]:
+async def record_deletion(
+    *,
+    event: Any,
+    owner: int | None = None,
+    peer_is_bot: Any = None,
+) -> list[dict[str, Any]]:
     """Record deletion events honestly.
 
     A deletion row is ``recoverable`` only when the original content was observed
     and stored BEFORE the deletion; otherwise the row records the event with an
     empty body and ``recoverable=False`` (an honest miss — nothing is fabricated).
+
+    ``peer_is_bot`` is the handler's classification from the event's own peer
+    entity when Telegram provides one (tri-state; only ``True`` blocks).
     """
     owner = owner or _owner_id
     await ensure_loaded_async()
@@ -678,6 +779,7 @@ async def record_deletion(*, event: Any, owner: int | None = None) -> list[dict[
         chat_id=chat_id,
         is_private=_is_private_event(event),
         via_bot_id=getattr(event, "via_bot_id", None),
+        peer_is_bot=peer_is_bot,
     )
     if not ok:
         return []

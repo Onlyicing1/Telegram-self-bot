@@ -26,6 +26,7 @@ from backend.services import anti_edit_delete_service as svc
 
 OWNER = 7770001
 FRIEND = 5001
+BOT = 4242
 GROUP = -1001234567890
 
 
@@ -218,13 +219,15 @@ def _deleted_event(*, chat_id=FRIEND, ids=(7,), is_private=True):
 
 class User:
     """Minimal stand-in for ``telethon.tl.types.User`` (the handler keys off the
-    class NAME, exactly as it does for the real type)."""
+    class NAME, exactly as it does for the real type). ``bot`` mirrors the real
+    constructor flag the installed Telethon exposes."""
 
-    def __init__(self, id, username=None, first_name=None, last_name=None):
+    def __init__(self, id, username=None, first_name=None, last_name=None, bot=False):
         self.id = id
         self.username = username
         self.first_name = first_name
         self.last_name = last_name
+        self.bot = bot
 
 
 class _Event:
@@ -930,3 +933,178 @@ def test_grouped_media_detail_keeps_the_metadata_only_indicator(client, enabled)
     _capture(client, _msg(message_id=7, text="", media=media))
     _title, body, _buttons = _panel("archive_item", svc.group_id(FRIEND, 7))
     assert "metadata only" in body
+
+
+# ── 14. bot exclusion (the peer's REAL Telegram User.bot flag) ───────────────
+
+
+def _bot_entity():
+    return User(id=BOT, username="sexyboyvpn_bot", first_name="Sexyboy VPN", last_name="Bot", bot=True)
+
+
+def test_is_bot_entity_requires_a_resolved_bot_user():
+    # A resolved bot User is the ONLY positive classification.
+    assert svc.is_bot_entity(_bot_entity()) is True
+    # A human User (bot=False), missing or non-User entities are NOT classified.
+    assert svc.is_bot_entity(User(id=FRIEND, username="alice")) is False
+    assert svc.is_bot_entity(None) is False
+    assert svc.is_bot_entity("sexyboyvpn_bot") is False
+
+
+def test_scope_gate_rejects_only_a_confirmed_bot_peer():
+    assert svc.eligible(owner=OWNER, chat_id=BOT, is_private=True, peer_is_bot=True) == (
+        False, "peer_is_bot"
+    )
+    # Unknown (None) never blocks — the documented safe fallback.
+    assert svc.eligible(owner=OWNER, chat_id=BOT, is_private=True, peer_is_bot=None) == (
+        True, "eligible"
+    )
+
+
+def test_a_bot_private_message_is_never_snapshotted(client, enabled):
+    # The observed bug: @sexyboyvpn_bot's private message archived with its bot
+    # username shown as the user identity. The resolved entity says bot.
+    event = _Event(_msg(chat_id=BOT, message_id=5, out=False, sender_id=BOT), chat_entity=_bot_entity())
+    _run(client.handler("NewMessage")(event))
+    assert _run(svc.load_rows_async()) == []
+
+
+def test_a_bot_edit_cannot_create_an_archive_record(client, enabled):
+    event = _Event(
+        _msg(chat_id=BOT, message_id=5, text="v2", edit_date=datetime.now(timezone.utc)),
+        chat_entity=_bot_entity(),
+    )
+    _run(client.handler("MessageEdited")(event))
+    assert _run(svc.load_rows_async()) == []
+
+
+def test_a_bot_deletion_is_never_recorded_when_the_peer_resolves(client, enabled):
+    event = _deleted_event(chat_id=BOT, ids=(9,))
+
+    async def _get_chat():
+        return _bot_entity()
+
+    event.get_chat = _get_chat
+    _run(client.handler("MessageDeleted")(event))
+    assert _run(svc.load_rows_async()) == []
+
+
+def test_a_deletion_from_an_unclassifiable_peer_keeps_the_safe_fallback(client, enabled):
+    # A deletion event whose peer cannot be resolved must not invent a human
+    # classification either; the existing chat-id fallback behaviour stands.
+    _run(client.handler("NewMessage")(SimpleNamespace(message=_msg(message_id=9, text="x"))))
+    event = _deleted_event(chat_id=BOT, ids=(9,))  # no get_chat → peer unknown
+    _run(client.handler("MessageDeleted")(event))
+    rows = _run(svc.load_rows_async())
+    assert len(rows) == 2  # snapshot + honest deletion record, unchanged
+
+
+def test_service_rejects_a_confirmed_bot_peer_on_snapshot_and_deletion(client, enabled):
+    assert _run(svc.record_message(
+        msg=_msg(chat_id=BOT, message_id=1), kind=svc.KIND_SNAPSHOT, owner=OWNER, peer_is_bot=True
+    )) is None
+    assert _run(svc.record_deletion(event=_deleted_event(chat_id=BOT, ids=(3,)), owner=OWNER, peer_is_bot=True)) == []
+    assert _run(svc.load_rows_async()) == []
+
+
+def test_a_human_private_message_is_still_archived_next_to_a_bot(client, enabled):
+    _capture(client, _msg(message_id=5, text="human words"), entity=User(id=FRIEND, username="alice"))
+    bot_event = _Event(_msg(chat_id=BOT, message_id=6, out=False, sender_id=BOT), chat_entity=_bot_entity())
+    _run(client.handler("NewMessage")(bot_event))
+    rows = _run(svc.load_rows_async())
+    assert len(rows) == 1
+    assert rows[0]["chat_id"] == FRIEND
+    assert rows[0]["body"] == "human words"
+
+
+def _seed_legacy_rows():
+    now = datetime.now(timezone.utc).isoformat()
+    rows = [
+        {"id": "botrow01", "owner_id": OWNER, "chat_id": BOT, "message_id": 1,
+         "kind": svc.KIND_SNAPSHOT, "category": svc.CATEGORY_TEXT, "has_caption": False,
+         "captured_at": now, "body": "bot advertising", "has_media": False, "recoverable": True},
+        {"id": "humrow02", "owner_id": OWNER, "chat_id": FRIEND, "message_id": 2,
+         "kind": svc.KIND_SNAPSHOT, "category": svc.CATEGORY_TEXT, "has_caption": False,
+         "captured_at": now, "body": "human note", "has_media": False, "recoverable": True},
+    ]
+    return rows
+
+
+def _resolving_peer(entity=None, broken=False):
+    class _PeerResolver:
+        async def get_entity(self, chat_id):
+            if broken:
+                raise RuntimeError("nope")
+            if entity is not None and int(chat_id) == BOT:
+                return entity
+            return User(id=int(chat_id), username="human")
+
+    return _PeerResolver()
+
+
+def test_persisted_bot_records_are_hidden_from_listing_and_detail(client, enabled, monkeypatch):
+    seeded = _seed_legacy_rows()
+    _run(db_client.aed_save_archive(list(svc._SHARD_KEYS), [[seeded[0]], [seeded[1]], [], []]))
+    svc.reset_in_memory()
+    svc.configure_owner(OWNER)
+    _run(svc.set_enabled(True))
+    monkeypatch.setattr("backend.helper.inline_engine.get_self_client",
+                        lambda: _resolving_peer(entity=_bot_entity()))
+
+    _title, body, buttons = _panel("archive_list")
+    rendered = body + " ".join(_texts(buttons))
+    assert "bot advertising" not in rendered
+    assert "human note" in rendered
+    assert "hidden" in body
+
+    _title, body, _buttons = _panel("archive_item", svc.group_id(BOT, 1))
+    assert "no longer in the archive" in body
+
+    # The human item keeps its full grouped behaviour.
+    _title, body, _buttons = _panel("archive_item", svc.group_id(FRIEND, 2))
+    assert "human note" in body
+
+
+def test_no_client_or_unresolvable_peer_keeps_the_existing_fallback(client, enabled):
+    """Without a classification, a persisted row is NEVER hidden nor guessed
+    human-flat out: the existing safe fallback keeps it visible."""
+    seeded = _seed_legacy_rows()
+    _run(db_client.aed_save_archive(list(svc._SHARD_KEYS), [[seeded[0]], [seeded[1]], [], []]))
+    svc.reset_in_memory()
+    svc.configure_owner(OWNER)
+    _run(svc.set_enabled(True))
+
+    # No client at all: nothing can be classified, nothing is hidden.
+    _title, body, buttons = _panel("archive_list")
+    rendered = body + " ".join(_texts(buttons))
+    assert "bot advertising" in rendered and "human note" in rendered
+
+    # A resolution failure is never guessed either: the row stays visible.
+    svc.reset_in_memory()
+    svc.configure_owner(OWNER)
+    _run(svc.set_enabled(True))
+    svc._peer_bot_cache.clear()
+    filtered, hidden = _run(svc.filter_bot_items(_resolving_peer(broken=True),
+                                                 svc.build_items(_run(svc.load_rows_async()))))
+    assert hidden == 0
+    assert len(filtered) == 2
+
+
+def test_peer_bot_status_is_cached_and_bounded(client, enabled, monkeypatch):
+    client_stub = _resolving_peer(entity=_bot_entity())
+    calls = []
+
+    original = client_stub.get_entity
+
+    async def _counting(entity_chat_id):
+        calls.append(int(entity_chat_id))
+        return await original(entity_chat_id)
+
+    client_stub.get_entity = _counting
+    for _ in range(3):
+        assert _run(svc.peer_bot_status(client_stub, BOT)) is True
+    assert len(calls) == 1  # one resolution, cached afterwards
+    monkeypatch.setattr(svc, "_PEER_BOT_CACHE_MAX", 2)
+    for index in range(5):
+        _run(svc.peer_bot_status(client_stub, OWNER + index))
+    assert len(svc._peer_bot_cache) <= 2 + 1  # bounded cache, never grows unbounded
