@@ -162,6 +162,7 @@ def reset_in_memory() -> None:
     """Clear every in-memory cache (tests / process restart)."""
     global _state, _loaded, _load_task, _load_task_loop
     global _rows, _rows_loaded, _lock, _lock_loop, _owner_id
+    global _inflight_loop
     _state = {}
     _loaded = False
     _load_task = None
@@ -173,6 +174,13 @@ def reset_in_memory() -> None:
     _owner_id = 0
     _handled.clear()
     _peer_bot_cache.clear()
+    # In-progress tasks are DROPPED, not awaited: a reset must never block on a
+    # shared lookup, and any live task finishes on its own and is reclaimed by
+    # the next caller / bounded eviction. Dropping the dict removes the stale
+    # references; the loop marker reset invalidates them on the next loop scan.
+    _inflight.clear()
+    _inflight_loop = None
+    _cooldowns.clear()
 
 
 # ── Config ───────────────────────────────────────────────────────────────────
@@ -353,6 +361,20 @@ def eligible(
 _PEER_BOT_CACHE_MAX = 512
 _peer_bot_cache: dict[int, bool] = {}
 
+# Resolution reliability: ONE shared in-flight lookup per peer, plus a bounded
+# temporary cooldown after any failed or rate-limited attempt, so repeated
+# browse/detail renders and concurrent callers can never turn one unresolved
+# peer into an RPC storm. Cooldowns are TIMED (never permanent poison) and are
+# gone on reset; a later success always classifies normally.
+_PEER_FAIL_COOLDOWN_S = 30.0        # transient failure: short, bounded
+_PEER_FLOOD_DEFAULT_S = 60.0        # flood error without a parseable duration
+_PEER_FLOOD_MAX_S = 3600.0          # never silently queue on an absurd wait
+_INFLIGHT_MAX = _PEER_BOT_CACHE_MAX
+_COOLDOWN_MAX = _PEER_BOT_CACHE_MAX
+_inflight: dict[int, Any] = {}      # chat id -> the ONE shared resolution task
+_inflight_loop: Any = None
+_cooldowns: dict[int, float] = {}   # chat id -> monotonic until
+
 
 def is_bot_entity(entity: Any) -> bool:
     """True ONLY for a resolved Telegram ``User`` entity whose real ``bot``
@@ -372,29 +394,128 @@ def _cache_peer_bot(chat_id: int, value: bool) -> None:
     _peer_bot_cache[chat_id] = value
 
 
-async def peer_bot_status(client: Any, chat_id: Any) -> bool:
-    """The peer's real bot flag for one archive chat id, or ``False`` (UNKNOWN).
+def _cooldown_remaining(chat_id: int) -> float:
+    """Remaining cooldown seconds for one peer; expiry is pruned immediately so
+    a cooldown can NEVER become permanently stuck."""
+    until = _cooldowns.get(chat_id)
+    if until is None:
+        return 0.0
+    remaining = until - time.monotonic()
+    if remaining <= 0.0:
+        _cooldowns.pop(chat_id, None)
+        return 0.0
+    return remaining
 
-    ``True`` requires a RESOLVED bot ``User`` entity; anything else — no client,
-    an unresolvable peer, an unresolved entity — stays False and is treated as
-    unknown (rows are kept, never guessed human). Results are cached per chat id
-    (bounded) so a browse page costs at most one resolution per unique peer over
-    the process lifetime.
+
+def _defer_resolution(chat_id: int, seconds: float) -> None:
+    """Set one bounded temporary cooldown. Never a permanent suppression."""
+    if len(_cooldowns) >= _COOLDOWN_MAX:
+        now = time.monotonic()
+        for key in [k for k, until in _cooldowns.items() if now >= until]:
+            _cooldowns.pop(key)
+    while len(_cooldowns) >= _COOLDOWN_MAX:
+        _cooldowns.pop(next(iter(_cooldowns)))
+    _cooldowns[chat_id] = time.monotonic() + max(0.0, float(seconds))
+
+
+def _inflight_registry() -> dict[int, Any]:
+    """The in-progress resolution registry for the CURRENT loop (cleared when
+    the loop changed, so stale task references never survive a loop switch)."""
+    global _inflight_loop
+    loop = _running_loop()
+    if _inflight_loop is not loop:
+        _inflight.clear()
+        _inflight_loop = loop
+    return _inflight
+
+
+async def _resolve_peer_bot(client: Any, chat_id: int) -> bool:
+    """The ONE per-peer resolution body, run as a SHARED in-flight task.
+
+    Rate limiting is the ONLY path that logs a warning, because all concurrent
+    callers share this single attempt; every failure inside it sets a bounded
+    cooldown for exactly THIS peer — never a retry loop and never a global
+    suppression.
     """
-    if not isinstance(chat_id, int) or isinstance(chat_id, bool) or chat_id <= 0 or client is None:
-        return False
-    if chat_id in _peer_bot_cache:
-        return _peer_bot_cache[chat_id]
+    try:
+        from telethon.errors import FloodError
+    except Exception:  # classification must not depend on an import success
+        FloodError = None
     try:
         entity = await client.get_entity(int(chat_id))
     except asyncio.CancelledError:
         raise
     except Exception as exc:
-        logger.debug("[AED] peer bot resolution failed: %s", type(exc).__name__)
+        if FloodError is not None and isinstance(exc, FloodError):
+            seconds = getattr(exc, "seconds", None)
+            if not isinstance(seconds, int) or isinstance(seconds, bool) or seconds <= 0:
+                seconds = _PEER_FLOOD_DEFAULT_S
+            defer = min(seconds, _PEER_FLOOD_MAX_S)
+            if seconds > _PEER_FLOOD_MAX_S:
+                logger.warning(
+                    "[AED] Telegram flood wait %ss exceeds the %ss deadline — "
+                    "peer %s resolution deferred until then (no early retry)",
+                    seconds, _PEER_FLOOD_MAX_S, chat_id,
+                )
+            else:
+                logger.warning(
+                    "[AED] Telegram flood wait %ss — peer %s resolution deferred "
+                    "(ONE shared rate-limited attempt, no retry storm)", defer, chat_id,
+                )
+            _defer_resolution(chat_id, defer)
+            return False
+        logger.debug("[AED] peer bot resolution failed for %s: %s", chat_id, type(exc).__name__)
+        _defer_resolution(chat_id, _PEER_FAIL_COOLDOWN_S)
         return False
     flagged = is_bot_entity(entity)
     _cache_peer_bot(chat_id, flagged)
+    if flagged:
+        logger.info("[AED] peer %s resolved as a Telegram BOT — excluded from the archive", chat_id)
+    else:
+        logger.info("[AED] peer %s resolved as a human user", chat_id)
     return flagged
+
+
+async def peer_bot_status(client: Any, chat_id: Any) -> bool:
+    """The peer's real bot flag for one archive chat id, or ``False`` (UNKNOWN).
+
+    ``True`` requires a RESOLVED bot ``User`` entity; anything else — no client,
+    an unresolvable peer, an unresolved entity, a deferred (rate-limited)
+    resolution — stays False and is treated as UNKNOWN (rows are kept, never
+    guessed human). Successful results are cached per chat id (bounded).
+
+    Reliability (no retry loop, no request storm):
+      * ONE shared in-flight task per peer: concurrent and successive callers
+        join the same attempt instead of spawning identical lookups; completed
+        tasks are reclaimed so no stale reference survives.
+      * A FAILED or flood-limited attempt sets a BOUNDED cooldown for that peer
+        only; while it is active no RPC is issued, after it expires the peer is
+        retried and classified normally (cooldowns are never permanent poison).
+    """
+    if not isinstance(chat_id, int) or isinstance(chat_id, bool) or chat_id <= 0 or client is None:
+        return False
+    chat_id = int(chat_id)
+    if chat_id in _peer_bot_cache:
+        return _peer_bot_cache[chat_id]
+    if _cooldown_remaining(chat_id) > 0.0:
+        return False
+    registry = _inflight_registry()
+    task = registry.get(chat_id)
+    if task is None or task.done():
+        if len(registry) >= _INFLIGHT_MAX:
+            for key in [k for k, value in registry.items() if value.done()]:
+                registry.pop(key)
+        while len(registry) >= _INFLIGHT_MAX:
+            registry.pop(next(iter(registry)))
+        task = asyncio.ensure_future(_resolve_peer_bot(client, chat_id))
+        registry[chat_id] = task
+    try:
+        return await asyncio.shield(task)
+    finally:
+        # A cancelled joiner must NOT reclaim a task other callers still share;
+        # only a COMPLETED task is popped, so no stale reference survives.
+        if task.done() and registry.get(chat_id) is task:
+            registry.pop(chat_id, None)
 
 
 async def filter_bot_items(client: Any, items: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
@@ -402,9 +523,10 @@ async def filter_bot_items(client: Any, items: list[dict[str, Any]]) -> tuple[li
 
     Rows captured before the bot exclusion (or on a cold capture) carry no bot
     metadata, so the live entity check is the only reliable classification at
-    browse time. Without a client, or when a peer cannot be resolved, the item
-    is KEPT (the existing safe fallback) — the limitation is documented in the
-    capture handlers. Returns ``(filtered_items, number_hidden)``.
+    browse time. Without a client, or while a peer's classification is unknown
+    (including a bounded rate-limit cooldown), the item is KEPT (the existing
+    safe fallback) — the limitation is documented in the capture handlers.
+    Returns ``(filtered_items, number_hidden)``.
     """
     if client is None or not items:
         return list(items), 0

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -1108,3 +1109,154 @@ def test_peer_bot_status_is_cached_and_bounded(client, enabled, monkeypatch):
     for index in range(5):
         _run(svc.peer_bot_status(client_stub, OWNER + index))
     assert len(svc._peer_bot_cache) <= 2 + 1  # bounded cache, never grows unbounded
+
+
+# ── 15. resolution reliability (single-flight + FloodWait cooldown) ─────────
+
+
+class _StubResolver:
+    """A get_entity stand-in that records every call."""
+
+    def __init__(self, entity=None, raises=None, delay=0.0):
+        self.calls = []
+        self._entity = entity
+        self._raises = raises
+        self._delay = delay
+
+    async def get_entity(self, chat_id):
+        self.calls.append(int(chat_id))
+        if self._delay:
+            await asyncio.sleep(self._delay)
+        if self._raises is not None:
+            raise self._raises
+        if self._entity is not None and int(chat_id) == int(self._entity.id):
+            return self._entity
+        return User(id=int(chat_id), username="human")
+
+
+def _flood(seconds=69):
+    # The REAL Telethon error type, carrying the server-provided duration.
+    from telethon.errors import FloodWaitError
+
+    return FloodWaitError(request=None, capture=seconds)
+
+
+def test_concurrent_same_peer_share_one_resolution(client, enabled):
+    resolver = _StubResolver(entity=_bot_entity(), delay=0.05)
+
+    async def _five():
+        return await asyncio.gather(
+            *[svc.peer_bot_status(resolver, BOT) for _ in range(5)]
+        )
+
+    assert _run(_five()) == [True] * 5
+    assert resolver.calls == [BOT]           # ONE in-flight resolution, joined
+    assert svc._peer_bot_cache.get(BOT) is True
+    assert svc._inflight.get(BOT) is None    # completed task reclaimed
+
+
+def test_flood_wait_defers_without_immediate_retry(client, enabled):
+    resolver = _StubResolver(raises=_flood(69))
+    assert _run(svc.peer_bot_status(resolver, BOT)) is False   # unknown, NOT bot
+    assert resolver.calls == [BOT]
+
+    followup = _StubResolver(entity=_bot_entity())
+    for _ in range(4):
+        assert _run(svc.peer_bot_status(followup, BOT)) is False
+    assert followup.calls == []              # NO retry while Telegram requires the wait
+    assert 0 < svc._cooldown_remaining(BOT) <= 69   # bounded, timed, from the error
+
+
+def test_flood_wait_larger_than_the_deadline_is_capped_and_deferred(client, enabled):
+    resolver = _StubResolver(raises=_flood(99999))
+    assert _run(svc.peer_bot_status(resolver, BOT)) is False
+    assert 0 < svc._cooldown_remaining(BOT) <= svc._PEER_FLOOD_MAX_S
+
+
+def test_transient_failure_bounded_cooldown_prevents_request_storms(client, enabled):
+    resolver = _StubResolver(raises=RuntimeError("peer gone"))
+    for _ in range(6):
+        assert _run(svc.peer_bot_status(resolver, BOT)) is False
+    assert resolver.calls == [BOT]           # one attempt, then cooldown
+
+
+def test_failed_resolution_is_never_permanent_poison(client, enabled):
+    resolver = _StubResolver(raises=RuntimeError("peer gone"))
+    assert _run(svc.peer_bot_status(resolver, BOT)) is False
+    assert svc._cooldown_remaining(BOT) > 0.0
+    svc._cooldowns.pop(BOT)                  # the cooldown EXPIRES (no real sleeping)
+    good = _StubResolver(entity=_bot_entity())
+    assert _run(svc.peer_bot_status(good, BOT)) is True
+    assert good.calls == [BOT]               # retry after expiry, normal classification
+
+
+def test_cooldown_expiry_retries_and_classifies_normally(client, enabled):
+    resolver = _StubResolver(raises=_flood(69))
+    _run(svc.peer_bot_status(resolver, BOT))
+    svc._cooldowns[BOT] = time.monotonic() - 1     # expiry, deterministically
+    good = _StubResolver(entity=_bot_entity())
+    assert _run(svc.peer_bot_status(good, BOT)) is True
+
+
+def test_later_successful_resolution_hides_persisted_bot_rows(client, enabled):
+    _run(db_client.aed_save_archive(
+        list(svc._SHARD_KEYS),
+        [[_seed_legacy_rows()[0]], [_seed_legacy_rows()[1]], [], []],
+    ))
+    svc.reset_in_memory()
+    svc.configure_owner(OWNER)
+    _run(svc.set_enabled(True))
+    broken = _StubResolver(raises=RuntimeError("boom"))
+    items = svc.build_items(_run(svc.load_rows_async()))
+    _filtered, hidden = _run(svc.filter_bot_items(broken, items))
+    assert hidden == 0                       # unknown keeps rows, no guessing
+    for key in list(svc._cooldowns):
+        svc._cooldowns[key] = time.monotonic() - 1   # after the cooldown expires
+    bot_resolver = _StubResolver(entity=_bot_entity())
+    _filtered, hidden = _run(svc.filter_bot_items(bot_resolver, items))
+    assert hidden == 1                       # the resolved bot row is now hidden
+    assert svc._peer_bot_cache.get(BOT) is True
+    assert svc._peer_bot_cache.get(FRIEND) is False
+
+
+def test_a_cancelled_caller_leaves_the_shared_resolution_alive(client, enabled):
+    resolver = _StubResolver(entity=_bot_entity(), delay=0.05)
+
+    async def _scenario():
+        owner = asyncio.ensure_future(svc.peer_bot_status(resolver, BOT))
+        joiner = asyncio.ensure_future(svc.peer_bot_status(resolver, BOT))
+        await asyncio.sleep(0.01)
+        assert svc._inflight.get(BOT) is not None     # one shared task
+        owner.cancel()
+        try:
+            await owner
+        except asyncio.CancelledError:
+            pass
+        assert await joiner is True                   # the shared task survived
+        assert resolver.calls == [BOT]
+
+    _run(_scenario())
+    assert svc._inflight == {}                        # nothing stale survives
+
+
+def test_reset_and_bounds_behaviour_remains(client, enabled, monkeypatch):
+    resolver = _StubResolver(raises=_flood(5))
+    _run(svc.peer_bot_status(resolver, FRIEND))
+    assert svc._cooldowns and svc._peer_bot_cache == {}
+    monkeypatch.setattr(svc, "_COOLDOWN_MAX", 8)
+    for index in range(12):
+        svc._defer_resolution(OWNER + index, svc._PEER_FAIL_COOLDOWN_S)
+    assert len(svc._cooldowns) <= 8                   # bounded cooldown map
+    svc.reset_in_memory()
+    assert svc._cooldowns == {}                      # no permanent suppression
+    assert svc._peer_bot_cache == {}
+    assert svc._inflight == {}                       # no stale task references
+
+
+def test_unknown_stays_unknown_during_deferral(client, enabled):
+    resolver = _StubResolver(raises=_flood(5))
+    assert _run(svc.peer_bot_status(resolver, BOT)) is False
+    assert svc.is_bot_entity(None) is False
+    assert svc.is_bot_entity(User(id=BOT, username="sexyboyvpn_bot")) is False  # bot flag absent
+    assert svc.is_bot_entity(User(id=BOT, username="sexyboyvpn_bot", bot=False)) is False
+    assert svc.is_bot_entity(User(id=BOT, username="sexyboyvpn_bot", bot=True)) is True
