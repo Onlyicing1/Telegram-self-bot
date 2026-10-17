@@ -216,6 +216,34 @@ def _deleted_event(*, chat_id=FRIEND, ids=(7,), is_private=True):
     )
 
 
+class User:
+    """Minimal stand-in for ``telethon.tl.types.User`` (the handler keys off the
+    class NAME, exactly as it does for the real type)."""
+
+    def __init__(self, id, username=None, first_name=None, last_name=None):
+        self.id = id
+        self.username = username
+        self.first_name = first_name
+        self.last_name = last_name
+
+
+class _Event:
+    """A capture event that can resolve its own chat entity."""
+
+    def __init__(self, message, chat_entity=None, is_private=True, chat_error=None):
+        self.message = message
+        self.is_private = is_private
+        self.chat_id = getattr(message, "chat_id", None)
+        self.sender_id = getattr(message, "sender_id", None)
+        self._chat_entity = chat_entity
+        self._chat_error = chat_error
+
+    async def get_chat(self):
+        if self._chat_error is not None:
+            raise self._chat_error
+        return self._chat_entity
+
+
 def _run(coro):
     return asyncio.new_event_loop().run_until_complete(coro)
 
@@ -611,3 +639,294 @@ def test_retention_input_validates_and_persists(client, db, monkeypatch):
     assert svc.retention_days() == 14
     _run(config["handler"]("not-a-number", FRIEND, 1, FRIEND, 2))
     assert svc.retention_days() == 14
+
+
+# ── 12. logical-message grouping (Requirement 1) ─────────────────────────────
+
+
+def _capture(client, message, *, entity=None, kind="NewMessage"):
+    event = _Event(message, chat_entity=entity)
+    _run(client.handler(kind)(event))
+
+
+def _edit(client, message, *, entity=None):
+    _run(client.handler("MessageEdited")(_Event(message, chat_entity=entity)))
+
+
+def _list_buttons(client):
+    _title, _body, buttons = _panel("archive_list")
+    return _datas(buttons)
+
+
+def test_a_snapshot_and_its_edit_render_as_one_list_button(client, enabled):
+    _capture(client, _msg(message_id=7, text="v1"))
+    _edit(client, _msg(message_id=7, text="v2", edit_date=datetime.now(timezone.utc)))
+    # Two rows are stored (history preserved) but ONE browse item exists.
+    assert len(_run(svc.load_rows_async())) == 2
+    item_buttons = [d for d in _list_buttons(client) if d.startswith("panel:archive_item:")]
+    assert len(item_buttons) == 1
+    assert item_buttons[0] == f"panel:archive_item:{svc.group_id(FRIEND, 7)}"
+
+
+def test_multiple_edits_still_render_as_one_button_with_all_versions(client, enabled):
+    _capture(client, _msg(message_id=7, text="v1"))
+    for index in range(2, 5):
+        _edit(client, _msg(message_id=7, text=f"v{index}",
+                           edit_date=datetime.now(timezone.utc)))
+    items = svc.build_items(_run(svc.load_rows_async()))
+    assert len(items) == 1
+    assert items[0]["version_count"] == 4
+    item_buttons = [d for d in _list_buttons(client) if d.startswith("panel:archive_item:")]
+    assert len(item_buttons) == 1
+    assert "4 versions" in " ".join(_texts(_panel("archive_list")[2]))
+
+
+def test_different_messages_with_identical_content_stay_separate(client, enabled):
+    _capture(client, _msg(message_id=1, text="same"))
+    _capture(client, _msg(message_id=2, text="same"))
+    items = svc.build_items(_run(svc.load_rows_async()))
+    assert len(items) == 2
+    assert {i["message_id"] for i in items} == {1, 2}
+
+
+def test_identical_message_ids_in_different_chats_are_not_grouped(client, enabled):
+    _capture(client, _msg(chat_id=FRIEND, message_id=7, text="a"))
+    _capture(client, _msg(chat_id=FRIEND + 1, message_id=7, text="b"))
+    items = svc.build_items(_run(svc.load_rows_async()))
+    assert len(items) == 2
+    assert {(i["chat_id"], i["message_id"]) for i in items} == {(FRIEND, 7), (FRIEND + 1, 7)}
+
+
+def test_grouped_detail_shows_version_count_and_history(client, enabled):
+    _capture(client, _msg(message_id=7, text="original text"))
+    _edit(client, _msg(message_id=7, text="edited text", edit_date=datetime.now(timezone.utc)))
+    _title, body, _buttons = _panel("archive_item", svc.group_id(FRIEND, 7))
+    assert "2 observed version(s)" in body
+    assert "original text" in body
+    assert "edited text" in body
+    assert "v1 (original)" in body and "v2 (edit)" in body
+
+
+def test_grouped_detail_uses_the_latest_content_as_the_list_label(client, enabled):
+    _capture(client, _msg(message_id=7, text="old"))
+    _edit(client, _msg(message_id=7, text="newest", edit_date=datetime.now(timezone.utc)))
+    labels = " ".join(_texts(_panel("archive_list")[2]))
+    assert "newest" in labels
+    assert "old" not in labels
+
+
+def test_pagination_counts_grouped_items_not_raw_versions(client, enabled):
+    # PAGE_SIZE distinct messages, each with an extra edit → 2 rows apiece.
+    for index in range(svc.PAGE_SIZE):
+        _capture(client, _msg(message_id=100 + index, text=f"m{index}"))
+        _edit(client, _msg(message_id=100 + index, text=f"m{index}!",
+                           edit_date=datetime.now(timezone.utc)))
+    rows = _run(svc.load_rows_async())
+    assert len(rows) == svc.PAGE_SIZE * 2
+    items = svc.build_items(rows)
+    first, page, pages = svc.page_of(items, 1)
+    assert pages == 1 and page == 1
+    assert len(first) == svc.PAGE_SIZE
+
+
+def test_category_filtering_is_correct_for_grouped_items(client, enabled):
+    media = MessageMediaPhoto()
+    _capture(client, _msg(message_id=1, text="plain text"))
+    _capture(client, _msg(message_id=2, text="a caption", media=media))
+    _edit(client, _msg(message_id=2, text="a caption edited", media=media,
+                       edit_date=datetime.now(timezone.utc)))
+    items = svc.build_items(_run(svc.load_rows_async()))
+    text_items = svc.filter_items(items, category=svc.CATEGORY_TEXT)
+    photo_items = svc.filter_items(items, category=svc.CATEGORY_PHOTOS)
+    assert [i["message_id"] for i in text_items] == [1]
+    assert [i["message_id"] for i in photo_items] == [2]
+
+
+def test_a_deletion_event_remains_independently_visible_and_recoverable(client, enabled):
+    _capture(client, _msg(message_id=9, text="secret"))
+    _edit(client, _msg(message_id=9, text="secret v2", edit_date=datetime.now(timezone.utc)))
+    _run(client.handler("MessageDeleted")(_deleted_event(ids=(9,))))
+    items = svc.build_items(_run(svc.load_rows_async()))
+    # ONE grouped content item + ONE independent deletion event = 2 items.
+    assert len(items) == 2
+    grouped = next(i for i in items if i["kind"] == svc.KIND_MESSAGE)
+    deletion = next(i for i in items if i["kind"] == svc.KIND_DELETE)
+    assert grouped["version_count"] == 2
+    assert grouped["has_deletion"] is True
+    assert deletion["recoverable"] is True
+    item_buttons = [d for d in _list_buttons(client) if d.startswith("panel:archive_item:")]
+    assert len(item_buttons) == 2
+    # The deletion keeps its own recoverability display.
+    _t, dbody, _b = _panel("archive_item", deletion["id"])
+    assert "Recoverable" in dbody
+
+
+def test_group_delete_removes_the_whole_history_without_orphans(client, enabled):
+    _capture(client, _msg(message_id=7, text="v1"))
+    _edit(client, _msg(message_id=7, text="v2", edit_date=datetime.now(timezone.utc)))
+    removed = _run(svc.delete_group(FRIEND, 7))
+    assert removed == 2
+    assert _run(svc.load_rows_async()) == []
+
+
+def test_group_delete_leaves_a_deletion_event_in_place(client, enabled):
+    _capture(client, _msg(message_id=9, text="x"))
+    _edit(client, _msg(message_id=9, text="y", edit_date=datetime.now(timezone.utc)))
+    _run(client.handler("MessageDeleted")(_deleted_event(ids=(9,))))
+    assert _run(svc.delete_group(FRIEND, 9)) == 2
+    remaining = _run(svc.load_rows_async())
+    assert [r["kind"] for r in remaining] == [svc.KIND_DELETE]
+    assert remaining[0]["recoverable"] is True
+
+
+def test_group_delete_action_drives_the_service(client, enabled):
+    _capture(client, _msg(message_id=7, text="v1"))
+    _edit(client, _msg(message_id=7, text="v2", edit_date=datetime.now(timezone.utc)))
+    _action("aed_delete_group", f"{FRIEND}:7")
+    assert _run(svc.load_rows_async()) == []
+
+
+def test_group_delete_action_rejects_malformed_input(client, enabled):
+    _capture(client, _msg(message_id=7, text="keep"))
+    _action("aed_delete_group", "not-an-id")
+    assert len(_run(svc.load_rows_async())) == 1
+
+
+def test_no_duplicate_deletion_buttons_after_grouping(client, enabled):
+    _capture(client, _msg(message_id=9, text="x"))
+    _run(client.handler("MessageDeleted")(_deleted_event(ids=(9,))))
+    # A redelivered deletion event must not create a second deletion button.
+    _run(client.handler("MessageDeleted")(_deleted_event(ids=(9,))))
+    items = svc.build_items(_run(svc.load_rows_async()))
+    assert sum(1 for i in items if i["kind"] == svc.KIND_DELETE) == 1
+
+
+# ── 13. peer identity (Requirement 2) ────────────────────────────────────────
+
+
+def test_outgoing_message_peer_is_the_other_user_not_the_owner(client, enabled):
+    entity = User(id=FRIEND, username="alice", first_name="Alice", last_name="Smith")
+    _capture(client, _msg(message_id=7, out=True, sender_id=OWNER), entity=entity)
+    row = _run(svc.load_rows_async())[0]
+    assert row["sender_id"] == OWNER          # the author IS the owner
+    assert row["peer_id"] == FRIEND           # the PEER is the other user
+    assert row["peer_username"] == "alice"
+    assert row["peer_name"] == "Alice Smith"
+
+
+def test_incoming_message_peer_is_the_sender(client, enabled):
+    entity = User(id=FRIEND, username="bob", first_name="Bob")
+    _capture(client, _msg(message_id=7, out=False, sender_id=FRIEND), entity=entity)
+    row = _run(svc.load_rows_async())[0]
+    assert row["peer_id"] == FRIEND
+    assert row["peer_username"] == "bob"
+
+
+def test_detail_view_shows_username_and_numeric_user_id(client, enabled):
+    entity = User(id=FRIEND, username="alice", first_name="Alice")
+    _capture(client, _msg(message_id=7, text="hi"), entity=entity)
+    _title, body, _buttons = _panel("archive_item", svc.group_id(FRIEND, 7))
+    assert f"@alice" in body
+    assert f"User ID: {FRIEND}" in body
+    # The technical identifiers are retained for troubleshooting.
+    assert f"Chat ID: {FRIEND}" in body
+    assert "Message ID: 7" in body
+
+
+def test_identity_falls_back_to_the_numeric_id_without_a_username(client, enabled):
+    entity = User(id=FRIEND, username=None, first_name=None, last_name=None)
+    _capture(client, _msg(message_id=7, text="hi"), entity=entity)
+    _title, body, _buttons = _panel("archive_item", svc.group_id(FRIEND, 7))
+    assert f"User ID: {FRIEND}" in body
+    assert "@" not in body.split("User ID:")[0].split("User:")[-1]
+
+
+def test_capture_survives_an_entity_resolution_failure(client, enabled):
+    event = _Event(_msg(message_id=7, text="still captured"), chat_error=RuntimeError("boom"))
+    _run(client.handler("NewMessage")(event))
+    row = _run(svc.load_rows_async())[0]
+    assert row["body"] == "still captured"
+    assert row["peer_id"] == FRIEND
+    assert row["peer_username"] is None
+
+
+def test_legacy_rows_without_identity_render_safely(client, enabled):
+    # Simulate a row captured before the identity fields existed.
+    legacy = {
+        "id": "legacy01", "owner_id": OWNER, "chat_id": FRIEND, "message_id": 7,
+        "kind": svc.KIND_SNAPSHOT, "category": svc.CATEGORY_TEXT, "has_caption": False,
+        "captured_at": datetime.now(timezone.utc).isoformat(),
+        "body": "old row", "has_media": False, "recoverable": True,
+    }
+    _run(db_client.aed_save_archive(list(svc._SHARD_KEYS), [[legacy], [], [], []]))
+    svc.reset_in_memory()
+    svc.configure_owner(OWNER)
+    _run(svc.set_enabled(True))
+    items = svc.build_items(_run(svc.load_rows_async()))
+    assert items[0]["identity"]["peer_id"] == FRIEND   # falls back to chat_id
+    assert items[0]["identity"]["username"] is None
+    _title, body, _buttons = _panel("archive_item", svc.group_id(FRIEND, 7))
+    assert f"User ID: {FRIEND}" in body
+
+
+def test_identity_and_version_history_survive_a_persisted_reload(client, enabled):
+    entity = User(id=FRIEND, username="alice", first_name="Alice")
+    _capture(client, _msg(message_id=7, text="v1"), entity=entity)
+    _edit(client, _msg(message_id=7, text="v2", edit_date=datetime.now(timezone.utc)), entity=entity)
+    svc.reset_in_memory()
+    svc.configure_owner(OWNER)
+    _run(svc.ensure_loaded_async())
+    items = svc.build_items(_run(svc.load_rows_async()))
+    assert len(items) == 1
+    assert items[0]["version_count"] == 2
+    assert items[0]["identity"]["username"] == "alice"
+    assert items[0]["identity"]["peer_id"] == FRIEND
+
+
+def test_identity_is_not_read_off_a_non_user_entity(client, enabled):
+    class Chat:
+        def __init__(self):
+            self.id = FRIEND
+            self.title = "Not A User"
+
+    _capture(client, _msg(message_id=7, text="hi"), entity=Chat())
+    row = _run(svc.load_rows_async())[0]
+    assert row["peer_id"] == FRIEND
+    assert row["peer_username"] is None
+
+
+def test_owner_isolation_is_preserved_across_grouping(client, enabled):
+    _capture(client, _msg(message_id=7, text="mine"))
+    # Inject a row belonging to a DIFFERENT owner into the same store.
+    other = {
+        "id": "other01", "owner_id": OWNER + 1, "chat_id": FRIEND, "message_id": 8,
+        "kind": svc.KIND_SNAPSHOT, "category": svc.CATEGORY_TEXT,
+        "captured_at": datetime.now(timezone.utc).isoformat(), "body": "not mine",
+    }
+    stored = _run(svc.load_rows_async())
+    shards = [[r for r in stored] + [other], [], [], []]
+    _run(db_client.aed_save_archive(list(svc._SHARD_KEYS), shards))
+    svc.reset_in_memory()
+    svc.configure_owner(OWNER)
+    _run(svc.set_enabled(True))
+    items = svc.build_items(_run(svc.load_rows_async()))
+    assert len(items) == 1
+    assert items[0]["version_count"] == 1
+    assert items[0]["message_id"] == 7
+    assert "not mine" not in (items[0]["body"] or "")
+
+
+def test_media_only_message_uses_an_honest_fallback_label(client, enabled):
+    media = MessageMediaPhoto()
+    _capture(client, _msg(message_id=7, text="", media=media))
+    item = svc.build_items(_run(svc.load_rows_async()))[0]
+    assert item["body"].startswith("(Photo")
+    assert item["media_name"] is None
+
+
+def test_grouped_media_detail_keeps_the_metadata_only_indicator(client, enabled):
+    doc = _document([DocumentAttributeFilename("report.pdf")], size=999)
+    media = MessageMediaDocument(doc)
+    _capture(client, _msg(message_id=7, text="", media=media))
+    _title, body, _buttons = _panel("archive_item", svc.group_id(FRIEND, 7))
+    assert "metadata only" in body

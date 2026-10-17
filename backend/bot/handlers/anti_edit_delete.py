@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import Any
 
 from telethon import events
 
@@ -80,10 +81,42 @@ def _category_glyph(category: str) -> str:
 
 def _kind_glyph(kind: str) -> str:
     return {
+        service.KIND_MESSAGE: sym.OP_SAVE,
         service.KIND_SNAPSHOT: sym.OP_SAVE,
         service.KIND_EDIT: sym.OP_EDIT,
         service.KIND_DELETE: sym.STATE_DELETED,
     }.get(kind, sym.STATE_DELETED)
+
+
+async def _resolve_peer_identity(event, chat_id: Any) -> dict | None:
+    """The OTHER participant's bounded identity, from the event's own chat entity.
+
+    In a private chat the chat entity IS the peer, so this never confuses the
+    message author with the conversation peer (an outgoing message's ``sender_id``
+    is the OWNER, while the peer is the positive ``chat_id``). The entity is read
+    from Telethon's own in-memory cache — ``get_chat()`` only performs an RPC when
+    the entity is missing from the session cache, and any failure degrades to the
+    numeric peer id rather than blocking capture. Never raises.
+    """
+    if not isinstance(chat_id, int) or isinstance(chat_id, bool) or chat_id <= 0:
+        return None
+    identity: dict = {"peer_id": chat_id, "username": None, "name": None}
+    try:
+        entity = await event.get_chat()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.debug("[AED] peer entity unresolved: %s", type(exc).__name__)
+        return identity
+    if entity is None:
+        return identity
+    # A private chat's entity is a User; never read a username off a non-user.
+    if type(entity).__name__ == "User":
+        identity["username"] = getattr(entity, "username", None)
+        first = getattr(entity, "first_name", None) or ""
+        last = getattr(entity, "last_name", None) or ""
+        identity["name"] = f"{first} {last}".strip() or None
+    return identity
 
 
 def _truncate(value: str, limit: int = _BODY_PREVIEW) -> str:
@@ -167,19 +200,17 @@ async def _render_list(owner_id: int, extra: str) -> tuple[str, str, list]:
     rows = await service.load_rows_async()
     if rows is None:
         return "Archive", f"{sym.STATE_WARNING} The archive store could not be read.", []
-    filtered = service.filter_rows(rows, category=category, query=query)
-    items, page, pages = service.page_of(filtered, page)
+    items = service.build_items(rows)
+    filtered = service.filter_items(items, category=category, query=query)
+    page_items, page, pages = service.page_of(filtered, page)
     builder = InlinePanelBuilder()
-    if not items:
+    if not page_items:
         builder.add_row(sym.label(sym.OP_CREATE, "Nothing archived yet"), "action:aed_noop", PRIMARY)
-    for row in items:
-        label = (
-            f"{_kind_glyph(row.get('kind'))} {_category_glyph(row.get('category'))} "
-            f"{_truncate(row.get('body') or row.get('media_name') or '(no content)')}"
-        )
+    for item in page_items:
+        label = _item_label(item)
         builder.add_row(
             label,
-            f"panel:{ITEM_ID}:{row.get('id')}",
+            f"panel:{ITEM_ID}:{item.get('id')}",
             PRIMARY,
         )
     if pages > 1:
@@ -191,52 +222,102 @@ async def _render_list(owner_id: int, extra: str) -> tuple[str, str, list]:
     active = category or "all"
     body = (
         f"{sym.ICON_STATS} {len(filtered)} item(s) · filter: {active} · page {page}/{pages}\n\n"
-        "Select an item to view or delete it."
+        "Each message is ONE item; select it to view its versions or delete it."
     )
     return "Archive", body, builder.build()
 
 
+def _item_label(item: dict) -> str:
+    """One bounded list button. Grouped messages show their version count so the
+    owner can see history is preserved; a deletion event is marked as such."""
+    kind = item.get("kind")
+    preview = _truncate(item.get("body") or item.get("media_name") or "(no content)")
+    if kind == service.KIND_DELETE:
+        state = "recoverable" if item.get("recoverable") else "not recoverable"
+        return f"{_kind_glyph(kind)} {_category_glyph(item.get('category'))} Deleted · {state} · {preview}"
+    count = int(item.get("version_count") or 1)
+    history = f" · {count} versions" if count > 1 else ""
+    deleted = " · deleted" if item.get("has_deletion") else ""
+    return f"{_kind_glyph(kind)} {_category_glyph(item.get('category'))}{history}{deleted} {preview}"
+
+
+def _identity_line(identity: Any) -> str:
+    identity = identity if isinstance(identity, dict) else {}
+    parts = []
+    if identity.get("username"):
+        parts.append(f"@{identity['username']}")
+    if identity.get("name"):
+        parts.append(identity["name"])
+    peer = identity.get("peer_id")
+    parts.append(f"User ID: {peer if peer is not None else 'unknown'}")
+    return f"{sym.META_SENDER} User: " + " · ".join(parts)
+
+
 async def _render_item(owner_id: int, extra: str) -> tuple[str, str, list]:
-    archive_id = (extra or "").strip()
+    browse_id = (extra or "").strip()
     rows = await service.load_rows_async()
     if rows is None:
         return "Archive Item", f"{sym.STATE_WARNING} The archive store could not be read.", []
-    row = service.get_row(rows, archive_id)
-    if row is None:
+    item = service.get_item(service.build_items(rows), browse_id)
+    if item is None:
         return "Archive Item", f"{sym.STATE_WARNING} That item is no longer in the archive.", []
-    versions = service.versions_for(rows, row.get("chat_id"), row.get("message_id"))
-    kind = row.get("kind")
+    return _render_item_body(item)
+
+
+def _render_item_body(item: dict) -> tuple[str, str, list]:
+    kind = item.get("kind")
+    is_delete = kind == service.KIND_DELETE
     body = [
-        f"{_kind_glyph(kind)} Kind: {kind}",
-        f"{_category_glyph(row.get('category'))} Category: {row.get('category')}",
-        f"{sym.OP_CHAT} Chat: {row.get('chat_id')} · Message: {row.get('message_id')}",
-        f"{sym.META_TIME} Captured: {row.get('captured_at')}",
+        f"{_kind_glyph(kind)} Kind: {'deleted' if is_delete else 'message'}",
+        f"{_category_glyph(item.get('category'))} Category: {item.get('category')}",
+        f"{sym.OP_CHAT} Chat ID: {item.get('chat_id')} · Message ID: {item.get('message_id')}",
+        _identity_line(item.get("identity")),
+        f"{sym.META_TIME} Captured: {item.get('captured_at')}",
     ]
-    if row.get("edited_at"):
-        body.append(f"{sym.OP_EDIT} Edited: {row.get('edited_at')}")
-    if row.get("has_media"):
-        body.append(
-            f"{sym.META_MEDIA} Media: {row.get('media_type') or 'unknown'}"
-            + (f" · {row.get('media_name')}" if row.get("media_name") else "")
-            + ("" if row.get("media_stored") else " (metadata only)")
-        )
-    if kind == service.KIND_DELETE:
-        if row.get("recoverable"):
+    versions = item.get("versions") or []
+    if not is_delete and item.get("has_deletion"):
+        body.append(f"{sym.STATE_DELETED} This message was also observed as deleted.")
+    if is_delete:
+        if item.get("recoverable"):
             body.append(f"{sym.STATE_COMPLETED} Recoverable from a pre-deletion snapshot.")
         else:
             body.append(f"{sym.STATE_WARNING} Content was never captured — not recoverable.")
-    if row.get("body"):
+    if item.get("has_media"):
+        body.append(
+            f"{sym.META_MEDIA} Media: {item.get('media_type') or 'unknown'}"
+            + (f" · {item.get('media_name')}" if item.get("media_name") else "")
+            + ("" if item.get("media_stored") else " (metadata only)")
+        )
+    if is_delete:
+        if item.get("body"):
+            body.append("")
+            body.append(_truncate(item.get("body"), 600))
+    else:
         body.append("")
-        body.append(_truncate(row.get("body"), 600))
-    body.append("")
-    body.append(f"{sym.ICON_STATS} {len(versions)} observed version(s) of this message.")
+        body.append(f"{sym.ICON_STATS} {len(versions)} observed version(s) of this message.")
+        # Number chronologically so v1 is the original and later edits follow.
+        for index, version in enumerate(reversed(versions), start=1):
+            when = version.get("edited_at") or version.get("captured_at") or "unknown time"
+            label = "edit" if version.get("kind") == service.KIND_EDIT else "original"
+            content = _truncate(version.get("body") or version.get("media_name") or "(no content)", 200)
+            body.append(f"{sym.OP_EDIT if version.get('kind') == service.KIND_EDIT else sym.OP_SAVE} "
+                        f"v{index} ({label}) · {when}")
+            body.append(f"   {content}")
     builder = InlinePanelBuilder()
     builder.add_row(sym.label(sym.OP_BACK, "Back to list"), f"panel:{LIST_ID}", PRIMARY)
-    builder.add_row(
-        sym.label(sym.OP_DELETE, "Delete this item"),
-        f"action:aed_delete:{archive_id}",
-        DANGER,
-    )
+    if not is_delete:
+        # Group-level delete: removes this message's whole snapshot/edit history.
+        builder.add_row(
+            sym.label(sym.OP_DELETE, "Delete this message"),
+            f"action:aed_delete_group:{item.get('chat_id')}:{item.get('message_id')}",
+            DANGER,
+        )
+    else:
+        builder.add_row(
+            sym.label(sym.OP_DELETE, "Delete this event"),
+            f"action:aed_delete:{item.get('id')}",
+            DANGER,
+        )
     return "Archive Item", "\n".join(body), builder.build()
 
 
@@ -315,6 +396,20 @@ async def _delete_action(event, extra: str, chat_id: int):
     return await _render_list(inline_engine.get_owner_id(), "")
 
 
+async def _delete_group_action(event, extra: str, chat_id: int):
+    """Delete a logical message's whole snapshot/edit history (group semantics)."""
+    parts = (extra or "").split(":", 1)
+    if len(parts) != 2:
+        return "Archive", f"{sym.STATE_WARNING} That item could not be deleted.", []
+    chat_s, message_s = parts
+    if not (chat_s.lstrip("-").isdigit() and message_s.lstrip("-").isdigit()):
+        return "Archive", f"{sym.STATE_WARNING} That item could not be deleted.", []
+    removed = await service.delete_group(int(chat_s), int(message_s))
+    if removed < 0:
+        return "Archive", f"{sym.STATE_WARNING} That item could not be deleted.", []
+    return await _render_list(inline_engine.get_owner_id(), "")
+
+
 async def _clear_confirm_action(event, extra: str, chat_id: int):
     removed = await service.clear_archive()
     if removed < 0:
@@ -383,7 +478,10 @@ def register(client, owner_id: int, tz_str: str = "UTC") -> None:
             msg = getattr(event, "message", None)
             if msg is None or getattr(msg, "action", None) is not None:
                 return
-            await service.record_message(msg=msg, kind=service.KIND_SNAPSHOT, owner=owner_id)
+            identity = await _resolve_peer_identity(event, getattr(msg, "chat_id", None))
+            await service.record_message(
+                msg=msg, kind=service.KIND_SNAPSHOT, owner=owner_id, identity=identity
+            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -397,7 +495,10 @@ def register(client, owner_id: int, tz_str: str = "UTC") -> None:
             msg = getattr(event, "message", None)
             if msg is None:
                 return
-            await service.record_message(msg=msg, kind=service.KIND_EDIT, owner=owner_id)
+            identity = await _resolve_peer_identity(event, getattr(msg, "chat_id", None))
+            await service.record_message(
+                msg=msg, kind=service.KIND_EDIT, owner=owner_id, identity=identity
+            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -431,6 +532,7 @@ def register(client, owner_id: int, tz_str: str = "UTC") -> None:
     register_action("aed_category", _category_action)
     register_action("aed_page", _page_action)
     register_action("aed_delete", _delete_action)
+    register_action("aed_delete_group", _delete_group_action)
     register_action("aed_clear_confirm", _clear_confirm_action)
     register_action("aed_noop", _noop_action)
 

@@ -76,6 +76,16 @@ KIND_SNAPSHOT = "snapshot"
 KIND_EDIT = "edit"
 KIND_DELETE = "delete"
 
+#: Presentation-only kind: a LOGICAL message — the grouping of one snapshot plus
+#: its observed edit versions. It is never persisted (every version keeps its own
+#: ``snapshot``/``edit`` row); it exists only so browsing shows one list entry per
+#: Telegram message instead of one per observed version.
+KIND_MESSAGE = "message"
+
+#: Prefix of a grouped browse id. Raw row ids are bare hex, so a leading ``g``
+#: can never collide with one, and the two id spaces stay unambiguous.
+GROUP_ID_PREFIX = "g"
+
 # ── Bounds ───────────────────────────────────────────────────────────────────
 
 MAX_BODY_CHARS = 4096           # Telegram's own text limit
@@ -394,6 +404,81 @@ def _iso(value: Any) -> str | None:
     return None
 
 
+# ── Peer identity (bounded, optional, never inferred) ────────────────────────
+
+MAX_USERNAME_CHARS = 64
+MAX_PEER_NAME_CHARS = 128
+
+
+def clean_username(value: Any) -> str | None:
+    """A public ``@username`` without the sigil, or ``None``.
+
+    Usernames are optional and changeable, so a malformed one is dropped rather
+    than stored — the numeric id is always the identifier.
+    """
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip().lstrip("@").strip()
+    if not cleaned or len(cleaned) > MAX_USERNAME_CHARS:
+        return None
+    if not all(ch.isalnum() or ch == "_" for ch in cleaned):
+        return None
+    return cleaned
+
+
+def clean_peer_name(value: Any) -> str | None:
+    """A display name, bounded. Never treated as an identifier."""
+    if not isinstance(value, str):
+        return None
+    cleaned = " ".join(value.split())
+    if not cleaned:
+        return None
+    return cleaned[:MAX_PEER_NAME_CHARS]
+
+
+def peer_identity(row: Any) -> dict[str, Any]:
+    """The OTHER participant's stored identity for one archive row.
+
+    Backward compatible by construction: rows captured before these fields
+    existed simply carry no username/name, and the caller falls back to the
+    numeric peer id (which equals ``chat_id`` in a private chat). Nothing is
+    ever invented.
+    """
+    if not isinstance(row, dict):
+        return {"peer_id": None, "username": None, "name": None}
+    peer = row.get("peer_id")
+    if not isinstance(peer, int) or isinstance(peer, bool):
+        chat_id = row.get("chat_id")
+        peer = chat_id if isinstance(chat_id, int) and not isinstance(chat_id, bool) else None
+    return {
+        "peer_id": peer,
+        "username": clean_username(row.get("peer_username")),
+        "name": clean_peer_name(row.get("peer_name")),
+    }
+
+
+def describe_peer(row: Any) -> str:
+    """One bounded display line: ``@username`` when known, the numeric peer id
+    always, plus a display name when one was reliably observed."""
+    identity = peer_identity(row)
+    parts: list[str] = []
+    if identity["username"]:
+        parts.append(f"@{identity['username']}")
+    if identity["name"]:
+        parts.append(identity["name"])
+    parts.append(f"User ID: {identity['peer_id'] if identity['peer_id'] is not None else 'unknown'}")
+    return " · ".join(parts)
+
+
+def _identity_fields(identity: dict[str, Any] | None) -> dict[str, Any]:
+    identity = identity if isinstance(identity, dict) else {}
+    return {
+        "peer_id": _as_id(identity.get("peer_id")) or None,
+        "peer_username": clean_username(identity.get("username")),
+        "peer_name": clean_peer_name(identity.get("name")),
+    }
+
+
 def make_id(*, owner: int, chat_id: int, message_id: int, kind: str, version: str) -> str:
     """Deterministic archive id — the idempotency key for a redelivered update."""
     raw = f"{owner}|{chat_id}|{message_id}|{kind}|{version}".encode("utf-8")
@@ -486,9 +571,20 @@ def _latest_content(rows: list[dict[str, Any]], chat_id: int, message_id: int) -
     return versions[0]
 
 
-async def record_message(*, msg: Any, kind: str, owner: int | None = None) -> dict[str, Any] | None:
+async def record_message(
+    *,
+    msg: Any,
+    kind: str,
+    owner: int | None = None,
+    identity: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
     """Record a snapshot (new message) or edit version. Returns the row, or None
-    when out of scope / disabled / duplicate / not persisted."""
+    when out of scope / disabled / duplicate / not persisted.
+
+    ``identity`` is the bounded peer metadata the handler resolved from the
+    event's own chat entity (``{"peer_id", "username", "name"}``). It is
+    optional: when absent the row is still captured, only without a username.
+    """
     owner = owner or _owner_id
     await ensure_loaded_async()
     if not is_enabled():
@@ -542,6 +638,7 @@ async def record_message(*, msg: Any, kind: str, owner: int | None = None) -> di
         "media_object": None,
         "recoverable": kind != KIND_DELETE,
         "recovered_from": None,
+        **_identity_fields(identity),
     }
     async with _lock_for_loop():
         rows = await load_rows_async(force=True)
@@ -633,6 +730,9 @@ async def record_deletion(*, event: Any, owner: int | None = None) -> list[dict[
                 "media_object": previous.get("media_object") if previous else None,
                 "recoverable": previous is not None,
                 "recovered_from": previous.get("id") if previous else None,
+                "peer_id": previous.get("peer_id") if previous else chat_id,
+                "peer_username": previous.get("peer_username") if previous else None,
+                "peer_name": previous.get("peer_name") if previous else None,
             }
             rows.insert(0, row)
             recorded.append(row)
@@ -667,6 +767,141 @@ def filter_rows(
     return result
 
 
+# ── Logical-message grouping (presentation only) ─────────────────────────────
+
+def group_id(chat_id: Any, message_id: Any) -> str:
+    """The deterministic browse id of one logical message."""
+    return f"{GROUP_ID_PREFIX}{chat_id}:{message_id}"
+
+
+def _identity_from(versions: list[dict[str, Any]]) -> dict[str, Any]:
+    """The best stored peer identity across a message's versions.
+
+    A newer version that lost the username (Telegram does not resend entities on
+    every edit) must not erase one already observed, so the first non-empty value
+    wins. Nothing is ever inferred.
+    """
+    for row in versions:
+        identity = peer_identity(row)
+        if identity["peer_id"] is not None or identity["username"] or identity["name"]:
+            return identity
+    return {"peer_id": None, "username": None, "name": None}
+
+
+def build_items(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse snapshot/edit rows into ONE item per logical message.
+
+    Deletion rows are NEVER collapsed: a deletion is an independent archive event
+    and stays its own list entry with its own recoverability display, even when
+    the same message also has observed content versions.
+    """
+    groups: dict[tuple[Any, Any], dict[str, Any]] = {}
+    order: list[Any] = []
+    deletes: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if row.get("kind") == KIND_DELETE:
+            deletes.append(row)
+            continue
+        if row.get("kind") not in (KIND_SNAPSHOT, KIND_EDIT):
+            continue
+        key = (row.get("chat_id"), row.get("message_id"))
+        group = groups.get(key)
+        if group is None:
+            group = {"chat_id": key[0], "message_id": key[1], "versions": []}
+            groups[key] = group
+            order.append(key)
+        group["versions"].append(row)
+
+    items: list[dict[str, Any]] = []
+    for key in order:
+        group = groups[key]
+        versions = group["versions"]
+        latest = max(versions, key=lambda r: str(r.get("captured_at") or ""))
+        body = latest.get("body") or ""
+        media_name = latest.get("media_name")
+        has_media = bool(latest.get("has_media"))
+        if not body and not media_name and has_media:
+            # Honest fallback: a media-only message has no text to show.
+            body = f"({latest.get('media_type') or 'media'} — no text)"
+        items.append({
+            "id": group_id(key[0], key[1]),
+            "kind": KIND_MESSAGE,
+            "chat_id": key[0],
+            "message_id": key[1],
+            "category": latest.get("category"),
+            "has_caption": bool(latest.get("has_caption")),
+            "body": body,
+            "media_name": media_name,
+            "has_media": has_media,
+            "media_type": latest.get("media_type"),
+            "media_stored": bool(latest.get("media_stored")),
+            "captured_at": latest.get("captured_at"),
+            "version_count": len(versions),
+            "has_deletion": any(
+                d.get("chat_id") == key[0] and d.get("message_id") == key[1] for d in deletes
+            ),
+            "versions": sorted(versions, key=lambda r: str(r.get("captured_at") or ""), reverse=True),
+        })
+        items[-1]["identity"] = _identity_from(versions)
+
+    for row in deletes:
+        items.append({
+            "id": row.get("id"),
+            "kind": KIND_DELETE,
+            "chat_id": row.get("chat_id"),
+            "message_id": row.get("message_id"),
+            "category": row.get("category"),
+            "has_caption": bool(row.get("has_caption")),
+            "body": row.get("body") or "",
+            "media_name": row.get("media_name"),
+            "has_media": bool(row.get("has_media")),
+            "media_type": row.get("media_type"),
+            "media_stored": bool(row.get("media_stored")),
+            "captured_at": row.get("captured_at"),
+            "version_count": 1,
+            "has_deletion": True,
+            "recoverable": bool(row.get("recoverable")),
+            "identity": peer_identity(row),
+            "row": row,
+        })
+
+    items.sort(key=lambda i: str(i.get("captured_at") or ""), reverse=True)
+    return items
+
+
+def filter_items(
+    items: list[dict[str, Any]],
+    *,
+    category: str | None = None,
+    query: str | None = None,
+) -> list[dict[str, Any]]:
+    """The same category/query filter, applied to grouped browse items."""
+    result = list(items)
+    if category and category in CATEGORIES:
+        if category == CATEGORY_CAPTIONS:
+            result = [i for i in result if i.get("has_caption")]
+        else:
+            result = [i for i in result if i.get("category") == category]
+    if query:
+        needle = query.strip().lower()
+        if needle:
+            result = [
+                i for i in result
+                if needle in str(i.get("body") or "").lower()
+                or needle in str(i.get("media_name") or "").lower()
+            ]
+    return result
+
+
+def get_item(items: list[dict[str, Any]], browse_id: str) -> dict[str, Any] | None:
+    for item in items:
+        if item.get("id") == browse_id:
+            return item
+    return None
+
+
 def page_of(rows: list[dict[str, Any]], page: int) -> tuple[list[dict[str, Any]], int, int]:
     total = len(rows)
     pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
@@ -696,6 +931,35 @@ async def delete_row(archive_id: str) -> bool:
             return False
     _delete_media_object(target.get("media_object"))
     return True
+
+
+async def delete_group(chat_id: Any, message_id: Any) -> int:
+    """Delete the WHOLE logical message: its snapshot and every observed edit.
+
+    Deletion-event rows for the same message are independent archive events and
+    are deliberately left in place — deleting the content history must not erase
+    the record that the message was deleted. Returns the number of content rows
+    removed (0 when there was nothing to remove), or -1 when the store failed.
+    """
+    async with _lock_for_loop():
+        rows = await load_rows_async(force=True)
+        if rows is None:
+            return -1
+        victims = [
+            r for r in rows
+            if r.get("chat_id") == chat_id
+            and r.get("message_id") == message_id
+            and r.get("kind") in (KIND_SNAPSHOT, KIND_EDIT)
+        ]
+        if not victims:
+            return 0
+        victim_ids = {r.get("id") for r in victims}
+        remaining = [r for r in rows if r.get("id") not in victim_ids]
+        if not await _save_rows(remaining):
+            return -1
+    for row in victims:
+        _delete_media_object(row.get("media_object"))
+    return len(victims)
 
 
 async def clear_archive() -> int:
