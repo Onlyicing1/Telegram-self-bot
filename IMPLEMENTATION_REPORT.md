@@ -1,212 +1,283 @@
-# IMPLEMENTATION_REPORT.md — Anti-Edit & Anti-Delete database security correction
+# IMPLEMENTATION_REPORT.md — Task Runtime Database Failures: diagnosis + the stall-diagnostics identity defect
 
-> This file describes ONLY the current state of the repository with respect to
-> the Anti-Edit / Anti-Delete (AED) database **security** correction and
-> **replaces every previous report in full** — it is not an appended report.
-> The earlier reports (the dedicated-database-foundation round, the
-> peer-resolution reliability round, the bot-exclusion round, the archive-UX
-> round and the implementation round) remain readable in git history. Evidence
-> records live in `docs/investigations/`.
+> This file describes ONLY the current state of the repository for the **task
+> runtime database-failure diagnosis** phase and **replaces every previous
+> report in full** — it is not an appended report. Earlier reports (the
+> AED security round, the AED database foundation, the peer-resolution,
+> bot-exclusion and archive-UX rounds, the emoji/private-message rounds) remain
+> readable in git history and in `docs/investigations/`.
 
 | Item | Value |
 |---|---|
-| Stage | **Implementation — AED restrictive grant/RLS model delivered (security round)** |
-| Date | 2026-10-17 |
+| Stage | **Diagnosis + one confirmed defect fixed** (task runtime DB failures) |
+| Date | 2026-10-18 |
 | Project / remote | LifeOS Telegram self-bot, `Onlyicing1/Telegram-self-bot` (`origin`) |
-| Branch | `main` (work delivered from `fix/aed-db-security`, fast-forwarded into `main`) |
-| Base commit | `c54a92cb8de379aff0426a0953462cdd98724c93` — verified `= origin/main` at task start |
-| Working tree at start | clean in the task worktree; the shared checkout carried the unrelated pre-existing `M INVESTIGATION.md` and untracked agent directories |
-| Live Telegram / Render / Supabase | **NOT touched.** No `.env`, no credentials, no deployment access. **No SQL was executed against Supabase by this task** and the live project was not modified |
+| Branch | `main` (work done in a detached worktree at `origin/main`, pushed with `git push origin HEAD:main`) |
+| Base commit | `69364c7194fb4fd409df66b900058e20eccb15e8` — verified `= origin/main` at task start (`git fetch origin` + `git rev-parse origin/main`) |
+| Live Telegram / Render / Supabase | **NOT touched.** No deployment access, no Render shell, no `.env`, no credentials, **no SQL**, no Supabase connection, no restart, no Render config change |
+| Actionable production log lines | 2 of 4 are the existing protections working as designed; 2 of 4 had a **provable, reproduced defect in the diagnostics' identity model** (fixed here) |
 
 ---
 
 ## 1. Objective and scope
 
-The AED archive stores the **body of the owner's private conversations** in two
-dedicated tables (`aed_config`, `aed_archive_entries`). The repository defined
-those tables with the generic read-only dashboard boundary — a `GRANT SELECT …
-TO anon, authenticated` on each table plus a permissive
-`FOR SELECT TO anon, authenticated USING (true)` policy. Anything holding the
-anon key could therefore read private message bodies.
+Identify the evidence-based root cause of four recurring production symptoms —
+`TASK_FALLBACK_CLASSIFIED reason=local_resource … [Errno 11]`,
+`Supabase event task query failed; using fallback: <ConnectionTerminated …>`,
+`TASK_NO_PROGRESS` and `TASK_STARVATION` — and apply only the smallest
+correction the repository can prove is missing.
 
-This round corrects the **repository's** definition so that applying the
-migration (or the ONE canonical setup script in `DATABASE_ARCHITECTURE.md`
-§31.3) can never recreate that public read path. It is a source-of-truth fix,
-**not** a live database migration: the owner configured the live project
-manually, and no SQL of this repository was run against it.
+Nothing about the runtime's shape was changed: no second scheduler, executor,
+Supabase client, update loop or retry loop; no schema change; no
+`DATABASE_ARCHITECTURE.md` change; no environment/Render change. The single
+repository authority, bounded concurrency, truthful fallback classification,
+cancellation behaviour and existing task semantics are all preserved (and
+re-pinned by the tests listed in §6).
 
-Scope limits honoured: no table schema, constraint, index, comment, retention
-semantic, legacy-shard fallback or feature-scope change; no runtime code change;
-no new dependency, secret, bucket or environment variable; no second migration
-for the same schema; no unrelated table or global Supabase setting touched.
+Files inspected (current versions at `origin/main` = `69364c7`):
+`backend/ai/database/task_repository.py`, `backend/db/client.py`,
+`backend/runtime/operation_watchdog.py`, `backend/runtime/diagnostics.py`,
+`backend/ai/task_event_dispatcher.py`, `backend/ai/task_scheduler.py`,
+`backend/ai/database/manager.py`, `backend/ai/task_execution.py`,
+`backend/runtime/task_guard.py`, `backend/runtime/heartbeat.py`,
+`backend/health.py`, `backend/bot/router.py`, `backend/bot/handlers/task_events.py`,
+`backend/ai/persistence.py`, the four focused suites named in §6, plus
+`IMPLEMENTATION_REPORT.md` and `INVESTIGATION.md`.
 
 ---
 
-## 2. The original defect (repository state at `c54a92c`)
+## 2. What each log line actually is (provenance, on `origin/main`)
 
-`supabase/migrations/20261017000001_create_anti_edit_delete_tables.sql` (and its
-verbatim copy in part 11 of the setup block) contained:
+| Log line | Exact producer | Introduced by (all verified ancestors of `origin/main`) |
+|---|---|---|
+| `TASK_FALLBACK_CLASSIFIED reason=… exception=… message=…` | `SupabaseTaskRepository._mark_fallback` (`backend/ai/database/task_repository.py`) — the once-per-episode structured diagnostic | `2551970`, extended by `4b20653` (2026-09-11) |
+| `Supabase event task query failed; using fallback: <exception>` | same file, `list_event_tasks` → `_degrade(…)` (the per-call-site wording) | `40b57e0` / earlier |
+| `TASK_NO_PROGRESS — N bounded tasks unchanged since last dump` | `backend/runtime/diagnostics.py::_dump_tasks` | `3893d77` (permanent/bounded classification, 2026-08-12); bounded by `4b20653` |
+| `TASK_STARVATION — N tasks unchanged across 3+ dumps` | `backend/runtime/diagnostics.py::_detect_starvation` | `3893d77` |
 
-```sql
-GRANT SELECT ON aed_config TO anon, authenticated;
-GRANT SELECT ON aed_archive_entries TO anon, authenticated;
+Consequence for the first question in the brief: **these lines cannot predate
+the protections.** The bounded 4-worker pool and 8 s transport deadline
+(`40b57e0`), the `local_resource` classification (`2551970`), the 5 s
+local-resource cooldown and the once-per-episode diagnostic (`4b20653`), and
+the permanent-vs-bounded diagnostics classification (`3893d77`) are all present
+in `origin/main`'s history — the observed lines are the *post-protection*
+behaviour of that code.
 
-CREATE POLICY "anon_select_aed_config" ON aed_config FOR SELECT
-    TO anon, authenticated USING (true);
-CREATE POLICY "anon_select_aed_archive_entries" ON aed_archive_entries FOR SELECT
-    TO anon, authenticated USING (true);
+**Deployed-commit evidence is missing and is reported as such.** No commit
+marker exists in the repository (`grep` for `RENDER_GIT_COMMIT`/`GIT_COMMIT`/
+`BUILD_SHA`/`__version__` in `backend/` → nothing), `render.yaml`/`Procfile`
+carry no commit pin, the reported lines carry no timestamps in the brief, and
+this workspace holds no Render credential (`freebuff-env list` → no keys), so
+the deployed commit and the log timestamps cannot be established read-only from
+here. The four log lines are, however, reproducible only by code that contains
+the protections above, which is what makes the deployment-vs-`main` question
+moot for this phase.
+
+---
+
+## 3. The DB failure path, traced (and why it contains no provable defect)
+
+```
+Telegram update
+  → bot/handlers/task_events.py::_task_event_handler
+  → TaskEventDispatcher.handle_event            (ai/task_event_dispatcher.py)
+  → SupabaseTaskRepository.list_event_tasks     (ai/database/task_repository.py)
+  → repository._run(fn)                         ← cooldown gate lives here
+  → backend.db.client.run_sync_db               (single bounded dispatch)
+        loop.run_in_executor(_get_db_executor())   # ThreadPoolExecutor(max_workers=4)
+        → guarded_await(..., timeout=10s)          # runtime/operation_watchdog.py
+              postgrest/httpx sync call, transport deadline 8s (= _DB_HTTP_TIMEOUT)
+  → exception classification → _mark_fallback/_degrade → in-memory fallback result
+  → 0 executions + bounded TASK_EVENT_TRACE warnings (never raises into the event path)
 ```
 
-Root cause: the AED migration was written by copying the Private Message
-Management migration's access block, which itself copies the read-only dashboard
-convention used by every catalogue-style table (`saved_items`, `bot_logs`, …).
-For a table whose rows are private message bodies that convention is wrong: the
-`USING (true)` policy plus the `anon` SELECT grant is a public read path. The
-documentation repeated the same claim in §31.1 (inventory row 11), §34.4 and §20
-(Migration Status row 23), so the defect was described, not flagged.
+1. **Local OS resource exhaustion (symptom 1).** The transport error is
+   `httpx`/`httpcore`'s wrapper around `OSError(11)`; `_is_local_resource_failure`
+   walks the whole `__cause__`/`__context__` chain and matches
+   `{EAGAIN/EWOULDBLOCK, EMFILE, ENFILE, ENOMEM, ENOBUFS}`. The line's
+   `reason=local_resource` is proof the walk succeeded — i.e. the classification
+   that exists to stop EAGAIN being reported as a Supabase outage *worked*. The
+   failure then arms the bounded 5 s cooldown (no durable call is re-issued
+   inside it, the window is never extended by a skipped call, a successful
+   durable operation clears it) and emits the diagnostic once per episode.
+   **This is the protection, not the defect.**
+2. **A peer-terminated pooled HTTP/2 connection (symptom 2).** Installed
+   `postgrest==0.16.11` creates its session with `http2=True`
+   (`SyncPostgrestClient.create_session`), so Supabase REST traffic runs over
+   TLS+HTTP/2. A GOAWAY from the peer is rendered by `h2` as
+   `<ConnectionTerminated error_code:…, last_stream_id:…, additional_data:…>`
+   and surfaced by httpcore as a protocol error carrying exactly that text —
+   which is the string in the log line. httpx performs **no** retry, so one dead
+   pooled connection fails one operation; with no errno in the chain it is
+   classified `FALLBACK_REASON_UNAVAILABLE` (truthful: the durable store did not
+   answer this request), the read degrades to the in-memory fallback
+   (**non-durable**) and the caller/panel is told so (`fallback_active` /
+   `fallback_reason` / the rendered fallback note). A transient transport
+   termination therefore does **not** mean Supabase is down, and it never
+   reaches the durable write path as a silent success.
+3. **No defect was provable anywhere else on this path**: the pool is bounded at
+   four workers and reused (threads are stable across 24 calls); the transport
+   deadline is strictly below the dispatch budget; a timed-out dispatch emits one
+   `OP_TIMEOUT` and cannot be cancelled inside the thread, so the code pins the
+   transport shorter than the watchdog; `CancelledError` is re-raised at every
+   boundary; `_run`'s cooldown skip carries its own honest reason so a skipped
+   call can never be re-labelled as an outage; a genuine store failure is never
+   suppressed (every attempt stays visible — an intentional, test-pinned
+   contract); and `RepositoryManager` still owns the one task repository, so the
+   process degrades to exactly one in-memory fallback. All of it is re-verified
+   by the suites in §6.
+4. `TASK_NO_PROGRESS` / `TASK_STARVATION` are **not** produced by this path: they
+   come from the 60 s diagnostics dump, and §4 shows the defect that made them
+   fire for tasks that were not stalled at all.
+
+Deliberately **not** done, and why: no retry was added to `run_sync_db` (a
+re-dispatch is unsafe for this repository's non-idempotent inserts, whose
+exactly-once guarantees rest on CAS/unique keys — and a retry path is out of
+scope by the brief); the local-resource cooldown was **not** broadened into a
+process-wide gate (that would change every DB surface's degradation semantics
+and its honesty contract); and no recovery behaviour was touched.
 
 ---
 
-## 3. The corrected security model
+## 4. The confirmed defect: stall diagnostics identified tasks by NAME
 
-For **both** `aed_config` and `aed_archive_entries`:
+`backend/runtime/diagnostics.py` kept its three per-task registries — the
+previous stack, the unchanged-dump counter and the first-seen instant — **under
+the task name**. A task name is reusable: the runtime re-creates bounded tasks
+under a stable name precisely when things are unhealthy
+(`lifeos-keepalive-recovery`, `lifeos-heartbeat-recovery`,
+`lifeos-failsafe-retry`, `lifeos-recovery-retry`, the `*:preload_state` tasks
+re-spawned on a rebuild, `panel:delayed-delete`, `lifeos-callback-trace-send`).
+Keyed by name, a finished task's counter and first-seen instant were inherited
+by the **next** task created with that name, so:
 
-| Aspect | Definition |
-|---|---|
-| RLS | `ALTER TABLE <t> ENABLE ROW LEVEL SECURITY;` on both tables |
-| Policies | **ZERO.** No SELECT/INSERT/UPDATE/DELETE policy is created for any role (no public, no authenticated, no owner-facing, no dashboard policy) |
-| `PUBLIC` / `anon` / `authenticated` | `REVOKE ALL ON TABLE <t> FROM PUBLIC, anon, authenticated;` plus a bounded `DO` block that revokes the **column-level** privileges of every column of both tables (`REVOKE ALL (%s) ON TABLE public.%I FROM PUBLIC, anon, authenticated`) — a table `REVOKE` alone cannot clear a per-column grant |
-| `service_role` | `GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE <t> TO service_role;` — exactly the four verbs `backend/db/client.py` uses for AED (reads, upserts, bounded retention delete). The inspection of `_get_aed_config_sync` / `_save_aed_config_sync` / `_aed_*_entries_*` showed no `TRUNCATE`, `REFERENCES`, `TRIGGER` or any other privilege is needed |
-| Legacy permissive policies | Removed by name, idempotently: `DROP POLICY IF EXISTS "anon_select_aed_config" ON aed_config;` and `DROP POLICY IF EXISTS "anon_select_aed_archive_entries" ON aed_archive_entries;` (plus the never-created insert/update/delete variants, kept as defensive drops) |
-| FORCE ROW LEVEL SECURITY | Deliberately **not** used. `service_role` bypasses RLS in Supabase and the table owner keeps its normal rights, so forcing RLS would only add a failure mode without changing the access model |
-| Effect | `anon` and `authenticated` have no table privilege, no column privilege and no matching policy on either table; the backend keeps exactly the access it needs through `service_role` |
+* a task that had just started was reported as `TASK_NO_PROGRESS` after a
+  **single** dump (`Unchanged dumps: 2`/`3` inherited from the dead task);
+* it reached the `TASK_STARVATION` threshold with **fewer dumps than the
+  three-dump contract**, and its reported `(elapsed)` time belonged to the
+  already-finished task (`unchanged for 3 dumps (0s)`).
 
-Everything else is byte-identical: both `CREATE TABLE` statements, every
-constraint (`kind`/`category`/`chat_id > 0`/`message_id > 0`/`body` length/
-retention range), the read index `idx_aed_archive_entries_owner_captured`, every
-`COMMENT`, `NOTIFY pgrst`, both verification queries and the read-only legacy
-`bot_settings` probe.
+Reproduced before the fix (focused test, fixed clocks, no live anything):
+
+```
+WARNING backend.diagnostics_loop TASK_NO_PROGRESS — 1 bounded tasks unchanged since last dump:
+  Task: lifeos-keepalive-recovery
+  Elapsed waiting: 0s
+  Unchanged dumps: 2            <-- inherited by a task created milliseconds earlier
+WARNING backend.diagnostics_loop TASK_STARVATION — 1 tasks unchanged across 3+ dumps:
+  STARVATION: lifeos-keepalive-recovery unchanged for 3 dumps (0s)
+```
+
+That is exactly the recurring pair in the production logs, and it is why those
+two lines — in a runtime that is neither stalled nor deadlocked — **do not prove
+a stall**. The DB-failure episode only makes it more likely: recovery attempts
+and preloads are re-created under those names while the DB path is failing.
 
 ---
 
-## 4. Files changed
+## 5. The fix (smallest change that removes the false report)
 
 | File | Change | Reason |
 |---|---|---|
-| `supabase/migrations/20261017000001_create_anti_edit_delete_tables.sql` | Security block replaced: the two `GRANT SELECT … TO anon, authenticated` and the two `CREATE POLICY … USING (true)` statements are gone; the legacy policies are dropped by name; `REVOKE ALL … FROM PUBLIC, anon, authenticated` is added for both tables plus the bounded column-level revoke `DO` block; `GRANT SELECT, INSERT, UPDATE, DELETE … TO service_role` is added. Prose updated: the header's access sentence, a rewritten `## Security` section, and a note in `## MANUAL SUPABASE ACTION REQUIRED` that re-running the file on manually created tables converges them onto the restrictive posture | The migration is the SQL source of truth |
-| `DATABASE_ARCHITECTURE.md` | §31.3 part 11 replaced with the corrected statements (statement-identical to the migration); §31.1 inventory row 11 now states the service-role-only posture; §20 Migration Status row 23 likewise; §18 gained a **Documented exceptions — server-only tables** note naming `api_credentials` and the two AED tables; §34.4's owner-isolation bullet rewritten; **new §34.7** documents the defect, the corrected model and its consequences | The document is the canonical database specification; leaving the permissive text would keep the defect documented as intended behaviour |
-| `tests/test_aed_db_security.py` | **NEW (11 tests).** Pins the migration's RLS/zero-policy/grant model, the revokes (table- and column-level), the exact service-role verb set, the absence of any client grant, the by-name removal of the legacy policies, the `FORCE` decision, the untouched schema/constraints/index/verification statements, the statement-identity of part 11 with its migration, and the documentation's description of the restrictive model | Make the regression impossible to reintroduce silently |
-| `tests/test_database_setup_order.py` | The AED part's guarantee list now asserts the two `DROP POLICY IF EXISTS …` statements, both `REVOKE ALL …` statements and both `GRANT … TO service_role` statements, and asserts `CREATE POLICY` is absent from the part | The setup-order test is the contract that ties the block to the migrations; it must pin the corrected statements |
+| `backend/runtime/diagnostics.py` | `_prev_stacks`, `_stack_unchanged_count` and `_task_first_seen` are keyed by the **pending `asyncio.Task` object** instead of its name; `task_info`/`elapsed`, `_detect_starvation`, `_detect_deadlocks` and `_detect_slow_handlers` follow the same key; per-task state is pruned against the **pending task set** (so a finished task's counters can be neither reported forever nor inherited); `stalled`/`permanent`/`bounded` sets are task-based. The permanent/bounded classification, the loop-latency stall check, the report layout, the 60 s interval and the three-dump starvation threshold are unchanged | "Unchanged" must mean **the same task** unchanged. Identity, not a reusable name, owns the counter — and two concurrent tasks sharing a name keep separate state and separate report entries, so a genuine stall is still reported for the task that really is stalled |
+| `tests/test_runtime_diagnostics_classification.py` | Three new tests: (1) a name reused by a new task starts from zero, is not reported after one dump, and **is** still reported for three dumps of its own existence; (2) two concurrent same-name tasks are tracked per task; (3) the deadlock report still names the blocked task (the edited detector's only reachable shape: a task created directly from `Event.wait()`) | Both stall tests **fail against the previous implementation** and pass after it; the 12 pre-existing diagnostics tests pass in both states |
 
-No runtime code, handler, service, provider, dependency or environment variable
-changed. No new migration file was added (the existing AED migration is
-corrected in place, which is safe because the Supabase migration history is
-empty and the migration has never been applied by this repository).
+The fix touches only the report path. It removes a false warning and never
+suppresses a real one: a bounded task that is genuinely unchanged for three
+dumps of its own existence is still reported — asserted in the same tests.
 
----
-
-## 5. Migration ⇄ documentation synchronization
-
-* `tests/test_database_setup_order.py::test_every_part_is_statement_identical_to_its_migration`
-  proves part 11 of §31.3 is the migration's statements verbatim (comments
-  stripped); it passes after the change.
-* `tests/test_aed_db_security.py::test_the_canonical_part_is_statement_identical_to_the_migration`
-  re-proves the same property for the AED part specifically, and adds
-  `test_the_canonical_part_carries_no_permissive_statement`, which fails if any
-  `CREATE POLICY`, any `GRANT … TO anon/authenticated` or any
-  `FORCE ROW LEVEL SECURITY` reappears in the block.
-* The canonical setup model is unchanged: still ONE paste-ready block in §31.3,
-  still 11 parts in their documented order, no second apply step, no competing
-  script. Part 11 remains the last part and the migration remains the SQL source
-  of truth.
+Also documented, deliberately **not** changed (latent, no live false positive
+today): a task created through `backend/runtime/task_guard.py` reports the
+wrapper's coroutine name (`_wrapper`/`_immortal_wrapper`) and `task_guard.py` as
+its await location, because a task's `cr_frame` is its **outermost** coroutine
+frame (verified empirically). `_PERMANENT_CORO_PATTERNS`' `uvicorn`/`serve`
+entries and the `telethon/` source marker can therefore never match a
+wrapper-created task. Every permanent runtime loop carries a permanent *name*,
+so the classification is correct in practice; changing it would mean changing a
+core runtime module for no reproduced symptom. The residual
+`asyncio.to_thread` DB paths that still bypass the shared bounded pool
+(`backend/ai/config_store.py::_run_sync`, `backend/ai/database/usage_reader.py`,
+`usage_recorder.py`, `backend/services/ghost_seen_v2.py`,
+`backend/ai/tools/memory.py`, `backend/ai/engine/dispatcher.py`) are likewise
+left as a documented follow-up: they are bounded by the loop's default executor
+and there is no evidence they produced any of the four lines.
 
 ---
 
-## 6. Tests actually run (exact commands and results)
+## 6. Tests actually run (commands and real results)
 
-All commands were run in the task worktree (`/home/daytona/codebase/.aedsec`)
-with the repository virtualenv (`../.venv/bin/python`).
+All commands were run in the task worktree (`/home/daytona/codebase/.taskrt`, a
+detached checkout of `origin/main` = `69364c7`) with the repository virtualenv
+(`../.venv/bin/python`, CPython 3.10.12; the workspace venv carries
+`telethon 1.34.0` while `backend/requirements.txt` pins `1.43.0`, and neither the
+change nor the tests depend on Telethon).
 
 | Command | Result |
 |---|---|
-| `python -m pytest tests/test_aed_db_security.py -q` | **11 passed** |
-| `python -m pytest tests/test_anti_edit_delete.py -q` | **95 passed** |
-| `python -m pytest tests/test_database_setup_order.py tests/test_canonical_schema_reconciliation.py -q` | **65 passed** |
-| `python -m pytest tests/test_aed_db_security.py tests/test_database_setup_order.py tests/test_canonical_schema_reconciliation.py -q` | **76 passed** |
-| `python -m pytest tests -q` (full suite) | **6367 passed, 27 skipped, 40 failed** in 139.84s |
-| `python -m py_compile tests/test_aed_db_security.py tests/test_database_setup_order.py` | OK (exit 0) |
-| `git diff --check` | OK (exit 0, no whitespace errors) |
-
-**The 40 failures are pre-existing and unrelated.** Every one of them is in
-`tests/test_colored_buttons.py`; running that file against a pristine
-`origin/main` worktree (`c54a92c`) produced the identical **40 failed, 12
-passed**. No test that touches AED, the database schema, the setup block or the
-documentation fails.
-
-### SQL verification limits
-
-No PostgreSQL server, `psql` binary or SQL parser is available in this
-workspace, and executing SQL against Supabase is prohibited for this task.
-Verification of the new statements is therefore static — the repository's own
-SQL contract tests plus a structural check (balanced `$$` dollar quotes: exactly
-2; zero `CREATE POLICY`; exactly the two intended `GRANT` lines; exactly the two
-intended table-level `REVOKE` lines; no `FORCE ROW LEVEL SECURITY`). The SQL has
-**not** been executed anywhere.
+| `python -m pytest tests/test_task_fallback_classification.py tests/test_task_fallback_cooldown.py tests/test_runtime_diagnostics_classification.py tests/test_local_resource_bounds.py -q` (before the change) | **42 passed** — the existing protections are intact |
+| `python -m pytest tests/test_07_diagnostics.py tests/test_11_runtime_wiring.py tests/test_task_fallback_classification.py tests/test_task_fallback_cooldown.py tests/test_local_resource_bounds.py tests/test_task_repository.py tests/test_task_scheduler.py tests/test_task_execution.py tests/test_runtime_diagnostics_classification.py -q` | **106 passed** |
+| `python -m pytest tests/test_runtime_diagnostics_classification.py -q` (with the fix) | **15 passed** (12 pre-existing + 3 new) |
+| same suite against the **pre-fix** `backend/runtime/diagnostics.py` | **2 failed** — the two new stall tests fail exactly on the production symptom (`assert 'lifeos-keepalive-recovery' not in {'lifeos-keepalive-recovery'}`), the 12 pre-existing tests pass |
+| `python -m pytest tests -q` (full suite, final state) | **6370 passed, 27 skipped, 40 failed** in 124 s |
+| `python -m pytest tests/test_colored_buttons.py -q` in a pristine `origin/main` worktree | **40 failed, 12 passed** — the identical, pre-existing failure set (pending colored-button expectations, unrelated to this phase; nothing in the task-runtime, DB, watchdog or diagnostics area fails) |
+| `python -m py_compile backend/runtime/diagnostics.py tests/test_runtime_diagnostics_classification.py` | OK (exit 0) |
+| `git diff --check` | clean |
 
 ---
 
-## 7. Live Supabase status (observed vs. repository-only)
+## 7. Production verification — NOT performed (and what would verify it)
 
-* **Direct observations reported by the owner (not produced by this task):** the
-  two AED tables already exist in the live project; RLS is enabled on both;
-  there are no RLS policies; the column-level privileges show `service_role`
-  only; both tables currently hold zero rows; the Supabase migration history is
-  empty.
-* **Repository-only work (this task):** the corrected migration, the corrected
-  canonical block and §34/§18 prose, plus the new regression tests. These are
-  source changes only.
-* **Explicitly:** no SQL was executed against Supabase, no migration-history
-  record was created or fabricated, no grant, policy, table or row was changed,
-  and this task did not connect to Supabase at all. The corrected repository
-  definition has **not** been applied to the live project by this task.
-* Because the live project already matches the restrictive posture, no manual
-  action is required to fix the live database. The repository fix exists so that
-  a future application of the migration or of §31.3 cannot reintroduce the
-  public read path. The canonical block's part 11 is itself safe to re-run: it
-  contains no `CREATE TABLE` change for existing tables, drops the legacy
-  policies if any survived, and ends in the service-role-only posture.
+The fix is **unverified in production**: no deployment was triggered, no Render
+shell or log access was used, no live Telegram/Supabase session exists here, and
+no service was restarted (all out of scope by the brief). What would confirm it:
+
+1. The `ASYNC_TASK_DUMP` lines must stop reporting a task whose `Elapsed waiting`
+   is smaller than the interval it has existed for, and must keep reporting the
+   same task when it is *genuinely* unchanged for three dumps of its own
+   existence.
+2. `TASK_NO_PROGRESS`/`TASK_STARVATION` bodies should name tasks whose reported
+   `Unchanged dumps` is consistent with that task's own lifetime.
+3. For the DB lines, the deployed commit (Render's build log or the runtime's own
+   `RENDER_GIT_COMMIT`, neither of which is readable from here) is needed to
+   correlate the four lines with a deployment; the brief's lines carry no
+   timestamps.
 
 ---
 
-## 8. Commit and remote verification
+## 8. Commit, push and remote verification
 
 | Item | Value |
 |---|---|
-| Code commit | `2afd89ac6b096a67ad9284c17b6334eb24b502f5` — `fix(archive): make the AED tables service-role only` |
-| Base commit | `c54a92cb8de379aff0426a0953462cdd98724c93` (previous `origin/main`) |
-| Branch | pushed to `main` (committed on `fix/aed-db-security`, fast-forwarded: `git merge-base --is-ancestor origin/main HEAD` printed `FF_SAFE` before the push) |
-| Remote | `origin` = `https://github.com/Onlyicing1/Telegram-self-bot.git` |
-| Push result | `git push origin HEAD:main` → `c54a92c..2afd89a  HEAD -> main` |
-| Remote `main` after push | `git fetch origin` → `git rev-parse origin/main` = `2afd89ac6b096a67ad9284c17b6334eb24b502f5` = local `HEAD` |
-| Ancestry | `git merge-base --is-ancestor 2afd89a origin/main` → exit 0 (`ANCESTOR_OK`) |
-| Remote content spot-check | `git show origin/main:supabase/migrations/20261017000001_create_anti_edit_delete_tables.sql` shows both `REVOKE ALL ON TABLE …` and both `GRANT SELECT, INSERT, UPDATE, DELETE … TO service_role` statements and **no** `CREATE POLICY` |
-| Worktree state | this task's worktree is clean after the push; the shared checkout keeps its pre-existing `M INVESTIGATION.md` and the untracked agent directories |
-| Documentation follow-up | a second `docs(report)` commit records this delivery block (the commit ID can only exist after the code commit) |
+| Code commit | `58fa664296c1d2d86682072210965d1b1b12d098` — `fix(runtime): key task stall diagnostics by task, not by task name` |
+| Base commit | `69364c7194fb4fd409df66b900058e20eccb15e8` (previous `origin/main`) |
+| Push | `git push origin HEAD:main` → `69364c7..58fa664  HEAD -> main` |
+| Remote `main` after the push | `git fetch origin` → `git rev-parse origin/main` = `58fa664296c1d2d86682072210965d1b1b12d098` = local `HEAD` |
+| Ancestry | `git merge-base --is-ancestor 58fa664 origin/main` → exit 0 (`ANCESTRY OK`) |
+| Working tree | only the two delivered files changed in the task worktree; the shared checkout keeps its pre-existing `M INVESTIGATION.md` and untracked agent directories (untouched) |
+| Documentation follow-up | a second `docs(report)` commit records this delivery block (its own SHA can only exist after the code commit) |
 
 ---
 
-## 9. Remaining limitations and unresolved items
+## 9. Unresolved limitations / missing evidence
 
-* The corrected migration and the canonical block have not been executed against
-  any database (no Postgres available; Supabase execution is out of scope). The
-  SQL is reviewed statically and pinned by tests only.
-* The column-level `DO` block revokes every column privilege of the two tables
-  from `PUBLIC`/`anon`/`authenticated`. It cannot revoke a grant made to some
-  other, unmodelled role; no such role exists in this project's model.
-* `postgres` (the table owner) keeps its normal rights — FORCE RLS was
-  deliberately not added, matching the documented Supabase service_role model.
-* The other tables (`saved_items`, `bot_logs`, emoji tables, Private Message
-  tables, …) keep the read-only dashboard convention unchanged; this task did
-  not alter the project-wide model, only the AED exception and its documentation.
-* Live Telegram behaviour, the Render deployment and the live database were not
-  verified — this task is a repository correction with no runtime change.
+* **Deployed commit unknown** (no commit marker in the repo, no Render
+  credential here, no timestamps in the reported lines). The logs are consistent
+  with post-protection code, but that correlation is inference, not a
+  measurement.
+* **The OS-level origin of `EAGAIN` is not provable from the repository.** The
+  classification ("local resource, not a store outage") is the codebase's own
+  documented reading of `[Errno 11]` and is test-pinned; proving *which* local
+  resource ran short (ephemeral ports, file descriptors, memory) needs
+  host-level metrics (`ss -s`, `/proc/<pid>/limits`, fd counts, thread counts)
+  that this workspace cannot collect.
+* **No retry was added for transient pooled-connection deaths** (GOAWAY). The
+  degradation is honest (non-durable, reported), but a task write attempted in
+  exactly that window is not durable; a safe design would need read-only retry
+  semantics, which is a larger, riskier change than this phase's brief allows.
+* **Latent diagnostics blind spots are documented, not fixed** (§5): the
+  wrapper frames hide the real coroutine from the coro-name/source signals, and
+  the residual `asyncio.to_thread` DB paths still bypass the single bounded
+  pool.
+* `tests/test_colored_buttons.py` keeps its 40 pre-existing failures (identical
+  on a pristine `origin/main`); they are unrelated to this phase but are not
+  fixed here.
