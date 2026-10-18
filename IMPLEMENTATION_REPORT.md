@@ -182,10 +182,16 @@ intended table-level `REVOKE` lines; no `FORCE ROW LEVEL SECURITY`). The SQL has
 
 | Item | Value |
 |---|---|
-| Commit | recorded in the delivery section below after the push |
-| Branch | `main` |
+| Code commit | `2afd89ac6b096a67ad9284c17b6334eb24b502f5` — `fix(archive): make the AED tables service-role only` |
+| Base commit | `c54a92cb8de379aff0426a0953462cdd98724c93` (previous `origin/main`) |
+| Branch | pushed to `main` (committed on `fix/aed-db-security`, fast-forwarded: `git merge-base --is-ancestor origin/main HEAD` printed `FF_SAFE` before the push) |
 | Remote | `origin` = `https://github.com/Onlyicing1/Telegram-self-bot.git` |
-| Push / remote `main` HEAD / ancestry | verified with `git fetch origin`, `git rev-parse origin/main`, `git merge-base --is-ancestor` — see the delivery block appended at the end of this report |
+| Push result | `git push origin HEAD:main` → `c54a92c..2afd89a  HEAD -> main` |
+| Remote `main` after push | `git fetch origin` → `git rev-parse origin/main` = `2afd89ac6b096a67ad9284c17b6334eb24b502f5` = local `HEAD` |
+| Ancestry | `git merge-base --is-ancestor 2afd89a origin/main` → exit 0 (`ANCESTOR_OK`) |
+| Remote content spot-check | `git show origin/main:supabase/migrations/20261017000001_create_anti_edit_delete_tables.sql` shows both `REVOKE ALL ON TABLE …` and both `GRANT SELECT, INSERT, UPDATE, DELETE … TO service_role` statements and **no** `CREATE POLICY` |
+| Worktree state | this task's worktree is clean after the push; the shared checkout keeps its pre-existing `M INVESTIGATION.md` and the untracked agent directories |
+| Documentation follow-up | a second `docs(report)` commit records this delivery block (the commit ID can only exist after the code commit) |
 
 ---
 
