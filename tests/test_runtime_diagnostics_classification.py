@@ -36,6 +36,8 @@ import pytest
 
 from backend.runtime import diagnostics as diag
 
+_INTERVAL_S = diag._INTERVAL
+
 
 @pytest.fixture(autouse=True)
 def _restore_diagnostics_state():
@@ -190,6 +192,107 @@ async def test_starvation_state_is_pruned_when_the_task_is_gone(caplog):
     assert "finished-task" not in diag._stack_unchanged_count
     assert "finished-task" not in diag._task_first_seen
     assert "STARVATION: finished-task" not in caplog.text
+
+
+# ── per-TASK identity, not per-NAME ────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_a_reused_name_is_not_inherited_by_a_new_task(caplog):
+    """A finished task's history must not be inherited by the next task's name.
+
+    Production symptom: ``TASK_NO_PROGRESS`` / ``TASK_STARVATION`` for tasks
+    that had only just started. The runtime re-creates bounded tasks under a
+    stable name (a recovery attempt, a state preload, a panel timer), so keyed
+    by NAME the finished task's unchanged-stack counter and first-seen instant
+    were inherited by the next task created with that name: it was reported
+    after one dump instead of three, with an elapsed time belonging to the
+    earlier task.
+    """
+    with caplog.at_level(logging.WARNING, logger="backend.diagnostics_loop"):
+        first = asyncio.create_task(_bounded_slow_op(), name="lifeos-keepalive-recovery")
+        try:
+            await asyncio.sleep(0)
+            await diag._dump_tasks()   # baseline for the name
+            await diag._dump_tasks()   # `first` is now unchanged for one dump
+        finally:
+            first.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await first
+
+        caplog.clear()
+        second = asyncio.create_task(_bounded_slow_op(), name="lifeos-keepalive-recovery")
+        try:
+            await asyncio.sleep(0)
+            await diag._dump_tasks()   # ONE dump since the NEW task appeared
+            after_one_dump = caplog.text
+            reported_after_one_dump = _reported_task_names(after_one_dump)
+
+            caplog.clear()
+            for _ in range(3):         # three dumps of ITS OWN existence
+                await diag._dump_tasks()
+            after_four_dumps = caplog.text
+            reported_after_four_dumps = _reported_task_names(after_four_dumps)
+        finally:
+            second.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await second
+
+        second_unchanged_dumps = diag._stack_unchanged_count.get(second, 0)
+        second_first_seen = diag._task_first_seen.get(second)
+
+    # The production symptom: a brand-new task reported as stalled after a
+    # single dump, with the finished task's history behind it.
+    assert "lifeos-keepalive-recovery" not in reported_after_one_dump
+    assert "TASK_NO_PROGRESS" not in after_one_dump
+    assert "TASK_STARVATION" not in after_one_dump
+    # The per-task state belongs to the NEW task, and the finished task's state
+    # is gone rather than inherited.
+    assert first not in diag._task_first_seen
+    assert second_first_seen is not None and second_first_seen > time.time() - 60.0
+    assert second_unchanged_dumps == 3
+    # ...while the SAME task, unchanged for three dumps of its own, still is.
+    assert "lifeos-keepalive-recovery" in reported_after_four_dumps
+    assert "TASK_NO_PROGRESS" in after_four_dumps
+    assert "TASK_STARVATION" in after_four_dumps
+
+
+@pytest.mark.asyncio
+async def test_two_concurrent_tasks_sharing_a_name_are_tracked_per_task():
+    """Identity, not the name, owns the per-task stall state."""
+    name = "panel:delayed-delete"
+    first = asyncio.create_task(_bounded_slow_op(), name=name)
+    second = asyncio.create_task(_bounded_slow_op(), name=name)
+    try:
+        await asyncio.sleep(0)
+        await diag._dump_tasks()
+        assert {first, second} <= set(diag._stack_unchanged_count)
+        assert {first, second} <= set(diag._task_first_seen)
+        assert {first, second} <= set(diag._prev_stacks)
+    finally:
+        for task in (first, second):
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+
+@pytest.mark.asyncio
+async def test_a_task_blocked_on_a_sync_primitive_is_still_reported(caplog):
+    """The deadlock report is per TASK too, and still fires when it should."""
+    event = asyncio.Event()
+    task = asyncio.create_task(event.wait(), name="blocked-slow-op")
+    try:
+        await asyncio.sleep(0)
+        diag._task_first_seen[task] = time.time() - (_INTERVAL_S * 3)
+        with caplog.at_level(logging.WARNING, logger="backend.diagnostics_loop"):
+            await diag._dump_tasks()
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert "DEADLOCK_DETECTED" in caplog.text
+    assert "DEADLOCK: blocked-slow-op blocked on" in caplog.text
 
 
 class _Clock:
