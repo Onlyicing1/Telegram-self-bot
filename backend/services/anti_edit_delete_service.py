@@ -222,8 +222,20 @@ def _config_key(owner: int) -> str:
 
 
 async def _read_config(owner: int) -> dict[str, Any]:
+    """The owner's configuration from the ONE active store.
+
+    The dedicated ``aed_config`` row is authoritative once the migration is
+    applied; before that the legacy ``bot_settings`` document is read (READ
+    ONLY) so the feature keeps its behaviour. ``aed_store_mode`` decides which
+    one is used, once per process.
+    """
     from backend.db import client as db_client
 
+    if await db_client.aed_store_mode() == "dedicated":
+        row = await db_client.aed_load_config(owner)
+        if row is None:
+            return default_state()
+        return sanitize_state(row)
     raw = await db_client.aed_get_document(_config_key(owner))
     if raw is None:
         return default_state()
@@ -276,8 +288,11 @@ async def _persist_state(candidate: dict[str, Any]) -> bool:
     from backend.db import client as db_client
 
     owner = _owner_id
-    payload = json.dumps(candidate, separators=(",", ":"), default=str)
-    ok = await db_client.aed_put_document(_config_key(owner), payload)
+    if await db_client.aed_store_mode() == "dedicated":
+        ok = await db_client.aed_save_config(owner, candidate)
+    else:
+        payload = json.dumps(candidate, separators=(",", ":"), default=str)
+        ok = await db_client.aed_put_document(_config_key(owner), payload)
     if ok:
         _state.clear()
         _state.update(candidate)
@@ -730,15 +745,21 @@ async def load_rows_async(force: bool = False) -> list[dict[str, Any]] | None:
         return [dict(r) for r in _rows]
     from backend.db import client as db_client
 
-    shards = await db_client.aed_load_archive(list(_SHARD_KEYS))
-    if shards is None:
-        return None
+    if await db_client.aed_store_mode() == "dedicated":
+        stored = await db_client.aed_load_entries(_owner_id)
+        if stored is None:
+            return None
+        raw_rows = stored
+    else:
+        shards = await db_client.aed_load_archive(list(_SHARD_KEYS))
+        if shards is None:
+            return None
+        raw_rows = [row for shard in shards for row in shard]
     owner = _owner_id
     rows: list[dict[str, Any]] = []
-    for shard in shards:
-        for row in shard:
-            if isinstance(row, dict) and row.get("owner_id") == owner:
-                rows.append(row)
+    for row in raw_rows:
+        if isinstance(row, dict) and row.get("owner_id") == owner:
+            rows.append(row)
     rows.sort(key=lambda r: str(r.get("captured_at") or ""), reverse=True)
     rows = rows[:MAX_ARCHIVE_ROWS]
     _rows = rows
@@ -751,7 +772,10 @@ async def _save_rows(rows: list[dict[str, Any]]) -> bool:
     from backend.db import client as db_client
 
     bounded = rows[:MAX_ARCHIVE_ROWS]
-    ok = await db_client.aed_save_archive(list(_SHARD_KEYS), _split_shards(bounded))
+    if await db_client.aed_store_mode() == "dedicated":
+        ok = await db_client.aed_save_entries(_owner_id, bounded)
+    else:
+        ok = await db_client.aed_save_archive(list(_SHARD_KEYS), _split_shards(bounded))
     if ok:
         _rows = bounded
         _rows_loaded = True
@@ -1232,6 +1256,53 @@ async def cleanup_expired(now: datetime | None = None) -> dict[str, int]:
     from backend.db import client as db_client
 
     stats = {"archive_deleted": 0, "snapshots_deleted": 0, "objects_deleted": 0}
+    mode = await db_client.aed_store_mode()
+
+    if mode == "dedicated":
+        all_rows = await db_client.aed_load_all_entries()
+        if all_rows is None:
+            return stats
+        now = now or datetime.now(timezone.utc)
+        owners = {
+            row.get("owner_id")
+            for row in all_rows
+            if isinstance(row, dict) and isinstance(row.get("owner_id"), int)
+        }
+        retention: dict[int, int] = {}
+        for owner in owners:
+            config = await db_client.aed_load_config(owner)
+            days = DEFAULT_RETENTION_DAYS
+            if isinstance(config, dict):
+                days = sanitize_state(config).get("retention_days", DEFAULT_RETENTION_DAYS)
+            retention[owner] = days
+
+        expired_ids: list[str] = []
+        expired_objects: list[Any] = []
+        for row in all_rows:
+            if not isinstance(row, dict):
+                continue
+            owner = row.get("owner_id")
+            days = retention.get(owner, DEFAULT_RETENTION_DAYS)
+            captured = _parse_instant(row.get("captured_at"))
+            if captured is None or captured >= _cutoff(now, days):
+                continue
+            if row.get("kind") == KIND_DELETE:
+                stats["archive_deleted"] += 1
+            else:
+                stats["snapshots_deleted"] += 1
+            if row.get("id"):
+                expired_ids.append(str(row.get("id")))
+            if row.get("media_object"):
+                expired_objects.append(row.get("media_object"))
+
+        if expired_ids and not await db_client.aed_delete_entries(expired_ids):
+            logger.warning("[AED] retention delete failed — nothing was deleted durably")
+            return {"archive_deleted": 0, "snapshots_deleted": 0, "objects_deleted": 0}
+        for path in expired_objects:
+            if _delete_media_object(path):
+                stats["objects_deleted"] += 1
+        return stats
+
     shards = await db_client.aed_load_archive(list(_SHARD_KEYS))
     if shards is None:
         return stats

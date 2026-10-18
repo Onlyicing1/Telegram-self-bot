@@ -50,6 +50,8 @@ _fallback: dict = {
     "bot_settings": {},
     "private_message_config": {},
     "private_message_senders": [],
+    "aed_config": {},
+    "aed_archive_entries": [],
 }
 _save_code_lock = asyncio.Lock()
 _initialised = False
@@ -2810,4 +2812,284 @@ async def aed_save_archive(shard_keys: list[str], shards: list[list]) -> bool:
         return await _run_sync(_aed_save_shards_sync, list(shard_keys), list(shards))
     except Exception as exc:
         logger.error("[AED_DB] shard save FAILED: %s", exc)
+        return False
+
+
+# ── Anti-Edit / Anti-Delete dedicated tables (aed_config / aed_archive_entries) ──
+#
+# AED originally persisted through the generic ``bot_settings`` key/value store:
+# ONE configuration document (``anti_edit_delete_config:<owner>``) plus a fixed
+# set of JSON shard documents (``anti_edit_delete_archive_shard:0..3``). The
+# dedicated tables (migration ``20261017000001_create_anti_edit_delete_tables.sql``,
+# DATABASE_ARCHITECTURE.md §34) replace that store.
+#
+# ONE source of truth, decided once per process: ``aed_store_mode`` probes whether
+# the dedicated tables are readable and then routes EVERY AED read and write to
+# that one store for the rest of the process. Before the migration is applied the
+# probe finds no table and the feature keeps its current behaviour through the
+# legacy shards; after it is applied the dedicated tables are the ONLY store (the
+# legacy shards are neither read nor written), so the two stores can never
+# disagree. Applying the migration therefore takes effect on the next service start.
+#
+# Every dedicated function returns ``None``/``False`` on failure (never raises), so
+# the service can fail closed and never mistake an unreadable store for an empty
+# one — exactly like the legacy helpers above.
+
+#: The writable columns of ``aed_config``.
+_AED_CONFIG_COLUMNS: tuple[str, ...] = ("enabled", "categories", "retention_days")
+
+#: The writable columns of ``aed_archive_entries`` (``updated_at`` is added here).
+_AED_ENTRY_COLUMNS: tuple[str, ...] = (
+    "id", "owner_id", "chat_id", "message_id", "kind", "category", "has_caption",
+    "captured_at", "message_date", "edited_at", "sender_id", "out", "has_media",
+    "body", "media_type", "media_name", "media_size", "media_stored",
+    "media_object", "recoverable", "recovered_from", "peer_id", "peer_username",
+    "peer_name",
+)
+
+#: ``"dedicated"`` | ``"legacy"`` | ``None`` (not probed yet). Decided once.
+_aed_store_mode: str | None = None
+
+
+def reset_aed_store_mode() -> None:
+    """Forget the cached store decision (tests / process restart)."""
+    global _aed_store_mode
+    _aed_store_mode = None
+
+
+def _aed_probe_store_sync() -> tuple[str, bool]:
+    """Decide the ONE AED store for this process: the dedicated tables when they
+    are readable, the legacy ``bot_settings`` shards otherwise.
+
+    Returns ``(mode, definitive)``. Only a DEFINITIVE result is cached: a missing
+    table cannot appear mid-process without a restart, but a transient network or
+    timeout error must not pin the feature to the legacy store forever, so it is
+    used for this call only and the probe runs again next time.
+    """
+    db = get_db()
+    if db is None:
+        # The in-memory fallback implements the dedicated store directly.
+        return "dedicated", True
+    try:
+        db.table("aed_config").select("owner_id").limit(1).execute()
+        return "dedicated", True
+    except Exception as exc:
+        code = str(getattr(exc, "code", "") or "")
+        message = str(exc).lower()
+        definitive = (
+            code in ("42P01", "PGRST205")
+            or "does not exist" in message
+            or "could not find the table" in message
+        )
+        logger.info(
+            "[AED_DB] dedicated tables unavailable (%s, definitive=%s) — using the "
+            "legacy bot_settings shards until the migration is applied",
+            type(exc).__name__, definitive,
+        )
+        return "legacy", definitive
+
+
+async def aed_store_mode() -> str:
+    """The ONE AED store for this process (probed once, then cached)."""
+    global _aed_store_mode
+    if _aed_store_mode is not None:
+        return _aed_store_mode
+    try:
+        mode, definitive = await _run_sync(_aed_probe_store_sync)
+    except Exception as exc:
+        logger.error("[AED_DB] store probe FAILED: %s", exc)
+        return "legacy"
+    if definitive:
+        _aed_store_mode = mode
+    return mode
+
+
+def _aed_config_payload(document: dict) -> dict:
+    """The writable half of a configuration document (unknown keys are never written)."""
+    payload = {column: document[column] for column in _AED_CONFIG_COLUMNS if column in document}
+    payload["updated_at"] = datetime.now(timezone.utc).isoformat()
+    return payload
+
+
+def _aed_entry_payload(owner_id: int, row: dict) -> dict:
+    """One archive row mapped onto its columns, with the durable identity pinned."""
+    payload = {column: row.get(column) for column in _AED_ENTRY_COLUMNS}
+    payload["id"] = str(row.get("id"))
+    payload["owner_id"] = owner_id
+    payload["updated_at"] = datetime.now(timezone.utc).isoformat()
+    return payload
+
+
+def _get_aed_config_sync(owner_id: int) -> dict | None:
+    db = get_db()
+    if db is None:
+        row = _fallback["aed_config"].get(owner_id)
+        return dict(row) if row else None
+    try:
+        result = (
+            db.table("aed_config")
+            .select("*")
+            .eq("owner_id", owner_id)
+            .limit(1)
+            .execute()
+        )
+        rows = getattr(result, "data", None) or []
+        return dict(rows[0]) if rows else None
+    except Exception as exc:
+        logger.error("[AED_DB] get aed_config FAILED: %s", exc)
+        return None
+
+
+async def aed_load_config(owner_id: int) -> dict | None:
+    """The owner's dedicated configuration row, or None when no row exists yet
+    OR the store could not be read. Both resolve to the fail-closed default in
+    the service (a missing row means the feature is OFF)."""
+    try:
+        return await _run_sync(_get_aed_config_sync, owner_id)
+    except Exception as exc:
+        logger.error("[AED_DB] get aed_config FAILED: %s", exc)
+        return None
+
+
+def _save_aed_config_sync(owner_id: int, document: dict) -> bool:
+    payload = _aed_config_payload(document)
+    db = get_db()
+    if db is None:
+        row = dict(_fallback["aed_config"].get(owner_id) or {"owner_id": owner_id})
+        row.update(payload)
+        _fallback["aed_config"][owner_id] = row
+        return True
+    try:
+        existing = (
+            db.table("aed_config").select("owner_id").eq("owner_id", owner_id).limit(1).execute()
+        )
+        if getattr(existing, "data", None):
+            db.table("aed_config").update(payload).eq("owner_id", owner_id).execute()
+        else:
+            db.table("aed_config").insert({"owner_id": owner_id, **payload}).execute()
+        return True
+    except Exception as exc:
+        logger.error("[AED_DB] save aed_config FAILED: %s", exc)
+        record_event("database", "save aed_config", 0, "ERROR", str(exc))
+        return False
+
+
+async def aed_save_config(owner_id: int, document: dict) -> bool:
+    """Write the whole configuration document into the dedicated row. True only
+    when the durable write landed."""
+    try:
+        return await _run_sync(_save_aed_config_sync, owner_id, document)
+    except Exception as exc:
+        logger.error("[AED_DB] save aed_config FAILED: %s", exc)
+        return False
+
+
+def _aed_entry_rows(owner_id: int | None) -> list[dict]:
+    rows = _fallback["aed_archive_entries"]
+    if owner_id is None:
+        return [dict(r) for r in rows]
+    return [dict(r) for r in rows if r.get("owner_id") == owner_id]
+
+
+def _load_aed_entries_sync(owner_id: int | None) -> list[dict] | None:
+    """Read this owner's archive rows (or every owner's when ``owner_id`` is
+    None). ``None`` means the store could not be read."""
+    db = get_db()
+    if db is None:
+        return _aed_entry_rows(owner_id)
+    try:
+        query = db.table("aed_archive_entries").select("*")
+        if owner_id is not None:
+            query = query.eq("owner_id", owner_id)
+        result = query.order("captured_at", desc=True).execute()
+        return [dict(row) for row in (getattr(result, "data", None) or [])]
+    except Exception as exc:
+        logger.error("[AED_DB] load aed_archive_entries FAILED: %s", exc)
+        return None
+
+
+async def aed_load_entries(owner_id: int) -> list[dict] | None:
+    """Load THIS owner's archive rows, newest first. ``None`` means the store
+    could not be read (never presented as an empty archive)."""
+    try:
+        return await _run_sync(_load_aed_entries_sync, owner_id)
+    except Exception as exc:
+        logger.error("[AED_DB] load aed_archive_entries FAILED: %s", exc)
+        return None
+
+
+async def aed_load_all_entries() -> list[dict] | None:
+    """Load EVERY owner's archive rows (the retention worker sweeps all owners).
+    ``None`` means the store could not be read."""
+    try:
+        return await _run_sync(_load_aed_entries_sync, None)
+    except Exception as exc:
+        logger.error("[AED_DB] load aed_archive_entries FAILED: %s", exc)
+        return None
+
+
+def _save_aed_entries_sync(owner_id: int, rows: list[dict]) -> bool:
+    """Replace THIS owner's archive rows with ``rows`` (the caller always passes
+    the complete bounded set). New rows are written first, then the owner's rows
+    that are no longer present are pruned, so an interrupted write can never
+    leave the store claiming rows the service no longer holds."""
+    db = get_db()
+    payloads = [_aed_entry_payload(owner_id, row) for row in rows]
+    if db is None:
+        kept = [dict(r) for r in _fallback["aed_archive_entries"] if r.get("owner_id") != owner_id]
+        _fallback["aed_archive_entries"] = kept + payloads
+        return True
+    try:
+        if payloads:
+            db.table("aed_archive_entries").upsert(
+                payloads, on_conflict="id"
+            ).execute()
+            db.table("aed_archive_entries").delete().eq("owner_id", owner_id).not_.in_(
+                "id", [p["id"] for p in payloads]
+            ).execute()
+        else:
+            db.table("aed_archive_entries").delete().eq("owner_id", owner_id).execute()
+        return True
+    except Exception as exc:
+        logger.error("[AED_DB] save aed_archive_entries FAILED: %s", exc)
+        record_event("database", "save aed_archive_entries", 0, "ERROR", str(exc))
+        return False
+
+
+async def aed_save_entries(owner_id: int, rows: list[dict]) -> bool:
+    """Persist THIS owner's complete bounded archive row set. True only when the
+    durable write landed."""
+    try:
+        return await _run_sync(_save_aed_entries_sync, owner_id, list(rows))
+    except Exception as exc:
+        logger.error("[AED_DB] save aed_archive_entries FAILED: %s", exc)
+        return False
+
+
+def _delete_aed_entries_sync(ids: list[str]) -> bool:
+    db = get_db()
+    wanted = [str(i) for i in ids if i]
+    if db is None:
+        drop = set(wanted)
+        _fallback["aed_archive_entries"] = [
+            r for r in _fallback["aed_archive_entries"] if str(r.get("id")) not in drop
+        ]
+        return True
+    if not wanted:
+        return True
+    try:
+        db.table("aed_archive_entries").delete().in_("id", wanted).execute()
+        return True
+    except Exception as exc:
+        logger.error("[AED_DB] delete aed_archive_entries FAILED: %s", exc)
+        record_event("database", "delete aed_archive_entries", 0, "ERROR", str(exc))
+        return False
+
+
+async def aed_delete_entries(ids: list[str]) -> bool:
+    """Delete specific archive rows by id (the retention worker's sweep)."""
+    try:
+        return await _run_sync(_delete_aed_entries_sync, list(ids))
+    except Exception as exc:
+        logger.error("[AED_DB] delete aed_archive_entries FAILED: %s", exc)
         return False

@@ -33,15 +33,17 @@ TODO_SCHEDULE_TYPE = "20260926000001_add_todo_schedule_type.sql"
 TODO_STEPS = "20260927000001_add_todo_steps.sql"
 EMOJI_TABLES = "20260928000001_create_emoji_reaction_tables.sql"
 PRIVATE_MESSAGE_TABLES = "20260929000001_create_private_message_tables.sql"
+ANTI_EDIT_DELETE_TABLES = "20261017000001_create_anti_edit_delete_tables.sql"
 
 #: The order §31 documents — verified against the sources, not assumed. The TTS
 #: settings migration, the Todo schedule type, the Todo steps table, the Emoji &
-#: Reaction tables and the Private Message Management tables are LATER additive
-#: schema changes, so they are appended last, newest last (the documented rule:
-#: a later change never edits the snapshot).
+#: Reaction tables, the Private Message Management tables and the Anti-Edit /
+#: Anti-Delete tables are LATER additive schema changes, so they are appended
+#: last, newest last (the documented rule: a later change never edits the snapshot).
 DOCUMENTED_ORDER = (
     RECONCILE, VAULT_PART1, VAULT_PART2, DISPLAY_NAME, SEARCH_INDEXES, TTS_SETTINGS,
     TODO_SCHEDULE_TYPE, TODO_STEPS, EMOJI_TABLES, PRIVATE_MESSAGE_TABLES,
+    ANTI_EDIT_DELETE_TABLES,
 )
 
 #: The banner that marks the ONE complete deployment block.
@@ -277,16 +279,43 @@ def test_the_todo_steps_part_carries_the_whole_table_before_the_newest_change():
     )
 
 
-def test_the_private_message_part_is_last_and_carries_the_two_tables():
-    """The Private Message Management tables are the newest additive change, so
-    they close the block; the Emoji & Reaction part sits immediately before."""
+def test_the_anti_edit_delete_part_is_last_and_carries_the_two_tables():
+    """The Anti-Edit / Anti-Delete tables are the newest additive change, so they
+    close the block; the Private Message part sits immediately before."""
     spans = _part_spans(_setup_block())
-    assert list(spans)[-1] == PRIVATE_MESSAGE_TABLES, (
+    assert list(spans)[-1] == ANTI_EDIT_DELETE_TABLES, (
         "the most recent additive migration must close the block"
     )
-    assert list(spans)[-2] == EMOJI_TABLES, (
-        "the Emoji & Reaction part must stay immediately before it"
+    assert list(spans)[-2] == PRIVATE_MESSAGE_TABLES, (
+        "the Private Message part must stay immediately before it"
     )
+    part = spans[ANTI_EDIT_DELETE_TABLES]
+    for table in ("aed_config", "aed_archive_entries"):
+        assert f"CREATE TABLE IF NOT EXISTS {table}" in part, (
+            f"the Anti-Edit / Anti-Delete part is missing the {table} table"
+        )
+    for guarantee in (
+        "enabled",
+        "categories",
+        "retention_days",
+        "kind IN ('snapshot', 'edit', 'delete')",
+        "CHECK (chat_id > 0)",
+        "idx_aed_archive_entries_owner_captured",
+        "ENABLE ROW LEVEL SECURITY",
+        "anon_select_aed_config",
+        "anon_select_aed_archive_entries",
+        "NOTIFY pgrst, 'reload schema'",
+        "FROM information_schema.tables",
+        "FROM information_schema.columns",
+        "FROM bot_settings",
+    ):
+        assert guarantee in part, f"the Anti-Edit / Anti-Delete part is missing {guarantee!r}"
+
+
+def test_the_private_message_part_carries_the_two_tables():
+    """The Private Message Management tables stay embedded, whole."""
+    spans = _part_spans(_setup_block())
+    assert PRIVATE_MESSAGE_TABLES in spans, "the Private Message tables must stay embedded"
     part = spans[PRIVATE_MESSAGE_TABLES]
     for table in ("private_message_config", "private_message_senders"):
         assert f"CREATE TABLE IF NOT EXISTS {table}" in part, (
@@ -409,12 +438,12 @@ def test_the_audited_order_is_recorded_in_the_audit_table():
     """§31.1 names every embedded migration, and its PART table keeps the order.
 
     The audit now also classifies the 22 pre-reconciliation migrations, so the
-    order contract is checked against the table of the nine EMBEDDED parts
+    order contract is checked against the table of the eleven EMBEDDED parts
     (the first table in §31.1), not against the whole prose.
     """
     section = _section_31()
     audit = section[: section.index("### 31.2")]
-    assert "all 32 migrations" in _flat(audit) or "32 files" in audit, (
+    assert "all 33 migrations" in _flat(audit) or "33 files" in audit, (
         "the audit must state that every repository migration was classified"
     )
     embedded_table = audit[audit.index("| Order | Migration") :]
@@ -433,12 +462,14 @@ def test_the_documented_deviations_are_stated_explicitly():
     flat = _flat(_section_31())
     assert "display_name" in flat
     assert "42703" in flat, "the failure the ordering prevents must be named"
-    assert "ten migrations" in flat, "the later migrations must be acknowledged"
+    assert "eleven migrations" in flat, "the later migrations must be acknowledged"
     assert "add_todo_schedule_type" in flat, "the Todo schedule type must be acknowledged"
     assert "add_todo_steps" in flat, "the Todo steps table must be acknowledged"
     assert "create_emoji_reaction_tables" in flat, "the Emoji & Reaction tables must be acknowledged"
     assert "create_private_message_tables" in flat, "the Private Message tables must be acknowledged"
     assert "private_message_senders" in flat, "the per-person counters must be acknowledged"
+    assert "create_anti_edit_delete_tables" in flat, "the Anti-Edit / Anti-Delete tables must be acknowledged"
+    assert "aed_archive_entries" in flat, "the AED archive table must be acknowledged"
     assert "tts_provider" in flat, "the TTS settings columns must be acknowledged"
 
 

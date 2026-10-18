@@ -82,6 +82,8 @@ SUCCESSOR_TABLES = (
     "emoji_chat_overrides",
     "private_message_config",
     "private_message_senders",
+    "aed_config",
+    "aed_archive_entries",
 )
 
 # Identifiers that are SQL keywords/functions, not columns.
@@ -712,8 +714,8 @@ def doc_setup_block() -> str:
 def doc_reconciliation_segment() -> str:
     """Part 1 of the setup block — the canonical snapshot, comment-stripped."""
     block = doc_setup_block()
-    start = block.index("-- ─── PART 1 of 10")
-    end = block.index("-- ─── PART 2 of 10")
+    start = block.index("-- ─── PART 1 of 11")
+    end = block.index("-- ─── PART 2 of 11")
     return block[start:end]
 
 

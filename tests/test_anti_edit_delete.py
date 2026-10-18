@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -31,7 +32,7 @@ BOT = 4242
 GROUP = -1001234567890
 
 
-# ── fake database (the bot_settings key/value table) ─────────────────────────
+# ── fake database (bot_settings + the two dedicated AED tables) ──────────────
 
 
 class _Result:
@@ -40,22 +41,39 @@ class _Result:
 
 
 class _FakeDB:
-    """``bot_settings`` with the query shapes the db helpers use."""
+    """A minimal PostgREST stand-in for the three tables the AED layer touches.
 
-    def __init__(self, fail_write: bool = False):
-        self.rows: dict[str, dict] = {}
+    ``bot_settings`` is the legacy key/value store; ``aed_config`` and
+    ``aed_archive_entries`` are the dedicated tables. ``has_aed_tables=False``
+    simulates a database where the migration has NOT been applied: touching
+    either dedicated table raises the missing-table error the store probe
+    detects, so the feature falls back to the legacy shards.
+    """
+
+    def __init__(self, fail_write: bool = False, has_aed_tables: bool = True):
+        self.rows: dict[str, dict] = {}          # bot_settings key -> row
+        self.aed_config: dict[int, dict] = {}    # owner_id -> row
+        self.aed_entries: list[dict] = []        # one row per archive record
         self.fail_write = fail_write
+        self.has_aed_tables = has_aed_tables
         self._table = None
         self._op = None
         self._payload = None
         self._filters: list[tuple[str, str, object]] = []
+        self._order: tuple[str, bool] | None = None
         self._limit = None
         self._single = False
+        self._negate = False
+
+    # -- query builder -------------------------------------------------------
 
     def table(self, name):
-        assert name == "bot_settings", name
+        if name in ("aed_config", "aed_archive_entries") and not self.has_aed_tables:
+            raise RuntimeError(f'relation "public.{name}" does not exist')
+        assert name in ("bot_settings", "aed_config", "aed_archive_entries"), name
         self._table, self._op, self._payload = name, None, None
-        self._filters, self._limit, self._single = [], None, False
+        self._filters, self._order, self._limit, self._single = [], None, None, False
+        self._negate = False
         return self
 
     def select(self, columns="*"):
@@ -72,12 +90,35 @@ class _FakeDB:
         self._payload = payload
         return self
 
+    def upsert(self, payload, on_conflict=None):
+        self._op = "upsert"
+        self._payload = payload
+        self._on_conflict = on_conflict
+        return self
+
+    def delete(self):
+        self._op = "delete"
+        return self
+
     def eq(self, column, value):
         self._filters.append(("eq", column, value))
         return self
 
     def like(self, column, pattern):
         self._filters.append(("like", column, pattern))
+        return self
+
+    def in_(self, column, value):
+        self._filters.append(("not_in" if self._negate else "in", column, value))
+        return self
+
+    @property
+    def not_(self):
+        self._negate = True
+        return self
+
+    def order(self, column, desc=False):
+        self._order = (column, desc)
         return self
 
     def limit(self, value):
@@ -88,9 +129,18 @@ class _FakeDB:
         self._single = True
         return self
 
-    def _match(self):
+    # -- execution -----------------------------------------------------------
+
+    def _store(self) -> list[dict]:
+        if self._table == "bot_settings":
+            return list(self.rows.values())
+        if self._table == "aed_config":
+            return list(self.aed_config.values())
+        return self.aed_entries
+
+    def _match(self, rows=None):
         out = []
-        for key, row in self.rows.items():
+        for row in self._store() if rows is None else rows:
             ok = True
             for op, column, value in self._filters:
                 if op == "eq" and row.get(column) != value:
@@ -99,23 +149,51 @@ class _FakeDB:
                     prefix = str(value).rstrip("%")
                     if not str(row.get(column, "")).startswith(prefix):
                         ok = False
+                if op == "in" and row.get(column) not in value:
+                    ok = False
+                if op == "not_in" and row.get(column) in value:
+                    ok = False
             if ok:
                 out.append(row)
         return out
 
     def execute(self):
+        if self._op in ("insert", "update", "upsert", "delete") and self.fail_write:
+            raise RuntimeError("write refused")
         if self._op == "insert":
-            if self.fail_write:
-                raise RuntimeError("write refused")
-            self.rows[self._payload["key"]] = dict(self._payload)
+            if self._table == "bot_settings":
+                self.rows[self._payload["key"]] = dict(self._payload)
+                return _Result([dict(self._payload)])
+            if self._table == "aed_config":
+                self.aed_config[self._payload["owner_id"]] = dict(self._payload)
+                return _Result([dict(self._payload)])
+            self.aed_entries.append(dict(self._payload))
             return _Result([dict(self._payload)])
+        if self._op == "upsert":
+            by_id = {row["id"]: row for row in self.aed_entries}
+            for payload in self._payload:
+                by_id[payload["id"]] = dict(payload)
+            self.aed_entries = list(by_id.values())
+            return _Result([dict(p) for p in self._payload])
         if self._op == "update":
-            if self.fail_write:
-                raise RuntimeError("write refused")
             for row in self._match():
                 row.update(self._payload)
             return _Result([dict(r) for r in self._match()])
+        if self._op == "delete":
+            victims = {id(r) for r in self._match()}
+            if self._table == "bot_settings":
+                for key in [k for k, row in self.rows.items() if id(row) in victims]:
+                    self.rows.pop(key, None)
+            elif self._table == "aed_config":
+                for key in [k for k, row in self.aed_config.items() if id(row) in victims]:
+                    self.aed_config.pop(key, None)
+            else:
+                self.aed_entries = [r for r in self.aed_entries if id(r) not in victims]
+            return _Result([])
         matched = self._match()
+        if self._order is not None:
+            column, desc = self._order
+            matched = sorted(matched, key=lambda r: str(r.get(column) or ""), reverse=desc)
         if self._limit is not None:
             matched = matched[: self._limit]
         if self._single:
@@ -258,11 +336,13 @@ def _run(coro):
 @pytest.fixture(autouse=True)
 def _clean(monkeypatch):
     svc.reset_in_memory()
+    db_client.reset_aed_store_mode()
     svc.configure_owner(OWNER)
     inline_engine.set_owner_id(OWNER)
     inline_engine.set_self_client(None)
     yield
     svc.reset_in_memory()
+    db_client.reset_aed_store_mode()
     inline_engine.set_self_client(None)
 
 
@@ -284,6 +364,15 @@ def client(db):
 def enabled(db):
     _run(svc.set_enabled(True))
     return db
+
+
+def _seed_rows(db, rows):
+    """Seed archive rows straight into the DEDICATED store (the fake tables).
+
+    A malformed entry is stored AS-IS, so the test exercises the service's real
+    tolerance of malformed persisted data.
+    """
+    db.aed_entries.extend(dict(r) if isinstance(r, dict) else r for r in rows)
 
 
 def _datas(buttons):
@@ -547,12 +636,12 @@ def test_cleanup_expired_removes_only_rows_past_retention(db):
         {"id": "old1", "owner_id": OWNER, "kind": svc.KIND_SNAPSHOT, "captured_at": old, "media_object": None},
         {"id": "new1", "owner_id": OWNER, "kind": svc.KIND_SNAPSHOT, "captured_at": fresh, "media_object": None},
     ]
-    _run(db_client.aed_save_archive(list(svc._SHARD_KEYS), [[rows[0]], [rows[1]], [], []]))
+    _seed_rows(db, rows)
     stats = _run(svc.cleanup_expired(now=now))
     assert set(stats) == {"archive_deleted", "snapshots_deleted", "objects_deleted"}
     assert stats["snapshots_deleted"] == 1
-    remaining = _run(db_client.aed_load_archive(list(svc._SHARD_KEYS)))
-    kept_ids = [r["id"] for shard in remaining for r in shard]
+    remaining = _run(db_client.aed_load_entries(OWNER))
+    kept_ids = [r["id"] for r in remaining]
     assert kept_ids == ["new1"]
 
 
@@ -862,7 +951,7 @@ def test_legacy_rows_without_identity_render_safely(client, enabled):
         "captured_at": datetime.now(timezone.utc).isoformat(),
         "body": "old row", "has_media": False, "recoverable": True,
     }
-    _run(db_client.aed_save_archive(list(svc._SHARD_KEYS), [[legacy], [], [], []]))
+    _seed_rows(enabled, [legacy])
     svc.reset_in_memory()
     svc.configure_owner(OWNER)
     _run(svc.set_enabled(True))
@@ -907,9 +996,7 @@ def test_owner_isolation_is_preserved_across_grouping(client, enabled):
         "kind": svc.KIND_SNAPSHOT, "category": svc.CATEGORY_TEXT,
         "captured_at": datetime.now(timezone.utc).isoformat(), "body": "not mine",
     }
-    stored = _run(svc.load_rows_async())
-    shards = [[r for r in stored] + [other], [], [], []]
-    _run(db_client.aed_save_archive(list(svc._SHARD_KEYS), shards))
+    _seed_rows(enabled, [other])
     svc.reset_in_memory()
     svc.configure_owner(OWNER)
     _run(svc.set_enabled(True))
@@ -1045,7 +1132,7 @@ def _resolving_peer(entity=None, broken=False):
 
 def test_persisted_bot_records_are_hidden_from_listing_and_detail(client, enabled, monkeypatch):
     seeded = _seed_legacy_rows()
-    _run(db_client.aed_save_archive(list(svc._SHARD_KEYS), [[seeded[0]], [seeded[1]], [], []]))
+    _seed_rows(enabled, [seeded[0], seeded[1]])
     svc.reset_in_memory()
     svc.configure_owner(OWNER)
     _run(svc.set_enabled(True))
@@ -1070,7 +1157,7 @@ def test_no_client_or_unresolvable_peer_keeps_the_existing_fallback(client, enab
     """Without a classification, a persisted row is NEVER hidden nor guessed
     human-flat out: the existing safe fallback keeps it visible."""
     seeded = _seed_legacy_rows()
-    _run(db_client.aed_save_archive(list(svc._SHARD_KEYS), [[seeded[0]], [seeded[1]], [], []]))
+    _seed_rows(enabled, [seeded[0], seeded[1]])
     svc.reset_in_memory()
     svc.configure_owner(OWNER)
     _run(svc.set_enabled(True))
@@ -1199,10 +1286,8 @@ def test_cooldown_expiry_retries_and_classifies_normally(client, enabled):
 
 
 def test_later_successful_resolution_hides_persisted_bot_rows(client, enabled):
-    _run(db_client.aed_save_archive(
-        list(svc._SHARD_KEYS),
-        [[_seed_legacy_rows()[0]], [_seed_legacy_rows()[1]], [], []],
-    ))
+    seeded = _seed_legacy_rows()
+    _seed_rows(enabled, [seeded[0], seeded[1]])
     svc.reset_in_memory()
     svc.configure_owner(OWNER)
     _run(svc.set_enabled(True))
@@ -1260,3 +1345,157 @@ def test_unknown_stays_unknown_during_deferral(client, enabled):
     assert svc.is_bot_entity(User(id=BOT, username="sexyboyvpn_bot")) is False  # bot flag absent
     assert svc.is_bot_entity(User(id=BOT, username="sexyboyvpn_bot", bot=False)) is False
     assert svc.is_bot_entity(User(id=BOT, username="sexyboyvpn_bot", bot=True)) is True
+
+
+# ── 16. dedicated AED tables (the migration's repository integration) ─────────
+
+
+def _legacy_db(monkeypatch):
+    """A database where the AED migration has NOT been applied."""
+    fake = _FakeDB(has_aed_tables=False)
+    monkeypatch.setattr("backend.db.client.get_db", lambda: fake)
+    return fake
+
+
+def test_store_mode_is_dedicated_when_the_tables_exist(client, db):
+    assert _run(db_client.aed_store_mode()) == "dedicated"
+
+
+def test_store_mode_falls_back_to_legacy_before_the_migration(monkeypatch):
+    _legacy_db(monkeypatch)
+    assert _run(db_client.aed_store_mode()) == "legacy"
+
+
+def test_capture_persists_into_the_dedicated_tables(client, enabled):
+    _capture(client, _msg(message_id=7, text="hello there"), entity=User(id=FRIEND, username="alice"))
+    assert enabled.aed_entries, "the row must be written to aed_archive_entries"
+    row = enabled.aed_entries[0]
+    assert row["owner_id"] == OWNER
+    assert row["chat_id"] == FRIEND
+    assert row["message_id"] == 7
+    assert row["kind"] == svc.KIND_SNAPSHOT
+    assert row["body"] == "hello there"
+    assert row["peer_username"] == "alice"
+    # The legacy shard documents are NOT touched once the tables exist.
+    assert not any(key.startswith("anti_edit_delete_archive_shard") for key in enabled.rows)
+
+
+def test_config_persists_into_the_dedicated_table(client, db):
+    assert _run(svc.set_enabled(True)) is True
+    assert db.aed_config[OWNER]["enabled"] is True
+    assert not any(key.startswith("anti_edit_delete_config") for key in db.rows)
+    assert _run(svc.set_retention_days(9)) is True
+    assert db.aed_config[OWNER]["retention_days"] == 9
+
+
+def test_config_reloads_from_the_dedicated_table(client, db):
+    _run(svc.set_enabled(True))
+    _run(svc.set_retention_days(3))
+    svc.reset_in_memory()
+    svc.configure_owner(OWNER)
+    _run(svc.ensure_loaded_async())
+    assert svc.is_enabled() is True
+    assert svc.retention_days() == 3
+
+
+def test_edit_and_delete_rows_keep_their_distinct_kinds(client, enabled):
+    entity = User(id=FRIEND, username="alice")
+    _capture(client, _msg(message_id=7, text="v1"), entity=entity)
+    _edit(client, _msg(message_id=7, text="v2", edit_date=datetime.now(timezone.utc)), entity=entity)
+    _run(client.handler("MessageDeleted")(
+        SimpleNamespace(chat_id=FRIEND, deleted_ids=[7], is_private=True)
+    ))
+    kinds = sorted(r["kind"] for r in enabled.aed_entries)
+    assert kinds == [svc.KIND_DELETE, svc.KIND_EDIT, svc.KIND_SNAPSHOT]
+
+
+def test_owner_isolation_is_enforced_by_the_dedicated_queries(client, enabled):
+    _capture(client, _msg(message_id=7, text="mine"))
+    _seed_rows(enabled, [{
+        "id": "other01", "owner_id": OWNER + 1, "chat_id": FRIEND, "message_id": 8,
+        "kind": svc.KIND_SNAPSHOT, "category": svc.CATEGORY_TEXT,
+        "captured_at": datetime.now(timezone.utc).isoformat(), "body": "not mine",
+    }])
+    svc.reset_in_memory()
+    svc.configure_owner(OWNER)
+    _run(svc.set_enabled(True))
+    rows = _run(svc.load_rows_async())
+    assert [r["owner_id"] for r in rows] == [OWNER]
+    assert all(r.get("body") != "not mine" for r in rows)
+
+
+def test_a_duplicate_id_is_never_stored_twice(client, enabled):
+    entity = User(id=FRIEND, username="alice")
+    message = _msg(message_id=7, text="hello")          # the SAME message, same date
+    _capture(client, message, entity=entity)
+    _capture(client, message, entity=entity)            # a redelivered update
+    ids = [r["id"] for r in enabled.aed_entries]
+    assert len(ids) == len(set(ids)) == 1
+
+
+def test_malformed_persisted_rows_are_tolerated(client, enabled):
+    _seed_rows(enabled, [
+        {"id": "broken01", "owner_id": OWNER},                       # missing fields
+        {"id": "broken02", "owner_id": OWNER, "chat_id": None, "message_id": None,
+         "kind": "nonsense", "captured_at": "not-a-date"},           # wrong values
+        {"id": "ok01", "owner_id": OWNER, "chat_id": FRIEND, "message_id": 3,
+         "kind": svc.KIND_SNAPSHOT, "category": svc.CATEGORY_TEXT,
+         "captured_at": datetime.now(timezone.utc).isoformat(), "body": "fine"},
+    ])
+    svc.reset_in_memory()
+    svc.configure_owner(OWNER)
+    _run(svc.set_enabled(True))
+    items = svc.build_items(_run(svc.load_rows_async()))
+    assert any(i.get("body") == "fine" for i in items)
+
+
+def test_a_failed_dedicated_write_is_reported_honestly(monkeypatch):
+    fake = _FakeDB(fail_write=True)
+    monkeypatch.setattr("backend.db.client.get_db", lambda: fake)
+    svc.reset_in_memory()
+    db_client.reset_aed_store_mode()
+    svc.configure_owner(OWNER)
+    assert _run(svc.set_enabled(True)) is False       # the write did not land
+    assert svc.is_enabled() is False                  # so the switch stays OFF
+
+
+def test_cleanup_deletes_expired_rows_from_the_dedicated_store(db):
+    _run(svc.set_enabled(True))
+    _run(svc.set_retention_days(1))
+    now = datetime.now(timezone.utc)
+    _seed_rows(db, [
+        {"id": "old1", "owner_id": OWNER, "kind": svc.KIND_SNAPSHOT,
+         "captured_at": (now - timedelta(days=5)).isoformat()},
+        {"id": "new1", "owner_id": OWNER, "kind": svc.KIND_SNAPSHOT,
+         "captured_at": now.isoformat()},
+    ])
+    stats = _run(svc.cleanup_expired(now=now))
+    assert stats["snapshots_deleted"] == 1
+    assert [r["id"] for r in db.aed_entries] == ["new1"]
+
+
+def test_the_dedicated_schema_cannot_broaden_the_archive_scope():
+    """The migration's CHECK is the structural backstop for the private-only scope."""
+    from pathlib import Path
+
+    sql = (Path(__file__).resolve().parent.parent / "supabase" / "migrations"
+           / "20261017000001_create_anti_edit_delete_tables.sql").read_text(encoding="utf-8")
+    executable = re.sub(r"/\*.*?\*/", "", sql, flags=re.S)
+    assert "CHECK (chat_id > 0)" in executable
+    assert "CHECK (kind IN ('snapshot', 'edit', 'delete'))" in executable
+
+
+def test_legacy_shards_still_work_before_the_migration(monkeypatch):
+    """Before the migration is applied the feature keeps its existing behaviour."""
+    _legacy_db(monkeypatch)
+    svc.reset_in_memory()
+    svc.configure_owner(OWNER)
+    _run(db_client.aed_save_archive(list(svc._SHARD_KEYS), [[{
+        "id": "legacy01", "owner_id": OWNER, "chat_id": FRIEND, "message_id": 1,
+        "kind": svc.KIND_SNAPSHOT, "category": svc.CATEGORY_TEXT,
+        "captured_at": datetime.now(timezone.utc).isoformat(), "body": "old row",
+    }], [], [], []]))
+    _run(svc.set_enabled(True))
+    rows = _run(svc.load_rows_async())
+    assert [r["id"] for r in rows] == ["legacy01"]
+    assert _run(svc.set_retention_days(4)) is True     # config still writes the legacy doc
