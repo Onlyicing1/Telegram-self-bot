@@ -302,14 +302,19 @@ def test_the_anti_edit_delete_part_is_last_and_carries_the_two_tables():
         "CHECK (chat_id > 0)",
         "idx_aed_archive_entries_owner_captured",
         "ENABLE ROW LEVEL SECURITY",
-        "anon_select_aed_config",
-        "anon_select_aed_archive_entries",
+        'DROP POLICY IF EXISTS "anon_select_aed_config" ON aed_config;',
+        'DROP POLICY IF EXISTS "anon_select_aed_archive_entries" ON aed_archive_entries;',
+        "REVOKE ALL ON TABLE aed_config FROM PUBLIC, anon, authenticated;",
+        "REVOKE ALL ON TABLE aed_archive_entries FROM PUBLIC, anon, authenticated;",
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE aed_config TO service_role;",
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE aed_archive_entries TO service_role;",
         "NOTIFY pgrst, 'reload schema'",
         "FROM information_schema.tables",
         "FROM information_schema.columns",
         "FROM bot_settings",
     ):
         assert guarantee in part, f"the Anti-Edit / Anti-Delete part is missing {guarantee!r}"
+    assert "CREATE POLICY" not in part, "the AED tables must carry no policy at all"
 
 
 def test_the_private_message_part_carries_the_two_tables():

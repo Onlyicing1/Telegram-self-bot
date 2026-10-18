@@ -9,9 +9,9 @@ migration gives the feature its own two tables in their FINAL shape — exactly
 the shape `backend/services/anti_edit_delete_service.py` reads and writes — so
 the archive no longer shares one row-per-shard document with every other
 `bot_settings` consumer. Like every successor migration it is forward-only and
-additive: it creates two tables, their constraints, one index, RLS policies,
-grants and comments, and it touches no existing table, column, row, policy or
-grant.
+additive: it creates two tables, their constraints, one index, their RLS posture
+and grants, and comments, and it touches no existing table, column, row, policy
+or grant.
 
     aed_config           the owner's configuration (ONE row per owner)
     aed_archive_entries  one row per observed archive record
@@ -89,12 +89,26 @@ once the tables exist.
 
 ## Security
 
-RLS is enabled on both tables and `anon`/`authenticated` receive SELECT only —
-the same read-only dashboard boundary every other table has. Every write goes
-through the backend service-role client, and every repository query filters by
-`owner_id`, so one owner can never read or mutate another owner's rows. The AI
-has no tool that reaches either table: capture, browsing and cleanup are
-deterministic service code.
+The archive holds PRIVATE message bodies and peer metadata, so it is
+service-role only — it is deliberately NOT part of the read-only dashboard
+boundary:
+
+- RLS is enabled on both tables and there are **ZERO policies**. `service_role`
+  bypasses RLS, so no policy is needed for the backend; without FORCE ROW LEVEL
+  SECURITY the tables behave exactly like every other table for their owner.
+- Every privilege is **revoked** from `PUBLIC`, `anon` and `authenticated` —
+  table-level AND column-level (a table `REVOKE` alone would leave a legacy
+  per-column grant intact).
+- `service_role` receives exactly the four verbs the repository uses: SELECT,
+  INSERT, UPDATE and DELETE. Nothing else is granted.
+- The permissive read policies an earlier revision of this file created
+  (`anon_select_aed_config`, `anon_select_aed_archive_entries`) are removed by
+  name, so re-running this migration on a database that still carries them ends
+  in the restrictive posture above.
+
+Every repository query filters by `owner_id`, so one owner can never read or
+mutate another owner's rows. The AI has no tool that reaches either table:
+capture, browsing and cleanup are deterministic service code.
 
 Idempotent: safe to run more than once. Applying it to the live Supabase project
 is a separate manual owner action.
@@ -106,6 +120,11 @@ DATABASE_ARCHITECTURE.md §31.3, so it is normally applied by running that block
 once). Until it is applied the feature keeps its current behaviour: the archive
 is read and written through the legacy `bot_settings` documents, which this
 migration neither reads nor modifies.
+
+If the two tables already exist (created manually), running this file is still
+worth it: it drops the legacy read policies, revokes every client privilege and
+leaves the service-role grants in place, so the repository's source of truth and
+the live posture converge instead of drifting.
 
 Rollback (destroys the dedicated configuration and archive rows — the feature
 then reports honestly that its durable store is missing and stays OFF; the
@@ -174,22 +193,45 @@ CREATE INDEX IF NOT EXISTS idx_aed_archive_entries_owner_captured
 ALTER TABLE aed_config ENABLE ROW LEVEL SECURITY;
 ALTER TABLE aed_archive_entries ENABLE ROW LEVEL SECURITY;
 
-GRANT SELECT ON aed_config TO anon, authenticated;
-GRANT SELECT ON aed_archive_entries TO anon, authenticated;
-
+-- Service-role only: no client role may read a private message body. A previous
+-- revision of this migration (and any setup that copied it) created permissive
+-- read policies; remove them by name, idempotently.
 DROP POLICY IF EXISTS "anon_insert_aed_config" ON aed_config;
 DROP POLICY IF EXISTS "anon_update_aed_config" ON aed_config;
 DROP POLICY IF EXISTS "anon_delete_aed_config" ON aed_config;
 DROP POLICY IF EXISTS "anon_select_aed_config" ON aed_config;
-CREATE POLICY "anon_select_aed_config" ON aed_config FOR SELECT
-    TO anon, authenticated USING (true);
 
 DROP POLICY IF EXISTS "anon_insert_aed_archive_entries" ON aed_archive_entries;
 DROP POLICY IF EXISTS "anon_update_aed_archive_entries" ON aed_archive_entries;
 DROP POLICY IF EXISTS "anon_delete_aed_archive_entries" ON aed_archive_entries;
 DROP POLICY IF EXISTS "anon_select_aed_archive_entries" ON aed_archive_entries;
-CREATE POLICY "anon_select_aed_archive_entries" ON aed_archive_entries FOR SELECT
-    TO anon, authenticated USING (true);
+
+REVOKE ALL ON TABLE aed_config FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON TABLE aed_archive_entries FROM PUBLIC, anon, authenticated;
+
+-- Column privileges are granted independently of table privileges, so a table
+-- REVOKE cannot clear a legacy grant that was made per column.
+DO $$
+DECLARE
+    tbl  text;
+    cols text;
+BEGIN
+    FOREACH tbl IN ARRAY ARRAY['aed_config', 'aed_archive_entries'] LOOP
+        SELECT string_agg(quote_ident(column_name), ', ' ORDER BY ordinal_position)
+          INTO cols
+          FROM information_schema.columns
+         WHERE table_schema = 'public'
+           AND table_name   = tbl;
+        IF cols IS NOT NULL THEN
+            EXECUTE format(
+                'REVOKE ALL (%s) ON TABLE public.%I FROM PUBLIC, anon, authenticated',
+                cols, tbl);
+        END IF;
+    END LOOP;
+END $$;
+
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE aed_config TO service_role;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE aed_archive_entries TO service_role;
 
 COMMENT ON TABLE aed_config IS
     'ONE Anti-Edit / Anti-Delete configuration row per owner. The feature defaults to OFF; categories is the content filter (never empty) and retention_days (1..3650) is applied by the existing periodic memory-cleanup worker, not by a scheduler.';
