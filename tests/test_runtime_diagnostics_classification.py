@@ -97,6 +97,121 @@ def test_telethon_transport_loops_are_permanent_by_name_and_source():
     assert diag._is_permanent_task("bounded-slow-op", "_bounded_slow_op", "/app/backend/x.py") is False
 
 
+def _lifecycle_task(source: str, filename: str, name: str) -> asyncio.Task:
+    """A real task whose coroutine has the production frame (file + name).
+
+    ``_get_await_location``/``_get_coro_name`` read the coroutine's OWN frame,
+    so compiling the coroutine with the production filename reproduces exactly
+    what the dump sees for an asyncio.run()-created lifecycle task — no fake
+    frame objects and no live runtime.
+    """
+    namespace: dict = {}
+    exec(compile(source, filename, "exec"), namespace)
+    return asyncio.create_task(namespace["main"](), name=name)
+
+
+_LIFECYCLE_BODY = (
+    "import asyncio\n"
+    "async def main():\n"
+    "    await asyncio.Event().wait()\n"
+)
+
+
+def test_the_process_entrypoint_task_is_permanent_not_a_stall():
+    """Production symptom: ``Task-1`` = ``main`` awaiting shutdown_event.wait()."""
+    assert diag._is_permanent_task(
+        "Task-1", "main", "/app/backend/main.py:140"
+    ) is True
+    # The line suffix must not defeat the source match, and a relative entry
+    # path (``python backend/main.py``) must match too.
+    assert diag._is_permanent_task("Task-1", "main", "backend/main.py:140") is True
+
+
+def test_the_uvicorn_lifespan_task_is_permanent():
+    """Production symptom: ``Task-27`` = uvicorn's detached lifespan ``main``."""
+    assert diag._is_permanent_task(
+        "Task-27", "main",
+        "/app/.venv/lib/python3.12/site-packages/uvicorn/lifespan/on.py:63",
+    ) is True
+
+
+def test_an_application_coroutine_named_main_is_still_bounded():
+    """The rule is the entrypoint FILE, never the name ``main`` alone."""
+    assert diag._is_permanent_task(
+        "Task-7", "main", "/app/backend/services/worker.py:21"
+    ) is False
+    # A third-party file that merely happens to be called main.py is not the
+    # process entrypoint either.
+    assert diag._is_permanent_task(
+        "Task-8", "main", "/app/.venv/lib/python3.12/site-packages/acme/main.py:5"
+    ) is False
+
+
+def test_serve_is_matched_exactly_so_observe_and_preserve_stay_bounded():
+    """``serve`` was a substring pattern: ``_observe_*`` was never monitored."""
+    assert diag._is_permanent_task(
+        "Task-9", "serve", "/app/.venv/lib/python3.12/site-packages/uvicorn/server.py:75"
+    ) is True
+    for bounded in ("_observe_durable_ceiling", "_preserve_state", "observe_all"):
+        assert diag._is_permanent_task(
+            "bounded-op", bounded, "/app/backend/ai/database/task_repository.py:709"
+        ) is False, bounded
+
+
+@pytest.mark.asyncio
+async def test_the_two_production_lifecycle_tasks_are_never_reported(caplog):
+    """The exact post-58fa664 report: Task-1 and Task-27 as BOUNDED stalls."""
+    process = _lifecycle_task(_LIFECYCLE_BODY, "/app/backend/main.py", "Task-1")
+    lifespan = _lifecycle_task(
+        _LIFECYCLE_BODY, "/app/.venv/lib/python3.12/site-packages/uvicorn/lifespan/on.py",
+        "Task-27",
+    )
+    try:
+        await asyncio.sleep(0)
+        with caplog.at_level(logging.WARNING, logger="backend.diagnostics_loop"):
+            for _ in range(4):
+                await diag._dump_tasks()
+    finally:
+        for task in (process, lifespan):
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+    reported = _reported_task_names(caplog.text)
+    assert "Task-1" not in reported
+    assert "Task-27" not in reported
+    assert "TASK_NO_PROGRESS" not in caplog.text
+    assert "TASK_STARVATION" not in caplog.text
+    assert diag._stack_unchanged_count.get(process, 0) >= 3
+
+
+@pytest.mark.asyncio
+async def test_an_app_task_awaiting_a_shutdown_wait_is_still_reported(caplog):
+    """A bounded coroutine that awaits a lifecycle-style wait is NOT hidden."""
+    source = (
+        "import asyncio\n"
+        "_EVENT = asyncio.Event()\n"
+        "async def _shutdown_wait():\n"
+        "    await _EVENT.wait()\n"
+        "async def main():\n"
+        "    await _shutdown_wait()\n"
+    )
+    task = _lifecycle_task(source, "/app/backend/services/worker.py", "bounded-worker")
+    try:
+        await asyncio.sleep(0)
+        with caplog.at_level(logging.WARNING, logger="backend.diagnostics_loop"):
+            for _ in range(4):
+                await diag._dump_tasks()
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert "bounded-worker" in _reported_task_names(caplog.text)
+    assert "TASK_NO_PROGRESS" in caplog.text
+    assert "TASK_STARVATION" in caplog.text
+
+
 def test_runtime_loops_are_permanent_by_their_assigned_names():
     for name in (
         "lifeos-run", "lifeos-heartbeat", "lifeos-keepalive", "lifeos-failsafe",

@@ -210,6 +210,37 @@ def _classify_degradation(exc) -> str:
     )
 
 
+# Bound on the exception-chain description logged once per episode. Six links
+# cover the real shapes (ReadError < BlockingIOError(errno=11),
+# RemoteProtocolError < ConnectionTerminated, ...) and keep the line bounded no
+# matter how deep a library's chaining goes.
+_MAX_CHAIN_LINKS = 6
+
+
+def _describe_exception_chain(exc) -> str:
+    """Bounded, secret-free description of a failure's exception chain.
+
+    Class names and integer errno values only — never a message, URL, header
+    or user data. The once-per-episode ``TASK_FALLBACK_CLASSIFIED`` line used to
+    record just the outer type and its text, which cannot distinguish a socket
+    READ that returned EAGAIN (``ReadError``) from a connect-phase failure
+    (``ConnectError``), an fd shortage (a different errno), a read TIMEOUT
+    (``ReadTimeout``, no errno) or a remote HTTP/2 termination
+    (``RemoteProtocolError`` < ``ConnectionTerminated``). Naming the chain makes
+    the next episode decidable without guessing from the message string.
+    """
+    parts: list[str] = []
+    seen: set[int] = set()
+    current = exc
+    while current is not None and id(current) not in seen and len(parts) < _MAX_CHAIN_LINKS:
+        seen.add(id(current))
+        name = type(current).__name__
+        code = getattr(current, "errno", None)
+        parts.append(f"{name}(errno={code})" if isinstance(code, int) else name)
+        current = current.__cause__ or current.__context__
+    return "<".join(parts)
+
+
 def _is_local_resource_failure(exc) -> bool:
     """True when a failure is a LOCAL resource shortage, not a store outage.
 
@@ -667,8 +698,9 @@ class SupabaseTaskRepository(TaskRepository):
         # distinguish a local resource shortage from a store outage (that is
         # the exact gap that made the live misclassification possible).
         logger.warning(
-            "TASK_FALLBACK_CLASSIFIED reason=%s exception=%s message=%s",
-            self._fallback_reason, type(exc).__name__, str(exc)[:200],
+            "TASK_FALLBACK_CLASSIFIED reason=%s exception=%s chain=%s message=%s",
+            self._fallback_reason, type(exc).__name__,
+            _describe_exception_chain(exc), str(exc)[:200],
         )
     def _degrade(self, message: str, exc: Exception, *, align_ids: bool = False) -> None:
         """Enter the degraded state and report it — at most once per episode.

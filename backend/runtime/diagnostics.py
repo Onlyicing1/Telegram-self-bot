@@ -56,19 +56,42 @@ _PERMANENT_CORO_PATTERNS = (
     "run_until_disconnected", "run_until_connected",
     "_heartbeat_loop", "_keepalive_loop", "_failsafe_loop",
     "_diagnostics_loop", "_cleanup_loop", "_run_loop",
-    "uvicorn", "serve",
+    "uvicorn",
     # Long-lived Telethon transport/update loops. The library creates them with
     # auto-generated task names ("Task-N"), so only the coroutine name can
     # identify them: _update_loop / _recv_loop / _send_loop / _keepalive_loop
     # never complete while the client is connected — their stack IS the await.
     "_update_loop", "_recv_loop", "_send_loop",
 )
-# A task whose OWN coroutine is suspended inside the telethon package is
-# library machinery that is long-lived by construction (Telethon owns the
-# connection loops), whatever name it was given. ``_get_await_location`` reads
-# the coroutine's own frame, so an application coroutine awaiting a Telethon
-# RPC still reports an application file and stays correctly bounded.
-_PERMANENT_SOURCE_MARKERS = ("telethon/",)
+# Library coroutine names that are long-lived only when they are EXACTLY that
+# name. "serve" used to be a substring pattern, which also matched every
+# application coroutine whose name merely CONTAINS it (_observe_durable_ceiling,
+# any _preserve_*), hiding a genuine stall there. Uvicorn's own serve loop is
+# the only intended match.
+_PERMANENT_CORO_EXACT = frozenset({"serve"})
+# A task whose OWN coroutine is suspended inside one of these packages is
+# library machinery that is long-lived by construction, whatever name it was
+# given. ``_get_await_location`` reads the coroutine's own frame, so an
+# application coroutine awaiting a Telethon RPC or a uvicorn lifespan call
+# still reports an application file and stays correctly bounded.
+_PERMANENT_SOURCE_MARKERS = (
+    "telethon/",
+    # uvicorn's lifespan supervisor is a detached library task (auto-named
+    # "Task-N", coroutine ``main``) that parks on its receive queue until the
+    # server shuts down. Its own frame lives in this package and nowhere else.
+    "uvicorn/lifespan/",
+)
+# The process entrypoint's own coroutine: ``backend/main.py::main`` is the
+# process lifecycle wait. ``asyncio.run()`` names its task "Task-N" and its
+# coroutine literally ``main``, so the coroutine's OWN source file is the only
+# signal that identifies it. By the time this dump runs, ``supervisor.start()``
+# has returned (diagnostics starts inside it) and main can only be parked on
+# ``supervisor.shutdown_event.wait()`` until shutdown — a deliberate indefinite
+# wait, not a stall. The rule is deliberately narrow: a bounded application
+# coroutine awaiting a lifecycle/shutdown function keeps its OWN frame and its
+# OWN file, so it stays BOUNDED and is still reported.
+_PROCESS_LIFECYCLE_CORO = "main"
+_PROCESS_LIFECYCLE_SOURCE = "backend/main.py"
 
 _task: asyncio.Task | None = None
 # Per-task state is keyed by the PENDING TASK OBJECT, never by its name. A name
@@ -136,6 +159,13 @@ def _is_blocked_on_sync_primitive(awaited: str) -> bool:
     )
 
 
+def _source_file(await_loc: str) -> str:
+    """The source path of an await location ("file:line"), normalized."""
+    loc = (await_loc or "").replace("\\", "/")
+    head, sep, tail = loc.rpartition(":")
+    return (head if sep and tail.isdigit() else loc).lower()
+
+
 def _is_permanent_task(name: str, coro_name: str = "", await_loc: str = "") -> bool:
     """Classify a task as permanent (long-lived) or bounded (should complete).
 
@@ -143,17 +173,26 @@ def _is_permanent_task(name: str, coro_name: str = "", await_loc: str = "") -> b
     stack trace across dumps is NORMAL for them.  Bounded tasks should
     complete within a reasonable period; an unchanged stack is a stall.
 
-    Three independent signals, in order: the runtime's own assigned task
-    names, the coroutine name (covers Telethon's auto-named loops), and the
-    file the suspended frame lives in (any Telethon machinery is long-lived
-    by construction).
+    Four independent signals, in order: the runtime's own assigned task
+    names, exact library coroutine names, coroutine-name patterns (covers
+    Telethon's auto-named loops), and the file the suspended frame lives in —
+    any Telethon/uvicorn-lifespan machinery is long-lived by construction, and
+    the process entrypoint's own ``main`` (``backend/main.py``) is the process
+    lifecycle wait.
     """
     if name in _PERMANENT_TASK_NAMES:
         return True
+    if coro_name in _PERMANENT_CORO_EXACT:
+        return True
     if any(pat in coro_name for pat in _PERMANENT_CORO_PATTERNS):
         return True
-    normalized = (await_loc or "").replace("\\", "/").lower()
-    return any(marker in normalized for marker in _PERMANENT_SOURCE_MARKERS)
+    source = _source_file(await_loc)
+    if (
+        coro_name == _PROCESS_LIFECYCLE_CORO
+        and source.endswith(_PROCESS_LIFECYCLE_SOURCE)
+    ):
+        return True
+    return any(marker in source for marker in _PERMANENT_SOURCE_MARKERS)
 
 
 def _detect_deadlocks(pending_tasks: list, task_info: dict, elapsed: dict) -> list[str]:

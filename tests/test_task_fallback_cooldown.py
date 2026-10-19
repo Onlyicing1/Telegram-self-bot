@@ -25,6 +25,7 @@ In-process only: no live Supabase, no live Telegram.
 from __future__ import annotations
 
 import logging
+import types
 
 import pytest
 
@@ -122,6 +123,29 @@ async def test_cooldown_expires_and_the_durable_path_is_attempted_again():
     assert repo._in_local_resource_cooldown() is False
     assert await repo.list_tasks(OWNER) == []
     assert _durable_attempts(client) == 2
+
+
+@pytest.mark.asyncio
+async def test_the_cooldown_bounds_attempts_across_a_multi_minute_episode(monkeypatch):
+    """A 90s episode must not issue 180 durable calls (the production window)."""
+    from backend.ai.database import task_repository as repo_module
+
+    client = FakeClient([row_task()], error=_local_resource_transport_error())
+    repo = _repo(client)
+    clock = [0.0]
+    monkeypatch.setattr(
+        repo_module, "time", types.SimpleNamespace(monotonic=lambda: clock[0])
+    )
+
+    # One incoming event every 0.5s for 90 simulated seconds.
+    for _ in range(180):
+        assert await repo.list_event_tasks(OWNER, 20) == []
+        clock[0] += 0.5
+
+    attempts = _durable_attempts(client)
+    assert attempts >= 1
+    assert attempts <= 19  # one per 5s window, not one per event
+    assert repo.fallback_reason == FALLBACK_REASON_LOCAL_RESOURCE
 
 
 @pytest.mark.asyncio

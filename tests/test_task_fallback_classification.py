@@ -80,6 +80,42 @@ def test_local_resource_errno_is_not_evidence_of_a_store_outage():
     assert _is_local_resource_failure(None) is False
 
 
+def test_the_exact_production_shape_is_a_local_resource_failure():
+    """httpcore's READ wrapper around EAGAIN, not only the connect wrapper."""
+    cause = OSError(errno.EAGAIN, os.strerror(errno.EAGAIN))
+    read_error = httpx.ReadError(str(cause))
+    read_error.__cause__ = cause
+    assert _is_local_resource_failure(read_error) is True
+
+    write_error = httpx.WriteError(str(cause))
+    write_error.__cause__ = cause
+    assert _is_local_resource_failure(write_error) is True
+
+
+def test_a_read_timeout_is_not_local_resource_exhaustion():
+    """A read TIMEOUT carries no errno: it must stay ``unavailable``.
+
+    Reproduced against the shipped socket behaviour (an SSLSocket with a
+    ``settimeout`` raises ``TimeoutError``, errno None), which httpcore maps to
+    ``ReadTimeout`` — NOT to ``ReadError(OSError)``. The observed production
+    chain is therefore a socket-layer would-block, not an expired deadline.
+    """
+    assert _is_local_resource_failure(httpx.ReadTimeout("The read operation timed out")) is False
+    assert _is_local_resource_failure(httpx.ConnectTimeout("timed out")) is False
+
+
+def test_other_socket_errnos_stay_distinguishable():
+    """Only the documented local-resource errnos are local-resource failures."""
+    reset = OSError(errno.ECONNRESET, os.strerror(errno.ECONNRESET))
+    exc = httpx.ReadError(str(reset))
+    exc.__cause__ = reset
+    assert _is_local_resource_failure(exc) is False
+
+    fds = httpx.ReadError(os.strerror(errno.EMFILE))
+    fds.__cause__ = OSError(errno.EMFILE, os.strerror(errno.EMFILE))
+    assert _is_local_resource_failure(fds) is True
+
+
 def test_the_wrapped_cause_chain_is_walked():
     cause = OSError(errno.EAGAIN, os.strerror(errno.EAGAIN))
     outer = RuntimeError("wrapped transport failure")
@@ -220,6 +256,56 @@ async def test_a_successful_durable_read_is_durable_and_clears_the_reason():
     assert len(await repo.list_tasks(10)) == 1
     assert repo.fallback_active is False
     assert repo.fallback_reason == ""
+
+
+# ── The once-per-episode diagnostic names the chain's phase and errno ──
+
+
+def test_the_classification_diagnostic_records_a_bounded_chain_without_content():
+    """The next episode must be decidable from class names + errno alone.
+
+    ``TASK_FALLBACK_CLASSIFIED`` used to carry only the outer type and the
+    exception's text, which cannot tell a socket READ (ReadError), a connect
+    phase (ConnectError), an fd shortage (a different errno) or a read TIMEOUT
+    (ReadTimeout, no errno) apart.
+    """
+    from backend.ai.database.task_repository import _describe_exception_chain
+
+    # ``OSError(EAGAIN)`` is constructed as the ``BlockingIOError`` subclass —
+    # exactly the class name the production chain carries.
+    cause = OSError(errno.EAGAIN, os.strerror(errno.EAGAIN))
+    assert type(cause) is BlockingIOError
+    exc = httpx.ReadError(str(cause))
+    exc.__cause__ = cause
+    assert _describe_exception_chain(exc) == "ReadError<BlockingIOError(errno=11)"
+
+    # A deep chain stays bounded...
+    deep = ValueError("x")
+    current = deep
+    for index in range(20):
+        wrapper = RuntimeError(f"layer {index}")
+        wrapper.__cause__ = current
+        current = wrapper
+    chain = _describe_exception_chain(current)
+    assert len(chain.split("<")) == 6
+    # ...and only names + errno travel: no message, URL or header text.
+    assert "layer" not in chain
+    assert ":" not in chain and "/" not in chain
+
+
+@pytest.mark.asyncio
+async def test_the_episode_line_carries_that_chain(caplog):
+    import logging
+
+    repo = SupabaseTaskRepository(
+        FakeClient(error=_local_resource_transport_error()), InMemoryTaskRepository()
+    )
+
+    with caplog.at_level(logging.WARNING, logger="backend.ai.database.task_repository"):
+        assert await repo.list_tasks(10) == []
+
+    assert "TASK_FALLBACK_CLASSIFIED" in caplog.text
+    assert "chain=ConnectError<BlockingIOError(errno=11)" in caplog.text
 
 
 # ── Audit persistence stays decoupled from task persistence ──

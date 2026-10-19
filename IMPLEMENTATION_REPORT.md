@@ -1,283 +1,293 @@
-# IMPLEMENTATION_REPORT.md — Task Runtime Database Failures: diagnosis + the stall-diagnostics identity defect
+# IMPLEMENTATION_REPORT.md — Runtime DB `Errno 11` diagnosis + the remaining lifecycle-task false positives
 
-> This file describes ONLY the current state of the repository for the **task
-> runtime database-failure diagnosis** phase and **replaces every previous
-> report in full** — it is not an appended report. Earlier reports (the
-> AED security round, the AED database foundation, the peer-resolution,
-> bot-exclusion and archive-UX rounds, the emoji/private-message rounds) remain
-> readable in git history and in `docs/investigations/`.
+> This file describes ONLY the current state of the repository for this phase and
+> **replaces every previous report in full** — it is not an appended report.
+> Earlier reports (the task-stall identity round at `58fa664`, the AED security
+> and archive rounds, the emoji/private-message rounds) remain readable in git
+> history and in `docs/investigations/`.
 
 | Item | Value |
 |---|---|
-| Stage | **Diagnosis + one confirmed defect fixed** (task runtime DB failures) |
-| Date | 2026-10-18 |
+| Stage | Diagnosis + one confirmed classification defect fixed |
+| Date | 2026-10-19 |
 | Project / remote | LifeOS Telegram self-bot, `Onlyicing1/Telegram-self-bot` (`origin`) |
-| Branch | `main` (work done in a detached worktree at `origin/main`, pushed with `git push origin HEAD:main`) |
-| Base commit | `69364c7194fb4fd409df66b900058e20eccb15e8` — verified `= origin/main` at task start (`git fetch origin` + `git rev-parse origin/main`) |
-| Live Telegram / Render / Supabase | **NOT touched.** No deployment access, no Render shell, no `.env`, no credentials, **no SQL**, no Supabase connection, no restart, no Render config change |
-| Actionable production log lines | 2 of 4 are the existing protections working as designed; 2 of 4 had a **provable, reproduced defect in the diagnostics' identity model** (fixed here) |
+| Branch | `main` |
+| Base commit | `3f0ef80b60d65c3a10582b6e86d6be4a06190c17` — `git fetch origin` → `git rev-parse origin/main` = this, and the local tree was fast-forwarded to it (it was four commits ahead of the previous workspace HEAD `702c1d1`; merged `--ff-only`, not rebased) |
+| Live Telegram / Render / Supabase | **NOT touched.** No deployment, no Render shell, no `.env`, no credentials, **no SQL**, no Supabase connection, no restart, no Render/environment change |
+| Workspace interpreter | CPython **3.10.12** (the workspace has no venv); `telethon 1.34.0` installed vs `1.43.0` pinned by `backend/requirements.txt` — the only suites affected are the pre-existing button-colour tests (§5) |
 
 ---
 
-## 1. Objective and scope
+## 1. Objective
 
-Identify the evidence-based root cause of four recurring production symptoms —
-`TASK_FALLBACK_CLASSIFIED reason=local_resource … [Errno 11]`,
-`Supabase event task query failed; using fallback: <ConnectionTerminated …>`,
-`TASK_NO_PROGRESS` and `TASK_STARVATION` — and apply only the smallest
-correction the repository can prove is missing.
+Two post-deployment symptoms were to be investigated **independently**:
 
-Nothing about the runtime's shape was changed: no second scheduler, executor,
-Supabase client, update loop or retry loop; no schema change; no
-`DATABASE_ARCHITECTURE.md` change; no environment/Render change. The single
-repository authority, bounded concurrency, truthful fallback classification,
-cancellation behaviour and existing task semantics are all preserved (and
-re-pinned by the tests listed in §6).
+* **A** — repeated `httpx`/`httpcore` `ReadError: [Errno 11] Resource temporarily
+  unavailable` inside `backend.ai.database.task_repository`, followed by
+  `TASK_FALLBACK_CLASSIFIED reason=local_resource` and the in-memory fallback,
+  while the process stayed `READY` with both clients connected; a separate
+  `ConnectionTerminated` HTTP/2 error was also seen.
+* **B** — `TASK_NO_PROGRESS` / `TASK_STARVATION` after `58fa664` still naming
+  long-lived lifecycle tasks: `Task-1` (`main` awaiting
+  `supervisor.shutdown_event.wait()` in `backend/main.py`) and `Task-27`
+  (`main` awaiting uvicorn lifespan machinery in `uvicorn/lifespan/on.py`).
 
-Files inspected (current versions at `origin/main` = `69364c7`):
-`backend/ai/database/task_repository.py`, `backend/db/client.py`,
-`backend/runtime/operation_watchdog.py`, `backend/runtime/diagnostics.py`,
-`backend/ai/task_event_dispatcher.py`, `backend/ai/task_scheduler.py`,
-`backend/ai/database/manager.py`, `backend/ai/task_execution.py`,
+No assumption was made that they share a cause. They do not.
+
+Files read in full before any edit: `IMPLEMENTATION_REPORT.md`,
+`INVESTIGATION.md`, `backend/runtime/diagnostics.py`,
+`tests/test_runtime_diagnostics_classification.py`, `backend/db/client.py`,
+`backend/ai/database/task_repository.py`, `tests/test_task_fallback_cooldown.py`,
+`tests/test_task_fallback_classification.py`, `tests/test_local_resource_bounds.py`,
+`backend/runtime/operation_watchdog.py`, `backend/ai/task_event_dispatcher.py`,
+`backend/ai/task_scheduler.py`, `backend/ai/database/manager.py`,
 `backend/runtime/task_guard.py`, `backend/runtime/heartbeat.py`,
-`backend/health.py`, `backend/bot/router.py`, `backend/bot/handlers/task_events.py`,
-`backend/ai/persistence.py`, the four focused suites named in §6, plus
-`IMPLEMENTATION_REPORT.md` and `INVESTIGATION.md`.
+`backend/main.py`, `backend/runtime/supervisor.py` (start, web-server and
+orphan-cancel paths) — plus the installed `supabase 2.4.2` / `postgrest 0.16.11`
+/ `httpcore 1.0.9` / `h2 4.4.1` sources named in §3.
 
 ---
 
-## 2. What each log line actually is (provenance, on `origin/main`)
+## 2. Confirmed facts about the DB path (A) — source and package verified
 
-| Log line | Exact producer | Introduced by (all verified ancestors of `origin/main`) |
+| Claim in the brief | Verified? | Evidence |
 |---|---|---|
-| `TASK_FALLBACK_CLASSIFIED reason=… exception=… message=…` | `SupabaseTaskRepository._mark_fallback` (`backend/ai/database/task_repository.py`) — the once-per-episode structured diagnostic | `2551970`, extended by `4b20653` (2026-09-11) |
-| `Supabase event task query failed; using fallback: <exception>` | same file, `list_event_tasks` → `_degrade(…)` (the per-call-site wording) | `40b57e0` / earlier |
-| `TASK_NO_PROGRESS — N bounded tasks unchanged since last dump` | `backend/runtime/diagnostics.py::_dump_tasks` | `3893d77` (permanent/bounded classification, 2026-08-12); bounded by `4b20653` |
-| `TASK_STARVATION — N tasks unchanged across 3+ dumps` | `backend/runtime/diagnostics.py::_detect_starvation` | `3893d77` |
+| One reusable `ThreadPoolExecutor`, 4 workers | **Yes** | `backend/db/client.py::_get_db_executor` — `ThreadPoolExecutor(max_workers=4, thread_name_prefix="lifeos-supabase")`, created once under `_db_executor_lock`; `run_sync_db` dispatches every call through it |
+| 8 s transport timeout, 10 s dispatch timeout | **Yes** | `_DB_HTTP_TIMEOUT = 8.0` passed to `ClientOptions(postgrest_client_timeout=…)`; `_DB_TIMEOUT = 10.0` → `guarded_await(..., timeout=10.0)`; `0 < 8 < 10` is test-pinned |
+| `ClientOptions(postgrest_client_timeout=…)` is real in the pinned library | **Yes** | `supabase 2.4.2` exports `ClientOptions` with `postgrest_client_timeout: Union[int, float, httpx.Timeout] = 120`; `get_db()` builds the one shared client with `8.0` |
+| 5 s local-resource cooldown in `SupabaseTaskRepository` | **Yes** | `_LOCAL_RESOURCE_COOLDOWN_SECONDS = 5.0`; the gate lives in `_run`/`_run_checked`; a skipped call raises `LocalResourceCooldown` carrying `reason=local_resource`; skipped calls never extend the deadline; a successful durable op clears it |
+| In-memory fallback on failure | **Yes** | every repository method catches, calls `_degrade`/`_mark_fallback`, and returns `InMemoryTaskRepository` data annotated `fallback_backend` / `fallback_reason` (non-durable, truthfully labelled) |
+| Supabase REST traffic is HTTP/2 | **Yes** | `postgrest 0.16.11::SyncPostgrestClient.create_session` constructs `SyncClient(..., http2=True)`; `h2 4.4.1` is installed. `ConnectionTerminated` is h2's own event/exception class, so it belongs to this same transport |
+| A read timeout on an SSL socket surfaces as `ReadError(OSError(EAGAIN))` | **No — disproved** | `httpcore._backends.sync.SyncStream.read` maps `socket.timeout → ReadTimeout` and `OSError → ReadError`. Reproduced locally (a TLS server that never writes, client `settimeout(0.2)`, see §3): CPython raises `TimeoutError` with `errno=None`, i.e. `httpx.ReadTimeout`, **never** `ReadError [Errno 11]` |
 
-Consequence for the first question in the brief: **these lines cannot predate
-the protections.** The bounded 4-worker pool and 8 s transport deadline
-(`40b57e0`), the `local_resource` classification (`2551970`), the 5 s
-local-resource cooldown and the once-per-episode diagnostic (`4b20653`), and
-the permanent-vs-bounded diagnostics classification (`3893d77`) are all present
-in `origin/main`'s history — the observed lines are the *post-protection*
-behaviour of that code.
+### What `[Errno 11]` means in this exact chain
 
-**Deployed-commit evidence is missing and is reported as such.** No commit
-marker exists in the repository (`grep` for `RENDER_GIT_COMMIT`/`GIT_COMMIT`/
-`BUILD_SHA`/`__version__` in `backend/` → nothing), `render.yaml`/`Procfile`
-carry no commit pin, the reported lines carry no timestamps in the brief, and
-this workspace holds no Render credential (`freebuff-env list` → no keys), so
-the deployed commit and the log timestamps cannot be established read-only from
-here. The four log lines are, however, reproducible only by code that contains
-the protections above, which is what makes the deployment-vs-`main` question
-moot for this phase.
+`httpx.ReadError("[Errno 11] …")` wraps `httpcore.ReadError`, which wraps the raw
+`OSError` from `SyncStream.read` → `SSLSocket.recv`. `OSError(EAGAIN)` is
+constructed as the **`BlockingIOError`** subclass (verified:
+`type(OSError(errno.EAGAIN, …)) is BlockingIOError`), so the observed text is a
+socket-layer "would block / no data available right now", not an HTTP status, not
+a PostgREST error, and not a store response.
 
----
+The discrimination the brief asked for, with the exception type each hypothesis
+would actually produce:
 
-## 3. The DB failure path, traced (and why it contains no provable defect)
-
-```
-Telegram update
-  → bot/handlers/task_events.py::_task_event_handler
-  → TaskEventDispatcher.handle_event            (ai/task_event_dispatcher.py)
-  → SupabaseTaskRepository.list_event_tasks     (ai/database/task_repository.py)
-  → repository._run(fn)                         ← cooldown gate lives here
-  → backend.db.client.run_sync_db               (single bounded dispatch)
-        loop.run_in_executor(_get_db_executor())   # ThreadPoolExecutor(max_workers=4)
-        → guarded_await(..., timeout=10s)          # runtime/operation_watchdog.py
-              postgrest/httpx sync call, transport deadline 8s (= _DB_HTTP_TIMEOUT)
-  → exception classification → _mark_fallback/_degrade → in-memory fallback result
-  → 0 executions + bounded TASK_EVENT_TRACE warnings (never raises into the event path)
-```
-
-1. **Local OS resource exhaustion (symptom 1).** The transport error is
-   `httpx`/`httpcore`'s wrapper around `OSError(11)`; `_is_local_resource_failure`
-   walks the whole `__cause__`/`__context__` chain and matches
-   `{EAGAIN/EWOULDBLOCK, EMFILE, ENFILE, ENOMEM, ENOBUFS}`. The line's
-   `reason=local_resource` is proof the walk succeeded — i.e. the classification
-   that exists to stop EAGAIN being reported as a Supabase outage *worked*. The
-   failure then arms the bounded 5 s cooldown (no durable call is re-issued
-   inside it, the window is never extended by a skipped call, a successful
-   durable operation clears it) and emits the diagnostic once per episode.
-   **This is the protection, not the defect.**
-2. **A peer-terminated pooled HTTP/2 connection (symptom 2).** Installed
-   `postgrest==0.16.11` creates its session with `http2=True`
-   (`SyncPostgrestClient.create_session`), so Supabase REST traffic runs over
-   TLS+HTTP/2. A GOAWAY from the peer is rendered by `h2` as
-   `<ConnectionTerminated error_code:…, last_stream_id:…, additional_data:…>`
-   and surfaced by httpcore as a protocol error carrying exactly that text —
-   which is the string in the log line. httpx performs **no** retry, so one dead
-   pooled connection fails one operation; with no errno in the chain it is
-   classified `FALLBACK_REASON_UNAVAILABLE` (truthful: the durable store did not
-   answer this request), the read degrades to the in-memory fallback
-   (**non-durable**) and the caller/panel is told so (`fallback_active` /
-   `fallback_reason` / the rendered fallback note). A transient transport
-   termination therefore does **not** mean Supabase is down, and it never
-   reaches the durable write path as a silent success.
-3. **No defect was provable anywhere else on this path**: the pool is bounded at
-   four workers and reused (threads are stable across 24 calls); the transport
-   deadline is strictly below the dispatch budget; a timed-out dispatch emits one
-   `OP_TIMEOUT` and cannot be cancelled inside the thread, so the code pins the
-   transport shorter than the watchdog; `CancelledError` is re-raised at every
-   boundary; `_run`'s cooldown skip carries its own honest reason so a skipped
-   call can never be re-labelled as an outage; a genuine store failure is never
-   suppressed (every attempt stays visible — an intentional, test-pinned
-   contract); and `RepositoryManager` still owns the one task repository, so the
-   process degrades to exactly one in-memory fallback. All of it is re-verified
-   by the suites in §6.
-4. `TASK_NO_PROGRESS` / `TASK_STARVATION` are **not** produced by this path: they
-   come from the 60 s diagnostics dump, and §4 shows the defect that made them
-   fire for tasks that were not stalled at all.
-
-Deliberately **not** done, and why: no retry was added to `run_sync_db` (a
-re-dispatch is unsafe for this repository's non-idempotent inserts, whose
-exactly-once guarantees rest on CAS/unique keys — and a retry path is out of
-scope by the brief); the local-resource cooldown was **not** broadened into a
-process-wide gate (that would change every DB surface's degradation semantics
-and its honesty contract); and no recovery behaviour was touched.
-
----
-
-## 4. The confirmed defect: stall diagnostics identified tasks by NAME
-
-`backend/runtime/diagnostics.py` kept its three per-task registries — the
-previous stack, the unchanged-dump counter and the first-seen instant — **under
-the task name**. A task name is reusable: the runtime re-creates bounded tasks
-under a stable name precisely when things are unhealthy
-(`lifeos-keepalive-recovery`, `lifeos-heartbeat-recovery`,
-`lifeos-failsafe-retry`, `lifeos-recovery-retry`, the `*:preload_state` tasks
-re-spawned on a rebuild, `panel:delayed-delete`, `lifeos-callback-trace-send`).
-Keyed by name, a finished task's counter and first-seen instant were inherited
-by the **next** task created with that name, so:
-
-* a task that had just started was reported as `TASK_NO_PROGRESS` after a
-  **single** dump (`Unchanged dumps: 2`/`3` inherited from the dead task);
-* it reached the `TASK_STARVATION` threshold with **fewer dumps than the
-  three-dump contract**, and its reported `(elapsed)` time belonged to the
-  already-finished task (`unchanged for 3 dumps (0s)`).
-
-Reproduced before the fix (focused test, fixed clocks, no live anything):
-
-```
-WARNING backend.diagnostics_loop TASK_NO_PROGRESS — 1 bounded tasks unchanged since last dump:
-  Task: lifeos-keepalive-recovery
-  Elapsed waiting: 0s
-  Unchanged dumps: 2            <-- inherited by a task created milliseconds earlier
-WARNING backend.diagnostics_loop TASK_STARVATION — 1 tasks unchanged across 3+ dumps:
-  STARVATION: lifeos-keepalive-recovery unchanged for 3 dumps (0s)
-```
-
-That is exactly the recurring pair in the production logs, and it is why those
-two lines — in a runtime that is neither stalled nor deadlocked — **do not prove
-a stall**. The DB-failure episode only makes it more likely: recovery attempts
-and preloads are re-created under those names while the DB path is failing.
-
----
-
-## 5. The fix (smallest change that removes the false report)
-
-| File | Change | Reason |
+| Hypothesis | Expected surfaced failure | Observed? |
 |---|---|---|
-| `backend/runtime/diagnostics.py` | `_prev_stacks`, `_stack_unchanged_count` and `_task_first_seen` are keyed by the **pending `asyncio.Task` object** instead of its name; `task_info`/`elapsed`, `_detect_starvation`, `_detect_deadlocks` and `_detect_slow_handlers` follow the same key; per-task state is pruned against the **pending task set** (so a finished task's counters can be neither reported forever nor inherited); `stalled`/`permanent`/`bounded` sets are task-based. The permanent/bounded classification, the loop-latency stall check, the report layout, the 60 s interval and the three-dump starvation threshold are unchanged | "Unchanged" must mean **the same task** unchanged. Identity, not a reusable name, owns the counter — and two concurrent tasks sharing a name keep separate state and separate report entries, so a genuine stall is still reported for the task that really is stalled |
-| `tests/test_runtime_diagnostics_classification.py` | Three new tests: (1) a name reused by a new task starts from zero, is not reported after one dump, and **is** still reported for three dumps of its own existence; (2) two concurrent same-name tasks are tracked per task; (3) the deadlock report still names the blocked task (the edited detector's only reachable shape: a task created directly from `Event.wait()`) | Both stall tests **fail against the previous implementation** and pass after it; the 12 pre-existing diagnostics tests pass in both states |
+| Socket read returned `EAGAIN` (local would-block) | `httpx.ReadError` ← `BlockingIOError(errno=11)` | **Yes — the production text** |
+| Executor saturation / queued call beyond the dispatch budget | `OperationTimeoutError` (no errno) → `reason=unavailable` | No |
+| Transport read deadline expired | `httpx.ReadTimeout` (no errno) → `reason=unavailable` | No (disproved by the reproduction above) |
+| File-descriptor exhaustion | `EMFILE`/`ENFILE` (24/23) — also `local_resource`, but a different errno | No |
+| Remote HTTP/2 connection termination | `RemoteProtocolError` ← `ConnectionTerminated` (no errno) → `reason=unavailable` | Seen as a **separate** line, not as the Errno-11 chain |
+| Peer reset / closed socket | `ECONNRESET`(104) / `EBADF`(9) → `unavailable` | No |
 
-The fix touches only the report path. It removes a false warning and never
-suppresses a real one: a bounded task that is genuinely unchanged for three
-dumps of its own existence is still reported — asserted in the same tests.
+So: the production `ReadError [Errno 11]` is **not** evidence that Supabase was
+unavailable, **not** an expired timeout, and **not** executor saturation. It is
+a would-block returned by the local socket layer under the synchronous Supabase
+HTTP call. What the repository *cannot* establish is **why** the local socket
+layer produces it on Render: that needs host-level data (fd/socket/thread
+counters, egress/NAT behaviour, gVisor-level syscall behaviour, and the h2
+connection-reuse pattern) which this workspace cannot collect. It is reported as
+**unproven**, not guessed at.
 
-Also documented, deliberately **not** changed (latent, no live false positive
-today): a task created through `backend/runtime/task_guard.py` reports the
-wrapper's coroutine name (`_wrapper`/`_immortal_wrapper`) and `task_guard.py` as
-its await location, because a task's `cr_frame` is its **outermost** coroutine
-frame (verified empirically). `_PERMANENT_CORO_PATTERNS`' `uvicorn`/`serve`
-entries and the `telethon/` source marker can therefore never match a
-wrapper-created task. Every permanent runtime loop carries a permanent *name*,
-so the classification is correct in practice; changing it would mean changing a
-core runtime module for no reproduced symptom. The residual
-`asyncio.to_thread` DB paths that still bypass the shared bounded pool
-(`backend/ai/config_store.py::_run_sync`, `backend/ai/database/usage_reader.py`,
-`usage_recorder.py`, `backend/services/ghost_seen_v2.py`,
-`backend/ai/tools/memory.py`, `backend/ai/engine/dispatcher.py`) are likewise
-left as a documented follow-up: they are bounded by the loop's default executor
-and there is no evidence they produced any of the four lines.
+### Cooldown — verified, and now measured deterministically
+
+By construction it bounds durable re-attempts to at most one per 5 s window
+while the episode lasts; a skipped call is served from the in-memory fallback
+with `reason=local_resource`, never re-labelled as an outage, and never extends
+the window. A new test drives **180 calls over 90 simulated seconds** (a
+monotonic-clock shim, no sleeping) and asserts **≤ 19** durable attempts instead
+of 180. No worker count, timeout, retry, Render setting or cooldown scope was
+changed: an automatic retry is unsafe for this repository's non-idempotent
+inserts, and a process-wide breaker would change every DB surface's degradation
+semantics.
+
+### The one narrow change on A
+
+`TASK_FALLBACK_CLASSIFIED` recorded only the outer exception's type and text. That
+cannot distinguish a *read* would-block (`ReadError`) from a *connect*-phase one,
+an fd shortage (different errno) or a timeout (`ReadTimeout`, no errno), which is
+exactly the ambiguity that kept this symptom unresolved across two phases. The
+once-per-episode line now also prints `chain=<names+errno>` — **class names and
+integer errno only**, capped at 6 links: no message, URL, header, token or user
+data. Nothing is retried or suppressed; classification and fallback semantics are
+unchanged.
 
 ---
 
-## 6. Tests actually run (commands and real results)
+## 3. Local reproduction used to distinguish timeout from would-block
 
-All commands were run in the task worktree (`/home/daytona/codebase/.taskrt`, a
-detached checkout of `origin/main` = `69364c7`) with the repository virtualenv
-(`../.venv/bin/python`, CPython 3.10.12; the workspace venv carries
-`telethon 1.34.0` while `backend/requirements.txt` pins `1.43.0`, and neither the
-change nor the tests depend on Telethon).
+Run outside the repository (no source or test depends on it):
+
+```
+TLS server (self-signed) accepts, then never writes
+client: wrap_socket → settimeout(0.2) → recv(1024)
+→ TimeoutError errno=None   (isinstance socket.timeout → True)
+```
+
+`httpcore`'s map turns that into `httpx.ReadTimeout`, so a `ReadError` carrying
+`errno=11` cannot be a read deadline. The classification matrix in §2 is pinned
+by tests in `tests/test_task_fallback_classification.py`:
+`ReadError`/`WriteError` + `EAGAIN` → `local_resource`; `ReadTimeout` /
+`ConnectTimeout` → `unavailable`; `ECONNRESET` → `unavailable`; `EMFILE` →
+`local_resource`.
+
+---
+
+## 4. Workstream B — confirmed defect in the permanent/bounded classifier
+
+### How the classification is actually computed
+
+`_dump_tasks()` → `t.get_coro()` → the coroutine's **own** outermost frame
+(`cr_frame`) → `coro_name` (`__name__`) and `await_loc`
+(`co_filename:f_lineno`) → `_is_permanent_task(name, coro_name, await_loc)`.
+Permanent tasks are excluded from `stalled`, `_detect_starvation`,
+`_detect_deadlocks` and `_detect_slow_handlers`; the per-task identity registry
+(`_prev_stacks`, `_stack_unchanged_count`, `_task_first_seen`, keyed by the task
+object, pruned each dump) is untouched.
+
+### Why the two lifecycle tasks were classified BOUNDED
+
+`_is_permanent_task` had three signals: the runtime's assigned task names, the
+coroutine-name patterns, and a **`telethon/`-only** source marker.
+
+* `Task-1` — name `Task-1` (not assigned by the runtime), coroutine `main`,
+  await location `backend/main.py:…`. `"main"` matches none of
+  `run_until_disconnected`, `_heartbeat_loop`, `_update_loop`, …; the source was
+  not inside `telethon/` → **BOUNDED**.
+* `Task-27` — coroutine `main`, await location
+  `…/uvicorn/lifespan/on.py:…` (uvicorn's detached `LifespanOn.main`, created by
+  `LifespanOn.startup()` with an auto-generated `Task-N` name). No name match, no
+  pattern match, and `uvicorn`/`serve` were only *coroutine-name* patterns — not
+  source markers → **BOUNDED**.
+
+Reproduced against the pre-fix module (same tests, original
+`backend/runtime/diagnostics.py` restored from `HEAD`): **4 failed / 17 passed**,
+with the exact production output:
+
+```
+TASK_NO_PROGRESS — … Task: Task-1 / Task: Task-27
+TASK_STARVATION — 2 tasks unchanged across 3+ dumps:
+  STARVATION: Task-1 unchanged for 3 dumps (0s)
+  STARVATION: Task-27 unchanged for 3 dumps (0s)
+  Stack trace: File "/app/.venv/lib/.../uvicorn/lifespan/on.py", line 3, in main
+```
+
+### Why they are expected waits (not blocked application work)
+
+* `backend/main.py::main` awaits `supervisor.start()`, and `start_diagnostics()`
+  is called **inside** that method (verified at
+  `backend/runtime/supervisor.py:201`). Therefore no dump can observe `main`
+  during startup: whenever diagnostics runs, `main` can only be parked on
+  `await supervisor.shutdown_event.wait()` — the deliberate process lifecycle
+  wait — until shutdown. The process entry task is created by `asyncio.run()`
+  with an auto-generated name, so its own source file is the only reliable
+  identifier.
+* `uvicorn/lifespan/on.py::main` is library machinery: uvicorn creates it with
+  `loop.create_task(self.main())` and it parks on its receive queue until the
+  server shuts down. The app's uvicorn task is separately named
+  `lifeos-web-server` (already permanent by name).
+
+### Fix (classification only)
+
+| File | Change |
+|---|---|
+| `backend/runtime/diagnostics.py` | `_PERMANENT_SOURCE_MARKERS` gains `uvicorn/lifespan/` (library machinery, matched by the coroutine's own frame, not by name). A new narrow rule classifies a task permanent only when its coroutine is exactly `main` **and** that coroutine's own source file is the process entrypoint `backend/main.py` (`_source_file` strips the `:line` suffix first). `serve` moved from the substring tuple to an **exact** name set (`_PERMANENT_CORO_EXACT`), because as a substring it also matched application coroutines such as `_observe_durable_ceiling` and any `_preserve_*`, silently hiding a real stall there. |
+| `tests/test_runtime_diagnostics_classification.py` | Six new tests: the two production tasks are permanent (compiled with the real frame file names, not fake frames); an application coroutine named `main` in another file stays bounded; an app coroutine that awaits a lifecycle-style shutdown wait is still reported as `TASK_NO_PROGRESS`/`TASK_STARVATION`; `serve` exact vs `_observe_*`/`_preserve_*`; and an end-to-end four-dump run of the two production tasks producing no warning at all. |
+
+**Why the task is not simply renamed.** Naming it `lifeos-main` would also
+require adding it to `RuntimeSupervisor._cancel_orphan_tasks`' protected set —
+that method cancels every pending task whose name is not protected, so renaming
+the process entry task without that change would let a hard reset cancel the
+process lifecycle task itself. The classification-only rule is the smaller and
+safer fix, and it is precise: an application coroutine always keeps its own frame
+file, so it cannot be caught by the entrypoint rule.
+
+Preserved: the task-object identity registry and pruning from `58fa664`,
+counter/elapsed accounting, the three-dump starvation threshold, the deadlock and
+slow-handler reports, and real bounded-stall detection (asserted by both the
+pre-existing tests and the new controls).
+
+---
+
+## 5. Tests and exact results
 
 | Command | Result |
 |---|---|
-| `python -m pytest tests/test_task_fallback_classification.py tests/test_task_fallback_cooldown.py tests/test_runtime_diagnostics_classification.py tests/test_local_resource_bounds.py -q` (before the change) | **42 passed** — the existing protections are intact |
-| `python -m pytest tests/test_07_diagnostics.py tests/test_11_runtime_wiring.py tests/test_task_fallback_classification.py tests/test_task_fallback_cooldown.py tests/test_local_resource_bounds.py tests/test_task_repository.py tests/test_task_scheduler.py tests/test_task_execution.py tests/test_runtime_diagnostics_classification.py -q` | **106 passed** |
-| `python -m pytest tests/test_runtime_diagnostics_classification.py -q` (with the fix) | **15 passed** (12 pre-existing + 3 new) |
-| same suite against the **pre-fix** `backend/runtime/diagnostics.py` | **2 failed** — the two new stall tests fail exactly on the production symptom (`assert 'lifeos-keepalive-recovery' not in {'lifeos-keepalive-recovery'}`), the 12 pre-existing tests pass |
-| `python -m pytest tests -q` (full suite, final state) | **6370 passed, 27 skipped, 40 failed** in 124 s |
-| `python -m pytest tests/test_colored_buttons.py -q` in a pristine `origin/main` worktree | **40 failed, 12 passed** — the identical, pre-existing failure set (pending colored-button expectations, unrelated to this phase; nothing in the task-runtime, DB, watchdog or diagnostics area fails) |
-| `python -m py_compile backend/runtime/diagnostics.py tests/test_runtime_diagnostics_classification.py` | OK (exit 0) |
+| `pytest tests/test_runtime_diagnostics_classification.py tests/test_task_fallback_classification.py tests/test_task_fallback_cooldown.py tests/test_local_resource_bounds.py -q` | **57 passed** |
+| the same diagnostics file against the **pre-fix** `diagnostics.py` | **4 failed, 17 passed** — the four new failure-mode tests, reproducing `STARVATION: Task-1` / `Task-27` verbatim; the "app coroutine awaiting a shutdown wait is reported" control passed before and after |
+| `pytest … + tests/test_07_diagnostics.py tests/test_11_runtime_wiring.py tests/test_task_repository.py tests/test_task_scheduler.py tests/test_task_execution.py -q` | **119 passed** |
+| `pytest tests -q -p no:cacheprovider` (full suite) | **6382 passed, 27 skipped, 40 failed** in 124.39 s |
+| `pytest tests/test_colored_buttons.py -q` | **40 failed, 12 passed** — the entire failure set of the full run, identical to the recorded baseline; failures are `TypeError: Button.inline() got an unexpected keyword argument 'style'` / `KeyboardButtonCallback` lacking the style field, i.e. the workspace's **Telethon 1.34.0** vs the pinned **1.43.0**. Confirmed pre-existing and unrelated; not fixed here |
+| `python3 -m py_compile backend/runtime/diagnostics.py backend/ai/database/task_repository.py tests/test_runtime_diagnostics_classification.py tests/test_task_fallback_classification.py tests/test_task_fallback_cooldown.py` | exit 0 |
 | `git diff --check` | clean |
 
----
-
-## 7. Production verification — NOT performed (and what would verify it)
-
-The fix is **unverified in production**: no deployment was triggered, no Render
-shell or log access was used, no live Telegram/Supabase session exists here, and
-no service was restarted (all out of scope by the brief). What would confirm it:
-
-1. The `ASYNC_TASK_DUMP` lines must stop reporting a task whose `Elapsed waiting`
-   is smaller than the interval it has existed for, and must keep reporting the
-   same task when it is *genuinely* unchanged for three dumps of its own
-   existence.
-2. `TASK_NO_PROGRESS`/`TASK_STARVATION` bodies should name tasks whose reported
-   `Unchanged dumps` is consistent with that task's own lifetime.
-3. For the DB lines, the deployed commit (Render's build log or the runtime's own
-   `RENDER_GIT_COMMIT`, neither of which is readable from here) is needed to
-   correlate the four lines with a deployment; the brief's lines carry no
-   timestamps.
+Accounting: the previous baseline recorded `6370 passed`; this phase adds
+**12** tests (6 diagnostics, 5 classification/chain, 1 cooldown) → `6382`.
+**No newly introduced failures.** The 40 failures are the same pre-existing
+button-colour failures; 27 skips are unchanged opt-in/live tests.
 
 ---
 
-## 8. Commit, push and remote verification
+## 6. Files changed
 
-| Item | Value |
+| File | Why |
 |---|---|
-| Code commit | `58fa664296c1d2d86682072210965d1b1b12d098` — `fix(runtime): key task stall diagnostics by task, not by task name` |
-| Base commit | `69364c7194fb4fd409df66b900058e20eccb15e8` (previous `origin/main`) |
-| Push | `git push origin HEAD:main` → `69364c7..58fa664  HEAD -> main` |
-| Remote `main` after the push | `git fetch origin` → `git rev-parse origin/main` = `58fa664296c1d2d86682072210965d1b1b12d098` = local `HEAD` |
-| Ancestry | `git merge-base --is-ancestor 58fa664 origin/main` → exit 0 (`ANCESTRY OK`) |
-| Working tree | only the two delivered files changed in the task worktree; the shared checkout keeps its pre-existing `M INVESTIGATION.md` and untracked agent directories (untouched) |
-| Documentation follow-up | a second `docs(report)` commit records this delivery block (its own SHA can only exist after the code commit) |
+| `backend/runtime/diagnostics.py` | Fix the proven permanent/bounded misclassification of the two lifecycle tasks; remove the `serve` substring over-match |
+| `backend/ai/database/task_repository.py` | Add the bounded, secret-free exception-chain field to the once-per-episode fallback diagnostic (the only ambiguity left in the Errno-11 evidence) |
+| `tests/test_runtime_diagnostics_classification.py` | Regression coverage for the two lifecycle tasks, the entrypoint rule, the app-side controls, and exact `serve` |
+| `tests/test_task_fallback_classification.py` | `ReadError`/`WriteError` shape, timeout/ECONNRESET/EMFILE discrimination, chain content bound and the logged chain field |
+| `tests/test_task_fallback_cooldown.py` | Deterministic 90-second episode proving the cooldown bounds durable attempts |
+| `IMPLEMENTATION_REPORT.md` | This report (full replacement) |
+
+Not changed: no schema, no migration, no SQL, no `DATABASE_ARCHITECTURE.md`, no
+second client/executor/scheduler/retry loop, no worker count or timeout change,
+no Render or environment change, no user-facing behaviour.
 
 ---
 
-## 9. Unresolved limitations / missing evidence
+## 7. Production status — NOT verified
 
-* **Deployed commit unknown** (no commit marker in the repo, no Render
-  credential here, no timestamps in the reported lines). The logs are consistent
-  with post-protection code, but that correlation is inference, not a
-  measurement.
-* **The OS-level origin of `EAGAIN` is not provable from the repository.** The
-  classification ("local resource, not a store outage") is the codebase's own
-  documented reading of `[Errno 11]` and is test-pinned; proving *which* local
-  resource ran short (ephemeral ports, file descriptors, memory) needs
-  host-level metrics (`ss -s`, `/proc/<pid>/limits`, fd counts, thread counts)
-  that this workspace cannot collect.
-* **No retry was added for transient pooled-connection deaths** (GOAWAY). The
-  degradation is honest (non-durable, reported), but a task write attempted in
-  exactly that window is not durable; a safe design would need read-only retry
-  semantics, which is a larger, riskier change than this phase's brief allows.
-* **Latent diagnostics blind spots are documented, not fixed** (§5): the
-  wrapper frames hide the real coroutine from the coro-name/source signals, and
-  the residual `asyncio.to_thread` DB paths still bypass the single bounded
-  pool.
-* `tests/test_colored_buttons.py` keeps its 40 pre-existing failures (identical
-  on a pristine `origin/main`); they are unrelated to this phase but are not
-  fixed here.
+* No deployment was triggered, no Render shell/log access was used, no service
+  was restarted, and no live Telegram/Supabase session exists in this workspace.
+  A successful commit and push is **not** proof of deployment or runtime
+  recovery.
+* The two warnings are expected to disappear from the next
+  `ASYNC_TASK_DUMP`/`TASK_STARVATION` body (the tasks will be listed as
+  `[PERMANENT]`), and any genuine bounded stall must still be reported.
+* The `Errno 11` condition itself is untouched: the change makes the **next
+  episode decidable**, it does not remove the failure. If a task write lands in
+  such a window it is still degraded to the in-memory fallback and honestly
+  labelled non-durable.
+
+### Follow-up evidence that would settle the remaining question
+
+1. The next `TASK_FALLBACK_CLASSIFIED` line's `chain=` field: `ReadError` vs
+   `RemoteProtocolError` vs `ReadTimeout`, and which errno, at which frequency.
+2. Host-level counters around the episode (open fds, sockets in `CLOSE_WAIT`/
+   `TIME_WAIT`, thread count of `lifeos-supabase-*`) — Render Free has no shell,
+   so this needs an existing metric/log surface or a platform metric, not code.
+3. Whether `ConnectionTerminated` correlates with the Errno-11 bursts (same
+   minute) or is independent connection expiry.
+
+---
+
+## 8. Remaining known limitations
+
+* **The OS-level origin of `EAGAIN` is unproven.** The repository can prove it is
+  a local socket-layer would-block (not a timeout, not saturation, not a store
+  error) and can prove the cooldown bounds the retry rate, but not *which* local
+  resource/condition produced it on Render.
+* **No retry for a terminated pooled HTTP/2 connection.** Deliberate: the
+  repository's writes are non-idempotent and rely on CAS/unique keys; a retry
+  path needs a separate, carefully designed change.
+* **`RuntimeSupervisor._cancel_orphan_tasks` still cancels uvicorn's lifespan
+  task** on a hard reset (it is auto-named and unprotected). That is existing
+  behaviour, outside this phase; the new classification only stops reporting it
+  as a stalled bounded task.
+* **`heartbeat.py`'s own permanent-name counter** still counts only assigned
+  names, so its `bounded_tasks` telemetry is two higher than the diagnostics'
+  count (it produces no warning). Left unchanged to avoid duplicating the
+  classifier in a second runtime-critical loop.
+* **The 40 button-colour failures** remain (Telethon version mismatch in this
+  workspace) and are unrelated to this phase.
