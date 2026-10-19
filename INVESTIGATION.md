@@ -91,6 +91,23 @@ Installed and inspected in this workspace: `supabase 2.4.2`, `postgrest 0.16.11`
    dispatches once. A failed write therefore stays ambiguous — which is why no
    retry is added here.
 
+### Transport/lifecycle knobs that exist today
+
+Checked one by one, because the brief asks whether any *existing* setting can be
+changed safely without adding another client, executor or retry loop:
+
+| Knob | Where | Verdict |
+|---|---|---|
+| PostgREST transport deadline (8 s) | `ClientOptions(postgrest_client_timeout=8.0)` | the only transport knob the pinned `supabase` client exposes; already correct (strictly below the 10 s dispatch budget) |
+| Worker count (4) | `backend/db/client.py::_DB_MAX_WORKERS` | bounds concurrent sockets on the shared client; no evidence supports changing it |
+| HTTP/2 on/off, keepalive expiry, connection limits, `max_connections` | built *inside* `postgrest.utils.SyncClient` as `httpx.Client(..., http2=True)` | not reachable through `ClientOptions`; changing them means replacing the session/transport by private-API surgery, i.e. exactly the second transport layer this phase must not add |
+| Client lifetime (created once, never closed) | `backend/db/client.py::get_db` | closing/recreating it would end keepalive reuse and need a new lifecycle owner; unsupported by the evidence |
+
+**No existing transport setting or lifecycle behaviour can be changed safely on
+the current evidence.** Each candidate would be a hypothesis-driven change, and
+the focused regression test such a change requires cannot even be written until
+the missing measurement exists.
+
 ### Local reproductions used above
 
 | Experiment | Result |
@@ -128,6 +145,13 @@ consistent with the evidence.
 ---
 
 ## 4. The one change made (diagnostic, not behavioural)
+
+Are the current logs sufficient to decide the remaining hypotheses? **Before this
+change: no.** `reason` + `chain` name the failing layer and errno, but a
+would-block that returns instantly and a transport deadline that expired after
+eight seconds produce the identical line. **After it: yes**, for the read path —
+the added fields separate those two cases mechanically, and separate a read from
+a write/connect, a peer termination, and a watchdog abandonment.
 
 `chain=` answered *what* failed. It cannot answer *when in the call* it failed,
 and that is the last thing separating the two remaining explanations of
