@@ -21,12 +21,12 @@ is pinned below the dispatch budget so a slow call can never pin a
 worker thread longer than the application is willing to wait.
 """
 import asyncio
-import functools
 import logging
 import os
 import random
 import string
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
@@ -135,6 +135,45 @@ def _get_db_executor() -> ThreadPoolExecutor:
     return executor
 
 
+# In-flight duration of one synchronous transport call, tagged on the failure
+# that comes out of the worker. A would-block that returns immediately and a
+# transport deadline that expired after eight seconds produce the SAME errno
+# chain, so the duration is the only in-process evidence that separates them.
+# Diagnostic attribute only: nothing is retried, delayed or re-classified.
+_DB_INFLIGHT_ATTR = "_lifeos_db_inflight_seconds"
+
+
+def _timed_db_call(fn, args, kwargs):
+    """Run one synchronous Supabase call and tag its in-flight duration.
+
+    Measured INSIDE the worker so executor queueing is excluded: the value is
+    the time the transport itself spent before failing.
+    """
+    started = time.monotonic()
+    try:
+        return fn(*args, **kwargs)
+    except BaseException as exc:
+        try:
+            setattr(exc, _DB_INFLIGHT_ATTR, time.monotonic() - started)
+        except Exception:
+            pass
+        raise
+
+
+def db_inflight_seconds(exc) -> float | None:
+    """How long the failing transport call was in flight, when it is known.
+
+    ``None`` means the failure was raised OUTSIDE the worker (for example the
+    dispatch deadline fired while the thread was still blocked in the
+    transport), so no transport duration exists — reporting one would be a
+    fabrication.
+    """
+    value = getattr(exc, _DB_INFLIGHT_ATTR, None)
+    if isinstance(value, (int, float)) and value >= 0:
+        return float(value)
+    return None
+
+
 async def run_sync_db(fn, *args, timeout=_DB_TIMEOUT, **kwargs):
     """The ONE bounded dispatch for synchronous Supabase HTTP work.
 
@@ -151,7 +190,7 @@ async def run_sync_db(fn, *args, timeout=_DB_TIMEOUT, **kwargs):
     op_name = getattr(fn, "__name__", "db_unknown")
     loop = asyncio.get_running_loop()
     coro = loop.run_in_executor(
-        _get_db_executor(), functools.partial(fn, *args, **kwargs)
+        _get_db_executor(), _timed_db_call, fn, args, kwargs
     )
     return await guarded_await(coro, name=f"db:{op_name}", timeout=timeout)
 

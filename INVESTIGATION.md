@@ -1,358 +1,257 @@
-# INVESTIGATION.md — Runtime DB `Errno 11` degradation and lifecycle tasks reported as stalls
+# INVESTIGATION.md — recurring Supabase task-repository transport failures
 
-This file records **only** the latest completed investigation and **replaces
-every previous investigation in full**. Earlier handoffs (colored-button
-semantics, the symbol registry, premium-emoji rounds, AED archive rounds,
-private-message rounds) remain readable in git history and are obsolete here.
+This file is the **complete current investigation and handoff** and replaces every
+previous investigation in full. Earlier handoffs (colored-button semantics, the
+symbol registry, premium-emoji rounds, AED archive rounds, private-message
+rounds, the lifecycle-task stall round) remain readable in git history and are
+obsolete here.
 
 | Item | Value |
 |---|---|
-| Investigation | Post-deployment runtime diagnosis, two independent workstreams |
+| Investigation | Supabase task-repository `ReadError [Errno 11]` bursts and the separate HTTP/2 `ConnectionTerminated` failure |
 | Date | 2026-10-19 |
 | Project / remote | LifeOS Telegram self-bot, `Onlyicing1/Telegram-self-bot` (`origin`) |
-| Delivery branch | `main` (the investigation commit `17942f1` is on `origin/main`) |
-| Base revision at investigation start | `3f0ef80b60d65c3a10582b6e86d6be4a06190c17` (`= origin/main`, verified with `git fetch` + `git rev-parse`) |
-| Resulting fix commit | `17942f167591618c4ba9111d15f2f7cffc7d789d` — `fix(runtime): stop reporting lifecycle tasks as stalls and record the DB failure chain` |
-| Evidence basis | Full source reads, the installed dependency sources, local reproductions, and the repository test suite. **No live environment was touched** |
+| Base revision | `aee3e163e914eae72cafa922eb3d38fd7a3ca697` (`origin/main`; this documentation commit) |
+| Relevant code before this phase | `17942f167591618c4ba9111d15f2f7cffc7d789d` |
+| Evidence basis | Full source reads of this repository **and the installed pinned libraries**, plus local socket/TLS reproductions and the repository test suite |
 | Live Telegram / Render / Supabase | **NOT accessed.** No deployment, Render shell, log stream, `.env`, credential, SQL, migration, restart or environment change. No claim of runtime recovery is made |
-
-Detailed implementation notes are in `IMPLEMENTATION_REPORT.md` at commit
-`17942f1`; this document is the self-contained handoff.
+| Outcome | Root cause **not** proven at the OS level. One narrow, safe **diagnostic** change implemented so the next production episode is decidable. No behaviour, retry, timeout, worker-count or transport change |
 
 ---
 
-## 1. Questions investigated
+## 1. What the production evidence now proves
 
-Two symptoms appeared after deployment. They were investigated **separately**;
-no shared cause was assumed, and none was found.
+The chain field added in `17942f1` did its job. Production now reports:
 
-* **A — DB degradation.** Repeated `httpx`/`httpcore`
-  `ReadError: [Errno 11] Resource temporarily unavailable` raised inside
-  `backend.ai.database.task_repository`, each followed by
-  `TASK_FALLBACK_CLASSIFIED reason=local_resource` and a switch to the
-  in-memory task repository, while the process stayed `READY` with both
-  Telegram clients connected. A separate `ConnectionTerminated` HTTP/2 error
-  was also observed.
-* **B — false stall reports.** After the earlier identity fix `58fa664`,
-  `TASK_NO_PROGRESS` / `TASK_STARVATION` still named two long-lived lifecycle
-  tasks: `Task-1` (coroutine `main`, awaiting the process shutdown event) and
-  `Task-27` (coroutine `main` inside uvicorn's lifespan machinery).
+```
+TASK_FALLBACK_CLASSIFIED reason=local_resource exception=ReadError
+  chain=ReadError<ReadError<BlockingIOError(errno=11)
+Supabase event task query failed; using fallback
+ConnectionTerminated error_code:1            (separate line, HTTP/2 transport)
+```
 
----
+That chain is **shape evidence**, and it settles several hypotheses outright:
 
-## 2. Workstream A — confirmed facts about the DB path
-
-All rows below were verified in source or in the installed packages, not
-inferred from the log text.
-
-| Claim | Status | Evidence |
+| Claim | Status | Basis |
 |---|---|---|
-| One reusable `ThreadPoolExecutor` with 4 workers | **Confirmed** | `backend/db/client.py::_get_db_executor` — `ThreadPoolExecutor(max_workers=4, thread_name_prefix="lifeos-supabase")`, created once under `_db_executor_lock`; every call goes through `run_sync_db` |
-| 8 s transport deadline below a 10 s dispatch deadline | **Confirmed** | `_DB_HTTP_TIMEOUT = 8.0` → `ClientOptions(postgrest_client_timeout=…)`; `_DB_TIMEOUT = 10.0` → `guarded_await(..., timeout=10.0)` in `run_sync_db`; the `0 < 8 < 10` ordering is test-pinned |
-| `ClientOptions(postgrest_client_timeout=…)` exists in the pinned library | **Confirmed** | `supabase 2.4.2` exports `ClientOptions` with `postgrest_client_timeout` (default 120); `get_db()` builds the single shared client with `8.0` |
-| 5 s local-resource cooldown | **Confirmed** | `_LOCAL_RESOURCE_COOLDOWN_SECONDS = 5.0` in `backend/ai/database/task_repository.py`; the gate is in `_run`/`_run_checked`; a skipped call raises `LocalResourceCooldown` with `reason=local_resource`; a skipped call never extends the window; a successful durable operation clears it |
-| Failure degrades to the in-memory repository | **Confirmed** | Each repository method catches, calls `_degrade`/`_mark_fallback`, and returns data annotated with `fallback_backend` / `fallback_reason` — non-durable and truthfully labelled |
-| Supabase REST traffic uses HTTP/2 | **Confirmed** | `postgrest 0.16.11::SyncPostgrestClient.create_session` builds `SyncClient(..., http2=True)`; `h2 4.4.1` installed. `ConnectionTerminated` is an h2 class, i.e. the same transport |
-| A socket read timeout would surface as `ReadError [Errno 11]` | **Disproved** | `httpcore._backends.sync.SyncStream.read` maps `socket.timeout → ReadTimeout` and other `OSError → ReadError`. A local TLS reproduction (§4) produced `TimeoutError` with `errno=None` |
+| The failure is a local socket-layer would-block, not a PostgREST/HTTP status | **Confirmed** | `OSError(errno.EAGAIN)` *is* `BlockingIOError`; the innermost link is that raw OS error, so nothing above it produced a response |
+| It is **not** an expired HTTP read deadline | **Confirmed (disproved as the explanation)** | `httpcore._backends.sync.SyncStream.read` maps `socket.timeout → ReadTimeout`; a real deadline expiry surfaces as `httpx.ReadTimeout` with **no errno**. Reproduced locally: a TLS peer that never writes + `settimeout(0.2)` → `TimeoutError`, `errno=None` |
+| It is **not** executor saturation or a queued dispatch | **Confirmed (absent)** | That path raises `OperationTimeoutError` with no errno → `reason=unavailable`; production says `local_resource` with errno 11 |
+| It is **not** file-descriptor exhaustion | **Confirmed (absent)** | `EMFILE`/`ENFILE` (24/23) also classify `local_resource`, but the chain names errno **11** |
+| It is **not** the HTTP/2 termination | **Confirmed (separate)** | `ConnectionTerminated` is an `h2` event; httpcore raises `RemoteProtocolError(event)` — **no errno**, `phase=protocol`, `reason=unavailable`. It is a different line from the errno-11 chain, and whether the two coincide in time is still unmeasured |
+| Classification, cooldown and fallback attribution behave as designed | **Confirmed** | 5 s bounded local-resource cooldown, skipped calls never extend it, a success clears it, in-memory results are labelled non-durable with `reason=local_resource` |
 
-### What the errno means in this exact chain
+What is **still unproven** is *why* the local socket layer returns `EAGAIN` on
+Render. That is an OS/network-stack question, and it is recorded as unproven
+rather than guessed at.
 
-`httpx.ReadError` wraps `httpcore.ReadError`, which wraps the raw `OSError`
-raised by `SyncStream.read` → `SSLSocket.recv`. `OSError(errno.EAGAIN, …)`
-constructs the `BlockingIOError` subclass (verified locally), so
-`[Errno 11]` is a socket-layer "would block / no data currently available" —
-not an HTTP status, not a PostgREST error, and not a response from the store.
+---
 
-### Actual execution/data flow for a task write
+## 2. Pinned-stack facts (source-verified, not assumed)
 
-```
-AI call site / scheduler / execution coordinator
-  → repository method (SupabaseTaskRepository._run / _run_checked)
-  → cooldown gate?  (inside 5 s window → LocalResourceCooldown(reason=local_resource))
-  → run_sync_db(...) in backend/db/client.py
-  → loop.run_in_executor(one 4-worker pool, lifeos-supabase-*)
-  → guarded_await(..., timeout=10 s)   [backend/runtime/operation_watchdog.py]
-  → synchronous supabase-py → postgrest 0.16.11 → httpx over HTTP/2
-      transport deadline pinned at 8 s
-  → on failure: _classify_degradation walks __cause__/__context__
-      errno EAGAIN/EMFILE/ENFILE, thread-start RuntimeError → local_resource
-      ReadTimeout / ConnectTimeout / ECONNRESET / RemoteProtocolError → unavailable
-  → _degrade / _mark_fallback → InMemoryTaskRepository + fallback annotations
-  → TASK_FALLBACK_CLASSIFIED (once per episode) then per-operation warning
-```
+Installed and inspected in this workspace: `supabase 2.4.2`, `postgrest 0.16.11`,
+`httpx 0.27.0`, `httpcore 1.0.9`, `h2 4.4.1` (`backend/requirements.txt` pins
+`supabase==2.4.2` and `httpx==0.27.0`; `httpcore`/`h2` arrive transitively).
 
-`guarded_await` bounds the *awaiting coroutine*; a thread blocked inside the
-synchronous HTTP call cannot be cancelled, which is why the transport deadline
-must be strictly shorter than the dispatch deadline.
+1. **One synchronous client, HTTP/2 on.**
+   `postgrest/_sync/client.py::SyncPostgrestClient.create_session` builds
+   `SyncClient(..., timeout=timeout, http2=True)`, i.e. a bare `httpx.Client`
+   subclass. `backend/db/client.py::get_db` passes
+   `ClientOptions(postgrest_client_timeout=8.0)`.
+2. **The read primitive.**
+   `httpcore/_backends/sync.py::SyncStream.read` is exactly
+   `self._sock.settimeout(timeout); return self._sock.recv(max_bytes)` inside
+   `map_exceptions({socket.timeout: ReadTimeout, OSError: ReadError})`.
+   So *only* a real `OSError` can produce `ReadError`, and its errno is preserved
+   as the innermost link of the chain we log.
+3. **Where the errno comes from.** `httpcore/_sync/http2.py::_read_incoming_data`
+   calls `network_stream.read(READ_NUM_BYTES, timeouts["read"])` — a constant
+   per-read timeout (8.0 s here), not a shrinking deadline. A would-block at the
+   syscall level therefore has exactly two possible timings: immediate
+   (`elapsed ≈ 0`) or after the timeout (`elapsed ≈ 8`).
+4. **CPython implements a positive socket timeout over a NON-BLOCKING fd.**
+   Measured: with `settimeout(0.6)` the fd has `O_NONBLOCK` set (`fcntl
+   F_GETFL`) both before and during `recv`; `SO_RCVTIMEO` stays `(0,0)`.
+   Consequently every Supabase read runs over a non-blocking TLS fd, and an
+   `SSL_read` EAGAIN that OpenSSL reports as `SSL_ERROR_SYSCALL` (rather than
+   `SSL_ERROR_WANT_READ`) is translated by CPython into `OSError(11)` →
+   **`BlockingIOError`**, which is precisely the observed innermost link.
+   A plain non-blocking `socket.recv` gives the same class
+   (`BlockingIOError`, errno 11); an `SSLSocket` in pure non-blocking mode gives
+   `SSLWantReadError` with **errno 2**. The production chain is the former.
+5. **Connection reuse cannot manufacture `EAGAIN`.**
+   A pooled connection that the peer closed cleanly yields
+   `RemoteProtocolError("Server disconnected")` (read returned `b""`); a GOAWAY
+   yields `RemoteProtocolError(ConnectionTerminated)`; a reset yields
+   `ECONNRESET` (104). None of these is `EAGAIN`. Also, `HTTP2Connection
+   .is_available()` is `False` once `_connection_error` is set, so a poisoned
+   connection is not handed out again.
+6. **No retry exists anywhere in this path.** Neither `postgrest` nor `httpx`
+   contains retry logic (grep: no `retry`/`max_retries`), and `run_sync_db`
+   dispatches once. A failed write therefore stays ambiguous — which is why no
+   retry is added here.
 
-### Hypothesis discrimination
+### Local reproductions used above
 
-| Hypothesis | Failure that would surface | Observed |
+| Experiment | Result |
+|---|---|
+| TLS peer accepts, never writes; client `settimeout(0.2)`, `recv` | `TimeoutError`, `errno=None` (→ `ReadTimeout`) |
+| TLS peer accepts, silent; client `settimeout(0)`, `recv` | `SSLWantReadError`, `errno=2` |
+| Plain `socketpair`, peer silent, `setblocking(False)`, `recv` | `BlockingIOError`, `errno=11` |
+| TLS fd flags with `settimeout(0.6)` before and during `recv` | `O_NONBLOCK` set in both, `SO_RCVTIMEO=(0,0)` |
+| 200 trials: one thread blocked in `SSLSocket.recv`, one thread `send`ing on the same socket | 198 `TimeoutError`, 0 `BlockingIOError` |
+
+---
+
+## 3. Concurrency question (is the shared client / bounded pool invalid?)
+
+Investigated because the same synchronous client is dispatched from a bounded
+4-worker pool:
+
+* `httpx.Client` is documented as shareable across threads; `httpcore` guards a
+  connection with a separate read lock and write lock, and reads/writes from
+  different threads are the intended HTTP/2 pattern (multiplexed streams).
+* Both `SyncStream.read` and `SyncStream.write` call `sock.settimeout(...)` on
+  the same fd, but with the **same** value here (read = write = 8.0 from
+  `ClientOptions`), so no thread can flip the other's mode.
+* The 200-trial concurrency reproduction above produced `TimeoutError` only —
+  never `BlockingIOError`, never a corrupted-SSL error.
+* The pool is bounded: `_DB_MAX_WORKERS = 4`, `_DB_HTTP_TIMEOUT = 8.0 <
+  _DB_TIMEOUT = 10.0` (test-pinned), so at most four sockets exist on the shared
+  client and no thread outlives its transport deadline.
+
+**Conclusion:** nothing in the current design is proven invalid, and no
+evidence justifies a second client, a bigger/smaller pool, a timeout change or
+serialisation. The brief's constraint to preserve this architecture is
+consistent with the evidence.
+
+---
+
+## 4. The one change made (diagnostic, not behavioural)
+
+`chain=` answered *what* failed. It cannot answer *when in the call* it failed,
+and that is the last thing separating the two remaining explanations of
+`BlockingIOError(errno=11)`:
+
+* the 8 s read transport deadline expired and the platform surfaced it as a
+  syscall would-block → the call was in flight for ~8 s;
+* the TLS/socket layer refused the read immediately (non-blocking fd / would-
+  block or an `SSL_ERROR_SYSCALL` EAGAIN) → the call failed in milliseconds.
+
+So the once-per-episode `TASK_FALLBACK_CLASSIFIED` line now also carries:
+
+| Field | Meaning | Why it decides |
 |---|---|---|
-| Local socket read returned `EAGAIN` | `httpx.ReadError` ← `BlockingIOError(errno=11)` | **Yes — the production text** |
-| Executor saturation / dispatch budget exceeded | `OperationTimeoutError`, no errno → `unavailable` | No |
-| Transport read deadline expired | `httpx.ReadTimeout`, no errno → `unavailable` | No — disproved by the reproduction |
-| File-descriptor exhaustion | `EMFILE`/`ENFILE` (24/23) → also `local_resource`, different errno | No |
-| Remote HTTP/2 termination | `RemoteProtocolError` ← `ConnectionTerminated`, no errno → `unavailable` | Seen as a **separate** line, not as the Errno-11 chain |
-| Peer reset / closed socket | `ECONNRESET` (104) / `EBADF` (9) → `unavailable` | No |
+| `elapsed` | in-flight seconds of the failing transport call, measured **inside** the shared worker (executor queueing excluded); `n/a` when the failure came from the watchdog, not the transport | `≈8.0s` ⇒ deadline; `≈0.0s` ⇒ immediate refusal |
+| `phase` | transport stage derived from class names only: `read`, `write`, `connect`, `pool`, `protocol`, `deadline`, `unknown` | separates a read from a connect/write, and a peer termination from a deadline |
+| `since_ok` | seconds since the last successful durable operation in this process (`never` if none) | a failure 0.5 s after a success is a transient blip, not an unreachable store |
 
-### Cooldown: bounded, and now measured
-
-The cooldown limits durable re-attempts to at most one per 5 s window while an
-episode lasts. A skipped call is served from the in-memory fallback with
-`reason=local_resource`, is never re-labelled an outage, and does not extend the
-window. A test drives **180 calls across 90 simulated seconds** with a
-monotonic-clock shim (no sleeping) and asserts **≤ 19** durable attempts instead
-of 180.
-
-### Conclusion for A
-
-* **Confirmed:** the failure is a *local socket-layer would-block*, not a
-  Supabase outage, not an expired read deadline, and not executor saturation.
-  Classification and cooldown already behave as designed.
-* **Not established (unproven):** *why* the local socket layer returns `EAGAIN`
-  on Render. Settling that needs host-level data this workspace cannot collect
-  (fd/socket/thread counters, egress/NAT behaviour, gVisor syscall behaviour,
-  h2 reuse pattern). It is recorded as unproven rather than guessed.
-* **Diagnostic gap that was real:** `TASK_FALLBACK_CLASSIFIED` recorded only the
-  outer exception type and its message, which cannot distinguish a read
-  would-block from a connect-phase failure, an fd shortage, a timeout, or an
-  h2 termination. This ambiguity had survived two earlier phases.
+All three are numbers or lower-case enums. **Nothing** is retried, delayed,
+re-classified, suppressed or relabelled; the cooldown, the dispatch budget, the
+transport deadline, the worker count and the fallback semantics are untouched.
+Implementation detail and exact code are in `IMPLEMENTATION_REPORT.md`.
 
 ---
 
-## 3. Workstream A — the one narrow change made
+## 5. What the next production episode must show
 
-In `backend/ai/database/task_repository.py`, the once-per-episode
-`TASK_FALLBACK_CLASSIFIED` warning now includes
-`chain=<names+errno>`. `_describe_exception_chain` walks
-`__cause__`/`__context__`, emits **class names and integer errno values only**,
-is capped at `_MAX_CHAIN_LINKS = 6`, and guards against cycles. No message, URL,
-header, token or user data is logged. Nothing is retried, suppressed, or
-re-classified; fallback semantics are unchanged.
+Read the `TASK_FALLBACK_CLASSIFIED` line and decide mechanically:
 
----
+| Observed | Conclusion | Next action |
+|---|---|---|
+| `phase=read elapsed=7.5s…8.0s chain=…BlockingIOError(errno=11)` | the transport deadline is being reported as a syscall would-block — a latency/platform artefact on the read path | pursue host/edge latency (Render egress, Supabase edge), not the client |
+| `phase=read elapsed=0.0s…0.1s chain=…BlockingIOError(errno=11)` | the socket refused the read immediately — non-blocking-fd / `SSL_ERROR_SYSCALL` path | capture host counters around the same minute (open fds, sockets in `CLOSE_WAIT`/`TIME_WAIT`, `lifeos-supabase-*` threads) and, if available, an `strace`-level sample |
+| `phase=protocol` + `ConnectionTerminated` | peer/HTTP-2 GOAWAY — connection expiry, a different problem | correlate timestamps with the errno rows; consider connection lifetime, never a blind retry |
+| `phase=deadline` / `elapsed=n/a` | watchdog abandonment (thread still blocked) — the client cannot keep up | revisit the dispatch budget with measurements |
+| `phase=write` | the write phase, so response ambiguity is even stronger | do **not** retry; keep the non-durable label |
+| `since_ok=` small (≪ the episode) | the durable path was healthy moments earlier | treat as transient, keep the cooldown |
 
-## 4. Local reproduction used to separate timeout from would-block
-
-Performed outside the repository (nothing in the source or tests depends on it):
-
-```
-self-signed TLS server accepts, then never writes
-client: wrap_socket → settimeout(0.2) → recv(1024)
-→ TimeoutError  errno=None   (isinstance(socket.timeout) is True)
-```
-
-`httpcore` maps that to `httpx.ReadTimeout`, so a `ReadError` carrying
-`errno=11` cannot be an expired read deadline. The matrix is test-pinned in
-`tests/test_task_fallback_classification.py`: `ReadError`/`WriteError` +
-`EAGAIN` → `local_resource`; `ReadTimeout` / `ConnectTimeout` → `unavailable`;
-`ECONNRESET` → `unavailable`; `EMFILE` → `local_resource`.
+Simultaneously confirm that the lifecycle-task false-stall warnings stay absent
+(`Task-1`/`Task-27` no longer appear as `TASK_NO_PROGRESS`/`TASK_STARVATION`)
+while a genuine bounded stall is still reported.
 
 ---
 
-## 5. Workstream B — confirmed root cause
-
-### Actual classification flow
-
-```
-_dump_tasks()
-  → for each pending asyncio.Task: t.get_coro()
-  → coroutine's OWN outermost frame (cr_frame)
-  → coro_name (__name__) + await_loc (co_filename:f_lineno)
-  → _is_permanent_task(name, coro_name, await_loc)
-      name in _PERMANENT_TASK_NAMES
-      or coro_name in _PERMANENT_CORO_EXACT / matches _PERMANENT_CORO_PATTERNS
-      or await_loc's source file matches _PERMANENT_SOURCE_MARKERS
-      or (coro_name == "main" and source == backend/main.py)
-  → permanent tasks are excluded from stalled / starvation / deadlock /
-    slow-handler reports
-  → per-task identity state (_prev_stacks, _stack_unchanged_count,
-    _task_first_seen) keyed by the task object, pruned each dump
-```
-
-### Why the two tasks were classified BOUNDED
-
-`_is_permanent_task` originally had three signals: runtime-assigned task names,
-coroutine-name patterns, and a **`telethon/`-only** source marker.
-
-* **`Task-1`** — runtime name `Task-1` (not assigned by LifeOS), coroutine
-  `main`, await location `backend/main.py:…`. `"main"` matched no coroutine
-  pattern and the source was not under `telethon/` → BOUNDED.
-* **`Task-27`** — coroutine `main`, await location
-  `…/uvicorn/lifespan/on.py:…`; uvicorn creates it with
-  `loop.create_task(self.main())`, so it gets an auto-generated `Task-N` name.
-  `uvicorn`/`serve` existed only as *coroutine-name* patterns, not source
-  markers → BOUNDED.
-
-Reproduced against the pre-fix `backend/runtime/diagnostics.py` restored from
-`HEAD`: **4 failed / 17 passed**, with the production output:
-
-```
-TASK_NO_PROGRESS — … Task: Task-1 / Task: Task-27
-TASK_STARVATION — 2 tasks unchanged across 3+ dumps:
-  STARVATION: Task-1 unchanged for 3 dumps (0s)
-  STARVATION: Task-27 unchanged for 3 dumps (0s)
-  Stack trace: File ".../uvicorn/lifespan/on.py", line 3, in main
-```
-
-### Why both waits are expected
-
-* `backend/main.py::main` awaits `supervisor.start()`; `start_diagnostics()` is
-  called **inside** that method (`backend/runtime/supervisor.py:201`). No dump
-  can therefore observe `main` during startup — whenever diagnostics runs,
-  `main` can only be parked on `await supervisor.shutdown_event.wait()` until
-  shutdown. `asyncio.run()` names the entry task `Task-N`, so its own source
-  file is the only reliable identifier.
-* `uvicorn/lifespan/on.py::main` is library machinery that parks on its receive
-  queue until server shutdown. The app's uvicorn task is separately named
-  `lifeos-web-server`, already permanent by name.
-
-### Fix (classification only, in `backend/runtime/diagnostics.py`)
-
-* `_PERMANENT_SOURCE_MARKERS` gains `"uvicorn/lifespan/"`, matched against the
-  coroutine's **own** frame.
-* A narrow rule treats a task as permanent only when its coroutine is exactly
-  `main` **and** that coroutine's own source file is the process entrypoint
-  `backend/main.py` (`_source_file` strips the `:line` suffix first).
-* `serve` moved from the substring tuple into the **exact** set
-  `_PERMANENT_CORO_EXACT`, because as a substring it also matched application
-  coroutines such as `_observe_durable_ceiling` and any `_preserve_*`, silently
-  hiding a genuine stall there.
-* **Server-side control:** an application coroutine named `main` in a different
-  file remains BOUNDED; an application coroutine awaiting a lifecycle-style
-  shutdown wait is still reported as `TASK_NO_PROGRESS`/`TASK_STARVATION`.
-
-**Why the process task was not simply renamed:** it would also have to be added
-to `RuntimeSupervisor._cancel_orphan_tasks`' protected name set, because that
-method cancels every pending task whose name is not protected. Renaming without
-that change would let a hard reset cancel the process lifecycle task itself. The
-source-based classification rule is smaller and precise.
-
-Preserved unchanged: the task-object identity registry and pruning from
-`58fa664`, counter/elapsed accounting, the three-dump starvation threshold,
-deadlock and slow-handler detection, and detection of real bounded stalls.
-This was **classification only** — no runtime recovery, scheduling, timeout or
-retry behaviour was altered.
-
-**Conclusion for B — established:** colour of the defect is in the classifier's
-source-marker whitelist, not in the tasks. Both reported tasks are deliberate
-process/library waits; the classifier could not identify them by the signals it
-had. `Task-1` and `Task-27` are now `[PERMANENT]` and produce no warning.
-
----
-
-## 6. Evidence: tests and exact results
+## 6. Tests and exact results (this phase)
 
 | Command | Result |
 |---|---|
-| `pytest tests/test_runtime_diagnostics_classification.py tests/test_task_fallback_classification.py tests/test_task_fallback_cooldown.py tests/test_local_resource_bounds.py -q` | **57 passed** |
-| The diagnostics test file against the **pre-fix** `diagnostics.py` | **4 failed / 17 passed** — reproduces `STARVATION: Task-1` / `Task-27` verbatim; the app-side control passed before and after |
-| Above plus `tests/test_07_diagnostics.py tests/test_11_runtime_wiring.py tests/test_task_repository.py tests/test_task_scheduler.py tests/test_task_execution.py` | **119 passed** |
-| `pytest tests -q -p no:cacheprovider` (full suite) | **6382 passed, 27 skipped, 40 failed** in 124.39 s |
-| `pytest tests/test_colored_buttons.py -q` | **40 failed / 12 passed** — the entire failure set: `Button.inline() got an unexpected keyword argument 'style'`, i.e. workspace Telethon **1.34.0** vs pinned **1.43.0**. Pre-existing, unrelated, not fixed |
-| `python3 -m py_compile` on both changed modules and the three test files | exit 0 |
+| `pytest tests/test_task_transport_evidence.py -q` | **12 passed** (new file) |
+| `pytest tests/test_task_transport_evidence.py tests/test_task_fallback_classification.py tests/test_task_fallback_cooldown.py tests/test_local_resource_bounds.py tests/test_task_repository.py -q` | **64 passed** |
+| `pytest tests/test_07_diagnostics.py tests/test_11_runtime_wiring.py tests/test_task_scheduler.py tests/test_task_execution.py tests/test_03_database_consistency.py tests/test_06_failure_simulation.py tests/test_22_reliability.py tests/test_24_execution_reliability.py tests/test_30_delete_timeout_hardening.py -q` | **91 passed** |
+| `pytest tests -q -p no:cacheprovider` (full suite) | **6394 passed, 27 skipped, 40 failed** in 123.97 s |
+| failure set of the full run | **all 40 in `tests/test_colored_buttons.py`** — `Button.inline() got an unexpected keyword argument 'style'`, i.e. workspace Telethon **1.34.0** vs pinned **1.43.0**. Pre-existing, unrelated, not fixed here |
+| `python3 -m py_compile backend/db/client.py backend/ai/database/task_repository.py tests/test_task_transport_evidence.py` | exit 0 |
 | `git diff --check` | clean |
 
-Baseline accounting: the previous baseline was `6370 passed`; this phase adds
-**12 tests** (6 diagnostics, 5 classification/chain, 1 cooldown) → `6382`.
-No new failures were introduced. The 27 skips are unchanged opt-in/live tests.
-
-**Post-fix reruns on the final committed tree:** focused **57 passed**,
-broader relevant set **119 passed**, full suite with the same 40 pre-existing
-failures, `py_compile` exit 0, `git diff --check` clean, both modules import
-cleanly.
+Accounting: baseline `6382 passed` + **12** new tests = `6394`. No new failures;
+the 27 skips are the unchanged opt-in/live tests.
 
 ---
 
-## 7. Files changed by the investigation (commit `17942f1`)
+## 7. Constraints preserved
 
-| File | Why |
-|---|---|
-| `backend/runtime/diagnostics.py` | Fix the proven permanent/bounded misclassification; remove the `serve` substring over-match |
-| `backend/ai/database/task_repository.py` | Add the bounded, secret-free exception chain to the once-per-episode fallback diagnostic |
-| `tests/test_runtime_diagnostics_classification.py` | Regression coverage for both lifecycle tasks, the entrypoint rule, app-side controls, exact `serve` |
-| `tests/test_task_fallback_classification.py` | Read/Write error shape, timeout/ECONNRESET/EMFILE discrimination, chain bound and logged field |
-| `tests/test_task_fallback_cooldown.py` | Deterministic 90-second episode proving the cooldown bounds durable attempts |
-| `IMPLEMENTATION_REPORT.md` | Full-replacement implementation report |
-
-Deliberately **not** changed: no schema, migration or SQL, no
-`DATABASE_ARCHITECTURE.md`, no second client/executor/scheduler/retry loop, no
-worker-count or timeout change, no Render or environment change, no
-user-facing behaviour.
-
----
-
-## 8. Constraints and architectural decisions that shaped this work
-
-* **One shared Supabase client and one bounded 4-worker pool.** Every DB surface
-  (DB layer, task repository, AI persistence) dispatches through `run_sync_db`;
-  concurrency and socket count stay bounded regardless of callers.
-* **Transport deadline strictly below the dispatch deadline.** The watchdog can
-  abandon the awaiting coroutine, but only the transport deadline releases the
-  blocked thread.
-* **No automatic retry for the Errno-11 path.** Writes are non-idempotent and
-  rely on CAS/unique keys; a retry needs a separate, carefully designed change.
-  The 5 s cooldown is the only rate control, and it is scoped to the durable
-  task path rather than process-wide.
-* **No new task name for the process entry task.** Renaming it would require
-  widening `_cancel_orphan_tasks`' protected set or a hard reset would cancel
-  the process lifecycle task.
-* **Classification remains source/frame based.** An application coroutine always
-  keeps its own frame file, so the entrypoint and `uvicorn/lifespan/` rules
-  cannot capture real application work.
+* One shared Supabase client, one bounded 4-worker pool, one dispatch point
+  (`run_sync_db`). No second client, executor, scheduler, update loop or retry
+  system.
+* Transport deadline (8 s) strictly below the dispatch deadline (10 s) — the
+  measurement is taken inside the worker and never changes either deadline.
+* Bounded local-resource cooldown (5 s) and truthful in-memory fallback
+  labelling unchanged; a cooldown-skipped call still raises
+  `LocalResourceCooldown`/`reason=local_resource` and emits no second line.
+* No retry of writes (ambiguous completion), no suppression of the warning, no
+  relabelling of `EAGAIN` as an outage.
+* No HTTP/2 disablement, no timeout/worker-count change.
+* No schema, SQL, migration or `DATABASE_ARCHITECTURE.md` change.
+* No credential, token, URL, header or message content in the diagnostics —
+  names, errno integers, enums and bounded numbers only.
 
 ---
 
-## 9. Unresolved / unverified
+## 8. Unresolved / unverified
 
-* **The OS-level cause of `EAGAIN` on Render is unproven** (see §2).
-* **`ConnectionTerminated` correlation with the Errno-11 bursts is unproven.**
-  It is known to be a separate line from the same HTTP/2 transport, but whether
-  it coincides with the bursts in time has not been measured.
-* **No retry for a terminated pooled HTTP/2 connection** exists, deliberately.
+* **The OS-level origin of `EAGAIN` on Render is unproven.** The repository can
+  prove it is a local socket-layer would-block on the read path (not a timeout,
+  not saturation, not a store error, not the HTTP/2 termination) but not which
+  local condition produces it.
+* **`ConnectionTerminated` correlation with the errno-11 bursts is unproven**;
+  only the separation of the two signatures is proven.
+* **No production verification.** Nothing was deployed or observed. A
+  successful commit is not proof of deployment or recovery.
+* **Dependency drift:** `httpcore` and `h2` are not pinned in
+  `backend/requirements.txt`; the versions examined here are `httpcore 1.0.9`
+  and `h2 4.4.1`, so a later rebuild may resolve a different transport
+  implementation and change the semantics these conclusions rest on. Not
+  changed in this phase (it alters the deployed stack and is not needed to
+  answer the question); recommended as a separate, deliberate dependency pin.
 * **`RuntimeSupervisor._cancel_orphan_tasks` still cancels uvicorn's lifespan
-  task** on a hard reset (auto-named and unprotected). That is pre-existing
-  behaviour, outside this phase; the new classification only stops reporting it
-  as a stalled bounded task.
-* **`backend/runtime/heartbeat.py`'s own permanent-name counter** still counts
-  only assigned names, so its `bounded_tasks` telemetry can be two higher than
-  the diagnostics' count. It produces no warning; left unchanged to avoid
-  duplicating the classifier in a second runtime-critical loop.
-* **No production verification.** No deployment, Render shell, log stream, live
-  Telegram session or Supabase connection was used. The commit is not proof of
-  deployment or recovery.
+  task** on a hard reset (auto-named, unprotected). Pre-existing, outside this
+  phase.
+* **The 40 button-colour failures** remain (workspace Telethon version) and are
+  unrelated.
 
 ---
 
-## 10. Precise next step
+## 9. Manual action required
 
-When the next episode occurs, read the `TASK_FALLBACK_CLASSIFIED` line's
-`chain=` field. From it, decide between:
-
-1. `ReadError(errno=11)` ← `BlockingIOError` — confirm the read-phase
-   would-block and pursue host-level socket/fd metrics.
-2. `RemoteProtocolError` ← `ConnectionTerminated` — connection reuse/expiry, a
-   separate problem from the local errno.
-3. `ReadTimeout` / `OperationTimeoutError` — a latency/budget problem, not
-   `EAGAIN`.
-4. `ReadError(errno=24)` or `errno=23` — descriptor exhaustion, not the current
-   symptom.
-
-Alongside that line, collect host-level counters around the same minute (open
-fds, sockets in `CLOSE_WAIT`/`TIME_WAIT`, `lifeos-supabase-*` thread count).
-Render Free has no shell, so this requires an existing metric/log surface or a
-platform metric, not code. Separately confirm whether the lifecycle-task
-warnings have disappeared from `ASYNC_TASK_DUMP` / `TASK_STARVATION` while a
-genuine bounded stall is still reported.
+1. Confirm Render deployed the commit that carries this change and read the next
+   `TASK_FALLBACK_CLASSIFIED` line — the table in §5 decides the remaining cause
+   mechanically. This workspace cannot reach Render.
+2. Collect host-level counters for the same minute as the episode (open fds,
+   sockets in `CLOSE_WAIT`/`TIME_WAIT`, `lifeos-supabase-*` thread count). Render
+   Free has no shell; this needs an existing metric surface or platform metric.
+3. Decide, once §5 identifies the cause, whether a single bounded **read-only**
+   re-dispatch is worth designing (writes must stay non-retried). Not designed
+   here, because the cause is not established and a second attempt would need to
+   fit inside the existing 10 s dispatch budget.
 
 ---
 
-## 11. Delivery state of this documentation change
+## 10. Delivery state
 
-`INVESTIGATION.md` is the only file changed by the documentation commit that
-delivers this document. Its parent is the investigation's code commit
-`17942f1` (`fix(runtime): stop reporting lifecycle tasks as stalls and record
-the DB failure chain`). Because a file cannot contain the SHA of its own
-commit, the delivery commit is identified with `git log -1 -- INVESTIGATION.md`
-on the checked-out branch; both commits are on `origin/main`.
+The code and test change is in `backend/db/client.py`,
+`backend/ai/database/task_repository.py` and
+`tests/test_task_transport_evidence.py`; this document and
+`IMPLEMENTATION_REPORT.md` are replaced in full. The commit that delivers them is
+identified with `git log -1` on the checked-out branch (`origin/main`), because a
+file cannot contain the SHA of its own commit.

@@ -216,6 +216,50 @@ def _classify_degradation(exc) -> str:
 # matter how deep a library's chaining goes.
 _MAX_CHAIN_LINKS = 6
 
+# The transport phase, keyed by the exception class that carries it (httpx and
+# httpcore use the same names for their mirrored classes). The phase names a
+# transport STAGE, never a cause: it separates a read from a connect, a write, a
+# pooled-connection wait, a peer/HTTP-2 termination and our own dispatch
+# deadline without printing a single message byte.
+_TRANSPORT_PHASE_BY_CLASS = {
+    "ConnectError": "connect",
+    "ConnectTimeout": "connect",
+    "ReadError": "read",
+    "ReadTimeout": "read",
+    "WriteError": "write",
+    "WriteTimeout": "write",
+    "PoolTimeout": "pool",
+    "RemoteProtocolError": "protocol",
+    "ConnectionTerminated": "protocol",
+    "OperationTimeoutError": "deadline",
+    "TimeoutError": "deadline",
+}
+
+
+def _transport_phase(exc) -> str:
+    """Which transport stage produced this failure (``unknown`` if none).
+
+    Walks the same ``__cause__``/``__context__`` chain as the classifier, so a
+    raw ``OSError`` wrapped by a transport error is still attributed to the
+    wrapper that knows the stage.
+    """
+    seen: set[int] = set()
+    current = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        phase = _TRANSPORT_PHASE_BY_CLASS.get(type(current).__name__)
+        if phase is not None:
+            return phase
+        current = current.__cause__ or current.__context__
+    return "unknown"
+
+
+def _format_evidence_seconds(value) -> str:
+    """A bounded seconds field for the once-per-episode diagnostic (``n/a``)."""
+    if isinstance(value, (int, float)) and value >= 0:
+        return f"{min(float(value), 86400.0):.1f}s"
+    return "n/a"
+
 
 def _describe_exception_chain(exc) -> str:
     """Bounded, secret-free description of a failure's exception chain.
@@ -621,6 +665,10 @@ class SupabaseTaskRepository(TaskRepository):
         # Bounded local-resource cooldown (monotonic deadline; 0.0 = inactive)
         # and "this continuous degradation episode was already reported".
         self._local_resource_until=0.0;self._degraded_announced=False;self._audit_drop_announced=False
+        # When the last durable operation actually succeeded (monotonic; None =
+        # never in this process). A failure seconds after a success is evidence
+        # of a transient transport blip, not of an unreachable store.
+        self._last_ok_monotonic=None
         # Highest durable task id this process has observed. PostgreSQL's
         # bigserial sequence stays the ONLY allocator of durable ids; this is
         # never written to the database — it is only a floor handed to the
@@ -658,6 +706,7 @@ class SupabaseTaskRepository(TaskRepository):
         self._local_resource_until = 0.0
         self._degraded_announced = False
         self._audit_drop_announced = False
+        self._last_ok_monotonic = time.monotonic()
     def _in_local_resource_cooldown(self) -> bool:
         """True while the bounded post-local-failure window is still open."""
         return time.monotonic() < self._local_resource_until
@@ -697,10 +746,25 @@ class SupabaseTaskRepository(TaskRepository):
         # string, which is the OS text for the local errno and by itself cannot
         # distinguish a local resource shortage from a store outage (that is
         # the exact gap that made the live misclassification possible).
+        # ``phase``, ``elapsed`` and ``since_ok`` are the remaining deciders:
+        #   * elapsed ~= the transport deadline (8s) -> the deadline expired;
+        #   * elapsed ~= 0s -> the socket refused the read immediately;
+        #   * phase -> read vs write vs connect vs protocol termination;
+        #   * since_ok -> the durable path was healthy moments before.
+        # All four are numbers/enums only (no message, URL, header or token).
+        from backend.db.client import db_inflight_seconds
+
+        since_ok = (
+            "never" if self._last_ok_monotonic is None
+            else _format_evidence_seconds(time.monotonic() - self._last_ok_monotonic)
+        )
         logger.warning(
-            "TASK_FALLBACK_CLASSIFIED reason=%s exception=%s chain=%s message=%s",
-            self._fallback_reason, type(exc).__name__,
-            _describe_exception_chain(exc), str(exc)[:200],
+            "TASK_FALLBACK_CLASSIFIED reason=%s phase=%s exception=%s chain=%s "
+            "elapsed=%s since_ok=%s message=%s",
+            self._fallback_reason, _transport_phase(exc), type(exc).__name__,
+            _describe_exception_chain(exc),
+            _format_evidence_seconds(db_inflight_seconds(exc)),
+            since_ok, str(exc)[:200],
         )
     def _degrade(self, message: str, exc: Exception, *, align_ids: bool = False) -> None:
         """Enter the degraded state and report it — at most once per episode.
