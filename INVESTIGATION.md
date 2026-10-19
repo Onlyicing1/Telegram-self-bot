@@ -350,7 +350,9 @@ genuine bounded stall is still reported.
 
 ## 11. Delivery state of this documentation change
 
-`INVESTIGATION.md` is the only file changed by the documentation commit. The
-investigation's code commit is `17942f1`, verified present on `origin/main`;
-the current `origin/main` HEAD is recorded in the final task report after the
-push, because a file cannot contain the SHA of its own commit.
+`INVESTIGATION.md` is the only file changed by the documentation commit that
+delivers this document. Its parent is the investigation's code commit
+`17942f1` (`fix(runtime): stop reporting lifecycle tasks as stalls and record
+the DB failure chain`). Because a file cannot contain the SHA of its own
+commit, the delivery commit is identified with `git log -1 -- INVESTIGATION.md`
+on the checked-out branch; both commits are on `origin/main`.
