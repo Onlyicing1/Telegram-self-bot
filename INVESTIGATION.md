@@ -85,10 +85,12 @@ dict is mutated with no lock at all. `HTTP11Connection` (`connection.py:66`)
 instead has one `_request_lock` for the whole exchange, which is why the
 HTTP/1.1 path cannot exhibit the same interference.
 
-`httpcore/_backends/sync.py:126–129` remains the single site that converts a
-socket `OSError` into `ReadError` (`sock.settimeout(timeout); sock.recv(...)`),
-so the production `errno 11` was produced by a read on an already-open socket,
-not by connect, DNS or TLS setup.
+`httpcore/_backends/sync.py:125–128` (`SyncStream.read`) remains the single
+site that maps a socket `OSError` to `ReadError`
+(`exc_map = {socket.timeout: ReadTimeout, OSError: ReadError}` →
+`sock.settimeout(timeout); sock.recv(...)`; the write path maps to `WriteError`
+at line 80). So the production `errno 11` was produced by a read on an
+already-open socket, not by connect, DNS or TLS setup.
 
 ---
 
