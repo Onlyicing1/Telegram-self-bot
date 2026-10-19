@@ -29,6 +29,7 @@ import errno
 import logging
 import os
 import re
+import sys
 import threading
 import time
 
@@ -46,6 +47,24 @@ from backend.ai.database.task_repository import (
 from tests.test_task_repository import FakeClient, row_task, task_data
 
 _EVIDENCE = re.compile(r"phase=(\S+) .*elapsed=(\S+) since_ok=(\S+) ")
+_TEARDOWN = re.compile(r"since_teardown=(\S+) ")
+
+
+def _teardown_field(line: str) -> str:
+    match = _TEARDOWN.search(line)
+    assert match is not None, line
+    return match.group(1)
+
+
+def _raiser(exc: BaseException):
+    """A dispatch callable that fails with the given exception, exactly once."""
+    calls: list[int] = []
+
+    def call():
+        calls.append(1)
+        raise exc
+
+    return call, calls
 
 
 def _eagain_read_error() -> httpx.ReadError:
@@ -330,6 +349,119 @@ async def test_a_cooldown_skipped_call_adds_no_second_evidence_line(caplog):
     assert repo._in_local_resource_cooldown() is True
 
 
+# ── Is the errno-11 read coupled to the separate ConnectionTerminated line? ──
+
+
+@pytest.mark.asyncio
+async def test_only_a_peer_or_http2_termination_is_recorded_as_a_teardown(monkeypatch):
+    """The recorder observes the ONE shared transport, and only terminations."""
+    from backend.db import client as dbc
+
+    monkeypatch.setattr(dbc, "_last_transport_teardown", None)
+
+    failing, calls = _raiser(_eagain_read_error())
+    with pytest.raises(httpx.ReadError):
+        await dbc.run_sync_db(failing)
+    assert calls == [1]
+    # A socket-layer read failure is NOT evidence of a peer termination.
+    assert dbc.seconds_since_transport_teardown() is None
+
+    failing, calls = _raiser(httpx.ReadTimeout("timed out"))
+    with pytest.raises(httpx.ReadTimeout):
+        await dbc.run_sync_db(failing)
+    assert dbc.seconds_since_transport_teardown() is None
+
+    failing, calls = _raiser(_remote_h2_termination())
+    with pytest.raises(httpx.RemoteProtocolError):
+        await dbc.run_sync_db(failing)
+    assert calls == [1]
+    gap = dbc.seconds_since_transport_teardown()
+    assert gap is not None
+    assert 0.0 <= gap < 2.0
+
+
+def test_the_recorder_is_bounded_and_never_raises_on_a_pathological_chain(monkeypatch):
+    """A cyclic or absurdly deep chain must not spin or escape the bookkeeping."""
+    from backend.db import client as dbc
+
+    monkeypatch.setattr(dbc, "_last_transport_teardown", None)
+
+    cyclic = RuntimeError("loop")
+    cyclic.__cause__ = cyclic
+    dbc._note_transport_teardown(cyclic)
+    assert dbc.seconds_since_transport_teardown() is None
+
+    deep = RuntimeError("deep")
+    current = deep
+    for _ in range(200):
+        nxt = RuntimeError("link")
+        current.__cause__ = nxt
+        current = nxt
+    current.__cause__ = RuntimeError("ConnectionTerminated error_code:1")
+    # The walk is capped, so a class match beyond the bound is NOT recorded —
+    # the field reports what was observed, never what was assumed.
+    dbc._note_transport_teardown(deep)
+    assert dbc.seconds_since_transport_teardown() is None
+
+
+@pytest.mark.asyncio
+async def test_the_line_reports_the_gap_since_the_last_observed_teardown(caplog, monkeypatch):
+    """``none`` without a teardown, a real gap when one was observed."""
+    from backend.db import client as dbc
+
+    monkeypatch.setattr(dbc, "_last_transport_teardown", None)
+
+    with caplog.at_level(logging.WARNING, logger="backend.ai.database.task_repository"):
+        lonely = SupabaseTaskRepository(
+            FakeClient(error=_eagain_read_error()), InMemoryTaskRepository()
+        )
+        assert await lonely.list_tasks(10) == []
+    assert _teardown_field(_evidence_lines(caplog)[-1]) == "none"
+
+    # The separate production line: the same transport reports a peer/HTTP-2
+    # termination, and the NEXT local-resource episode is read against it.
+    failing, _calls = _raiser(_remote_h2_termination())
+    with pytest.raises(httpx.RemoteProtocolError):
+        await dbc.run_sync_db(failing)
+
+    with caplog.at_level(logging.WARNING, logger="backend.ai.database.task_repository"):
+        after = SupabaseTaskRepository(
+            FakeClient(error=_eagain_read_error()), InMemoryTaskRepository()
+        )
+        assert await after.list_tasks(10) == []
+
+    gap = _teardown_field(_evidence_lines(caplog)[-1])
+    assert gap.endswith("s")
+    assert 0.0 <= float(gap[:-1]) < 2.0
+
+
+# ── The deployed runtime identity, logged once when the client is built ──
+
+
+def test_the_client_init_line_carries_the_runtime_identity(monkeypatch, caplog):
+    """Local diagnosis ran on 3.10; Render runs 3.11.7 — record what actually runs."""
+    from backend.db import client as dbc
+
+    monkeypatch.setenv("SUPABASE_URL", "https://example.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "service-role")
+    monkeypatch.setattr(dbc, "_initialised", False)
+    monkeypatch.setattr(dbc, "_client", None)
+    monkeypatch.setattr(dbc, "_available", False)
+    monkeypatch.setattr("supabase.create_client", lambda *a, **k: object())
+
+    with caplog.at_level(logging.INFO, logger="backend.db.client"):
+        assert dbc.get_db() is not None
+
+    lines = [r.getMessage() for r in caplog.records if "Supabase client initialised" in r.getMessage()]
+    assert lines, caplog.text
+    line = lines[-1]
+    assert f"runtime=python-{sys.version_info.major}.{sys.version_info.minor}" in line
+    assert "ssl=" in line
+    # Identity only: no URL, key or token may ride along.
+    assert "service-role" not in line
+    assert "example.supabase.co" not in line
+
+
 # ── The evidence fields carry names and numbers only ──
 
 
@@ -353,6 +485,7 @@ async def test_evidence_fields_are_bounded_and_secret_free(caplog):
     assert re.fullmatch(r"[a-z]+", phase)
     assert re.fullmatch(r"\d+\.\ds|n/a", elapsed)
     assert re.fullmatch(r"\d+\.\ds|never", since_ok)
+    assert re.fullmatch(r"\d+\.\ds|none", _teardown_field(line))
     assert "chain=ReadError<BlockingIOError(errno=11)" in line
     assert secret not in line
     assert "apikey" not in line

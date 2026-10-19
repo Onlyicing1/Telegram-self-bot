@@ -24,7 +24,9 @@ import asyncio
 import logging
 import os
 import random
+import ssl
 import string
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -108,7 +110,11 @@ def get_db():
             ClientOptions(postgrest_client_timeout=_DB_HTTP_TIMEOUT),
         )
         _available = True
-        logger.info("[SAVE_DB] Supabase client initialised.")
+        logger.info(
+            "[SAVE_DB] Supabase client initialised. runtime=python-%s ssl=%s",
+            f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+            ssl.OPENSSL_VERSION,
+        )
         return _client
     except Exception as exc:
         logger.error("[SAVE_DB] Supabase init FAILED (%s) — using in-memory fallback.", exc)
@@ -142,6 +148,42 @@ def _get_db_executor() -> ThreadPoolExecutor:
 # Diagnostic attribute only: nothing is retried, delayed or re-classified.
 _DB_INFLIGHT_ATTR = "_lifeos_db_inflight_seconds"
 
+# Production also emits a separate ``ConnectionTerminated error_code:1`` line,
+# and whether it is causally related to the errno-11 read failures is still
+# unmeasured. Recording the most recent PEER/HTTP-2 termination where every
+# synchronous Supabase call already passes (this single dispatch) makes that
+# relationship readable in the next episode instead of guessed at: the
+# local-resource line reports the gap, or ``none`` when no teardown was ever
+# seen in this process. Bounded bookkeeping only — no retry, delay, deadline,
+# worker-count, lifecycle or classification change, and no payload captured.
+_TRANSPORT_TEARDOWN_CLASSES = frozenset({"ConnectionTerminated", "RemoteProtocolError"})
+_MAX_TEARDOWN_CHAIN_LINKS = 8
+_last_transport_teardown: float | None = None
+
+
+def _note_transport_teardown(exc) -> None:
+    """Record the instant of a peer/HTTP-2 termination seen in a failure chain."""
+    global _last_transport_teardown
+    seen: set[int] = set()
+    current = exc
+    links = 0
+    while current is not None and id(current) not in seen and links < _MAX_TEARDOWN_CHAIN_LINKS:
+        seen.add(id(current))
+        links += 1
+        if type(current).__name__ in _TRANSPORT_TEARDOWN_CLASSES:
+            _last_transport_teardown = time.monotonic()
+            return
+        current = current.__cause__ or current.__context__
+
+
+def seconds_since_transport_teardown() -> float | None:
+    """Seconds since the last observed transport teardown (``None`` if never)."""
+    last = _last_transport_teardown
+    if last is None:
+        return None
+    elapsed = time.monotonic() - last
+    return elapsed if elapsed >= 0 else 0.0
+
 
 def _timed_db_call(fn, args, kwargs):
     """Run one synchronous Supabase call and tag its in-flight duration.
@@ -155,6 +197,10 @@ def _timed_db_call(fn, args, kwargs):
     except BaseException as exc:
         try:
             setattr(exc, _DB_INFLIGHT_ATTR, time.monotonic() - started)
+        except Exception:
+            pass
+        try:
+            _note_transport_teardown(exc)
         except Exception:
             pass
         raise
