@@ -229,10 +229,11 @@ workspace.** Checked, not assumed:
   deployments on record are from 2026-08-17/2026-10-13 unrelated branch deploys.
 
 Therefore the following are **unverified by this round** and belong to the
-owner's Render dashboard: whether the delivery commit is deployed; whether the
-errno-11 line recurs and how often; whether `since_teardown` shows coupling to
-the `ConnectionTerminated` line; and the deployed OpenSSL build (now printed by
-the init line). A commit and a push are not proof of deployment or recovery.
+owner's Render dashboard: whether the delivery commit is deployed; the exact UTC
+window of the failures and their recurrence rate; whether the errno-11 line
+recurs and how often; whether `since_teardown` shows coupling to the
+`ConnectionTerminated` line; and the deployed OpenSSL build (now printed by the
+init line). A commit and a push are not proof of deployment or recovery.
 
 ---
 

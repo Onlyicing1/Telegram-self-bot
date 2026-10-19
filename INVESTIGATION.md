@@ -39,6 +39,16 @@ ConnectionTerminated error_code:1                 (separate line, HTTP/2 transpo
 | It is **not** peer-close, RST, or GOAWAY reaching the read | **Confirmed (absently)** — measured here | Peer FIN → clean `b''`; peer RST (SO_LINGER 0) → clean `b''`; GOAWAY → `RemoteProtocolError` (`phase=protocol`, **no errno**). None produces `OSError(11)` |
 | The two signatures (`ConnectionTerminated`, errno-11 read) are causally related | **Unproven — and now measured by the code rather than by eye** | Only temporal proximity was ever available; §4 makes it a field on the same log line |
 
+**The precise UTC window and the recurrence rate are NOT established**, because
+this workspace has no access to the Render log stream (§9). What is known: the
+lines appear repeatedly across the post-deployment period, and because the line
+is emitted **once per continuous episode** — and the flag that gates it is reset
+only by a durable success — repeated lines prove repeated
+failure→success→failure cycles, i.e. **intermittent blips on an otherwise working
+store**, not one long outage. Timestamps, counts per interval and any correlation
+with `ConnectionTerminated` must come from the owner's log view or from the
+`since_teardown` field once the next episode is logged.
+
 ---
 
 ## 2. New local measurements (the decisive negatives)
@@ -249,6 +259,9 @@ kept and remain green.
   and push is not proof of deployment or recovery.
 * **`ConnectionTerminated` correlation is now measured, not yet observed** — the
   field ships with this change and will speak only on the next episode.
+* **The exact UTC failure window, per-interval counts and host-level counters are
+  unknown here** (no Render log/metric access); the only timing evidence this
+  round could add is in-process (`elapsed`, `since_ok`, and now `since_teardown`).
 * **Dependency drift:** `httpcore` and `h2` are still unpinned in
   `backend/requirements.txt`; the conclusions above rest on `httpcore 1.0.9` /
   `h2 4.4.1` / `httpx 0.27.0`. A deliberate pin remains a separate change.
