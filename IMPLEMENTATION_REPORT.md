@@ -149,8 +149,9 @@ TASK_FALLBACK_CLASSIFIED reason=local_resource phase=read exception=ReadError \
 The mechanism is unproven on the deployed build and the local probe matrix
 removes the explanations that a transport-side change would rest on; the one
 non-hypothesis-driven shape — re-issuing an ambiguous write — is forbidden. So
-the round ships the two fields that make the next episode decidable (see §8),
-plus the runtime identity that removes a load-bearing unknown.
+the round ships the two fields that make the next episode decidable (see §9 and
+`INVESTIGATION.md` §5), plus the runtime identity that removes a load-bearing
+unknown.
 
 ---
 
