@@ -388,7 +388,10 @@ def test_the_documented_counts_match_the_repository():
     flat = _flat(_section("## 31. Canonical Database Setup"))
     assert f"all {TOTAL_MIGRATIONS} migrations" in flat
     assert f"{TOTAL_MIGRATIONS} files" in flat
-    assert "thirteen later additive migrations" in flat
+    assert "twelve later additive migrations" in flat
+    assert len(_recorded_order()) - 1 == 12, (
+        "the snapshot plus twelve later parts is what the prose must count"
+    )
     assert f"parts 1–{TOTAL_PARTS} of §31.3" in flat
 
 

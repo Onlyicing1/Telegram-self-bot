@@ -2,7 +2,7 @@
 
 DATABASE_ARCHITECTURE.md §31 must give the owner exactly ONE thing to paste: a
 single fenced SQL block that contains the complete ordered setup — the canonical
-reconciliation snapshot first, then every later pending migration. This module pins
+reconciliation snapshot first, then every later additive migration. This module pins
 that property so the document cannot regress to a two-stage workflow (a "step 0"
 block plus a second block) or a shell `cat` command.
 
@@ -737,7 +737,7 @@ def test_the_documented_deviations_are_stated_explicitly():
     flat = _flat(_section_31())
     assert "display_name" in flat
     assert "42703" in flat, "the failure the ordering prevents must be named"
-    assert "thirteen later additive migrations" in flat, (
+    assert "twelve later additive migrations" in flat, (
         "the later migrations must be acknowledged"
     )
     assert "add_todo_schedule_type" in flat, "the Todo schedule type must be acknowledged"
@@ -761,3 +761,67 @@ def test_the_section_does_not_pretend_the_sql_was_executed():
     assert "NOTHING has been executed against Supabase" in flat
     assert "no SQL was run" in flat
     assert "pending an owner action" in flat
+
+
+# ─── 5. counts and the manual-action list must match the block ───────────────
+
+def test_the_later_part_count_matches_the_block():
+    """13 parts are the snapshot plus TWELVE later parts, and the prose says so."""
+    total = len(DOCUMENTED_ORDER)
+    assert total == 13
+    flat = _flat(_section_31())
+    assert "twelve later additive migrations" in flat
+    assert f"parts 2–{total}" in flat
+    assert "thirteen later additive migrations" not in flat, (
+        "the snapshot is not one of the later parts"
+    )
+
+
+def test_the_manual_action_section_names_every_embedded_part():
+    """§30.11 must not send the owner back to individual migration files."""
+    section = _section("### 30.11 Manual Supabase action still required")
+    flat = _flat(section)
+    assert "§31.3" in section
+    for name in DOCUMENTED_ORDER[1:]:
+        assert name in section, f"§30.11 must name {name} as part of the one paste"
+    assert "nine pending" not in flat
+    assert "parts 4, 5, 7, 8 and 9" not in flat, (
+        "every later part must be listed, never a stale subset"
+    )
+    assert "twelve" in flat
+
+
+def test_the_waiting_answer_migration_is_absorbed_by_part_one():
+    """Its widened CHECK lives in the snapshot, so it needs no part of its own."""
+    snapshot = _part_spans(_setup_block())[RECONCILE]
+    assert "waiting_answer" in snapshot, (
+        "part 1 must re-add the status CHECK in its final form"
+    )
+    status = _section("## 20. Migration Status")
+    row = next(
+        line
+        for line in status.splitlines()
+        if "20260927020000_add_waiting_answer_status.sql" in line
+    )
+    assert "PART 1 of §31.3" in row, (
+        "the inventory must say the snapshot already establishes it"
+    )
+    assert "owner action required" not in row
+    assert "**35** files" in _flat(status), (
+        "the audited file count must be the current one (35)"
+    )
+
+
+def test_the_one_unmigrated_column_pair_is_documented_not_hidden():
+    """The only code-required columns no migration creates are named, not implied."""
+    block = _setup_block()
+    for name in ("auto_reaction_enabled", "auto_reaction_emoji"):
+        assert name not in block, (
+            f"{name} has no migration; the block must not invent it"
+        )
+    flat = _flat(_section_31())
+    assert "no migration file creates them" in flat
+    assert "auto_reaction_enabled" in flat
+    assert "auto_reaction_emoji" in flat
+    section_6 = _section("## 6. panel_settings")
+    assert "no migration creates it" in _flat(section_6).lower()

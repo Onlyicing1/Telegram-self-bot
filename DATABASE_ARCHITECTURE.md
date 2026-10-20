@@ -72,8 +72,8 @@ This section answers one operational question: **what exactly does the owner
 paste?** The answer is exactly ONE SQL script — the block in §31.3. It is the
 CURRENT canonical setup for the database the current code expects: the
 complete ordered setup, the canonical reconciliation snapshot first, then the
-thirteen later additive migrations, in one fenced block. There is no "step 0", no
-second block to paste and no shell workflow. Open this section, copy §31.3,
+twelve later additive migrations (parts 2–13), in one fenced block. There is
+no "step 0", no second block to paste and no shell workflow. Open this section, copy §31.3,
 paste it into the Supabase SQL Editor as `postgres` and run it. §31.1 is the
 reconciliation audit that proves the block equals the effective final state of
 all 35 repository migrations — including the two Todo migrations
@@ -452,7 +452,7 @@ tables here" appears in it.
 --
 -- Copy this whole block and paste it into the Supabase SQL Editor as `postgres`.
 -- It is the complete ordered setup: the canonical reconciliation snapshot first,
--- then the twelve pending migrations.
+-- then the twelve later additive migrations (parts 2-13).
 --
 -- Order (source-derived from supabase/migrations/):
 --   1. 20260920000001_reconcile_canonical_schema.sql     (canonical snapshot)
@@ -3400,9 +3400,22 @@ repository, which is exactly why every statement in the block is idempotent.
   revokes client privileges, drops the named permissive policies and grants the
   four backend verbs to `service_role`, which is the posture §33.4 documents and
   the backend already relied on (its one client is built from
-  `SUPABASE_SERVICE_ROLE_KEY`). The last six parts add no foreign key, no
-  trigger, no function and no seed row; only part 11 alters an existing table's
-  shape (columns and one CHECK), and part 13 alters only access, not shape.
+  `SUPABASE_SERVICE_ROLE_KEY`). Apart from part 8's `todo_steps.task_id →
+  ai_tasks(id) ON DELETE CASCADE` foreign key, the last six parts add no foreign
+  key, no trigger, no function and no seed row; only part 11 alters an existing
+  table's shape (columns and one CHECK), and part 13 alters only access, not
+  shape.
+* **It does not close the one application-required column pair that no migration
+  establishes.** `settings_service` writes `panel_settings.auto_reaction_enabled`
+  and `panel_settings.auto_reaction_emoji` (the Auto-Reaction setting read by
+  `auto_reaction_service.process_outgoing_message`), and §6 lists both as
+  proposed columns — but **no migration file creates them**, so §31.3 does not
+  create them either: the block is complete against the repository's migration
+  history, not against that one proposal. Until an additive migration is
+  generated (the §23 rule: document first, then migrate), the toggle and the
+  chosen emoji persist only in the process cache and are lost on restart. This
+  is the only such pair; no other column, table, index, constraint, function or
+  policy the code uses is missing from the block.
 * The §31.1 reconciliation matrix is documentation derived from the repository
   files (migrations, source, tests); it was verified statically — statement
   identity and semantic equivalence — and **no SQL was executed against any
@@ -3415,9 +3428,10 @@ repository, which is exactly why every statement in the block is idempotent.
 The database contains **13 tables** in the `public` schema — 5 core
 LifeOS tables and 8 AI subsystem tables. Two additional tables exist in
 migrations (`bot_settings`, `ghost_chats`). `ai_usage` and
-`ai_provider_stats` have migration files (`20260827000003` /
-`20260827000004`) pending manual application; `ai_preferences` is
-specified here and implemented in code but has **no applied migration**.
+`ai_provider_stats` are created by their migrations (`20260827000003` /
+`20260827000004`), which part 1 of the one-paste setup (§31.3) absorbs;
+`ai_preferences` is specified here and implemented in code but has **no
+migration at all**.
 The exact
 status of every table is in [§19](#19-known-inconsistencies),
 [§20](#20-migration-status), and [§23](#23-self-bot-persistent-state-inventory).
@@ -3451,8 +3465,8 @@ status of every table is in [§19](#19-known-inconsistencies),
 |---|---|---|---|
 | `bot_settings` | `20260729213959` | `ghost_seen_v2` (key `ghost_seen_allowed_chats`) | **Live** — NOT orphaned. See §19.4. |
 | `ghost_chats` | `20260822090000` | none | **Orphaned** — no code reads or writes it. See §19.12. |
-| `ai_usage` | `20260827000003` | `SupabaseUsageRepository` + `usage_recorder` | Migration created, **pending manual application** (§13). |
-| `ai_provider_stats` | `20260827000004` | `SupabaseProviderStatsRepository` + `usage_recorder` | Migration created, **pending manual application** (§12). |
+| `ai_usage` | `20260827000003` | `SupabaseUsageRepository` + `usage_recorder` | Created by the canonical setup (§31.3, part 1); see §13. |
+| `ai_provider_stats` | `20260827000004` | `SupabaseProviderStatsRepository` + `usage_recorder` | Created by the canonical setup (§31.3, part 1); see §12. |
 | `ai_preferences` | none | interface + in-memory only | Specified (§14), **no producer, no migration**. |
 
 ### Emoji & Reaction Tables (MANUAL-ONLY migration)
@@ -3514,7 +3528,7 @@ the Save path (see AGENTS.md §6).
 | `file_id` | `text` | YES | — | Telegram file ID |
 | `file_size` | `bigint` | YES | — | File size in bytes |
 | `media_type` | `text` | YES | — | Human-readable media type label (Photo, Video, etc.) |
-| `display_name` | `text` | YES | — | **Owner-supplied name** for the item (e.g. `University Weekly Schedule — Semester Two`). Added by `20260921000001_add_saved_items_display_name.sql` — pending manual application. `NULL` = the owner gave no name: display falls back to the source filename and then to `media_type`. Never auto-filled and never LLM-generated; independent of `save_code`, `caption` and `file_name` (see *User-facing metadata* below). Searched by the saved-item resolver (`retrieve_service.resolve_saved_items`). |
+| `display_name` | `text` | YES | — | **Owner-supplied name** for the item (e.g. `University Weekly Schedule — Semester Two`). Added by `20260921000001_add_saved_items_display_name.sql` — part 4 of the one-paste setup (§31.3). `NULL` = the owner gave no name: display falls back to the source filename and then to `media_type`. Never auto-filled and never LLM-generated; independent of `save_code`, `caption` and `file_name` (see *User-facing metadata* below). Searched by the saved-item resolver (`retrieve_service.resolve_saved_items`). |
 | `tags` | `text[]` | YES | `'{}'` | **Owner-supplied semantic tags** (e.g. `{university, semester-2}`). Since Save V2 the column holds only what the owner provided — a save with no tags stores `'{}'` — while the machine-generated hashtags (`#saved`, `#saved_photo`, …) are rendered into `caption` instead. Historical rows keep the hashtags they were saved with; nothing is backfilled or rewritten, and a `#`-prefixed entry is not an owner tag (see *User-facing metadata* below). Searched by the saved-item resolver as whole-tag equality. |
 | `caption` | `text` | YES | — | Caption attached to the saved message |
 
@@ -3555,8 +3569,8 @@ Save V2 separates four concepts that were previously conflated:
 | `idx_saved_items_created_at` | `created_at` | btree | |
 | `idx_saved_items_save_type` | `save_type` | btree | |
 | `idx_saved_items_owner_created` | `(owner_id, created_at)` | btree | Added by migration `20260718143752`. Composite index for `list_saves` + `list_recent_saves` queries, and the owner filter + `created_at DESC` ordering of the Save V2 resolver. |
-| `idx_saved_items_display_name_trgm` | `display_name` | GIN (trigram) | Save V2 — supports the resolver's owner-scoped `display_name ILIKE '%token%'` prefilter. Added by `20260922000001_add_saved_items_search_indexes.sql` — pending manual application. Requires `pg_trgm` (already enabled by the canonical script). |
-| `idx_saved_items_tags` | `tags` | GIN | Save V2 — supports the resolver's whole-tag containment (`tags.cs.{term}`). Added by the same pending successor migration. |
+| `idx_saved_items_display_name_trgm` | `display_name` | GIN (trigram) | Save V2 — supports the resolver's owner-scoped `display_name ILIKE '%token%'` prefilter. Added by `20260922000001_add_saved_items_search_indexes.sql` — part 5 of the one-paste setup (§31.3). Requires `pg_trgm` (already enabled by the canonical script). |
+| `idx_saved_items_tags` | `tags` | GIN | Save V2 — supports the resolver's whole-tag containment (`tags.cs.{term}`). Added by the same migration (part 5 of the one-paste setup, §31.3). |
 
 ### Dead Indexes (depend on dead columns, should be dropped)
 
@@ -3730,8 +3744,8 @@ a key-value store.
 | `debug_callbacks` | `boolean` | NO | `false` | Debug callback tracing |
 | `owner_only` | `boolean` | NO | `true` | Restrict commands to owner only |
 | `dashboard_font` | `text` | NO | `'default'` | Glass UI / dashboard font key — one of `FONT_KEYS` in `backend/helper/font_style.py` (`DASHBOARD_FONTS` == `FONT_KEYS`); never free-text CSS |
-| `auto_reaction_enabled` | `boolean` | NO | `false` | Auto-Reaction setting (Emoji Stage 1) — whether the owner has enabled automatic reactions to their own outgoing messages. The setting is stored/read through `settings_service`; the reaction engine that would consume it is a later stage and is not yet implemented. **PROPOSED column — pending manual application** (see Migration Status) |
-| `auto_reaction_emoji` | `text` | NO | `''` | Auto-Reaction setting (Emoji Stage 2) — the exact Telegram reaction emoji the owner selected through the General panel selector, stored/read through `settings_service`. **PROPOSED column — pending manual application** (see Migration Status) |
+| `auto_reaction_enabled` | `boolean` | NO | `false` | Auto-Reaction setting (Emoji Stage 1) — whether the owner has enabled automatic reactions to their own outgoing messages. The setting is stored/read through `settings_service` and consumed by `auto_reaction_service.process_outgoing_message`. **PROPOSED — no migration creates it**, so the one-paste setup in §31.3 does not create it either (see §31.6) |
+| `auto_reaction_emoji` | `text` | NO | `''` | Auto-Reaction setting (Emoji Stage 2) — the exact Telegram reaction emoji the owner selected through the General panel selector, stored/read through `settings_service` and consumed by `auto_reaction_service.process_outgoing_message`. **PROPOSED — no migration creates it**, so the one-paste setup in §31.3 does not create it either (see §31.6) |
 | `ghost_seen_retention_seconds` | `bigint` | NO | `2592000` | Ghost Seen registry retention window in seconds (30 min–365 days); presets include sub-day durations |
 | `update_stale_seconds` | `integer` | NO | `300` | Update staleness threshold (seconds) |
 | `updated_at` | `timestamptz` | YES | `now()` | Last update timestamp |
@@ -3776,27 +3790,30 @@ columns were supposed to be added by migrations
 migration files do not exist** in the repository. Migration
 `20260827000001_add_missing_panel_settings_columns.sql` now adds all
 10 missing columns (idempotent, with CHECK constraints mirroring the
-`settings_service` validators) — pending manual application. Migration
+`settings_service` validators) — embedded in part 1 of the one-paste setup
+(§31.3). Migration
 `20260823120000_add_dashboard_font_and_ghost_seen_settings.sql`
 (idempotent) covers `dashboard_font` and (originally)
 `ghost_seen_retention_days`; it was applied to the live database and
 verified by the project owner. The follow-up migration
 `20260823130000_ghost_seen_retention_duration.sql` (idempotent)
 replaces the days column with `ghost_seen_retention_seconds`
-(backfilling `days × 86400`) to support sub-day retention windows; it
-is pending manual application. See [§20](#20-migration-status) and
+(backfilling `days × 86400`) to support sub-day retention windows; it is
+also embedded in part 1 of the one-paste setup (§31.3), which carries only the
+final `ghost_seen_retention_seconds` shape. See [§20](#20-migration-status) and
 [§19](#19-known-inconsistencies).
 
 **Proposed (Emoji Stage 1, NOT yet a migration file):** the
 Auto-Reaction setting adds one boolean column,
 `panel_settings.auto_reaction_enabled boolean NOT NULL DEFAULT false`
-(mirroring the `settings_service` `_validate_bool` validator). It is
-**documented here for the owner to apply manually** — no SQL has been
-executed and no migration file has been added. Until it is applied, a
-configured Supabase reports the write as a no-op and the setting runs on
-the in-memory cache (the same graceful-degradation contract every other
-`panel_settings` column followed before its column existed). Suggested
-idempotent SQL:
+(mirroring the `settings_service` `_validate_bool` validator). **No migration
+file creates it**, so it is NOT part of the one-paste setup in §31.3 (§31.6
+records this as the one application-required column pair the block cannot
+establish). Until a migration is generated, a configured Supabase reports the
+write as a no-op and the setting runs on the in-memory cache (the same
+graceful-degradation contract every other `panel_settings` column followed
+before its column existed), i.e. it is lost on restart. The snippet below is
+an OPTIONAL owner-gated workaround, never a second setup step:
 
 ```sql
 ALTER TABLE panel_settings ADD COLUMN IF NOT EXISTS auto_reaction_enabled boolean;
@@ -3809,10 +3826,9 @@ ALTER TABLE panel_settings ALTER COLUMN auto_reaction_enabled SET NOT NULL;
 emoji selection adds one text column,
 `panel_settings.auto_reaction_emoji text NOT NULL DEFAULT ''`
 (mirroring the `settings_service` `_validate_nonempty_str` validator; the
-stored value is the exact Telegram reaction emoji). It is **documented
-here for the owner to apply manually** — no SQL has been executed and no
-migration file has been added, with the same graceful-degradation
-contract as above. Suggested idempotent SQL:
+stored value is the exact Telegram reaction emoji). **No migration file
+creates it** either, with the same status, the same cache-only degradation and
+the same OPTIONAL owner-gated workaround as above. Suggested idempotent SQL:
 
 ```sql
 ALTER TABLE panel_settings ADD COLUMN IF NOT EXISTS auto_reaction_emoji text;
@@ -3886,13 +3902,13 @@ parameters.
 | `is_configured` | `boolean` | NO | `false` | Whether the user completed setup |
 | `trigger_en` | `text` | YES | `NULL` | English trigger word (case-insensitive matching). NULL = not set. |
 | `trigger_fa` | `text` | YES | `NULL` | Persian trigger word (exact matching). NULL = not set. |
-| `show_question` | `boolean` | NO | `false` | Presentation-only "Show my message in AI replies" preference. Read/written by `config_store` (`_DEFAULTS` merge + upsert payload); toggled from AI → Settings. Consumed only by the Telegram reply renderer. Added by `20260913000000_add_ai_config_show_question.sql` — pending manual application. |
-| `stt_model` | `text` | YES | `NULL` | Dedicated Gemini transcription model. Read/written by `config_store` (`_DEFAULTS` merge + upsert payload), edited from AI → Settings → Advanced, consumed at runtime by `services/gemini_media_engine.py` (`stt_settings_from` / `apply_stt_settings`). NULL = the general media model answers the STT instruction. Added by `20260917000001_add_ai_config_stt_settings.sql` — pending manual application. |
-| `stt_language` | `text` | YES | `NULL` | BCP-47 language hint for transcription (e.g. `fa-IR`). Same read/write/consumer path as `stt_model`. NULL = automatic language detection. Added by `20260917000001_add_ai_config_stt_settings.sql` — pending manual application. |
-| `stt_passes` | `integer` | NO | `1` | Bounded number of recognition passes (CHECK `BETWEEN 1 AND 3`; 1 = the single-pass route). Same read/write/consumer path as `stt_model`. Added by `20260917000001_add_ai_config_stt_settings.sql` — pending manual application. |
-| `tts_provider` | `text` | YES | `NULL` | Registered Text-to-Speech provider id (e.g. `openai`). Read/written by `config_store` (`_DEFAULTS` merge + upsert payload), resolved by `backend/ai/tts_control_plane.py`, edited from AI → Media Analysis → Text-to-Speech, and consumed at runtime by `services/tts_service.py` (`apply_tts_settings` / `apply_tts_settings_async`). NULL = the default provider. Added by `20260923000001_add_ai_config_tts_settings.sql` — pending manual application. |
-| `tts_model` | `text` | YES | `NULL` | A model id the selected TTS provider offers. Same read/write/consumer path as `tts_provider`. NULL = that provider's default model. Added by `20260923000001_add_ai_config_tts_settings.sql` — pending manual application. |
-| `tts_voice` | `text` | YES | `NULL` | A voice id the selected model offers. Same read/write/consumer path as `tts_provider`. NULL = that model's default voice. Added by `20260923000001_add_ai_config_tts_settings.sql` — pending manual application. |
+| `show_question` | `boolean` | NO | `false` | Presentation-only "Show my message in AI replies" preference. Read/written by `config_store` (`_DEFAULTS` merge + upsert payload); toggled from AI → Settings. Consumed only by the Telegram reply renderer. Added by `20260913000000_add_ai_config_show_question.sql` — part 1 of the one-paste setup (§31.3). |
+| `stt_model` | `text` | YES | `NULL` | Dedicated Gemini transcription model. Read/written by `config_store` (`_DEFAULTS` merge + upsert payload), edited from AI → Settings → Advanced, consumed at runtime by `services/gemini_media_engine.py` (`stt_settings_from` / `apply_stt_settings`). NULL = the general media model answers the STT instruction. Added by `20260917000001_add_ai_config_stt_settings.sql` — part 1 of the one-paste setup (§31.3). |
+| `stt_language` | `text` | YES | `NULL` | BCP-47 language hint for transcription (e.g. `fa-IR`). Same read/write/consumer path as `stt_model`. NULL = automatic language detection. Added by `20260917000001_add_ai_config_stt_settings.sql` — part 1 of the one-paste setup (§31.3). |
+| `stt_passes` | `integer` | NO | `1` | Bounded number of recognition passes (CHECK `BETWEEN 1 AND 3`; 1 = the single-pass route). Same read/write/consumer path as `stt_model`. Added by `20260917000001_add_ai_config_stt_settings.sql` — part 1 of the one-paste setup (§31.3). |
+| `tts_provider` | `text` | YES | `NULL` | Registered Text-to-Speech provider id (e.g. `openai`). Read/written by `config_store` (`_DEFAULTS` merge + upsert payload), resolved by `backend/ai/tts_control_plane.py`, edited from AI → Media Analysis → Text-to-Speech, and consumed at runtime by `services/tts_service.py` (`apply_tts_settings` / `apply_tts_settings_async`). NULL = the default provider. Added by `20260923000001_add_ai_config_tts_settings.sql` — part 6 of the one-paste setup (§31.3). |
+| `tts_model` | `text` | YES | `NULL` | A model id the selected TTS provider offers. Same read/write/consumer path as `tts_provider`. NULL = that provider's default model. Added by `20260923000001_add_ai_config_tts_settings.sql` — part 6 of the one-paste setup (§31.3). |
+| `tts_voice` | `text` | YES | `NULL` | A voice id the selected model offers. Same read/write/consumer path as `tts_provider`. NULL = that model's default voice. Added by `20260923000001_add_ai_config_tts_settings.sql` — part 6 of the one-paste setup (§31.3). |
 | `last_request_at` | `timestamptz` | YES | `NULL` | Timestamp of the last AI request. **Currently never persisted** — see [§19](#19-known-inconsistencies). |
 | `last_latency_ms` | `real` | YES | `NULL` | Latency of the last AI request in ms. **Currently never persisted** — see [§19](#19-known-inconsistencies). |
 | `created_at` | `timestamptz` | YES | `now()` | When the config row was created |
@@ -4167,7 +4183,8 @@ Supabase is available. Updates come from
 (provider, owner)). Methods: `get_or_create`, `record_request`, `get`,
 `list_all`. Migration `20260827000004_create_ai_provider_stats_table.sql`
 has been generated from this section (the composite PK matches the
-writer's upsert conflict target) — pending manual application.
+writer's upsert conflict target) and is created by part 1 of the one-paste setup
+(§31.3).
 
 ---
 
@@ -4215,7 +4232,7 @@ which persists the normalized `AIExecutionRecord` exactly once per
 request. Methods: `create`, `total_tokens`, `daily_tokens`, `recent`.
 Migration `20260827000003_create_ai_usage_table.sql` has been generated
 from this section (bigserial `id` — the Supabase writer never sends
-`id`) — pending manual application.
+`id`) and is created by part 1 of the one-paste setup (§31.3).
 
 ---
 
@@ -5269,7 +5286,7 @@ bot continues running, but trigger words are lost on restart.
 **Resolution [MIGRATION CREATED]:** Migration
 `20260827000002_add_ai_config_trigger_columns.sql` adds
 `trigger_en TEXT DEFAULT NULL` and `trigger_fa TEXT DEFAULT NULL` to
-the `ai_config` table — pending manual application.
+the `ai_config` table — embedded in part 1 of the one-paste setup (§31.3).
 
 ### 19.2 `ai_config` — `last_request_at` / `last_latency_ms` (RESOLVED in code)
 
@@ -5296,9 +5313,10 @@ restart.
 **Resolution [MIGRATION CREATED]:** Migration
 `20260913000000_add_ai_config_show_question.sql` adds
 `show_question BOOLEAN NOT NULL DEFAULT false` (idempotent, with
-rollback SQL) — pending manual application. Until it is applied, the
-application still serves the default (`false`) and the toggle degrades
-to the in-memory fallback exactly like every other `ai_config` key.
+rollback SQL) — embedded in part 1 of the one-paste setup (§31.3). On a
+database that has not run the setup, the application still serves the default
+(`false`) and the toggle degrades to the in-memory fallback exactly like every
+other `ai_config` key.
 No second preference store exists; the RAM-only `ExecutionTelemetry`
 store is NOT a source of truth for this preference.
 
@@ -5320,10 +5338,10 @@ in-memory fallback, so a Telegram change would be lost on restart.
 `stt_model TEXT`, `stt_language TEXT` and
 `stt_passes INTEGER NOT NULL DEFAULT 1` (plus the
 `ai_config_stt_passes_range` CHECK `BETWEEN 1 AND 3`) — idempotent, with
-rollback SQL, pending manual application. Until it is applied, the
-application still serves the defaults (the single-pass route) and the
-Settings controls degrade to the in-memory fallback exactly like every
-other `ai_config` key. These values are behavior, not deployment
+rollback SQL, embedded in part 1 of the one-paste setup (§31.3). On a database
+that has not run the setup, the application still serves the defaults (the
+single-pass route) and the Settings controls degrade to the in-memory fallback
+exactly like every other `ai_config` key. These values are behavior, not deployment
 configuration: no ENV variable is required for them and no second
 settings store exists.
 
@@ -5353,7 +5371,8 @@ Settings changes by the user are not persisted.
 `20260827000001_add_missing_panel_settings_columns.sql` adds all
 10 missing columns to `panel_settings` with the types and defaults
 listed in [§6](#6-panel_settings) (plus CHECK constraints mirroring the
-`settings_service` validators) — pending manual application.
+`settings_service` validators) — embedded in part 1 of the one-paste setup
+(§31.3).
 
 Migration `20260823120000_add_dashboard_font_and_ghost_seen_settings.sql`
 now exists and covers `dashboard_font` and (originally)
@@ -5456,7 +5475,7 @@ implementations for `ai_provider_stats` and `ai_usage` (via
 interface + in-memory only. The runtime degrades to in-memory behavior
 when Supabase is unavailable or the tables are missing. Migrations for
 `ai_provider_stats` (`20260827000004`) and `ai_usage` (`20260827000003`)
-have been generated and are pending manual application;
+have been generated and are created by part 1 of the one-paste setup (§31.3);
 `ai_preferences` ([§14](#14-ai_preferences)) still has no migration
 (see §20, item 6).
 
@@ -5711,7 +5730,7 @@ migration. No code change needed.
 | 17 | `20260922000001_add_saved_items_search_indexes.sql` | The Save V2 resolver's two search indexes on `saved_items`: `idx_saved_items_display_name_trgm` (GIN trigram for the `display_name ILIKE '%token%'` prefilter; enables `pg_trgm` itself) and `idx_saved_items_tags` (GIN for whole-tag containment `tags.cs.{…}`). Additive successor to #15/#16: indexes only — no column, no row, no `save_code` change; idempotent; reloads the PostgREST schema cache | **NOT APPLIED — owner action required** (§2 index table). Safe on any database that already has `saved_items` (created by #15 or earlier migrations) |
 | 18 | `20260926000001_add_todo_schedule_type.sql` | Widens exactly two existing `ai_tasks` constraints for the basic Todo item: `ai_tasks_schedule_type_check` gains `'todo'`, and `ai_tasks_actions_count` becomes conditional so a `'todo'` row stores 0–5 actions (0 in practice) while every scheduled row keeps 1–5. No table, no column, no index, no policy, no grant, no row and no backfill; ends with `NOTIFY pgrst, 'reload schema'` | **NOT APPLIED — owner action required** (§31.3, part 7 of 13; the row shape is documented in §15). Until it runs, the legacy enum and actions count still hold: a Todo *create* is rejected by the old CHECK and the application reports that honestly, while every scheduled task keeps working unchanged |
 | 19 | `20260927000001_add_todo_steps.sql` | Creates the ONE new table of the multi-step phase: `todo_steps` — the ordered steps of ONE todo. `task_id` REFERENCES `ai_tasks(id)` `ON DELETE CASCADE` (a step can never be orphaned), denormalized `owner_id` (every repository read/write filters by it), 1-based `position` with `UNIQUE (task_id, position)` (never renumbered), nonblank ≤256-char `title`, `status` CHECK `active`/`completed` (no other state exists), CAS `version` (a stale mutation writes nothing), `completed_at` bound to the status, timestamps; RLS + SELECT-only `anon`/`authenticated`; ends with `NOTIFY pgrst` and a verification query. Additive: no existing table, column, index, policy, grant or row is touched | **NOT APPLIED — owner action required** (§31.3, part 8 of 13; the table is documented in §15). Without it the application keeps every Part 1 Todo behaviour and reports step operations as not-durable instead of pretending they persisted |
-| 20 | `20260927020000_add_waiting_answer_status.sql` | Widens exactly the `ai_task_occurrences_status_check` constraint to admit the Taskloom question-park status `waiting_answer` (durable question/answer continuation). No table, no column, no index, no policy, no grant, no row; the widened enum accepts every row the old constraint accepted; ends with `NOTIFY pgrst` | **NOT APPLIED — owner action required**. Until it runs, the repository's status validation refuses the park write (fail closed): a question chain reports the park honestly instead of pretending a question was stored, and every scheduled/waiting/branch behaviour keeps working unchanged |
+| 20 | `20260927020000_add_waiting_answer_status.sql` | Widens exactly the `ai_task_occurrences_status_check` constraint to admit the Taskloom question-park status `waiting_answer` (durable question/answer continuation). No table, no column, no index, no policy, no grant, no row; the widened enum accepts every row the old constraint accepted; ends with `NOTIFY pgrst` | **ABSORBED BY PART 1 of §31.3 — no separate action.** The canonical reconciliation snapshot already re-adds `ai_task_occurrences_status_check` WITH `waiting_answer` in the enum (§31.1: “part 1 already re-adds in final form”), so the one paste establishes the widened status and this file needs no part of its own. Until any setup script runs, the repository's status validation refuses the park write (fail closed): a question chain reports the park honestly instead of pretending a question was stored, and every scheduled/waiting/branch behaviour keeps working unchanged |
 | 22 | `20260929000001_create_private_message_tables.sql` | The Private Message Management feature's TWO persistence tables, in their final shape (§33): `private_message_config` (ONE owner-scoped row: the master `enabled` switch, `mode`, the access state the panel edits (`allowlist`, `exceptions`, `temporary`, `schedule`), the three INDEPENDENT action flags `delete_incoming` / `fixed_response_enabled` / `ai_response_enabled`, `fixed_response_text`, `ai_max_replies_per_person` with its explicit `ai_unlimited_replies` option, and `ai_interval_seconds` where `0` is a supported no-delay value) and `private_message_senders` (durable per-person AI-reply counters — `PRIMARY KEY (owner_id, sender_id)`, `ai_replies_used`, `last_ai_reply_at` — claimed by ONE bounded conditional update and given back by the compensating CAS when nothing was delivered); plus one read index, RLS + SELECT-only `anon`/`authenticated` policies on both, comments, `NOTIFY pgrst`, verification queries and a read-only legacy probe | **NOT APPLIED — owner action required** (§31.3, part 10 of 13, together with parts 11 and 13; the tables are documented in §33). Until it runs, the feature is INERT: the configuration read degrades to "no row", which the service treats as disabled, so nothing is deleted, no response is sent, no AI request is made and no counter is consumed — and the panel reports the refused write honestly. The Phase-1 `bot_settings` document is read once as the backfill source and is never modified. The `SELECT`-only `anon`/`authenticated` boundary this file establishes is SUPERSEDED by row 25 |
 | 21 | `20260928000001_create_emoji_reaction_tables.sql` | The Emoji & Reaction feature's five persistence tables, in their final shape (§32): `emoji_library`, `emoji_categories` (with the Phase 5 `is_custom` / `source_category_ids` columns, re-asserted with `ADD COLUMN IF NOT EXISTS`), `emoji_mappings`, `emoji_state` (the toggle defaulting to `false` — OFF on first boot) and `emoji_chat_overrides`; plus three read indexes, RLS + SELECT-only `anon`/`authenticated` policies on all five, comments, `NOTIFY pgrst` and verification queries. Additive: no existing table, column, index, policy, grant or row is touched, and no foreign key is created (the emoji references are application-level). Reactions persist nothing, so they add no table | **NOT APPLIED — owner action required** (§31.3, part 9 of 13; the tables are documented in §32). Until it runs, the Emoji & Reaction feature starts and works against the in-memory fallback only: every durable read/write reports the failure honestly instead of pretending the library, categories, mappings or state persisted |
 | 23 | `20261017000001_create_anti_edit_delete_tables.sql` | The Anti-Edit / Anti-Delete feature's TWO persistence tables, in their final shape (§34): `aed_config` (ONE owner-scoped row: the master `enabled` switch defaulting to `false`, the `categories text[]` content filter that is never empty, and `retention_days` 1..3650) and `aed_archive_entries` (one row per observed archive record — the deterministic `id` primary key/idempotency key, `owner_id`, the POSITIVE private `chat_id` with `CHECK (> 0)`, `message_id`, `kind` `snapshot`/`edit`/`delete`, `category`, `has_caption`, `captured_at`, `message_date`, `edited_at`, `sender_id`, `out`, `has_media`, the bounded `body` (`CHECK length <= 4096`), the media metadata, `recoverable`/`recovered_from` and the bounded peer identity `peer_id`/`peer_username`/`peer_name`); plus one read index, RLS enabled with ZERO policies and a service-role-only posture (every privilege revoked from `PUBLIC`/`anon`/`authenticated`, only SELECT/INSERT/UPDATE/DELETE granted to `service_role`, the legacy read policies dropped by name), comments, `NOTIFY pgrst`, verification queries and a read-only legacy probe. Additive: no existing table, column, index, policy, grant or row is touched, and no foreign key is created (the peer reference is application-level) | **NOT APPLIED — owner action required** (§31.3, part 12 of 13; the tables are documented in §34). Until it runs, the feature keeps its current behaviour: the archive is read and written through the legacy `bot_settings` shard documents, which this migration neither reads nor modifies (the one-process store decision falls back to `legacy`) |
@@ -5724,10 +5743,12 @@ migration. No code change needed.
 > here. The API Credential Vault objects created by row 13 are documented in
 > full in §29. The `#` column is a label in the order rows were added to THIS
 > table, not the migration-timestamp order (row `9a` is a later file inserted
-> next to row 9, and the Private Message row is listed before the Emoji &
-> Reaction row that its file predates); the authoritative, timestamp-ordered
-> classification of all **34** files is §31.1, and every embedded part's
-> statement identity is pinned by `tests/test_database_setup_order.py`.
+> next to row 9; rows 21 and 22 carry their timestamp-order numbers but were
+> typed in the opposite order; and the `20261016…` counter-reset row is
+> numbered 24 although its file predates the `20261017…` row numbered 23); the
+> authoritative, timestamp-ordered classification of all **35** files is §31.1,
+> and every embedded part's statement identity is pinned by
+> `tests/test_database_setup_order.py`.
 
 ### Missing Migration Files (referenced in prior docs but never created)
 
@@ -7943,9 +7964,20 @@ agent.
 
 1. Open the Supabase **SQL Editor** as `postgres` and run the ONE complete setup
    script in **§31.3** — a single fenced block that begins with the canonical
-   reconciliation snapshot and continues, in order, with the nine pending
-   migrations (Vault ×2, Save V2 ×2, TTS, Todo schedule type, Todo steps,
-   Emoji & Reaction tables, Private Message Management tables). It is
+   reconciliation snapshot (part 1) and continues, in order, with the twelve
+   later additive migrations, parts 2–13:
+   `20260919000001_create_api_credential_vault.sql` (part 2, Vault PART 1),
+   `20260919000002_credential_vault_management.sql` (part 3, Vault PART 2),
+   `20260921000001_add_saved_items_display_name.sql` (part 4),
+   `20260922000001_add_saved_items_search_indexes.sql` (part 5),
+   `20260923000001_add_ai_config_tts_settings.sql` (part 6),
+   `20260926000001_add_todo_schedule_type.sql` (part 7),
+   `20260927000001_add_todo_steps.sql` (part 8),
+   `20260928000001_create_emoji_reaction_tables.sql` (part 9),
+   `20260929000001_create_private_message_tables.sql` (part 10),
+   `20261016000001_add_private_message_counter_reset.sql` (part 11),
+   `20261017000001_create_anti_edit_delete_tables.sql` (part 12) and
+   `20261020144423_harden_private_message_table_access.sql` (part 13). It is
    one transaction-safe, re-runnable statement batch.
    (`supabase/canonical_bootstrap.sql` and the migration file remain the
    byte-identical convenience copies of the snapshot part.)
@@ -7956,20 +7988,22 @@ agent.
      in it is a column the script could not create (see §30.12).
    * `NOTIFY pgrst, 'reload schema'` has already asked PostgREST to drop its
      stale schema cache, so the API sees the new columns immediately.
-3. Nothing else has to be applied by hand: the additive migrations newer than
-   the snapshot — `20260921000001_add_saved_items_display_name.sql` (the
-   nullable `saved_items.display_name`, idempotent),
-   `20260922000001_add_saved_items_search_indexes.sql` (the Save V2 resolver's
-   two search indexes on `saved_items`, idempotent),
-   `20260926000001_add_todo_schedule_type.sql` (the basic Todo row's two
-   widened constraints), `20260927000001_add_todo_steps.sql` (the
-   `todo_steps` table of the multi-step phase) and
-   `20260928000001_create_emoji_reaction_tables.sql` (the five Emoji &
-   Reaction tables) — are already parts 4, 5, 7, 8 and 9 of the §31.3 block.
-   The snapshot is never regenerated to include them,
-   so the two byte-identical repository copies stay byte-identical.
-4. Nothing else is required: no new table to create by hand, no env var, no
-   Render setting, no Supabase Vault change.
+3. Nothing else has to be applied by hand. Eleven migrations are newer than the
+   snapshot and every one of them is inside the block: parts 4–13 carry ten of
+   them verbatim (named in item 1), and the eleventh,
+   `20260927020000_add_waiting_answer_status.sql`, needs no part of its own
+   because part 1 already re-adds `ai_task_occurrences_status_check` with
+   `waiting_answer` in the enum. The snapshot is never regenerated to include
+   any of them, so the two byte-identical repository copies stay
+   byte-identical.
+4. Nothing else is required for the schema: no new table to create by hand, no
+   env var, no Render setting, no Supabase Vault secret. The one exception is
+   recorded, not hidden: the Auto-Reaction setting's two `panel_settings`
+   columns have **no migration at all**, so §31.3 cannot carry them and they
+   stay a cache-only setting until an additive migration is generated (§6,
+   §31.6). Vault itself is the only extension dependency — if the `postgres`
+   role cannot create `supabase_vault` on the project, enable Vault from the
+   dashboard once (§29.5).
 5. §29 (the API Credential Vault) is documented separately, but its two
    migrations are also part 2 and part 3 of the §31.3 block, so the one paste
    establishes them too — without it applied, the credential panel reports the

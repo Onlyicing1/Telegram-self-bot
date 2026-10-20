@@ -387,3 +387,64 @@ CREATE POLICY "anon_select_private_message_senders" ON private_message_senders F
   report for this phase.
 - The working tree is clean except for the pre-existing unrelated changes listed
   in §2, which were never staged.
+
+---
+
+## 12. Follow-up pass — the one-paste setup reconciled against the current inventory
+
+**Baseline:** `origin/main` `f432493` (the hardening commit above already carried
+part 13 and its counts). This pass re-audited the whole artifact instead of
+trusting that state.
+
+**What was audited.** All **35** files in `supabase/migrations/`, the complete
+§31.3 block, both byte-identical canonical copies
+(`supabase/canonical_bootstrap.sql` == `20260920000001_reconcile_canonical_schema.sql`,
+confirmed with `cmp`), and the four database documentation test modules. Every
+part's statement identity was re-proved against its migration; every table the
+backend addresses (24 `.table()` names) and every RPC it calls is created by the
+block; every literal write payload compared against the block's declared
+columns.
+
+**What was wrong (documentation only).**
+
+1. §31 intro counted "thirteen later additive migrations" — the block has 13
+   parts, i.e. the snapshot plus **twelve** later ones.
+2. The block banner still called the twelve later parts "pending migrations",
+   which reads as a second, unapplied step.
+3. §31.6 claimed "the last six parts add no foreign key" — part 8 creates
+   `todo_steps.task_id → ai_tasks(id) ON DELETE CASCADE`.
+4. §30.11 (the manual-action section) listed "nine pending migrations" and said
+   only parts 4, 5, 7, 8 and 9 carried the later files, omitting parts 6, 10, 11,
+   12 and 13.
+5. §20's row for `20260927020000_add_waiting_answer_status.sql` still said
+   "NOT APPLIED — owner action required / until it runs the park write is
+   refused", although part 1 re-adds that status CHECK in final form (§31.1);
+   the same table's footnote still counted **34** files.
+6. Thirteen per-column/per-table notes (§1, §2, §6, §7, §12, §13, §19) said a
+   migration was "pending manual application", implying the owner must apply it
+   separately from §31.3; each now names the part that carries it.
+
+**What was NOT invented.** `settings_service` writes
+`panel_settings.auto_reaction_enabled` / `auto_reaction_emoji` and
+`auto_reaction_service` reads them, but **no migration file creates those two
+columns**. §6 previously told the owner to paste a snippet for them, i.e. a
+second schema step outside the one block. No migration was fabricated here (the
+request limits this pass to documentation and tests, and no schema object may be
+added speculatively): the pair is now documented as the one application-required
+exception — §6 marks both columns "no migration creates it", §31.6 states the
+block cannot establish them, and §30.11 item 4 names them instead of claiming
+nothing is missing. Generating the additive migration is the owner's next call.
+
+**Tests.** Two existing assertions that pinned the wrong count ("thirteen later
+additive migrations") were corrected, and four narrow tests were added: the later
+part count matches the block, §30.11 names every embedded part and no stale
+subset, the waiting-answer migration is recorded as absorbed by part 1, and the
+unmigrated Auto-Reaction pair stays documented while no part invents it.
+
+**Verification.** `pytest tests/test_database_setup_order.py
+tests/test_canonical_schema_reconciliation.py tests/test_private_message_db_security.py
+tests/test_aed_db_security.py` → 112 passed. Full suite → 6484 passed, 27
+skipped (the sandbox had Telethon 1.34.0 instead of the pinned 1.43.0, which
+fails 40 unrelated colored-button assertions; installing the pinned version made
+the suite green). `git diff --check` clean. **No SQL was executed and Supabase
+was not contacted.**
