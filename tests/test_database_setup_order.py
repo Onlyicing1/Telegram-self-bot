@@ -35,6 +35,7 @@ EMOJI_TABLES = "20260928000001_create_emoji_reaction_tables.sql"
 PRIVATE_MESSAGE_TABLES = "20260929000001_create_private_message_tables.sql"
 PRIVATE_MESSAGE_COUNTER_RESET = "20261016000001_add_private_message_counter_reset.sql"
 ANTI_EDIT_DELETE_TABLES = "20261017000001_create_anti_edit_delete_tables.sql"
+PRIVATE_MESSAGE_ACCESS = "20261020144423_harden_private_message_table_access.sql"
 
 #: The order §31 documents — verified against the sources, not assumed. The TTS
 #: settings migration, the Todo schedule type, the Todo steps table, the Emoji &
@@ -43,11 +44,12 @@ ANTI_EDIT_DELETE_TABLES = "20261017000001_create_anti_edit_delete_tables.sql"
 #: changes, so they are appended last, newest last (the documented rule: a later
 #: change never edits the snapshot). The counter-reset part is the one part that
 #: alters a table an earlier part creates, so it must follow the Private Message
-#: tables it extends.
+#: tables it extends; the access-hardening part must follow them too, because it
+#: revokes the grants and drops the policies that part created.
 DOCUMENTED_ORDER = (
     RECONCILE, VAULT_PART1, VAULT_PART2, DISPLAY_NAME, SEARCH_INDEXES, TTS_SETTINGS,
     TODO_SCHEDULE_TYPE, TODO_STEPS, EMOJI_TABLES, PRIVATE_MESSAGE_TABLES,
-    PRIVATE_MESSAGE_COUNTER_RESET, ANTI_EDIT_DELETE_TABLES,
+    PRIVATE_MESSAGE_COUNTER_RESET, ANTI_EDIT_DELETE_TABLES, PRIVATE_MESSAGE_ACCESS,
 )
 
 #: The banner that marks the ONE complete deployment block.
@@ -283,19 +285,23 @@ def test_the_todo_steps_part_carries_the_whole_table_before_the_newest_change():
     )
 
 
-def test_the_anti_edit_delete_part_is_last_and_carries_the_two_tables():
-    """The Anti-Edit / Anti-Delete tables are the newest additive change, so they
-    close the block; the counter reset sits immediately before, and the Private
-    Message tables right before that (it alters them)."""
+def test_the_anti_edit_delete_part_carries_the_two_tables():
+    """The Anti-Edit / Anti-Delete tables stay embedded, whole, just before the
+    part that hardens the Private Message tables — which must follow the part
+    that creates those tables and their policies."""
     spans = _part_spans(_setup_block())
-    assert list(spans)[-1] == ANTI_EDIT_DELETE_TABLES, (
-        "the most recent additive migration must close the block"
+    assert list(spans)[-1] == PRIVATE_MESSAGE_ACCESS, (
+        "the Private Message access hardening must close the block: it removes "
+        "grants and policies an earlier part creates"
     )
-    assert list(spans)[-2] == PRIVATE_MESSAGE_COUNTER_RESET, (
-        "the counter reset must stay immediately before it"
+    assert list(spans)[-2] == ANTI_EDIT_DELETE_TABLES, (
+        "the Anti-Edit / Anti-Delete tables stay immediately before it"
     )
-    assert list(spans)[-3] == PRIVATE_MESSAGE_TABLES, (
-        "the Private Message tables must stay immediately before the part that alters them"
+    assert list(spans)[-3] == PRIVATE_MESSAGE_COUNTER_RESET, (
+        "the counter reset must stay immediately before that"
+    )
+    assert list(spans)[-4] == PRIVATE_MESSAGE_TABLES, (
+        "the Private Message tables must stay before the parts that alter and harden them"
     )
     part = spans[ANTI_EDIT_DELETE_TABLES]
     for table in ("aed_config", "aed_archive_entries"):
@@ -709,10 +715,10 @@ def test_the_audited_order_is_recorded_in_the_audit_table():
     """
     section = _section_31()
     audit = section[: section.index("### 31.2")]
-    assert "all 34 migrations" in _flat(audit) or "34 files" in audit, (
+    assert "all 35 migrations" in _flat(audit) or "35 files" in audit, (
         "the audit must state that every repository migration was classified"
     )
-    assert len(list(MIGRATIONS_DIR.glob("*.sql"))) == 34, (
+    assert len(list(MIGRATIONS_DIR.glob("*.sql"))) == 35, (
         "the audited count must equal the migrations actually in the repository"
     )
     embedded_table = audit[audit.index("| Order | Migration") :]
@@ -731,7 +737,7 @@ def test_the_documented_deviations_are_stated_explicitly():
     flat = _flat(_section_31())
     assert "display_name" in flat
     assert "42703" in flat, "the failure the ordering prevents must be named"
-    assert "twelve later additive migrations" in flat, (
+    assert "thirteen later additive migrations" in flat, (
         "the later migrations must be acknowledged"
     )
     assert "add_todo_schedule_type" in flat, "the Todo schedule type must be acknowledged"
@@ -744,6 +750,9 @@ def test_the_documented_deviations_are_stated_explicitly():
     )
     assert "create_anti_edit_delete_tables" in flat, "the Anti-Edit / Anti-Delete tables must be acknowledged"
     assert "aed_archive_entries" in flat, "the AED archive table must be acknowledged"
+    assert "harden_private_message_table_access" in flat, (
+        "the Private Message access hardening must be acknowledged"
+    )
     assert "tts_provider" in flat, "the TTS settings columns must be acknowledged"
 
 
