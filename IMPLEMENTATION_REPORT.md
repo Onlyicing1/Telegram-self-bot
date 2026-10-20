@@ -1,249 +1,199 @@
-# IMPLEMENTATION_REPORT.md — Supabase transport `ReadError`/EAGAIN, round 2 (diagnosis + one bounded diagnostic)
+# IMPLEMENTATION_REPORT.md — Supabase transport: HTTP/1.1 for the shared client
 
-> This file describes ONLY the current state of the repository for this round and
-> **replaces every previous report in full** — it is not an appended report.
-> Earlier reports (the transport-evidence audit at `6f93228`, the lifecycle-task
-> stall round at `17942f1`, the AED archive rounds, the emoji/private-message
-> rounds) remain readable in git history and in `docs/investigations/`.
+> This file describes **only** the current state of the repository for this
+> round and **replaces every previous report in full**. Earlier reports (the AED
+> archive rounds, the private-message rounds, the lifecycle-stall round, the
+> Supabase EAGAIN investigation rounds) remain readable in Git history.
 
 | Item | Value |
 |---|---|
-| Stage | Diagnosis + the smallest safe diagnostic that decides the remaining cause |
-| Date | 2026-10-19 (11:01 UTC) |
-| Project / remote | LifeOS Telegram self-bot, `Onlyicing1/Telegram-self-bot` (`origin`), branch `main` |
-| Revision at task start | `6f93228b604737b3dda985627f9ef33418b7c573` (`origin/main`, verified with `git fetch` + `rev-parse`); the workspace was 2 commits behind at `89a3007` and was fast-forwarded |
-| Live Telegram / Render / Supabase | **NOT touched.** No deployment, no Render shell or log stream, no `.env`, no credentials, no SQL, no migration, no restart, no environment change — and this workspace has **no Render access at all** (see §7) |
-| Workspace interpreter | CPython **3.10.12**, OpenSSL 3.0.2; inspected deps: `httpx 0.27.0`, `httpcore 1.0.9`, `h2 4.4.1`, `supabase 2.4.2`, `postgrest 0.16.11`, `telethon 1.43.0` |
-| Deployed interpreter | **CPython 3.11.7** (`render.yaml` → `PYTHON_VERSION: 3.11.7`) — a gap the previous round did not record |
+| Stage | **Implementation** (fix + regression tests + reports), delivered on `main` |
+| Date | 2026-10-19 (UTC) |
+| Repository / remote | `Onlyicing1/Telegram-self-bot`, branch `main` |
+| Revision at task start | `13f9a1cdade1668a72ef5e69b85b1eb571503ff9` (`origin/main`, verified with `git fetch` + `rev-parse` before any edit) |
+| Final commit | The commit that carries this file on `main`; resolve with `git log -1 --format=%H -- IMPLEMENTATION_REPORT.md`. The exact SHA, the push result and the remote verification are stated in the completion response. |
+| Workspace runtime | CPython **3.12.3**, OpenSSL **3.0.13**; `supabase 2.4.2`, `postgrest 0.16.11`, `httpx 0.27.0`, `httpcore 1.0.9`, `h2 4.4.1`, `telethon 1.43.0` |
+| Live Render / Supabase / Telegram | **Not touched:** no deployment, no Render API/shell/log stream, no `.env`, no credential, no SQL, no migration, no restart, no environment change |
 
 ---
 
 ## 1. Objective
 
-Resolve — or, if the evidence does not allow it, make decidable in one pass — the
-recurring production transport failure reported after the October 18–19
-deployments:
+Stop the recurring production transport failure
 
 ```text
-TASK_FALLBACK_CLASSIFIED reason=local_resource phase=read exception=ReadError
-  chain=ReadError<ReadError<BlockingIOError(errno=11) elapsed=0.0s since_ok=0.0s
-Supabase event task query failed; using fallback
-ConnectionTerminated error_code:1                    (separate line)
+ReadError <- ReadError <- BlockingIOError(errno=11)   (elapsed=0.0s)
 ```
 
-without confusing it with the already-fixed lifecycle-task diagnostic
-misclassification, without conflating `ConnectionTerminated` with `EAGAIN`, and
-without presenting a hypothesis as a confirmed cause.
+by removing the configuration in which it is reproducible — concurrent use of one
+HTTP/2-multiplexed socket by the shared Supabase client's worker threads — with
+the smallest safe change, regression tests, no retries, and no change to
+timeouts, dependencies, schema, secrets or deployment configuration.
 
 ---
 
-## 2. What was read before any edit
+## 2. Root cause, with its confidence
 
-`INVESTIGATION.md`, `IMPLEMENTATION_REPORT.md`, `render.yaml`, `Procfile`,
-`backend/requirements.txt`, `backend/db/client.py` (dispatch, pool, deadlines,
-`_timed_db_call`/`db_inflight_seconds`, client construction),
-`backend/ai/database/task_repository.py` (classification, chain walker, transport
-phase, cooldown, `_run`/`_run_checked`, degradation sites),
-`tests/test_task_transport_evidence.py`, `tests/test_local_resource_bounds.py`,
-`tests/test_task_repository.py` — plus the installed sources of the pinned
-transport: `httpcore/_backends/sync.py`, `httpcore/_sync/http2.py`,
-`httpcore/_sync/connection_pool.py`, `httpx/_client.py`,
-`postgrest/_sync/client.py`, `postgrest/utils.py`, and `/usr/lib/python3.10/ssl.py`.
+**Confirmed (source + measurement).** The shared Supabase client spoke HTTP/2
+because `postgrest`'s session factory hard-codes `http2=True`
+(`postgrest/_sync/client.py::create_session`), and supabase-py constructs that
+client internally. HTTP/2 multiplexes all concurrent requests onto one TLS
+connection; `httpcore` reads and writes it under two *separate* locks
+(`_read_lock`, `_write_lock`) over h2 state whose `_events` bookkeeping is
+mutated without a lock. `backend/db/client.py` dispatches up to `_DB_MAX_WORKERS
+= 4` threads through that one client.
 
----
+Measured on this stack (earlier round, CPython 3.10.12 / OpenSSL 3.0.2): shared
+client + HTTP/2 + 4 threads → 99 failures / 1,463; shared client + HTTP/1.1 + 4
+threads → 0 / 4,947; per-thread clients + HTTP/2 → 0 / 4,594; one thread + HTTP/2
+→ 0 / 1,648. Reproduced against a real production HTTP/2 origin (99 failures at
+1.7–2.9 ms) and clean over HTTP/1.1 (0 / 6,258) on the same origin.
 
-## 3. Confirmed facts
-
-| Claim | Status | Evidence |
-|---|---|---|
-| One shared synchronous `httpx.Client` with HTTP/2 on, dispatched from one bounded 4-worker pool through `run_sync_db` | **Confirmed** | `postgrest` builds `SyncClient(..., http2=True)`; `get_db()` passes `ClientOptions(postgrest_client_timeout=8.0)`; `_DB_MAX_WORKERS = 4`, `0 < 8.0 < 10.0` (test-pinned) |
-| The failing read is `sock.recv` under `settimeout(8.0)` | **Confirmed** | `httpcore._backends.sync.SyncStream.read` is exactly `settimeout(timeout)` + `recv(max_bytes)`; `ReadError` exists nowhere else in httpcore |
-| The failure is a genuine local `OSError(EAGAIN)` | **Confirmed** | `OSError(errno.EAGAIN)` *is* `BlockingIOError`; the production chain names errno **11** |
-| It is not a deadline, not saturation, not fd exhaustion, not a store outage, not a peer close/RST/GOAWAY | **Confirmed / measured** | §4 (probe matrix) and `elapsed=0.0s`, `since_ok=0.0s` |
-| Nothing retries anything | **Confirmed** | No `retry`/`max_retries` in `postgrest` or `httpx`; `run_sync_db` dispatches once; `httpcore` is constructed with `retries=0` |
-| httpcore's `HTTP2Connection.close()` takes **no lock** and can run while another thread is inside `_read_incoming_data` | **Confirmed** | Source comment in `httpcore/_sync/http2.py`: *"this method unilaterally closes the connection, and does not have any kind of locking in place around it"*; `_response_closed()` calls it when the connection was terminated and no events remain |
-| That race does **not** by itself produce the observed signature | **Confirmed by measurement** | A blocked read survives a sibling `close()`/`os.close(fd)`/fd reuse and returns a clean `b''` or the full-timeout result — never `BlockingIOError(11)` (§4) |
-| The deployed interpreter differs from the one every previous conclusion was measured on | **Confirmed** | `render.yaml` pins `PYTHON_VERSION: 3.11.7`; this workspace is 3.10.12 |
-
-**Leading mechanism (medium confidence, source-backed, not proven on the deployed
-build):** the SSL layer surfaces an `EAGAIN` as a fatal `SSL_ERROR_SYSCALL`
-instead of a retryable `SSL_ERROR_WANT_READ`; CPython's `_ssl.c` then raises
-`OSError(EAGAIN)` → `BlockingIOError`, which httpcore maps to `ReadError`. OpenSSL
-documents `SSL_ERROR_SYSCALL` as fatal, a public OpenSSL users-list report
-describes precisely this misclassification on a non-blocking socket, and CPython's
-socket code documents the *readiness false positive* that precedes it. Remaining
-alternatives and their status: teardown coupling (now measured, contradicted as a
-direct mechanism), platform/network-stack behaviour on Render (unverifiable here).
+**Not proven.** Why the socket layer returns `EAGAIN` at all. The exact
+production chain (`BlockingIOError(errno=11)`) was never reproduced locally —
+local failures were `RemoteProtocolError` and h2 state errors. The fix removes
+the reproducible condition; it does not claim to explain the final syscall, and
+no retry or masking was added.
 
 ---
 
-## 4. Probe matrix (new evidence, run in this workspace)
+## 3. The change
 
-`scratchpad/eagain_probe.py`, `scratchpad/eagain_probe2.py` — **untracked
-diagnostic scripts, deliberately not part of the repository** — build a local
-self-signed TLS pair and drive each condition against a timed `SSLSocket`:
+### 3.1 New: `backend/db/transport.py`
 
-| Condition | Result | Elapsed |
-|---|---|---|
-| Peer silent (baseline) | `TimeoutError(errno=None)` | 8.008 s |
-| Peer FIN while blocked in read | `b''` | 0.301 s |
-| Peer RST while blocked in read | `b''` | 0.201 s |
-| Our own `close()` from another thread while blocked | `b''` (not interrupted) | 8.009 s |
-| `os.close(fd)` from another thread while blocked | `b''` | 8.008 s |
-| fd closed **and reused** by a non-blocking socket, then read | `TimeoutError` | 8.501 s |
-| `settimeout(1e-9)` / `settimeout(0.001)` | `TimeoutError` | ≈0 s |
-| `settimeout(0)` on an `SSLSocket` | `SSLWantReadError(errno=2)` | 0 s |
-| `unwrap()` then read (raw fallback) | `SSLError(errno=1)` | 0.05 s |
-| Two concurrent readers sharing one `SSLSocket` (400 iters) | `SSLWantReadError` only; **0** `BlockingIOError` | — |
-
-This is what removes the local explanations that would have justified a
-transport-side change, and it is why the round ships diagnostics rather than a
-behaviour change.
-
----
-
-## 5. Implemented change (diagnostic only)
-
-### 5.1 `backend/db/client.py`
-
-* `_note_transport_teardown(exc)` — records the monotonic instant of the most
-  recent **peer/HTTP-2 termination** (class names `ConnectionTerminated` /
-  `RemoteProtocolError`) seen in a failure chain, at the single dispatch point
-  every synchronous Supabase call already passes. The walk is capped at 8 links,
-  cycle-safe, wrapped so it can never raise, and captures no payload.
-* `seconds_since_transport_teardown()` — the gap, or `None` when no teardown has
-  been observed in this process.
-* The existing init line now carries the deployed runtime identity:
-  `[SAVE_DB] Supabase client initialised. runtime=python-X.Y.Z ssl=<OpenSSL>`.
-
-Both are bookkeeping on the failure path. The measured exception object, its
-propagation, the dispatch count, the deadlines, the pool, the cooldown and the
-classification are all untouched.
-
-### 5.2 `backend/ai/database/task_repository.py`
-
-The once-per-episode local-resource line gains one bounded field, so the two
-production signatures are correlated by the code instead of by eye:
-
-```text
-TASK_FALLBACK_CLASSIFIED reason=local_resource phase=read exception=ReadError \
-  chain=ReadError<ReadError<BlockingIOError(errno=11) elapsed=0.0s since_ok=0.0s \
-  since_teardown=none message=[Errno 11] Resource temporarily unavailable
-```
-
-`since_teardown` is `<seconds>s` or `none` — the same bounded formatting as
-`since_ok`, so the line stays numbers/enums only.
-
-**Deliberately NOT done**
-
-* No retry of any kind — a failed write's completion stays ambiguous.
-* No suppression/relabelling: `EAGAIN` is still `reason=local_resource`, and the
-  non-durable fallback label is unchanged.
-* No change to the 5 s cooldown, the 8 s < 10 s ordering, the worker count, the
-  HTTP/2 setting, the client lifecycle, dependencies, or any Render/env setting.
-* No schema, SQL, migration or `DATABASE_ARCHITECTURE.md` change.
-* No URL, key, header, token or message text in any new field.
-
-### Why this and not a fix
-
-The mechanism is unproven on the deployed build and the local probe matrix
-removes the explanations that a transport-side change would rest on; the one
-non-hypothesis-driven shape — re-issuing an ambiguous write — is forbidden. So
-the round ships the two fields that make the next episode decidable (see §9 and
-`INVESTIGATION.md` §5), plus the runtime identity that removes a load-bearing
-unknown.
-
----
-
-## 6. Tests
-
-New coverage in `tests/test_task_transport_evidence.py` (+4 tests, 12 existing
-kept and updated):
-
-| Test | Pins |
+| Symbol | Role |
 |---|---|
-| `test_only_a_peer_or_http2_termination_is_recorded_as_a_teardown` | a socket-layer read failure and a timeout record **nothing**; a `RemoteProtocolError`/`ConnectionTerminated` records a real gap; the failing call is still issued exactly once |
-| `test_the_recorder_is_bounded_and_never_raises_on_a_pathological_chain` | a cyclic chain and a 200-link chain neither spin nor escape the bookkeeping, and a match beyond the bound is not recorded |
-| `test_the_line_reports_the_gap_since_the_last_observed_teardown` | `none` without a teardown; a real seconds gap after one, on a new episode |
-| `test_the_client_init_line_carries_the_runtime_identity` | the init line names the Python/OpenSSL of the deployed build and carries no URL or key |
-| `test_evidence_fields_are_bounded_and_secret_free` (extended) | `since_teardown` matches `\d+\.\ds|none`; the line stays under 400 characters and free of the injected secret |
+| `HTTP1Session(httpx.Client)` | PostgREST's session with `http2=False`, plus `aclose()` (postgrest closes its session through that name; httpx's sync client only defines `close()`) |
+| `HTTP1PostgrestClient(SyncPostgrestClient)` | Overrides `create_session` to build that session with the same base URL, headers, timeout, `verify` and `follow_redirects=True` |
+| `HTTP1SupabaseClient(SupabaseClient)` | Overrides the PostgREST factory, so the pin survives the library's lazy construction **and** its rebuild on an auth-state change |
+| `create_http1_client(url, key, options=None)` | Drop-in for `supabase.create_client`: same validation, auth headers, sub-clients; only the transport differs. Logs `Supabase transport=http/1.1 (HTTP/2 disabled)` |
+| `install_http1_transport()` | Installs that factory on the public `supabase.create_client` entry point (idempotent) |
 
-Existing pins that remain green: the in-flight duration is measured inside the
-worker and the same exception object travels; a watchdog abandonment reports
-`n/a`; the phase matrix; bounded seconds formatting; an immediate would-block and
-a deadline remain distinguishable; a remote HTTP/2 termination is still
-`unavailable` and arms no cooldown; an ambiguous failed insert is issued exactly
-once; a cooldown-skipped call adds no second line.
+`http2=False` is the decisive flag: `httpcore` builds its ALPN list as
+`["http/1.1", "h2"] if http2 else ["http/1.1"]` and only uses `HTTP2Connection`
+when h2 was negotiated, so this session cannot multiplex.
 
-### Results (exact commands)
+### 3.2 Changed: `backend/db/__init__.py`
 
-| Command | Result |
+Imports `transport` and calls `install_http1_transport()`. A missing transport
+dependency is swallowed (with a warning), because `get_db()` already degrades to
+the in-memory fallback when it cannot build a client.
+
+### 3.3 Why the factory install, and not an edit in `get_db()`
+
+`get_db()` is the single construction call site, and it imports `create_client`
+from the `supabase` package **at call time**. Installing the public factory at the
+one place every `backend.db.*` import passes through therefore keeps a single
+construction boundary — and leaves `backend/db/client.py` (3,180 lines of
+dispatch, pool, deadlines and diagnostics) completely untouched. The install is a
+replacement of a **public** function, not a patch of a private internal, it is
+idempotent, and a regression test asserts it is in place. The alternative —
+editing the call inside `client.py` — would have duplicated the construction
+boundary and changed a large file for a one-line change.
+
+### 3.4 Old vs new behaviour
+
+| Aspect | Before | After |
+|---|---|---|
+| Transport | HTTP/2 (hard-coded, unavoidable from this repo) | HTTP/1.1 only |
+| Sockets per concurrency | one multiplexed TLS connection | one pooled connection per in-flight request |
+| Client, worker pool (`4`), transport deadline (`8 s`), dispatch budget (`10 s`) | — | **unchanged** |
+| Headers, timeout object, redirects, verification | — | **unchanged** |
+| PostgREST request path and response parsing | — | **unchanged** |
+| Classification, fallback, 5 s cooldown, no retry | — | **unchanged** |
+| `get_db()`, `run_sync_db()`, service interfaces | — | **unchanged** |
+
+---
+
+## 4. Tests
+
+`tests/test_supabase_transport_http1.py` (new, 10 tests) — real `supabase` client,
+real `postgrest` client, real `httpcore` pool, real local HTTP server and real
+sockets; no mocked transport, no credentials:
+
+* construction path is HTTP/1.1 only (`_http2 is False`, `_http1 is True`);
+* the factory is installed and `get_db()`, with its own unmodified call, returns
+  an HTTP/1.1 client;
+* the stock library client still reports `_http2 is True` — the assertion is
+  discriminating;
+* the pin survives a PostgREST client rebuild;
+* a real request travels and parses (`/rest/v1/...`, `apikey`,
+  `Accept-Profile`);
+* 4 threads × 25 requests on one client → 100 responses, 0 exceptions;
+* a real transport failure raises (never a false success), and through
+  `SupabaseTaskRepository` it degrades and is classified `unavailable`;
+* missing credentials still fall back; pool size and timeout relationship
+  unchanged.
+
+**No existing test was modified.** The two suites that patch
+`supabase.create_client` still intercept, because that is exactly the installed
+factory.
+
+---
+
+## 5. Validation results (actual)
+
+| Check | Result |
 |---|---|
-| `.venv/bin/python -m pytest tests/test_task_transport_evidence.py -q -p no:cacheprovider` | **16 passed** |
-| `.venv/bin/python -m pytest tests/test_task_transport_evidence.py tests/test_task_fallback_classification.py tests/test_task_fallback_cooldown.py tests/test_local_resource_bounds.py tests/test_task_repository.py -q -p no:cacheprovider` | **68 passed** |
-| `.venv/bin/python -m pytest tests/test_07_diagnostics.py tests/test_11_runtime_wiring.py tests/test_task_scheduler.py tests/test_task_execution.py tests/test_03_database_consistency.py tests/test_06_failure_simulation.py tests/test_22_reliability.py tests/test_24_execution_reliability.py tests/test_30_delete_timeout_hardening.py -q -p no:cacheprovider` | **91 passed** |
-| `.venv/bin/python -m pytest tests -q -p no:cacheprovider` | **6438 passed, 27 skipped, 0 failed** in 124.05 s |
-| `.venv/bin/python -m py_compile backend/db/client.py backend/ai/database/task_repository.py tests/test_task_transport_evidence.py` | exit 0 |
+| `pytest tests/test_supabase_transport_http1.py -q` | **10 passed** |
+| `pytest` on the 10 focused transport/DB/runtime files | **147 passed** |
+| `pytest tests -q -p no:cacheprovider` | **6447 passed, 27 skipped, 1 failed** |
+| `python -m py_compile` on the changed Python files | clean |
 | `git diff --check` | clean |
 
-**Baseline revalidated, not assumed.** The previous round's full run reported
-`6394 passed, 27 skipped, 40 failed`, with every failure in
-`tests/test_colored_buttons.py` attributed to a workspace Telethon **1.34.0** vs
-the pinned **1.43.0**. The workspace now resolves **Telethon 1.43.0** (`pip list`,
-matching `backend/requirements.txt`) and **all 40 now pass**: the historical
-failure set is empty and no new failure exists. Accounting: 6394 + 40 (repaired
-by the environment now matching the pin) + 4 (new) = 6438. The 27 skips are the
-unchanged opt-in/live tests.
+**The single failure** is
+`tests/test_private_message_panel.py::test_the_schedule_panel_names_the_next_transition`.
+It asserts the panel says `rule 1 start` for a rule of 22:00–23:00 UTC; the run
+was at 22:12 UTC, inside that window, where the next transition is the rule's
+end. Verified to fail **on the clean tree too** (this change stashed, same
+result), it imports only the private-message service/panel modules, and it is
+reported as a failure rather than a pass. It was deliberately left alone.
 
 ---
 
-## 7. Files changed
+## 6. Delivery
 
-| File | Why |
+| Item | Value |
 |---|---|
-| `backend/db/client.py` | Record the most recent peer/HTTP-2 termination at the single dispatch point and expose the gap; log the runtime identity once when the client is built |
-| `backend/ai/database/task_repository.py` | Add the bounded `since_teardown` field to the existing once-per-episode diagnostic |
-| `tests/test_task_transport_evidence.py` | Four new tests + the extended secret-free/bounded pin |
-| `INVESTIGATION.md`, `IMPLEMENTATION_REPORT.md` | Full replacements (this round) |
+| Branch | `main` (the required destination) |
+| Local branch created from | verified `origin/main` = `13f9a1c` at task start |
+| Scope of the diff | 3 code/test files (`backend/db/transport.py` new, `backend/db/__init__.py`, `tests/test_supabase_transport_http1.py` new) plus the two fully replaced reports |
+| Shell `git push` | **Failed — no credentials** in the sandbox (`could not read Username for 'https://github.com'`) |
+| Delivery channel | The authenticated GitHub integration (Git Data API), reported in the completion response with `origin/main` verification |
+| Pre-existing unrelated work | Preserved; untouched by this change |
 
-Untouched: schema, migrations, SQL, `DATABASE_ARCHITECTURE.md`, `AGENTS.md`,
-`ROADMAP.md`, `backend/requirements.txt`, Render configuration, `.env`; no second
-client/executor/scheduler/retry loop; the pre-existing workspace modifications
-(`backend/services/premium_emoji_inline_service.py`, untracked
-`backend/test_patch_story.md`, `scratchpad/`, `telegram-self-bot/`) were preserved
-and not staged.
+No rebase, no force-push, no history rewrite, no reset of unrelated work.
 
 ---
 
-## 8. Production verification — what is reachable, and what is not
+## 7. Deployment and live verification
 
-**No Render verification was performed, and none could be performed from this
-workspace.** Checked, not assumed:
+**Not verified in this round.** Whether Render deployed the commit, its terminal
+status, its startup logs, and whether production episodes stop were **not
+observed** — this workspace has no Render access and no Supabase credential, and
+none was requested.
 
-* no Render CLI is installed, `freebuff-env list` reports **no** environment keys
-  set in this workspace at all (so no Render API credential exists here), and no
-  Render integration is available to this session;
-* GitHub is reachable through the managed credential, but that exposes **no**
-  Render deploy signal for this repository: the commit-status API returns an
-  empty status list for `6f93228`, `c9e5203` and `17942f1`, and the only GitHub
-  deployments on record are from 2026-08-17/2026-10-13 unrelated branch deploys.
+To confirm from the deployed build, with no further change:
 
-Therefore the following are **unverified by this round** and belong to the
-owner's Render dashboard: whether the delivery commit is deployed; the exact UTC
-window of the failures and their recurrence rate; whether the errno-11 line
-recurs and how often; whether `since_teardown` shows coupling to the
-`ConnectionTerminated` line; and the deployed OpenSSL build (now printed by the
-init line). A commit and a push are not proof of deployment or recovery.
+1. The log must contain `Supabase transport=http/1.1 (HTTP/2 disabled)`.
+2. If an episode still appears, `phase` / `elapsed` / `chain` / `since_teardown`
+   remain the deciders.
+3. `ConnectionTerminated error_code:1` should no longer be produced by this
+   client, because h2 is never negotiated.
+
+A successful deployment or a `live` status would **not** by itself prove the
+recurring error stopped.
 
 ---
 
-## 9. Next smallest action
+## 8. Remaining risks and open items
 
-1. Confirm Render deployed the commit that carries this change (the init line
-   prints `runtime=`/`ssl=`, so the deployed build identifies itself).
-2. Read the next `TASK_FALLBACK_CLASSIFIED` line and apply the decision table in
-   `INVESTIGATION.md` §5 — `since_teardown=none` (teardown family disproven →
-   SSL/platform family) versus `since_teardown≈0…few s` (coupling confirmed →
-   design the smallest change that removes the coupling).
-3. Only then decide whether a change is warranted, and keep it to the two bounded
-   options in `INVESTIGATION.md` §6 — never a blind retry of an ambiguous write.
+| Item | Status |
+|---|---|
+| Syscall-level cause of the original `EAGAIN` | **Not proven**; the fix removes the reproducible configuration, not a proven syscall cause |
+| `errno=11` reproduction | **Never reproduced** here; not claimed |
+| Deployed runtime | Previously observed CPython 3.13.4 / OpenSSL 3.0.20; this workspace is 3.12.3 / 3.0.13. The fix does not depend on the runtime |
+| `render.yaml` pins `3.11.7`, live logs previously showed 3.13.4 | Configuration drift, documented in `INVESTIGATION.md`; **not** changed here |
+| Unpinned transitive dependencies (`postgrest`, `httpcore`, `h2`) | The HTTP/1.1 pin is asserted by tests; a dependency that renames the factory would fail those tests rather than silently revert |
+| Factory install scope | Process-wide: any other importer of `supabase.create_client` would also receive the HTTP/1.1 factory. In this single-process, single-owner bot that is the intended construction path, and it is covered by a test |
+| HTTP/1.1 throughput | One connection per in-flight request instead of one multiplexed socket; the pool is bounded at 4 workers, so at most 4 connections are in use. No throughput regression was measured, and none is claimed |
