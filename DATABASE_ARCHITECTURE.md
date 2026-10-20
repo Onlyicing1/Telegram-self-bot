@@ -159,29 +159,34 @@ migration creates them.
 
 ### 31.1.1 Reconciliation note — what changed while reconciling §31
 
-1. **What was already present.** The complete canonical reconciliation SQL
-   (part 1), the two Vault migrations (parts 2–3), the two Save V2 migrations
-   (parts 4–5), the TTS settings migration (part 6) and the Todo schedule-type
-   migration (part 7) — all embedded statement-for-statement; part 8
-   (`20260927000001_add_todo_steps.sql`) was added by the multi-step phase,
-   part 9 (`20260928000001_create_emoji_reaction_tables.sql`) by the Emoji &
-   Reaction persistence phase, part 10
+1. **What is embedded, and when each part arrived.** The complete canonical
+   reconciliation SQL (part 1), the two Vault migrations (parts 2–3), the two
+   Save V2 migrations (parts 4–5), the TTS settings migration (part 6) and the
+   Todo schedule-type migration (part 7) — all embedded statement-for-statement;
+   part 8 (`20260927000001_add_todo_steps.sql`) was added by the multi-step
+   phase, part 9 (`20260928000001_create_emoji_reaction_tables.sql`) by the
+   Emoji & Reaction persistence phase, part 10
    (`20260929000001_create_private_message_tables.sql`) by the Private Message
    phase, part 11
    (`20261016000001_add_private_message_counter_reset.sql`) by the Private
    Message counter-reset phase and part 12
    (`20261017000001_create_anti_edit_delete_tables.sql`) by the Anti-Edit /
    Anti-Delete phase; all are embedded the same way.
-2. **What was missing.** Nothing was missing from the *block* after the Part 1
-   phase. What the previous §31 **prose** lacked was the audit trail: the
-   earlier §31.1 listed only the seven embedded migrations and was silent on
-   the other 21 files that then existed in `supabase/migrations/`, leaving the reader unable to
+2. **What was missing, and when.** At the end of the Part 1 phase nothing was
+   missing from the *block* relative to the migrations that existed then:
+   parts 1–7 covered them. The gap opened afterwards, on two fronts. The
+   previous §31 **prose** lacked the audit trail — the earlier §31.1 listed
+   only the seven embedded migrations and was silent on the other 21 files
+   that then existed in `supabase/migrations/`, leaving the reader unable to
    verify that a fresh database would end up equal to "all migrations
-   applied". A later audit found the one file that was still missing from BOTH
-   lists — `20261016000001_add_private_message_counter_reset.sql`: its three
-   columns and its CHECK were absent from the block, so a fresh database built
-   from §31.3 could not store any Private Message setting (the configuration
-   write names those columns). It is embedded as part 11.
+   applied". And a later audit of the files added by the subsequent phases
+   found the one migration still missing from BOTH the block and those lists —
+   `20261016000001_add_private_message_counter_reset.sql`: its three columns
+   and its CHECK were absent from the block, so a fresh database built from
+   §31.3 alone could not store any Private Message setting (the configuration
+   write names those columns). Those two findings are what the fix addressed:
+   the migration was subsequently incorporated verbatim as part 11, directly
+   after part 10 (item 10 below), so no file is missing from the block any more.
 3. **What was incomplete.** The per-historical-migration classification above
    (which migration's change lives where inside part 1) did not exist; it is
    now recorded.

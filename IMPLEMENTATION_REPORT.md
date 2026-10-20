@@ -1,199 +1,193 @@
-# IMPLEMENTATION_REPORT.md — Supabase transport: HTTP/1.1 for the shared client
+# IMPLEMENTATION_REPORT.md — Canonical schema reconciliation: §31.1.1 correction and final verification
 
-> This file describes **only** the current state of the repository for this
-> round and **replaces every previous report in full**. Earlier reports (the AED
-> archive rounds, the private-message rounds, the lifecycle-stall round, the
-> Supabase EAGAIN investigation rounds) remain readable in Git history.
+> This file describes **only** the current state of the repository for this round
+> and **replaces every previous report in full**. Earlier reports (the Supabase
+> HTTP/1.1 transport round, the AED archive rounds, the private-message rounds,
+> the lifecycle-stall round) remain readable in Git history.
 
 | Item | Value |
 |---|---|
-| Stage | **Implementation** (fix + regression tests + reports), delivered on `main` |
-| Date | 2026-10-19 (UTC) |
-| Repository / remote | `Onlyicing1/Telegram-self-bot`, branch `main` |
-| Revision at task start | `13f9a1cdade1668a72ef5e69b85b1eb571503ff9` (`origin/main`, verified with `git fetch` + `rev-parse` before any edit) |
-| Final commit | The commit that carries this file on `main`; resolve with `git log -1 --format=%H -- IMPLEMENTATION_REPORT.md`. The exact SHA, the push result and the remote verification are stated in the completion response. |
-| Workspace runtime | CPython **3.12.3**, OpenSSL **3.0.13**; `supabase 2.4.2`, `postgrest 0.16.11`, `httpx 0.27.0`, `httpcore 1.0.9`, `h2 4.4.1`, `telethon 1.43.0` |
-| Live Render / Supabase / Telegram | **Not touched:** no deployment, no Render API/shell/log stream, no `.env`, no credential, no SQL, no migration, no restart, no environment change |
+| Stage | **Documentation correction + verification** of the canonical one-paste schema; delivered on `main` |
+| Date | 2026-10-20 (UTC) |
+| Repository / remote | `Onlyicing1/Telegram-self-bot`, `origin` = `https://github.com/Onlyicing1/Telegram-self-bot.git`, destination branch `main` |
+| Revision at task start | `01db1cb270fbb397acd8d6c6a5d04cdb314cdfad` — verified as local `HEAD` **and** `origin/main` after `git fetch origin` (`git ls-remote origin refs/heads/main` returned the same SHA) |
+| Commit carrying this report | Resolve with `git log -1 --format=%H -- IMPLEMENTATION_REPORT.md`; a commit cannot contain its own SHA, so the exact SHA, the push range and the post-push remote verification are recorded in the completion response |
+| Workspace runtime | CPython **3.10.12**; `telethon 1.34.0`, `supabase 2.4.2`, `httpx 0.27.0` (see §9 for the pin mismatch) |
+| Live Supabase / Telegram / Render | **Not touched:** no SQL executed, no database contacted, no migration applied, no RLS/policy/grant change, no deployment, no restart |
 
 ---
 
-## 1. Objective
+## 1. Objective and scope
 
-Stop the recurring production transport failure
+The canonical one-paste schema in `DATABASE_ARCHITECTURE.md` §31.3 already
+carries **12 embedded parts** (part 11 =
+`20261016000001_add_private_message_counter_reset.sql`, part 12 =
+`20261017000001_create_anti_edit_delete_tables.sql`), and §31.1 already records
+**34 migration files / 12 embedded parts**. That reconciliation was delivered in
+earlier commits (`a2f94c0`, `9222bbf`, `01db1cb`).
 
-```text
-ReadError <- ReadError <- BlockingIOError(errno=11)   (elapsed=0.0s)
-```
-
-by removing the configuration in which it is reproducible — concurrent use of one
-HTTP/2-multiplexed socket by the shared Supabase client's worker threads — with
-the smallest safe change, regression tests, no retries, and no change to
-timeouts, dependencies, schema, secrets or deployment configuration.
-
----
-
-## 2. Root cause, with its confidence
-
-**Confirmed (source + measurement).** The shared Supabase client spoke HTTP/2
-because `postgrest`'s session factory hard-codes `http2=True`
-(`postgrest/_sync/client.py::create_session`), and supabase-py constructs that
-client internally. HTTP/2 multiplexes all concurrent requests onto one TLS
-connection; `httpcore` reads and writes it under two *separate* locks
-(`_read_lock`, `_write_lock`) over h2 state whose `_events` bookkeeping is
-mutated without a lock. `backend/db/client.py` dispatches up to `_DB_MAX_WORKERS
-= 4` threads through that one client.
-
-Measured on this stack (earlier round, CPython 3.10.12 / OpenSSL 3.0.2): shared
-client + HTTP/2 + 4 threads → 99 failures / 1,463; shared client + HTTP/1.1 + 4
-threads → 0 / 4,947; per-thread clients + HTTP/2 → 0 / 4,594; one thread + HTTP/2
-→ 0 / 1,648. Reproduced against a real production HTTP/2 origin (99 failures at
-1.7–2.9 ms) and clean over HTTP/1.1 (0 / 6,258) on the same origin.
-
-**Not proven.** Why the socket layer returns `EAGAIN` at all. The exact
-production chain (`BlockingIOError(errno=11)`) was never reproduced locally —
-local failures were `RemoteProtocolError` and h2 state errors. The fix removes
-the reproducible condition; it does not claim to explain the final syscall, and
-no retry or masking was added.
+This round did exactly one thing beyond verifying that state: it removed the one
+**contradictory documentation passage** in §31.1.1, then ran the two required
+test files and delivered the result. No schema, migration, test, runtime or
+security change was made or needed.
 
 ---
 
-## 3. The change
+## 2. The documentation correction
 
-### 3.1 New: `backend/db/transport.py`
+**File:** `DATABASE_ARCHITECTURE.md` — **§31.1.1 only** (`Reconciliation note —
+what changed while reconciling §31`).
 
-| Symbol | Role |
+### 2.1 The defect
+
+Item 2 of the note asserted two mutually exclusive things in one paragraph:
+
+1. “*Nothing was missing from the block after the Part 1 phase.*”
+2. “*A later audit found the one file that was still missing from BOTH lists —
+   `20261016000001_add_private_message_counter_reset.sql`: its three columns and
+   its CHECK were absent from the block … It is embedded as part 11.*”
+
+The first sentence denies that the block ever lacked anything; the second
+states that a migration was missing from the block and had to be incorporated.
+Item 1 compounded it by heading the list of parts — including parts 11 and 12,
+which arrived later — “*What was already present*”, so the same passage both
+listed part 11 as present and described it as the file that was missing.
+
+### 2.2 The correction (wording only)
+
+- Item 1 heading is now **“What is embedded, and when each part arrived.”** The
+  body is unchanged apart from line re-wrapping: it still lists parts 1–7 as
+  embedded at the Part 1 phase and parts 8–12 as added by their own phases.
+- Item 2 is now **“What was missing, and when.”** It states the earlier state and
+  the later finding separately and consistently:
+  - at the end of the Part 1 phase **nothing was missing from the block relative
+    to the migrations that existed then** — parts 1–7 covered them;
+  - the gap opened afterwards on two fronts: the §31 **prose** carried no audit
+    trail (only the seven embedded migrations were listed, the other 21 files
+    were unclassified), and a later audit of the files added by the subsequent
+    phases found the one migration still missing from the block and the lists —
+    `20261016000001_add_private_message_counter_reset.sql` (three columns + one
+    CHECK absent, so a database built from §31.3 alone rejected the
+    configuration write);
+  - those findings are what the fix addressed: the migration was **subsequently
+    incorporated verbatim as part 11, directly after part 10**, so no file is
+    missing from the block any more (cross-referenced to item 10, which documents
+    part 11 in full).
+
+Items 3–10 of the note are untouched. The edit is **prose only, in one
+section**: `git diff --numstat` reports `21` insertions / `16` deletions for
+`DATABASE_ARCHITECTURE.md` (re-wrapping included), and no other line of the
+document changes. Not changed: the SQL block in §31.3, any migration file, §31.1’s
+tables and counts, §31.2–§31.6, §33, §34, any number, and any statement about
+security.
+
+---
+
+## 3. Files changed by this task
+
+| File | Change |
 |---|---|
-| `HTTP1Session(httpx.Client)` | PostgREST's session with `http2=False`, plus `aclose()` (postgrest closes its session through that name; httpx's sync client only defines `close()`) |
-| `HTTP1PostgrestClient(SyncPostgrestClient)` | Overrides `create_session` to build that session with the same base URL, headers, timeout, `verify` and `follow_redirects=True` |
-| `HTTP1SupabaseClient(SupabaseClient)` | Overrides the PostgREST factory, so the pin survives the library's lazy construction **and** its rebuild on an auth-state change |
-| `create_http1_client(url, key, options=None)` | Drop-in for `supabase.create_client`: same validation, auth headers, sub-clients; only the transport differs. Logs `Supabase transport=http/1.1 (HTTP/2 disabled)` |
-| `install_http1_transport()` | Installs that factory on the public `supabase.create_client` entry point (idempotent) |
+| `DATABASE_ARCHITECTURE.md` | §31.1.1 items 1–2 re-worded to remove the self-contradiction (§2); nothing else |
+| `IMPLEMENTATION_REPORT.md` | Replaced in full by this report |
 
-`http2=False` is the decisive flag: `httpcore` builds its ALPN list as
-`["http/1.1", "h2"] if http2 else ["http/1.1"]` and only uses `HTTP2Connection`
-when h2 was negotiated, so this session cannot multiplex.
+---
 
-### 3.2 Changed: `backend/db/__init__.py`
+## 4. Required tests — commands and actual results
 
-Imports `transport` and calls `install_http1_transport()`. A missing transport
-dependency is swallowed (with a warning), because `get_db()` already degrades to
-the in-memory fallback when it cannot build a client.
+Runner: the repository virtualenv, invoked from the repository root.
 
-### 3.3 Why the factory install, and not an edit in `get_db()`
+| # | Command | Result | Exit status |
+|---|---|---|---|
+| 1 | `.venv/bin/python -m pytest tests/test_database_setup_order.py -q` | **39 passed**, 1 warning (the `gotrue` deprecation warning emitted on import), 0 failed, 0 skipped | **0** |
+| 2 | `.venv/bin/python -m pytest tests/test_canonical_schema_reconciliation.py -q` | **33 passed**, 1 warning (same import-time deprecation), 0 failed, 0 skipped | **0** |
 
-`get_db()` is the single construction call site, and it imports `create_client`
-from the `supabase` package **at call time**. Installing the public factory at the
-one place every `backend.db.*` import passes through therefore keeps a single
-construction boundary — and leaves `backend/db/client.py` (3,180 lines of
-dispatch, pool, deadlines and diagnostics) completely untouched. The install is a
-replacement of a **public** function, not a patch of a private internal, it is
-idempotent, and a regression test asserts it is in place. The alternative —
-editing the call inside `client.py` — would have duplicated the construction
-boundary and changed a large file for a one-line change.
+Both files were run **twice**: once after the §31.1.1 rewrite and again after the
+final line-wrapping adjustments to the same two items. Both runs produced the
+same results above; the table reports the final run.
 
-### 3.4 Old vs new behaviour
+Additional check actually run (documentation-sensitive suites that read the same
+sections, after the final edit):
 
-| Aspect | Before | After |
+| Command | Result | Exit status |
 |---|---|---|
-| Transport | HTTP/2 (hard-coded, unavoidable from this repo) | HTTP/1.1 only |
-| Sockets per concurrency | one multiplexed TLS connection | one pooled connection per in-flight request |
-| Client, worker pool (`4`), transport deadline (`8 s`), dispatch budget (`10 s`) | — | **unchanged** |
-| Headers, timeout object, redirects, verification | — | **unchanged** |
-| PostgREST request path and response parsing | — | **unchanged** |
-| Classification, fallback, 5 s cooldown, no retry | — | **unchanged** |
-| `get_db()`, `run_sync_db()`, service interfaces | — | **unchanged** |
+| `.venv/bin/python -m pytest tests/test_aed_db_security.py tests/test_private_message_scope.py -q` | **129 passed**, 0 failed | **0** |
+
+**No test was modified, skipped, weakened or deleted** in this task. No assertion
+was relaxed. No test needed a repair: nothing failed.
+
+**Not run:** a full-suite `pytest tests` run was **not** attempted this round (it
+is optional for this scope and would not improve confidence in a prose-only
+edit). The full-suite figure from the previous round is therefore **not**
+restated here as a current result.
 
 ---
 
-## 4. Tests
-
-`tests/test_supabase_transport_http1.py` (new, 10 tests) — real `supabase` client,
-real `postgrest` client, real `httpcore` pool, real local HTTP server and real
-sockets; no mocked transport, no credentials:
-
-* construction path is HTTP/1.1 only (`_http2 is False`, `_http1 is True`);
-* the factory is installed and `get_db()`, with its own unmodified call, returns
-  an HTTP/1.1 client;
-* the stock library client still reports `_http2 is True` — the assertion is
-  discriminating;
-* the pin survives a PostgREST client rebuild;
-* a real request travels and parses (`/rest/v1/...`, `apikey`,
-  `Accept-Profile`);
-* 4 threads × 25 requests on one client → 100 responses, 0 exceptions;
-* a real transport failure raises (never a false success), and through
-  `SupabaseTaskRepository` it degrades and is classified `unavailable`;
-* missing credentials still fall back; pool size and timeout relationship
-  unchanged.
-
-**No existing test was modified.** The two suites that patch
-`supabase.create_client` still intercept, because that is exactly the installed
-factory.
-
----
-
-## 5. Validation results (actual)
+## 5. Other validation
 
 | Check | Result |
 |---|---|
-| `pytest tests/test_supabase_transport_http1.py -q` | **10 passed** |
-| `pytest` on the 10 focused transport/DB/runtime files | **147 passed** |
-| `pytest tests -q -p no:cacheprovider` | **6447 passed, 27 skipped, 1 failed** |
-| `python -m py_compile` on the changed Python files | clean |
-| `git diff --check` | clean |
-
-**The single failure** is
-`tests/test_private_message_panel.py::test_the_schedule_panel_names_the_next_transition`.
-It asserts the panel says `rule 1 start` for a rule of 22:00–23:00 UTC; the run
-was at 22:12 UTC, inside that window, where the next transition is the rule's
-end. Verified to fail **on the clean tree too** (this change stashed, same
-result), it imports only the private-message service/panel modules, and it is
-reported as a failure rather than a pass. It was deliberately left alone.
+| `git diff --check` (working tree, before staging and again before committing) | **clean**, exit status **0** — no whitespace errors, no conflict markers |
+| `git status --porcelain=v1 --untracked-files=all` before editing | **empty** — the tree was clean, so no pre-existing unrelated change had to be isolated or preserved |
+| Diff review | Only the two files in §3; `git diff --stat` shows exactly `DATABASE_ARCHITECTURE.md` and `IMPLEMENTATION_REPORT.md` |
+| SQL / migration execution | **None.** Only `grep`/`sed`/read tools and pytest touched the files |
+| `python -m py_compile` | Not applicable — no Python file changed |
 
 ---
 
-## 6. Delivery
+## 6. Files intentionally left unchanged
+
+- **All SQL:** `DATABASE_ARCHITECTURE.md` §31.3’s single fenced block, and every
+  file under `supabase/migrations/` (34 files), including
+  `20261016000001_add_private_message_counter_reset.sql`, whose DDL and header
+  comment already match part 11.
+- **All tests:** `tests/test_database_setup_order.py`,
+  `tests/test_canonical_schema_reconciliation.py`,
+  `tests/test_aed_db_security.py`, `tests/test_private_message_scope.py`,
+  `tests/test_private_message_panel.py`, `tests/test_private_message_management.py`.
+- **All runtime code:** `backend/**` — no handler, service, tool, scheduler, DB
+  client or panel changed.
+- **Other documents:** §31.1, §31.2–§31.6, §33, §34 and every other section of
+  `DATABASE_ARCHITECTURE.md`; `INVESTIGATION.md`, `ROADMAP.md`, `AGENTS.md`.
+- **Configuration:** `render.yaml`, `requirements.txt`, `.env*` (never read or
+  printed).
+
+---
+
+## 7. Database security — explicitly not performed
+
+- **No SQL was executed. No Supabase project, REST endpoint or database was
+  contacted.** Every schema claim in this report is static evidence (files +
+  tests that parse them).
+- **No RLS setting, policy, grant, privilege, column or row was changed.**
+- The previously observed public `SELECT` access on `private_message_config` and
+  `private_message_senders` (`anon`/`authenticated` grants with `USING (true)`
+  policies) **remains exactly as it was**. It is recorded as an exposure in
+  `DATABASE_ARCHITECTURE.md` §33.4 and belongs to the separate security phase.
+- **The database is not claimed to be secure.** Nothing in this round hardened
+  it.
+
+---
+
+## 8. Delivery
 
 | Item | Value |
 |---|---|
-| Branch | `main` (the required destination) |
-| Local branch created from | verified `origin/main` = `13f9a1c` at task start |
-| Scope of the diff | 3 code/test files (`backend/db/transport.py` new, `backend/db/__init__.py`, `tests/test_supabase_transport_http1.py` new) plus the two fully replaced reports |
-| Shell `git push` | **Failed — no credentials** in the sandbox (`could not read Username for 'https://github.com'`) |
-| Delivery channel | The authenticated GitHub integration (Git Data API), reported in the completion response with `origin/main` verification |
-| Pre-existing unrelated work | Preserved; untouched by this change |
-
-No rebase, no force-push, no history rewrite, no reset of unrelated work.
+| Branch situation at task start | The workspace was on `investigation-rebuild` (the branch every previous round of this work delivered from), tracking `origin/main`, with `HEAD` = `origin/main` = `01db1cb…` and a clean tree. Local `main` was a stale, diverged branch (`d084e6b`, 1 ahead / 30 behind) and was **not** checked out, reset or touched. Because the current branch was byte-identical to `origin/main`, the commit applies directly to `main`; a branch switch would have moved or discarded nothing but also changed nothing. |
+| Commit | `docs(db): resolve the §31.1.1 reconciliation contradiction` — the two files in §3 |
+| Push | `git push origin HEAD:main` — normal fast-forward push, authenticated by the workspace’s managed GitHub credential (no PAT, no SSH change, no remote rewrite) |
+| Forbidden operations | **None used:** no rebase, no force-push, no `--skip`, no history rewrite, no reset/clean |
+| Post-push verification | `git fetch origin` → `git rev-parse origin/main` → `git ls-remote origin refs/heads/main` → `git merge-base --is-ancestor <commit> origin/main` → `git status --porcelain` → `git show origin/main:IMPLEMENTATION_REPORT.md` / `:DATABASE_ARCHITECTURE.md`. The exact SHA, the pushed range and each result are stated in the completion response. |
+| Pre-existing unrelated work | None existed in the tree at task start; none was created. |
 
 ---
 
-## 7. Deployment and live verification
-
-**Not verified in this round.** Whether Render deployed the commit, its terminal
-status, its startup logs, and whether production episodes stop were **not
-observed** — this workspace has no Render access and no Supabase credential, and
-none was requested.
-
-To confirm from the deployed build, with no further change:
-
-1. The log must contain `Supabase transport=http/1.1 (HTTP/2 disabled)`.
-2. If an episode still appears, `phase` / `elapsed` / `chain` / `since_teardown`
-   remain the deciders.
-3. `ConnectionTerminated error_code:1` should no longer be produced by this
-   client, because h2 is never negotiated.
-
-A successful deployment or a `live` status would **not** by itself prove the
-recurring error stopped.
-
----
-
-## 8. Remaining risks and open items
+## 9. Remaining limitations
 
 | Item | Status |
 |---|---|
-| Syscall-level cause of the original `EAGAIN` | **Not proven**; the fix removes the reproducible configuration, not a proven syscall cause |
-| `errno=11` reproduction | **Never reproduced** here; not claimed |
-| Deployed runtime | Previously observed CPython 3.13.4 / OpenSSL 3.0.20; this workspace is 3.12.3 / 3.0.13. The fix does not depend on the runtime |
-| `render.yaml` pins `3.11.7`, live logs previously showed 3.13.4 | Configuration drift, documented in `INVESTIGATION.md`; **not** changed here |
-| Unpinned transitive dependencies (`postgrest`, `httpcore`, `h2`) | The HTTP/1.1 pin is asserted by tests; a dependency that renames the factory would fail those tests rather than silently revert |
-| Factory install scope | Process-wide: any other importer of `supabase.create_client` would also receive the HTTP/1.1 factory. In this single-process, single-owner bot that is the intended construction path, and it is covered by a test |
-| HTTP/1.1 throughput | One connection per in-flight request instead of one multiplexed socket; the pool is bounded at 4 workers, so at most 4 connections are in use. No throughput regression was measured, and none is claimed |
+| Commit SHA / push evidence inside this file | **Not physically possible** — a commit cannot contain its own SHA. The pre-commit verified remote state (`01db1cb…`) is recorded above; the final SHA, push range and post-push checks are in the completion response and are reproducible with the commands in §8. |
+| SQL executability and idempotency | **Proven statically only** (part↔migration statement equality, effective-schema equality, additivity). The block was not executed against any Postgres instance. |
+| Full test suite | **Not run this round.** The last full-suite result is from the previous round and is deliberately not restated as current. |
+| Environment pin mismatch | The workspace has `telethon 1.34.0` while `backend/requirements.txt` pins `1.43.0`; this is pre-existing and irrelevant to the two suites run here (neither imports Telethon’s coloured-button code), but it is why `tests/test_colored_buttons.py` fails in this workspace. That file was not part of this task and was not touched. |
+| Deployed database | The live Supabase schema, its migration history and `pip freeze` were **not** inspected; whether the deployed database already carries part 11 is unverified from here. |
+| Broader security posture | Unchanged and unverified in this task by design (§7). |
