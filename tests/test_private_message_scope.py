@@ -1273,7 +1273,9 @@ def test_the_feature_documentation_exists_and_states_the_manual_action():
     doc = (REPO / "DATABASE_ARCHITECTURE.md").read_text(encoding="utf-8")
     assert "## 33. Private Message Management Persistence" in doc
     assert "20260929000001_create_private_message_tables.sql" in doc
-    assert "part 10 of 11" in doc
+    assert "20261016000001_add_private_message_counter_reset.sql" in doc
+    assert "part 10 of 12" in doc
+    assert "part 11 of 12" in doc
     assert "private_message_senders" in doc
 
 
