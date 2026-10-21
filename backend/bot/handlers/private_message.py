@@ -10,7 +10,7 @@ Two responsibilities, both attached to EXISTING architecture:
 2. **Glass UI** — the ``panel:pm`` family (mode, unauthorized policy,
    allowlist, exceptions, temporary override, schedule) rendered through the
    existing ``register_panel`` / ``register_action`` / ``register_input``
-   machinery, reachable from the mother panel.
+   machinery, reachable from the Cipher category.
 
 Everything the panel shows comes from ``backend/services/private_message_service``
 (persisted ``bot_settings`` state, loaded once at startup, cached in memory), and
@@ -1341,7 +1341,7 @@ def register(client, owner_id: int, tz_str: str = "UTC") -> None:
         except Exception:
             pass
 
-    register_panel(PANEL_ID, lambda event, extra: _panel_result(PANEL_ID, extra, owner_id), parent="menu", title="Private Messages")
+    register_panel(PANEL_ID, lambda event, extra: _panel_result(PANEL_ID, extra, owner_id), parent="cipher", title="Private Messages")
     register_panel(POLICY_PANEL_ID, lambda event, extra: _panel_result(POLICY_PANEL_ID, extra, owner_id), parent=PANEL_ID, title="Closing Actions")
     register_panel(ALLOW_PANEL_ID, lambda event, extra: _panel_result(ALLOW_PANEL_ID, extra, owner_id), parent=PANEL_ID, title="Allowlist")
     register_panel(EXCEPT_PANEL_ID, lambda event, extra: _panel_result(EXCEPT_PANEL_ID, extra, owner_id), parent=PANEL_ID, title="Exceptions")

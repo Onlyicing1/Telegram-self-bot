@@ -133,13 +133,13 @@ def _restore_engine():
 
 @pytest.mark.asyncio
 async def test_1_ghost_seen_panel_registered_for_direct_open():
-    """The Ghost Seen panel is registered under the main menu so a direct
+    """The Ghost Seen panel is registered under the Cipher category so a direct
     ``panel:ghost_seen_v2`` callback resolves to the browser handler."""
     handler_module.register(object(), owner_id=999, tz_str="UTC")
     from backend.helper.panel_registry import get_panel_handler, get_panel_parent
     handler = get_panel_handler("ghost_seen_v2")
     assert handler is not None
-    assert get_panel_parent("ghost_seen_v2") == "menu"
+    assert get_panel_parent("ghost_seen_v2") == "cipher"
     from backend.helper.panels import get_action, get_input
     assert get_action("ghost_seen_v2_page") is not None
     assert get_action("ghost_seen_v2_manage_page") is not None

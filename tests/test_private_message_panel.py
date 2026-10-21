@@ -441,13 +441,15 @@ def test_every_panel_action_and_input_is_registered(registered):
     assert get_input("pm_rule", "start") is not None
     assert get_input("pm_rule", "end") is not None
     assert get_input("pm_sched", "timezone") is not None
-    assert get_registry().get_parent("pm") == "menu"
+    assert get_registry().get_parent("pm") == "cipher"
 
 
-def test_the_mother_menu_opens_the_private_message_panel(registered):
+def test_the_mother_menu_routes_private_messages_through_cipher(registered):
     from backend.bot.handlers.misc import _build_menu_buttons
 
-    assert "panel:pm" in _datas(_build_menu_buttons())
+    datas = _datas(_build_menu_buttons())
+    assert "panel:pm" not in datas
+    assert "panel:cipher" in datas
 
 
 def test_all_new_callback_data_fits_telegram_limits(registered, db):

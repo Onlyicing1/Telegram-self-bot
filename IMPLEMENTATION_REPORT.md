@@ -554,3 +554,105 @@ does not model, so the migration cannot silently grow an unverified step. It
    makes the feature fail closed until the next retry succeeds — that is the
    intended trade (never overwrite a stored configuration with defaults), not a
    regression.
+
+---
+
+## 14. Navigation round — the Cipher category
+
+**Baseline:** `fe462940cc953950eb1f434687a2a8d67a8a8fc8` (= `origin/main`, verified
+with `git fetch` + `git rev-parse`), read from a detached worktree at that
+commit. The shared checkout's pre-existing branch and working-tree edits were
+never touched.
+
+**Objective.** Group the private-message features into one first-class category,
+**Cipher** (subtitle *Private Communications*), so the mother panel stops
+listing each of them separately — without changing any feature's handler,
+service, persistence, permissions or execution path.
+
+### 14.1 Classification, from source
+
+Moved under Cipher:
+
+- **Private Messages** (`backend/bot/handlers/private_message.py`, the
+  `panel:pm` family): effective mode, closing actions (delete / fixed response /
+  AI response), allowlist, exceptions, temporary override, schedule and its rule
+  editor, the per-person AI reply limit and interval, the durable AI counters
+  and their automatic reset window. This is the PV policy itself.
+- **Ghost Seen** (`backend/bot/handlers/ghost_seen_v2.py`,
+  `panel:ghost_seen_v2`): the private-chat browser, the message viewer, the
+  reply / AI-reply actions and the per-chat allow-list (`Permissions`). Every
+  one of those panels is scoped to private chats.
+
+Intentionally left outside Cipher:
+
+- **Anti-Edit / Anti-Delete** (`panel:archive`): its capture gate is indeed
+  private-chat-only (`eligible()` rejects every non-private chat), but its
+  primary purpose is an independent edit/deletion archive — not private-message
+  policy, PV sender access or PV reply behaviour. It is the adjacent feature the
+  task says to leave alone unless the source makes it part of the PV set; it
+  does not, so it stays top-level.
+- **Auto-Reaction** (inside `General`): it reacts to the owner's own outgoing
+  messages in every chat, not to private messages specifically.
+- **Save, Delete, Database, AI, Profile, Todo**: general-purpose features with
+  no PV-specific behaviour.
+
+### 14.2 The category and the navigation change
+
+- New `cipher` panel, registered in `misc.py` as a child of `menu` with title
+  `Cipher` and the description `Private Communications`.
+- The mother panel now shows one `Cipher` button where `Ghost Seen` and
+  `Private Messages` used to be listed; every other row and callback value is
+  unchanged.
+- `pm` and `ghost_seen_v2` were re-parented from `menu` to `cipher`, so Back from
+  either — with an empty nav stack — returns to Cipher. Their ids, titles,
+  sub-panel parents, actions, inputs, services and persistence are untouched, so
+  a callback that already existed still resolves to the same handler.
+- Because the panels themselves did not change, the shared renderer still
+  injects the standard Back/Home/Close row for them, and Home still resets to
+  the mother panel.
+- No icon was added: the mother panel uses no icon convention for categories,
+  and the project's symbol registry is functional (geometric) rather than
+  decorative — a shield glyph would have introduced a new visual language.
+
+### 14.3 Files
+
+- `backend/bot/handlers/misc.py` — the `Cipher` category buttons, handler,
+  inline builder and registration; the two removed menu rows.
+- `backend/bot/handlers/private_message.py` — parent `menu` → `cipher`, docstring
+  navigation note.
+- `backend/bot/handlers/ghost_seen_v2.py` — parent `menu` → `cipher`.
+- `tests/test_cipher_category.py` (new) — the menu, the category, reachability,
+  parent chain, Back/Home, duplicate-free callbacks and the no-mutation check.
+- `tests/test_private_message_panel.py`, `tests/test_colored_buttons.py`,
+  `tests/test_60_ghost_seen_v2_nav_search_perf.py` — updated assertions only.
+- `AGENTS.md` §5 and this report.
+
+No service, database client, migration, SQL, callback action, input or
+dependency was changed.
+
+### 14.4 Verification
+
+- Focused: `pytest tests/test_cipher_category.py tests/test_private_message_panel.py
+  tests/test_colored_buttons.py -q` → **119 passed** (17 of them the new module).
+- Ghost Seen / emoji / AED / Todo batch: **352 passed, 1 failed** — the failure
+  was `test_60_ghost_seen_v2_nav_search_perf` still asserting the old `menu`
+  parent, which is exactly the navigation this round changes; the assertion was
+  updated to `cipher`, and the two Ghost Seen navigation modules then passed
+  (**31 passed**).
+- Full suite: `pytest -q` → **6517 passed, 27 skipped** (CPython 3.10.12,
+  Telethon 1.43.0 as pinned).
+- `python -m py_compile` on the three changed modules and the new test module →
+  OK; `git diff --check` → clean.
+- The new module drives the real registry, the real panel handlers and the real
+  `_handle_navigation`; only the final edit boundary is stubbed, so no Telegram
+  call is made.
+
+### 14.5 Limits
+
+1. **No live helper-bot/inline rendering was observed.** The category is
+   verified through the same render/finalize path the callback router uses, but
+   not on a running account.
+2. **No database was contacted.** This round changes no schema and reads/writes
+   no stored configuration; the no-mutation check covers the in-memory PV state.
+3. **Back/Home were driven directly**, not through a real callback query; the
+   data values themselves are asserted unchanged.

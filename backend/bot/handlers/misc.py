@@ -211,11 +211,10 @@ def _build_menu_buttons() -> list:
     builder.add_buttons(
         ("General", "panel:general", PRIMARY),
         ("Settings", "panel:settings", PRIMARY),
-        ("Ghost Seen", "panel:ghost_seen_v2", PRIMARY),
+        ("Cipher", "panel:cipher", PRIMARY),
     )
     builder.add_row("Todo", "panel:todo", PRIMARY)
     builder.add_row("AI", "panel:ai", PRIMARY)
-    builder.add_row("Private Messages", "panel:pm", PRIMARY)
     builder.add_row("Anti-Edit / Anti-Delete", "panel:archive", PRIMARY)
     return builder.build()
 
@@ -248,6 +247,27 @@ async def _profile_inline_builder(event, extra: str) -> list:
     builder.add_row("Bio", "panel:bio", PRIMARY)
     builder.add_row("Username", "panel:username", PRIMARY)
     return [render("Profile", "Choose a section:", builder.build())]
+
+
+def _build_cipher_buttons() -> list:
+    builder = InlinePanelBuilder()
+    builder.add_row("Private Messages", "panel:pm", PRIMARY)
+    builder.add_row("Ghost Seen", "panel:ghost_seen_v2", PRIMARY)
+    return builder.build()
+
+
+async def _cipher_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
+    return "Cipher", "Private Communications\n\nChoose a section:", _build_cipher_buttons()
+
+
+async def _cipher_inline_builder(event, extra: str) -> list:
+    return [
+        render(
+            "Cipher",
+            "Private Communications\n\nChoose a section:",
+            _build_cipher_buttons(),
+        )
+    ]
 
 
 async def _build_settings_body() -> str:
@@ -856,6 +876,8 @@ def register(client, owner_id: int):
         register_inline_builder("menu", _menu_inline_builder)
         register_panel("profile", _profile_panel_handler, parent="menu", title="Profile")
         register_inline_builder("profile", _profile_inline_builder)
+        register_panel("cipher", _cipher_panel_handler, parent="menu", title="Cipher")
+        register_inline_builder("cipher", _cipher_inline_builder)
         register_panel("context", _context_panel_handler, parent="menu", title="Context Panel")
         register_panel("health", _health_panel_handler, parent="menu", title="Health Dashboard")
         register_inline_builder("health", _health_inline_builder)

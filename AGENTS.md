@@ -230,6 +230,9 @@ layer — an execution interface, never just a text response.
 - **Database** (`🗄`) — DB maintenance.
 - **AI** (`🧠`) — provider/model/settings/status/diagnostics + trigger-word config.
 - **Profile** → **Bio** (`🧬`) and **Username** (`👤`).
+- **Cipher** — *Private Communications*: **Private Messages** and **Ghost Seen**.
+  Both keep their own `panel:pm` / `panel:ghost_seen_v2` callback families and
+  are reached only through this category.
 - **Settings / General**, **Context Panel**, **Health Dashboard**.
 
 Actions (`action:*`), panels (`panel:*`), and inputs (`input:*`) are registered
