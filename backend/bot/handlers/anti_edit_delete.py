@@ -5,7 +5,10 @@ Registers, on the ONE shared self-client (through ``backend.bot.router``):
   * an ``events.NewMessage`` handler that records a bounded snapshot of an
     eligible private message WHILE its content is present — this snapshot is
     what makes a later deletion recoverable at all;
-  * an ``events.MessageEdited`` handler that records each edit version;
+  * an ``events.MessageEdited`` handler that records each CONTENT edit version
+    (the service classifies the update from the message's own ``edit_date``, so
+    an edit-shaped update that carries no content change — a reaction-only
+    state update — never creates a version or a visible archive item);
   * an ``events.MessageDeleted`` handler that records the deletion event and
     marks it recoverable ONLY when the content was captured beforehand.
 

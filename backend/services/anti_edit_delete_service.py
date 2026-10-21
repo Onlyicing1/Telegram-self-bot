@@ -2,11 +2,14 @@
 
 The feature archives the owner's PRIVATE conversations: it records a bounded
 snapshot of a private message while its content is still present, records each
-edit version, and records a deletion event. It never fabricates content: a
-deletion can only be marked recoverable when the original content was actually
-observed and stored beforehand, and a message deleted while the bot was offline
-(or before its content was captured) is recorded as an honest, unrecoverable
-miss.
+CONTENT edit version, and records a deletion event. An edit-shaped update that
+carries no content change (a reaction-only state update) is never archived: a
+version requires Telegram's own ``edit_date`` stamp and either a content change
+or an advanced stamp, and reaction state never participates in either test. It
+never fabricates content: a deletion can only be marked recoverable when the
+original content was actually observed and stored beforehand, and a message
+deleted while the bot was offline (or before its content was captured) is
+recorded as an honest, unrecoverable miss.
 
 ## What is stored, and where
 
@@ -621,6 +624,67 @@ def body_of(msg: Any, category: str) -> str:
     return text[:limit]
 
 
+def is_content_edit(msg: Any) -> bool:
+    """True only for a message Telegram stamped as a genuine content edit.
+
+    Telegram ALWAYS sets ``edit_date`` when a message's content changes, and
+    NEVER sets it for a reaction: the reaction state travels separately in
+    ``Message.reactions`` / ``updateMessageReactions``. The edit stamp is
+    therefore the reliable discriminator between a content edit and an
+    edit-shaped update that carries no content change. Whether the message HAS
+    reactions is deliberately NOT consulted — a genuinely edited message may
+    carry reactions too.
+    """
+    return _iso(getattr(msg, "edit_date", None)) is not None
+
+
+def content_signature(value: Any) -> tuple:
+    """A bounded fingerprint of a message's CONTENT, never its reaction state.
+
+    Accepts a live message or one stored archive row, so an incoming edit can be
+    compared with the newest observed version using only fields the archive
+    already stores. ``Message.reactions`` takes no part: a reaction is not
+    content, so adding, changing or removing one can never change this value.
+    """
+    if isinstance(value, dict):
+        size = value.get("media_size")
+        return (
+            str(value.get("category") or ""),
+            str(value.get("body") or ""),
+            bool(value.get("has_caption")),
+            bool(value.get("has_media")),
+            str(value.get("media_type") or ""),
+            str(value.get("media_name") or ""),
+            size if isinstance(size, int) and not isinstance(size, bool) else None,
+        )
+    category = classify_category(value)
+    media = media_metadata(value)
+    return (
+        category,
+        body_of(value, category),
+        category != CATEGORY_TEXT and bool(getattr(value, "message", None)),
+        getattr(value, "media", None) is not None,
+        str(media["media_type"] or ""),
+        str(media["media_name"] or ""),
+        media["media_size"],
+    )
+
+
+def _edit_advanced(previous: dict[str, Any] | None, edited_at: str | None) -> bool:
+    """True when ``edited_at`` is strictly newer than the stored version's stamp.
+
+    Both values come from ``_iso`` (UTC ISO-8601), so they order
+    lexicographically. A stored version with no stamp is an unedited snapshot,
+    so any edit stamp is newer than it.
+    """
+    if not isinstance(edited_at, str) or not edited_at:
+        return False
+    stored = (previous or {}).get("edited_at")
+    if not isinstance(stored, str) or not stored:
+        return True
+    return edited_at > stored
+
+
 def _iso(value: Any) -> str | None:
     if isinstance(value, datetime):
         if value.tzinfo is None:
@@ -846,8 +910,21 @@ async def record_message(
     if not _category_enabled(category, has_caption):
         return None
 
+    edited_at: str | None = None
     if kind == KIND_EDIT:
-        version = _iso(getattr(msg, "edit_date", None)) or _iso(getattr(msg, "date", None)) or ""
+        # An edit-shaped update is NOT an edit: only a message Telegram stamped
+        # with ``edit_date`` carries a content change. A reaction-only update
+        # (which may be delivered through updateEditMessage) carries no stamp,
+        # so it must never create a version. Falling back to ``date`` here is
+        # exactly what archived an unchanged message as an "edit".
+        edited_at = _iso(getattr(msg, "edit_date", None))
+        if edited_at is None:
+            logger.debug(
+                "[AED] edit-shaped update ignored: no content edit chat=%s msg=%s",
+                getattr(msg, "chat_id", None), getattr(msg, "id", None),
+            )
+            return None
+        version = edited_at
     else:
         version = _iso(getattr(msg, "date", None)) or ""
     archive_id = make_id(owner=owner, chat_id=chat_id, message_id=message_id, kind=kind, version=version)
@@ -887,6 +964,18 @@ async def record_message(
         existing = [r for r in rows if r.get("id") == archive_id]
         if existing:
             return None
+        if kind == KIND_EDIT:
+            # A version is stored only when the CONTENT changed or the edit
+            # stamp advanced; an update that carries neither is a state update
+            # about an unchanged message and must stay invisible.
+            previous = _latest_content(rows, chat_id, message_id)
+            if previous is not None and content_signature(previous) == content_signature(msg):
+                if not _edit_advanced(previous, edited_at):
+                    logger.debug(
+                        "[AED] edit-shaped update ignored: content unchanged chat=%s msg=%s",
+                        chat_id, message_id,
+                    )
+                    return None
         # Bound the number of versions kept for one message.
         same = _versions_for(rows, chat_id, message_id)
         if len(same) >= MAX_VERSIONS_PER_MESSAGE:

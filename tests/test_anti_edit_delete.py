@@ -16,6 +16,8 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
+from telethon import events
+from telethon.tl import types
 
 from backend.bot.handlers import anti_edit_delete as aed
 from backend.bot.handlers import misc
@@ -1499,3 +1501,246 @@ def test_legacy_shards_still_work_before_the_migration(monkeypatch):
     rows = _run(svc.load_rows_async())
     assert [r["id"] for r in rows] == ["legacy01"]
     assert _run(svc.set_retention_days(4)) is True     # config still writes the legacy doc
+
+
+# ── 16. reaction-only updates are never edits ────────────────────────────────
+#
+# Telegram reports a reaction state change as ``UpdateMessageReactions`` — the
+# reaction lives in ``Message.reactions``, NOT in the message's content. These
+# tests model the REAL Telethon update/event types and drive the REAL
+# ``events.MessageEdited`` builder, so the classification under test is the
+# production one: the builder turns only ``UpdateEditMessage`` /
+# ``UpdateEditChannelMessage`` into a ``MessageEdited`` event, and an
+# edit-shaped update whose message carries no ``edit_date`` stamp is a state
+# update, not a content edit.
+
+_DATED = datetime(2026, 10, 21, 10, 0, tzinfo=timezone.utc)
+
+
+def _reaction_state(*emoticons):
+    return types.MessageReactions(
+        results=[
+            types.ReactionCount(reaction=types.ReactionEmoji(emoticon=emoticon), count=1)
+            for emoticon in emoticons
+        ]
+    )
+
+
+def _tl_message(
+    *,
+    message_id=7,
+    text="hello world",
+    edit_date=None,
+    media=None,
+    reactions=None,
+    date=_DATED,
+):
+    """A REAL ``telethon.tl.types.Message`` — the object a live update carries."""
+    return types.Message(
+        id=message_id,
+        peer_id=types.PeerUser(FRIEND),
+        date=date,
+        message=text,
+        out=True,
+        media=media,
+        edit_date=edit_date,
+        reactions=reactions,
+    )
+
+
+def _reaction_update(*, message_id=7, reactions=None):
+    """The documented reaction update: it never names ``edit_date``."""
+    return types.UpdateMessageReactions(
+        peer=types.PeerUser(FRIEND),
+        msg_id=message_id,
+        reactions=reactions if reactions is not None else _reaction_state("👍"),
+    )
+
+
+def _edit_update(message, *, pts=1):
+    return types.UpdateEditMessage(message=message, pts=pts, pts_count=1)
+
+
+def _deliver_as_edit(client, update):
+    """Run ONE real update through Telethon's builder, then the AED handler.
+
+    Returns the built event (``None`` when the builder does not classify the
+    update as an edit), so a test can assert on the real classification result
+    rather than on a mocked one.
+    """
+    event = events.MessageEdited.build(update)
+    if event is None:
+        return None
+    _run(client.handler("MessageEdited")(event))
+    return event
+
+
+def _rows(client):
+    return _run(svc.load_rows_async())
+
+
+def _kinds(rows):
+    return [row["kind"] for row in rows]
+
+
+def test_the_reaction_update_never_builds_a_message_edited_event(client, enabled):
+    # The REAL type Telegram sends for a reaction change is not an edit update.
+    assert events.MessageEdited.build(_reaction_update()) is None
+    assert _deliver_as_edit(client, _reaction_update()) is None
+    assert _rows(client) == []
+    # ...while a real edit update still builds one, so the path stays exercised.
+    assert _deliver_as_edit(client, _edit_update(_tl_message(edit_date=_DATED))) is not None
+
+
+def test_a_reaction_on_an_archived_message_creates_no_edit_version(client, enabled):
+    _capture(client, _tl_message(text="meet at 5pm"))
+    _deliver_as_edit(client, _reaction_update(reactions=_reaction_state("👍")))
+    rows = _rows(client)
+    assert _kinds(rows) == [svc.KIND_SNAPSHOT]
+    items = svc.build_items(rows)
+    assert len(items) == 1
+    assert items[0]["version_count"] == 1
+    assert "versions" not in " ".join(_texts(_panel("archive_list")[2]))
+
+
+def test_an_edit_shaped_reaction_update_cannot_create_a_version(client, enabled):
+    """The defect itself: an ``UpdateEditMessage`` carrying an unchanged message.
+
+    Telegram may deliver a reaction change through an edit-shaped update. The
+    message carries the reaction state and no ``edit_date`` — the pre-fix code
+    keyed a new ``edit`` version off ``date`` and archived an unchanged message.
+    """
+    _capture(client, _tl_message(text="hello world"))
+    reacted = _tl_message(text="hello world", reactions=_reaction_state("❤"))
+    assert reacted.edit_date is None
+    assert svc.is_content_edit(reacted) is False
+
+    event = _deliver_as_edit(client, _edit_update(reacted))
+    assert event is not None, "the update IS delivered as an edit event — classification must stop it"
+
+    rows = _rows(client)
+    assert _kinds(rows) == [svc.KIND_SNAPSHOT]
+    assert svc.build_items(rows)[0]["version_count"] == 1
+
+
+def test_an_unchanged_message_stays_invisible_after_a_reaction(client, enabled):
+    """No snapshot, only a reaction-only edit-shaped update → nothing archived."""
+    reacted = _tl_message(text="never archived before", reactions=_reaction_state("🔥"))
+    assert _deliver_as_edit(client, _edit_update(reacted)) is not None
+    assert _rows(client) == []
+    assert svc.build_items(_rows(client)) == []
+
+
+def test_adding_and_changing_reactions_never_increments_the_version_count(client, enabled):
+    _capture(client, _tl_message(text="steady"))
+    for emoticons in (("👍",), ("👍", "❤"), (), ("🔥",)):
+        _deliver_as_edit(client, _edit_update(
+            _tl_message(text="steady", reactions=_reaction_state(*emoticons))
+        ))
+        _deliver_as_edit(client, _reaction_update(reactions=_reaction_state(*emoticons)))
+
+    rows = _rows(client)
+    assert _kinds(rows) == [svc.KIND_SNAPSHOT]
+    items = svc.build_items(rows)
+    assert items[0]["version_count"] == 1
+    assert items[0]["body"] == "steady"
+
+
+def test_reaction_state_never_participates_in_the_content_signature():
+    plain = _tl_message(text="same text")
+    reacted = _tl_message(text="same text", reactions=_reaction_state("👍", "❤"))
+    # Different reaction state, IDENTICAL content fingerprint.
+    assert svc.content_signature(plain) == svc.content_signature(reacted)
+    # ...and a genuinely different text does change it.
+    assert svc.content_signature(plain) != svc.content_signature(_tl_message(text="other"))
+
+
+def test_a_genuine_text_edit_is_still_captured_with_its_original_snapshot(client, enabled):
+    _capture(client, _tl_message(text="v1"))
+    edited = _tl_message(text="v2", edit_date=datetime.now(timezone.utc),
+                         reactions=_reaction_state("👍"))
+    event = _deliver_as_edit(client, _edit_update(edited))
+    assert event is not None
+
+    rows = _rows(client)
+    assert sorted(_kinds(rows)) == [svc.KIND_EDIT, svc.KIND_SNAPSHOT]
+    items = svc.build_items(rows)
+    assert len(items) == 1
+    assert items[0]["version_count"] == 2
+    assert items[0]["body"] == "v2"
+    bodies = [version["body"] for version in items[0]["versions"]]
+    assert sorted(bodies) == ["v1", "v2"]
+    # The edited message HAVING reactions must not block it: reactions are not
+    # consulted, the edit stamp and the content change are.
+    assert "2 versions" in " ".join(_texts(_panel("archive_list")[2]))
+
+
+def test_a_genuine_caption_edit_on_media_is_still_captured(client, enabled):
+    media = types.MessageMediaPhoto(photo=types.PhotoEmpty(id=1))
+    _capture(client, _tl_message(text="old caption", media=media))
+    edited = _tl_message(
+        text="new caption",
+        media=types.MessageMediaPhoto(photo=types.PhotoEmpty(id=1)),
+        edit_date=datetime.now(timezone.utc),
+    )
+    assert _deliver_as_edit(client, _edit_update(edited)) is not None
+
+    rows = _rows(client)
+    assert sorted(_kinds(rows)) == [svc.KIND_EDIT, svc.KIND_SNAPSHOT]
+    edit_row = next(row for row in rows if row["kind"] == svc.KIND_EDIT)
+    assert edit_row["category"] == svc.CATEGORY_PHOTOS
+    assert edit_row["body"] == "new caption"
+    assert edit_row["has_caption"] is True
+
+
+def test_an_edit_that_advances_the_stamp_is_captured_even_with_identical_text(client, enabled):
+    """A real edit always advances ``edit_date`` — that alone is a new version."""
+    _capture(client, _tl_message(text="same"))
+    later = _DATED + timedelta(minutes=5)
+    assert _deliver_as_edit(client, _edit_update(_tl_message(text="same", edit_date=later))) is not None
+    assert sorted(_kinds(_rows(client))) == [svc.KIND_EDIT, svc.KIND_SNAPSHOT]
+
+
+def test_a_stale_unchanged_edit_update_cannot_re_add_a_version(client, enabled):
+    _capture(client, _tl_message(text="v1"))
+    newest = _DATED + timedelta(minutes=10)
+    assert _deliver_as_edit(client, _edit_update(_tl_message(text="v2", edit_date=newest))) is not None
+    # Same content as the newest stored version, with an OLDER stamp: no version.
+    stale = _DATED + timedelta(minutes=1)
+    assert _deliver_as_edit(client, _edit_update(_tl_message(text="v2", edit_date=stale))) is not None
+    rows = _rows(client)
+    assert sorted(_kinds(rows)) == [svc.KIND_EDIT, svc.KIND_SNAPSHOT]
+
+
+def test_a_redelivered_edit_is_recorded_once(client, enabled):
+    _capture(client, _tl_message(text="v1"))
+    edited = _tl_message(text="v2", edit_date=datetime.now(timezone.utc))
+    _deliver_as_edit(client, _edit_update(edited))
+    _deliver_as_edit(client, _edit_update(edited))
+    assert sorted(_kinds(_rows(client))) == [svc.KIND_EDIT, svc.KIND_SNAPSHOT]
+
+
+def test_reactions_do_not_disturb_deletion_recovery(client, enabled):
+    _capture(client, _tl_message(message_id=9, text="secret"))
+    _deliver_as_edit(client, _edit_update(
+        _tl_message(message_id=9, text="secret", reactions=_reaction_state("👍"))
+    ))
+    _deliver_as_edit(client, _reaction_update(message_id=9))
+    _run(client.handler("MessageDeleted")(_deleted_event(ids=(9,))))
+
+    rows = _rows(client)
+    assert _kinds(rows).count(svc.KIND_EDIT) == 0
+    deletion = next(row for row in rows if row["kind"] == svc.KIND_DELETE)
+    assert deletion["recoverable"] is True
+    assert deletion["body"] == "secret"
+    assert deletion["recovered_from"] == next(
+        row["id"] for row in rows if row["kind"] == svc.KIND_SNAPSHOT
+    )
+
+
+def test_the_reaction_only_classification_is_boundary_safe():
+    """No edit stamp → no edit; a missing/malformed message never raises."""
+    assert svc.is_content_edit(_tl_message()) is False
+    assert svc.is_content_edit(_tl_message(edit_date=_DATED)) is True
+    assert svc.is_content_edit(SimpleNamespace()) is False
+    assert svc.is_content_edit(None) is False
