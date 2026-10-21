@@ -504,6 +504,10 @@ def register(client, owner_id: int, tz_str: str = "UTC") -> None:
     @client.on(events.NewMessage())
     async def _aed_new_message(event):
         try:
+            # Await the persisted configuration: the background preload may not
+            # have finished yet, and an unloaded cache reads as "disabled", which
+            # would silently drop every capture in the startup window.
+            await service.ensure_loaded_async()
             if not service.is_enabled():
                 return
             msg = getattr(event, "message", None)
@@ -525,6 +529,7 @@ def register(client, owner_id: int, tz_str: str = "UTC") -> None:
     @client.on(events.MessageEdited())
     async def _aed_message_edited(event):
         try:
+            await service.ensure_loaded_async()
             if not service.is_enabled():
                 return
             msg = getattr(event, "message", None)
@@ -546,6 +551,7 @@ def register(client, owner_id: int, tz_str: str = "UTC") -> None:
     @client.on(events.MessageDeleted())
     async def _aed_message_deleted(event):
         try:
+            await service.ensure_loaded_async()
             if not service.is_enabled():
                 return
             chat_id = getattr(event, "chat_id", None)

@@ -448,3 +448,109 @@ skipped (the sandbox had Telethon 1.34.0 instead of the pinned 1.43.0, which
 fails 40 unrelated colored-button assertions; installing the pinned version made
 the suite green). `git diff --check` clean. **No SQL was executed and Supabase
 was not contacted.**
+
+> **Superseded by §13.** That pass deliberately left the Auto-Reaction pair as
+> the block's one documented exception. §13 generated exactly the additive
+> migration §12 asked the owner to decide on, so the pair is an exception no
+> longer: it is part 14 of the same one-paste block.
+
+---
+
+## 13. Persistence round — AED, Private Message Management, Auto-Reaction
+
+**Baseline:** `d33dbe27956aaf3819b27ae2ce416856f9de968f` (= `origin/main`, verified
+with `git fetch` + `git rev-parse`), branch `db-persistence-audit`. The audit
+that named the defects is `INVESTIGATION.md` (replaced in full by that round);
+this section records only the fixes and their verification.
+
+**The report.** The owner reports that parts of **AED**, **Private Message
+Management** and the **Auto-Reaction setting** reset after updates/redeploys.
+Five defects were confirmed from source; none was a "table does not exist"
+failure, and no row deletion exists anywhere in the repository.
+
+### 13.1 Defects and fixes
+
+| # | Defect (feature) | Fix |
+|---|---|---|
+| 1 | AED never read the pre-migration `bot_settings` store once the dedicated tables became readable, so the first restart after the migration showed the defaults and hid every archived row (AED) | `_import_legacy_store` imports the legacy archive **and** configuration once, in that order, into the dedicated tables |
+| 2 | All three AED capture handlers read the synchronous cache switch before the asynchronous preload finished, so messages/edits/deletions arriving in the startup window were dropped (AED) | each handler awaits `ensure_loaded_async()` before `is_enabled()` |
+| 3 | A failed read was indistinguishable from “no row”: the defaults were loaded, marked loaded, and then persisted over the real row. For PM the failed read also fell through to the legacy document and wrote that over the dedicated row (AED + PM) | `aed_load_config_state`, `aed_get_document_state` and `read_private_message_config` return `(value, readable)`; an unreadable store leaves the feature fail-closed, is never marked loaded, and is retried at most every 5 s |
+| 4 | No migration created `panel_settings.auto_reaction_enabled` / `auto_reaction_emoji`, although `settings_service` wrote both, so the write was rejected and the value lived only in the process cache (Auto-Reaction) | new additive migration, embedded as part 14 of §31.3 (§13.3) |
+| 5 | PM reported a durable save while writing nothing when no owner was configured (PM) | `_write_state_row` returns `False` when there is no owner; every mutation awaits the load and is refused while the stored state is unknown |
+
+The import's safety properties, in the order it enforces them: it runs only in
+`dedicated` mode and only while the owner has **no** dedicated configuration row
+(that row is the migration marker, so a second start — or an owner who later
+clears the archive — never re-imports); rows are imported only when the
+dedicated archive is empty; an unreadable legacy source aborts and is retried
+rather than importing defaults over a stored configuration; nothing is deleted.
+
+### 13.2 Files
+
+Source: `backend/db/client.py` (three `(value, readable)` readers; the existing
+single-value helpers delegate, so no caller changed meaning),
+`backend/services/anti_edit_delete_service.py`,
+`backend/services/private_message_service.py`,
+`backend/bot/handlers/anti_edit_delete.py`.
+Schema: `supabase/migrations/20261020160000_add_panel_settings_auto_reaction_settings.sql`.
+Tests: `tests/test_auto_reaction_schema.py` (new),
+`tests/test_anti_edit_delete.py`, `tests/test_private_message_management.py`,
+`tests/test_database_setup_order.py`, `tests/test_private_message_db_security.py`,
+`tests/test_private_message_scope.py`, `tests/test_private_message_panel.py`.
+Documentation: `DATABASE_ARCHITECTURE.md`, `ROADMAP.md`, `INVESTIGATION.md` and
+this report. No dependency, secret or unrelated feature was touched, and no SQL
+was executed against any database.
+
+### 13.3 The migration and the canonical block
+
+`20261020160000_add_panel_settings_auto_reaction_settings.sql` is additive and
+idempotent per column: `ADD COLUMN IF NOT EXISTS` (no default, so an existing
+column keeps every value) → `SET DEFAULT` (`false` / `''`) → `UPDATE … WHERE
+<col> IS NULL` → `SET NOT NULL`, then `NOTIFY pgrst` and one read-only
+column-count query. It creates no table, index, constraint, policy, grant or row,
+and it cannot enable a reaction: `false` is the OFF default and the file carries
+no `= TRUE` assignment. It is embedded verbatim as **part 14 of 14** of §31.3;
+the block now comprises the snapshot plus **thirteen** later additive migrations,
+and the migration inventory row, §6, §30.11, §31.6 and the reconciliation
+narrative were updated to say so. The two byte-identical canonical copies
+(`supabase/canonical_bootstrap.sql` and
+`20260920000001_reconcile_canonical_schema.sql`) embed part 1 only and were
+correctly left unchanged.
+
+### 13.4 Verification
+
+- Targeted: `pytest tests/test_auto_reaction_schema.py tests/test_anti_edit_delete.py
+tests/test_private_message_management.py -q` → **148 passed**;
+  `pytest tests/test_database_setup_order.py
+tests/test_canonical_schema_reconciliation.py tests/test_private_message_db_security.py
+tests/test_aed_db_security.py tests/test_private_message_scope.py
+tests/test_private_message_panel.py -q` → **281 passed**.
+- Full suite: `pytest -q` → **6500 passed, 27 skipped** (CPython 3.10.12,
+  `telethon 1.43.0` as pinned, `supabase 2.4.2`), the new module included.
+- The new suite executes the shipped migration statement by statement against a
+  column/row model with PostgreSQL semantics (a re-run is a no-op, an existing
+  value — even a non-default one — survives, only NULL cells are backfilled, a
+  surviving NULL would fail `SET NOT NULL`) and refuses any statement form it
+does not model, so the migration cannot silently grow an unverified step. It
+  also pins the OFF default and the real-column write path through
+  `panel_settings_repository`.
+
+### 13.5 Limits — what is NOT proven
+
+1. **No SQL was executed and Supabase was not contacted.** The migration's
+   semantics are verified against the model above, not against PostgreSQL.
+2. **The migration is not applied to the live project.** Until the owner runs
+   §31.3 (or this file) the Auto-Reaction pair still lives only in the cache;
+   the code now reports that write failure instead of pretending success.
+3. **Live restart behaviour was not observed.** “The archive survives a
+   redeploy”, “the PM policy survives a redeploy” and “the legacy import ran”
+   remain untested claims until a restart is observed on the deployment.
+4. **The AED import runs against the real store for the first time in
+   production.** It is idempotent and marker-gated, but the first start after
+   the migration is the only chance to verify it; the log line
+   `[AED] imported … legacy archive row(s)` / `[AED] legacy configuration
+   imported into aed_config` is the evidence to look for.
+5. **Not addressed (out of scope, unchanged):** a transient store failure still
+   makes the feature fail closed until the next retry succeeds — that is the
+   intended trade (never overwrite a stored configuration with defaults), not a
+   regression.

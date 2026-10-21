@@ -659,6 +659,11 @@ _state_lock: asyncio.Lock | None = None
 _state_lock_loop: Any = None
 _locally_mutated = False
 
+#: A failed load is retried no more often than this, so a database outage cannot
+#: turn every incoming private message into a read attempt.
+_LOAD_RETRY_SECONDS = 5.0
+_load_retry_at: float = 0.0
+
 
 def _mutation_lock() -> asyncio.Lock:
     """The serialization lock for this event loop.
@@ -692,13 +697,14 @@ def persistence_available() -> bool:
 
 def reset_in_memory() -> None:
     """Drop all in-memory state (tests, and a full runtime rebuild)."""
-    global _loaded, _load_task, _load_task_loop, _locally_mutated
+    global _loaded, _load_task, _load_task_loop, _locally_mutated, _load_retry_at
     _state.clear()
     _state.update(_default_state())
     _loaded = False
     _load_task = None
     _load_task_loop = None
     _locally_mutated = False
+    _load_retry_at = 0.0
     _handled.clear()
     _locks.clear()
 
@@ -721,48 +727,60 @@ def owner_id() -> int | None:
     return value if _valid_owner(value) else None
 
 
-async def _read_state_document() -> tuple[dict[str, Any] | None, bool]:
-    """``(document, is_legacy)`` for this owner.
+async def _read_state_document() -> tuple[dict[str, Any] | None, bool, bool]:
+    """``(document, is_legacy, readable)`` for this owner.
 
-    The DEDICATED row is authoritative. Only when it does not exist yet is the
-    legacy Phase-1 ``bot_settings`` document read — once — as the backfill
-    source; :func:`sanitize_state` maps its single ``policy`` value onto the
-    independent flags, so an existing configuration is imported, never lost.
+    The DEDICATED row is authoritative. Only a SUCCESSFUL read that finds no row
+    falls back to the legacy Phase-1 ``bot_settings`` document — once — as the
+    backfill source; :func:`sanitize_state` maps its single ``policy`` value onto
+    the independent flags, so an existing configuration is imported, never lost.
+
+    ``readable=False`` means the store could not be read at all. The legacy
+    document must then NOT be consulted: doing so would write a stale Phase-1
+    policy over the dedicated row, which is the reset this guards against.
     """
     from backend.db import client as db_client
 
     current = owner_id()
     if current is None:
-        return None, False
-    row = await db_client.get_private_message_config(current)
+        return None, False, False
+    row, readable = await db_client.read_private_message_config(current)
+    if not readable:
+        logger.warning("private_message: configuration store unreadable")
+        return None, False, False
     if isinstance(row, dict):
-        return row, False
+        return row, False, True
     legacy = await db_client.get_legacy_private_message_state(current)
     if not isinstance(legacy, str) or not legacy.strip():
-        return None, False
+        return None, False, True
     try:
         parsed = json.loads(legacy)
     except Exception as exc:
         logger.warning("private_message: legacy configuration is not usable JSON: %s", exc)
-        return None, False
+        return None, False, True
     if not isinstance(parsed, dict):
-        return None, False
+        return None, False, True
     logger.info(
         "private_message: importing the legacy settings document into the dedicated tables"
     )
-    return parsed, True
+    return parsed, True, True
 
 
 async def _load_task_body() -> None:
-    global _loaded, _locally_mutated
-    _loaded = True
+    global _loaded, _locally_mutated, _load_retry_at
     try:
-        raw, is_legacy = await _read_state_document()
+        raw, is_legacy, readable = await _read_state_document()
     except asyncio.CancelledError:
         raise
     except Exception as exc:
         logger.warning("private_message: state load failed: %s", exc)
+        raw, is_legacy, readable = None, False, False
+    if not readable:
+        # Never mark an unreadable store as loaded: the cached defaults would
+        # then be persisted by the next change and replace the real policy.
+        _load_retry_at = time.monotonic() + _LOAD_RETRY_SECONDS
         return
+    _loaded = True
     if raw is None:
         return
     loaded = sanitize_state(raw)
@@ -793,12 +811,18 @@ async def ensure_loaded_async() -> None:
     restart resolves the persisted policy on FIRST USE instead of relying on a
     startup race: an unauthorized message arriving during startup must not be
     judged against the in-memory default.
+
+    A FAILED read does not count as a load: ``_loaded`` stays False (so the
+    policy is retried, bounded by ``_LOAD_RETRY_SECONDS``) and every mutation is
+    refused until the stored state is actually known.
     """
     global _load_task, _load_task_loop
     loop = asyncio.get_running_loop()
+    if _loaded and _load_task_loop is loop:
+        return
+    if time.monotonic() < _load_retry_at:
+        return
     if _load_task is None or _load_task.done() or _load_task_loop is not loop:
-        if _loaded and _load_task_loop is loop:
-            return
         _load_task = asyncio.ensure_future(_load_task_body())
         _load_task_loop = loop
     await asyncio.shield(_load_task)
@@ -806,10 +830,11 @@ async def ensure_loaded_async() -> None:
 
 async def reload_async() -> None:
     """Force a fresh read of the persisted state (the panel's Refresh action)."""
-    global _load_task, _loaded, _locally_mutated
+    global _load_task, _loaded, _locally_mutated, _load_retry_at
     _load_task = None
     _loaded = False
     _locally_mutated = False
+    _load_retry_at = 0.0
     await ensure_loaded_async()
 
 
@@ -823,8 +848,10 @@ async def _write_state_row(candidate: dict[str, Any]) -> bool:
 
     current = owner_id()
     if current is None:
-        logger.warning("private_message: no owner configured — state kept in memory only")
-        return True
+        # Nothing identifies the row to write, so nothing was persisted. Reporting
+        # success here would claim a durable save that never happened.
+        logger.warning("private_message: no owner configured — change NOT persisted")
+        return False
     if not persistence_available():
         # No database: the change applies to this process only. The panel shows
         # that explicitly instead of claiming durable storage.
@@ -840,6 +867,12 @@ async def _mutate(mutator: Callable[[dict[str, Any]], None]) -> bool:
     in-memory state exactly as it was, so memory and storage cannot conflict.
     """
     global _locally_mutated
+    await ensure_loaded_async()
+    if not _loaded:
+        # The stored policy was never read, so this candidate is built on the
+        # defaults. Writing it would replace the owner's real configuration.
+        logger.warning("private_message: state not loaded — change refused, nothing written")
+        return False
     async with _mutation_lock():
         candidate = sanitize_state(copy.deepcopy(_state))
         try:

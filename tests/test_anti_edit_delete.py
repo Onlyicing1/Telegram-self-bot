@@ -1485,6 +1485,148 @@ def test_the_dedicated_schema_cannot_broaden_the_archive_scope():
     assert "CHECK (kind IN ('snapshot', 'edit', 'delete'))" in executable
 
 
+# ── the legacy → dedicated transition (the persistence audit) ───────────────
+#
+# The dedicated tables become authoritative the moment they exist, but the
+# owner's configuration and archive live in the legacy bot_settings documents.
+# Without the one-time import the first restart after the migration shows the
+# defaults and an empty archive — the reported "reset".
+
+
+def _legacy_row(row_id: str, owner: int = OWNER) -> dict:
+    return {
+        "id": row_id, "owner_id": owner, "chat_id": FRIEND, "message_id": 1,
+        "kind": svc.KIND_SNAPSHOT, "category": svc.CATEGORY_TEXT,
+        "captured_at": datetime.now(timezone.utc).isoformat(), "body": f"body {row_id}",
+    }
+
+
+def _apply_migration(fake: _FakeDB) -> None:
+    """Turn the SAME database into one where the dedicated tables now exist."""
+    fake.has_aed_tables = True
+    db_client.reset_aed_store_mode()
+    svc.reset_in_memory()
+    svc.configure_owner(OWNER)
+
+
+def test_the_legacy_configuration_and_archive_survive_the_migration(monkeypatch):
+    fake = _legacy_db(monkeypatch)
+    assert _run(svc.set_enabled(True)) is True
+    assert _run(svc.set_retention_days(2)) is True
+    assert _run(db_client.aed_save_archive(list(svc._SHARD_KEYS), [[
+        _legacy_row("legacy01"), _legacy_row("other-owner", owner=999999),
+    ], [], [], []])) is True
+    legacy_document = fake.rows[svc._config_key(OWNER)]["value"]
+
+    _apply_migration(fake)
+    assert fake.aed_config == {} and fake.aed_entries == []
+
+    _run(svc.ensure_loaded_async())
+    assert svc.is_enabled() is True, "the stored switch must not reset to OFF"
+    assert svc.retention_days() == 2
+    assert fake.aed_config[OWNER]["enabled"] is True
+
+    rows = _run(svc.load_rows_async())
+    assert [r["id"] for r in rows] == ["legacy01"], "owner-scoped, no foreign rows"
+    assert {r["id"] for r in fake.aed_entries} == {"legacy01"}
+    # The legacy source is preserved, never deleted by the import.
+    assert fake.rows[svc._config_key(OWNER)]["value"] == legacy_document
+
+
+def test_the_import_runs_once_and_newer_dedicated_data_wins(monkeypatch):
+    fake = _legacy_db(monkeypatch)
+    assert _run(svc.set_retention_days(2)) is True
+    assert _run(db_client.aed_save_archive(list(svc._SHARD_KEYS), [[
+        _legacy_row("legacy01"),
+    ], [], [], []])) is True
+    _apply_migration(fake)
+    _run(svc.load_rows_async())
+    assert {r["id"] for r in fake.aed_entries} == {"legacy01"}
+
+    # A newer dedicated value, and an archive the owner curated afterwards.
+    assert _run(svc.set_retention_days(7)) is True
+    fake.aed_entries.clear()
+
+    svc.reset_in_memory()
+    svc.configure_owner(OWNER)
+    _run(svc.ensure_loaded_async())
+    assert svc.retention_days() == 7, "a stale legacy value must never win"
+    assert _run(svc.load_rows_async()) == [], (
+        "the dedicated configuration row is the import marker, so a second start "
+        "never resurrects deleted archive rows"
+    )
+
+
+def test_a_restart_reloads_the_configuration_and_archive_from_the_tables(db):
+    assert _run(svc.set_enabled(True)) is True
+    assert _run(svc.set_retention_days(3)) is True
+    _seed_rows(db, [_legacy_row("persisted1"), _legacy_row("persisted2")])
+
+    svc.reset_in_memory()
+    svc.configure_owner(OWNER)
+    assert svc.is_enabled() is False  # the safe default until the load lands
+
+    _run(svc.ensure_loaded_async())
+    assert svc.is_enabled() is True
+    assert svc.retention_days() == 3
+    rows = _run(svc.load_rows_async())
+    assert {r["id"] for r in rows} == {"persisted1", "persisted2"}
+
+
+def test_an_unreadable_store_leaves_the_feature_off_and_refuses_writes(monkeypatch):
+    fake = _FakeDB()
+    monkeypatch.setattr("backend.db.client.get_db", lambda: fake)
+
+    async def _unreadable_config(owner_id):
+        return None, False
+
+    async def _unreadable_document(key):
+        return None, False
+
+    monkeypatch.setattr(db_client, "aed_load_config_state", _unreadable_config)
+    monkeypatch.setattr(db_client, "aed_get_document_state", _unreadable_document)
+
+    _run(svc.ensure_loaded_async())
+    assert svc._loaded is False, "a failed read must never count as a load"
+    assert svc.is_enabled() is False
+    assert _run(svc.set_enabled(True)) is False
+    assert fake.aed_config == {}, "an unreadable store must never be written over"
+
+
+def test_the_import_writes_no_defaults_when_a_legacy_source_is_unreadable(monkeypatch):
+    fake = _FakeDB()
+    monkeypatch.setattr("backend.db.client.get_db", lambda: fake)
+
+    async def _unreadable_document(key):
+        return None, False
+
+    monkeypatch.setattr(db_client, "aed_get_document_state", _unreadable_document)
+    _run(svc.ensure_loaded_async())
+    assert fake.aed_config == {}, "no configuration may be invented from an outage"
+    assert svc.is_enabled() is False
+
+
+def test_the_archive_import_is_deferred_when_the_legacy_shards_are_unreadable(monkeypatch):
+    fake = _FakeDB()
+    monkeypatch.setattr("backend.db.client.get_db", lambda: fake)
+
+    async def _unreadable_archive(shard_keys):
+        return None
+
+    stored_document = json.dumps({"enabled": True, "retention_days": 3})
+
+    async def _document(key):
+        return stored_document, True
+
+    monkeypatch.setattr(db_client, "aed_load_archive", _unreadable_archive)
+    monkeypatch.setattr(db_client, "aed_get_document_state", _document)
+
+    _run(svc.load_rows_async())
+    assert fake.aed_config == {}, (
+        "the configuration import waits for the archive, so a retry re-runs both"
+    )
+
+
 def test_legacy_shards_still_work_before_the_migration(monkeypatch):
     """Before the migration is applied the feature keeps its existing behaviour."""
     _legacy_db(monkeypatch)

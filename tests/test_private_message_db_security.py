@@ -59,8 +59,10 @@ BACKEND_VERBS = ("SELECT", "INSERT", "UPDATE", "DELETE")
 SETUP_BANNER = "ONE COMPLETE SUPABASE SETUP SCRIPT"
 PART_MARKER = re.compile(r"--[^\n]*\bPART (\d+) of (\d+)\b[^\n]*\n")
 PM_ACCESS_PART = 13
-TOTAL_PARTS = 13
-TOTAL_MIGRATIONS = 35
+TOTAL_PARTS = 14
+TOTAL_MIGRATIONS = 36
+AUTO_REACTION_PART = 14
+AUTO_REACTION_MIGRATION = "20261020160000_add_panel_settings_auto_reaction_settings.sql"
 
 
 # ─── helpers ─────────────────────────────────────────────────────────────────
@@ -290,7 +292,7 @@ def test_the_backend_uses_exactly_the_four_granted_verbs():
     source = "".join(
         inspect.getsource(getattr(db_client, name))
         for name in (
-            "_get_private_message_config_sync",
+            "_get_private_message_config_state_sync",
             "_save_private_message_config_sync",
             "_list_private_message_senders_sync",
             "_claim_private_message_ai_reply_sync",
@@ -338,16 +340,20 @@ def test_the_historical_creation_migration_still_carries_its_permissive_policies
 
 # ─── 6. the canonical block embeds the migration verbatim --------------------
 
-def test_the_private_message_access_part_is_the_thirteenth_and_last():
+def test_the_private_message_access_part_is_the_thirteenth():
     block = _setup_block()
     marks = list(PART_MARKER.finditer(block))
     assert [m.group(1) for m in marks] == [str(i) for i in range(1, TOTAL_PARTS + 1)]
     assert {m.group(2) for m in marks} == {str(TOTAL_PARTS)}
-    assert marks[-1].group(2) == str(TOTAL_PARTS)
-    assert MIGRATION_NAME in block[marks[-1].start(): marks[-1].end()], (
-        "the last part banner must name the hardening migration"
+    banner = block[marks[PM_ACCESS_PART - 1].start(): marks[PM_ACCESS_PART - 1].end()]
+    assert MIGRATION_NAME in banner, (
+        "part 13's banner must name the hardening migration"
     )
-    assert PM_ACCESS_PART == TOTAL_PARTS == len(_recorded_order())
+    # The hardening keeps its place in the migration order; the Auto-Reaction
+    # migration is the newer additive part appended after it.
+    assert PM_ACCESS_PART + 1 == AUTO_REACTION_PART == TOTAL_PARTS
+    assert AUTO_REACTION_MIGRATION in block[marks[-1].start(): marks[-1].end()]
+    assert TOTAL_PARTS == len(_recorded_order())
 
 
 def _recorded_order() -> tuple[str, ...]:
@@ -388,9 +394,9 @@ def test_the_documented_counts_match_the_repository():
     flat = _flat(_section("## 31. Canonical Database Setup"))
     assert f"all {TOTAL_MIGRATIONS} migrations" in flat
     assert f"{TOTAL_MIGRATIONS} files" in flat
-    assert "twelve later additive migrations" in flat
-    assert len(_recorded_order()) - 1 == 12, (
-        "the snapshot plus twelve later parts is what the prose must count"
+    assert "thirteen later additive migrations" in flat
+    assert len(_recorded_order()) - 1 == 13, (
+        "the snapshot plus thirteen later parts is what the prose must count"
     )
     assert f"parts 1–{TOTAL_PARTS} of §31.3" in flat
 

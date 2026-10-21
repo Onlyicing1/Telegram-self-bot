@@ -921,7 +921,10 @@ def test_the_schedule_panel_names_the_next_transition(registered, db, helper):
     _action("pm_sched_toggle")
     _title, body, _buttons = _panel("pm_sched")
     assert "**Next transition:**" in body
-    assert "rule 1 start" in body
+    # The rule window is wall-clock based: outside 22:00–23:00 the next boundary
+    # is the rule's start, inside it the boundary that ends it. Both name the
+    # rule that causes the transition, which is what the panel promises.
+    assert "rule 1 start" in body or "rule 1 end" in body
 
 
 # ── enforcement through the existing update path ─────────────────────────────

@@ -426,6 +426,68 @@ def test_without_a_database_the_state_is_memory_only_and_the_panel_text_says_so(
     assert svc.state()["mode"] == svc.MODE_CLOSED
 
 
+# ── a read failure must never look like a fresh install ──────────────────────
+
+
+def test_a_read_failure_never_imports_the_legacy_document_over_the_stored_row(db, monkeypatch):
+    """An unreadable dedicated store is NOT "no row": the Phase-1 backfill must
+    not run, because importing a stale policy would replace the real one."""
+    from backend.db import client as db_client
+
+    assert asyncio.run(svc.set_mode(svc.MODE_CLOSED)) is True
+    assert asyncio.run(svc.set_action(svc.ACTION_DELETE, True)) is True
+    stored = dict(_stored(db))
+    db.legacy[svc.LEGACY_STATE_ROW_KEY] = json.dumps({"mode": "open", "policy": "none"})
+    svc.reset_in_memory()
+
+    async def _unreadable(owner_id):
+        return None, False
+
+    monkeypatch.setattr(db_client, "read_private_message_config", _unreadable)
+    asyncio.run(svc.ensure_loaded_async())
+
+    assert svc._loaded is False, "a failed read must never count as a load"
+    assert _stored(db) == stored, "nothing may be written while the store is unreadable"
+    assert svc.state()["mode"] == svc.MODE_OPEN  # the fail-closed default, in memory only
+
+    # A mutation built on that default is refused instead of replacing the row.
+    assert asyncio.run(svc.set_mode(svc.MODE_WHITELIST_ONLY)) is False
+    assert asyncio.run(svc.set_action(svc.ACTION_AI, True)) is False
+    assert _stored(db) == stored
+
+
+def test_a_transient_read_failure_is_retried_and_then_loads_the_stored_policy(db, monkeypatch):
+    from backend.db import client as db_client
+
+    assert asyncio.run(svc.set_mode(svc.MODE_CLOSED)) is True
+    assert asyncio.run(svc.set_action(svc.ACTION_DELETE, True)) is True
+    svc.reset_in_memory()
+
+    real = db_client.read_private_message_config
+    calls = {"n": 0}
+
+    async def _flaky(owner_id):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None, False
+        return await real(owner_id)
+
+    monkeypatch.setattr(db_client, "read_private_message_config", _flaky)
+    asyncio.run(svc.ensure_loaded_async())
+    assert svc._loaded is False and calls["n"] == 1
+
+    # The retry window keeps an outage from turning every message into a read.
+    asyncio.run(svc.ensure_loaded_async())
+    assert calls["n"] == 1
+
+    svc._load_retry_at = 0.0  # the window elapsed
+    asyncio.run(svc.ensure_loaded_async())
+    assert calls["n"] == 2
+    assert svc._loaded is True
+    assert svc.state()["mode"] == svc.MODE_CLOSED
+    assert svc.state()[svc.ACTION_DELETE] is True
+
+
 # ── validation ───────────────────────────────────────────────────────────────
 
 

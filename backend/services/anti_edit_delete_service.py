@@ -123,6 +123,16 @@ _state: dict[str, Any] = {}
 _loaded = False
 _load_task: asyncio.Task | None = None
 _load_task_loop: Any = None
+
+#: The one-time legacy -> dedicated import runs at most once per process. It is
+#: marked done only when the dedicated row was written, so a failed import is
+#: retried on the next start instead of being forgotten.
+_legacy_import_done = False
+
+#: A failed load is retried no more often than this, so a database outage cannot
+#: turn every incoming message into a read attempt.
+_LOAD_RETRY_SECONDS = 5.0
+_load_retry_at: float = 0.0
 _rows: list[dict[str, Any]] = []
 _rows_loaded = False
 _lock: asyncio.Lock | None = None
@@ -162,11 +172,13 @@ def reset_in_memory() -> None:
     """Clear every in-memory cache (tests / process restart)."""
     global _state, _loaded, _load_task, _load_task_loop
     global _rows, _rows_loaded, _lock, _lock_loop, _owner_id
-    global _inflight_loop
+    global _inflight_loop, _legacy_import_done, _load_retry_at
     _state = {}
     _loaded = False
     _load_task = None
     _load_task_loop = None
+    _legacy_import_done = False
+    _load_retry_at = 0.0
     _rows = []
     _rows_loaded = False
     _lock = None
@@ -221,22 +233,33 @@ def _config_key(owner: int) -> str:
     return f"{_CONFIG_KEY_PREFIX}{owner}"
 
 
-async def _read_config(owner: int) -> dict[str, Any]:
+async def _read_config(owner: int) -> dict[str, Any] | None:
     """The owner's configuration from the ONE active store.
 
     The dedicated ``aed_config`` row is authoritative once the migration is
     applied; before that the legacy ``bot_settings`` document is read (READ
     ONLY) so the feature keeps its behaviour. ``aed_store_mode`` decides which
     one is used, once per process.
+
+    ``None`` means the store could NOT be read. That is deliberately distinct
+    from “no row yet”: an unreadable store must never be presented as (or
+    persisted as) the default configuration.
     """
     from backend.db import client as db_client
 
     if await db_client.aed_store_mode() == "dedicated":
-        row = await db_client.aed_load_config(owner)
+        await _import_legacy_store(owner)
+        row, readable = await db_client.aed_load_config_state(owner)
+        if not readable:
+            logger.warning("[AED] configuration store unreadable — feature stays OFF")
+            return None
         if row is None:
             return default_state()
         return sanitize_state(row)
-    raw = await db_client.aed_get_document(_config_key(owner))
+    raw, readable = await db_client.aed_get_document_state(_config_key(owner))
+    if not readable:
+        logger.warning("[AED] legacy configuration store unreadable — feature stays OFF")
+        return None
     if raw is None:
         return default_state()
     try:
@@ -246,17 +269,102 @@ async def _read_config(owner: int) -> dict[str, Any]:
         return default_state()
 
 
+async def _import_legacy_store(owner: int) -> None:
+    """Import the pre-migration ``bot_settings`` store into the dedicated tables
+    exactly ONCE, before the dedicated row is trusted.
+
+    The dedicated tables became authoritative the moment they became readable,
+    but the legacy store is where every existing configuration and archive row
+    lives; without this import the first restart after the migration shows the
+    defaults and an empty archive, i.e. the owner's settings “reset”.
+
+    Safety properties, in the order they are enforced:
+
+    * it runs only in ``dedicated`` mode and only while the owner has NO
+      dedicated configuration row — that row is the migration marker, so a
+      second start, or an owner who later clears the archive, never re-imports;
+    * rows are imported only when the DEDICATED archive is empty, and the
+      configuration only after the rows landed, so no newer dedicated value is
+      ever overwritten by a stale legacy one;
+    * an unreadable legacy source (``readable=False``) aborts the attempt and
+      leaves the marker unwritten, so it is retried instead of importing
+      defaults over a stored configuration;
+    * nothing is deleted: the legacy documents stay exactly as they are.
+    """
+    global _legacy_import_done
+    from backend.db import client as db_client
+
+    if _legacy_import_done:
+        return
+    row, readable = await db_client.aed_load_config_state(owner)
+    if not readable:
+        return
+    if row is not None:
+        _legacy_import_done = True
+        return
+
+    existing = await db_client.aed_load_entries(owner)
+    if existing is None:
+        return
+    if not existing:
+        shards = await db_client.aed_load_archive(list(_SHARD_KEYS))
+        if shards is None:
+            logger.warning("[AED] legacy archive unreadable — import deferred")
+            return
+        legacy_rows = [
+            dict(row)
+            for shard in shards
+            for row in shard
+            if isinstance(row, dict) and row.get("owner_id") == owner
+        ]
+        if legacy_rows:
+            legacy_rows.sort(key=lambda r: str(r.get("captured_at") or ""), reverse=True)
+            legacy_rows = legacy_rows[:MAX_ARCHIVE_ROWS]
+            if not await db_client.aed_save_entries(owner, legacy_rows):
+                logger.warning("[AED] legacy archive import failed — retried on the next start")
+                return
+            logger.info(
+                "[AED] imported %s legacy archive row(s) into aed_archive_entries",
+                len(legacy_rows),
+            )
+
+    raw, readable = await db_client.aed_get_document_state(_config_key(owner))
+    if not readable:
+        logger.warning("[AED] legacy configuration unreadable — import deferred")
+        return
+    imported = default_state()
+    if raw:
+        try:
+            imported = sanitize_state(json.loads(raw))
+        except Exception:
+            logger.warning("[AED] legacy configuration is not valid JSON — importing defaults")
+    if not await db_client.aed_save_config(owner, imported):
+        logger.warning("[AED] legacy configuration import failed — retried on the next start")
+        return
+    _legacy_import_done = True
+    logger.info("[AED] legacy configuration imported into aed_config")
+
+
 async def ensure_loaded_async() -> None:
-    """Single-flight load of this owner's configuration into memory."""
-    global _loaded, _load_task, _load_task_loop
+    """Single-flight load of this owner's configuration into memory.
+
+    A failed read leaves ``_loaded`` False (the feature fails closed) and is
+    retried no more often than ``_LOAD_RETRY_SECONDS``.
+    """
+    global _loaded, _load_task, _load_task_loop, _load_retry_at
     owner = _owner_id
     loop = _running_loop()
     if _loaded and _state:
+        return
+    if time.monotonic() < _load_retry_at:
         return
     if _load_task is None or _load_task.done() or _load_task_loop is not loop:
         _load_task_loop = loop
         _load_task = asyncio.ensure_future(_read_config(owner))
     doc = await asyncio.shield(_load_task)
+    if doc is None:
+        _load_retry_at = time.monotonic() + _LOAD_RETRY_SECONDS
+        return
     _state.clear()
     _state.update(doc)
     _loaded = True
@@ -287,6 +395,11 @@ def retention_days() -> int:
 async def _persist_state(candidate: dict[str, Any]) -> bool:
     from backend.db import client as db_client
 
+    if not _loaded:
+        # The stored configuration was never read, so this candidate is built on
+        # defaults. Writing it would erase the owner's real settings.
+        logger.warning("[AED] configuration not loaded — refusing to overwrite it")
+        return False
     owner = _owner_id
     if await db_client.aed_store_mode() == "dedicated":
         ok = await db_client.aed_save_config(owner, candidate)
@@ -746,6 +859,7 @@ async def load_rows_async(force: bool = False) -> list[dict[str, Any]] | None:
     from backend.db import client as db_client
 
     if await db_client.aed_store_mode() == "dedicated":
+        await _import_legacy_store(_owner_id)
         stored = await db_client.aed_load_entries(_owner_id)
         if stored is None:
             return None

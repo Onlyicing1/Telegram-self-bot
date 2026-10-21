@@ -36,20 +36,23 @@ PRIVATE_MESSAGE_TABLES = "20260929000001_create_private_message_tables.sql"
 PRIVATE_MESSAGE_COUNTER_RESET = "20261016000001_add_private_message_counter_reset.sql"
 ANTI_EDIT_DELETE_TABLES = "20261017000001_create_anti_edit_delete_tables.sql"
 PRIVATE_MESSAGE_ACCESS = "20261020144423_harden_private_message_table_access.sql"
+AUTO_REACTION_SETTINGS = "20261020160000_add_panel_settings_auto_reaction_settings.sql"
 
 #: The order §31 documents — verified against the sources, not assumed. The TTS
 #: settings migration, the Todo schedule type, the Todo steps table, the Emoji &
 #: Reaction tables, the Private Message Management tables, the Private Message
-#: counter reset and the Anti-Edit / Anti-Delete tables are LATER additive schema
-#: changes, so they are appended last, newest last (the documented rule: a later
-#: change never edits the snapshot). The counter-reset part is the one part that
-#: alters a table an earlier part creates, so it must follow the Private Message
-#: tables it extends; the access-hardening part must follow them too, because it
-#: revokes the grants and drops the policies that part created.
+#: counter reset, the Anti-Edit / Anti-Delete tables, the Private Message access
+#: hardening and the Auto-Reaction columns are LATER additive schema changes, so
+#: they are appended last, newest last (the documented rule: a later change never
+#: edits the snapshot). The counter-reset part is the one part that alters a table
+#: an earlier part creates, so it must follow the Private Message tables it
+#: extends; the access-hardening part must follow them too, because it revokes the
+#: grants and drops the policies that part created.
 DOCUMENTED_ORDER = (
     RECONCILE, VAULT_PART1, VAULT_PART2, DISPLAY_NAME, SEARCH_INDEXES, TTS_SETTINGS,
     TODO_SCHEDULE_TYPE, TODO_STEPS, EMOJI_TABLES, PRIVATE_MESSAGE_TABLES,
     PRIVATE_MESSAGE_COUNTER_RESET, ANTI_EDIT_DELETE_TABLES, PRIVATE_MESSAGE_ACCESS,
+    AUTO_REACTION_SETTINGS,
 )
 
 #: The banner that marks the ONE complete deployment block.
@@ -244,8 +247,8 @@ def test_the_display_name_column_precedes_its_index():
     assert "CREATE EXTENSION IF NOT EXISTS pg_trgm" in spans[SEARCH_INDEXES]
 
 
-def test_the_todo_schedule_type_part_is_last_and_carries_both_constraints():
-    """The newest additive migration closes the block, and it is complete in it."""
+def test_the_todo_schedule_type_part_carries_both_constraints():
+    """The basic Todo part is complete in the block."""
     spans = _part_spans(_setup_block())
     assert TODO_SCHEDULE_TYPE in spans, "the Todo schedule type must stay embedded"
     part = spans[TODO_SCHEDULE_TYPE]
@@ -290,17 +293,16 @@ def test_the_anti_edit_delete_part_carries_the_two_tables():
     part that hardens the Private Message tables — which must follow the part
     that creates those tables and their policies."""
     spans = _part_spans(_setup_block())
-    assert list(spans)[-1] == PRIVATE_MESSAGE_ACCESS, (
-        "the Private Message access hardening must close the block: it removes "
-        "grants and policies an earlier part creates"
+    assert list(spans)[-1] == AUTO_REACTION_SETTINGS, (
+        "the newest additive migration (the Auto-Reaction columns) closes the block"
     )
-    assert list(spans)[-2] == ANTI_EDIT_DELETE_TABLES, (
-        "the Anti-Edit / Anti-Delete tables stay immediately before it"
+    order = list(spans)
+    assert order[-2] == PRIVATE_MESSAGE_ACCESS, (
+        "the Private Message access hardening must follow the tables it hardens"
     )
-    assert list(spans)[-3] == PRIVATE_MESSAGE_COUNTER_RESET, (
-        "the counter reset must stay immediately before that"
-    )
-    assert list(spans)[-4] == PRIVATE_MESSAGE_TABLES, (
+    assert order.index(PRIVATE_MESSAGE_ACCESS) == order.index(ANTI_EDIT_DELETE_TABLES) + 1
+    assert order.index(ANTI_EDIT_DELETE_TABLES) == order.index(PRIVATE_MESSAGE_COUNTER_RESET) + 1
+    assert order.index(PRIVATE_MESSAGE_COUNTER_RESET) == order.index(PRIVATE_MESSAGE_TABLES) + 1, (
         "the Private Message tables must stay before the parts that alter and harden them"
     )
     part = spans[ANTI_EDIT_DELETE_TABLES]
@@ -715,10 +717,10 @@ def test_the_audited_order_is_recorded_in_the_audit_table():
     """
     section = _section_31()
     audit = section[: section.index("### 31.2")]
-    assert "all 35 migrations" in _flat(audit) or "35 files" in audit, (
+    assert "all 36 migrations" in _flat(audit) or "36 files" in audit, (
         "the audit must state that every repository migration was classified"
     )
-    assert len(list(MIGRATIONS_DIR.glob("*.sql"))) == 35, (
+    assert len(list(MIGRATIONS_DIR.glob("*.sql"))) == 36, (
         "the audited count must equal the migrations actually in the repository"
     )
     embedded_table = audit[audit.index("| Order | Migration") :]
@@ -737,7 +739,7 @@ def test_the_documented_deviations_are_stated_explicitly():
     flat = _flat(_section_31())
     assert "display_name" in flat
     assert "42703" in flat, "the failure the ordering prevents must be named"
-    assert "twelve later additive migrations" in flat, (
+    assert "thirteen later additive migrations" in flat, (
         "the later migrations must be acknowledged"
     )
     assert "add_todo_schedule_type" in flat, "the Todo schedule type must be acknowledged"
@@ -753,6 +755,10 @@ def test_the_documented_deviations_are_stated_explicitly():
     assert "harden_private_message_table_access" in flat, (
         "the Private Message access hardening must be acknowledged"
     )
+    assert "add_panel_settings_auto_reaction_settings" in flat, (
+        "the Auto-Reaction migration must be acknowledged"
+    )
+    assert "auto_reaction_enabled" in flat, "the Auto-Reaction columns must be acknowledged"
     assert "tts_provider" in flat, "the TTS settings columns must be acknowledged"
 
 
@@ -766,13 +772,13 @@ def test_the_section_does_not_pretend_the_sql_was_executed():
 # ─── 5. counts and the manual-action list must match the block ───────────────
 
 def test_the_later_part_count_matches_the_block():
-    """13 parts are the snapshot plus TWELVE later parts, and the prose says so."""
+    """14 parts are the snapshot plus THIRTEEN later parts, and the prose says so."""
     total = len(DOCUMENTED_ORDER)
-    assert total == 13
+    assert total == 14
     flat = _flat(_section_31())
-    assert "twelve later additive migrations" in flat
+    assert "thirteen later additive migrations" in flat
     assert f"parts 2–{total}" in flat
-    assert "thirteen later additive migrations" not in flat, (
+    assert "twelve later additive migrations" not in flat, (
         "the snapshot is not one of the later parts"
     )
 
@@ -788,7 +794,7 @@ def test_the_manual_action_section_names_every_embedded_part():
     assert "parts 4, 5, 7, 8 and 9" not in flat, (
         "every later part must be listed, never a stale subset"
     )
-    assert "twelve" in flat
+    assert "thirteen" in flat
 
 
 def test_the_waiting_answer_migration_is_absorbed_by_part_one():
@@ -807,21 +813,45 @@ def test_the_waiting_answer_migration_is_absorbed_by_part_one():
         "the inventory must say the snapshot already establishes it"
     )
     assert "owner action required" not in row
-    assert "**35** files" in _flat(status), (
-        "the audited file count must be the current one (35)"
+    assert "**36** files" in _flat(status), (
+        "the audited file count must be the current one (36)"
     )
 
 
-def test_the_one_unmigrated_column_pair_is_documented_not_hidden():
-    """The only code-required columns no migration creates are named, not implied."""
-    block = _setup_block()
-    for name in ("auto_reaction_enabled", "auto_reaction_emoji"):
-        assert name not in block, (
-            f"{name} has no migration; the block must not invent it"
+def test_the_auto_reaction_columns_arrive_in_their_own_additive_part():
+    """The two Auto-Reaction columns are additive and OFF by default.
+
+    They were the one code-required column pair no migration created; part 14 is
+    the additive migration that closes that gap without touching the snapshot.
+    """
+    spans = _part_spans(_setup_block())
+    part = spans[AUTO_REACTION_SETTINGS]
+    for column, definition in (
+        ("auto_reaction_enabled", "boolean"),
+        ("auto_reaction_emoji", "text"),
+    ):
+        assert f"ADD COLUMN IF NOT EXISTS {column} {definition};" in part, (
+            f"part 14 must add {column} as {definition}"
         )
-    flat = _flat(_section_31())
-    assert "no migration file creates them" in flat
-    assert "auto_reaction_enabled" in flat
-    assert "auto_reaction_emoji" in flat
-    section_6 = _section("## 6. panel_settings")
-    assert "no migration creates it" in _flat(section_6).lower()
+    assert "ALTER COLUMN auto_reaction_enabled SET DEFAULT false;" in part
+    assert "ALTER COLUMN auto_reaction_emoji SET DEFAULT '';" in part
+    for column in ("auto_reaction_enabled", "auto_reaction_emoji"):
+        assert f"ALTER COLUMN {column} SET NOT NULL;" in part
+    assert part.count("WHERE auto_reaction_enabled IS NULL") == 1
+    assert part.count("WHERE auto_reaction_emoji IS NULL") == 1
+    # OFF by default: nothing in the part can turn a reaction on.
+    assert "SET DEFAULT true" not in part
+    assert "= true" not in part
+    assert "DELETE FROM" not in part and "DROP COLUMN" not in part, (
+        "the Auto-Reaction part must stay additive"
+    )
+    # The snapshot and every earlier part stay untouched by it.
+    for name in DOCUMENTED_ORDER[:-1]:
+        assert "auto_reaction" not in spans[name], (
+            f"{name} must not carry the Auto-Reaction columns"
+        )
+    assert "auto_reaction_enabled" in _migration(AUTO_REACTION_SETTINGS)
+    section_6 = _flat(_section("## 6. panel_settings"))
+    assert AUTO_REACTION_SETTINGS in section_6, (
+        "§6 must attribute the columns to their migration"
+    )
