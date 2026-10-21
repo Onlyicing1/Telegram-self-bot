@@ -656,3 +656,64 @@ dependency was changed.
    no stored configuration; the no-mutation check covers the in-memory PV state.
 3. **Back/Home were driven directly**, not through a real callback query; the
    data values themselves are asserted unchanged.
+
+---
+
+## 15. Navigation round — Anti-Edit / Anti-Delete under Cipher
+
+**Baseline:** `bdcb1d16e83be376bec3543bc8656ef40490f1da` (= `origin/main`, verified
+with `git fetch` + `git rev-parse`), read from a detached worktree at that
+commit. The shared checkout's pre-existing branch and working-tree edits were
+never touched.
+
+**Objective.** Move the existing **Anti-Edit / Anti-Delete** entry from the
+mother panel into the existing **Cipher** category. Cipher is a panel
+organization category: the move changes where the entry is reached from, not
+what the feature does or which chats it captures.
+
+### 15.1 The change
+
+- `misc.py::_build_cipher_buttons` gained the existing entry
+  `("Anti-Edit / Anti-Delete", "panel:archive")`; the label is unchanged.
+- `misc.py::_build_menu_buttons` lost its `Anti-Edit / Anti-Delete` row, so the
+  feature is not duplicated and every other top-level entry stays where it was.
+- `anti_edit_delete.py` registers its root panel with `parent="cipher"` instead
+  of `parent="menu"`, so Back from the archive returns to Cipher when the nav
+  stack is empty. Its panel id and title, the `archive_list` / `archive_item` /
+  `archive_cats` / `archive_confirm` parents, all `aed_*` actions, the
+  `retention` input, the capture handlers, service calls and persistence are
+  unchanged.
+
+No callback id, action, input, service, database file, migration or
+documentation about the schema was changed.
+
+### 15.2 Files
+
+- `backend/bot/handlers/misc.py` — one row moved between two button builders.
+- `backend/bot/handlers/anti_edit_delete.py` — panel parent `menu` → `cipher`.
+- `tests/test_cipher_category.py` — the category now registers AED too: its menu
+  absence, presence/label inside Cipher, parent chain, sub-panel parents,
+  Back-from-archive and the untouched AED configuration are asserted.
+- `tests/test_anti_edit_delete.py` — the parent assertion and the old
+  “mother menu opens the archive” test now assert the Cipher route.
+- `AGENTS.md` §5 and this report.
+
+### 15.3 Verification
+
+- Focused: `pytest tests/test_cipher_category.py tests/test_anti_edit_delete.py
+  tests/test_colored_buttons.py tests/test_private_message_panel.py -q` →
+  **223 passed** (`tests/test_cipher_category.py` alone: **20 passed**).
+- Full suite: `pytest -q` → **6520 passed, 27 skipped** (CPython 3.10.12,
+  Telethon 1.43.0 as pinned).
+- `python -m py_compile` on `misc.py` and `anti_edit_delete.py` → OK;
+  `git diff --check` → clean.
+
+### 15.4 Limits
+
+1. **No live Telegram panel was rendered.** The move is verified through the
+   real registry, panel handlers, `_finalize_panel` and `_handle_navigation`,
+   not on a running account.
+2. **No database was contacted.** The no-mutation assertion covers the in-memory
+   AED configuration only; nothing in this round reads or writes a table.
+3. Capture behaviour (new message / edit / deletion) was not exercised by this
+   change; the existing AED tests that cover it still pass in the full suite.

@@ -434,11 +434,13 @@ def test_register_wires_every_panel_action_and_input(client):
     ):
         assert get_action(action_id) is not None, action_id
     assert get_input("archive", "retention") is not None
-    assert get_registry().get_parent("archive") == "menu"
+    assert get_registry().get_parent("archive") == "cipher"
 
 
-def test_the_mother_menu_opens_the_archive_panel(client):
-    assert "panel:archive" in _datas(misc._build_menu_buttons())
+def test_the_mother_menu_reaches_the_archive_through_cipher(client):
+    datas = _datas(misc._build_menu_buttons())
+    assert "panel:archive" not in datas
+    assert "panel:cipher" in datas
 
 
 def test_every_callback_data_fits_telegram_limits(client):

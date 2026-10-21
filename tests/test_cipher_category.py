@@ -1,9 +1,9 @@
-"""Cipher category — one navigation home for the private-message features.
+"""Cipher category — one navigation home for the private-communication features.
 
-The category is pure navigation: it groups the features whose primary purpose
-is managing private messages, private-chat access, or replies to private chats.
-Nothing about a feature is re-implemented here; the tests drive the REAL panel
-registry, the REAL panel handlers and the REAL Back/Home navigation.
+The category is pure navigation: it groups the private-message features and the
+Anti-Edit / Anti-Delete archive. Grouping is menu organization only — no
+feature's scope, behaviour or persistence changes. The tests drive the REAL
+panel registry, the REAL panel handlers and the REAL Back/Home navigation.
 
 Everything runs offline: no Telegram client, no helper bot, no database.
 """
@@ -15,12 +15,13 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from backend.bot.handlers import anti_edit_delete as aed
 from backend.bot.handlers import ghost_seen_v2, misc
 from backend.bot.handlers import private_message as pm
 from backend.helper import inline_engine
 from backend.helper.panel_registry import registry as get_registry
 from backend.helper.panels import _finalize_panel, get_panel
-from backend.services import private_message_service
+from backend.services import anti_edit_delete_service, private_message_service
 
 OWNER = 7770001
 CHAT_ID = 6100
@@ -55,6 +56,7 @@ def registered(monkeypatch):
     misc.register(client=_FakeClient(), owner_id=OWNER)
     pm.register(client=None, owner_id=OWNER, tz_str="Asia/Tehran")
     ghost_seen_v2.register(client=None, owner_id=OWNER, tz_str="Asia/Tehran")
+    aed.register(client=_FakeClient(), owner_id=OWNER, tz_str="Asia/Tehran")
 
 
 def _run(coro):
@@ -89,13 +91,15 @@ def test_the_main_menu_shows_one_cipher_category(registered):
     assert _datas(buttons).count("panel:cipher") == 1
 
 
-def test_private_message_features_are_no_longer_top_level_entries(registered):
+def test_private_features_are_no_longer_top_level_entries(registered):
     datas = _datas(misc._build_menu_buttons())
     texts = _texts(misc._build_menu_buttons())
     assert "panel:pm" not in datas
     assert "panel:ghost_seen_v2" not in datas
+    assert "panel:archive" not in datas
     assert "Private Messages" not in texts
     assert "Ghost Seen" not in texts
+    assert "Anti-Edit / Anti-Delete" not in texts
 
 
 def test_unrelated_top_level_entries_are_unchanged(registered):
@@ -109,7 +113,6 @@ def test_unrelated_top_level_entries_are_unchanged(registered):
         "panel:settings",
         "panel:todo",
         "panel:ai",
-        "panel:archive",
     ):
         assert data in datas, data
 
@@ -139,17 +142,24 @@ def test_cipher_describes_itself_as_private_communications(registered):
 def test_every_child_of_cipher_is_reachable(registered):
     _title, _body, buttons = _panel("cipher")
     datas = _datas(buttons)
-    assert datas == ["panel:pm", "panel:ghost_seen_v2"]
+    assert datas == ["panel:pm", "panel:ghost_seen_v2", "panel:archive"]
     for data in datas:
         panel_id = data.split(":", 1)[1]
         assert get_panel(panel_id) is not None, panel_id
 
 
+def test_the_archive_entry_keeps_its_existing_label(registered):
+    _title, _body, buttons = _panel("cipher")
+    assert "Anti-Edit / Anti-Delete" in _texts(buttons)
+
+
 def test_moved_features_keep_their_own_callback_identifiers(registered):
     assert pm.PANEL_ID == "pm"
     assert ghost_seen_v2._PANEL_ID == "ghost_seen_v2"
+    assert aed.PANEL_ID == "archive"
     assert get_registry().get_parent("pm") == "cipher"
     assert get_registry().get_parent("ghost_seen_v2") == "cipher"
+    assert get_registry().get_parent("archive") == "cipher"
 
 
 def test_the_moved_features_keep_their_existing_sub_panels(registered):
@@ -162,6 +172,10 @@ def test_the_moved_features_keep_their_existing_sub_panels(registered):
     assert get_registry().get_parent("ghost_seen_v2_viewer") == "ghost_seen_v2"
     assert get_registry().get_parent("ghost_seen_v2_actions") == "ghost_seen_v2_viewer"
     assert get_registry().get_parent("ghost_seen_v2_manage") == "ghost_seen_v2"
+    assert get_registry().get_parent("archive_list") == "archive"
+    assert get_registry().get_parent("archive_item") == "archive_list"
+    assert get_registry().get_parent("archive_cats") == "archive"
+    assert get_registry().get_parent("archive_confirm") == "archive"
 
 
 # ── Back / Home ──────────────────────────────────────────────────────────────
@@ -208,6 +222,19 @@ def test_back_from_a_cipher_child_returns_to_cipher(registered, monkeypatch):
     assert lifecycle.sessions.current_nav(CHAT_ID, MSG_ID)[0] == "cipher"
     datas = _datas(container[2])
     assert "panel:pm" in datas and "panel:ghost_seen_v2" in datas
+
+
+def test_back_from_the_moved_archive_returns_to_cipher(registered, monkeypatch):
+    from backend.helper.lifecycle import get_lifecycle
+
+    lifecycle = get_lifecycle()
+    lifecycle.sessions.reset_nav(CHAT_ID, MSG_ID, "menu", "")
+    lifecycle.sessions.push_nav(CHAT_ID, MSG_ID, "cipher", "")
+    lifecycle.sessions.push_nav(CHAT_ID, MSG_ID, "archive", "")
+
+    container = _navigate(monkeypatch, "back")
+    assert lifecycle.sessions.current_nav(CHAT_ID, MSG_ID)[0] == "cipher"
+    assert "panel:archive" in _datas(container[2])
 
 
 def test_back_from_cipher_returns_to_the_main_menu(registered, monkeypatch):
@@ -262,8 +289,17 @@ def test_the_private_message_panel_is_reachable_and_unchanged(registered):
     assert "panel:pm_allow" in datas
 
 
+def test_opening_the_moved_archive_keeps_its_configuration(registered):
+    before = dict(anti_edit_delete_service.state())
+    title, _body, buttons = _panel("archive")
+    assert title == "Anti-Edit / Anti-Delete"
+    assert dict(anti_edit_delete_service.state()) == before
+    assert "action:aed_toggle_enabled" in _datas(buttons)
+
+
 def test_the_cipher_panel_is_registered_once_for_each_child(registered):
     panel_ids = get_registry().all_ids()
     assert panel_ids.count("cipher") == 1
     assert panel_ids.count("pm") == 1
     assert panel_ids.count("ghost_seen_v2") == 1
+    assert panel_ids.count("archive") == 1

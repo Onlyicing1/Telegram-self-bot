@@ -215,7 +215,6 @@ def _build_menu_buttons() -> list:
     )
     builder.add_row("Todo", "panel:todo", PRIMARY)
     builder.add_row("AI", "panel:ai", PRIMARY)
-    builder.add_row("Anti-Edit / Anti-Delete", "panel:archive", PRIMARY)
     return builder.build()
 
 
@@ -253,6 +252,7 @@ def _build_cipher_buttons() -> list:
     builder = InlinePanelBuilder()
     builder.add_row("Private Messages", "panel:pm", PRIMARY)
     builder.add_row("Ghost Seen", "panel:ghost_seen_v2", PRIMARY)
+    builder.add_row("Anti-Edit / Anti-Delete", "panel:archive", PRIMARY)
     return builder.build()
 
 

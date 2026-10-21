@@ -569,7 +569,7 @@ def register(client, owner_id: int, tz_str: str = "UTC") -> None:
         except Exception as exc:
             logger.warning("[AED] deletion capture failed: %s", type(exc).__name__)
 
-    register_panel(PANEL_ID, lambda event, extra: _panel_result(PANEL_ID, extra, owner_id), parent="menu", title="Anti-Edit / Anti-Delete")
+    register_panel(PANEL_ID, lambda event, extra: _panel_result(PANEL_ID, extra, owner_id), parent="cipher", title="Anti-Edit / Anti-Delete")
     register_panel(LIST_ID, lambda event, extra: _panel_result(LIST_ID, extra, owner_id), parent=PANEL_ID, title="Archive")
     register_panel(ITEM_ID, lambda event, extra: _panel_result(ITEM_ID, extra, owner_id), parent=LIST_ID, title="Archive Item")
     register_panel(CATS_ID, lambda event, extra: _panel_result(CATS_ID, extra, owner_id), parent=PANEL_ID, title="Categories")
