@@ -14,6 +14,12 @@ Owner metadata is OPTIONAL and never prompted for: ``Name & tags`` is its own
 row, and Reply Mode without it stays exactly as prompt-free as before. The
 metadata always travels as the shared ``save_service.SaveMetadata`` contract —
 this module parses the one-line UI format and nothing else.
+
+Live transfer progress is wired the same way: both user-facing sources (Reply
+Mode and Save by Link) pass a ``save_service`` progress observer bound to the
+SAME status message, which the helper edits in place. Without a helper bot there
+is no inline panel message to edit, so the pipeline simply runs without
+progress instead of inventing a new UI.
 """
 import logging
 import os
@@ -28,6 +34,7 @@ from backend.helper import (
     render,
 )
 from backend.helper.client import get_client
+from backend.helper.save_progress import SaveProgressReporter
 from backend.helper.styles import PRIMARY
 from backend.helper import symbols as sym
 
@@ -227,6 +234,26 @@ async def _save_metadata_input_handler(text, chat_id, msg_id, inline_chat_id, in
             pass
 
 
+def _progress_reporter(helper, inline_chat_id, inline_msg_id):
+    """Bind save progress to the panel message that launched the operation.
+
+    ``None`` when there is no helper-backed status message: a non-inline save
+    has no message to edit, and a progress UI must not be invented for it.
+    """
+    if not helper or not inline_chat_id or not inline_msg_id:
+        return None
+
+    async def _edit(text: str) -> bool:
+        try:
+            await helper.edit_message(inline_chat_id, inline_msg_id, text, buttons=[])
+            return True
+        except Exception as exc:
+            logger.warning("save progress edit failed: %s", exc)
+            return False
+
+    return SaveProgressReporter(_edit)
+
+
 async def _save_reply_wait_handler(
     text, chat_id, msg_id, inline_chat_id, inline_msg_id, *, metadata=None
 ):
@@ -236,6 +263,9 @@ async def _save_reply_wait_handler(
     owner_id = _owner_id
     client = _self_client
     clear_pending(owner_id)
+
+    helper = get_client()
+    reporter = _progress_reporter(helper, inline_chat_id, inline_msg_id)
 
     try:
         # Resolve the user's outgoing reply, then the exact message it
@@ -250,6 +280,7 @@ async def _save_reply_wait_handler(
                 result = await save_service.execute_save(
                     client, owner_id, target_msg, os.getenv("TZ", "Asia/Tehran"),
                     metadata=metadata,
+                    progress=reporter.handle if reporter is not None else None,
                 )
         elif reply_msg:
             result = f"{sym.STATE_WARNING} Your message was not a reply. Please reply to a message to select what to save."
@@ -258,8 +289,9 @@ async def _save_reply_wait_handler(
     except Exception as exc:
         result = f"{sym.STATE_FAILED} Deep Save failed: {exc}"
 
-    helper = get_client()
-    if helper and inline_chat_id and inline_msg_id:
+    if reporter is not None:
+        await reporter.close(result)
+    elif helper and inline_chat_id and inline_msg_id:
         try:
             await helper.edit_message(inline_chat_id, inline_msg_id, result, buttons=[])
         except Exception as exc:
@@ -280,18 +312,23 @@ async def _save_link_input_handler(text, chat_id, msg_id, inline_chat_id, inline
     client = _self_client
     clear_pending(owner_id)
 
+    helper = get_client()
+    reporter = _progress_reporter(helper, inline_chat_id, inline_msg_id)
+
     link = text.strip()
     if not link:
         result = f"{sym.STATE_WARNING} Link cannot be empty."
     else:
         result = await save_service.execute_link_save(
-            client, owner_id, link, os.getenv("TZ", "Asia/Tehran")
+            client, owner_id, link, os.getenv("TZ", "Asia/Tehran"),
+            progress=reporter.handle if reporter is not None else None,
         )
 
     logger.info("[LINK_SAVE] handler result: %s", result)
 
-    helper = get_client()
-    if helper and inline_chat_id and inline_msg_id:
+    if reporter is not None:
+        await reporter.close(result)
+    elif helper and inline_chat_id and inline_msg_id:
         try:
             await helper.edit_message(inline_chat_id, inline_msg_id, result, buttons=[])
         except Exception as exc:

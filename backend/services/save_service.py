@@ -19,6 +19,7 @@ hand it to ``execute_save``, so the normalization rules below cannot drift
 between the manual and the AI path.
 """
 import asyncio
+import inspect
 import logging
 import os
 import re
@@ -26,6 +27,7 @@ import shutil
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Awaitable, Callable
 
 from telethon.tl.types import (
     MessageMediaDocument,
@@ -452,16 +454,225 @@ class SaveOutcome(str):
     boundary can expose ``save_code`` through ``ToolResult.data`` instead of
     re-parsing human-readable confirmation text. ``saved`` is True only when
     the whole pipeline really persisted the item.
+
+    For an album, ``saved`` describes the WHOLE album (every item persisted),
+    ``save_code`` is empty unless exactly one item was saved, and ``media_type``
+    is empty — the per-item codes and types are listed in the result text and
+    each has its own ``saved_items`` row.
     """
 
     save_code: str
     saved: bool
+    media_type: str
 
-    def __new__(cls, text: str, *, save_code: str = "", saved: bool = False) -> "SaveOutcome":
+    def __new__(
+        cls, text: str, *, save_code: str = "", saved: bool = False, media_type: str = ""
+    ) -> "SaveOutcome":
         outcome = super().__new__(cls, text)
         outcome.save_code = str(save_code or "")
         outcome.saved = bool(saved)
+        outcome.media_type = str(media_type or "")
         return outcome
+
+
+# ── transfer progress (service → UI, never the reverse) ──
+
+
+@dataclass(frozen=True)
+class SaveProgressEvent:
+    """One real transfer observation for the caller's own status surface.
+
+    ``completed_bytes`` / ``total_bytes`` come straight from Telethon's
+    ``progress_callback`` (or from the phase boundary), never from elapsed
+    time. ``total_bytes`` is ``None`` when the transfer cannot report a size,
+    and ``finished`` marks the phase boundary so the caller can render a
+    truthful 100% even when no callback ever fired.
+    """
+
+    phase: str                 # "download" | "upload"
+    completed_bytes: int = 0
+    total_bytes: int | None = None
+    item_index: int = 1
+    item_count: int = 1
+    finished: bool = False
+
+
+ProgressCallback = Callable[[SaveProgressEvent], Awaitable[None]]
+
+
+async def _emit_progress(progress: ProgressCallback | None, event: SaveProgressEvent) -> None:
+    """Report one progress event; a reporting failure never aborts a transfer."""
+    if progress is None:
+        return
+    try:
+        result = progress(event)
+        if inspect.isawaitable(result):
+            await result
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — a UI failure must not fail the save
+        logger.warning("[SAVE] progress reporting failed: %s", exc)
+
+
+def _transfer_progress_callback(
+    progress: ProgressCallback | None,
+    phase: str,
+    item_index: int,
+    item_count: int,
+    total_bytes: int | None,
+) -> Callable | None:
+    """Telethon's ``progress_callback`` adapter (``(current, total)``).
+
+    Pinned Telethon 1.43.0 awaits an awaitable callback result for both
+    ``download_media`` and ``send_file``, so this coroutine is invoked from the
+    transfer itself with the REAL byte counts.
+    """
+    if progress is None:
+        return None
+
+    async def _callback(current, total=None) -> None:
+        await _emit_progress(
+            progress,
+            SaveProgressEvent(
+                phase=phase,
+                completed_bytes=int(current or 0),
+                total_bytes=int(total) if total else total_bytes,
+                item_index=item_index,
+                item_count=item_count,
+            ),
+        )
+
+    return _callback
+
+
+# ── view-once / expiring media ──
+
+#: Telegram's documented view-once marker (``2**31 - 1``). It is a SENTINEL,
+#: not a duration: any other positive TTL is a secret-chat self-destruct timer.
+VIEW_ONCE_TTL_SECONDS = 2147483647
+EPHEMERAL_VIEW_ONCE = "view_once"
+EPHEMERAL_EXPIRING = "expiring"
+
+
+def media_ttl_seconds(media) -> int | None:
+    """The media's own self-destruct TTL, or ``None`` for ordinary media."""
+    ttl = getattr(media, "ttl_seconds", None)
+    if isinstance(ttl, bool) or not isinstance(ttl, int):
+        return None
+    return ttl if ttl > 0 else None
+
+
+def ephemeral_media_kind(media) -> str | None:
+    """``view_once`` / ``expiring`` / ``None``, decided from Telegram's TTL only.
+
+    The view-once marker is exactly ``VIEW_ONCE_TTL_SECONDS``; every OTHER
+    positive TTL is an expiry timer. Both mean the media is ephemeral by the
+    sender's/Telegram's design, so neither is ever downloaded, re-uploaded or
+    recorded — no attribute guessing and no workaround.
+    """
+    ttl = media_ttl_seconds(media)
+    if ttl is None:
+        return None
+    return EPHEMERAL_VIEW_ONCE if ttl == VIEW_ONCE_TTL_SECONDS else EPHEMERAL_EXPIRING
+
+
+def ephemeral_refusal(media) -> str:
+    """The deterministic, pre-transfer refusal text for ephemeral media."""
+    kind = ephemeral_media_kind(media)
+    ttl = media_ttl_seconds(media)
+    if kind == EPHEMERAL_VIEW_ONCE:
+        return (
+            f"{sym.STATE_FAILED} Nothing was saved: this is view-once media. "
+            "Telegram marks it as one-time viewing, so LifeOS does not download "
+            "or re-upload it."
+        )
+    return (
+        f"{sym.STATE_FAILED} Nothing was saved: this media expires after {ttl}s. "
+        "LifeOS does not download or re-upload ephemeral media."
+    )
+
+
+# ── albums (grouped media) ──
+
+#: Telegram's own hard cap on the number of items in one album. A window of
+#: this many ids on each side of the selected message therefore always contains
+#: every member of the album it belongs to — deterministic and bounded.
+ALBUM_MAX_ITEMS = 10
+
+
+def album_group_id(message) -> int | None:
+    """The message's album id, or ``None`` when it is not part of an album."""
+    grouped = getattr(message, "grouped_id", None)
+    if isinstance(grouped, bool) or not isinstance(grouped, int) or grouped <= 0:
+        return None
+    return grouped
+
+
+async def resolve_album_messages(client, target) -> tuple[list, str]:
+    """Resolve the FULL album the selected message belongs to.
+
+    Returns ``(members, error)``. A non-album target resolves to ``[target]``
+    with no fetch at all. An album member is resolved by reading the bounded
+    id window around it and keeping ONLY messages whose ``grouped_id`` and chat
+    match the target — so an unrelated neighbouring message is never included
+    and no member is ever listed twice. Members are ordered by message id.
+
+    A resolution failure returns an honest error instead of silently saving
+    the single selected item: quietly saving one of an album is exactly the
+    behavior this path must not have.
+    """
+    grouped = album_group_id(target)
+    if grouped is None:
+        return [target], ""
+
+    base_id = getattr(target, "id", 0) or 0
+    chat_id = getattr(target, "chat_id", None)
+    if not base_id or chat_id is None:
+        return [target], ""
+
+    window = [
+        message_id
+        for message_id in range(
+            base_id - (ALBUM_MAX_ITEMS - 1), base_id + ALBUM_MAX_ITEMS
+        )
+        if message_id > 0
+    ]
+    try:
+        fetched = await client.get_messages(chat_id, ids=window)
+    except Exception as exc:  # noqa: BLE001 — honest resolution failure
+        logger.warning(
+            "[SAVE] album resolution failed chat=%s msg=%s: %s", chat_id, base_id, exc
+        )
+        return [], f"the album could not be resolved ({type(exc).__name__})"
+
+    if fetched is None:
+        fetched = []
+    elif not isinstance(fetched, (list, tuple)):
+        fetched = [fetched]
+
+    members: list = []
+    seen: set[int] = set()
+    for message in fetched:
+        if message is None:
+            continue
+        message_id = getattr(message, "id", None)
+        if not isinstance(message_id, int) or message_id in seen:
+            continue
+        if album_group_id(message) != grouped:
+            continue
+        if getattr(message, "chat_id", None) != chat_id:
+            continue
+        seen.add(message_id)
+        members.append(message)
+
+    if base_id not in seen:
+        members.append(target)
+    members.sort(key=lambda message: getattr(message, "id", 0) or 0)
+    logger.info(
+        "[SAVE] album resolved chat=%s grouped_id=%s selected=%s members=%d",
+        chat_id, grouped, base_id, len(members),
+    )
+    return members, ""
 
 
 def build_confirmation(
@@ -619,39 +830,79 @@ def _extract_source_media(reply_msg, save_code: str) -> tuple[str | None, int | 
     return mime_type, file_size, file_name, file_id, media_type
 
 
-async def execute_save(
+def _one_line(value, limit: int = 180) -> str:
+    """Collapse a result string into one bounded line (album summaries)."""
+    line = " ".join(str(value or "").split())
+    return line[:limit] + ("…" if len(line) > limit else "")
+
+
+def _album_outcome(results: list) -> SaveOutcome:
+    """Aggregate per-item outcomes — honest about partial success.
+
+    The album is reported as saved only when EVERY resolved item persisted; a
+    partial run states how many items were saved and names the failing ones.
+    Each successful item keeps its own code and metadata row.
+    """
+    total = len(results)
+    saved = [result for result in results if getattr(result, "saved", False)]
+    codes = [getattr(result, "save_code", "") for result in saved]
+    codes = [code for code in codes if code]
+
+    lines: list[str] = []
+    if saved and len(saved) == total:
+        lines.append(f"{sym.STATE_COMPLETED} **Album saved — {total} of {total} items**")
+    elif saved:
+        lines.append(f"{sym.STATE_WARNING} **Album saved — {len(saved)} of {total} items**")
+    else:
+        lines.append(f"{sym.STATE_FAILED} **Album save failed — 0 of {total} items**")
+    lines.append("")
+
+    for index, result in enumerate(results, 1):
+        if getattr(result, "saved", False):
+            code = getattr(result, "save_code", "") or "—"
+            media_type = getattr(result, "media_type", "") or "Item"
+            lines.append(f"{sym.OP_SAVE} `{code}` · {media_type}")
+        else:
+            lines.append(f"{sym.STATE_FAILED} Item {index} — {_one_line(result)}")
+
+    fully_saved = bool(total) and len(saved) == total
+    return SaveOutcome(
+        "\n".join(lines),
+        save_code=codes[0] if len(codes) == 1 else "",
+        saved=fully_saved,
+    )
+
+
+async def _deep_save_one(
     client,
     owner_id: int,
     reply_msg,
     tz_str: str,
     *,
-    metadata: SaveMetadata | None = None,
-) -> str:
-    """Deep Save — the single authoritative save pipeline.
+    metadata: SaveMetadata,
+    progress: ProgressCallback | None = None,
+    item_index: int = 1,
+    item_count: int = 1,
+) -> SaveOutcome:
+    """Deep-Save ONE source message — the per-item half of ``execute_save``.
 
-    Deep Save downloads the source content and uploads it again as a NEW
-    Saved Messages message. It NEVER forwards, under any circumstance:
-
-    - text-only source → a new ``send_message`` text message
-    - media source → ``download_media`` → validate → ``send_file``
-
-    A download or upload failure is an honest Deep Save failure. The DB
-    record is written only after the Telegram operation succeeded.
-
-    ``metadata`` is the owner's optional display name and tags (see
-    ``SaveMetadata``). Omitted/empty metadata reproduces the previous behavior
-    for the row's identity and Telegram side exactly; the only difference is
-    that the ``tags`` column now stays empty instead of receiving invented
-    hashtags. Metadata that cannot be honoured is refused BEFORE any transfer —
-    it is never silently truncated or discarded.
+    Its Telegram behavior is exactly the previously single-item pipeline
+    (ephemeral refusal → download → validate → upload as a NEW message → DB);
+    the only additions are the item's ordinal (for progress) and the optional
+    progress reporter. The temporary directory is removed on every exit path.
     """
-    if metadata is None:
-        metadata = SaveMetadata()
-    else:
-        try:
-            metadata = SaveMetadata.from_raw(metadata.display_name, list(metadata.tags))
-        except ValueError as exc:
-            return f"{sym.STATE_WARNING} Nothing was saved: {exc}"
+    media = getattr(reply_msg, "media", None)
+
+    # Ephemeral (view-once / expiring) media is refused BEFORE any transfer,
+    # any save code, any caption and any database write.
+    if ephemeral_media_kind(media) is not None:
+        logger.info(
+            "[SAVE] refused ephemeral media kind=%s chat=%s msg=%s",
+            ephemeral_media_kind(media),
+            getattr(reply_msg, "chat_id", None),
+            getattr(reply_msg, "id", None),
+        )
+        return SaveOutcome(ephemeral_refusal(media), saved=False)
 
     save_code = await db_client.get_next_save_code()
     now = datetime.now(_get_tz(tz_str))
@@ -659,14 +910,16 @@ async def execute_save(
     origin_chat_id = reply_msg.chat_id
     origin_msg_id = reply_msg.id
 
-    media = reply_msg.media
     mime_type, file_size, file_name, file_id, media_type = _extract_source_media(reply_msg, save_code)
 
     # Text-only source → a NEW text message (no media transfer, no forward).
     if media is None:
         original_text = (reply_msg.text or "").strip()
         if not original_text:
-            return f"{sym.STATE_WARNING} Replied message has no text or media to save."
+            return SaveOutcome(
+                f"{sym.STATE_WARNING} Replied message has no text or media to save.",
+                saved=False,
+            )
         media_type = "Text"
         mime_type = None
         file_name = None
@@ -674,17 +927,20 @@ async def execute_save(
         file_size = len(original_text.encode("utf-8"))
 
     logger.info(
-        "[SAVE] owner=%s media=%s save_code=%s file_name=%s mime=%s size=%s file_id=%s "
-        "display_name=%s tags=%s",
-        owner_id, media is not None, save_code, file_name, mime_type, file_size, file_id,
-        metadata.display_name, len(metadata.tags),
+        "[SAVE] owner=%s media=%s save_code=%s item=%s/%s file_name=%s mime=%s size=%s "
+        "file_id=%s display_name=%s tags=%s",
+        owner_id, media is not None, save_code, item_index, item_count, file_name,
+        mime_type, file_size, file_id, metadata.display_name, len(metadata.tags),
     )
 
     max_bytes = settings_service.max_deep_save_mb() * 1024 * 1024
     if file_size and file_size > max_bytes:
         mb = file_size / (1024 * 1024)
         limit_mb = settings_service.max_deep_save_mb()
-        return f"{sym.STATE_WARNING} File is {mb:.1f} MB — exceeds the {limit_mb} MB deep-save limit."
+        return SaveOutcome(
+            f"{sym.STATE_WARNING} File is {mb:.1f} MB — exceeds the {limit_mb} MB deep-save limit.",
+            saved=False,
+        )
 
     caption_tags = caption_hashtags(media_type, now)
     caption = _append_original_text(
@@ -715,43 +971,102 @@ async def execute_save(
         except Exception as exc:
             logger.error("deep save text send failed: %s", exc)
             record_event("save", "send_message", 0, "ERROR", str(exc))
-            return f"{sym.STATE_FAILED} Deep Save failed: text could not be uploaded to Saved Messages ({exc})"
+            return SaveOutcome(
+                f"{sym.STATE_FAILED} Deep Save failed: text could not be uploaded to Saved Messages ({exc})",
+                saved=False,
+            )
     else:
-        # Isolated temp storage per operation; removed on every exit path.
+        # Isolated temp storage per item; removed on every exit path.
         tmp_dir = tempfile.mkdtemp(prefix="lifeos_dl_")
         tmp_path = os.path.join(tmp_dir, os.path.basename(file_name or "file.bin"))
         try:
             # STAGE 1 — physically download the source media.
+            await _emit_progress(
+                progress,
+                SaveProgressEvent(
+                    phase="download", completed_bytes=0, total_bytes=file_size,
+                    item_index=item_index, item_count=item_count,
+                ),
+            )
+            download_callback = _transfer_progress_callback(
+                progress, "download", item_index, item_count, file_size
+            )
             try:
                 t0 = asyncio.get_event_loop().time()
-                await client.download_media(reply_msg, file=tmp_path)
+                download_kwargs = {}
+                if download_callback is not None:
+                    download_kwargs["progress_callback"] = download_callback
+                await client.download_media(reply_msg, file=tmp_path, **download_kwargs)
                 record_event("save", "download_media", (asyncio.get_event_loop().time() - t0) * 1000, "SUCCESS")
             except Exception as exc:
                 logger.error("deep save download failed: %s", exc)
                 record_event("save", "download_media", 0, "ERROR", str(exc))
-                return f"{sym.STATE_FAILED} Deep Save failed: unable to download the source message ({exc})"
+                return SaveOutcome(
+                    f"{sym.STATE_FAILED} Deep Save failed: unable to download the source message ({exc})",
+                    saved=False,
+                )
 
             # Validate the download before uploading anything.
             if not os.path.exists(tmp_path):
-                return f"{sym.STATE_FAILED} Deep Save failed: downloaded file is missing."
+                return SaveOutcome(
+                    f"{sym.STATE_FAILED} Deep Save failed: downloaded file is missing.",
+                    saved=False,
+                )
             actual_size = os.path.getsize(tmp_path)
             if actual_size == 0:
-                return f"{sym.STATE_FAILED} Deep Save failed: downloaded file is empty."
+                return SaveOutcome(
+                    f"{sym.STATE_FAILED} Deep Save failed: downloaded file is empty.",
+                    saved=False,
+                )
+
+            await _emit_progress(
+                progress,
+                SaveProgressEvent(
+                    phase="download", completed_bytes=actual_size,
+                    total_bytes=file_size or actual_size, item_index=item_index,
+                    item_count=item_count, finished=True,
+                ),
+            )
 
             # STAGE 2 — upload the downloaded content as a NEW message.
+            await _emit_progress(
+                progress,
+                SaveProgressEvent(
+                    phase="upload", completed_bytes=0, total_bytes=actual_size,
+                    item_index=item_index, item_count=item_count,
+                ),
+            )
+            upload_callback = _transfer_progress_callback(
+                progress, "upload", item_index, item_count, actual_size
+            )
             try:
                 t1 = asyncio.get_event_loop().time()
+                upload_kwargs = _upload_kwargs_for_media(media, mime_type, file_name)
+                if upload_callback is not None:
+                    upload_kwargs["progress_callback"] = upload_callback
                 sent = await client.send_file(
                     "me",
                     tmp_path,
                     caption=caption,
-                    **_upload_kwargs_for_media(media, mime_type, file_name),
+                    **upload_kwargs,
                 )
                 record_event("save", "send_file", (asyncio.get_event_loop().time() - t1) * 1000, "SUCCESS")
             except Exception as exc:
                 logger.error("deep save upload failed: %s", exc)
                 record_event("save", "send_file", 0, "ERROR", str(exc))
-                return f"{sym.STATE_FAILED} Deep Save failed: downloaded media could not be uploaded to Saved Messages ({exc})"
+                return SaveOutcome(
+                    f"{sym.STATE_FAILED} Deep Save failed: downloaded media could not be uploaded to Saved Messages ({exc})",
+                    saved=False,
+                )
+
+            await _emit_progress(
+                progress,
+                SaveProgressEvent(
+                    phase="upload", completed_bytes=actual_size,
+                    total_bytes=actual_size, item_index=item_index,
+                    item_count=item_count, finished=True,
+                ),
+            )
         except asyncio.CancelledError:
             raise
         finally:
@@ -794,7 +1109,10 @@ async def execute_save(
             "origin_chat_id": origin_chat_id,
             "origin_msg_id": origin_msg_id,
         })
-        return f"{sym.STATE_WARNING} Uploaded to Saved Messages, but the database record failed for `{save_code}`."
+        return SaveOutcome(
+            f"{sym.STATE_WARNING} Uploaded to Saved Messages, but the database record failed for `{save_code}`.",
+            saved=False,
+        )
 
     await db_client.log(owner_id, "INFO", f"Saved D {save_code}", {
         "save_code": save_code,
@@ -806,7 +1124,81 @@ async def execute_save(
         build_confirmation(save_code, media_type, file_name),
         save_code=save_code,
         saved=True,
+        media_type=media_type,
     )
+
+
+async def execute_save(
+    client,
+    owner_id: int,
+    reply_msg,
+    tz_str: str,
+    *,
+    metadata: SaveMetadata | None = None,
+    progress: ProgressCallback | None = None,
+) -> str:
+    """Deep Save — the single authoritative save pipeline.
+
+    Deep Save downloads the source content and uploads it again as a NEW
+    Saved Messages message. It NEVER forwards, under any circumstance:
+
+    - text-only source → a new ``send_message`` text message
+    - media source → ``download_media`` → validate → ``send_file``
+
+    A download or upload failure is an honest Deep Save failure. The DB
+    record is written only after the Telegram operation succeeded.
+
+    ``metadata`` is the owner's optional display name and tags (see
+    ``SaveMetadata``). Omitted/empty metadata reproduces the previous behavior
+    for the row's identity and Telegram side exactly; the only difference is
+    that the ``tags`` column now stays empty instead of receiving invented
+    hashtags. Metadata that cannot be honoured is refused BEFORE any transfer —
+    it is never silently truncated or discarded.
+
+    An album source is resolved to its full, bounded member set (see
+    ``resolve_album_messages``) and saved item by item through the SAME
+    per-item pipeline; partial success is reported as partial. Ephemeral media
+    (view-once and expiring) is refused before any transfer.
+
+    ``progress`` is an optional observer of the REAL transfer byte counts. It
+    knows nothing about the Glass UI: the caller decides what to render.
+    """
+    if metadata is None:
+        metadata = SaveMetadata()
+    else:
+        try:
+            metadata = SaveMetadata.from_raw(metadata.display_name, list(metadata.tags))
+        except ValueError as exc:
+            return SaveOutcome(f"{sym.STATE_WARNING} Nothing was saved: {exc}", saved=False)
+
+    members, album_error = await resolve_album_messages(client, reply_msg)
+    if album_error:
+        return SaveOutcome(
+            f"{sym.STATE_FAILED} Deep Save failed: {album_error}", saved=False
+        )
+
+    if len(members) == 1:
+        return await _deep_save_one(
+            client, owner_id, reply_msg, tz_str,
+            metadata=metadata, progress=progress, item_index=1, item_count=1,
+        )
+
+    results: list[SaveOutcome] = []
+    for index, member in enumerate(members, 1):
+        results.append(
+            await _deep_save_one(
+                client, owner_id, member, tz_str,
+                metadata=metadata, progress=progress,
+                item_index=index, item_count=len(members),
+            )
+        )
+
+    outcome = _album_outcome(results)
+    logger.info(
+        "[SAVE] album finished: %d/%d items saved",
+        sum(1 for result in results if result.saved), len(results),
+    )
+    return outcome
 
 
 async def execute_link_save(
@@ -816,12 +1208,13 @@ async def execute_link_save(
     tz_str: str,
     *,
     metadata: SaveMetadata | None = None,
+    progress: ProgressCallback | None = None,
 ) -> str:
     """Resolve a Telegram link and Deep-Save the linked message.
 
     This is the same Deep Save pipeline as ``execute_save`` — the only
     difference is the source resolution (a t.me link instead of a reply), so it
-    takes and forwards the same optional ``SaveMetadata`` contract.
+    takes and forwards the same optional ``SaveMetadata`` and progress contracts.
     """
     logger.info("[LINK_SAVE] resolving link: %s", link)
     channel, chat_id, msg_id = parse_telegram_link(link)
@@ -847,4 +1240,6 @@ async def execute_link_save(
         logger.warning("[LINK_SAVE] source message not found at link")
         return f"{sym.STATE_FAILED} Message not found at that link."
 
-    return await execute_save(client, owner_id, target_msg, tz_str, metadata=metadata)
+    return await execute_save(
+        client, owner_id, target_msg, tz_str, metadata=metadata, progress=progress
+    )

@@ -27,21 +27,14 @@ import logging
 import time
 
 from backend.ai.model_tester import test_all_models_streaming
+from backend.helper.progress import render_progress_bar
 from backend.runtime.task_guard import guarded_create_task
 
 logger = logging.getLogger(__name__)
 
-_SEGMENTS = 5
 _MIN_PROGRESS_INTERVAL = 12.0
 _TERMINAL_EDIT_RETRIES = 2
 _TERMINAL_RETRY_BACKOFF = 2.0
-
-
-def render_progress_bar(fraction: float) -> str:
-    """Exactly five segments; each segment covers 20 percentage points."""
-    fraction = min(max(fraction, 0.0), 1.0)
-    filled = min(_SEGMENTS, int(fraction * _SEGMENTS + 1e-9))
-    return "".join(sym.PAGE_CURRENT if i < filled else sym.PAGE_EMPTY for i in range(_SEGMENTS))
 
 
 def render_progress_view(

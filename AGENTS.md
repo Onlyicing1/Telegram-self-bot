@@ -105,7 +105,8 @@ backend/
 │   ├── inline_sender.py             # send_inline_panel + input listener
 │   ├── input_state.py               # per-owner pending-input state
 │   ├── panel_registry.py, panels.py, panel_render.py, lifecycle.py,
-│   ├── session_manager.py, rpc_timeout.py
+│   ├── session_manager.py, rpc_timeout.py,
+│   ├── progress.py (shared five-segment bar), save_progress.py (Save reporter)
 │
 ├── telegram_api/                    # typed RPC wrappers over the self client
 ├── db/client.py                     # Supabase singleton + in-memory fallback
@@ -268,6 +269,29 @@ source message
   timeout. The separate 120s pending-input **state expiry** is unchanged.
 - **AI Save tool**: `SaveTool` marks `long_running=True`; the
   `ToolExecutor` skips the generic 10s tool timeout for long-running tools.
+- **Albums**: a source carrying `grouped_id` is resolved to its FULL, bounded
+  member set by `resolve_album_messages` (the selected id ± the 10-item album
+  cap, keeping only messages whose `grouped_id` and chat match, deduped by id
+  and ordered by id). Every eligible member is Deep-Saved item by item through
+  the SAME per-item pipeline — one new message and one `saved_items` row each,
+  never a forward and never a duplicate. A partial run reports
+  `◬ Album saved — N of M items` and a total failure reports 0 of M; resolution
+  failure refuses instead of silently saving one item. Album members are saved
+  sequentially, so progress is always per file.
+- **Ephemeral media**: view-once media (Telegram's `ttl_seconds ==
+  2147483647` sentinel) and every other positive TTL (secret-chat expiry) are
+  refused in `_deep_save_one` BEFORE any download, upload, save code or DB
+  write — there is no workaround and no bypass.
+- **Transfer progress**: `execute_save` / `execute_link_save` accept an optional
+  `progress` observer (`SaveProgressEvent`, real Telethon byte counts). The
+  Glass handlers bind `backend/helper/save_progress.py::SaveProgressReporter`
+  to the SAME status message: the shared five-segment bar
+  (`backend/helper/progress.py::render_progress_bar`, also used by the model
+  tester), cadence `50/100` at or below 10 MiB and `20/40/60/80/100` above it,
+  independently per download/upload phase. An unknown size gets one phase line
+  without a percentage and a truthful 100% at the boundary; a terminal result
+  closes the reporter first, so a late event can never overwrite it. A caller
+  with no status message (the AI tools) passes no reporter.
 
 **Save code format:** short, human-readable codes — `S` + 4 characters
 (e.g. `S0001`, or a random `SXXXX` on collision). No `SV-NNNNNN` format.
