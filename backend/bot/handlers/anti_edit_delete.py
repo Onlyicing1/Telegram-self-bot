@@ -9,17 +9,21 @@ Registers, on the ONE shared self-client (through ``backend.bot.router``):
   * an ``events.MessageDeleted`` handler that records the deletion event and
     marks it recoverable ONLY when the content was captured beforehand.
 
-Telegram BOT accounts are excluded at every capture boundary: before a message,
-an edit, or a deletion is recorded, the event's own chat entity is classified
-through the REAL ``User.bot`` flag (``service.is_bot_entity``) — never a
-username/name/id heuristic — and a confirmed bot peer is dropped BEFORE the
-service scope gate, so no archive row can be created for bot chats. A peer whose
-entity is missing or cannot be resolved is NOT classified as a human either:
-behaviour falls back to the existing private-chat rules and that limitation is
-recorded in the archive reports. Persisted rows that predate this exclusion are
-hidden from the listing when their peer resolves to a bot at browse time
-(``service.filter_bot_items``), using the live self client; rows that cannot be
-resolved stay visible (the existing safe fallback).
+Capture is strictly scoped to a CONFIRMED human peer in a one-to-one private
+chat: before a message, an edit, or a deletion is recorded, the event's own chat
+entity is classified through the REAL ``User.bot`` flag — never a
+username/name/id heuristic. A resolved bot, a non-``User`` entity, a missing
+entity, an unresolved peer and a positive chat id with no entity are all
+dropped BEFORE the service scope gate, so nothing unverified can create a row.
+The same strict scope is re-proved at browse/detail time
+(``service.filter_scope_items``) against the live self client, so a persisted
+row whose peer is not a confirmed human private chat is never shown as one.
+
+Visibility is event-driven: a snapshot captured when a message was first seen
+is an INTERNAL recovery record. A message becomes a list entry only when an
+edit was observed (or as its own entry when a deletion was observed). An
+unchanged private message is never displayed as archive history, while its
+snapshot stays available for a later deletion's recovery.
 
 Everything is registered LAST so a capture read never delays another handler's
 first claim on an update; a capture that cannot finish is an honest miss, never
@@ -100,24 +104,23 @@ def _kind_glyph(kind: str) -> str:
     }.get(kind, sym.STATE_DELETED)
 
 
-async def _resolve_peer_identity(event, chat_id: Any) -> tuple[dict | None, bool]:
+async def _resolve_peer_identity(event, chat_id: Any) -> tuple[dict | None, bool | None]:
     """The OTHER participant's bounded identity, from the event's own chat entity.
 
     In a private chat the chat entity IS the peer, so this never confuses the
     message author with the conversation peer (an outgoing message's ``sender_id``
     is the OWNER, while the peer is the positive ``chat_id``). The entity is read
     from Telethon's own in-memory cache — ``get_chat()`` only performs an RPC when
-    the entity is missing from the session cache, and any failure degrades to the
-    numeric peer id rather than blocking capture. Never raises.
+    the entity is missing from the session cache. Never raises.
 
-    Returns ``(identity, peer_is_bot)``. ``peer_is_bot`` is True ONLY when the
-    resolved entity is a Telegram ``User`` with the real ``bot`` flag set
-    (``service.is_bot_entity``); a missing or unresolved entity yields False =
-    UNKNOWN — it is never guessed to be a human, and those captures keep the
-    existing safe fallback (documented limitation).
+    Returns ``(identity, peer_is_bot)`` as a CONFIRMED tri-state: ``True`` for a
+    resolved Telegram ``User`` whose real ``bot`` flag is set, ``False`` for a
+    resolved human ``User``, and ``None`` when the peer is missing, unresolved
+    or not a ``User`` at all. Only ``False`` may be captured; a positive chat id
+    is never taken as proof of a human.
     """
     if not isinstance(chat_id, int) or isinstance(chat_id, bool) or chat_id <= 0:
-        return None, False
+        return None, None
     identity: dict = {"peer_id": chat_id, "username": None, "name": None}
     try:
         entity = await event.get_chat()
@@ -125,17 +128,22 @@ async def _resolve_peer_identity(event, chat_id: Any) -> tuple[dict | None, bool
         raise
     except Exception as exc:
         logger.debug("[AED] peer entity unresolved: %s", type(exc).__name__)
-        return identity, False
+        return identity, None
     if entity is None:
-        return identity, False
-    peer_is_bot = service.is_bot_entity(entity)
+        return identity, None
     # A private chat's entity is a User; never read a username off a non-user.
-    if type(entity).__name__ == "User":
-        identity["username"] = getattr(entity, "username", None)
-        first = getattr(entity, "first_name", None) or ""
-        last = getattr(entity, "last_name", None) or ""
-        identity["name"] = f"{first} {last}".strip() or None
-    return identity, peer_is_bot
+    if type(entity).__name__ != "User":
+        return identity, None
+    identity["username"] = getattr(entity, "username", None)
+    first = getattr(entity, "first_name", None) or ""
+    last = getattr(entity, "last_name", None) or ""
+    identity["name"] = f"{first} {last}".strip() or None
+    flag = getattr(entity, "bot", None)
+    if flag is True:
+        return identity, True
+    if flag is False:
+        return identity, False
+    return identity, None
 
 
 def _truncate(value: str, limit: int = _BODY_PREVIEW) -> str:
@@ -179,6 +187,7 @@ async def _render_main(owner_id: int) -> tuple[str, str, list]:
         f"{_mark(summary['media_storage'])} Durable media storage"
         + ("" if summary["media_storage"] else " (metadata only)"),
         "",
+        "Only messages with an observed edit or deletion are listed here.",
         "A deletion is recoverable only if the message was captured while present.",
     ]
     builder = InlinePanelBuilder()
@@ -221,7 +230,7 @@ async def _render_list(owner_id: int, extra: str) -> tuple[str, str, list]:
         return "Archive", f"{sym.STATE_WARNING} The archive store could not be read.", []
     items = service.build_items(rows)
     filtered = service.filter_items(items, category=category, query=query)
-    filtered, bots_hidden = await service.filter_bot_items(
+    filtered, scope_hidden = await service.filter_scope_items(
         inline_engine.get_self_client(), filtered
     )
     page_items, page, pages = service.page_of(filtered, page)
@@ -243,9 +252,9 @@ async def _render_list(owner_id: int, extra: str) -> tuple[str, str, list]:
         )
     active = category or "all"
     note = (
-        f"\n{sym.STATE_WARNING} {bots_hidden} persisted item(s) hidden: "
-        "the peer resolved as a Telegram bot."
-        if bots_hidden else ""
+        f"\n{sym.STATE_WARNING} {scope_hidden} persisted item(s) hidden: "
+        "the peer is not a confirmed human private chat."
+        if scope_hidden else ""
     )
     body = (
         f"{sym.ICON_STATS} {len(filtered)} item(s) · filter: {active} · page {page}/{pages}\n\n"
@@ -286,7 +295,7 @@ async def _render_item(owner_id: int, extra: str) -> tuple[str, str, list]:
     if rows is None:
         return "Archive Item", f"{sym.STATE_WARNING} The archive store could not be read.", []
     items = service.build_items(rows)
-    items, _bots_hidden = await service.filter_bot_items(
+    items, _scope_hidden = await service.filter_scope_items(
         inline_engine.get_self_client(), items
     )
     item = service.get_item(items, browse_id)
@@ -514,8 +523,11 @@ def register(client, owner_id: int, tz_str: str = "UTC") -> None:
             if msg is None or getattr(msg, "action", None) is not None:
                 return
             identity, peer_is_bot = await _resolve_peer_identity(event, getattr(msg, "chat_id", None))
-            if peer_is_bot:
-                logger.info("[AED] snapshot skipped: peer is a Telegram bot chat_id=%s", msg.chat_id)
+            if peer_is_bot is not False:
+                logger.info(
+                    "[AED] snapshot skipped: peer is not a confirmed human (bot=%s) chat_id=%s",
+                    peer_is_bot, getattr(msg, "chat_id", None),
+                )
                 return
             await service.record_message(
                 msg=msg, kind=service.KIND_SNAPSHOT, owner=owner_id,
@@ -536,8 +548,11 @@ def register(client, owner_id: int, tz_str: str = "UTC") -> None:
             if msg is None:
                 return
             identity, peer_is_bot = await _resolve_peer_identity(event, getattr(msg, "chat_id", None))
-            if peer_is_bot:
-                logger.info("[AED] edit skipped: peer is a Telegram bot chat_id=%s", msg.chat_id)
+            if peer_is_bot is not False:
+                logger.info(
+                    "[AED] edit skipped: peer is not a confirmed human (bot=%s) chat_id=%s",
+                    peer_is_bot, getattr(msg, "chat_id", None),
+                )
                 return
             await service.record_message(
                 msg=msg, kind=service.KIND_EDIT, owner=owner_id,
@@ -558,10 +573,13 @@ def register(client, owner_id: int, tz_str: str = "UTC") -> None:
             _identity, peer_is_bot = (
                 await _resolve_peer_identity(event, chat_id)
                 if isinstance(chat_id, int) and not isinstance(chat_id, bool) and chat_id > 0
-                else (None, False)
+                else (None, None)
             )
-            if peer_is_bot:
-                logger.info("[AED] deletion skipped: peer is a Telegram bot chat_id=%s", chat_id)
+            if peer_is_bot is not False:
+                logger.info(
+                    "[AED] deletion skipped: peer is not a confirmed human (bot=%s) chat_id=%s",
+                    peer_is_bot, chat_id,
+                )
                 return
             await service.record_deletion(event=event, owner=owner_id, peer_is_bot=peer_is_bot)
         except asyncio.CancelledError:

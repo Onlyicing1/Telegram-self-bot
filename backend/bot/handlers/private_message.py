@@ -62,6 +62,16 @@ _TEMPORARY_OPTIONS: tuple[tuple[str, int], ...] = (
 )
 _MODE_CYCLE: tuple[str, ...] = service.MODES
 
+#: The schedule's own policy names. ``MODE_CLOSED`` is the exceptions-only
+#: policy (only the explicit exception list gets through), so the rule builder
+#: names it as such instead of the shorter "Closed", which an owner could read
+#: as "closed to everyone". The stored value is the canonical constant.
+_RULE_MODE_LABELS: dict[str, str] = {
+    service.MODE_OPEN: "Open (everyone)",
+    service.MODE_WHITELIST_ONLY: "Whitelist only",
+    service.MODE_CLOSED: "Exceptions only",
+}
+
 #: Per-owner schedule-rule draft (server-side, like the Bio template builder).
 #: Short callback data carries the field/step, never the draft itself.
 _rule_drafts: dict[int, dict] = {}
@@ -819,7 +829,7 @@ def _draft_body(owner_id: int, notice: str = "") -> str:
         f"**Timezone:** {schedule.get('timezone')} (change it on the Schedule screen)",
         f"**Days:** {service.describe_days(draft['days'])}",
         f"**Window:** {draft['start']} – {draft['end']}",
-        f"**Mode:** {service.MODE_LABELS[draft['mode']]}",
+        f"**Mode:** {_RULE_MODE_LABELS.get(draft['mode'], service.MODE_LABELS[draft['mode']])}",
         "",
         "Days not selected do not match. An end earlier than the start spans "
         "midnight and belongs to the start day.",
@@ -850,7 +860,10 @@ def _draft_buttons(owner_id: int) -> list:
         (sym.label(sym.META_TIME, "End"), f"input:{RULE_PANEL_ID}:end", PRIMARY),
     )
     builder.add_row(
-        sym.label(sym.ICON_SELECT, f"Mode: {service.MODE_LABELS[draft['mode']].split(' (')[0]}"),
+        sym.label(
+            sym.ICON_SELECT,
+            f"Mode: {_RULE_MODE_LABELS.get(draft['mode'], draft['mode'])}",
+        ),
         "action:pm_rule_mode",
         PRIMARY,
     )

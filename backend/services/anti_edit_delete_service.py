@@ -463,11 +463,12 @@ def eligible(
     A private chat id is the other user's POSITIVE id; groups/supergroups/
     channels are negative, and Saved Messages is the owner's own id.
 
-    ``peer_is_bot`` is TRI-STATE: ``True`` only when the peer's RESOLVED
-    Telegram ``User`` entity carries the real ``bot`` flag — a positive chat id
-    alone is NOT proof of a human. ``None``/``False`` (entity missing or
-    unresolved) never blocks here; callers keep their documented safe fallback
-    rather than guessing an unclassified peer's humanity.
+    ``peer_is_bot`` is TRI-STATE and must be a CONFIRMED classification:
+    ``False`` only for a RESOLVED Telegram ``User`` whose real ``bot`` flag is
+    false (a human), ``True`` for a resolved bot, and ``None`` when the peer
+    could not be resolved at all. A positive chat id alone is NOT proof of a
+    human, so ``None`` is rejected here (fail closed): an unclassified peer is
+    never admitted as a confirmed human private chat.
     """
     if not isinstance(owner, int) or isinstance(owner, bool) or owner <= 0:
         return False, "invalid_owner"
@@ -481,6 +482,8 @@ def eligible(
         return False, "via_bot"
     if peer_is_bot is True:
         return False, "peer_is_bot"
+    if peer_is_bot is not False:
+        return False, "peer_unresolved"
     return True, "eligible"
 
 
@@ -595,7 +598,14 @@ async def _resolve_peer_bot(client: Any, chat_id: int) -> bool:
         logger.debug("[AED] peer bot resolution failed for %s: %s", chat_id, type(exc).__name__)
         _defer_resolution(chat_id, _PEER_FAIL_COOLDOWN_S)
         return False
-    flagged = is_bot_entity(entity)
+    # A confirmed classification needs a resolved Telegram User and a REAL
+    # boolean ``bot`` flag. Any other resolved object (a Chat/Channel) or a
+    # missing flag is UNKNOWN, not a human: it is not cached as one and gets the
+    # same bounded cooldown as a failed lookup.
+    if type(entity).__name__ != "User" or getattr(entity, "bot", None) not in (True, False):
+        _defer_resolution(chat_id, _PEER_FAIL_COOLDOWN_S)
+        return False
+    flagged = getattr(entity, "bot") is True
     _cache_peer_bot(chat_id, flagged)
     if flagged:
         logger.info("[AED] peer %s resolved as a Telegram BOT — excluded from the archive", chat_id)
@@ -608,9 +618,10 @@ async def peer_bot_status(client: Any, chat_id: Any) -> bool:
     """The peer's real bot flag for one archive chat id, or ``False`` (UNKNOWN).
 
     ``True`` requires a RESOLVED bot ``User`` entity; anything else — no client,
-    an unresolvable peer, an unresolved entity, a deferred (rate-limited)
-    resolution — stays False and is treated as UNKNOWN (rows are kept, never
-    guessed human). Successful results are cached per chat id (bounded).
+    an unresolvable peer, an unresolved entity, a non-``User`` entity, a
+    deferred (rate-limited) resolution — stays False and is UNKNOWN. Only a
+    resolved human ``User`` is cached with ``False``; browse scope uses that
+    cache entry to prove humanity (``peer_human_status``).
 
     Reliability (no retry loop, no request storm):
       * ONE shared in-flight task per peer: concurrent and successive callers
@@ -646,22 +657,42 @@ async def peer_bot_status(client: Any, chat_id: Any) -> bool:
             registry.pop(chat_id, None)
 
 
-async def filter_bot_items(client: Any, items: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
-    """Hide persisted archive items whose peer RESOLVES to a Telegram bot.
+async def peer_human_status(client: Any, chat_id: Any) -> bool:
+    """True ONLY for a peer CONFIRMED as a human Telegram user.
 
-    Rows captured before the bot exclusion (or on a cold capture) carry no bot
-    metadata, so the live entity check is the only reliable classification at
-    browse time. Without a client, or while a peer's classification is unknown
-    (including a bounded rate-limit cooldown), the item is KEPT (the existing
-    safe fallback) — the limitation is documented in the capture handlers.
-    Returns ``(filtered_items, number_hidden)``.
+    ``False`` covers every other case — invalid or non-private chat id, the
+    owner's own account (Saved Messages), a resolved bot, an unresolvable peer,
+    a failed lookup and a bounded rate-limit cooldown. A positive chat id alone
+    is never accepted as proof of a human.
     """
-    if client is None or not items:
-        return list(items), 0
+    if not isinstance(chat_id, int) or isinstance(chat_id, bool) or chat_id <= 0:
+        return False
+    current_owner = owner_id()
+    if current_owner is not None and chat_id == current_owner:
+        return False
+    if client is None:
+        return False
+    chat_id = int(chat_id)
+    await peer_bot_status(client, chat_id)
+    return _peer_bot_cache.get(chat_id) is False
+
+
+async def filter_scope_items(client: Any, items: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+    """Keep only items from a CONFIRMED human private chat.
+
+    Browse and detail are the user-visible surface of the archive, so the same
+    strict scope the capture path enforces is re-proved here against the LIVE
+    Telegram entity: a persisted row captured before this rule (or with an
+    unresolved peer) is never shown as a human private conversation. Hidden
+    items are not deleted — retention still owns their lifecycle. Returns
+    ``(visible_items, number_hidden)``.
+    """
+    if not items:
+        return [], 0
     result: list[dict[str, Any]] = []
     hidden = 0
     for item in items:
-        if await peer_bot_status(client, item.get("chat_id")):
+        if not await peer_human_status(client, item.get("chat_id")):
             hidden += 1
             continue
         result.append(item)
@@ -1151,11 +1182,18 @@ def _identity_from(versions: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def build_items(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Collapse snapshot/edit rows into ONE item per logical message.
+    """Collapse snapshot/edit rows into ONE VISIBLE item per logical message.
 
-    Deletion rows are NEVER collapsed: a deletion is an independent archive event
-    and stays its own list entry with its own recoverability display, even when
-    the same message also has observed content versions.
+    Only a message with an OBSERVED EDIT becomes a content item. The snapshot
+    captured when the message was first seen is an internal recovery record:
+    it is retained in storage (and in the item's ``versions`` once an edit
+    makes the item visible) so a later deletion can still be reconstructed,
+    but an unchanged message is never shown as an archive entry.
+
+    Deletion rows are NEVER collapsed: a deletion is an independent archive
+    event and stays its own list entry with its own recoverability display,
+    even when the same message also has observed content versions. Only an
+    actual deletion event creates one — a snapshot alone never does.
     """
     groups: dict[tuple[Any, Any], dict[str, Any]] = {}
     order: list[Any] = []
@@ -1180,6 +1218,9 @@ def build_items(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for key in order:
         group = groups[key]
         versions = group["versions"]
+        if not any(version.get("kind") == KIND_EDIT for version in versions):
+            # Snapshot-only history: an internal recovery record, not an event.
+            continue
         latest = max(versions, key=lambda r: str(r.get("captured_at") or ""))
         body = latest.get("body") or ""
         media_name = latest.get("media_name")
