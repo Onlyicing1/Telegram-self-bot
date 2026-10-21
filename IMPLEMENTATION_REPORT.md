@@ -1,237 +1,209 @@
-# IMPLEMENTATION_REPORT.md — Supabase transport-failure evidence (diagnosis + one bounded diagnostic)
+# IMPLEMENTATION_REPORT.md — Anti-Edit / Anti-Delete: reaction-only updates are never edits
 
-> This file describes ONLY the current state of the repository for this phase and
+> This file describes ONLY the current state of the repository for this task and
 > **replaces every previous report in full** — it is not an appended report.
-> Earlier reports (the lifecycle-task stall round at `17942f1`, the AED security
-> and archive rounds, the emoji/private-message rounds) remain readable in git
-> history and in `docs/investigations/`.
+> Earlier reports (the Supabase transport-evidence round at `6f93228`, the
+> lifecycle-task stall round at `17942f1`, the AED security/archive rounds)
+> remain readable in git history and in `docs/investigations/`.
 
 | Item | Value |
 |---|---|
-| Stage | Diagnosis + the smallest safe diagnostic that decides the remaining cause |
-| Date | 2026-10-19 |
+| Stage | Defect fix + regression tests |
+| Date | 2026-10-21 |
 | Project / remote | LifeOS Telegram self-bot, `Onlyicing1/Telegram-self-bot` (`origin`) |
-| Branch | `main` |
-| Base revision | `aee3e163e914eae72cafa922eb3d38fd7a3ca697` (`INVESTIGATION.md` commit); relevant code commit `17942f167591618c4ba9111d15f2f7cffc7d789d` |
-| Live Telegram / Render / Supabase | **NOT touched.** No deployment, no Render shell or log stream, no `.env`, no credentials, no SQL, no migration, no restart, no environment change |
-| Workspace interpreter | CPython **3.10.12**; inspected dependencies `supabase 2.4.2`, `postgrest 0.16.11`, `httpx 0.27.0`, `httpcore 1.0.9`, `h2 4.4.1` |
+| Branch / base | `feat/private-message-phase2` @ `6f93228b604737b3dda985627f9ef33418b7c573` (= `origin/main` at task start) |
+| Code commit | `0e56e8771f4a589b5185a079bd710e86987ce57c` |
+| Live Telegram / Render / Supabase | **NOT touched.** No session, no RPC, no deployment, no `.env`, no credentials, no SQL, no migration, no schema change |
+| Workspace interpreter | CPython 3.12 libraries present; workspace **Telethon 1.34.0**, pinned **Telethon 1.43.0** (`backend/requirements.txt`) — the pinned wheel was downloaded from PyPI and inspected directly |
 
 ---
 
 ## 1. Objective
 
-Resolve the recurring Supabase task-repository transport failures seen after the
-October 19 deployment — `TASK_FALLBACK_CLASSIFIED reason=local_resource
-exception=ReadError`, `chain=ReadError<ReadError<BlockingIOError(errno=11)`,
-repeated `Supabase event task query failed; using fallback`, and a separate HTTP/2
-`ConnectionTerminated error_code:1` — **without** confusing them with the
-already-fixed lifecycle-task diagnostic misclassification, and **without**
-presenting a hypothesis as a confirmed cause.
+A reaction added to a message (add / change / remove) must never produce an AED
+edit entry, must never increase the visible edit/version count, and must never
+make an unchanged message appear in the archive — while genuine content edits,
+genuine deletions and their recovery semantics keep working.
 
 ---
 
-## 2. What was read before any edit
+## 2. Source audit (read before any edit)
 
-`INVESTIGATION.md`, `IMPLEMENTATION_REPORT.md`, `backend/db/client.py`,
-`backend/ai/database/task_repository.py` (classification, chain, cooldown,
-`_run`/`_run_checked`, degradation sites), `backend/runtime/operation_watchdog.py`,
-`backend/runtime/diagnostics.py`, `backend/ai/task_event_dispatcher.py`,
-`backend/ai/database/manager.py`, `backend/requirements.txt`,
-`tests/test_task_fallback_classification.py`,
-`tests/test_task_fallback_cooldown.py`, `tests/test_local_resource_bounds.py`,
-`tests/test_runtime_diagnostics_classification.py`, `tests/test_task_repository.py`
-— plus the installed sources of the sync transport path:
-`postgrest/_sync/client.py`, `postgrest/utils.py`,
-`httpcore/_backends/sync.py`, `httpcore/_sync/http2.py` and
-`httpcore/_sync/connection.py`.
+**Repository** — branch, HEAD, working tree and `origin/main` were inspected
+first: the tree was clean apart from the three files this task changes; no
+unrelated pre-existing work existed in the workspace at task start.
 
----
+**Application code** — `backend/bot/handlers/anti_edit_delete.py` (the three
+capture handlers), `backend/services/anti_edit_delete_service.py` (scope gate,
+`record_message`, `record_deletion`, version grouping, persistence),
+`tests/test_anti_edit_delete.py`, `IMPLEMENTATION_REPORT.md`,
+`docs/investigations/anti-edit-delete-status.md`, `backend/bot/router.py`
+(registration order), `backend/runtime/memory_cleanup.py` (the only cleanup
+hook).
 
-## 3. Confirmed facts (source and measurement, not inference)
-
-| Claim | Status | Evidence |
-|---|---|---|
-| One shared synchronous `httpx.Client` with **HTTP/2 enabled** | **Confirmed** | `postgrest 0.16.11::SyncPostgrestClient.create_session` → `SyncClient(..., http2=True)`; `get_db()` builds it once with `ClientOptions(postgrest_client_timeout=8.0)` |
-| The only read primitive is `settimeout(timeout)` + `recv` | **Confirmed** | `httpcore/_backends/sync.py::SyncStream.read`; `map_exceptions({socket.timeout: ReadTimeout, OSError: ReadError})` |
-| The read timeout is a constant 8 s per read, not a shrinking deadline | **Confirmed** | `httpcore/_sync/http2.py::_read_incoming_data` → `timeouts.get("read")`; `_DB_HTTP_TIMEOUT = 8.0` |
-| A read **timeout** surfaces as `ReadTimeout`, never `ReadError(11)` | **Confirmed** | Reproduction: silent TLS peer + `settimeout(0.2)` → `TimeoutError`, `errno=None` |
-| `OSError(EAGAIN)` *is* `BlockingIOError` — the production innermost link | **Confirmed** | `type(OSError(errno.EAGAIN, …)) is BlockingIOError`; plain non-blocking `recv` → `BlockingIOError(11)`; `SSLSocket` in non-blocking mode → `SSLWantReadError` (`errno=2`) |
-| CPython runs a *timed* socket over a non-blocking fd | **Confirmed** | `fcntl(F_GETFL)` shows `O_NONBLOCK` set with `settimeout(0.6)` before and during `recv`; `SO_RCVTIMEO` stays `(0,0)` |
-| A closed/GOAWAY/remote-terminated pooled connection cannot produce `EAGAIN` | **Confirmed** | `b""` → `RemoteProtocolError("Server disconnected")`; GOAWAY → `RemoteProtocolError(ConnectionTerminated)`; reset → `ECONNRESET(104)`; `is_available()` is false once `_connection_error` is set |
-| No retry exists in the path | **Confirmed** | no `retry`/`max_retries` in `postgrest` or `httpx`; `run_sync_db` dispatches once |
-| The 4-worker pool is bounded and the two deadlines are ordered | **Confirmed, unchanged** | `_DB_MAX_WORKERS = 4`, `0 < 8.0 < 10.0` (test-pinned) |
-| Concurrent SSL read+write on the same socket produces `EAGAIN` | **Disproved here** | 200 trials (one thread blocked in `recv`, one `send`ing): 198 `TimeoutError`, zero `BlockingIOError` |
-
-**Therefore:** the production failure is a local socket-layer **would-block on the
-read path** of the shared HTTP/2 transport — not a Supabase outage, not an expired
-read deadline, not executor saturation, not fd exhaustion, and not the HTTP/2
-termination. The OS-level reason Render's socket layer returns `EAGAIN` remains
-**unproven**; a plausible mechanism (a timed read running over a non-blocking fd,
-where OpenSSL reports an `EAGAIN` as `SSL_ERROR_SYSCALL` and CPython raises
-`BlockingIOError`) is recorded as a hypothesis only.
+**Pinned Telethon 1.43.0** (wheel downloaded and unpacked, not assumed):
+`telethon/events/messageedited.py`, `telethon/events/newmessage.py`,
+`telethon/events/common.py`, `telethon/client/updates.py::_dispatch_update`,
+`telethon/_updates/messagebox.py`, `telethon/tl/custom/chatgetter.py`, and the
+TL constructors `UpdateEditMessage`, `UpdateEditChannelMessage`,
+`UpdateMessageReactions`, `MessageReactions`, `ReactionCount`, `Message`.
 
 ---
 
-## 4. Implemented change (diagnostic only)
+## 3. Verified root cause
 
-### 4.1 `backend/db/client.py`
+**The AED edit path treated "an edit-shaped update arrived" as "the content
+changed".**
 
-`run_sync_db` now dispatches through a tiny wrapper that measures the **in-flight
-duration inside the worker** and attaches it to the failure that comes out:
+1. **Only one code path can write `kind="edit"`.** A full-tree search shows
+   `record_message(..., kind=KIND_EDIT)` is called from exactly one place: the
+   `events.MessageEdited` handler. Nothing else records an edit version.
 
-```python
-_DB_INFLIGHT_ATTR = "_lifeos_db_inflight_seconds"
+2. **Telethon maps only two update types onto that event.** Pinned 1.43.0
+   `MessageEdited.build` returns an event only for
+   `types.UpdateEditMessage` / `types.UpdateEditChannelMessage`; it does not
+   inspect `UpdateMessageReactions`, and no code in `_updates/messagebox.py`
+   synthesises an edit event from a reaction change. Executed directly against
+   the real types:
 
-def _timed_db_call(fn, args, kwargs):
-    started = time.monotonic()
-    try:
-        return fn(*args, **kwargs)
-    except BaseException as exc:
-        try:
-            setattr(exc, _DB_INFLIGHT_ATTR, time.monotonic() - started)
-        except Exception:
-            pass
-        raise
-```
+   ```
+   events.MessageEdited.build(UpdateMessageReactions(...))  -> None
+   events.MessageEdited.build(UpdateEditMessage(...))       -> Event
+   ```
 
-* The **same exception object** propagates; nothing is wrapped, retried,
-  delayed or swallowed.
-* The measurement is taken inside the worker, so executor queueing is excluded —
-  it is time the transport itself spent.
-* `db_inflight_seconds(exc)` returns the value, or `None` when the failure came
-  from the watchdog rather than the transport (a blocked thread has no duration
-  yet; reporting one would be fabrication).
-* `functools` became unused and was removed.
+   A plain reaction notification therefore never reached the AED handler at all.
+   Any AED edit row must have come from an **edit-shaped** update that carried
+   an **unchanged message**.
 
-### 4.2 `backend/ai/database/task_repository.py`
+3. **The handler never checked whether anything changed.** `record_message`
+   computed the edit version as `edit_date or date` and stored the row
+   unconditionally. Consequently, for a message Telegram has never edited,
+   `edit_date` is `None`, the version fell back to the message `date`, and
+   `make_id(kind="edit", version=date)` differs from the snapshot's
+   `make_id(kind="snapshot", version=date)` — so the deterministic idempotency
+   key could not suppress it. Result: a second row with byte-identical content,
+   `version_count` 2, the item rendered as edited, and (when no snapshot existed)
+   an unchanged message appearing in the archive for the first time.
 
-The once-per-episode `TASK_FALLBACK_CLASSIFIED` line now carries three additional
-fields, all names/enums/bounded numbers:
+4. **`edit_date` is the correct discriminator, and reactions are not.** Telegram
+   stamps `edit_date` on every content edit (it is the "edited" label) and never
+   on a reaction change: reaction state travels in `Message.reactions` /
+   `updateMessageReactions` (`core.telegram.org/api/reactions`), not in the
+   message content. A message merely *having* reactions is therefore never a
+   signal — a genuinely edited message may carry them.
 
-```
-TASK_FALLBACK_CLASSIFIED reason=local_resource phase=read exception=ReadError \
-  chain=ReadError<ReadError<BlockingIOError(errno=11) elapsed=0.0s since_ok=0.5s \
-  message=[Errno 11] Resource temporarily unavailable
-```
+**Reproduced in-process (not mocked):** the same real
+`UpdateEditMessage(Message(...))` for an unchanged, reaction-only message,
+delivered through the real `events.MessageEdited` builder and the real handler,
+produced `['delete', 'edit', 'snapshot']` on the pre-fix service and produces no
+edit row after the fix (see §5).
 
-| Field | Implementation |
+---
+
+## 4. Implementation changes (exact)
+
+`backend/services/anti_edit_delete_service.py`
+
+* **`is_content_edit(msg)`** — True only when the message carries Telegram's own
+  `edit_date`. No reaction inspection, no content guesswork.
+* **`content_signature(value)`** — a bounded fingerprint of the *content*
+  (category, body, caption flag, media presence/type/name/size). It accepts a
+  live message or a stored archive row, so an incoming edit is compared with the
+  newest observed version using only fields the archive already stores.
+  `Message.reactions` is deliberately absent.
+* **`_edit_advanced(previous, edited_at)`** — True when the update's stamp is
+  strictly newer than the stored version's (`_iso` output is UTC ISO-8601, so it
+  orders lexicographically; an unedited snapshot has no stamp, so any stamp is
+  newer).
+* **`record_message`** — for `kind=KIND_EDIT`:
+  1. the version is the `edit_date` **only** (the `or date` fallback is gone); a
+     message without a stamp is a non-content state update and is dropped before
+     any row is built (bounded debug log: chat id + message id only, never
+     content);
+  2. inside the existing serialization lock, a version is written only when the
+     content signature differs from the newest stored version **or** the stamp
+     advanced — an unchanged message therefore stays invisible and its version
+     count stays put.
+* Module docstring updated to state the contract.
+
+`backend/bot/handlers/anti_edit_delete.py` — the module docstring now documents
+that only **content** edit versions are recorded and that the service classifies
+the update; no handler logic changed (the handler stays thin, the service remains
+the single owner of archive state).
+
+**Unchanged on purpose:** the confirmed-human-private-peer gate, inline-bot and
+bot exclusions, group/Saved-Messages exclusion, idempotency keys, snapshot
+capture, deletion recording and recoverability, browse grouping/filters,
+retention/cleanup, persistence (dedicated tables and the legacy shard fallback),
+and the update/handler registration. No second client, loop, scheduler or
+executor; no schema, SQL, Supabase or `DATABASE_ARCHITECTURE.md` change;
+`INVESTIGATION.md` untouched.
+
+---
+
+## 5. Tests (real Telethon update/event types, real handler, real service)
+
+Added to `tests/test_anti_edit_delete.py` (section 16, 15 tests). They build
+**real** `telethon.tl.types.Message`, `UpdateEditMessage`,
+`UpdateMessageReactions`, `MessageReactions`, `ReactionEmoji`,
+`MessageMediaPhoto` objects and pass them through the **real**
+`events.MessageEdited.build(...)` before invoking the registered handler, so the
+classification under test is the production one.
+
+| Test | Asserts |
 |---|---|
-| `phase` | `_transport_phase(exc)` walks the same chain and maps **class names** to `read` / `write` / `connect` / `pool` / `protocol` / `deadline`, else `unknown` |
-| `elapsed` | `_format_evidence_seconds(db_inflight_seconds(exc))` → `"8.0s"`, `"0.0s"`, capped at one day, or `"n/a"` |
-| `since_ok` | `self._last_ok_monotonic`, set by `_mark_supabase_ok` (the existing success path), formatted the same way, or `"never"` |
+| `test_the_reaction_update_never_builds_a_message_edited_event` | `UpdateMessageReactions` → `MessageEdited.build` is `None` (no dispatch, nothing archived); a real edit update still builds an event |
+| `test_a_reaction_on_an_archived_message_creates_no_edit_version` | snapshot only; `version_count` 1; list renders no version count |
+| `test_an_edit_shaped_reaction_update_cannot_create_a_version` | edit-shaped update, real `Message`, reaction state, `edit_date=None` → event **is** produced, **no** edit row (**the defect reproduction**) |
+| `test_an_unchanged_message_stays_invisible_after_a_reaction` | no snapshot + reaction-only edit-shaped update → archive empty, zero items |
+| `test_adding_and_changing_reactions_never_increments_the_version_count` | add/change/remove across both update shapes → `version_count` 1, body unchanged |
+| `test_reaction_state_never_participates_in_the_content_signature` | identical content + different reactions → identical signature; different text → different signature |
+| `test_a_genuine_text_edit_is_still_captured_with_its_original_snapshot` | real text edit **with reactions attached** → edit row, `version_count` 2, original + edited bodies, list shows "2 versions" |
+| `test_a_genuine_caption_edit_on_media_is_still_captured` | real `MessageMediaPhoto` caption edit → edit row, category photos, `has_caption` |
+| `test_an_edit_that_advances_the_stamp_is_captured_even_with_identical_text` | genuine re-edit with identical text → still captured (stamp advanced) |
+| `test_a_stale_unchanged_edit_update_cannot_re_add_a_version` | unchanged content with an older stamp → no new version |
+| `test_a_redelivered_edit_is_recorded_once` | idempotency preserved |
+| `test_reactions_do_not_disturb_deletion_recovery` | snapshot → reaction updates → deletion: no edit row, deletion `recoverable=True`, body intact, `recovered_from` = the snapshot |
+| `test_the_reaction_only_classification_is_boundary_safe` | no stamp → not an edit; missing/`None` message never raises; `edit_date` present → edit |
 
-Why this is the right amount of change: `chain=` proved *which* local condition
-failed, and only the **timing** now separates the two remaining explanations —
-a transport deadline that expired (`elapsed ≈ 8 s`) from a socket that refused
-the read immediately (`elapsed ≈ 0 s`). `phase` separates a read from a
-connect/write and a peer termination from a deadline; `since_ok` records whether
-the durable path was healthy moments earlier.
+**Measured results**
 
-**Deliberately NOT done**
-
-* No retry of any kind (writes are ambiguous after a failed response; the
-  repository's inserts rely on CAS/unique keys and are not idempotent).
-* No suppression, relabelling or downgrade of the warning; `EAGAIN` is still
-  `reason=local_resource`, not an outage.
-* No HTTP/2 disablement, no timeout change, no worker-count change, no new
-  client/executor/scheduler/update loop.
-* No change to the 5 s cooldown, its skip semantics, or the 8 s < 10 s ordering.
-* No schema, SQL, migration or `DATABASE_ARCHITECTURE.md` change.
-* No message text, URL, header, token or user data in the new fields.
-
----
-
-## 5. Tests
-
-New file `tests/test_task_transport_evidence.py` (12 tests):
-
-| Test | Pins |
+| Run | Result |
 |---|---|
-| `test_inflight_duration_is_measured_in_the_worker_and_the_call_is_issued_once` | duration is real, measured in the worker, the same exception object travels, exactly one dispatch |
-| `test_a_successful_dispatch_carries_no_failure_evidence` | a healthy call returns normally |
-| `test_the_dispatch_deadline_reports_no_transport_duration` | an `OperationTimeoutError` is `n/a` (never a fabricated socket duration); the blocked thread is released |
-| `test_phase_matrix_covers_every_pinned_transport_shape` | `ReadError`/`ReadTimeout` → read, connect, write, pool, `RemoteProtocolError`/`ConnectionTerminated` → protocol, `OperationTimeoutError` → deadline, else unknown |
-| `test_seconds_formatting_is_bounded_and_honest` | bounded formatting; `None`, negative and non-numeric → `n/a` |
-| `test_an_immediate_would_block_and_a_deadline_are_distinguishable` | identical errno-11 chains, different `elapsed` (`<0.1 s` vs `≥0.25 s`) |
-| `test_the_line_reports_the_gap_since_the_last_durable_success` | `since_ok` is a real gap after a success |
-| `test_a_repository_that_never_succeeded_says_so` | `since_ok=never` |
-| `test_remote_h2_termination_stays_unavailable_and_skips_the_local_line` | `ConnectionTerminated` → `unavailable`, cooldown not armed, no local episode line, failure still reported |
-| `test_an_ambiguous_failed_insert_is_issued_exactly_once` | exactly one `insert` is issued for a failed write; the record stays non-durable |
-| `test_a_cooldown_skipped_call_adds_no_second_evidence_line` | one line per episode; the cooldown is never extended by a skipped call |
-| `test_evidence_fields_are_bounded_and_secret_free` | the evidence fields are enums/numbers only, a URL/token in the exception never reaches the line, and the line stays under 400 characters |
-
-### Results
-
-| Command | Result |
-|---|---|
-| `pytest tests/test_task_transport_evidence.py -q` | **12 passed** |
-| `pytest … test_task_fallback_classification.py test_task_fallback_cooldown.py test_local_resource_bounds.py test_task_repository.py -q` | **64 passed** |
-| `pytest tests/test_07_diagnostics.py tests/test_11_runtime_wiring.py tests/test_task_scheduler.py tests/test_task_execution.py tests/test_03_database_consistency.py tests/test_06_failure_simulation.py tests/test_22_reliability.py tests/test_24_execution_reliability.py tests/test_30_delete_timeout_hardening.py -q` | **91 passed** |
-| `pytest tests -q -p no:cacheprovider` (full suite) | **6394 passed, 27 skipped, 40 failed** in 123.97 s |
-| failure set of the full run | **all 40 in `tests/test_colored_buttons.py`** — `Button.inline() got an unexpected keyword argument 'style'` (workspace Telethon **1.34.0** vs pinned **1.43.0**). Pre-existing and unrelated; not fixed here |
-| `python3 -m py_compile backend/db/client.py backend/ai/database/task_repository.py tests/test_task_transport_evidence.py` | exit 0 |
+| Focused AED suite (`tests/test_anti_edit_delete.py`) | **108 passed** |
+| Same 15 new tests against the **pre-fix** service (`git stash` of the two changed source files) | **7 failed, 3 passed, 98 deselected** — the defect tests fail exactly as reported (`['delete','edit','snapshot']`, version count 2, an unarchived message becoming visible) |
+| Adjacent regression suites (`test_anti_edit_delete`, `test_private_message_management`, `test_private_message_scope`, `test_database_setup_order`) | **296 passed** |
+| Full suite (`python3 -m pytest -q`) | **6407 passed, 27 skipped, 40 failed** |
+| `python3 -m py_compile` on the three changed files | exit 0 |
 | `git diff --check` | clean |
 
-Baseline `6382 passed` + 12 new = `6394`. **No newly introduced failures.**
+**The 40 full-suite failures are pre-existing and unrelated:** every one is in
+`tests/test_colored_buttons.py`, which requires `Button.inline(style=...)` — the
+workspace has **Telethon 1.34.0** installed while the project pins **1.43.0**.
+No AED test fails, and none of the changed files is touched by that suite.
+
+Existing bot / group / Saved Messages / inline-bot-origin / unresolved-peer
+exclusion tests, snapshot-only visibility tests, persistence tests and the
+dedicated/legacy store tests all still pass inside the 108.
 
 ---
 
-## 6. Files changed
+## 6. Not verified / limitations
 
-| File | Why |
-|---|---|
-| `backend/db/client.py` | Measure the in-flight duration of one synchronous transport call inside the bounded worker and expose it on the failure (diagnostic attribute only) |
-| `backend/ai/database/task_repository.py` | Add `phase`, `elapsed` and `since_ok` to the existing once-per-episode diagnostic; track the last durable success |
-| `tests/test_task_transport_evidence.py` | New regression coverage: in-flight evidence, phase matrix, HTTP/2 termination, no write retry, no duplicate lines, secret-free bounded fields |
-| `IMPLEMENTATION_REPORT.md` | This report (full replacement) |
-| `INVESTIGATION.md` | Full-replacement handoff for the next session/episode |
-
-Not changed: no schema, no migration, no SQL, no `DATABASE_ARCHITECTURE.md`, no
-`AGENTS.md`, no second client/executor/scheduler/retry loop, no worker count or
-timeout, no Render or environment change, no user-facing behaviour,
-`backend/requirements.txt` untouched.
-
----
-
-## 7. Production verification — NOT performed
-
-No deployment was triggered, no Render shell/log stream was used, no service was
-restarted, and no live Telegram/Supabase session exists in this workspace. A
-commit and push is **not** proof of deployment or recovery.
-
-Specifically, the following are **unverified**:
-
-* whether Render has deployed the commit carrying this change;
-* whether `BlockingIOError(errno=11)` recurs, and at what rate;
-* whether `ConnectionTerminated` recurs, and whether it coincides in time with
-  the errno-11 rows;
-* whether the durable task operations succeed more often (the `since_ok` field
-  will make the fallback rate readable);
-* that the lifecycle-task false-stall warnings stay absent while genuine bounded
-  stalls are still detected.
-
-**What the next episode must show** (also in `INVESTIGATION.md` §5): `elapsed ≈
-8 s` ⇒ the transport deadline is being surfaced as a would-block (latency
-problem); `elapsed ≈ 0 s` ⇒ the socket refused the read immediately (socket/fd
-state problem); `phase=protocol` ⇒ a peer termination; `phase=deadline` ⇒ watchdog
-abandonment. Only after that is known should any behavioural change be designed —
-and a **read-only** bounded re-dispatch is the only retry shape worth
-considering, because a failed write is ambiguous.
-
----
-
-## 8. Remaining uncertainty and manual action
-
-* The OS-level cause of `EAGAIN` on Render is **unproven**; this phase makes it
-  decidable without guessing.
-* `httpcore` and `h2` are **unpinned** in `backend/requirements.txt`; the
-  conclusions here rest on `httpcore 1.0.9` / `h2 4.4.1`. A dependency pin is a
-  deliberate, separate change (it alters the deployed stack) and is recommended
-  as a follow-up so a later rebuild cannot silently change transport semantics.
-* **Manual actions:** (1) confirm the Render deploy of this commit and capture the
-  next `TASK_FALLBACK_CLASSIFIED` line; (2) collect host counters for the same
-  minute (open fds, `CLOSE_WAIT`/`TIME_WAIT` sockets, `lifeos-supabase-*`
-  threads) — Render Free has no shell, so use an existing metric/log surface;
-  (3) decide on any follow-up fix only from that evidence.
-* The 40 button-colour failures remain (workspace Telethon version) and are
-  unrelated to this phase.
+* **Live Telegram behaviour was NOT observed.** No session, credentials,
+  deployment or account was available; nothing here was confirmed against a real
+  account. The fix is deliberately independent of *which* update Telegram emits
+  for a reaction: a documented `updateMessageReactions` never reaches the handler
+  (verified: it builds no event), and any edit-shaped update that carries no
+  content change is now rejected by the service. The owner should confirm on a
+  live session that reacting leaves the archive list and version count
+  unchanged, and that a genuine edit still records.
+* The exact server-side reason Telegram sent an edit-shaped update for the
+  observed reaction was not captured (no update log was available from the
+  account). It is not required by the fix, whose classification is content- and
+  stamp-based, but it remains unobserved.
+* Rows already archived as spurious edits before this fix are **not** rewritten
+  or deleted — no data migration, SQL or schema change was permitted. They age
+  out through the existing retention cleanup or the owner's "Clear archive".
+* Everything above is in-process verification with real Telethon types; no
+  production, Render, Supabase or network call was made.
