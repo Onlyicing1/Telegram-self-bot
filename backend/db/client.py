@@ -24,7 +24,9 @@ import asyncio
 import logging
 import os
 import random
+import ssl
 import string
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -108,7 +110,11 @@ def get_db():
             ClientOptions(postgrest_client_timeout=_DB_HTTP_TIMEOUT),
         )
         _available = True
-        logger.info("[SAVE_DB] Supabase client initialised.")
+        logger.info(
+            "[SAVE_DB] Supabase client initialised. runtime=python-%s ssl=%s",
+            f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+            ssl.OPENSSL_VERSION,
+        )
         return _client
     except Exception as exc:
         logger.error("[SAVE_DB] Supabase init FAILED (%s) — using in-memory fallback.", exc)
@@ -142,6 +148,42 @@ def _get_db_executor() -> ThreadPoolExecutor:
 # Diagnostic attribute only: nothing is retried, delayed or re-classified.
 _DB_INFLIGHT_ATTR = "_lifeos_db_inflight_seconds"
 
+# Production also emits a separate ``ConnectionTerminated error_code:1`` line,
+# and whether it is causally related to the errno-11 read failures is still
+# unmeasured. Recording the most recent PEER/HTTP-2 termination where every
+# synchronous Supabase call already passes (this single dispatch) makes that
+# relationship readable in the next episode instead of guessed at: the
+# local-resource line reports the gap, or ``none`` when no teardown was ever
+# seen in this process. Bounded bookkeeping only — no retry, delay, deadline,
+# worker-count, lifecycle or classification change, and no payload captured.
+_TRANSPORT_TEARDOWN_CLASSES = frozenset({"ConnectionTerminated", "RemoteProtocolError"})
+_MAX_TEARDOWN_CHAIN_LINKS = 8
+_last_transport_teardown: float | None = None
+
+
+def _note_transport_teardown(exc) -> None:
+    """Record the instant of a peer/HTTP-2 termination seen in a failure chain."""
+    global _last_transport_teardown
+    seen: set[int] = set()
+    current = exc
+    links = 0
+    while current is not None and id(current) not in seen and links < _MAX_TEARDOWN_CHAIN_LINKS:
+        seen.add(id(current))
+        links += 1
+        if type(current).__name__ in _TRANSPORT_TEARDOWN_CLASSES:
+            _last_transport_teardown = time.monotonic()
+            return
+        current = current.__cause__ or current.__context__
+
+
+def seconds_since_transport_teardown() -> float | None:
+    """Seconds since the last observed transport teardown (``None`` if never)."""
+    last = _last_transport_teardown
+    if last is None:
+        return None
+    elapsed = time.monotonic() - last
+    return elapsed if elapsed >= 0 else 0.0
+
 
 def _timed_db_call(fn, args, kwargs):
     """Run one synchronous Supabase call and tag its in-flight duration.
@@ -155,6 +197,10 @@ def _timed_db_call(fn, args, kwargs):
     except BaseException as exc:
         try:
             setattr(exc, _DB_INFLIGHT_ATTR, time.monotonic() - started)
+        except Exception:
+            pass
+        try:
+            _note_transport_teardown(exc)
         except Exception:
             pass
         raise
@@ -2331,11 +2377,12 @@ def _pm_cas_filters(token: dict) -> list[tuple[str, object]]:
     return filters
 
 
-def _get_private_message_config_sync(owner_id: int) -> dict | None:
+def _get_private_message_config_state_sync(owner_id: int) -> tuple[dict | None, bool]:
+    """``(row, readable)`` for the owner's dedicated configuration row."""
     db = get_db()
     if db is None:
         row = _fallback["private_message_config"].get(owner_id)
-        return dict(row) if row else None
+        return (dict(row) if row else None), True
     try:
         result = (
             db.table("private_message_config")
@@ -2345,21 +2392,37 @@ def _get_private_message_config_sync(owner_id: int) -> dict | None:
             .execute()
         )
         rows = getattr(result, "data", None) or []
-        return rows[0] if rows else None
+        return (rows[0] if rows else None), True
     except Exception as exc:
         logger.error("[PM_DB] get_private_message_config FAILED: %s", exc)
-        return None
+        return None, False
+
+
+async def read_private_message_config(owner_id: int) -> tuple[dict | None, bool]:
+    """``(row, readable)`` for the configuration.
+
+    ``readable=False`` means the read FAILED (the table is missing, the network
+    is down, the query timed out). The service must then neither treat the
+    policy as absent nor persist a default document over the stored one.
+    ``(None, True)`` is the honest "no row yet" case (a fresh install).
+    """
+    try:
+        return await _run_sync(_get_private_message_config_state_sync, owner_id)
+    except Exception as exc:
+        logger.error("[PM_DB] get_private_message_config FAILED: %s", exc)
+        return None, False
 
 
 async def get_private_message_config(owner_id: int) -> dict | None:
     """The owner's dedicated configuration row, or None when no row exists yet
     OR the store could not be read. Both resolve to the fail-closed default in
-    the service (a missing row means the feature is OFF)."""
-    try:
-        return await _run_sync(_get_private_message_config_sync, owner_id)
-    except Exception as exc:
-        logger.error("[PM_DB] get_private_message_config FAILED: %s", exc)
-        return None
+    the service (a missing row means the feature is OFF).
+
+    The state LOAD uses :func:`read_private_message_config`, which keeps the two
+    cases apart.
+    """
+    row, _ok = await read_private_message_config(owner_id)
+    return row
 
 
 def _get_legacy_private_message_state_sync(owner_id: int, key: str) -> str | None:
@@ -2731,12 +2794,47 @@ def _bot_settings_get_sync(key: str) -> str | None:
 
 async def aed_get_document(key: str) -> str | None:
     """Read one JSON document from ``bot_settings``. ``None`` means missing OR
-    unreadable — the caller resolves both to its fail-closed default."""
+    unreadable — the caller resolves both to its fail-closed default.
+
+    Callers that must TELL the two apart (the one-time legacy import, which may
+    never overwrite a stored configuration with imported defaults) use
+    :func:`aed_get_document_state`.
+    """
+    document, _ok = await aed_get_document_state(key)
+    return document
+
+
+def _bot_settings_get_state_sync(key: str) -> tuple[str | None, bool]:
+    db = get_db()
+    if db is None:
+        row = _fallback.get("bot_settings", {}).get(key)
+        return (row if isinstance(row, str) else None), True
     try:
-        return await _run_sync(_bot_settings_get_sync, key)
+        result = db.table("bot_settings").select("value").eq("key", key).maybe_single().execute()
+        data = getattr(result, "data", None)
+        if isinstance(data, dict):
+            value = data.get("value")
+            return (value if isinstance(value, str) and value.strip() else None), True
+        if isinstance(data, list) and data:
+            value = data[0].get("value")
+            return (value if isinstance(value, str) and value.strip() else None), True
+        return None, True
     except Exception as exc:
         logger.error("[AED_DB] read %s FAILED: %s", key, exc)
-        return None
+        return None, False
+
+
+async def aed_get_document_state(key: str) -> tuple[str | None, bool]:
+    """``(document, readable)`` for one ``bot_settings`` document.
+
+    ``readable=False`` means the store could not be read — never a missing
+    document — so an importer can refuse to treat an outage as "nothing stored".
+    """
+    try:
+        return await _run_sync(_bot_settings_get_state_sync, key)
+    except Exception as exc:
+        logger.error("[AED_DB] read %s FAILED: %s", key, exc)
+        return None, False
 
 
 def _bot_settings_put_sync(key: str, value: str) -> bool:
@@ -2959,11 +3057,12 @@ def _aed_entry_payload(owner_id: int, row: dict) -> dict:
     return payload
 
 
-def _get_aed_config_sync(owner_id: int) -> dict | None:
+def _get_aed_config_state_sync(owner_id: int) -> tuple[dict | None, bool]:
+    """``(row, readable)`` for the owner's dedicated configuration row."""
     db = get_db()
     if db is None:
         row = _fallback["aed_config"].get(owner_id)
-        return dict(row) if row else None
+        return (dict(row) if row else None), True
     try:
         result = (
             db.table("aed_config")
@@ -2973,21 +3072,37 @@ def _get_aed_config_sync(owner_id: int) -> dict | None:
             .execute()
         )
         rows = getattr(result, "data", None) or []
-        return dict(rows[0]) if rows else None
+        return (dict(rows[0]) if rows else None), True
     except Exception as exc:
         logger.error("[AED_DB] get aed_config FAILED: %s", exc)
-        return None
+        return None, False
+
+
+async def aed_load_config_state(owner_id: int) -> tuple[dict | None, bool]:
+    """``(row, readable)`` for the dedicated configuration.
+
+    ``readable=False`` means the read FAILED; the service must then keep the
+    feature OFF and must never persist a default document over the stored one.
+    ``(None, True)`` is the honest "no row yet" case.
+    """
+    try:
+        return await _run_sync(_get_aed_config_state_sync, owner_id)
+    except Exception as exc:
+        logger.error("[AED_DB] get aed_config FAILED: %s", exc)
+        return None, False
 
 
 async def aed_load_config(owner_id: int) -> dict | None:
     """The owner's dedicated configuration row, or None when no row exists yet
     OR the store could not be read. Both resolve to the fail-closed default in
-    the service (a missing row means the feature is OFF)."""
-    try:
-        return await _run_sync(_get_aed_config_sync, owner_id)
-    except Exception as exc:
-        logger.error("[AED_DB] get aed_config FAILED: %s", exc)
-        return None
+    the service (a missing row means the feature is OFF).
+
+    The configuration LOAD uses :func:`aed_load_config_state`, which keeps the two
+    cases apart; this collapsed form stays for the retention sweep, where an
+    unreadable row must simply not invent a longer retention.
+    """
+    row, _ok = await aed_load_config_state(owner_id)
+    return row
 
 
 def _save_aed_config_sync(owner_id: int, document: dict) -> bool:

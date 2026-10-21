@@ -7,7 +7,7 @@ authenticated` plus a `USING (true)` SELECT policy on each table — which would
 have let any holder of the anon key read private message bodies.
 
 This module pins the corrected definition in the MIGRATION (the SQL source of
-truth) and in part 11 of the canonical setup block in DATABASE_ARCHITECTURE.md
+truth) and in part 12 of the canonical setup block in DATABASE_ARCHITECTURE.md
 §31.3, so the two artifacts cannot drift apart and the permissive posture cannot
 come back silently. Everything here reads the repository's own SQL and prose; no
 database is contacted.
@@ -36,7 +36,7 @@ BACKEND_VERBS = ("SELECT", "INSERT", "UPDATE", "DELETE")
 
 SETUP_BANNER = "ONE COMPLETE SUPABASE SETUP SCRIPT"
 PART_MARKER = re.compile(r"--[^\n]*\bPART (\d+) of (\d+)\b[^\n]*\n")
-AED_PART = 11
+AED_PART = 12
 
 
 # ─── helpers ─────────────────────────────────────────────────────────────────
@@ -185,7 +185,7 @@ def test_the_schema_constraints_index_and_verification_are_intact():
 
 def test_the_canonical_part_is_statement_identical_to_the_migration():
     assert _statements(_aed_part()) == _statements(MIGRATION), (
-        "part 11 of §31.3 diverged from its migration; the block must copy it verbatim"
+        "part 12 of §31.3 diverged from its migration; the block must copy it verbatim"
     )
 
 
@@ -225,7 +225,7 @@ def test_the_documentation_describes_the_restrictive_model():
 
 
 def test_the_inventory_rows_state_the_restrictive_posture():
-    row = [line for line in DOC.splitlines() if MIGRATION_NAME in line and line.startswith("| 11 |")]
+    row = [line for line in DOC.splitlines() if MIGRATION_NAME in line and line.startswith("| 12 |")]
     assert len(row) == 1, "§31.1 must carry exactly one inventory row for the AED migration"
     assert "service-role-only" in row[0], "§31.1 must describe the service-role-only posture"
     assert "SELECT-only" not in row[0], "§31.1 must not claim a client read path"

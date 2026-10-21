@@ -90,9 +90,10 @@ is a separate manual owner action, and the coding agent never executes SQL.
 
 ## MANUAL SUPABASE ACTION REQUIRED
 
-Apply this file in the Supabase SQL editor (it is NOT part of the ONE complete
-setup script in DATABASE_ARCHITECTURE.md §31.3, which stays as the owner
-approved it). Until it is applied, saving ANY Private Message setting fails
+Apply this file in the Supabase SQL editor, or run the ONE complete setup script
+in DATABASE_ARCHITECTURE.md §31.3, which carries this file's executable
+statements verbatim as its part 11 (immediately after the two tables this file
+alters). Until it is applied, saving ANY Private Message setting fails
 honestly: the configuration write names the new columns, so a database without
 them rejects the statement, the service keeps the previous in-memory state and
 the panel reports the failed save instead of pretending the setting was stored.

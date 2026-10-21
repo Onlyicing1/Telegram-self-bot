@@ -1,281 +1,243 @@
-# INVESTIGATION.md — recurring Supabase task-repository transport failures
+# INVESTIGATION.md — persistence of AED, Private Message Management and Auto-Reaction
 
-This file is the **complete current investigation and handoff** and replaces every
-previous investigation in full. Earlier handoffs (colored-button semantics, the
-symbol registry, premium-emoji rounds, AED archive rounds, private-message
-rounds, the lifecycle-task stall round) remain readable in git history and are
-obsolete here.
+Investigation of **Anti-Edit / Anti-Delete** (AED), **Private Message Management**
+(“PV Manager”, PM) and the **Auto-Reaction** setting on `main`. It replaces every
+previous investigation in full; earlier rounds (Supabase transport, AED bot
+exclusion, AED/PM status audit) remain in Git history, and
+`docs/investigations/anti-edit-delete-status.md` still carries the older
+narrative. Nothing outside this file was changed by the investigation itself.
+
+## 1. Scope
 
 | Item | Value |
 |---|---|
-| Investigation | Supabase task-repository `ReadError [Errno 11]` bursts and the separate HTTP/2 `ConnectionTerminated` failure |
-| Date | 2026-10-19 |
-| Project / remote | LifeOS Telegram self-bot, `Onlyicing1/Telegram-self-bot` (`origin`) |
-| Base revision | `aee3e163e914eae72cafa922eb3d38fd7a3ca697` (`origin/main`; this documentation commit) |
-| Relevant code before this phase | `17942f167591618c4ba9111d15f2f7cffc7d789d` |
-| Evidence basis | Full source reads of this repository **and the installed pinned libraries**, plus local socket/TLS reproductions and the repository test suite |
-| Live Telegram / Render / Supabase | **NOT accessed.** No deployment, Render shell, log stream, `.env`, credential, SQL, migration, restart or environment change. No claim of runtime recovery is made |
-| Outcome | Root cause **not** proven at the OS level. One narrow, safe **diagnostic** change implemented so the next production episode is decidable. No behaviour, retry, timeout, worker-count or transport change |
+| Date | 2026-10-20 (UTC) |
+| Repository | `Onlyicing1/Telegram-self-bot` (`origin`) |
+| Branch / commit | **`main`** @ **`d33dbe27956aaf3819b27ae2ce416856f9de968f`**, verified `= origin/main` (`git fetch origin`, `git rev-parse origin/main`) |
+| Working tree at start | only the pre-existing unrelated `INVESTIGATION.md` modification in the shared clone plus three untouched worktrees (`.aedwork`, `.m14`, `.taskrt`) |
+| Runtime | CPython 3.10.12 venv; `supabase 2.4.2`, `telethon 1.43.0` |
+| Live Telegram / Render / Supabase | **not accessed** — no credential, no connection, no SQL |
 
----
+The task under investigation is the owner's report that **parts of these
+features repeatedly reset after Self Bot updates/redeployments**. That report is
+treated as a persistence defect: every durable field was traced from the panel
+write → the repository write → the table, and from the table → the load →
+the in-memory cache → the next restart.
 
-## 1. What the production evidence now proves
+## 2. Executive summary
 
-The chain field added in `17942f1` did its job. Production now reports:
+Three **confirmed** defects explain resets, plus one schema gap and one
+structural weakness. None of them is a “table does not exist” problem.
 
-```
-TASK_FALLBACK_CLASSIFIED reason=local_resource exception=ReadError
-  chain=ReadError<ReadError<BlockingIOError(errno=11)
-Supabase event task query failed; using fallback
-ConnectionTerminated error_code:1            (separate line, HTTP/2 transport)
-```
+| # | Defect | Feature | Confirmed by |
+|---|---|---|---|
+| 1 | The legacy → dedicated transition has **no backfill**. When `aed_config` becomes readable for the first time, `_read_config` returns `default_state()` (enabled `false`) and `load_rows_async` returns `[]`, so the owner's legacy configuration and every legacy shard row disappear from view at the first restart after the migration. | AED | `anti_edit_delete_service.py::_read_config` / `load_rows_async`; §34.5 says the import was deferred |
+| 2 | Every AED capture handler gates on the **synchronous** `service.is_enabled()` **before** the asynchronous load is awaited, so a message/edit/deletion that arrives during the startup preload window is silently dropped after every redeploy. | AED | `anti_edit_delete.py` handlers; `register()` starts the preload as a background task |
+| 3 | An **unreadable** configuration row is indistinguishable from **no row**: `aed_load_config` / `get_private_message_config` return `None` for both, and both services then load defaults and mark themselves loaded. The next panel change persists those defaults over the real row. For PM the failed read also falls through to the **legacy document** and writes it over the dedicated row. | AED + PM | `client.py::_get_aed_config_sync` / `_get_private_message_config_sync`; `private_message_service._read_state_document` / `_load_task_body` |
+| 4 | **No migration creates** `panel_settings.auto_reaction_enabled` / `auto_reaction_emoji`, although `settings_service` reads and writes both and `auto_reaction_service` consults them for every outgoing message. The write is rejected by the database and the value survives only in the process cache — reset on every redeploy. | Auto-Reaction | zero grep hits in `supabase/`; §6 documented them as “PROPOSED … no migration file creates it” |
+| 5 | A dedicated-store write can fail **silently at the service boundary** when no owner is configured: PM's `_write_state_row` returns `True` without writing anywhere. | PM | `private_message_service._write_state_row` |
 
-That chain is **shape evidence**, and it settles several hypotheses outright:
+Defect 3 is the one that turns a transient outage into permanent data loss: the
+defaults are not merely shown, they are written back. Defects 1 and 2 reproduce
+the owner's “after an update” symptom exactly (a redeploy changes the store mode
+and drops the startup window).
 
-| Claim | Status | Basis |
-|---|---|---|
-| The failure is a local socket-layer would-block, not a PostgREST/HTTP status | **Confirmed** | `OSError(errno.EAGAIN)` *is* `BlockingIOError`; the innermost link is that raw OS error, so nothing above it produced a response |
-| It is **not** an expired HTTP read deadline | **Confirmed (disproved as the explanation)** | `httpcore._backends.sync.SyncStream.read` maps `socket.timeout → ReadTimeout`; a real deadline expiry surfaces as `httpx.ReadTimeout` with **no errno**. Reproduced locally: a TLS peer that never writes + `settimeout(0.2)` → `TimeoutError`, `errno=None` |
-| It is **not** executor saturation or a queued dispatch | **Confirmed (absent)** | That path raises `OperationTimeoutError` with no errno → `reason=unavailable`; production says `local_resource` with errno 11 |
-| It is **not** file-descriptor exhaustion | **Confirmed (absent)** | `EMFILE`/`ENFILE` (24/23) also classify `local_resource`, but the chain names errno **11** |
-| It is **not** the HTTP/2 termination | **Confirmed (separate)** | `ConnectionTerminated` is an `h2` event; httpcore raises `RemoteProtocolError(event)` — **no errno**, `phase=protocol`, `reason=unavailable`. It is a different line from the errno-11 chain, and whether the two coincide in time is still unmeasured |
-| Classification, cooldown and fallback attribution behave as designed | **Confirmed** | 5 s bounded local-resource cooldown, skipped calls never extend it, a success clears it, in-memory results are labelled non-durable with `reason=local_resource` |
+## 3. AED — complete persistence audit
 
-What is **still unproven** is *why* the local socket layer returns `EAGAIN` on
-Render. That is an OS/network-stack question, and it is recorded as unproven
-rather than guessed at.
+### 3.1 Configuration
 
----
+| Field / state | Authoritative storage | Read path | Write path |
+|---|---|---|---|
+| `enabled` | `aed_config.enabled` (dedicated) / `bot_settings['anti_edit_delete_config:<owner>']` (legacy JSON) | `aed_load_config` → `_read_config` → `sanitize_state` → `_state` | `_persist_state` → `aed_save_config` (upsert by `owner_id`) / `aed_put_document` |
+| `categories` (`text[]`, never empty) | `aed_config.categories` | same | same |
+| `retention_days` (1–3650) | `aed_config.retention_days` | same | same |
 
-## 2. Pinned-stack facts (source-verified, not assumed)
+Store selection: `db_client.aed_store_mode()` probes `aed_config` **once per
+process** and caches only a definitive answer (`42P01`/`PGRST205`/“does not
+exist” ⇒ `legacy`; readable ⇒ `dedicated`; `get_db() is None` ⇒ `dedicated` over
+the in-memory fallback). A transient probe failure is not cached and falls back
+to `legacy` **for that call only**.
 
-Installed and inspected in this workspace: `supabase 2.4.2`, `postgrest 0.16.11`,
-`httpx 0.27.0`, `httpcore 1.0.9`, `h2 4.4.1` (`backend/requirements.txt` pins
-`supabase==2.4.2` and `httpx==0.27.0`; `httpcore`/`h2` arrive transitively).
+Startup: `register()` binds the owner and starts `ensure_loaded_async()` as one
+background task. `_state` is the only cache; `state()`, `is_enabled()`,
+`categories()`, `retention_days()` never perform I/O.
 
-1. **One synchronous client, HTTP/2 on.**
-   `postgrest/_sync/client.py::SyncPostgrestClient.create_session` builds
-   `SyncClient(..., timeout=timeout, http2=True)`, i.e. a bare `httpx.Client`
-   subclass. `backend/db/client.py::get_db` passes
-   `ClientOptions(postgrest_client_timeout=8.0)`.
-2. **The read primitive.**
-   `httpcore/_backends/sync.py::SyncStream.read` is exactly
-   `self._sock.settimeout(timeout); return self._sock.recv(max_bytes)` inside
-   `map_exceptions({socket.timeout: ReadTimeout, OSError: ReadError})`.
-   So *only* a real `OSError` can produce `ReadError`, and its errno is preserved
-   as the innermost link of the chain we log.
-3. **Where the errno comes from.** `httpcore/_sync/http2.py::_read_incoming_data`
-   calls `network_stream.read(READ_NUM_BYTES, timeouts["read"])` — a constant
-   per-read timeout (8.0 s here), not a shrinking deadline. A would-block at the
-   syscall level therefore has exactly two possible timings: immediate
-   (`elapsed ≈ 0`) or after the timeout (`elapsed ≈ 8`).
-4. **CPython implements a positive socket timeout over a NON-BLOCKING fd.**
-   Measured: with `settimeout(0.6)` the fd has `O_NONBLOCK` set (`fcntl
-   F_GETFL`) both before and during `recv`; `SO_RCVTIMEO` stays `(0,0)`.
-   Consequently every Supabase read runs over a non-blocking TLS fd, and an
-   `SSL_read` EAGAIN that OpenSSL reports as `SSL_ERROR_SYSCALL` (rather than
-   `SSL_ERROR_WANT_READ`) is translated by CPython into `OSError(11)` →
-   **`BlockingIOError`**, which is precisely the observed innermost link.
-   A plain non-blocking `socket.recv` gives the same class
-   (`BlockingIOError`, errno 11); an `SSLSocket` in pure non-blocking mode gives
-   `SSLWantReadError` with **errno 2**. The production chain is the former.
-5. **Connection reuse cannot manufacture `EAGAIN`.**
-   A pooled connection that the peer closed cleanly yields
-   `RemoteProtocolError("Server disconnected")` (read returned `b""`); a GOAWAY
-   yields `RemoteProtocolError(ConnectionTerminated)`; a reset yields
-   `ECONNRESET` (104). None of these is `EAGAIN`. Also, `HTTP2Connection
-   .is_available()` is `False` once `_connection_error` is set, so a poisoned
-   connection is not handed out again.
-6. **No retry exists anywhere in this path.** Neither `postgrest` nor `httpx`
-   contains retry logic (grep: no `retry`/`max_retries`), and `run_sync_db`
-   dispatches once. A failed write therefore stays ambiguous — which is why no
-   retry is added here.
+### 3.2 Archive
 
-### Transport/lifecycle knobs that exist today
-
-Checked one by one, because the brief asks whether any *existing* setting can be
-changed safely without adding another client, executor or retry loop:
-
-| Knob | Where | Verdict |
-|---|---|---|
-| PostgREST transport deadline (8 s) | `ClientOptions(postgrest_client_timeout=8.0)` | the only transport knob the pinned `supabase` client exposes; already correct (strictly below the 10 s dispatch budget) |
-| Worker count (4) | `backend/db/client.py::_DB_MAX_WORKERS` | bounds concurrent sockets on the shared client; no evidence supports changing it |
-| HTTP/2 on/off, keepalive expiry, connection limits, `max_connections` | built *inside* `postgrest.utils.SyncClient` as `httpx.Client(..., http2=True)` | not reachable through `ClientOptions`; changing them means replacing the session/transport by private-API surgery, i.e. exactly the second transport layer this phase must not add |
-| Client lifetime (created once, never closed) | `backend/db/client.py::get_db` | closing/recreating it would end keepalive reuse and need a new lifecycle owner; unsupported by the evidence |
-
-**No existing transport setting or lifecycle behaviour can be changed safely on
-the current evidence.** Each candidate would be a hypothesis-driven change, and
-the focused regression test such a change requires cannot even be written until
-the missing measurement exists.
-
-### Local reproductions used above
-
-| Experiment | Result |
+| Field / state | Storage |
 |---|---|
-| TLS peer accepts, never writes; client `settimeout(0.2)`, `recv` | `TimeoutError`, `errno=None` (→ `ReadTimeout`) |
-| TLS peer accepts, silent; client `settimeout(0)`, `recv` | `SSLWantReadError`, `errno=2` |
-| Plain `socketpair`, peer silent, `setblocking(False)`, `recv` | `BlockingIOError`, `errno=11` |
-| TLS fd flags with `settimeout(0.6)` before and during `recv` | `O_NONBLOCK` set in both, `SO_RCVTIMEO=(0,0)` |
-| 200 trials: one thread blocked in `SSLSocket.recv`, one thread `send`ing on the same socket | 198 `TimeoutError`, 0 `BlockingIOError` |
+| one row per observed version (`id` = deterministic SHA-1 of owner/chat/message/kind/version, `owner_id`, `chat_id` (>0), `message_id`, `kind`, `category`, `has_caption`, `captured_at`, `message_date`, `edited_at`, `sender_id`, `out`, `has_media`, `body`, `media_type/name/size/stored/object`, `recoverable`, `recovered_from`, `peer_id/username/name`) | `aed_archive_entries` (dedicated) or four `bot_settings['anti_edit_delete_archive_shard:0..3']` JSON lists (legacy) |
+| Read | `load_rows_async` → `aed_load_entries(owner)` (dedicated) / `aed_load_archive(keys)` (legacy); owner-filtered, sorted by `captured_at DESC`, bounded to `MAX_ARCHIVE_ROWS = 500`; `None` = unreadable (fail closed) |
+| Write | `_save_rows` → `aed_save_entries(owner, rows)` = upsert by `id` then prune the owner's rows no longer present / `aed_save_archive(keys, shards)` |
+| Deletion | explicit single/group/clear, and `cleanup_expired` (the existing `memory_cleanup` worker; no second scheduler) |
 
----
+### 3.3 What breaks (confirmed)
 
-## 3. Concurrency question (is the shared client / bounded pool invalid?)
+1. **No legacy → dedicated backfill.** `_read_config` (dedicated mode) returns
+   `default_state()` when `aed_load_config` returns `None`; `load_rows_async`
+   returns `stored` (empty list) as-is. The legacy document and shards are never
+   read once the probe says `dedicated`, so the first restart after the tables
+   appear loses the configuration and hides every previously archived row
+   (§34.5 documents the deferral; the user experiences it as a reset).
+2. **Startup capture race.** The three handlers check `service.is_enabled()`
+   synchronously. Before the preload completes `_state` is `{}`, so `is_enabled()`
+   is `False` and the event is dropped without ever calling
+   `record_message` (which is the function that awaits the load). Every redeploy
+   therefore opens a window in which captures are lost.
+3. **Unreadable ≠ empty.** `_get_aed_config_sync` returns `None` both for “no
+   row” and for “the read failed”. `ensure_loaded_async` then stores
+   `default_state()` and sets `_loaded = True`; `_persist_state` happily writes
+   that default document plus the next change, so one transient error silently
+   rewrites the owner's configuration.
 
-Investigated because the same synchronous client is dispatched from a bounded
-4-worker pool:
+## 4. Private Message Management — complete persistence audit
 
-* `httpx.Client` is documented as shareable across threads; `httpcore` guards a
-  connection with a separate read lock and write lock, and reads/writes from
-  different threads are the intended HTTP/2 pattern (multiplexed streams).
-* Both `SyncStream.read` and `SyncStream.write` call `sock.settimeout(...)` on
-  the same fd, but with the **same** value here (read = write = 8.0 from
-  `ClientOptions`), so no thread can flip the other's mode.
-* The 200-trial concurrency reproduction above produced `TimeoutError` only —
-  never `BlockingIOError`, never a corrupted-SSL error.
-* The pool is bounded: `_DB_MAX_WORKERS = 4`, `_DB_HTTP_TIMEOUT = 8.0 <
-  _DB_TIMEOUT = 10.0` (test-pinned), so at most four sockets exist on the shared
-  client and no thread outlives its transport deadline.
-
-**Conclusion:** nothing in the current design is proven invalid, and no
-evidence justifies a second client, a bigger/smaller pool, a timeout change or
-serialisation. The brief's constraint to preserve this architecture is
-consistent with the evidence.
-
----
-
-## 4. The one change made (diagnostic, not behavioural)
-
-Are the current logs sufficient to decide the remaining hypotheses? **Before this
-change: no.** `reason` + `chain` name the failing layer and errno, but a
-would-block that returns instantly and a transport deadline that expired after
-eight seconds produce the identical line. **After it: yes**, for the read path —
-the added fields separate those two cases mechanically, and separate a read from
-a write/connect, a peer termination, and a watchdog abandonment.
-
-`chain=` answered *what* failed. It cannot answer *when in the call* it failed,
-and that is the last thing separating the two remaining explanations of
-`BlockingIOError(errno=11)`:
-
-* the 8 s read transport deadline expired and the platform surfaced it as a
-  syscall would-block → the call was in flight for ~8 s;
-* the TLS/socket layer refused the read immediately (non-blocking fd / would-
-  block or an `SSL_ERROR_SYSCALL` EAGAIN) → the call failed in milliseconds.
-
-So the once-per-episode `TASK_FALLBACK_CLASSIFIED` line now also carries:
-
-| Field | Meaning | Why it decides |
+| Field / state | Column | Read/write path |
 |---|---|---|
-| `elapsed` | in-flight seconds of the failing transport call, measured **inside** the shared worker (executor queueing excluded); `n/a` when the failure came from the watchdog, not the transport | `≈8.0s` ⇒ deadline; `≈0.0s` ⇒ immediate refusal |
-| `phase` | transport stage derived from class names only: `read`, `write`, `connect`, `pool`, `protocol`, `deadline`, `unknown` | separates a read from a connect/write, and a peer termination from a deadline |
-| `since_ok` | seconds since the last successful durable operation in this process (`never` if none) | a failure 0.5 s after a success is a transient blip, not an unreachable store |
+| master switch | `private_message_config.enabled` | `sanitize_state` ⇄ `_pm_config_payload` (`_PM_CONFIG_COLUMNS`) via `get_private_message_config` / `save_private_message_config` |
+| mode | `.mode` (`open`/`whitelist_only`/`closed`) | same |
+| delete / fixed / AI action flags | `.delete_incoming`, `.fixed_response_enabled`, `.ai_response_enabled` | same |
+| fixed response text | `.fixed_response_text` (≤512) | same |
+| AI allowance | `.ai_max_replies_per_person`, `.ai_unlimited_replies` | same |
+| AI interval | `.ai_interval_seconds` | same |
+| automatic reset | `.ai_counter_reset_enabled`, `.ai_counter_reset_seconds` | same (added by `20261016000001…`) |
+| allow-list / exceptions | `.allowlist`, `.exceptions` (`bigint[]`) | same |
+| temporary override | `.temporary` (JSON, expiry) | same |
+| weekly schedule | `.schedule` (JSON: enabled, timezone, rules) | same |
+| per-person counters | `private_message_senders.ai_replies_used`, `.last_ai_reply_at`, `.window_started_at` | `claim_private_message_ai_reply` (one CAS) / `release_private_message_ai_reply` (compensating CAS) / `reset_private_message_counters` |
+| legacy Phase-1 state | `bot_settings['private_message_management']` | `get_legacy_private_message_state`, imported once and written to the dedicated row |
 
-All three are numbers or lower-case enums. **Nothing** is retried, delayed,
-re-classified, suppressed or relabelled; the cooldown, the dispatch budget, the
-transport deadline, the worker count and the fallback semantics are untouched.
-Implementation detail and exact code are in `IMPLEMENTATION_REPORT.md`.
+Every column exists in the migrations (`20260929000001…` + `20261016000001…`)
+and every one is in `_PM_CONFIG_COLUMNS` except the three sender columns, which
+the CAS in `client.py` writes.
 
----
+### 4.1 What breaks (confirmed)
 
-## 5. What the next production episode must show
+1. **Unreadable ≠ missing, and the failed read can overwrite.** `_read_state_document`
+   calls `get_private_message_config`, which returns `None` on a read error; the
+   service then reads the **legacy** document and `_load_task_body` writes the
+   imported (stale) state into the dedicated row. If the legacy document is
+   absent, defaults are loaded, `_loaded` becomes `True`, and the next panel
+   change persists defaults plus that change.
+2. **A failed load is treated as a completed load.** `_load_task_body` sets
+   `_loaded = True` before reading and never clears it on failure, so the
+   process keeps serving/caching defaults for its whole lifetime.
+3. **A change can be reported durable without a write.** `_write_state_row`
+   returns `True` when `owner_id()` is `None` (“state kept in memory only”). The
+   panel then reports success although nothing was persisted. (The no-database
+   case is different and documented: `persistence_available()` is surfaced in the
+   panel as “memory only”.)
+4. Counters themselves are **not** reset by a restart: the claim, release and
+   reset are dedicated-table writes; the in-memory fallback is used only when no
+   database is configured at all.
 
-Read the `TASK_FALLBACK_CLASSIFIED` line and decide mechanically:
+## 5. Auto-Reaction
 
-| Observed | Conclusion | Next action |
+`settings_service` has 14 typed settings; `_DEFAULTS` includes
+`auto_reaction_enabled` (False) and `auto_reaction_emoji` (""), the validators
+reject non-bool/non-str, the repository writes a real column per setting
+(`update_field`), and `auto_reaction_service.process_outgoing_message` reads both
+through `is_auto_reaction_enabled()` / `auto_reaction_emoji()`.
+
+`panel_settings` (canonical snapshot + migrations) has **no** such columns:
+`grep -r auto_reaction supabase/` returns nothing, and
+`tests/test_database_setup_order.py` previously pinned the absence. On a Supabase
+database built from §31.3, PostgREST rejects the update (unknown column), the
+repository logs the failure, `set_setting` still returns `True` after caching, and
+the toggle/emoji are lost on every restart. The tree documented the pair as
+“PROPOSED — no migration creates it” and even suggested a manual SQL snippet,
+which was in practice a second, undocumented setup step.
+
+## 6. Migration / canonical coverage
+
+| Object | Migration | In §31.3 (before this round) |
 |---|---|---|
-| `phase=read elapsed=7.5s…8.0s chain=…BlockingIOError(errno=11)` | the transport deadline is being reported as a syscall would-block — a latency/platform artefact on the read path | pursue host/edge latency (Render egress, Supabase edge), not the client |
-| `phase=read elapsed=0.0s…0.1s chain=…BlockingIOError(errno=11)` | the socket refused the read immediately — non-blocking-fd / `SSL_ERROR_SYSCALL` path | capture host counters around the same minute (open fds, sockets in `CLOSE_WAIT`/`TIME_WAIT`, `lifeos-supabase-*` threads) and, if available, an `strace`-level sample |
-| `phase=protocol` + `ConnectionTerminated` | peer/HTTP-2 GOAWAY — connection expiry, a different problem | correlate timestamps with the errno rows; consider connection lifetime, never a blind retry |
-| `phase=deadline` / `elapsed=n/a` | watchdog abandonment (thread still blocked) — the client cannot keep up | revisit the dispatch budget with measurements |
-| `phase=write` | the write phase, so response ambiguity is even stronger | do **not** retry; keep the non-durable label |
-| `since_ok=` small (≪ the episode) | the durable path was healthy moments earlier | treat as transient, keep the cooldown |
+| `aed_config`, `aed_archive_entries` (+ index, RLS, grants) | `20261017000001_create_anti_edit_delete_tables.sql` | part 12 of 13 |
+| `private_message_config`, `private_message_senders` | `20260929000001_create_private_message_tables.sql` | part 10 of 13 |
+| counter-reset columns + CHECK | `20261016000001_add_private_message_counter_reset.sql` | part 11 of 13 |
+| PM access hardening (service-role only, zero policies) | `20261020144423_harden_private_message_table_access.sql` | part 13 of 13 |
+| `panel_settings.auto_reaction_enabled` / `.auto_reaction_emoji` | **missing** | **missing** |
 
-Simultaneously confirm that the lifecycle-task false-stall warnings stay absent
-(`Task-1`/`Task-27` no longer appear as `TASK_NO_PROGRESS`/`TASK_STARVATION`)
-while a genuine bounded stall is still reported.
+AED and PM security posture is already restrictive and was **not** weakened:
+RLS enabled on all four tables, zero policies, every privilege revoked from
+`PUBLIC`/`anon`/`authenticated` (table and column level), only
+`SELECT/INSERT/UPDATE/DELETE` granted to `service_role`. The PM creation
+migration's permissive policies live only in history; part 13 removes them.
 
----
+## 7. Root causes — confirmed vs. hypothesis
 
-## 6. Tests and exact results (this phase)
-
-| Command | Result |
+| Claim | Status |
 |---|---|
-| `pytest tests/test_task_transport_evidence.py -q` | **12 passed** (new file) |
-| `pytest tests/test_task_transport_evidence.py tests/test_task_fallback_classification.py tests/test_task_fallback_cooldown.py tests/test_local_resource_bounds.py tests/test_task_repository.py -q` | **64 passed** |
-| `pytest tests/test_07_diagnostics.py tests/test_11_runtime_wiring.py tests/test_task_scheduler.py tests/test_task_execution.py tests/test_03_database_consistency.py tests/test_06_failure_simulation.py tests/test_22_reliability.py tests/test_24_execution_reliability.py tests/test_30_delete_timeout_hardening.py -q` | **91 passed** |
-| `pytest tests -q -p no:cacheprovider` (full suite) | **6394 passed, 27 skipped, 40 failed** in 123.97 s |
-| failure set of the full run | **all 40 in `tests/test_colored_buttons.py`** — `Button.inline() got an unexpected keyword argument 'style'`, i.e. workspace Telethon **1.34.0** vs pinned **1.43.0**. Pre-existing, unrelated, not fixed here |
-| `python3 -m py_compile backend/db/client.py backend/ai/database/task_repository.py tests/test_task_transport_evidence.py` | exit 0 |
-| `git diff --check` | clean |
+| AED configuration and archive appear reset because the dedicated tables are authoritative but empty (no legacy import) | **Confirmed** in code, §34.5 and the tests |
+| AED misses captures right after a restart because the handlers check the cache before awaiting the load | **Confirmed** in code |
+| A transient read error can replace a persisted AED/PM configuration with defaults (and, for PM, with the legacy document) | **Confirmed** in code |
+| Auto-Reaction settings do not survive a redeploy because no column exists | **Confirmed** statically (no migration, no column) |
+| “The migration was never applied on the live project” | **Hypothesis** — the live schema is not reachable from here; the code degrades honestly (writes report failure) in that case |
+| “Supabase is deleting rows” | **No evidence**; nothing in the repository deletes configuration rows, and the archive is only pruned by explicit actions/retention |
+| “A second scheduler/cache resets state” | **No evidence**; there is exactly one of each |
 
-Accounting: baseline `6382 passed` + **12** new tests = `6394`. No new failures;
-the 27 skips are the unchanged opt-in/live tests.
+## 8. Tests executed before editing
 
----
+`pytest tests/test_anti_edit_delete.py tests/test_private_message_management.py
+tests/test_private_message_db_security.py tests/test_aed_db_security.py
+tests/test_database_setup_order.py tests/test_canonical_schema_reconciliation.py
+tests/test_private_message_scope.py -q` → see §12 for the recorded run.
 
-## 7. Constraints preserved
+They prove the offline contracts (routing, scope, owner isolation, honest failed
+writes, retention, statement identity, security posture). They do **not** prove
+any of the persistence transitions above — no existing test simulates a legacy →
+dedicated restart, an unreadable read, or a capture during the preload window.
 
-* One shared Supabase client, one bounded 4-worker pool, one dispatch point
-  (`run_sync_db`). No second client, executor, scheduler, update loop or retry
-  system.
-* Transport deadline (8 s) strictly below the dispatch deadline (10 s) — the
-  measurement is taken inside the worker and never changes either deadline.
-* Bounded local-resource cooldown (5 s) and truthful in-memory fallback
-  labelling unchanged; a cooldown-skipped call still raises
-  `LocalResourceCooldown`/`reason=local_resource` and emits no second line.
-* No retry of writes (ambiguous completion), no suppression of the warning, no
-  relabelling of `EAGAIN` as an outage.
-* No HTTP/2 disablement, no timeout/worker-count change.
-* No schema, SQL, migration or `DATABASE_ARCHITECTURE.md` change.
-* No credential, token, URL, header or message content in the diagnostics —
-  names, errno integers, enums and bounded numbers only.
+## 9. Fixes (implemented in this round)
 
----
+1. New additive migration for the two Auto-Reaction columns, embedded as the
+   next part of §31.3, with the migration inventory/counts and tests updated.
+2. AED legacy → dedicated backfill (configuration **and** archive), idempotent,
+   never overwriting dedicated data, gated so a cleared archive is not
+   resurrected by a later restart.
+3. AED handlers await the load before reading the cached switch.
+4. AED + PM: an unreadable configuration is no longer treated as an empty one;
+   default state is never persisted unless it was actually loaded; both services
+   refuse a mutation while the state is not known.
+5. PM: the legacy fallback only runs after a **successful** dedicated read, and
+   a missing owner is reported as a failed durable write instead of a success.
 
-## 8. Unresolved / unverified
+## 10. Live verification limits
 
-* **The OS-level origin of `EAGAIN` on Render is unproven.** The repository can
-  prove it is a local socket-layer would-block on the read path (not a timeout,
-  not saturation, not a store error, not the HTTP/2 termination) but not which
-  local condition produces it.
-* **`ConnectionTerminated` correlation with the errno-11 bursts is unproven**;
-  only the separation of the two signatures is proven.
-* **No production verification.** Nothing was deployed or observed. A
-  successful commit is not proof of deployment or recovery.
-* **Dependency drift:** `httpcore` and `h2` are not pinned in
-  `backend/requirements.txt`; the versions examined here are `httpcore 1.0.9`
-  and `h2 4.4.1`, so a later rebuild may resolve a different transport
-  implementation and change the semantics these conclusions rest on. Not
-  changed in this phase (it alters the deployed stack and is not needed to
-  answer the question); recommended as a separate, deliberate dependency pin.
-* **`RuntimeSupervisor._cancel_orphan_tasks` still cancels uvicorn's lifespan
-  task** on a hard reset (auto-named, unprotected). Pre-existing, outside this
-  phase.
-* **The 40 button-colour failures** remain (workspace Telethon version) and are
-  unrelated.
+No Supabase connection, SQL execution or migration was performed here or by any
+commit reachable from `d33dbe2`. No Telegram client was started; no Render
+deployment or log was read. “The archive survives in production” and “PM policy
+survives in production” remain **untested claims** until the owner applies the
+migrations and observes a restart.
 
----
+## 11. Evidence table
 
-## 9. Manual action required
+| Claim | Evidence | Status |
+|---|---|---|
+| AED capture is gated on a possibly-unloaded cache | `anti_edit_delete.py` handlers check `service.is_enabled()` before any await | Confirmed (source) |
+| AED has no legacy import | `_read_config` / `load_rows_async` read only the active store; §34.5 | Confirmed (source) |
+| Unreadable config ⇒ defaults ⇒ next write persists them | `_get_aed_config_sync` / `_get_private_message_config_sync` return `None`; `_read_config` / `_read_state_document` map `None` to defaults | Confirmed (source) |
+| PM can overwrite a dedicated row with the legacy document | `_read_state_document` legacy branch + `_load_task_body` write | Confirmed (source) |
+| PM can report a durable save without writing | `_write_state_row` returns `True` when `owner_id()` is `None` | Confirmed (source) |
+| Auto-Reaction columns are absent from every migration | `grep -r auto_reaction supabase/` → no hits | Confirmed (static) |
+| The four feature tables are service-role only | migrations 20261017000001 / 20260929000001 / 20261020144423 + `test_aed_db_security.py` / `test_private_message_db_security.py` | Confirmed (static + tests) |
+| Live Supabase state | no connection | **Not verified** |
+| Live Telegram behaviour | no session | **Not verified** |
 
-1. Confirm Render deployed the commit that carries this change and read the next
-   `TASK_FALLBACK_CLASSIFIED` line — the table in §5 decides the remaining cause
-   mechanically. This workspace cannot reach Render.
-2. Collect host-level counters for the same minute as the episode (open fds,
-   sockets in `CLOSE_WAIT`/`TIME_WAIT`, `lifeos-supabase-*` thread count). Render
-   Free has no shell; this needs an existing metric surface or platform metric.
-3. Decide, once §5 identifies the cause, whether a single bounded **read-only**
-   re-dispatch is worth designing (writes must stay non-retried). Not designed
-   here, because the cause is not established and a second attempt would need to
-   fit inside the existing 10 s dispatch budget.
+## 12. Tests executed after the fixes
 
----
+Recorded in `IMPLEMENTATION_REPORT.md` §13 (exact commands and results).
 
-## 10. Delivery state
+## 13. Changes made
 
-The code and test change is in `backend/db/client.py`,
-`backend/ai/database/task_repository.py` and
-`tests/test_task_transport_evidence.py`; this document and
-`IMPLEMENTATION_REPORT.md` are replaced in full. The commit that delivers them is
-identified with `git log -1` on the checked-out branch (`origin/main`), because a
-file cannot contain the SHA of its own commit.
+Source: `backend/db/client.py`, `backend/services/anti_edit_delete_service.py`,
+`backend/services/private_message_service.py`,
+`backend/bot/handlers/anti_edit_delete.py`; schema:
+`supabase/migrations/20261020160000_add_panel_settings_auto_reaction_settings.sql`;
+documentation: `DATABASE_ARCHITECTURE.md`, `ROADMAP.md`,
+`IMPLEMENTATION_REPORT.md`, this file; tests: `tests/test_auto_reaction_schema.py`
+(new), `tests/test_anti_edit_delete.py`,
+`tests/test_private_message_management.py`, `tests/test_database_setup_order.py`,
+`tests/test_private_message_db_security.py`, `tests/test_private_message_scope.py`,
+`tests/test_private_message_panel.py`. No secret, credential, dependency or
+unrelated feature was touched, and no SQL was executed against any database.

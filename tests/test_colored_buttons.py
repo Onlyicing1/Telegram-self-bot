@@ -220,7 +220,7 @@ class TestMainPanelStyles:
     def test_other_menu_buttons_are_primary(self):
         result = self._menu_result()
         buttons = {b.text: b for r in result.send_message.reply_markup.rows for b in r.buttons}
-        for label in ("Profile", "Database", "General", "Settings", "Ghost Seen",
+        for label in ("Profile", "Database", "General", "Settings", "Cipher",
                       "Todo"):
             assert _bg(buttons[label], "primary") is True, label
 

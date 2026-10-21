@@ -126,6 +126,16 @@ _state: dict[str, Any] = {}
 _loaded = False
 _load_task: asyncio.Task | None = None
 _load_task_loop: Any = None
+
+#: The one-time legacy -> dedicated import runs at most once per process. It is
+#: marked done only when the dedicated row was written, so a failed import is
+#: retried on the next start instead of being forgotten.
+_legacy_import_done = False
+
+#: A failed load is retried no more often than this, so a database outage cannot
+#: turn every incoming message into a read attempt.
+_LOAD_RETRY_SECONDS = 5.0
+_load_retry_at: float = 0.0
 _rows: list[dict[str, Any]] = []
 _rows_loaded = False
 _lock: asyncio.Lock | None = None
@@ -165,11 +175,13 @@ def reset_in_memory() -> None:
     """Clear every in-memory cache (tests / process restart)."""
     global _state, _loaded, _load_task, _load_task_loop
     global _rows, _rows_loaded, _lock, _lock_loop, _owner_id
-    global _inflight_loop
+    global _inflight_loop, _legacy_import_done, _load_retry_at
     _state = {}
     _loaded = False
     _load_task = None
     _load_task_loop = None
+    _legacy_import_done = False
+    _load_retry_at = 0.0
     _rows = []
     _rows_loaded = False
     _lock = None
@@ -224,22 +236,33 @@ def _config_key(owner: int) -> str:
     return f"{_CONFIG_KEY_PREFIX}{owner}"
 
 
-async def _read_config(owner: int) -> dict[str, Any]:
+async def _read_config(owner: int) -> dict[str, Any] | None:
     """The owner's configuration from the ONE active store.
 
     The dedicated ``aed_config`` row is authoritative once the migration is
     applied; before that the legacy ``bot_settings`` document is read (READ
     ONLY) so the feature keeps its behaviour. ``aed_store_mode`` decides which
     one is used, once per process.
+
+    ``None`` means the store could NOT be read. That is deliberately distinct
+    from “no row yet”: an unreadable store must never be presented as (or
+    persisted as) the default configuration.
     """
     from backend.db import client as db_client
 
     if await db_client.aed_store_mode() == "dedicated":
-        row = await db_client.aed_load_config(owner)
+        await _import_legacy_store(owner)
+        row, readable = await db_client.aed_load_config_state(owner)
+        if not readable:
+            logger.warning("[AED] configuration store unreadable — feature stays OFF")
+            return None
         if row is None:
             return default_state()
         return sanitize_state(row)
-    raw = await db_client.aed_get_document(_config_key(owner))
+    raw, readable = await db_client.aed_get_document_state(_config_key(owner))
+    if not readable:
+        logger.warning("[AED] legacy configuration store unreadable — feature stays OFF")
+        return None
     if raw is None:
         return default_state()
     try:
@@ -249,17 +272,102 @@ async def _read_config(owner: int) -> dict[str, Any]:
         return default_state()
 
 
+async def _import_legacy_store(owner: int) -> None:
+    """Import the pre-migration ``bot_settings`` store into the dedicated tables
+    exactly ONCE, before the dedicated row is trusted.
+
+    The dedicated tables became authoritative the moment they became readable,
+    but the legacy store is where every existing configuration and archive row
+    lives; without this import the first restart after the migration shows the
+    defaults and an empty archive, i.e. the owner's settings “reset”.
+
+    Safety properties, in the order they are enforced:
+
+    * it runs only in ``dedicated`` mode and only while the owner has NO
+      dedicated configuration row — that row is the migration marker, so a
+      second start, or an owner who later clears the archive, never re-imports;
+    * rows are imported only when the DEDICATED archive is empty, and the
+      configuration only after the rows landed, so no newer dedicated value is
+      ever overwritten by a stale legacy one;
+    * an unreadable legacy source (``readable=False``) aborts the attempt and
+      leaves the marker unwritten, so it is retried instead of importing
+      defaults over a stored configuration;
+    * nothing is deleted: the legacy documents stay exactly as they are.
+    """
+    global _legacy_import_done
+    from backend.db import client as db_client
+
+    if _legacy_import_done:
+        return
+    row, readable = await db_client.aed_load_config_state(owner)
+    if not readable:
+        return
+    if row is not None:
+        _legacy_import_done = True
+        return
+
+    existing = await db_client.aed_load_entries(owner)
+    if existing is None:
+        return
+    if not existing:
+        shards = await db_client.aed_load_archive(list(_SHARD_KEYS))
+        if shards is None:
+            logger.warning("[AED] legacy archive unreadable — import deferred")
+            return
+        legacy_rows = [
+            dict(row)
+            for shard in shards
+            for row in shard
+            if isinstance(row, dict) and row.get("owner_id") == owner
+        ]
+        if legacy_rows:
+            legacy_rows.sort(key=lambda r: str(r.get("captured_at") or ""), reverse=True)
+            legacy_rows = legacy_rows[:MAX_ARCHIVE_ROWS]
+            if not await db_client.aed_save_entries(owner, legacy_rows):
+                logger.warning("[AED] legacy archive import failed — retried on the next start")
+                return
+            logger.info(
+                "[AED] imported %s legacy archive row(s) into aed_archive_entries",
+                len(legacy_rows),
+            )
+
+    raw, readable = await db_client.aed_get_document_state(_config_key(owner))
+    if not readable:
+        logger.warning("[AED] legacy configuration unreadable — import deferred")
+        return
+    imported = default_state()
+    if raw:
+        try:
+            imported = sanitize_state(json.loads(raw))
+        except Exception:
+            logger.warning("[AED] legacy configuration is not valid JSON — importing defaults")
+    if not await db_client.aed_save_config(owner, imported):
+        logger.warning("[AED] legacy configuration import failed — retried on the next start")
+        return
+    _legacy_import_done = True
+    logger.info("[AED] legacy configuration imported into aed_config")
+
+
 async def ensure_loaded_async() -> None:
-    """Single-flight load of this owner's configuration into memory."""
-    global _loaded, _load_task, _load_task_loop
+    """Single-flight load of this owner's configuration into memory.
+
+    A failed read leaves ``_loaded`` False (the feature fails closed) and is
+    retried no more often than ``_LOAD_RETRY_SECONDS``.
+    """
+    global _loaded, _load_task, _load_task_loop, _load_retry_at
     owner = _owner_id
     loop = _running_loop()
     if _loaded and _state:
+        return
+    if time.monotonic() < _load_retry_at:
         return
     if _load_task is None or _load_task.done() or _load_task_loop is not loop:
         _load_task_loop = loop
         _load_task = asyncio.ensure_future(_read_config(owner))
     doc = await asyncio.shield(_load_task)
+    if doc is None:
+        _load_retry_at = time.monotonic() + _LOAD_RETRY_SECONDS
+        return
     _state.clear()
     _state.update(doc)
     _loaded = True
@@ -290,6 +398,11 @@ def retention_days() -> int:
 async def _persist_state(candidate: dict[str, Any]) -> bool:
     from backend.db import client as db_client
 
+    if not _loaded:
+        # The stored configuration was never read, so this candidate is built on
+        # defaults. Writing it would erase the owner's real settings.
+        logger.warning("[AED] configuration not loaded — refusing to overwrite it")
+        return False
     owner = _owner_id
     if await db_client.aed_store_mode() == "dedicated":
         ok = await db_client.aed_save_config(owner, candidate)
@@ -353,11 +466,12 @@ def eligible(
     A private chat id is the other user's POSITIVE id; groups/supergroups/
     channels are negative, and Saved Messages is the owner's own id.
 
-    ``peer_is_bot`` is TRI-STATE: ``True`` only when the peer's RESOLVED
-    Telegram ``User`` entity carries the real ``bot`` flag — a positive chat id
-    alone is NOT proof of a human. ``None``/``False`` (entity missing or
-    unresolved) never blocks here; callers keep their documented safe fallback
-    rather than guessing an unclassified peer's humanity.
+    ``peer_is_bot`` is TRI-STATE and must be a CONFIRMED classification:
+    ``False`` only for a RESOLVED Telegram ``User`` whose real ``bot`` flag is
+    false (a human), ``True`` for a resolved bot, and ``None`` when the peer
+    could not be resolved at all. A positive chat id alone is NOT proof of a
+    human, so ``None`` is rejected here (fail closed): an unclassified peer is
+    never admitted as a confirmed human private chat.
     """
     if not isinstance(owner, int) or isinstance(owner, bool) or owner <= 0:
         return False, "invalid_owner"
@@ -371,6 +485,8 @@ def eligible(
         return False, "via_bot"
     if peer_is_bot is True:
         return False, "peer_is_bot"
+    if peer_is_bot is not False:
+        return False, "peer_unresolved"
     return True, "eligible"
 
 
@@ -485,7 +601,14 @@ async def _resolve_peer_bot(client: Any, chat_id: int) -> bool:
         logger.debug("[AED] peer bot resolution failed for %s: %s", chat_id, type(exc).__name__)
         _defer_resolution(chat_id, _PEER_FAIL_COOLDOWN_S)
         return False
-    flagged = is_bot_entity(entity)
+    # A confirmed classification needs a resolved Telegram User and a REAL
+    # boolean ``bot`` flag. Any other resolved object (a Chat/Channel) or a
+    # missing flag is UNKNOWN, not a human: it is not cached as one and gets the
+    # same bounded cooldown as a failed lookup.
+    if type(entity).__name__ != "User" or getattr(entity, "bot", None) not in (True, False):
+        _defer_resolution(chat_id, _PEER_FAIL_COOLDOWN_S)
+        return False
+    flagged = getattr(entity, "bot") is True
     _cache_peer_bot(chat_id, flagged)
     if flagged:
         logger.info("[AED] peer %s resolved as a Telegram BOT — excluded from the archive", chat_id)
@@ -498,9 +621,10 @@ async def peer_bot_status(client: Any, chat_id: Any) -> bool:
     """The peer's real bot flag for one archive chat id, or ``False`` (UNKNOWN).
 
     ``True`` requires a RESOLVED bot ``User`` entity; anything else — no client,
-    an unresolvable peer, an unresolved entity, a deferred (rate-limited)
-    resolution — stays False and is treated as UNKNOWN (rows are kept, never
-    guessed human). Successful results are cached per chat id (bounded).
+    an unresolvable peer, an unresolved entity, a non-``User`` entity, a
+    deferred (rate-limited) resolution — stays False and is UNKNOWN. Only a
+    resolved human ``User`` is cached with ``False``; browse scope uses that
+    cache entry to prove humanity (``peer_human_status``).
 
     Reliability (no retry loop, no request storm):
       * ONE shared in-flight task per peer: concurrent and successive callers
@@ -536,22 +660,42 @@ async def peer_bot_status(client: Any, chat_id: Any) -> bool:
             registry.pop(chat_id, None)
 
 
-async def filter_bot_items(client: Any, items: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
-    """Hide persisted archive items whose peer RESOLVES to a Telegram bot.
+async def peer_human_status(client: Any, chat_id: Any) -> bool:
+    """True ONLY for a peer CONFIRMED as a human Telegram user.
 
-    Rows captured before the bot exclusion (or on a cold capture) carry no bot
-    metadata, so the live entity check is the only reliable classification at
-    browse time. Without a client, or while a peer's classification is unknown
-    (including a bounded rate-limit cooldown), the item is KEPT (the existing
-    safe fallback) — the limitation is documented in the capture handlers.
-    Returns ``(filtered_items, number_hidden)``.
+    ``False`` covers every other case — invalid or non-private chat id, the
+    owner's own account (Saved Messages), a resolved bot, an unresolvable peer,
+    a failed lookup and a bounded rate-limit cooldown. A positive chat id alone
+    is never accepted as proof of a human.
     """
-    if client is None or not items:
-        return list(items), 0
+    if not isinstance(chat_id, int) or isinstance(chat_id, bool) or chat_id <= 0:
+        return False
+    current_owner = owner_id()
+    if current_owner is not None and chat_id == current_owner:
+        return False
+    if client is None:
+        return False
+    chat_id = int(chat_id)
+    await peer_bot_status(client, chat_id)
+    return _peer_bot_cache.get(chat_id) is False
+
+
+async def filter_scope_items(client: Any, items: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+    """Keep only items from a CONFIRMED human private chat.
+
+    Browse and detail are the user-visible surface of the archive, so the same
+    strict scope the capture path enforces is re-proved here against the LIVE
+    Telegram entity: a persisted row captured before this rule (or with an
+    unresolved peer) is never shown as a human private conversation. Hidden
+    items are not deleted — retention still owns their lifecycle. Returns
+    ``(visible_items, number_hidden)``.
+    """
+    if not items:
+        return [], 0
     result: list[dict[str, Any]] = []
     hidden = 0
     for item in items:
-        if await peer_bot_status(client, item.get("chat_id")):
+        if not await peer_human_status(client, item.get("chat_id")):
             hidden += 1
             continue
         result.append(item)
@@ -810,6 +954,7 @@ async def load_rows_async(force: bool = False) -> list[dict[str, Any]] | None:
     from backend.db import client as db_client
 
     if await db_client.aed_store_mode() == "dedicated":
+        await _import_legacy_store(_owner_id)
         stored = await db_client.aed_load_entries(_owner_id)
         if stored is None:
             return None
@@ -1126,11 +1271,18 @@ def _identity_from(versions: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def build_items(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Collapse snapshot/edit rows into ONE item per logical message.
+    """Collapse snapshot/edit rows into ONE VISIBLE item per logical message.
 
-    Deletion rows are NEVER collapsed: a deletion is an independent archive event
-    and stays its own list entry with its own recoverability display, even when
-    the same message also has observed content versions.
+    Only a message with an OBSERVED EDIT becomes a content item. The snapshot
+    captured when the message was first seen is an internal recovery record:
+    it is retained in storage (and in the item's ``versions`` once an edit
+    makes the item visible) so a later deletion can still be reconstructed,
+    but an unchanged message is never shown as an archive entry.
+
+    Deletion rows are NEVER collapsed: a deletion is an independent archive
+    event and stays its own list entry with its own recoverability display,
+    even when the same message also has observed content versions. Only an
+    actual deletion event creates one — a snapshot alone never does.
     """
     groups: dict[tuple[Any, Any], dict[str, Any]] = {}
     order: list[Any] = []
@@ -1155,6 +1307,9 @@ def build_items(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for key in order:
         group = groups[key]
         versions = group["versions"]
+        if not any(version.get("kind") == KIND_EDIT for version in versions):
+            # Snapshot-only history: an internal recovery record, not an event.
+            continue
         latest = max(versions, key=lambda r: str(r.get("captured_at") or ""))
         body = latest.get("body") or ""
         media_name = latest.get("media_name")

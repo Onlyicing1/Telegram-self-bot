@@ -746,25 +746,34 @@ class SupabaseTaskRepository(TaskRepository):
         # string, which is the OS text for the local errno and by itself cannot
         # distinguish a local resource shortage from a store outage (that is
         # the exact gap that made the live misclassification possible).
-        # ``phase``, ``elapsed`` and ``since_ok`` are the remaining deciders:
+        # Production's separate ``ConnectionTerminated`` line is now reported as
+        # a gap rather than correlated by hand, so the next episode says whether
+        # the errno-11 read failure followed a peer/HTTP-2 teardown or happened
+        # with no teardown observed at all in this process.
+        # ``phase``, ``elapsed``, ``since_ok`` and ``since_teardown`` are the
+        # deciders:
         #   * elapsed ~= the transport deadline (8s) -> the deadline expired;
         #   * elapsed ~= 0s -> the socket refused the read immediately;
         #   * phase -> read vs write vs connect vs protocol termination;
-        #   * since_ok -> the durable path was healthy moments before.
-        # All four are numbers/enums only (no message, URL, header or token).
-        from backend.db.client import db_inflight_seconds
+        #   * since_ok -> the durable path was healthy moments before;
+        #   * since_teardown -> a peer/HTTP-2 termination just happened (or not).
+        # All five are numbers/enums only (no message, URL, header or token).
+        from backend.db.client import db_inflight_seconds, seconds_since_transport_teardown
 
         since_ok = (
             "never" if self._last_ok_monotonic is None
             else _format_evidence_seconds(time.monotonic() - self._last_ok_monotonic)
         )
+        teardown_ago = seconds_since_transport_teardown()
         logger.warning(
             "TASK_FALLBACK_CLASSIFIED reason=%s phase=%s exception=%s chain=%s "
-            "elapsed=%s since_ok=%s message=%s",
+            "elapsed=%s since_ok=%s since_teardown=%s message=%s",
             self._fallback_reason, _transport_phase(exc), type(exc).__name__,
             _describe_exception_chain(exc),
             _format_evidence_seconds(db_inflight_seconds(exc)),
-            since_ok, str(exc)[:200],
+            since_ok,
+            "none" if teardown_ago is None else _format_evidence_seconds(teardown_ago),
+            str(exc)[:200],
         )
     def _degrade(self, message: str, exc: Exception, *, align_ids: bool = False) -> None:
         """Enter the degraded state and report it — at most once per episode.

@@ -928,7 +928,7 @@ def register(client, owner_id: int, tz_str: str = "UTC") -> None:
         guarded_create_task(_ensure_allowed_loaded_async(), name="ghost_seen_v2:preload_allowed")
     except Exception:
         pass
-    register_panel(_PANEL_ID, lambda event, extra: _browser_panel_handler(event, extra, owner_id), parent="menu", title="Ghost Seen")
+    register_panel(_PANEL_ID, lambda event, extra: _browser_panel_handler(event, extra, owner_id), parent="cipher", title="Ghost Seen")
     register_panel(_VIEWER_ID, lambda event, extra: _viewer_panel_handler(event, extra, owner_id), parent=_PANEL_ID, title="Ghost Seen")
     register_panel(_ACTION_ID, lambda event, extra: _actions_panel_handler(event, extra, owner_id), parent=_VIEWER_ID, title="Ghost Seen")
     register_panel(_MANAGE_ID, lambda event, extra: _manage_panel_handler(event, extra, owner_id), parent=_PANEL_ID, title="Permissions")

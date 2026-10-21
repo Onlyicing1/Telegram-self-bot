@@ -290,12 +290,28 @@ def _msg(
     )
 
 
-def _deleted_event(*, chat_id=FRIEND, ids=(7,), is_private=True):
-    return SimpleNamespace(
+_UNSET = object()
+
+
+def _human(chat_id):
+    """A resolved human ``User`` for a positive private chat id."""
+    return User(id=int(chat_id), username="peer", bot=False)
+
+
+def _deleted_event(*, chat_id=FRIEND, ids=(7,), is_private=True, entity=_UNSET):
+    event = SimpleNamespace(
         chat_id=chat_id,
         deleted_ids=list(ids),
         is_private=is_private,
     )
+    if entity is _UNSET:
+        entity = _human(chat_id) if isinstance(chat_id, int) and not isinstance(chat_id, bool) and chat_id > 0 else None
+
+    async def _get_chat():
+        return entity
+
+    event.get_chat = _get_chat
+    return event
 
 
 class User:
@@ -312,9 +328,21 @@ class User:
 
 
 class _Event:
-    """A capture event that can resolve its own chat entity."""
+    """A capture event that resolves its own chat entity.
 
-    def __init__(self, message, chat_entity=None, is_private=True, chat_error=None):
+    Omitting ``chat_entity`` means "a resolved human peer for this private
+    chat" (the ordinary case); pass ``None`` explicitly to simulate a peer that
+    cannot be resolved at all.
+    """
+
+    def __init__(self, message, chat_entity=_UNSET, is_private=True, chat_error=None):
+        if chat_entity is _UNSET:
+            chat_id = getattr(message, "chat_id", None)
+            chat_entity = (
+                _human(chat_id)
+                if isinstance(chat_id, int) and not isinstance(chat_id, bool) and chat_id > 0
+                else None
+            )
         self.message = message
         self.is_private = is_private
         self.chat_id = getattr(message, "chat_id", None)
@@ -365,6 +393,10 @@ def client(db):
 @pytest.fixture()
 def enabled(db):
     _run(svc.set_enabled(True))
+    # Browse/detail re-prove the strict scope against the live self client. A
+    # resolver that classifies every peer as a human is the ordinary case; the
+    # tests that exercise a bot or an unresolved peer override it.
+    inline_engine.set_self_client(_resolving_peer())
     return db
 
 
@@ -436,11 +468,13 @@ def test_register_wires_every_panel_action_and_input(client):
     ):
         assert get_action(action_id) is not None, action_id
     assert get_input("archive", "retention") is not None
-    assert get_registry().get_parent("archive") == "menu"
+    assert get_registry().get_parent("archive") == "cipher"
 
 
-def test_the_mother_menu_opens_the_archive_panel(client):
-    assert "panel:archive" in _datas(misc._build_menu_buttons())
+def test_the_mother_menu_reaches_the_archive_through_cipher(client):
+    datas = _datas(misc._build_menu_buttons())
+    assert "panel:archive" not in datas
+    assert "panel:cipher" in datas
 
 
 def test_every_callback_data_fits_telegram_limits(client):
@@ -489,12 +523,19 @@ def test_retention_validation_bounds(db):
 # ── 4. scope gate ────────────────────────────────────────────────────────────
 
 
-def test_scope_gate_accepts_only_private_user_chats():
-    assert svc.eligible(owner=OWNER, chat_id=FRIEND, is_private=True) == (True, "eligible")
-    assert svc.eligible(owner=OWNER, chat_id=GROUP, is_private=True)[0] is False
-    assert svc.eligible(owner=OWNER, chat_id=OWNER, is_private=True)[1] == "saved_messages"
-    assert svc.eligible(owner=OWNER, chat_id=FRIEND, is_private=False)[0] is False
-    assert svc.eligible(owner=OWNER, chat_id=FRIEND, is_private=True, via_bot_id=99)[0] is False
+def test_scope_gate_accepts_only_confirmed_human_private_chats():
+    assert svc.eligible(owner=OWNER, chat_id=FRIEND, is_private=True, peer_is_bot=False) == (
+        True, "eligible"
+    )
+    assert svc.eligible(owner=OWNER, chat_id=GROUP, is_private=True, peer_is_bot=False)[0] is False
+    assert svc.eligible(owner=OWNER, chat_id=OWNER, is_private=True, peer_is_bot=False)[1] == "saved_messages"
+    assert svc.eligible(owner=OWNER, chat_id=FRIEND, is_private=False, peer_is_bot=False)[0] is False
+    assert svc.eligible(owner=OWNER, chat_id=FRIEND, is_private=True,
+                        via_bot_id=99, peer_is_bot=False)[0] is False
+    # An unclassified peer is never admitted on the strength of a positive id.
+    assert svc.eligible(owner=OWNER, chat_id=FRIEND, is_private=True) == (
+        False, "peer_unresolved"
+    )
 
 
 # ── 5. snapshot capture ──────────────────────────────────────────────────────
@@ -502,7 +543,7 @@ def test_scope_gate_accepts_only_private_user_chats():
 
 def test_a_private_message_is_snapshotted_while_enabled(client, enabled):
     handler = client.handler("NewMessage")
-    _run(handler(SimpleNamespace(message=_msg(text="meet at 5pm"))))
+    _run(handler(_Event(_msg(text="meet at 5pm"))))
     rows = _run(svc.load_rows_async())
     assert len(rows) == 1
     assert rows[0]["kind"] == svc.KIND_SNAPSHOT
@@ -512,30 +553,30 @@ def test_a_private_message_is_snapshotted_while_enabled(client, enabled):
 
 def test_capture_is_inert_while_disabled(client, db):
     handler = client.handler("NewMessage")
-    _run(handler(SimpleNamespace(message=_msg())))
+    _run(handler(_Event(_msg())))
     assert _run(svc.load_rows_async()) == []
 
 
 def test_out_of_scope_messages_are_never_captured(client, enabled):
     handler = client.handler("NewMessage")
-    _run(handler(SimpleNamespace(message=_msg(chat_id=GROUP))))
-    _run(handler(SimpleNamespace(message=_msg(chat_id=OWNER))))
-    _run(handler(SimpleNamespace(message=_msg(via_bot_id=42))))
+    _run(handler(_Event(_msg(chat_id=GROUP))))
+    _run(handler(_Event(_msg(chat_id=OWNER))))
+    _run(handler(_Event(_msg(via_bot_id=42))))
     assert _run(svc.load_rows_async()) == []
 
 
 def test_a_redelivered_snapshot_is_recorded_once(client, enabled):
     handler = client.handler("NewMessage")
     message = _msg()
-    _run(handler(SimpleNamespace(message=message)))
-    _run(handler(SimpleNamespace(message=message)))
+    _run(handler(_Event(message)))
+    _run(handler(_Event(message)))
     assert len(_run(svc.load_rows_async())) == 1
 
 
 def test_category_filter_is_honoured_on_capture(client, enabled):
     assert _run(svc.set_category(svc.CATEGORY_TEXT, False)) is True
     handler = client.handler("NewMessage")
-    _run(handler(SimpleNamespace(message=_msg(text="plain"))))
+    _run(handler(_Event(_msg(text="plain"))))
     assert _run(svc.load_rows_async()) == []
 
 
@@ -543,9 +584,9 @@ def test_category_filter_is_honoured_on_capture(client, enabled):
 
 
 def test_an_edit_is_recorded_as_a_new_version(client, enabled):
-    _run(client.handler("NewMessage")(SimpleNamespace(message=_msg(text="v1"))))
+    _run(client.handler("NewMessage")(_Event(_msg(text="v1"))))
     _run(client.handler("MessageEdited")(
-        SimpleNamespace(message=_msg(text="v2", edit_date=datetime.now(timezone.utc)))
+        _Event(_msg(text="v2", edit_date=datetime.now(timezone.utc)))
     ))
     rows = _run(svc.load_rows_async())
     kinds = [r["kind"] for r in rows]
@@ -557,7 +598,7 @@ def test_an_edit_is_recorded_as_a_new_version(client, enabled):
 
 
 def test_a_deletion_after_a_snapshot_is_recoverable(client, enabled):
-    _run(client.handler("NewMessage")(SimpleNamespace(message=_msg(message_id=9, text="secret"))))
+    _run(client.handler("NewMessage")(_Event(_msg(message_id=9, text="secret"))))
     _run(client.handler("MessageDeleted")(_deleted_event(ids=(9,))))
     rows = _run(svc.load_rows_async())
     deletion = next(r for r in rows if r["kind"] == svc.KIND_DELETE)
@@ -582,8 +623,8 @@ def test_a_deletion_in_a_group_is_never_recorded(client, enabled):
 
 
 def test_browse_filters_by_category_and_query(client, enabled):
-    _run(client.handler("NewMessage")(SimpleNamespace(message=_msg(message_id=1, text="alpha"))))
-    _run(client.handler("NewMessage")(SimpleNamespace(message=_msg(message_id=2, text="beta"))))
+    _run(client.handler("NewMessage")(_Event(_msg(message_id=1, text="alpha"))))
+    _run(client.handler("NewMessage")(_Event(_msg(message_id=2, text="beta"))))
     rows = _run(svc.load_rows_async())
     assert [r["body"] for r in svc.filter_rows(rows, query="alph")] == ["alpha"]
     assert len(svc.filter_rows(rows, category=svc.CATEGORY_TEXT)) == 2
@@ -592,7 +633,7 @@ def test_browse_filters_by_category_and_query(client, enabled):
 def test_caption_filter_matches_media_with_captions(client, enabled):
     media = MessageMediaPhoto()
     _run(client.handler("NewMessage")(
-        SimpleNamespace(message=_msg(message_id=3, text="a caption", media=media))
+        _Event(_msg(message_id=3, text="a caption", media=media))
     ))
     rows = _run(svc.load_rows_async())
     assert len(svc.filter_rows(rows, category=svc.CATEGORY_CAPTIONS)) == 1
@@ -602,7 +643,7 @@ def test_caption_filter_matches_media_with_captions(client, enabled):
 def test_pagination_is_bounded_and_clamped(client, enabled):
     for index in range(svc.PAGE_SIZE + 3):
         _run(client.handler("NewMessage")(
-            SimpleNamespace(message=_msg(message_id=100 + index, text=f"m{index}"))
+            _Event(_msg(message_id=100 + index, text=f"m{index}"))
         ))
     rows = _run(svc.load_rows_async())
     first, page, pages = svc.page_of(rows, 1)
@@ -612,8 +653,8 @@ def test_pagination_is_bounded_and_clamped(client, enabled):
 
 
 def test_delete_one_row_and_clear_archive(client, enabled):
-    _run(client.handler("NewMessage")(SimpleNamespace(message=_msg(message_id=1))))
-    _run(client.handler("NewMessage")(SimpleNamespace(message=_msg(message_id=2))))
+    _run(client.handler("NewMessage")(_Event(_msg(message_id=1))))
+    _run(client.handler("NewMessage")(_Event(_msg(message_id=2))))
     rows = _run(svc.load_rows_async())
     assert _run(svc.delete_row(rows[0]["id"])) is True
     assert len(_run(svc.load_rows_async())) == 1
@@ -659,7 +700,7 @@ def test_cleanup_expired_is_a_noop_without_expired_rows(db):
 def test_media_metadata_is_bounded_and_never_fabricated(client, enabled):
     doc = _document([DocumentAttributeFilename("report.pdf")], size=999)
     media = MessageMediaDocument(doc)
-    _run(client.handler("NewMessage")(SimpleNamespace(message=_msg(message_id=4, text="", media=media))))
+    _run(client.handler("NewMessage")(_Event(_msg(message_id=4, text="", media=media))))
     row = _run(svc.load_rows_async())[0]
     assert row["category"] == svc.CATEGORY_DOCUMENTS
     assert row["media_name"] == "report.pdf"
@@ -672,7 +713,7 @@ def test_media_metadata_is_bounded_and_never_fabricated(client, enabled):
 def test_voice_document_is_classified_as_voice(client, enabled):
     doc = _document([DocumentAttributeAudio(voice=True)])
     media = MessageMediaDocument(doc)
-    _run(client.handler("NewMessage")(SimpleNamespace(message=_msg(message_id=5, media=media))))
+    _run(client.handler("NewMessage")(_Event(_msg(message_id=5, media=media))))
     assert _run(svc.load_rows_async())[0]["category"] == svc.CATEGORY_VOICE
 
 
@@ -702,14 +743,15 @@ def test_category_action_refuses_to_empty(client, db):
 
 
 def test_list_panel_renders_archived_items(client, enabled):
-    _run(client.handler("NewMessage")(SimpleNamespace(message=_msg(text="remember this"))))
+    _capture(client, _msg(text="remember this"))
+    _edit(client, _msg(text="remember this, edited", edit_date=datetime.now(timezone.utc)))
     title, body, buttons = _panel("archive_list")
     rendered = body + " ".join(_texts(buttons))
-    assert "remember this" in rendered
+    assert "remember this, edited" in rendered
 
 
 def test_item_panel_marks_recoverability(client, enabled):
-    _run(client.handler("NewMessage")(SimpleNamespace(message=_msg(message_id=9, text="x"))))
+    _run(client.handler("NewMessage")(_Event(_msg(message_id=9, text="x"))))
     _run(client.handler("MessageDeleted")(_deleted_event(ids=(9,))))
     rows = _run(svc.load_rows_async())
     deletion = next(r for r in rows if r["kind"] == svc.KIND_DELETE)
@@ -719,7 +761,7 @@ def test_item_panel_marks_recoverability(client, enabled):
 
 
 def test_clear_confirm_panel_and_action(client, enabled):
-    _run(client.handler("NewMessage")(SimpleNamespace(message=_msg())))
+    _run(client.handler("NewMessage")(_Event(_msg())))
     _title, _body, buttons = _panel("archive_confirm")
     assert "action:aed_clear_confirm" in _datas(buttons)
     _action("aed_clear_confirm")
@@ -739,18 +781,128 @@ def test_retention_input_validates_and_persists(client, db, monkeypatch):
 # ── 12. logical-message grouping (Requirement 1) ─────────────────────────────
 
 
-def _capture(client, message, *, entity=None, kind="NewMessage"):
+def _capture(client, message, *, entity=_UNSET, kind="NewMessage"):
     event = _Event(message, chat_entity=entity)
     _run(client.handler(kind)(event))
 
 
-def _edit(client, message, *, entity=None):
+def _edit(client, message, *, entity=_UNSET):
     _run(client.handler("MessageEdited")(_Event(message, chat_entity=entity)))
 
 
 def _list_buttons(client):
     _title, _body, buttons = _panel("archive_list")
     return _datas(buttons)
+
+
+# ── visible events vs. internal recovery snapshots ─────────────────────────
+
+
+def test_a_snapshot_only_message_is_not_an_archive_entry(client, enabled):
+    """The ordinary case: a human private message is captured for recovery but
+    is invisible until an edit or deletion is actually observed."""
+    _capture(client, _msg(message_id=7, text="untouched"))
+    rows = _run(svc.load_rows_async())
+    assert [r["kind"] for r in rows] == [svc.KIND_SNAPSHOT]   # stored internally
+    _title, body, buttons = _panel("archive_list")
+    assert not [d for d in _datas(buttons) if d.startswith("panel:archive_item:")]
+    assert "0 item(s)" in body
+    # ... and its detail is not reachable by id either.
+    _t, detail, _b = _panel("archive_item", svc.group_id(FRIEND, 7))
+    assert "no longer in the archive" in detail
+
+
+def test_an_observed_edit_makes_the_message_visible_with_its_original(client, enabled):
+    _capture(client, _msg(message_id=7, text="original"))
+    _edit(client, _msg(message_id=7, text="edited", edit_date=datetime.now(timezone.utc)))
+    items = svc.build_items(_run(svc.load_rows_async()))
+    assert len(items) == 1 and items[0]["version_count"] == 2
+    assert [v["kind"] for v in items[0]["versions"]] == [svc.KIND_EDIT, svc.KIND_SNAPSHOT]
+    _t, body, _b = _panel("archive_item", svc.group_id(FRIEND, 7))
+    assert "original" in body and "edited" in body
+    assert "v1 (original)" in body and "v2 (edit)" in body
+
+
+def test_a_deletion_is_listed_only_after_the_deletion_event(client, enabled):
+    _capture(client, _msg(message_id=9, text="secret"))
+    _title, _body, buttons = _panel("archive_list")
+    assert not [d for d in _datas(buttons) if d.startswith("panel:archive_item:")]
+
+    _run(client.handler("MessageDeleted")(_deleted_event(ids=(9,))))
+    items = svc.build_items(_run(svc.load_rows_async()))
+    assert [item["kind"] for item in items] == [svc.KIND_DELETE]
+    assert items[0]["recoverable"] is True
+    _t, detail, _b = _panel("archive_item", items[0]["id"])
+    assert "Recoverable from a pre-deletion snapshot" in detail
+    assert "secret" in detail
+
+
+def test_an_unrecoverable_deletion_is_listed_honestly_without_content(client, enabled):
+    _run(client.handler("MessageDeleted")(_deleted_event(ids=(555,))))
+    items = svc.build_items(_run(svc.load_rows_async()))
+    assert len(items) == 1 and items[0]["kind"] == svc.KIND_DELETE
+    assert items[0]["recoverable"] is False and items[0]["body"] == ""
+    _t, detail, _b = _panel("archive_item", items[0]["id"])
+    assert "never captured — not recoverable" in detail
+
+
+def test_the_snapshot_survives_after_a_deletion_for_recovery(client, enabled):
+    _capture(client, _msg(message_id=9, text="recover me"))
+    _run(client.handler("MessageDeleted")(_deleted_event(ids=(9,))))
+    rows = _run(svc.load_rows_async())
+    snapshot = next(r for r in rows if r["kind"] == svc.KIND_SNAPSHOT)
+    deletion = next(r for r in rows if r["kind"] == svc.KIND_DELETE)
+    assert snapshot["body"] == "recover me"           # internal record kept
+    assert deletion["body"] == "recover me"            # recovered from it
+    assert deletion["recoverable"] is True
+
+
+def test_browse_hides_persisted_rows_from_a_non_private_chat(client, enabled):
+    now = datetime.now(timezone.utc).isoformat()
+    _seed_rows(enabled, [{
+        "id": "grouprow", "owner_id": OWNER, "chat_id": GROUP, "message_id": 3,
+        "kind": svc.KIND_EDIT, "category": svc.CATEGORY_TEXT,
+        "captured_at": now, "body": "group message",
+    }, {
+        "id": "channelrow", "owner_id": OWNER, "chat_id": -1009876543210, "message_id": 4,
+        "kind": svc.KIND_EDIT, "category": svc.CATEGORY_TEXT,
+        "captured_at": now, "body": "channel post",
+    }])
+    svc.reset_in_memory()
+    svc.configure_owner(OWNER)
+    _run(svc.set_enabled(True))
+    _title, body, buttons = _panel("archive_list")
+    rendered = body + " ".join(_texts(buttons))
+    assert "group message" not in rendered and "channel post" not in rendered
+    assert "2 persisted item(s) hidden" in body
+    _t, detail, _b = _panel("archive_item", svc.group_id(GROUP, 3))
+    assert "no longer in the archive" in detail
+
+
+def test_a_channel_post_is_never_captured(client, enabled):
+    channel = _msg(chat_id=-1009876543210, message_id=1, text="channel post")
+    _run(client.handler("NewMessage")(_Event(channel, is_private=False)))
+    assert _run(svc.load_rows_async()) == []
+
+
+def test_a_resolved_non_user_entity_is_not_a_confirmed_human(client, enabled):
+    class Channel:
+        def __init__(self):
+            self.id = FRIEND
+            self.title = "Not a user"
+
+    now = datetime.now(timezone.utc).isoformat()
+    _seed_rows(enabled, [{
+        "id": "channelrow", "owner_id": OWNER, "chat_id": FRIEND, "message_id": 5,
+        "kind": svc.KIND_EDIT, "category": svc.CATEGORY_TEXT,
+        "captured_at": now, "body": "not a human",
+    }])
+    svc.reset_in_memory()
+    svc.configure_owner(OWNER)
+    _run(svc.set_enabled(True))
+    items = svc.build_items(_run(svc.load_rows_async()))
+    filtered, hidden = _run(svc.filter_scope_items(_StubResolver(entity=Channel()), items))
+    assert filtered == [] and hidden == 1
 
 
 def test_a_snapshot_and_its_edit_render_as_one_list_button(client, enabled):
@@ -777,16 +929,20 @@ def test_multiple_edits_still_render_as_one_button_with_all_versions(client, ena
 
 
 def test_different_messages_with_identical_content_stay_separate(client, enabled):
-    _capture(client, _msg(message_id=1, text="same"))
-    _capture(client, _msg(message_id=2, text="same"))
+    for message_id in (1, 2):
+        _capture(client, _msg(message_id=message_id, text="same"))
+        _edit(client, _msg(message_id=message_id, text="same edited",
+                          edit_date=datetime.now(timezone.utc)))
     items = svc.build_items(_run(svc.load_rows_async()))
     assert len(items) == 2
     assert {i["message_id"] for i in items} == {1, 2}
 
 
 def test_identical_message_ids_in_different_chats_are_not_grouped(client, enabled):
-    _capture(client, _msg(chat_id=FRIEND, message_id=7, text="a"))
-    _capture(client, _msg(chat_id=FRIEND + 1, message_id=7, text="b"))
+    for chat_id in (FRIEND, FRIEND + 1):
+        _capture(client, _msg(chat_id=chat_id, message_id=7, text="same id"))
+        _edit(client, _msg(chat_id=chat_id, message_id=7, text="same id edited",
+                          edit_date=datetime.now(timezone.utc)))
     items = svc.build_items(_run(svc.load_rows_async()))
     assert len(items) == 2
     assert {(i["chat_id"], i["message_id"]) for i in items} == {(FRIEND, 7), (FRIEND + 1, 7)}
@@ -827,6 +983,8 @@ def test_pagination_counts_grouped_items_not_raw_versions(client, enabled):
 def test_category_filtering_is_correct_for_grouped_items(client, enabled):
     media = MessageMediaPhoto()
     _capture(client, _msg(message_id=1, text="plain text"))
+    _edit(client, _msg(message_id=1, text="plain text edited",
+                       edit_date=datetime.now(timezone.utc)))
     _capture(client, _msg(message_id=2, text="a caption", media=media))
     _edit(client, _msg(message_id=2, text="a caption edited", media=media,
                        edit_date=datetime.now(timezone.utc)))
@@ -920,6 +1078,7 @@ def test_incoming_message_peer_is_the_sender(client, enabled):
 def test_detail_view_shows_username_and_numeric_user_id(client, enabled):
     entity = User(id=FRIEND, username="alice", first_name="Alice")
     _capture(client, _msg(message_id=7, text="hi"), entity=entity)
+    _edit(client, _msg(message_id=7, text="hi again", edit_date=datetime.now(timezone.utc)), entity=entity)
     _title, body, _buttons = _panel("archive_item", svc.group_id(FRIEND, 7))
     assert f"@alice" in body
     assert f"User ID: {FRIEND}" in body
@@ -931,25 +1090,30 @@ def test_detail_view_shows_username_and_numeric_user_id(client, enabled):
 def test_identity_falls_back_to_the_numeric_id_without_a_username(client, enabled):
     entity = User(id=FRIEND, username=None, first_name=None, last_name=None)
     _capture(client, _msg(message_id=7, text="hi"), entity=entity)
+    _edit(client, _msg(message_id=7, text="hi again", edit_date=datetime.now(timezone.utc)), entity=entity)
     _title, body, _buttons = _panel("archive_item", svc.group_id(FRIEND, 7))
     assert f"User ID: {FRIEND}" in body
     assert "@" not in body.split("User ID:")[0].split("User:")[-1]
 
 
-def test_capture_survives_an_entity_resolution_failure(client, enabled):
-    event = _Event(_msg(message_id=7, text="still captured"), chat_error=RuntimeError("boom"))
+def test_an_unresolved_peer_is_never_captured(client, enabled):
+    # A peer that cannot be resolved cannot be proven human; the strict scope
+    # fails closed instead of admitting it on the strength of a chat id.
+    event = _Event(_msg(message_id=7, text="not captured"), chat_error=RuntimeError("boom"))
     _run(client.handler("NewMessage")(event))
-    row = _run(svc.load_rows_async())[0]
-    assert row["body"] == "still captured"
-    assert row["peer_id"] == FRIEND
-    assert row["peer_username"] is None
+    assert _run(svc.load_rows_async()) == []
+
+    edit = _Event(_msg(message_id=7, text="v2", edit_date=datetime.now(timezone.utc)),
+                  chat_error=RuntimeError("boom"))
+    _run(client.handler("MessageEdited")(edit))
+    assert _run(svc.load_rows_async()) == []
 
 
 def test_legacy_rows_without_identity_render_safely(client, enabled):
     # Simulate a row captured before the identity fields existed.
     legacy = {
         "id": "legacy01", "owner_id": OWNER, "chat_id": FRIEND, "message_id": 7,
-        "kind": svc.KIND_SNAPSHOT, "category": svc.CATEGORY_TEXT, "has_caption": False,
+        "kind": svc.KIND_EDIT, "category": svc.CATEGORY_TEXT, "has_caption": False,
         "captured_at": datetime.now(timezone.utc).isoformat(),
         "body": "old row", "has_media": False, "recoverable": True,
     }
@@ -978,24 +1142,23 @@ def test_identity_and_version_history_survive_a_persisted_reload(client, enabled
     assert items[0]["identity"]["peer_id"] == FRIEND
 
 
-def test_identity_is_not_read_off_a_non_user_entity(client, enabled):
+def test_a_non_user_entity_is_not_a_human_private_peer(client, enabled):
     class Chat:
         def __init__(self):
             self.id = FRIEND
             self.title = "Not A User"
 
     _capture(client, _msg(message_id=7, text="hi"), entity=Chat())
-    row = _run(svc.load_rows_async())[0]
-    assert row["peer_id"] == FRIEND
-    assert row["peer_username"] is None
+    assert _run(svc.load_rows_async()) == []
 
 
 def test_owner_isolation_is_preserved_across_grouping(client, enabled):
     _capture(client, _msg(message_id=7, text="mine"))
+    _edit(client, _msg(message_id=7, text="mine edited", edit_date=datetime.now(timezone.utc)))
     # Inject a row belonging to a DIFFERENT owner into the same store.
     other = {
         "id": "other01", "owner_id": OWNER + 1, "chat_id": FRIEND, "message_id": 8,
-        "kind": svc.KIND_SNAPSHOT, "category": svc.CATEGORY_TEXT,
+        "kind": svc.KIND_EDIT, "category": svc.CATEGORY_TEXT,
         "captured_at": datetime.now(timezone.utc).isoformat(), "body": "not mine",
     }
     _seed_rows(enabled, [other])
@@ -1004,7 +1167,7 @@ def test_owner_isolation_is_preserved_across_grouping(client, enabled):
     _run(svc.set_enabled(True))
     items = svc.build_items(_run(svc.load_rows_async()))
     assert len(items) == 1
-    assert items[0]["version_count"] == 1
+    assert items[0]["version_count"] == 2
     assert items[0]["message_id"] == 7
     assert "not mine" not in (items[0]["body"] or "")
 
@@ -1012,6 +1175,7 @@ def test_owner_isolation_is_preserved_across_grouping(client, enabled):
 def test_media_only_message_uses_an_honest_fallback_label(client, enabled):
     media = MessageMediaPhoto()
     _capture(client, _msg(message_id=7, text="", media=media))
+    _edit(client, _msg(message_id=7, text="", media=media, edit_date=datetime.now(timezone.utc)))
     item = svc.build_items(_run(svc.load_rows_async()))[0]
     assert item["body"].startswith("(Photo")
     assert item["media_name"] is None
@@ -1021,6 +1185,7 @@ def test_grouped_media_detail_keeps_the_metadata_only_indicator(client, enabled)
     doc = _document([DocumentAttributeFilename("report.pdf")], size=999)
     media = MessageMediaDocument(doc)
     _capture(client, _msg(message_id=7, text="", media=media))
+    _edit(client, _msg(message_id=7, text="", media=media, edit_date=datetime.now(timezone.utc)))
     _title, body, _buttons = _panel("archive_item", svc.group_id(FRIEND, 7))
     assert "metadata only" in body
 
@@ -1041,12 +1206,15 @@ def test_is_bot_entity_requires_a_resolved_bot_user():
     assert svc.is_bot_entity("sexyboyvpn_bot") is False
 
 
-def test_scope_gate_rejects_only_a_confirmed_bot_peer():
+def test_scope_gate_requires_a_confirmed_human_peer():
     assert svc.eligible(owner=OWNER, chat_id=BOT, is_private=True, peer_is_bot=True) == (
         False, "peer_is_bot"
     )
-    # Unknown (None) never blocks — the documented safe fallback.
+    # Unknown (None) is NOT a human: the gate fails closed.
     assert svc.eligible(owner=OWNER, chat_id=BOT, is_private=True, peer_is_bot=None) == (
+        False, "peer_unresolved"
+    )
+    assert svc.eligible(owner=OWNER, chat_id=FRIEND, is_private=True, peer_is_bot=False) == (
         True, "eligible"
     )
 
@@ -1079,14 +1247,14 @@ def test_a_bot_deletion_is_never_recorded_when_the_peer_resolves(client, enabled
     assert _run(svc.load_rows_async()) == []
 
 
-def test_a_deletion_from_an_unclassifiable_peer_keeps_the_safe_fallback(client, enabled):
-    # A deletion event whose peer cannot be resolved must not invent a human
-    # classification either; the existing chat-id fallback behaviour stands.
-    _run(client.handler("NewMessage")(SimpleNamespace(message=_msg(message_id=9, text="x"))))
-    event = _deleted_event(chat_id=BOT, ids=(9,))  # no get_chat → peer unknown
+def test_a_deletion_from_an_unclassifiable_peer_is_not_recorded(client, enabled):
+    # A deletion event whose peer cannot be resolved does not invent a human
+    # classification: nothing is recorded for it.
+    _run(client.handler("NewMessage")(_Event(_msg(message_id=9, text="x"))))
+    event = _deleted_event(chat_id=BOT, ids=(9,), entity=None)  # peer unknown
     _run(client.handler("MessageDeleted")(event))
     rows = _run(svc.load_rows_async())
-    assert len(rows) == 2  # snapshot + honest deletion record, unchanged
+    assert [r["kind"] for r in rows] == [svc.KIND_SNAPSHOT]
 
 
 def test_service_rejects_a_confirmed_bot_peer_on_snapshot_and_deletion(client, enabled):
@@ -1111,10 +1279,10 @@ def _seed_legacy_rows():
     now = datetime.now(timezone.utc).isoformat()
     rows = [
         {"id": "botrow01", "owner_id": OWNER, "chat_id": BOT, "message_id": 1,
-         "kind": svc.KIND_SNAPSHOT, "category": svc.CATEGORY_TEXT, "has_caption": False,
+         "kind": svc.KIND_EDIT, "category": svc.CATEGORY_TEXT, "has_caption": False,
          "captured_at": now, "body": "bot advertising", "has_media": False, "recoverable": True},
         {"id": "humrow02", "owner_id": OWNER, "chat_id": FRIEND, "message_id": 2,
-         "kind": svc.KIND_SNAPSHOT, "category": svc.CATEGORY_TEXT, "has_caption": False,
+         "kind": svc.KIND_EDIT, "category": svc.CATEGORY_TEXT, "has_caption": False,
          "captured_at": now, "body": "human note", "has_media": False, "recoverable": True},
     ]
     return rows
@@ -1155,29 +1323,31 @@ def test_persisted_bot_records_are_hidden_from_listing_and_detail(client, enable
     assert "human note" in body
 
 
-def test_no_client_or_unresolvable_peer_keeps_the_existing_fallback(client, enabled):
-    """Without a classification, a persisted row is NEVER hidden nor guessed
-    human-flat out: the existing safe fallback keeps it visible."""
+def test_no_client_or_unresolvable_peer_is_hidden(client, enabled):
+    """Without a confirmed human classification a persisted row is NOT shown:
+    the browse scope fails closed instead of guessing the peer's humanity."""
     seeded = _seed_legacy_rows()
     _seed_rows(enabled, [seeded[0], seeded[1]])
     svc.reset_in_memory()
     svc.configure_owner(OWNER)
     _run(svc.set_enabled(True))
 
-    # No client at all: nothing can be classified, nothing is hidden.
+    # No client at all: nothing can be classified, so nothing is shown.
+    inline_engine.set_self_client(None)
     _title, body, buttons = _panel("archive_list")
-    rendered = body + " ".join(_texts(buttons))
-    assert "bot advertising" in rendered and "human note" in rendered
+    rendered = body + "  ".join(_texts(buttons))
+    assert "bot advertising" not in rendered and "human note" not in rendered
+    assert "hidden" in body
 
-    # A resolution failure is never guessed either: the row stays visible.
+    # A resolution failure is not guessed either: the rows stay hidden.
     svc.reset_in_memory()
     svc.configure_owner(OWNER)
     _run(svc.set_enabled(True))
     svc._peer_bot_cache.clear()
-    filtered, hidden = _run(svc.filter_bot_items(_resolving_peer(broken=True),
-                                                 svc.build_items(_run(svc.load_rows_async()))))
-    assert hidden == 0
-    assert len(filtered) == 2
+    filtered, hidden = _run(svc.filter_scope_items(_resolving_peer(broken=True),
+                                                   svc.build_items(_run(svc.load_rows_async()))))
+    assert hidden == 2
+    assert filtered == []
 
 
 def test_peer_bot_status_is_cached_and_bounded(client, enabled, monkeypatch):
@@ -1287,7 +1457,7 @@ def test_cooldown_expiry_retries_and_classifies_normally(client, enabled):
     assert _run(svc.peer_bot_status(good, BOT)) is True
 
 
-def test_later_successful_resolution_hides_persisted_bot_rows(client, enabled):
+def test_later_successful_resolution_shows_only_the_confirmed_human(client, enabled):
     seeded = _seed_legacy_rows()
     _seed_rows(enabled, [seeded[0], seeded[1]])
     svc.reset_in_memory()
@@ -1295,13 +1465,15 @@ def test_later_successful_resolution_hides_persisted_bot_rows(client, enabled):
     _run(svc.set_enabled(True))
     broken = _StubResolver(raises=RuntimeError("boom"))
     items = svc.build_items(_run(svc.load_rows_async()))
-    _filtered, hidden = _run(svc.filter_bot_items(broken, items))
-    assert hidden == 0                       # unknown keeps rows, no guessing
+    filtered, hidden = _run(svc.filter_scope_items(broken, items))
+    assert hidden == 2                       # unresolved: nothing is shown
+    assert filtered == []
     for key in list(svc._cooldowns):
         svc._cooldowns[key] = time.monotonic() - 1   # after the cooldown expires
     bot_resolver = _StubResolver(entity=_bot_entity())
-    _filtered, hidden = _run(svc.filter_bot_items(bot_resolver, items))
-    assert hidden == 1                       # the resolved bot row is now hidden
+    filtered, hidden = _run(svc.filter_scope_items(bot_resolver, items))
+    assert hidden == 1                       # the resolved bot row is hidden
+    assert [item["body"] for item in filtered] == ["human note"]
     assert svc._peer_bot_cache.get(BOT) is True
     assert svc._peer_bot_cache.get(FRIEND) is False
 
@@ -1404,9 +1576,7 @@ def test_edit_and_delete_rows_keep_their_distinct_kinds(client, enabled):
     entity = User(id=FRIEND, username="alice")
     _capture(client, _msg(message_id=7, text="v1"), entity=entity)
     _edit(client, _msg(message_id=7, text="v2", edit_date=datetime.now(timezone.utc)), entity=entity)
-    _run(client.handler("MessageDeleted")(
-        SimpleNamespace(chat_id=FRIEND, deleted_ids=[7], is_private=True)
-    ))
+    _run(client.handler("MessageDeleted")(_deleted_event(ids=(7,))))
     kinds = sorted(r["kind"] for r in enabled.aed_entries)
     assert kinds == [svc.KIND_DELETE, svc.KIND_EDIT, svc.KIND_SNAPSHOT]
 
@@ -1441,7 +1611,7 @@ def test_malformed_persisted_rows_are_tolerated(client, enabled):
         {"id": "broken02", "owner_id": OWNER, "chat_id": None, "message_id": None,
          "kind": "nonsense", "captured_at": "not-a-date"},           # wrong values
         {"id": "ok01", "owner_id": OWNER, "chat_id": FRIEND, "message_id": 3,
-         "kind": svc.KIND_SNAPSHOT, "category": svc.CATEGORY_TEXT,
+         "kind": svc.KIND_EDIT, "category": svc.CATEGORY_TEXT,
          "captured_at": datetime.now(timezone.utc).isoformat(), "body": "fine"},
     ])
     svc.reset_in_memory()
@@ -1485,6 +1655,148 @@ def test_the_dedicated_schema_cannot_broaden_the_archive_scope():
     executable = re.sub(r"/\*.*?\*/", "", sql, flags=re.S)
     assert "CHECK (chat_id > 0)" in executable
     assert "CHECK (kind IN ('snapshot', 'edit', 'delete'))" in executable
+
+
+# ── the legacy → dedicated transition (the persistence audit) ───────────────
+#
+# The dedicated tables become authoritative the moment they exist, but the
+# owner's configuration and archive live in the legacy bot_settings documents.
+# Without the one-time import the first restart after the migration shows the
+# defaults and an empty archive — the reported "reset".
+
+
+def _legacy_row(row_id: str, owner: int = OWNER) -> dict:
+    return {
+        "id": row_id, "owner_id": owner, "chat_id": FRIEND, "message_id": 1,
+        "kind": svc.KIND_SNAPSHOT, "category": svc.CATEGORY_TEXT,
+        "captured_at": datetime.now(timezone.utc).isoformat(), "body": f"body {row_id}",
+    }
+
+
+def _apply_migration(fake: _FakeDB) -> None:
+    """Turn the SAME database into one where the dedicated tables now exist."""
+    fake.has_aed_tables = True
+    db_client.reset_aed_store_mode()
+    svc.reset_in_memory()
+    svc.configure_owner(OWNER)
+
+
+def test_the_legacy_configuration_and_archive_survive_the_migration(monkeypatch):
+    fake = _legacy_db(monkeypatch)
+    assert _run(svc.set_enabled(True)) is True
+    assert _run(svc.set_retention_days(2)) is True
+    assert _run(db_client.aed_save_archive(list(svc._SHARD_KEYS), [[
+        _legacy_row("legacy01"), _legacy_row("other-owner", owner=999999),
+    ], [], [], []])) is True
+    legacy_document = fake.rows[svc._config_key(OWNER)]["value"]
+
+    _apply_migration(fake)
+    assert fake.aed_config == {} and fake.aed_entries == []
+
+    _run(svc.ensure_loaded_async())
+    assert svc.is_enabled() is True, "the stored switch must not reset to OFF"
+    assert svc.retention_days() == 2
+    assert fake.aed_config[OWNER]["enabled"] is True
+
+    rows = _run(svc.load_rows_async())
+    assert [r["id"] for r in rows] == ["legacy01"], "owner-scoped, no foreign rows"
+    assert {r["id"] for r in fake.aed_entries} == {"legacy01"}
+    # The legacy source is preserved, never deleted by the import.
+    assert fake.rows[svc._config_key(OWNER)]["value"] == legacy_document
+
+
+def test_the_import_runs_once_and_newer_dedicated_data_wins(monkeypatch):
+    fake = _legacy_db(monkeypatch)
+    assert _run(svc.set_retention_days(2)) is True
+    assert _run(db_client.aed_save_archive(list(svc._SHARD_KEYS), [[
+        _legacy_row("legacy01"),
+    ], [], [], []])) is True
+    _apply_migration(fake)
+    _run(svc.load_rows_async())
+    assert {r["id"] for r in fake.aed_entries} == {"legacy01"}
+
+    # A newer dedicated value, and an archive the owner curated afterwards.
+    assert _run(svc.set_retention_days(7)) is True
+    fake.aed_entries.clear()
+
+    svc.reset_in_memory()
+    svc.configure_owner(OWNER)
+    _run(svc.ensure_loaded_async())
+    assert svc.retention_days() == 7, "a stale legacy value must never win"
+    assert _run(svc.load_rows_async()) == [], (
+        "the dedicated configuration row is the import marker, so a second start "
+        "never resurrects deleted archive rows"
+    )
+
+
+def test_a_restart_reloads_the_configuration_and_archive_from_the_tables(db):
+    assert _run(svc.set_enabled(True)) is True
+    assert _run(svc.set_retention_days(3)) is True
+    _seed_rows(db, [_legacy_row("persisted1"), _legacy_row("persisted2")])
+
+    svc.reset_in_memory()
+    svc.configure_owner(OWNER)
+    assert svc.is_enabled() is False  # the safe default until the load lands
+
+    _run(svc.ensure_loaded_async())
+    assert svc.is_enabled() is True
+    assert svc.retention_days() == 3
+    rows = _run(svc.load_rows_async())
+    assert {r["id"] for r in rows} == {"persisted1", "persisted2"}
+
+
+def test_an_unreadable_store_leaves_the_feature_off_and_refuses_writes(monkeypatch):
+    fake = _FakeDB()
+    monkeypatch.setattr("backend.db.client.get_db", lambda: fake)
+
+    async def _unreadable_config(owner_id):
+        return None, False
+
+    async def _unreadable_document(key):
+        return None, False
+
+    monkeypatch.setattr(db_client, "aed_load_config_state", _unreadable_config)
+    monkeypatch.setattr(db_client, "aed_get_document_state", _unreadable_document)
+
+    _run(svc.ensure_loaded_async())
+    assert svc._loaded is False, "a failed read must never count as a load"
+    assert svc.is_enabled() is False
+    assert _run(svc.set_enabled(True)) is False
+    assert fake.aed_config == {}, "an unreadable store must never be written over"
+
+
+def test_the_import_writes_no_defaults_when_a_legacy_source_is_unreadable(monkeypatch):
+    fake = _FakeDB()
+    monkeypatch.setattr("backend.db.client.get_db", lambda: fake)
+
+    async def _unreadable_document(key):
+        return None, False
+
+    monkeypatch.setattr(db_client, "aed_get_document_state", _unreadable_document)
+    _run(svc.ensure_loaded_async())
+    assert fake.aed_config == {}, "no configuration may be invented from an outage"
+    assert svc.is_enabled() is False
+
+
+def test_the_archive_import_is_deferred_when_the_legacy_shards_are_unreadable(monkeypatch):
+    fake = _FakeDB()
+    monkeypatch.setattr("backend.db.client.get_db", lambda: fake)
+
+    async def _unreadable_archive(shard_keys):
+        return None
+
+    stored_document = json.dumps({"enabled": True, "retention_days": 3})
+
+    async def _document(key):
+        return stored_document, True
+
+    monkeypatch.setattr(db_client, "aed_load_archive", _unreadable_archive)
+    monkeypatch.setattr(db_client, "aed_get_document_state", _document)
+
+    _run(svc.load_rows_async())
+    assert fake.aed_config == {}, (
+        "the configuration import waits for the archive, so a retry re-runs both"
+    )
 
 
 def test_legacy_shards_still_work_before_the_migration(monkeypatch):
@@ -1561,16 +1873,34 @@ def _edit_update(message, *, pts=1):
     return types.UpdateEditMessage(message=message, pts=pts, pts_count=1)
 
 
-def _deliver_as_edit(client, update):
+class _OfflineClient:
+    """What a real Telethon event touches before its handler runs.
+
+    The peer entity is already in the event's own entity map, so ``get_chat()``
+    resolves it offline — exactly as it does during a live dispatch.
+    """
+
+    def __init__(self):
+        self._self_id = OWNER
+        self._mb_entity_cache = {}
+
+
+def _deliver_as_edit(client, update, *, entity=_UNSET):
     """Run ONE real update through Telethon's builder, then the AED handler.
 
-    Returns the built event (``None`` when the builder does not classify the
-    update as an edit), so a test can assert on the real classification result
-    rather than on a mocked one.
+    The built event is wired the way ``TelegramClient._dispatch_update`` wires
+    it (entity map + client), so the handler sees a CONFIRMED human peer without
+    any RPC. Returns the built event (``None`` when the builder does not
+    classify the update as an edit), so a test asserts on the REAL
+    classification result rather than on a mocked one.
     """
     event = events.MessageEdited.build(update)
     if event is None:
         return None
+    peer = _human(FRIEND) if entity is _UNSET else entity
+    if peer is not None:
+        event._entities[FRIEND] = peer
+    event._set_client(_OfflineClient())
     _run(client.handler("MessageEdited")(event))
     return event
 
@@ -1597,10 +1927,12 @@ def test_a_reaction_on_an_archived_message_creates_no_edit_version(client, enabl
     _deliver_as_edit(client, _reaction_update(reactions=_reaction_state("👍")))
     rows = _rows(client)
     assert _kinds(rows) == [svc.KIND_SNAPSHOT]
-    items = svc.build_items(rows)
-    assert len(items) == 1
-    assert items[0]["version_count"] == 1
-    assert "versions" not in " ".join(_texts(_panel("archive_list")[2]))
+    # The internal recovery snapshot must not become an archive entry, i.e. the
+    # reaction is not an "observed event".
+    assert svc.build_items(rows) == []
+    _title, body, _buttons = _panel("archive_list")
+    assert "0 item(s)" in body
+    assert "versions" not in " ".join(_texts(_buttons))
 
 
 def test_an_edit_shaped_reaction_update_cannot_create_a_version(client, enabled):
@@ -1620,7 +1952,7 @@ def test_an_edit_shaped_reaction_update_cannot_create_a_version(client, enabled)
 
     rows = _rows(client)
     assert _kinds(rows) == [svc.KIND_SNAPSHOT]
-    assert svc.build_items(rows)[0]["version_count"] == 1
+    assert svc.build_items(rows) == []
 
 
 def test_an_unchanged_message_stays_invisible_after_a_reaction(client, enabled):
@@ -1641,9 +1973,10 @@ def test_adding_and_changing_reactions_never_increments_the_version_count(client
 
     rows = _rows(client)
     assert _kinds(rows) == [svc.KIND_SNAPSHOT]
-    items = svc.build_items(rows)
-    assert items[0]["version_count"] == 1
-    assert items[0]["body"] == "steady"
+    # Not one visible version, and no visible item at all.
+    assert svc.build_items(rows) == []
+    _title, body, _buttons = _panel("archive_list")
+    assert "0 item(s)" in body
 
 
 def test_reaction_state_never_participates_in_the_content_signature():

@@ -441,13 +441,15 @@ def test_every_panel_action_and_input_is_registered(registered):
     assert get_input("pm_rule", "start") is not None
     assert get_input("pm_rule", "end") is not None
     assert get_input("pm_sched", "timezone") is not None
-    assert get_registry().get_parent("pm") == "menu"
+    assert get_registry().get_parent("pm") == "cipher"
 
 
-def test_the_mother_menu_opens_the_private_message_panel(registered):
+def test_the_mother_menu_routes_private_messages_through_cipher(registered):
     from backend.bot.handlers.misc import _build_menu_buttons
 
-    assert "panel:pm" in _datas(_build_menu_buttons())
+    datas = _datas(_build_menu_buttons())
+    assert "panel:pm" not in datas
+    assert "panel:cipher" in datas
 
 
 def test_all_new_callback_data_fits_telegram_limits(registered, db):
@@ -854,7 +856,8 @@ def test_the_rule_builder_creates_a_rule_from_the_draft(registered, db, helper):
     _title, body, _buttons = _action("pm_rule_day", "4")
     assert "Mon" in body and "Fri" in body
     _title, body, _buttons = _action("pm_rule_mode")
-    assert "Mode:**" in body
+    assert "Mode:** Exceptions only" in body
+    assert any("Exceptions only" in text for text in _texts(_buttons))
     _input("pm_rule", "start", "22:00")
     _input("pm_rule", "end", "06:00")
     assert "22:00 – 06:00" in _edited_text(helper)
@@ -866,6 +869,20 @@ def test_the_rule_builder_creates_a_rule_from_the_draft(registered, db, helper):
     assert rule["mode"] == svc.MODE_CLOSED
     assert _stored_config(db)["schedule"]["rules"][0]["days"] == [0, 4]
     assert "1. " in body
+
+
+def test_the_rule_builder_names_each_restricted_policy_exactly(registered, db):
+    _action("pm_sched_new")
+    # Default draft: whitelist only; one tap: exceptions only; then open.
+    _t, body, _b = _action("pm_rule_mode")
+    assert pm._rule_drafts[OWNER]["mode"] == svc.MODE_CLOSED
+    assert "Exceptions only" in body
+    _t, body, _b = _action("pm_rule_mode")
+    assert pm._rule_drafts[OWNER]["mode"] == svc.MODE_OPEN
+    assert "Open (everyone)" in body
+    _t, body, _b = _action("pm_rule_mode")
+    assert pm._rule_drafts[OWNER]["mode"] == svc.MODE_WHITELIST_ONLY
+    assert "Whitelist only" in body
 
 
 def test_the_rule_builder_refuses_an_incomplete_rule(registered, db, helper):
@@ -921,7 +938,10 @@ def test_the_schedule_panel_names_the_next_transition(registered, db, helper):
     _action("pm_sched_toggle")
     _title, body, _buttons = _panel("pm_sched")
     assert "**Next transition:**" in body
-    assert "rule 1 start" in body
+    # The rule window is wall-clock based: outside 22:00–23:00 the next boundary
+    # is the rule's start, inside it the boundary that ends it. Both name the
+    # rule that causes the transition, which is what the panel promises.
+    assert "rule 1 start" in body or "rule 1 end" in body
 
 
 # ── enforcement through the existing update path ─────────────────────────────

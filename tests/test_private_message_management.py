@@ -426,6 +426,68 @@ def test_without_a_database_the_state_is_memory_only_and_the_panel_text_says_so(
     assert svc.state()["mode"] == svc.MODE_CLOSED
 
 
+# ── a read failure must never look like a fresh install ──────────────────────
+
+
+def test_a_read_failure_never_imports_the_legacy_document_over_the_stored_row(db, monkeypatch):
+    """An unreadable dedicated store is NOT "no row": the Phase-1 backfill must
+    not run, because importing a stale policy would replace the real one."""
+    from backend.db import client as db_client
+
+    assert asyncio.run(svc.set_mode(svc.MODE_CLOSED)) is True
+    assert asyncio.run(svc.set_action(svc.ACTION_DELETE, True)) is True
+    stored = dict(_stored(db))
+    db.legacy[svc.LEGACY_STATE_ROW_KEY] = json.dumps({"mode": "open", "policy": "none"})
+    svc.reset_in_memory()
+
+    async def _unreadable(owner_id):
+        return None, False
+
+    monkeypatch.setattr(db_client, "read_private_message_config", _unreadable)
+    asyncio.run(svc.ensure_loaded_async())
+
+    assert svc._loaded is False, "a failed read must never count as a load"
+    assert _stored(db) == stored, "nothing may be written while the store is unreadable"
+    assert svc.state()["mode"] == svc.MODE_OPEN  # the fail-closed default, in memory only
+
+    # A mutation built on that default is refused instead of replacing the row.
+    assert asyncio.run(svc.set_mode(svc.MODE_WHITELIST_ONLY)) is False
+    assert asyncio.run(svc.set_action(svc.ACTION_AI, True)) is False
+    assert _stored(db) == stored
+
+
+def test_a_transient_read_failure_is_retried_and_then_loads_the_stored_policy(db, monkeypatch):
+    from backend.db import client as db_client
+
+    assert asyncio.run(svc.set_mode(svc.MODE_CLOSED)) is True
+    assert asyncio.run(svc.set_action(svc.ACTION_DELETE, True)) is True
+    svc.reset_in_memory()
+
+    real = db_client.read_private_message_config
+    calls = {"n": 0}
+
+    async def _flaky(owner_id):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None, False
+        return await real(owner_id)
+
+    monkeypatch.setattr(db_client, "read_private_message_config", _flaky)
+    asyncio.run(svc.ensure_loaded_async())
+    assert svc._loaded is False and calls["n"] == 1
+
+    # The retry window keeps an outage from turning every message into a read.
+    asyncio.run(svc.ensure_loaded_async())
+    assert calls["n"] == 1
+
+    svc._load_retry_at = 0.0  # the window elapsed
+    asyncio.run(svc.ensure_loaded_async())
+    assert calls["n"] == 2
+    assert svc._loaded is True
+    assert svc.state()["mode"] == svc.MODE_CLOSED
+    assert svc.state()[svc.ACTION_DELETE] is True
+
+
 # ── validation ───────────────────────────────────────────────────────────────
 
 
@@ -676,6 +738,118 @@ def test_no_transition_is_promised_when_enforcement_is_off_or_nothing_is_schedul
 
 
 # ── summary / formatting helpers used by the panel ───────────────────────────
+
+
+# ── schedule override: the selected policy and the exact prior mode ─────────
+
+
+def _scheduled(mode, *, underlying=None, start="09:00", end="18:00", days=(4,)):
+    return _state(
+        mode=underlying if underlying is not None else svc.MODE_OPEN,
+        schedule={
+            "enabled": True,
+            "timezone": "UTC",
+            "rules": [_rule(list(days), start, end, mode)],
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    "underlying,scheduled",
+    [
+        (svc.MODE_WHITELIST_ONLY, svc.MODE_CLOSED),
+        (svc.MODE_CLOSED, svc.MODE_WHITELIST_ONLY),
+        (svc.MODE_OPEN, svc.MODE_WHITELIST_ONLY),
+        (svc.MODE_OPEN, svc.MODE_CLOSED),
+        (svc.MODE_WHITELIST_ONLY, svc.MODE_OPEN),
+    ],
+)
+def test_the_schedule_applies_its_policy_and_restores_the_exact_prior_mode(underlying, scheduled):
+    state = _scheduled(scheduled, underlying=underlying)
+    during = svc.resolve_policy(state, NOW)
+    assert (during.mode, during.source) == (scheduled, svc.SOURCE_SCHEDULE)
+    after = svc.resolve_policy(state, NOW.replace(hour=19))
+    assert (after.mode, after.source) == (underlying, svc.SOURCE_MANUAL)
+    # Evaluation is pure: neither resolution rewrites the saved preference.
+    assert state["mode"] == underlying
+
+
+def test_a_schedule_activation_never_widens_the_selected_policy():
+    state = _scheduled(svc.MODE_WHITELIST_ONLY, underlying=svc.MODE_OPEN)
+    state["allowlist"] = [FRIEND]
+    assert _decide(state).permitted is False                    # not allowlisted
+    assert _decide(state, sender=FRIEND).permitted is True
+    state["schedule"]["rules"][0]["mode"] = svc.MODE_CLOSED
+    state["exceptions"] = [STRANGER]
+    assert _decide(state).permitted is True                     # the one exception
+    assert _decide(state, sender=FRIEND).permitted is False     # everyone else closed
+
+
+def test_repeated_evaluations_never_rewrite_the_saved_mode(db):
+    assert asyncio.run(svc.set_mode(svc.MODE_CLOSED)) is True
+    assert asyncio.run(svc.set_schedule_timezone("UTC")) is True
+    assert asyncio.run(svc.set_schedule_enabled(True)) is True
+    assert asyncio.run(svc.save_schedule_rule(_rule([4], "09:00", "18:00", svc.MODE_WHITELIST_ONLY))) is True
+    before = json.loads(json.dumps(_stored(db)))
+    for _ in range(6):
+        assert svc.resolve_policy(svc.state(), NOW).mode == svc.MODE_WHITELIST_ONLY
+    assert svc.state()["mode"] == svc.MODE_CLOSED
+    assert _stored(db) == before                                 # no write at all
+
+
+def test_the_prior_mode_survives_a_restart_during_an_active_schedule(db):
+    assert asyncio.run(svc.set_mode(svc.MODE_WHITELIST_ONLY)) is True
+    assert asyncio.run(svc.set_schedule_timezone("UTC")) is True
+    assert asyncio.run(svc.set_schedule_enabled(True)) is True
+    assert asyncio.run(svc.save_schedule_rule(_rule([4], "09:00", "18:00", svc.MODE_CLOSED))) is True
+    assert svc.resolve_policy(svc.state(), NOW).mode == svc.MODE_CLOSED  # active now
+
+    svc.reset_in_memory()
+    svc.configure_owner(OWNER)
+    asyncio.run(svc.ensure_loaded_async())
+
+    restored = svc.state()
+    assert restored["mode"] == svc.MODE_WHITELIST_ONLY            # durable preference
+    assert svc.resolve_policy(restored, NOW).mode == svc.MODE_CLOSED
+    assert svc.resolve_policy(restored, NOW.replace(hour=19)).mode == svc.MODE_WHITELIST_ONLY
+    assert _stored(db)["mode"] == svc.MODE_WHITELIST_ONLY
+
+
+def test_disabling_an_active_schedule_restores_the_saved_mode(db):
+    assert asyncio.run(svc.set_mode(svc.MODE_CLOSED)) is True
+    assert asyncio.run(svc.set_schedule_timezone("UTC")) is True
+    assert asyncio.run(svc.set_schedule_enabled(True)) is True
+    assert asyncio.run(svc.save_schedule_rule(_rule([4], "09:00", "18:00", svc.MODE_WHITELIST_ONLY))) is True
+    assert svc.resolve_policy(svc.state(), NOW).mode == svc.MODE_WHITELIST_ONLY
+
+    assert asyncio.run(svc.set_schedule_enabled(False)) is True
+    policy = svc.resolve_policy(svc.state(), NOW)
+    assert (policy.mode, policy.source) == (svc.MODE_CLOSED, svc.SOURCE_MANUAL)
+    assert svc.state()["mode"] == svc.MODE_CLOSED
+
+
+def test_switching_between_consecutive_rules_never_restores_an_intermediate_mode(db):
+    assert asyncio.run(svc.set_mode(svc.MODE_CLOSED)) is True
+    assert asyncio.run(svc.set_schedule_timezone("UTC")) is True
+    assert asyncio.run(svc.set_schedule_enabled(True)) is True
+    assert asyncio.run(svc.save_schedule_rule(_rule([4], "09:00", "12:00", svc.MODE_WHITELIST_ONLY))) is True
+    assert asyncio.run(svc.save_schedule_rule(_rule([4], "12:00", "18:00", svc.MODE_OPEN))) is True
+
+    state = svc.state()
+    assert svc.resolve_policy(state, NOW.replace(hour=10)).mode == svc.MODE_WHITELIST_ONLY
+    assert svc.resolve_policy(state, NOW.replace(hour=13)).mode == svc.MODE_OPEN
+    assert svc.resolve_policy(state, NOW.replace(hour=19)).mode == svc.MODE_CLOSED
+    assert svc.state()["mode"] == svc.MODE_CLOSED   # the underlying mode never moved
+
+
+def test_a_manual_change_outside_a_schedule_persists_and_takes_effect(db):
+    assert asyncio.run(svc.set_mode(svc.MODE_WHITELIST_ONLY)) is True
+    assert _stored(db)["mode"] == svc.MODE_WHITELIST_ONLY
+    assert svc.resolve_policy(svc.state(), NOW).mode == svc.MODE_WHITELIST_ONLY
+
+    assert asyncio.run(svc.set_mode(svc.MODE_CLOSED)) is True
+    assert _stored(db)["mode"] == svc.MODE_CLOSED
+    assert svc.resolve_policy(svc.state(), NOW.replace(hour=19)).mode == svc.MODE_CLOSED
 
 
 def test_summary_reports_the_effective_state_the_panel_renders():

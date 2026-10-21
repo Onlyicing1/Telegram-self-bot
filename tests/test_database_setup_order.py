@@ -2,7 +2,7 @@
 
 DATABASE_ARCHITECTURE.md §31 must give the owner exactly ONE thing to paste: a
 single fenced SQL block that contains the complete ordered setup — the canonical
-reconciliation snapshot first, then every later pending migration. This module pins
+reconciliation snapshot first, then every later additive migration. This module pins
 that property so the document cannot regress to a two-stage workflow (a "step 0"
 block plus a second block) or a shell `cat` command.
 
@@ -33,17 +33,26 @@ TODO_SCHEDULE_TYPE = "20260926000001_add_todo_schedule_type.sql"
 TODO_STEPS = "20260927000001_add_todo_steps.sql"
 EMOJI_TABLES = "20260928000001_create_emoji_reaction_tables.sql"
 PRIVATE_MESSAGE_TABLES = "20260929000001_create_private_message_tables.sql"
+PRIVATE_MESSAGE_COUNTER_RESET = "20261016000001_add_private_message_counter_reset.sql"
 ANTI_EDIT_DELETE_TABLES = "20261017000001_create_anti_edit_delete_tables.sql"
+PRIVATE_MESSAGE_ACCESS = "20261020144423_harden_private_message_table_access.sql"
+AUTO_REACTION_SETTINGS = "20261020160000_add_panel_settings_auto_reaction_settings.sql"
 
 #: The order §31 documents — verified against the sources, not assumed. The TTS
 #: settings migration, the Todo schedule type, the Todo steps table, the Emoji &
-#: Reaction tables, the Private Message Management tables and the Anti-Edit /
-#: Anti-Delete tables are LATER additive schema changes, so they are appended
-#: last, newest last (the documented rule: a later change never edits the snapshot).
+#: Reaction tables, the Private Message Management tables, the Private Message
+#: counter reset, the Anti-Edit / Anti-Delete tables, the Private Message access
+#: hardening and the Auto-Reaction columns are LATER additive schema changes, so
+#: they are appended last, newest last (the documented rule: a later change never
+#: edits the snapshot). The counter-reset part is the one part that alters a table
+#: an earlier part creates, so it must follow the Private Message tables it
+#: extends; the access-hardening part must follow them too, because it revokes the
+#: grants and drops the policies that part created.
 DOCUMENTED_ORDER = (
     RECONCILE, VAULT_PART1, VAULT_PART2, DISPLAY_NAME, SEARCH_INDEXES, TTS_SETTINGS,
     TODO_SCHEDULE_TYPE, TODO_STEPS, EMOJI_TABLES, PRIVATE_MESSAGE_TABLES,
-    ANTI_EDIT_DELETE_TABLES,
+    PRIVATE_MESSAGE_COUNTER_RESET, ANTI_EDIT_DELETE_TABLES, PRIVATE_MESSAGE_ACCESS,
+    AUTO_REACTION_SETTINGS,
 )
 
 #: The banner that marks the ONE complete deployment block.
@@ -238,8 +247,8 @@ def test_the_display_name_column_precedes_its_index():
     assert "CREATE EXTENSION IF NOT EXISTS pg_trgm" in spans[SEARCH_INDEXES]
 
 
-def test_the_todo_schedule_type_part_is_last_and_carries_both_constraints():
-    """The newest additive migration closes the block, and it is complete in it."""
+def test_the_todo_schedule_type_part_carries_both_constraints():
+    """The basic Todo part is complete in the block."""
     spans = _part_spans(_setup_block())
     assert TODO_SCHEDULE_TYPE in spans, "the Todo schedule type must stay embedded"
     part = spans[TODO_SCHEDULE_TYPE]
@@ -279,15 +288,22 @@ def test_the_todo_steps_part_carries_the_whole_table_before_the_newest_change():
     )
 
 
-def test_the_anti_edit_delete_part_is_last_and_carries_the_two_tables():
-    """The Anti-Edit / Anti-Delete tables are the newest additive change, so they
-    close the block; the Private Message part sits immediately before."""
+def test_the_anti_edit_delete_part_carries_the_two_tables():
+    """The Anti-Edit / Anti-Delete tables stay embedded, whole, just before the
+    part that hardens the Private Message tables — which must follow the part
+    that creates those tables and their policies."""
     spans = _part_spans(_setup_block())
-    assert list(spans)[-1] == ANTI_EDIT_DELETE_TABLES, (
-        "the most recent additive migration must close the block"
+    assert list(spans)[-1] == AUTO_REACTION_SETTINGS, (
+        "the newest additive migration (the Auto-Reaction columns) closes the block"
     )
-    assert list(spans)[-2] == PRIVATE_MESSAGE_TABLES, (
-        "the Private Message part must stay immediately before it"
+    order = list(spans)
+    assert order[-2] == PRIVATE_MESSAGE_ACCESS, (
+        "the Private Message access hardening must follow the tables it hardens"
+    )
+    assert order.index(PRIVATE_MESSAGE_ACCESS) == order.index(ANTI_EDIT_DELETE_TABLES) + 1
+    assert order.index(ANTI_EDIT_DELETE_TABLES) == order.index(PRIVATE_MESSAGE_COUNTER_RESET) + 1
+    assert order.index(PRIVATE_MESSAGE_COUNTER_RESET) == order.index(PRIVATE_MESSAGE_TABLES) + 1, (
+        "the Private Message tables must stay before the parts that alter and harden them"
     )
     part = spans[ANTI_EDIT_DELETE_TABLES]
     for table in ("aed_config", "aed_archive_entries"):
@@ -344,6 +360,259 @@ def test_the_private_message_part_carries_the_two_tables():
         "FROM bot_settings",
     ):
         assert guarantee in part, f"the Private Message part is missing {guarantee!r}"
+
+
+# ─── 5. the Private Message FINAL schema (tables + counter reset) ──────────────
+#
+# The two Private Message migrations are the ONE place that feature's final shape
+# lives: part 10 creates the two tables, part 11 alters them with the automatic
+# counter reset. These assertions are structural (a parsed column/constraint
+# model), so they cannot be satisfied by a keyword that appears in a comment —
+# and they compare the canonical block against the migrations themselves.
+
+_PM_TABLES = ("private_message_config", "private_message_senders")
+_TABLE_CONSTRAINT_PREFIXES = (
+    "CONSTRAINT ", "PRIMARY KEY", "UNIQUE", "CHECK", "FOREIGN KEY",
+)
+
+
+def _sql_statements(text: str) -> list[str]:
+    """Top-level statements of a SQL text with comments removed and space folded."""
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+    text = "\n".join(
+        line for line in text.splitlines() if not line.strip().startswith("--")
+    )
+    assert "$$" not in text, "this parser does not handle dollar-quoted bodies"
+    statements: list[str] = []
+    buf: list[str] = []
+    in_quote = False
+    depth = 0
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if in_quote:
+            buf.append(ch)
+            if ch == "'":
+                if i + 1 < len(text) and text[i + 1] == "'":
+                    buf.append("'")
+                    i += 2
+                    continue
+                in_quote = False
+            i += 1
+            continue
+        if ch == "'":
+            in_quote = True
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif ch == ";" and depth == 0:
+            statements.append(" ".join("".join(buf).split()))
+            buf = []
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    tail = " ".join("".join(buf).split())
+    if tail:
+        statements.append(tail)
+    return [statement for statement in statements if statement]
+
+
+def _top_level_items(body: str) -> list[str]:
+    """Split a CREATE TABLE body on its top-level commas."""
+    items: list[str] = []
+    buf: list[str] = []
+    in_quote = False
+    depth = 0
+    i = 0
+    while i < len(body):
+        ch = body[i]
+        if in_quote:
+            buf.append(ch)
+            if ch == "'":
+                if i + 1 < len(body) and body[i + 1] == "'":
+                    buf.append("'")
+                    i += 2
+                    continue
+                in_quote = False
+            i += 1
+            continue
+        if ch == "'":
+            in_quote = True
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            items.append(" ".join("".join(buf).split()))
+            buf = []
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    tail = " ".join("".join(buf).split())
+    if tail:
+        items.append(tail)
+    return [item for item in items if item]
+
+
+def private_message_schema(sql: str) -> tuple[dict[str, dict[str, str]], dict[str, str]]:
+    """``(table -> {column: definition}, constraint name -> CHECK body)``.
+
+    ``CREATE TABLE IF NOT EXISTS`` declares the table; every
+    ``ALTER TABLE … ADD COLUMN IF NOT EXISTS`` adds the columns a later additive
+    migration contributed, exactly as PostgreSQL would converge on them.
+    """
+    columns: dict[str, dict[str, str]] = {}
+    constraints: dict[str, str] = {}
+    for statement in _sql_statements(sql):
+        create = re.fullmatch(
+            r"CREATE TABLE IF NOT EXISTS (\w+) \((.*)\)", statement, flags=re.S
+        )
+        if create:
+            table, body = create.group(1), create.group(2)
+            if table not in _PM_TABLES:
+                continue
+            declared = columns.setdefault(table, {})
+            for item in _top_level_items(body):
+                if item.upper().startswith(_TABLE_CONSTRAINT_PREFIXES):
+                    continue
+                name, _, definition = item.partition(" ")
+                declared[name] = definition
+            continue
+        added = re.fullmatch(
+            r"ALTER TABLE (\w+) ADD COLUMN IF NOT EXISTS (\w+) (.+)", statement, flags=re.S
+        )
+        if added and added.group(1) in _PM_TABLES:
+            table, name, definition = added.groups()
+            columns.setdefault(table, {})[name] = definition
+            continue
+        constraint = re.fullmatch(
+            r"ALTER TABLE (\w+) ADD CONSTRAINT (\w+) CHECK \((.+)\)", statement, flags=re.S
+        )
+        if constraint and constraint.group(1) in _PM_TABLES:
+            constraints[constraint.group(2)] = constraint.group(3)
+    return columns, constraints
+
+
+def _canonical_pm_schema():
+    spans = _part_spans(_setup_block())
+    return private_message_schema(
+        spans[PRIVATE_MESSAGE_TABLES] + "\n" + spans[PRIVATE_MESSAGE_COUNTER_RESET]
+    )
+
+
+def _migration_pm_schema():
+    return private_message_schema(
+        "\n".join(
+            _migration(name)
+            for name in (PRIVATE_MESSAGE_TABLES, PRIVATE_MESSAGE_COUNTER_RESET)
+        )
+    )
+
+
+def test_the_canonical_sql_reaches_the_private_message_effective_schema():
+    """The block's final Private Message schema equals the migrations' final schema."""
+    canonical_columns, canonical_constraints = _canonical_pm_schema()
+    migration_columns, migration_constraints = _migration_pm_schema()
+    assert set(canonical_columns) == set(_PM_TABLES)
+    for table in _PM_TABLES:
+        assert canonical_columns[table] == migration_columns[table], (
+            f"{table}: the block and its migrations disagree on the final columns"
+        )
+    assert canonical_constraints == migration_constraints, (
+        "the block and its migrations disagree on the Private Message CHECK constraints"
+    )
+
+
+def test_the_counter_reset_columns_are_declared_with_their_final_definitions():
+    columns, _ = _canonical_pm_schema()
+    config = columns["private_message_config"]
+    senders = columns["private_message_senders"]
+    assert config["ai_counter_reset_enabled"] == "boolean NOT NULL DEFAULT false", (
+        "the automatic reset must default to OFF"
+    )
+    assert config["ai_counter_reset_seconds"] == "integer NOT NULL DEFAULT 86400", (
+        "the reset interval must default to one day"
+    )
+    # The window anchor is NULLABLE on purpose: NULL means "no window recorded
+    # yet", and a default would backfill an instant the migration cannot know.
+    assert senders["window_started_at"] == "timestamptz"
+    assert "NOT NULL" not in senders["window_started_at"]
+    assert "DEFAULT" not in senders["window_started_at"]
+
+
+def test_the_reset_interval_check_constraint_carries_the_panel_range():
+    from backend.services import private_message_service as svc
+
+    _, constraints = _canonical_pm_schema()
+    body = constraints["private_message_config_reset_interval_range"]
+    parsed = re.fullmatch(
+        r"ai_counter_reset_seconds BETWEEN (\d+) AND (\d+)", body
+    )
+    assert parsed, f"unexpected CHECK body: {body!r}"
+    low, high = int(parsed.group(1)), int(parsed.group(2))
+    assert low == svc.MIN_AI_COUNTER_RESET_SECONDS == 60
+    assert high == svc.MAX_AI_COUNTER_RESET_SECONDS == 365 * 24 * 60 * 60
+
+
+def test_the_final_schema_covers_every_column_the_repository_writes():
+    from backend.db import client as db_client
+
+    columns, _ = _canonical_pm_schema()
+    config = columns["private_message_config"]
+    missing = [name for name in db_client._PM_CONFIG_COLUMNS if name not in config]
+    assert missing == [], (
+        "the configuration write names columns the canonical SQL does not create: "
+        f"{missing}"
+    )
+    for name in ("owner_id", "updated_at"):
+        assert name in config, f"private_message_config is missing {name}"
+    senders = columns["private_message_senders"]
+    for name in (
+        "owner_id", "sender_id", "ai_replies_used", "last_ai_reply_at",
+        "window_started_at", "updated_at",
+    ):
+        assert name in senders, f"private_message_senders is missing {name}"
+
+
+def test_the_counter_reset_columns_are_not_folded_into_the_snapshot_or_part_10():
+    """The columns arrive as the later ALTER migration, never by editing part 1/10."""
+    snapshot = _part_spans(_setup_block())[RECONCILE]
+    for name in ("ai_counter_reset_enabled", "ai_counter_reset_seconds", "window_started_at"):
+        assert name not in snapshot, (
+            f"{name} belongs to the counter-reset migration, not the frozen snapshot"
+        )
+    tables_part = _part_spans(_setup_block())[PRIVATE_MESSAGE_TABLES]
+    for name in ("ai_counter_reset_enabled", "ai_counter_reset_seconds", "window_started_at"):
+        assert name not in tables_part, (
+            f"{name} must stay in part 11, exactly as its own migration adds it"
+        )
+
+
+def test_the_counter_reset_part_is_idempotent_and_additive():
+    part = _part_spans(_setup_block())[PRIVATE_MESSAGE_COUNTER_RESET]
+    statements = _sql_statements(part)
+    assert statements, "the counter-reset part must not be empty"
+    for statement in statements:
+        upper = statement.upper()
+        if " ADD COLUMN " in f" {upper} ":
+            assert "ADD COLUMN IF NOT EXISTS" in upper, (
+                f"a re-run must be a no-op: {statement!r}"
+            )
+        if " DROP CONSTRAINT " in f" {upper} ":
+            assert "DROP CONSTRAINT IF EXISTS" in upper, (
+                f"a re-run must be a no-op: {statement!r}"
+            )
+        for forbidden in ("DROP TABLE", "DROP COLUMN", "TRUNCATE", "DELETE FROM"):
+            assert forbidden not in upper, (
+                f"the counter-reset part must stay additive: {statement!r}"
+            )
+    # It ALTERs the two tables part 10 creates and creates none of its own.
+    assert "CREATE TABLE" not in "\n".join(statements).upper()
+    assert "ALTER TABLE private_message_config" in part
+    assert "ALTER TABLE private_message_senders" in part
 
 
 def test_the_emoji_part_carries_the_five_tables():
@@ -448,8 +717,11 @@ def test_the_audited_order_is_recorded_in_the_audit_table():
     """
     section = _section_31()
     audit = section[: section.index("### 31.2")]
-    assert "all 33 migrations" in _flat(audit) or "33 files" in audit, (
+    assert "all 36 migrations" in _flat(audit) or "36 files" in audit, (
         "the audit must state that every repository migration was classified"
+    )
+    assert len(list(MIGRATIONS_DIR.glob("*.sql"))) == 36, (
+        "the audited count must equal the migrations actually in the repository"
     )
     embedded_table = audit[audit.index("| Order | Migration") :]
     positions = [embedded_table.index(f"`{name}`") for name in DOCUMENTED_ORDER]
@@ -467,14 +739,26 @@ def test_the_documented_deviations_are_stated_explicitly():
     flat = _flat(_section_31())
     assert "display_name" in flat
     assert "42703" in flat, "the failure the ordering prevents must be named"
-    assert "eleven migrations" in flat, "the later migrations must be acknowledged"
+    assert "thirteen later additive migrations" in flat, (
+        "the later migrations must be acknowledged"
+    )
     assert "add_todo_schedule_type" in flat, "the Todo schedule type must be acknowledged"
     assert "add_todo_steps" in flat, "the Todo steps table must be acknowledged"
     assert "create_emoji_reaction_tables" in flat, "the Emoji & Reaction tables must be acknowledged"
     assert "create_private_message_tables" in flat, "the Private Message tables must be acknowledged"
     assert "private_message_senders" in flat, "the per-person counters must be acknowledged"
+    assert "add_private_message_counter_reset" in flat, (
+        "the Private Message counter reset must be acknowledged"
+    )
     assert "create_anti_edit_delete_tables" in flat, "the Anti-Edit / Anti-Delete tables must be acknowledged"
     assert "aed_archive_entries" in flat, "the AED archive table must be acknowledged"
+    assert "harden_private_message_table_access" in flat, (
+        "the Private Message access hardening must be acknowledged"
+    )
+    assert "add_panel_settings_auto_reaction_settings" in flat, (
+        "the Auto-Reaction migration must be acknowledged"
+    )
+    assert "auto_reaction_enabled" in flat, "the Auto-Reaction columns must be acknowledged"
     assert "tts_provider" in flat, "the TTS settings columns must be acknowledged"
 
 
@@ -483,3 +767,91 @@ def test_the_section_does_not_pretend_the_sql_was_executed():
     assert "NOTHING has been executed against Supabase" in flat
     assert "no SQL was run" in flat
     assert "pending an owner action" in flat
+
+
+# ─── 5. counts and the manual-action list must match the block ───────────────
+
+def test_the_later_part_count_matches_the_block():
+    """14 parts are the snapshot plus THIRTEEN later parts, and the prose says so."""
+    total = len(DOCUMENTED_ORDER)
+    assert total == 14
+    flat = _flat(_section_31())
+    assert "thirteen later additive migrations" in flat
+    assert f"parts 2–{total}" in flat
+    assert "twelve later additive migrations" not in flat, (
+        "the snapshot is not one of the later parts"
+    )
+
+
+def test_the_manual_action_section_names_every_embedded_part():
+    """§30.11 must not send the owner back to individual migration files."""
+    section = _section("### 30.11 Manual Supabase action still required")
+    flat = _flat(section)
+    assert "§31.3" in section
+    for name in DOCUMENTED_ORDER[1:]:
+        assert name in section, f"§30.11 must name {name} as part of the one paste"
+    assert "nine pending" not in flat
+    assert "parts 4, 5, 7, 8 and 9" not in flat, (
+        "every later part must be listed, never a stale subset"
+    )
+    assert "thirteen" in flat
+
+
+def test_the_waiting_answer_migration_is_absorbed_by_part_one():
+    """Its widened CHECK lives in the snapshot, so it needs no part of its own."""
+    snapshot = _part_spans(_setup_block())[RECONCILE]
+    assert "waiting_answer" in snapshot, (
+        "part 1 must re-add the status CHECK in its final form"
+    )
+    status = _section("## 20. Migration Status")
+    row = next(
+        line
+        for line in status.splitlines()
+        if "20260927020000_add_waiting_answer_status.sql" in line
+    )
+    assert "PART 1 of §31.3" in row, (
+        "the inventory must say the snapshot already establishes it"
+    )
+    assert "owner action required" not in row
+    assert "**36** files" in _flat(status), (
+        "the audited file count must be the current one (36)"
+    )
+
+
+def test_the_auto_reaction_columns_arrive_in_their_own_additive_part():
+    """The two Auto-Reaction columns are additive and OFF by default.
+
+    They were the one code-required column pair no migration created; part 14 is
+    the additive migration that closes that gap without touching the snapshot.
+    """
+    spans = _part_spans(_setup_block())
+    part = spans[AUTO_REACTION_SETTINGS]
+    for column, definition in (
+        ("auto_reaction_enabled", "boolean"),
+        ("auto_reaction_emoji", "text"),
+    ):
+        assert f"ADD COLUMN IF NOT EXISTS {column} {definition};" in part, (
+            f"part 14 must add {column} as {definition}"
+        )
+    assert "ALTER COLUMN auto_reaction_enabled SET DEFAULT false;" in part
+    assert "ALTER COLUMN auto_reaction_emoji SET DEFAULT '';" in part
+    for column in ("auto_reaction_enabled", "auto_reaction_emoji"):
+        assert f"ALTER COLUMN {column} SET NOT NULL;" in part
+    assert part.count("WHERE auto_reaction_enabled IS NULL") == 1
+    assert part.count("WHERE auto_reaction_emoji IS NULL") == 1
+    # OFF by default: nothing in the part can turn a reaction on.
+    assert "SET DEFAULT true" not in part
+    assert "= true" not in part
+    assert "DELETE FROM" not in part and "DROP COLUMN" not in part, (
+        "the Auto-Reaction part must stay additive"
+    )
+    # The snapshot and every earlier part stay untouched by it.
+    for name in DOCUMENTED_ORDER[:-1]:
+        assert "auto_reaction" not in spans[name], (
+            f"{name} must not carry the Auto-Reaction columns"
+        )
+    assert "auto_reaction_enabled" in _migration(AUTO_REACTION_SETTINGS)
+    section_6 = _flat(_section("## 6. panel_settings"))
+    assert AUTO_REACTION_SETTINGS in section_6, (
+        "§6 must attribute the columns to their migration"
+    )
