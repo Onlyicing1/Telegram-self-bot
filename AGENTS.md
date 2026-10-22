@@ -294,9 +294,12 @@ source message
   Retrieval forwards every member, and deletion resolves and deletes every
   member (never the anchor alone), refusing instead of leaving orphans.
 - **Ephemeral media**: view-once media (Telegram's `ttl_seconds ==
-  2147483647` sentinel) and every other positive TTL (secret-chat expiry) are
-  refused in `_deep_save_one` BEFORE any download, upload, save code or DB
-  write — there is no workaround and no bypass.
+  2147483647` sentinel, `0x7FFFFFFF`) and expiring media (any other positive
+  TTL) are refused in `_deep_save_one` BEFORE any download, upload, save code
+  or DB write — there is no workaround and no bypass. Per the TL schema `0`
+  disables self-destruction and ordinary media carries no TTL at all, so the
+  value always comes from Telegram: a refused photo was sent view-once, never
+  an ordinary photo misread.
 - **Transfer progress**: `execute_save` / `execute_link_save` accept an optional
   `progress` observer (`SaveProgressEvent`, real Telethon byte counts). Both
   Glass inputs bind

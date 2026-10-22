@@ -577,7 +577,10 @@ def _transfer_progress_callback(
 # ── view-once / expiring media ──
 
 #: Telegram's documented view-once marker (``2**31 - 1``). It is a SENTINEL,
-#: not a duration: any other positive TTL is a secret-chat self-destruct timer.
+#: not a duration: in the TL schema ``0`` disables self-destruction, the
+#: sentinel self-destructs immediately after playback (one-time viewing), and
+#: every other positive value is expiring media whose timer starts when the
+#: media is opened. Ordinary media carries no value at all.
 VIEW_ONCE_TTL_SECONDS = 2147483647
 EPHEMERAL_VIEW_ONCE = "view_once"
 EPHEMERAL_EXPIRING = "expiring"
@@ -594,10 +597,16 @@ def media_ttl_seconds(media) -> int | None:
 def ephemeral_media_kind(media) -> str | None:
     """``view_once`` / ``expiring`` / ``None``, decided from Telegram's TTL only.
 
-    The view-once marker is exactly ``VIEW_ONCE_TTL_SECONDS``; every OTHER
-    positive TTL is an expiry timer. Both mean the media is ephemeral by the
-    sender's/Telegram's design, so neither is ever downloaded, re-uploaded or
-    recorded — no attribute guessing and no workaround.
+    Telegram's documented split for ``ttl_seconds``: no value or ``0`` is
+    ordinary (``0`` disables self-destruction); exactly
+    ``VIEW_ONCE_TTL_SECONDS`` (``0x7FFFFFFF``) is view-once; any other positive
+    value (``0 < ttl < 0x7FFFFFFF``) is expiring media. Both ephemeral kinds are
+    one-time by the sender's/Telegram's design, so neither is ever downloaded,
+    re-uploaded or recorded — no attribute guessing and no workaround.
+
+    This value is Telegram's own wire value (nothing in the Save path invents
+    one), so an ordinary photo — which carries no TTL — can never reach either
+    branch: a refused photo really was sent as view-once.
     """
     ttl = media_ttl_seconds(media)
     if ttl is None:

@@ -1,218 +1,235 @@
-# IMPLEMENTATION_REPORT.md — bounded `[SAVE_TRACE]` instrumentation for the private-link Deep Save path
+# IMPLEMENTATION_REPORT.md — the `view_once` refusal on a `MessageMediaPhoto`
 
 > This file describes ONLY the current state of the repository for this task and
-> **replaces every previous report in full**. The Save pipeline's behaviour is
-> unchanged: this phase adds observability, not a fix. Reply Mode's early
-> trigger deletion and its single atomic finished-panel edit (the previous
-> report) still hold, as does every album / metadata / retrieval / delete /
-> Save-by-Link contract.
+> **replaces every previous report in full**. The previous phase (bounded
+> `[SAVE_TRACE]` instrumentation) is unchanged and still holds; its records are
+> what made this question answerable.
 
 | Item | Value |
 |---|---|
-| Stage | Diagnostic instrumentation: opt-in, bounded, line-level tracing of one Save attempt (link parsing → peer resolution → Deep Save → transfer → persistence) |
+| Question | A saved photo was refused as view-once with download/upload/persist `NOT_REACHED`. Is Deep Save misclassifying ordinary media, or is the item genuinely one-time? |
+| Verdict | **B — genuine view-once media.** The gate is correct; the value came from Telegram, not from a local assumption. **No bypass and no behavioral change were made.** |
+| Root cause of the reported *change in behavior* | Deliberate: the ephemeral-media gate was introduced on 2026-10-21 in `577a65e` (`feat(save): save full albums, refuse ephemeral media, report live progress`). Before that commit no gate existed, which is why the same item used to be saved. |
+| Media gate | **Unchanged.** `VIEW_ONCE_TTL_SECONDS`, `media_ttl_seconds`, `ephemeral_media_kind`, `ephemeral_refusal` and both guards keep their exact source semantics |
 | Date | 2026-10-22 |
 | Project / remote | LifeOS Telegram self-bot, `Onlyicing1/Telegram-self-bot` (`origin`) |
-| Base commit | `be1351def5a41e685331791a970e9bfd64d7247a` (`perf(save): delete reply early and combine final panel edit`) |
-| Classification logic | **NOT changed.** `VIEW_ONCE_TTL_SECONDS`, `media_ttl_seconds`, `ephemeral_media_kind`, `ephemeral_refusal` and every guard keep their exact source semantics |
-| Live Telegram / Supabase / Render | **NOT touched.** No session, no RPC, no SQL, no migration, no schema change, no `.env`, no credentials, no deployment, no Render shell |
-| Documents not modified | `DATABASE_ARCHITECTURE.md`, `README.md`, `INVESTIGATION.md` (unchanged — its conclusions about inline-panel identifiers are untouched by this phase) |
-| Interpreter used for verification | CPython 3.12 venv with `backend/requirements.txt` (**pinned Telethon 1.43.0**) + `pytest 9.1.1` + `pytest-asyncio` |
+| Base commit | `586d073` (`feat(save): add bounded opt-in SAVE_TRACE instrumentation`) |
+| Live Telegram / Supabase / Render | **NOT touched.** No session, no RPC, no SQL, no migration, no `.env`, no credentials, no deployment, no Render shell |
+| Documents not modified | `DATABASE_ARCHITECTURE.md`, `README.md`, `INVESTIGATION.md` |
+| Interpreter used for verification | CPython 3.12 venv with `backend/requirements.txt` (**pinned Telethon 1.43.0**) + `pytest` + `pytest-asyncio` |
 
 ---
 
-## 1. What was added
+## 1. The trace, and the one code path that can produce it
 
-Two layers, both OFF by default and both scoped to ONE attempt:
+The production trace is the reply path (`_save_reply_wait_handler` →
+`execute_save` → `_deep_save_one`), with `media_class=MessageMediaPhoto`,
+`ttl_field=present`, `ttl=view_once_sentinel`, the guard matching, and
+`download` / `upload` / `persist` recorded as `NOT_REACHED`.
 
-1. **Stage events** (`ENTER`, `BRANCH`, `CALL_START`, `CALL_END`, `RETURN`,
-   `EXCEPTION`, `CLEANUP`, `NOT_REACHED`, `TRUNCATED`) emitted by the Save code
-   itself at the handler, parsing, resolution, Deep Save, transfer and
-   persistence boundaries.
-2. **Line events** — real `sys.settrace` records for the executed statements of
-   the Save path only (whitelisted functions, whitelisted module, same asyncio
-   task), so a refusal can be pinned to the exact line and condition.
+Only one comparison in the codebase yields that category
+(`backend/services/save_service.py`, `ephemeral_media_kind`):
 
-Nothing in the Save algorithm, the view-once guard, the panel architecture or
-the status-message behaviour was changed.
-
-## 2. How it is enabled and bounded
-
-| Concern | Implementation |
-|---|---|
-| Switch | `SAVE_TRACE` (values `1/true/yes/on`, case-insensitive). Read per attempt in `backend/runtime/save_trace.py::save_trace_enabled`. No other env var is invented; the project had no equivalent tracer switch |
-| OFF behaviour | `SaveTrace.begin()` returns a disabled instance: `event()` returns immediately, `capturing()` installs nothing. No `[SAVE_TRACE]` record, no `sys.settrace`, no measurable overhead |
-| Event bound | `DEFAULT_MAX_EVENTS = 3000` per attempt |
-| Duration bound | `DEFAULT_MAX_DURATION_S = 120.0` per attempt |
-| At a bound | exactly ONE `TRUNCATED` record (`reason=events` / `reason=duration`), the tracer is restored at that moment, and no further record is written |
-| Concurrency | one line-traced attempt at a time: a second concurrent attempt keeps its stage events but never replaces the installed tracer (a thread-wide tracer would otherwise be stolen and restored to the wrong state) |
-| Restoration | `with trace.capturing():` in `execute_link_save` / `execute_save` and in `_save_link_input_handler`, so the previous tracer is reinstated on success, exception, **cancellation** and **timeout** (verified by tests) |
-| Failure containment | every trace call is inside the tracer's own `try/except`; a logging failure is swallowed. A trace can never turn a successful save into a failure |
-| Cancellation | `asyncio.CancelledError` is re-raised from the instrumented transfer blocks; the trace records `outcome=inconclusive` first |
-
-## 3. Coverage — stages that are traced
-
-| Stage | Where |
-|---|---|
-| A. Input handler | `_save_link_input_handler` (entry, empty-link branch, status creation, service call+result classification, result render, trigger cleanup), `_save_reply_wait_handler` (entry, panel editability, trigger read, deletion, target lookup, save call, terminal render), `_start_status`, `_delete_trigger_message` |
-| B. Link parsing | `parse_link_target`, `_parse_tg_openmessage`, `_parse_http_link`, `_parse_positive_id` — scheme branch, `tg://openmessage` match, peer-parameter count **and name**, id validity, `LinkTarget` construction, every failure branch |
-| C. Peer resolution + retrieval | `_resolve_link_peer` (username / cache / explicit entity / dialog scan), `_dialog_entity` (bounded scan, per-attempt outcome), `_fetch_linked_message` (peer read, peer-less lookup, each returned-id check), then `execute_link_save`'s `message_id_match` and `peer_match` branches |
-| D. Deep Save entry | `execute_save` (metadata branch, album resolution, single-vs-album), `_deep_save_one` (media presence + class, the ephemeral guard with its evidence, save-code issuance, size limit) |
-| E. Transfer + persistence | `download_media`, download validation (`file_exists`, `file_non_empty`), `send_file`, `insert_save` — each with `CALL_START` and a `CALL_END` that is written only after the real postcondition (byte counts / returned message / row) |
-
-`_deep_save_album` is traced at entry and at its pre-flight ephemeral decision
-only; the per-member transfer loop keeps its existing `record_event` telemetry.
-
-## 4. The view-once evidence this exists to produce
-
-`_deep_save_one` now records, before the guard runs:
-
-```
-stage=deep_save kind=BRANCH name=media_present   matched=true media_class=MessageMediaDocument
-stage=deep_save kind=BRANCH name=ephemeral_guard matched=view_once ttl_field=present ttl=view_once_sentinel
+```python
+return EPHEMERAL_VIEW_ONCE if ttl == VIEW_ONCE_TTL_SECONDS else EPHEMERAL_EXPIRING
 ```
 
-and, when the guard fires:
+`VIEW_ONCE_TTL_SECONDS = 2147483647` (`0x7FFFFFFF`), and `ttl` comes from
+`getattr(media, "ttl_seconds", None)` with a strict `int` check. So the trace is
+evidence that `reply_msg.media.ttl_seconds` was **exactly** `2147483647` — not
+"a large number", not "a photo", not "a present field".
 
+One correction about reading that trace: `ttl_field=present` proves nothing on
+its own, because every Telethon TL object carries the attribute (it is `None`
+when Telegram sent no value). The **`ttl=view_once_sentinel` category** is the
+evidence, and it cannot be produced by `None`, `0`, a bool, a string or any
+other integer.
+
+## 2. Where that value can and cannot come from
+
+Repository audit (the whole `backend/` tree):
+
+* Nothing constructs `MessageMediaPhoto` / `MessageMediaDocument`; there is no
+  serializer that rebuilds media, and `backend/telegram_api/_helpers.py`
+  serializes messages for AI context only, never for Save.
+* The reply path passes the object returned by `client.get_messages(chat_id,
+  ids=target_id)` straight into `execute_save`; the link path passes the object
+  returned by `_fetch_linked_message`. Neither rewrites `media`.
+* `_deep_save_one` reads `reply_msg.media` (`_extract_source_media` reads the
+  same object), so classification and transfer see one object.
+
+Therefore `ttl_seconds` is Telethon's parsed wire value. A local default,
+fixture or cache cannot produce the sentinel.
+
+## 3. Pinned Telethon: the field and its parsing
+
+`backend/requirements.txt` pins `telethon==1.43.0`, which ships TL **layer 224**.
+In that wheel (`telethon/tl/types/__init__.py`):
+
+```python
+class MessageMediaPhoto(TLObject):
+    CONSTRUCTOR_ID = 0xe216eb63
+    def __init__(self, spoiler=None, live_photo=None, photo=None, ttl_seconds=None, video=None): ...
+    @classmethod
+    def from_reader(cls, reader):
+        flags = reader.read_int()
+        ...
+        if flags & 4:
+            _ttl_seconds = reader.read_int()
 ```
-stage=deep_save kind=RETURN     func=_deep_save_one outcome=refused media_kind=view_once ttl=view_once_sentinel
-stage=download  kind=NOT_REACHED func=_deep_save_one outcome=not_reached reason=ephemeral_refusal
-stage=upload    kind=NOT_REACHED func=_deep_save_one outcome=not_reached reason=ephemeral_refusal
-stage=persist   kind=NOT_REACHED func=_deep_save_one outcome=not_reached reason=ephemeral_refusal
-```
 
-`ephemeral_evidence(media)` (new, pure, decides nothing) reports:
-`media_class`, whether the TL object actually carries a `ttl_seconds` field, and
-the category of that value — `absent`, `no_positive_ttl`, `expiring_positive`,
-`view_once_sentinel` — plus the resulting kind. An absent, non-int, zero or
-negative TTL can therefore never be reported as view-once, and ordinary private
-media reports `ttl_field=present ttl=no_positive_ttl` (confirmed in a local run).
+Executed against the installed package (real constructor bytes parsed by
+Telethon's own reader):
 
-The exact lines that execute are in the `LINE` records, so the terminating
-statement is identified by its own line number in `backend/services/save_service.py`
-(the guard `if guard_kind is not None:` and, one level down, the
-`ttl == VIEW_ONCE_TTL_SECONDS` comparison inside `ephemeral_media_kind`).
+| Wire flags | Parsed `ttl_seconds` | `ephemeral_media_kind` |
+|---|---|---|
+| `photo` only | `None` | `None` (ordinary) |
+| `photo` + `ttl_seconds = 0` | `0` | `None` (ordinary) |
+| `photo` + `ttl_seconds = 30` | `30` | `expiring` |
+| `photo` + `ttl_seconds = 2147483646` | `2147483646` | `expiring` |
+| `photo` + `ttl_seconds = 2147483647` | `2147483647` | `view_once` |
+| `photo` + `ttl_seconds = 2147483647` + `spoiler` | `2147483647` | `view_once` (spoiler is an independent flag) |
 
-**No conclusion is drawn here about the live reference message.** Without a real
-`SAVE_TRACE=1` run of the owner's own `tg://openmessage?…` link for that item
-there is no evidence about its TTL field, and this phase deliberately does not
-change the classification to "test" it.
+`MessageMediaDocument` carries the same flag bit and the same semantics.
 
-## 5. Sensitive data excluded
+## 4. Telegram's documented semantics (the decisive evidence)
 
-* The private link itself is never logged: `[LINK_SAVE] resolving link: fp:…`.
-  The previous `[LINK_SAVE] resolving link: <full link>` line is gone (a
-  `tg://` link names a private chat and a message).
-* Chat/user/message ids in the touched functions are logged as `fp:<8 hex>` —
-  a keyed BLAKE2s digest with a per-process random key, so two records of one
-  render instance are comparable and nothing is reversible.
-* No message text, caption, file bytes, media ids, object `repr()`, `f_locals`,
-  full filesystem path or credential is ever written. `LINE` records carry only
-  `mod=<repo-relative module>`, `func`, `line`.
-* Every value is collapsed to one whitespace-free token and truncated to 120
-  chars, so a record is always one greppable `key=value` line.
-* Peer-resolution failures log the reason kind plus a fingerprint instead of the
-  Telegram error text (which can echo the peer id). The owner-facing panel text
-  is unchanged.
+* `https://core.telegram.org/constructor/messageMediaPhoto` — `ttl_seconds`:
+  “Time to live of self-destructing photo, can be 0 to disable
+  self-destruction, `0x7FFFFFFF` to self-destruct the photo immediately after
+  it's played; otherwise self-destructs `ttl_seconds` after it's played.”
+* `https://core.telegram.org/api/views` — expiring media is
+  `0 < media.ttl_seconds < 0x7FFFFFFF`; **view-once media is exactly
+  `media.ttl_seconds == 0x7FFFFFFF`**, and the client is told to start no
+  timer and delete it after the viewer closes.
+* Chat auto-delete is a different field (`message.ttl_period`,
+  `flags.25?int`), and `spoiler` is a separate flag. Neither can put the
+  sentinel on an ordinary photo.
+* Secret Chats use a different schema (`decryptedMessage.ttl`), so they are not
+  a source of `media.ttl_seconds` either.
 
-## 6. Limits of line-level tracing (stated, not glossed over)
+So the mapping used by `ephemeral_media_kind` is exactly the documented one:
+no value or `0` → ordinary, the exact sentinel → view-once, anything else
+positive → expiring.
 
-* `sys.settrace` is **thread-wide**. This VM/process is single-threaded
-  asyncio, so the tracer is installed on the event-loop thread; that is why the
-  scope filter is *mandatory and threefold*: module whitelist, function
-  whitelist, and "same `asyncio.current_task()` as the attempt". Callbacks of
-  other tasks in the same thread are filtered out at `call` time, before any
-  line is recorded.
-* The global tracer is invoked for every *call* in the thread while installed
-  (a memoised code-object lookup each), which is why the duration bound and the
-  one-traced-attempt rule exist.
-* Only the modules/functions in `LINE_SCOPE` produce line events. Telethon
-  internals and the rest of the application never do.
-* Reply Mode installs line capture at `execute_save` (the panel/trigger stages
-  before it are stage events only), because that handler was not restructured
-  for this diagnostic phase.
-* Tracing is application-level evidence. It measures nothing about Telegram's
-  network behaviour and adds no latency claims.
+## 5. Git history — what actually changed
 
-## 7. Changed files
+| Item | Commit | Date |
+|---|---|---|
+| `VIEW_ONCE_TTL_SECONDS`, `media_ttl_seconds`, `ephemeral_media_kind`, `ephemeral_refusal`, the guard in `_deep_save_one`, the album pre-flight | `577a65e` | 2026-10-21 |
+| `ephemeral_evidence` (trace only; decides nothing) | `586d073` | 2026-10-22 |
+| Telethon `1.34.0` → `1.43.0` | `3370eae` | earlier |
 
-| File | Change |
-|---|---|
-| `backend/runtime/save_trace.py` | **new**: `SaveTrace` (stage events + scoped `sys.settrace`), `fingerprint`, `ephemeral`-free constants, bounds, restoration, `LINE_SCOPE` |
-| `backend/services/save_service.py` | `ephemeral_evidence`; optional `trace=` on `parse_link_target`, `_parse_tg_openmessage`, `_parse_http_link`, `_resolve_link_peer`, `_dialog_entity`, `_fetch_linked_message`, `execute_link_save`, `execute_save`, `_deep_save_one`, `_deep_save_album`; stage events at every discovered boundary; ids in the touched logs fingerprinted |
-| `backend/bot/handlers/save.py` | `_save_result_outcome`; trace lifecycle for the link and reply handlers; `trace=` into `_start_status` / `_delete_trigger_message` / `execute_*`; trigger cleanup now uses the shared `_delete_trigger_message` (one delete site, same behaviour) |
-| `tests/test_save_trace.py` | **new**: 20 focused tests |
-| `AGENTS.md` | §6 trace bullet, §11 `SAVE_TRACE`, runtime layout entry |
-| `IMPLEMENTATION_REPORT.md` | this report |
+* `git log -S "VIEW_ONCE_TTL_SECONDS"` and `git log -S "ttl_seconds"` return
+  only those two Save commits; `git blame` on the whole classification block
+  attributes every line to them.
+* **No commit changed media resolution, downloading or Save execution in a way
+  that could fabricate a TTL.** The only dependency change in the window is the
+  Telethon bump, and it cannot explain this: `telethon/client/messageparse.py`
+  is byte-identical between `1.34.0` and `1.43.0` (`diff` produced no output),
+  and `ttl_seconds` sits on the same flag bit (`flags.2`) in both versions. The
+  layer-224 addition to `messageMediaPhoto` is `live_photo`/`video` — Live
+  Photos — not a TTL change.
+* The behavior the owner remembers is the **pre-`577a65e`** pipeline: there was
+  no gate, so a one-time photo was downloaded and re-uploaded. `577a65e` added
+  the gate on purpose (its stated requirement: “one-time / expiring media must
+  be refused deterministically BEFORE any download or upload, with no success
+  record and no bypass”). That is the entire regression story.
 
-No dependency was added. `backend.runtime.__init__` is empty, so importing
-`backend.runtime.save_trace` from the service and the handler introduces no
-import cycle.
+## 6. Why this is not case A (a false positive)
+
+To call this a false positive, an **ordinary** photo would have to arrive with
+`ttl_seconds == 0x7FFFFFFF`. Every link in that chain is closed:
+
+1. the value is Telethon's parsed wire field (no local construction, §2);
+2. Telegram documents the sentinel as view-once, and documents `0`/absent as
+   the ordinary cases (§3–§4);
+3. no documented mechanism (chat auto-delete, spoilers, Live Photos, paid
+   media, secret chats) places the sentinel on ordinary cloud media (§4);
+4. the production item was a **photo**, and photos are fully covered by the
+   same documented field — the sentinel is not document-only.
+
+Therefore the item was sent as view-once, and refusing it is correct.
+Removing or narrowing the guard would not fix a defect; it would bypass a
+genuine Telegram one-time restriction, which this phase does not do.
+
+## 7. What changed in this phase
+
+**Behavior: nothing.** The gate is byte-for-byte the same logic, with the same
+pre-transfer position and the same refusal text, for photos and documents,
+single items and albums.
+
+**Documentation (comments only, no logic):** the classification's own
+description called every other positive TTL a “secret-chat self-destruct
+timer”. Telegram documents those as expiring media in cloud chats too (the
+timer starts when the media is opened), so the comment, the
+`ephemeral_media_kind` docstring and `AGENTS.md` §6 now state the verified
+split (`0` disables; `0x7FFFFFFF` view-once; otherwise expiring) and record that
+the value always comes from Telegram.
+
+**Tests:** `tests/test_save_view_once_photo_semantics.py` (new, 9 tests) pins
+the semantics to the wire instead of to the implementation:
+
+1. the pinned Telethon's `MessageMediaPhoto.CONSTRUCTOR_ID` is
+   `0xe216eb63`, and its reader parses `photo`/`ttl_seconds` from the
+   **documented** flag bits — `None`, `0`, `30`, `2147483646`,
+   `2147483647`, with and without `spoiler`;
+2. wire-parsed values map to the documented categories (`None`/`0` →
+   ordinary, finite → expiring, exact sentinel → view-once);
+3. **the production case**: a wire-parsed view-once **photo** is refused with
+   zero client calls, zero rows and no forward, and the trace records
+   `matched=view_once`, `ttl=view_once_sentinel`, `media_class=MessageMediaPhoto`
+   plus `download`/`upload`/`persist` `NOT_REACHED` with
+   `reason=ephemeral_refusal`;
+4. that refusal traces no caption, chat id, message id or peer id;
+5. an ordinary photo with no TTL still saves end to end (download → upload →
+   row, `media_type=Photo`, no forward);
+6. an ordinary photo whose TTL is Telegram's documented `0`
+   (“disable self-destruction”) still saves;
+7. a photo with a finite TTL (`30`) is refused with its own reason before any
+   transfer;
+8. only the exact sentinel is view-once — `None`, missing attribute, `0`,
+   negative, bool, string and `2147483648` are never view-once;
+9. link Save and reply Save both hand the resolved target to the single
+   `execute_save` pipeline (`execute_link_save` → the link's message; Reply
+   Mode → the replied-to message, never the trigger), with no forwarding.
 
 ## 8. Tests (executed — exact commands and results)
 
 | Command | Result |
 |---|---|
-| `pytest tests/test_save_trace.py -q` | **20 passed** |
-| `pytest tests/test_save_live_status_and_private_link.py tests/test_save_album_view_once_progress.py tests/test_save_trace.py tests/test_save_reply_panel_edit.py tests/test_save_success_panel.py tests/test_save_v2_wiring.py tests/test_20_advanced_execution.py -q` | **216 passed** |
-| Save/panel batch (the 14 Save suites + `test_save_trace.py`) | **457 passed** |
-| `pytest tests -q` (full suite) | **6703 passed, 27 skipped, 1 failed** (137 s) |
-| `python -m compileall -q backend tests/test_save_trace.py` | OK |
+| `.venv/bin/python -m pytest tests/test_save_view_once_photo_semantics.py -q` | **9 passed** |
+| `.venv/bin/python -m pytest tests/test_save_view_once_photo_semantics.py tests/test_save_trace.py tests/test_save_album_view_once_progress.py tests/test_save_live_status_and_private_link.py -q` | **107 passed** |
+| `.venv/bin/python -m pytest tests -q` | **6712 passed, 27 skipped, 1 failed** (148.91 s) |
+| `.venv/bin/python -m compileall -q backend/services/save_service.py tests/test_save_view_once_photo_semantics.py` | OK |
 | `git diff --check` | clean |
 
 The single failure is
 `tests/test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`
-("interval advancement exceeded bound"). It is **pre-existing and unrelated**:
-it reproduces identically on a clean `git archive HEAD` checkout of the base
-commit `be1351d` (10 passed, 1 failed), with no Save or trace code involved.
+(“interval advancement exceeded bound”). It is **pre-existing and unrelated**:
+it reproduces identically on a clean `git archive 586d073` checkout
+(`1 failed`), with no Save, media or trace code involved.
 
-Focused coverage added in `tests/test_save_trace.py`:
+## 9. What remains unverified (stated, not glossed over)
 
-1. off by default (no record, no tracer, save still succeeds);
-2. enabled tracing records real executed lines of `execute_link_save`,
-   `parse_link_target` and `_deep_save_one` with line numbers;
-3. unrelated code and a *different asyncio task* calling the same scoped
-   function produce no line events for the traced attempt;
-4. one trace id, strictly increasing `seq`, non-decreasing `elapsed_ms`;
-5. event bound (`reason=events`) and duration bound (`reason=duration`) both
-   truncate and restore;
-6. restoration after success, exception, cancellation and `wait_for` timeout,
-   plus "a second attempt does not steal the active tracer";
-7. a logging sink that always raises leaves the save successful;
-8. a valid private link resolves, is id- and peer-validated, and is saved;
-9. a wrong message id and a wrong peer stay refused (nothing saved, no
-   download) and record `matched=false`;
-10. view-once classification records `ttl_field`/`ttl` category and `matched`;
-11. a view-once refusal records the early return and marks
-    download/upload/persist `NOT_REACHED`, with no transfer and no row;
-12. ordinary private media traces download → upload → persist with `ok`
-    postconditions and the stored row;
-13. the existing protection still refuses (no download, no send, no row);
-14. no record contains the link, the peer id, the message id, the caption or a
-    full path, and fingerprints are stable within the process.
+* **Live behavior is unverified.** No Telegram session was used, so this phase
+  proves classification and pipeline behavior against the pinned library and
+  fakes; it does not re-run the owner's save.
+* The trace recorded the **category**, not the raw integer or the message's
+  `ttl_period`. The category can only be produced by exact equality with
+  `2147483647`, but a trace line carrying the raw `ttl_seconds` value would
+  remove the last step of inference. It was not added in this phase because it
+  changes the documented `[SAVE_TRACE]` output and its tests.
+* A negative `ttl_seconds` is treated as ordinary (fail-open). Telegram's
+  documented space is `0 … 0x7FFFFFFF`, so there is no evidence this occurs;
+  tightening it would be an unrequested behavior change.
+* The trace is from the **reply** path. The link path is proven to share the
+  same `execute_save` pipeline by test (§7.9), not by a production trace.
+* **Deployment: NOT VERIFIED.** `render.yaml` is unchanged and no Render action
+  was taken.
 
-## 9. What still requires live runtime verification
+## 10. If the owner wants one-time media saved
 
-* The reference message has **not** been traced. A real `SAVE_TRACE=1` run on
-  Render is what settles whether that media really carries
-  `VIEW_ONCE_TTL_SECONDS` or whether something upstream (link→message mapping)
-  hands `_deep_save_one` a different message.
-* One ordinary, non-ephemeral private-link save in the same run is needed to
-  prove the download/upload/persist stages on live Telegram (they are proven
-  only against the fakes here).
-* Whether Render's log pipeline shows every `[SAVE_TRACE]` record at
-  `LOG_LEVEL=INFO` is a deployment observation, not something this phase can
-  assert.
-* No deployment of this commit was verified. `render.yaml` is unchanged and no
-  Render action was taken.
-
-## 10. How to produce the real trace (owner action)
-
-1. Set `SAVE_TRACE=1` for the Render service (or the `.env` of a local run) and
-   redeploy so the process sees it.
-2. Save the reference item once through `Menu` → `Save` → `Deep Save` →
-   `Save using a link`, and once an ordinary non-ephemeral private media item.
-3. Filter the logs with `[SAVE_TRACE]`, group by `id=`, read `matched=`/`ttl=`
-   at `name=ephemeral_guard`, then the last `LINE` record before the `RETURN`.
-4. Unset `SAVE_TRACE` afterwards: with the flag off the tracer is never
-   installed and the Save path is byte-for-byte the production path again
-   (apart from the fingerprinted ids in its own log lines).
+That is a **policy change**, not a bug fix: it means deliberately removing or
+narrowing the `577a65e` gate (and its `AGENTS.md` contract). It must be an
+explicit decision by the owner of the account, and it is not made here.
