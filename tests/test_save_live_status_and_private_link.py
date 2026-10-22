@@ -682,8 +682,11 @@ async def test_public_and_private_http_links_keep_their_ordinary_path():
 
 
 @pytest.mark.asyncio
-async def test_tg_scheme_is_not_refused_but_view_once_is_refused_by_media_policy():
-    from backend.services.save_service import VIEW_ONCE_TTL_SECONDS
+async def test_tg_scheme_and_a_view_once_target_both_reach_the_pipeline():
+    from backend.services.save_service import (
+        EPHEMERAL_VIEW_ONCE,
+        VIEW_ONCE_TTL_SECONDS,
+    )
     from telethon.tl.types import MessageMediaDocument
 
     from tests.test_save_album_view_once_progress import FakeDoc
@@ -704,7 +707,10 @@ async def test_tg_scheme_is_not_refused_but_view_once_is_refused_by_media_policy
         f"tg://openmessage?user_id={PEER}&message_id={MSG_ID}", "UTC",
     )
 
-    assert "view-once" in result
+    # The URI resolves and the view-once media saves like any other item.
+    assert getattr(result, "saved", False) is True, result
     assert "tg://" not in result
-    assert client.download_calls == []
-    assert _rows() == []
+    assert save_service.ephemeral_media_kind(view_once.media) == EPHEMERAL_VIEW_ONCE
+    assert [message_id for message_id, _cb in client.download_calls] == [MSG_ID]
+    assert len(client.send_calls) == 1
+    assert len(_rows()) == 1

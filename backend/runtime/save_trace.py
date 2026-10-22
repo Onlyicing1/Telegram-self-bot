@@ -97,7 +97,6 @@ LINE_SCOPE: dict[str, frozenset[str]] = {
         "_deep_save_album",
         "media_ttl_seconds",
         "ephemeral_media_kind",
-        "ephemeral_refusal",
         "_extract_source_media",
     }),
     "backend/bot/handlers/save.py": frozenset({

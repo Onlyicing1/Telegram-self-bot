@@ -387,7 +387,7 @@ async def test_a_wrong_peer_is_still_refused_and_traced(monkeypatch, caplog):
     assert _named(events, "peer_match")[0]["matched"] == "false"
 
 
-# ── 10./11./13. view-once classification, refusal and protection ────────────
+# ── 10./11./13. view-once classification and protection ────────────────────
 
 
 @pytest.mark.asyncio
@@ -410,7 +410,9 @@ async def test_view_once_classification_records_the_exact_condition(monkeypatch,
 
 
 @pytest.mark.asyncio
-async def test_a_view_once_refusal_marks_later_stages_not_reached(monkeypatch, caplog):
+async def test_a_view_once_target_is_traced_through_the_whole_pipeline(
+    monkeypatch, caplog
+):
     monkeypatch.setenv(save_trace.ENV_FLAG, "1")
     caplog.set_level(logging.INFO)
     secret = view_once_message(MSG_ID)
@@ -419,26 +421,21 @@ async def test_a_view_once_refusal_marks_later_stages_not_reached(monkeypatch, c
 
     result = await save_service.execute_link_save(client, OWNER, LINK, "UTC")
 
-    assert "view-once" in result
-    assert getattr(result, "saved", False) is False
-    # Existing protection: nothing was transferred, nothing was recorded.
-    assert client.download_calls == []
-    assert client.send_calls == []
-    assert _rows() == []
+    assert getattr(result, "saved", False) is True, result
+    assert [message_id for message_id, _cb in client.download_calls] == [MSG_ID]
+    assert len(client.send_calls) == 1
+    assert len(_rows()) == 1
 
     events = _events(caplog)
-    refusal = [
+    # The classification is still recorded — as evidence, not as a refusal.
+    assert _named(events, "ephemeral_guard")[0]["matched"] == "view_once"
+    assert not [e for e in events if e.get("kind") == save_trace.NOT_REACHED]
+    saved = [
         e for e in events
         if e.get("kind") == save_trace.RETURN
         and e.get("func") == "_deep_save_one"
-        and e.get("outcome") == save_trace.OUTCOME_REFUSED
     ]
-    assert refusal and refusal[0]["media_kind"] == "view_once"
-    not_reached = {
-        e["stage"]: e for e in events if e.get("kind") == save_trace.NOT_REACHED
-    }
-    assert set(not_reached) == {"download", "upload", "persist"}
-    assert all(e["reason"] == "ephemeral_refusal" for e in not_reached.values())
+    assert saved and saved[0]["outcome"] == save_trace.OUTCOME_OK
 
 
 # ── 12. ordinary media through download/upload/persist ─────────────────────

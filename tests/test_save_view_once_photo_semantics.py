@@ -1,9 +1,10 @@
-"""Deep Save's ephemeral-media gate, verified against Telegram's own wire schema.
+"""Deep Save's media-TTL classification, verified against Telegram's wire schema.
 
 The production report behind this file: a saved ``MessageMediaPhoto`` was
-refused as view-once before any download, upload or row, and the owner
-remembered that the same item used to save. So the contracts pinned here are
-the PROTOCOL's, not the implementation's:
+refused as view-once before any download, upload or row. That refusal is gone —
+every media, including genuine view-once media, now flows through the ordinary
+Deep Save pipeline. The contracts pinned here are the PROTOCOL's, not the
+implementation's:
 
   * ``messageMediaPhoto#e216eb63`` carries ``photo:flags.0`` and
     ``ttl_seconds:flags.2``; the pinned Telethon parses those same flag bits,
@@ -11,10 +12,9 @@ the PROTOCOL's, not the implementation's:
   * Telegram documents ``ttl_seconds`` as: ``0`` disables self-destruction,
     ``0x7FFFFFFF`` self-destructs immediately after playback (view-once), and
     every other positive value is expiring media (the timer starts on open);
-  * therefore an ordinary photo never carries the sentinel, a photo that DOES
-    carry it is genuinely view-once and is refused before any transfer, and
-    the refusal is the documented LifeOS policy — not a misread of a normal
-    photo, and never a value the app invented;
+  * the classification survives ONLY as ``[SAVE_TRACE]`` evidence and decides
+    nothing: view-once and expiring media are downloaded, uploaded and recorded
+    exactly like ordinary media;
   * link and reply Save differ only in target resolution: both hand the
     resolved message to the ONE ``execute_save`` pipeline.
 
@@ -30,7 +30,7 @@ import sys
 
 import pytest
 from telethon.extensions.binaryreader import BinaryReader
-from telethon.tl.types import MessageMediaPhoto, PhotoEmpty
+from telethon.tl.types import MessageMediaDocument, MessageMediaPhoto, PhotoEmpty
 
 from backend.bot.handlers import save as save_handler
 from backend.db import client as db_client
@@ -46,6 +46,7 @@ from backend.services.save_service import (
 
 from tests.test_save_album_view_once_progress import (
     FakeClient,
+    FakeDoc,
     FakeMessage,
     FakePhoto,
 )
@@ -62,7 +63,8 @@ PANEL_MSG = 5001
 LINK = f"tg://openmessage?user_id={PEER}&message_id={MSG_ID}"
 
 #: ``messageMediaPhoto#e216eb63`` (Telegram layer 224+, where Live Photos were
-#: added) — the fields this gate reads, with their documented flag bits:
+#: added) — the fields this classification reads, with their documented flag
+#: bits::
 #:     spoiler:flags.3?true live_photo:flags.4?true photo:flags.0?Photo
 #:     ttl_seconds:flags.2?int     video:flags.4?Document
 PHOTO_CONSTRUCTOR_ID = 0xE216EB63
@@ -74,7 +76,6 @@ _UNSET = object()
 
 
 # ── wire fixtures (parsed by the pinned Telethon, never hand-built objects) ──
-
 
 def _photo_wire(*, ttl=_UNSET, spoiler: bool = False) -> bytes:
     """Real ``messageMediaPhoto`` bytes with exactly the documented flags set."""
@@ -99,6 +100,13 @@ def _parsed_photo(*, ttl=_UNSET, spoiler: bool = False) -> MessageMediaPhoto:
 def _photo_media(ttl, *, size: int = 2048, photo_id: int = 4321) -> MessageMediaPhoto:
     """A photo media object shaped exactly like the ones ``get_messages`` yields."""
     return MessageMediaPhoto(photo=FakePhoto(photo_id, size), ttl_seconds=ttl)
+
+
+def _document_media(ttl, *, mime: str = "video/mp4", name: str = "clip.mp4", size: int = 4096):
+    return MessageMediaDocument(
+        document=FakeDoc(MSG_ID, mime=mime, size=size, name=name),
+        ttl_seconds=ttl,
+    )
 
 
 def _message(msg_id: int, media, *, text: str = "", chat_id: int = CHAT) -> FakeMessage:
@@ -150,7 +158,6 @@ def _named(caplog, name: str) -> list[dict[str, str]]:
 
 # ── 1. what the pinned Telethon actually parses out of the wire ─────────────
 
-
 def test_pinned_telethon_parses_the_documented_photo_ttl_flags():
     """The sentinel must come from Telegram's schema, not from our assumptions."""
     assert MessageMediaPhoto.CONSTRUCTOR_ID == PHOTO_CONSTRUCTOR_ID
@@ -185,11 +192,10 @@ def test_wire_parsed_ttl_values_map_to_the_documented_categories():
     )
 
 
-# ── 2. the production case: a view-once PHOTO is refused before any transfer ──
-
+# ── 2. the production case: a view-once PHOTO is saved like any other ───────
 
 @pytest.mark.asyncio
-async def test_view_once_photo_is_refused_before_download_upload_and_persist(
+async def test_view_once_photo_is_saved_through_download_upload_and_persist(
     monkeypatch, caplog
 ):
     monkeypatch.setenv(save_trace.ENV_FLAG, "1")
@@ -202,35 +208,72 @@ async def test_view_once_photo_is_refused_before_download_upload_and_persist(
 
     result = await save_service.execute_save(client, OWNER, secret, "UTC")
 
-    assert getattr(result, "saved", False) is False
-    assert "view-once" in result
-    # Nothing moved and nothing was recorded: the guard is pre-transfer.
-    assert client.calls == []
+    assert getattr(result, "saved", False) is True, result
+    # The media moved through the ordinary pipeline: download → upload → send.
+    assert len(client.download_calls) == 1
+    assert len(client.send_calls) == 1
     assert client.forward_calls == []
-    assert _rows() == []
+    assert len(_rows()) == 1
+    assert _rows()[0]["media_type"] == "Photo"
 
     media = _named(caplog, "media_present")[0]
     assert media["media_class"] == "MessageMediaPhoto"
-    guard = _named(caplog, "ephemeral_guard")[0]
-    assert guard["matched"] == "view_once"
-    assert guard["ttl"] == "view_once_sentinel"
+    # Still classified as view-once — as trace evidence, not as a refusal.
+    classification = _named(caplog, "ephemeral_guard")[0]
+    assert classification["matched"] == "view_once"
+    assert classification["ttl"] == "view_once_sentinel"
 
-    not_reached = {
-        event["stage"]
+    not_reached = [
+        event
         for event in _fields(caplog)
         if event.get("kind") == save_trace.NOT_REACHED
-    }
-    assert not_reached == {"download", "upload", "persist"}
-    assert all(
-        event["reason"] == "ephemeral_refusal"
-        for event in _fields(caplog)
-        if event.get("kind") == save_trace.NOT_REACHED
-    )
+    ]
+    assert not_reached == []
     assert sys.gettrace() is None
 
 
 @pytest.mark.asyncio
-async def test_the_view_once_refusal_never_leaks_content_or_ids(monkeypatch, caplog):
+async def test_view_once_video_is_saved_through_download_upload_and_persist():
+    secret = _message(
+        MSG_ID,
+        _document_media(VIEW_ONCE_TTL_SECONDS, mime="video/mp4", name="clip.mp4"),
+        text="one time only",
+    )
+    client = FakeClient([secret])
+
+    result = await save_service.execute_save(client, OWNER, secret, "UTC")
+
+    assert getattr(result, "saved", False) is True, result
+    assert save_service.ephemeral_media_kind(secret.media) == EPHEMERAL_VIEW_ONCE
+    assert len(client.download_calls) == 1
+    assert len(client.send_calls) == 1
+    assert _rows()[0]["media_type"] == "Video"
+    assert "clip.mp4" in _rows()[0]["caption"]
+
+
+@pytest.mark.asyncio
+async def test_view_once_file_is_saved_through_download_upload_and_persist():
+    secret = _message(
+        MSG_ID,
+        _document_media(
+            VIEW_ONCE_TTL_SECONDS, mime="application/pdf", name="secret.pdf"
+        ),
+        text="one time only",
+    )
+    client = FakeClient([secret])
+
+    result = await save_service.execute_save(client, OWNER, secret, "UTC")
+
+    assert getattr(result, "saved", False) is True, result
+    assert save_service.ephemeral_media_kind(secret.media) == EPHEMERAL_VIEW_ONCE
+    assert len(client.download_calls) == 1
+    assert len(client.send_calls) == 1
+    assert _rows()[0]["media_type"] == "Document"
+    assert "secret.pdf" in _rows()[0]["caption"]
+
+
+@pytest.mark.asyncio
+async def test_the_view_once_save_never_leaks_content_or_ids(monkeypatch, caplog):
     monkeypatch.setenv(save_trace.ENV_FLAG, "1")
     caplog.set_level(logging.INFO)
 
@@ -249,8 +292,7 @@ async def test_the_view_once_refusal_never_leaks_content_or_ids(monkeypatch, cap
     assert not any(str(PEER) in record for record in records)
 
 
-# ── 3. ordinary photos keep saving (missing TTL and Telegram's TTL 0) ────────
-
+# ── 3. ordinary media keeps saving (missing TTL and Telegram's TTL 0) ───────
 
 @pytest.mark.asyncio
 async def test_ordinary_photo_without_a_ttl_is_saved():
@@ -283,21 +325,37 @@ async def test_ordinary_photo_with_zero_ttl_is_saved():
 
 
 @pytest.mark.asyncio
-async def test_photo_with_a_finite_ttl_follows_the_expiring_policy():
+async def test_ordinary_file_without_a_ttl_is_saved():
+    target = _message(
+        MSG_ID,
+        _document_media(None, mime="application/pdf", name="report.pdf"),
+        text="hello",
+    )
+    client = FakeClient([target])
+
+    result = await save_service.execute_save(client, OWNER, target, "UTC")
+
+    assert getattr(result, "saved", False) is True, result
+    assert len(client.download_calls) == 1
+    assert len(client.send_calls) == 1
+    assert _rows()[0]["media_type"] == "Document"
+
+
+@pytest.mark.asyncio
+async def test_photo_with_a_finite_ttl_is_saved_like_ordinary_media():
     target = _message(MSG_ID, _parsed_photo(ttl=30), text="timer")
     assert save_service.ephemeral_media_kind(target.media) == EPHEMERAL_EXPIRING
     client = FakeClient([target])
 
     result = await save_service.execute_save(client, OWNER, target, "UTC")
 
-    assert getattr(result, "saved", False) is False
-    assert "30s" in result
-    assert client.calls == []
-    assert _rows() == []
+    assert getattr(result, "saved", False) is True, result
+    assert len(client.download_calls) == 1
+    assert len(client.send_calls) == 1
+    assert len(_rows()) == 1
 
 
 # ── 4. the classification reads an exact TTL, never "a big number" ──────────
-
 
 def test_only_the_exact_sentinel_is_view_once():
     class NoTtlField:
@@ -319,7 +377,6 @@ def test_only_the_exact_sentinel_is_view_once():
 
 
 # ── 5. link and reply are target resolution only; ONE pipeline executes ─────
-
 
 @pytest.mark.asyncio
 async def test_link_and_reply_paths_both_use_the_one_execute_save_pipeline(monkeypatch):
@@ -364,3 +421,19 @@ async def test_link_and_reply_paths_both_use_the_one_execute_save_pipeline(monke
     # Neither path ever substitutes a forward for the pipeline.
     assert link_client.forward_calls == []
     assert reply_client.forward_calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_view_once_link_target_reaches_the_shared_pipeline(monkeypatch):
+    """A ``tg://`` view-once target is resolved and saved, never refused."""
+    link_target = _message(
+        MSG_ID, _document_media(VIEW_ONCE_TTL_SECONDS), chat_id=PEER
+    )
+    client = PeerResolutionClient([link_target], global_by_id={MSG_ID: link_target})
+
+    result = await save_service.execute_link_save(client, OWNER, LINK, "UTC")
+
+    assert getattr(result, "saved", False) is True, result
+    assert len(client.download_calls) == 1
+    assert len(client.send_calls) == 1
+    assert len(_rows()) == 1

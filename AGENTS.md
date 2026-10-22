@@ -289,17 +289,17 @@ source message
   in album order, each distinct caption once, blank-line separated, bounded
   with an explicit `…`. A failure before the album is sent leaves nothing in
   Saved Messages and no row; a partial album Telegram creates is removed
-  again; an ephemeral or over-limit member refuses the WHOLE album before any
-  transfer. Progress is per member (`File i/N`) from that member's own bytes.
+  again; an over-limit member refuses the WHOLE album before any transfer.
+  Progress is per member (`File i/N`) from that member's own bytes.
   Retrieval forwards every member, and deletion resolves and deletes every
   member (never the anchor alone), refusing instead of leaving orphans.
-- **Ephemeral media**: view-once media (Telegram's `ttl_seconds ==
-  2147483647` sentinel, `0x7FFFFFFF`) and expiring media (any other positive
-  TTL) are refused in `_deep_save_one` BEFORE any download, upload, save code
-  or DB write — there is no workaround and no bypass. Per the TL schema `0`
-  disables self-destruction and ordinary media carries no TTL at all, so the
-  value always comes from Telegram: a refused photo was sent view-once, never
-  an ordinary photo misread.
+- **View-once / expiring media**: Telegram's `ttl_seconds` value (the
+  `0x7FFFFFFF` view-once sentinel or any other positive TTL) is CLASSIFIED by
+  `media_ttl_seconds` / `ephemeral_media_kind` but never decides anything: such
+  media is downloaded, uploaded and persisted exactly like media without a
+  TTL, in `_deep_save_one` and in every album member. The classification is
+  kept only as safe `[SAVE_TRACE]` evidence (`ephemeral_guard`,
+  `member_N_ephemeral`); there is no refusal branch and no bypass to maintain.
 - **Transfer progress**: `execute_save` / `execute_link_save` accept an optional
   `progress` observer (`SaveProgressEvent`, real Telethon byte counts). Both
   Glass inputs bind

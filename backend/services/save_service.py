@@ -574,7 +574,7 @@ def _transfer_progress_callback(
     return _callback
 
 
-# ── view-once / expiring media ──
+# ── media TTL classification (trace evidence only) ──
 
 #: Telegram's documented view-once marker (``2**31 - 1``). It is a SENTINEL,
 #: not a duration: in the TL schema ``0`` disables self-destruction, the
@@ -600,13 +600,12 @@ def ephemeral_media_kind(media) -> str | None:
     Telegram's documented split for ``ttl_seconds``: no value or ``0`` is
     ordinary (``0`` disables self-destruction); exactly
     ``VIEW_ONCE_TTL_SECONDS`` (``0x7FFFFFFF``) is view-once; any other positive
-    value (``0 < ttl < 0x7FFFFFFF``) is expiring media. Both ephemeral kinds are
-    one-time by the sender's/Telegram's design, so neither is ever downloaded,
-    re-uploaded or recorded — no attribute guessing and no workaround.
+    value (``0 < ttl < 0x7FFFFFFF``) is expiring media.
 
-    This value is Telegram's own wire value (nothing in the Save path invents
-    one), so an ordinary photo — which carries no TTL — can never reach either
-    branch: a refused photo really was sent as view-once.
+    This is a CLASSIFICATION, not a policy: the Save pipeline never refuses
+    media because of it. View-once and expiring media take the ordinary Deep
+    Save path (download → upload → persist) exactly like media without a TTL;
+    the value survives only as safe evidence for ``[SAVE_TRACE]``.
     """
     ttl = media_ttl_seconds(media)
     if ttl is None:
@@ -644,22 +643,6 @@ def ephemeral_evidence(media) -> dict:
         "ttl": ttl_kind,
         "kind": ephemeral_media_kind(media) or "ordinary",
     }
-
-
-def ephemeral_refusal(media) -> str:
-    """The deterministic, pre-transfer refusal text for ephemeral media."""
-    kind = ephemeral_media_kind(media)
-    ttl = media_ttl_seconds(media)
-    if kind == EPHEMERAL_VIEW_ONCE:
-        return (
-            f"{sym.STATE_FAILED} Nothing was saved: this is view-once media. "
-            "Telegram marks it as one-time viewing, so LifeOS does not download "
-            "or re-upload it."
-        )
-    return (
-        f"{sym.STATE_FAILED} Nothing was saved: this media expires after {ttl}s. "
-        "LifeOS does not download or re-upload ephemeral media."
-    )
 
 
 # ── albums (grouped media) ──
@@ -1466,46 +1449,27 @@ async def _deep_save_one(
 ) -> SaveOutcome:
     """Deep-Save ONE source message — the per-item half of ``execute_save``.
 
-    Its Telegram behavior is exactly the previously single-item pipeline
-    (ephemeral refusal → download → validate → upload as a NEW message → DB);
-    the only additions are the item's ordinal (for progress) and the optional
-    progress reporter. The temporary directory is removed on every exit path.
+    Its Telegram behavior is the previously single-item pipeline
+    (download → validate → upload as a NEW message → DB); the only additions are
+    the item's ordinal (for progress) and the optional progress reporter. The
+    temporary directory is removed on every exit path.
     """
     media = getattr(reply_msg, "media", None)
     evidence = ephemeral_evidence(media)
-    guard_kind = ephemeral_media_kind(media)
+    ttl_kind = ephemeral_media_kind(media)
     if trace is not None:
         trace.enter("deep_save", "_deep_save_one", item=f"{item_index}/{item_count}")
         trace.branch(
             "deep_save", "media_present", media is not None,
             media_class=evidence["media_class"],
         )
-        # The guard's own condition, plus the evidence that produced it: the
-        # TTL field's presence and the category its value falls into.
+        # The TTL classification is recorded as evidence only: view-once and
+        # expiring media take the same download/upload/persist path as ordinary
+        # media, so this branch decides nothing.
         trace.branch(
-            "deep_save", "ephemeral_guard", guard_kind or "ordinary",
+            "deep_save", "ephemeral_guard", ttl_kind or "ordinary",
             ttl_field=evidence["ttl_field"], ttl=evidence["ttl"],
         )
-
-    # Ephemeral (view-once / expiring) media is refused BEFORE any transfer,
-    # any save code, any caption and any database write.
-    if guard_kind is not None:
-        logger.info(
-            "[SAVE] refused ephemeral media kind=%s chat=%s msg=%s",
-            guard_kind,
-            save_trace.fingerprint(getattr(reply_msg, "chat_id", None)),
-            save_trace.fingerprint(getattr(reply_msg, "id", None)),
-        )
-        if trace is not None:
-            trace.returned(
-                "deep_save", "_deep_save_one", save_trace.OUTCOME_REFUSED,
-                media_kind=guard_kind, ttl=evidence["ttl"],
-            )
-            # The refusal happens before any byte moves: the later stages are
-            # recorded as NOT REACHED, never as failures.
-            for stage in ("download", "upload", "persist"):
-                trace.not_reached(stage, "ephemeral_refusal", func="_deep_save_one")
-        return SaveOutcome(ephemeral_refusal(media), saved=False)
 
     save_code = await db_client.get_next_save_code()
     if trace is not None:
@@ -1849,33 +1813,12 @@ async def _deep_save_album(
     # Pre-flight: every member must be saveable before ANY transfer, code or row.
     for index, member in enumerate(members, 1):
         media = getattr(member, "media", None)
-        kind = ephemeral_media_kind(media)
         if trace is not None:
             evidence = ephemeral_evidence(media)
             trace.branch(
-                "album", f"member_{index}_ephemeral", kind or "ordinary",
+                "album", f"member_{index}_ephemeral",
+                ephemeral_media_kind(media) or "ordinary",
                 ttl_field=evidence["ttl_field"], ttl=evidence["ttl"],
-            )
-        if kind is not None:
-            label = "view-once" if kind == EPHEMERAL_VIEW_ONCE else "expiring"
-            logger.info(
-                "[SAVE] refused album: member %d/%d is %s media (chat=%s msg=%s)",
-                index, total_items, label,
-                save_trace.fingerprint(getattr(member, "chat_id", None)),
-                save_trace.fingerprint(getattr(member, "id", None)),
-            )
-            if trace is not None:
-                trace.returned(
-                    "album", "_deep_save_album", save_trace.OUTCOME_REFUSED,
-                    media_kind=kind, member=index,
-                )
-                for stage in ("download", "upload", "persist"):
-                    trace.not_reached(stage, "album_ephemeral_refusal", func="_deep_save_album")
-            return SaveOutcome(
-                f"{sym.STATE_FAILED} Nothing was saved: file {index} of {total_items} in this "
-                f"album is {label} media. An album is saved as one item, so it is saved "
-                "whole or not at all.",
-                saved=False,
             )
         if media is None:
             return SaveOutcome(
@@ -2162,8 +2105,8 @@ async def execute_save(
     An album source is resolved to its full, bounded member set (see
     ``resolve_album_messages``) and saved as ONE item through
     ``_deep_save_album``: one code, one grouped Telegram album, one row.
-    Ephemeral media (view-once and expiring) is refused before any transfer,
-    and an album that cannot be completed as a unit is never reported saved.
+    View-once and expiring media are saved exactly like ordinary media, and an
+    album that cannot be completed as a unit is never reported saved.
 
     ``progress`` is an optional observer of the REAL transfer byte counts. It
     knows nothing about the Glass UI: the caller decides what to render.
@@ -2406,8 +2349,8 @@ async def execute_link_save(
     (which parses ``tg://openmessage`` as the URI it is) and the fetched
     message is validated against the requested id/peer before anything is
     downloaded; a link that resolves to an album is saved as ONE item by the
-    same album pipeline as a reply. Whether the target media is view-once or
-    expiring is decided by the MEDIA, not by the link format.
+    same album pipeline as a reply. View-once and expiring targets take that
+    same pipeline as ordinary media: the link format never changes media policy.
     """
     trace = trace if trace is not None else save_trace.SaveTrace.begin("link_save")
     # The link itself is never logged: scheme + fingerprinted ids are enough to

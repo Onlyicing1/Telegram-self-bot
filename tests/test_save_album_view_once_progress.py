@@ -621,7 +621,35 @@ async def test_partial_album_creation_is_removed_and_never_reported_saved():
 
 
 @pytest.mark.asyncio
-async def test_album_with_ephemeral_member_is_refused_before_any_transfer():
+async def test_view_once_media_still_reports_live_progress_on_its_panel():
+    secret = FakeMessage(
+        141,
+        media=MessageMediaPhoto(
+            photo=FakePhoto(141, 200_000), ttl_seconds=VIEW_ONCE_TTL_SECONDS
+        ),
+        text="one time only",
+        download_size=200_000,
+    )
+    reply = FakeMessage(142, chat_id=PANEL_CHAT, text="save", reply_to_msg_id=141)
+    client = FakeClient([secret, reply])
+    _wire(client)
+
+    await save_handler._save_reply_wait_handler(
+        "save", PANEL_CHAT, 142, PANEL_CHAT, PANEL_MSG,
+    )
+
+    assert len(_rows()) == 1
+    texts = [call["text"] for call in client.edit_calls]
+    assert any("Downloading 50%" in text for text in texts)
+    assert any("Uploading 100%" in text for text in texts)
+    assert "Saved Successfully" in texts[-1]
+    # Reply Mode keeps editing the panel it armed — no new status message.
+    assert client.send_message_calls == []
+
+
+@pytest.mark.asyncio
+async def test_album_with_a_view_once_member_is_saved_as_one_item():
+    """A view-once member no longer refuses the album: it saves with the rest."""
     first = photo_message(41, grouped_id=9200, text="ok")
     secret = view_once_message(42, grouped_id=9200)
     third = photo_message(43, grouped_id=9200, text="ok")
@@ -629,14 +657,16 @@ async def test_album_with_ephemeral_member_is_refused_before_any_transfer():
 
     result = await save_service.execute_save(client, OWNER, third, "UTC")
 
-    assert getattr(result, "saved", False) is False
-    assert "view-once" in result
-    assert "file 2 of 3" in result
-    assert client.download_calls == []
-    assert client.upload_calls == []
-    assert client.send_calls == []
-    assert _rows() == []
-    assert db_client._fallback["saved_items"] == []
+    assert getattr(result, "saved", False) is True, result
+    # Every member moved through the ordinary pipeline, in album order.
+    assert [message_id for message_id, _cb in client.download_calls] == [41, 42, 43]
+    assert len(client.upload_calls) == 3
+    assert len(client.send_calls) == 1
+    assert len(client.send_calls[0]["file"]) == 3
+    assert len(_rows()) == 1
+    assert _rows()[0]["media_type"] == MEDIA_TYPE_ALBUM
+    assert _rows()[0]["file_size"] == 3000
+    assert _rows()[0]["saved_msg_id"] == 601
 
 
 @pytest.mark.asyncio
@@ -657,20 +687,22 @@ async def test_album_over_limit_member_is_refused_before_transfer():
 
 
 @pytest.mark.asyncio
-async def test_view_once_single_item_is_refused_before_transfer():
+async def test_view_once_single_item_is_saved_through_the_pipeline():
     secret = view_once_message(61)
     client = FakeClient([secret])
 
     result = await save_service.execute_save(client, OWNER, secret, "UTC")
 
-    assert getattr(result, "saved", False) is False
-    assert "view-once" in result
-    assert client.calls == []
-    assert _rows() == []
+    assert getattr(result, "saved", False) is True, result
+    assert [message_id for message_id, _cb in client.download_calls] == [61]
+    assert len(client.send_calls) == 1
+    assert len(_rows()) == 1
+    assert _rows()[0]["media_type"] == "Photo"
+    assert save_service.ephemeral_media_kind(secret.media) == EPHEMERAL_VIEW_ONCE
 
 
 @pytest.mark.asyncio
-async def test_expiring_single_item_is_refused_with_its_ttl():
+async def test_expiring_single_item_is_saved_like_ordinary_media():
     expiring = FakeMessage(
         62,
         media=MessageMediaDocument(
@@ -682,9 +714,10 @@ async def test_expiring_single_item_is_refused_with_its_ttl():
 
     result = await save_service.execute_save(client, OWNER, expiring, "UTC")
 
-    assert getattr(result, "saved", False) is False
-    assert "30s" in result
-    assert client.calls == []
+    assert getattr(result, "saved", False) is True, result
+    assert [message_id for message_id, _cb in client.download_calls] == [62]
+    assert len(client.send_calls) == 1
+    assert len(_rows()) == 1
     assert save_service.ephemeral_media_kind(expiring.media) == EPHEMERAL_EXPIRING
 
 
@@ -977,7 +1010,7 @@ async def test_link_save_reports_a_malformed_uri_without_touching_telegram():
 
 
 @pytest.mark.asyncio
-async def test_view_once_through_a_private_link_is_refused_by_the_media_policy():
+async def test_view_once_through_a_private_link_is_saved_by_the_shared_pipeline():
     secret = view_once_message(209974)
     secret.chat_id = 5406707941
     client = FakeClient([secret])
@@ -986,10 +1019,11 @@ async def test_view_once_through_a_private_link_is_refused_by_the_media_policy()
         client, OWNER, "tg://openmessage?user_id=5406707941&message_id=209974", "UTC"
     )
 
-    assert getattr(result, "saved", False) is False
-    assert "view-once" in result
-    assert client.download_calls == []
-    assert _rows() == []
+    assert getattr(result, "saved", False) is True, result
+    assert [message_id for message_id, _cb in client.download_calls] == [209974]
+    assert len(client.send_calls) == 1
+    assert len(_rows()) == 1
+    assert client.forward_calls == []
 
 
 @pytest.mark.asyncio
