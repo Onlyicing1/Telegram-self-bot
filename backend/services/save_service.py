@@ -28,11 +28,14 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Awaitable, Callable
+from urllib.parse import parse_qs
 
 from telethon.tl.types import (
+    DocumentAttributeFilename,
+    InputMediaUploadedDocument,
+    InputMediaUploadedPhoto,
     MessageMediaDocument,
     MessageMediaPhoto,
-    DocumentAttributeFilename,
 )
 
 from backend.bio.engine import _get_tz
@@ -48,6 +51,23 @@ _LINK_RE = re.compile(
     r"(?:c/(\d+)/(\d+)"        # private:  /c/<internal_chat>/<msg_id>
     r"|(\w+)/(\d+))"           # username: /<username>/<msg_id>
 )
+
+#: The private-chat link scheme Telegram itself emits ("Share Link" / "Copy
+#: Link" inside the app). It is a URI, never an HTTP URL, so it is parsed as a
+#: URI and never handed to ``_LINK_RE``.
+_TG_OPENMESSAGE_RE = re.compile(r"^tg://openmessage\??(?P<query>.*)$", re.IGNORECASE)
+_TG_PEER_PARAMS = ("user_id", "chat_id", "channel_id")
+_TG_MESSAGE_PARAMS = ("message_id", "post")
+#: Telegram ids are 64-bit; anything outside that range is not an id.
+MAX_TELEGRAM_ID = 2**63 - 1
+
+#: The ONE media-type token an album row stores (the album is one saved item).
+MEDIA_TYPE_ALBUM = "Album"
+
+#: Telegram's media-caption limit — an album caption must fit it.
+CAPTION_MAX_CHARS = 1024
+#: The album source text budget, so the metadata block always fits with it.
+ALBUM_SOURCE_TEXT_MAX_CHARS = 600
 
 _MEDIA_TYPE_MAP = {
     "image/jpeg": "Photo",
@@ -73,6 +93,7 @@ _MEDIA_ICON = {
     "Sticker": sym.MEDIA_STICKER,
     "Document": sym.MEDIA_DOCUMENT,
     "Text": sym.MEDIA_TEXT,
+    MEDIA_TYPE_ALBUM: sym.MEDIA_ALBUM,
     "Unknown": sym.MEDIA_UNKNOWN,
 }
 
@@ -370,6 +391,7 @@ def build_caption(
     file_name: str | None,
     tags: list[str],
     owner_tags=(),
+    album_count: int | None = None,
 ) -> str:
     """Compact, information-dense LifeOS caption.
 
@@ -378,16 +400,22 @@ def build_caption(
 
     ``tags`` are the generated system hashtags (presentation only);
     ``owner_tags`` are the owner's own semantic tags and render as their own
-    labelled section, never merged with the hashtag line.
+    labelled section, never merged with the hashtag line. ``album_count``
+    states how many files ONE album item carries — the caption is written
+    once for the whole album, never once per file.
     """
     size_str = _format_bytes(file_size) if file_size else "—"
     icon = media_icon(media_type)
+    media_line = f"{sym.META_MEDIA} {media_type}"
+    if album_count:
+        media_line += f" · {album_count} items"
+    media_line += f" · {size_str}" + (f" · {mime}" if mime else "")
     lines = [
         f"{icon} {save_code} · DEEP",
         f"{sym.META_SENDER} {sender}",
         f"{sym.META_TIME} {dt.strftime('%Y-%m-%d %H:%M')}",
         f"{sym.META_ID} {chat_id}/{msg_id}",
-        f"{sym.META_MEDIA} {media_type} · {size_str}" + (f" · {mime}" if mime else ""),
+        media_line,
     ]
     if file_name:
         lines.append(f"{FILE_NAME_PREFIX} {file_name}")
@@ -455,10 +483,9 @@ class SaveOutcome(str):
     re-parsing human-readable confirmation text. ``saved`` is True only when
     the whole pipeline really persisted the item.
 
-    For an album, ``saved`` describes the WHOLE album (every item persisted),
-    ``save_code`` is empty unless exactly one item was saved, and ``media_type``
-    is empty — the per-item codes and types are listed in the result text and
-    each has its own ``saved_items`` row.
+    For an album, ``saved`` describes the WHOLE album, ``save_code`` is the
+    album's ONE code and ``media_type`` is ``Album``: one code, one Telegram
+    album, one ``saved_items`` row — never one of each per file.
     """
 
     save_code: str
@@ -668,10 +695,93 @@ async def resolve_album_messages(client, target) -> tuple[list, str]:
     if base_id not in seen:
         members.append(target)
     members.sort(key=lambda message: getattr(message, "id", 0) or 0)
+    if len(members) > ALBUM_MAX_ITEMS:
+        logger.warning(
+            "[SAVE] album resolved %d members for grouped_id=%s — keeping Telegram's cap of %d",
+            len(members), grouped, ALBUM_MAX_ITEMS,
+        )
+        members = members[:ALBUM_MAX_ITEMS]
     logger.info(
         "[SAVE] album resolved chat=%s grouped_id=%s selected=%s members=%d",
         chat_id, grouped, base_id, len(members),
     )
+    return members, ""
+
+
+def is_album_row(row: dict | None) -> bool:
+    """True when a stored row represents ONE saved album, not one file."""
+    value = str((row or {}).get("media_type") or "").strip().casefold()
+    return value == MEDIA_TYPE_ALBUM.casefold()
+
+
+async def resolve_saved_album_messages(client, chat_id, msg_id) -> tuple[list, str]:
+    """Resolve the SAVED album anchored at ``(chat_id, msg_id)``.
+
+    An album row stores the album's FIRST destination message as its saved
+    location. The remaining members are Telegram's own grouping — read from
+    the anchor's ``grouped_id`` inside a bounded id window, exactly like the
+    source-side resolver, never inferred from adjacency.
+
+    Returns ``(members, error)``. A non-grouped anchor resolves to itself, so
+    a single saved item keeps its exact one-message behavior. A grouped anchor
+    whose other members cannot be resolved IS an error: retrieval and deletion
+    must never silently act on one file of an album and lose the rest.
+    """
+    if not chat_id or not msg_id:
+        return [], "the saved location data is missing"
+    try:
+        anchor = await client.get_messages(chat_id, ids=msg_id)
+    except Exception as exc:  # noqa: BLE001 — honest resolution failure
+        logger.warning("[SAVE] saved album anchor failed chat=%s msg=%s: %s", chat_id, msg_id, exc)
+        return [], f"the saved message could not be resolved ({type(exc).__name__})"
+    if anchor is None:
+        return [], "the saved message no longer exists"
+
+    grouped = album_group_id(anchor)
+    if grouped is None:
+        return [anchor], ""
+
+    base_id = getattr(anchor, "id", 0) or 0
+    window = [
+        message_id
+        for message_id in range(base_id - (ALBUM_MAX_ITEMS - 1), base_id + ALBUM_MAX_ITEMS)
+        if message_id > 0
+    ]
+    try:
+        fetched = await client.get_messages(chat_id, ids=window)
+    except Exception as exc:  # noqa: BLE001 — honest resolution failure
+        logger.warning("[SAVE] saved album resolve failed chat=%s msg=%s: %s", chat_id, base_id, exc)
+        return [], f"the saved album could not be resolved ({type(exc).__name__})"
+
+    if fetched is None:
+        fetched = []
+    elif not isinstance(fetched, (list, tuple)):
+        fetched = [fetched]
+
+    members: list = []
+    seen: set[int] = set()
+    for message in fetched:
+        if message is None:
+            continue
+        message_id = getattr(message, "id", None)
+        if not isinstance(message_id, int) or message_id in seen:
+            continue
+        if album_group_id(message) != grouped:
+            continue
+        if getattr(message, "chat_id", None) != getattr(anchor, "chat_id", None):
+            continue
+        seen.add(message_id)
+        members.append(message)
+
+    if base_id not in seen:
+        members.append(anchor)
+    members.sort(key=lambda message: getattr(message, "id", 0) or 0)
+    if len(members) < 2:
+        logger.warning(
+            "[SAVE] saved album is grouped but only its anchor resolved chat=%s msg=%s",
+            chat_id, base_id,
+        )
+        return [], "the saved album's other members could not be resolved"
     return members, ""
 
 
@@ -717,33 +827,157 @@ def _extract_uploaded_metadata(sent) -> tuple[str | None, str | None, int | None
     return None, None, None
 
 
-def parse_telegram_link(link: str) -> tuple[str | None, int, int]:
-    """Parse a t.me / telegram.me link into (username, chat_id, msg_id).
+@dataclass(frozen=True)
+class LinkTarget:
+    """One resolved Telegram link: the peer to read and the message inside it.
 
-    For private "/c/" links:
-      https://t.me/c/3080318802/42  →  (None, -1003080318802, 42)
-    For username links:
-      https://t.me/somechannel/42    →  ("somechannel", 0, 42)
-
-    Returns (None, 0, 0) if the link doesn't match any known pattern.
+    A link is either a username link (``https://t.me/<username>/<id>``), a
+    private HTTP link (``https://t.me/c/<chat>/<id>``, peer ``-100<chat>``) or
+    the app's own URI form (``tg://openmessage?...``). ``error`` is empty only
+    when the link parsed completely; a caller never guesses the missing half.
     """
-    m = _LINK_RE.search(link.strip())
-    if not m:
-        return None, 0, 0
 
-    private_chat, private_msg = m.group(1), m.group(2)
-    username, username_msg = m.group(3), m.group(4)
+    username: str | None = None
+    chat_id: int = 0
+    message_id: int = 0
+    scheme: str = "https"
+    error: str = ""
+
+    @property
+    def peer_id(self) -> int:
+        return int(self.chat_id or 0)
+
+
+def _parse_positive_id(value) -> int | None:
+    """A Telegram id from link text, or ``None`` when it is not one."""
+    text = str(value if value is not None else "").strip()
+    if not text or not text.isdigit():
+        return None
+    number = int(text)
+    if number <= 0 or number > MAX_TELEGRAM_ID:
+        return None
+    return number
+
+
+def _first_param(params: dict[str, list[str]], name: str) -> str | None:
+    values = params.get(name) or []
+    return values[0] if values else None
+
+
+def _parse_tg_openmessage(link: str) -> LinkTarget:
+    """Parse ``tg://openmessage`` — the URI scheme, NOT an HTTP URL.
+
+    Supported, and nothing else:
+
+    * ``?user_id=<id>&message_id=<id>`` — a private chat with that user
+    * ``?chat_id=<id>&message_id=<id>`` — a basic group (peer ``-<id>``)
+    * ``?channel_id=<id>&message_id=<id>`` (or ``&post=<id>``) — a channel or
+      supergroup (peer ``-100<id>``)
+
+    Exactly one peer parameter is required; a missing, duplicated or
+    non-numeric id is refused with a reason instead of a guessed peer.
+    """
+    match = _TG_OPENMESSAGE_RE.match(link.strip())
+    if not match:
+        return LinkTarget(scheme="tg", error="this tg:// link is not an openmessage link")
+
+    params = parse_qs(match.group("query") or "", keep_blank_values=True)
+    present = [name for name in _TG_PEER_PARAMS if name in params]
+    if len(present) != 1:
+        return LinkTarget(
+            scheme="tg",
+            error="a tg://openmessage link needs exactly one of user_id, chat_id or channel_id",
+        )
+
+    peer_param = present[0]
+    peer_number = _parse_positive_id(_first_param(params, peer_param))
+    if peer_number is None:
+        return LinkTarget(
+            scheme="tg",
+            error=f"`{peer_param}` in this tg:// link is not a valid Telegram id",
+        )
+
+    raw_message = next(
+        (_first_param(params, name) for name in _TG_MESSAGE_PARAMS if name in params),
+        None,
+    )
+    message_id = _parse_positive_id(raw_message)
+    if message_id is None:
+        return LinkTarget(
+            scheme="tg",
+            error="a tg://openmessage link needs a valid message_id",
+        )
+
+    if peer_param == "channel_id":
+        chat_id = int(f"-100{peer_number}")
+    elif peer_param == "chat_id":
+        chat_id = -peer_number
+    else:
+        chat_id = peer_number
+
+    logger.info(
+        "[LINK_SAVE] parsed type=tg_openmessage peer=%s chat_id=%s msg_id=%s",
+        peer_param, chat_id, message_id,
+    )
+    return LinkTarget(chat_id=chat_id, message_id=message_id, scheme="tg")
+
+
+def _parse_http_link(link: str) -> LinkTarget:
+    """Parse an http(s) t.me / telegram.me link (username or ``/c/`` form)."""
+    match = _LINK_RE.search(link.strip())
+    if not match:
+        return LinkTarget()
+
+    private_chat, private_msg = match.group(1), match.group(2)
+    username, username_msg = match.group(3), match.group(4)
 
     if private_chat is not None:
         chat_id = int(f"-100{private_chat}")
         msg_id = int(private_msg)
         logger.info("[LINK_SAVE] parsed type=private chat_id=%s msg_id=%s", chat_id, msg_id)
-        return None, chat_id, msg_id
+        return LinkTarget(chat_id=chat_id, message_id=msg_id)
 
-    chat_username = username
     msg_id = int(username_msg)
-    logger.info("[LINK_SAVE] parsed type=username chat=%s msg_id=%s", chat_username, msg_id)
-    return chat_username, 0, msg_id
+    logger.info("[LINK_SAVE] parsed type=username chat=%s msg_id=%s", username, msg_id)
+    return LinkTarget(username=username, message_id=msg_id)
+
+
+def parse_link_target(link: str) -> LinkTarget:
+    """The ONE link parser: ``tg://openmessage`` first, then http(s) links."""
+    text = str(link or "").strip()
+    if not text:
+        return LinkTarget(error="the link is empty")
+    if text.lower().startswith("tg://"):
+        return _parse_tg_openmessage(text)
+    target = _parse_http_link(text)
+    if not target.message_id or not (target.username or target.chat_id):
+        return LinkTarget(
+            error=(
+                "this is not a Telegram message link "
+                "(use https://t.me/<username>/<id>, https://t.me/c/<chat>/<id> "
+                "or tg://openmessage?user_id=<id>&message_id=<id>)"
+            )
+        )
+    return target
+
+
+def parse_telegram_link(link: str) -> tuple[str | None, int, int]:
+    """Parse any supported Telegram message link → ``(username, chat_id, msg_id)``.
+
+    For private "/c/" links:
+      https://t.me/c/3080318802/42  →  (None, -1003080318802, 42)
+    For username links:
+      https://t.me/somechannel/42    →  ("somechannel", 0, 42)
+    For the app's URI form:
+      tg://openmessage?user_id=5406707941&message_id=209974
+                                    →  (None, 5406707941, 209974)
+
+    Returns (None, 0, 0) if the link doesn't match any known pattern.
+    """
+    target = parse_link_target(link)
+    if target.error:
+        return None, 0, 0
+    return target.username, target.chat_id, target.message_id
 
 
 def _format_bytes(n: int | None) -> str:
@@ -830,46 +1064,109 @@ def _extract_source_media(reply_msg, save_code: str) -> tuple[str | None, int | 
     return mime_type, file_size, file_name, file_id, media_type
 
 
-def _one_line(value, limit: int = 180) -> str:
-    """Collapse a result string into one bounded line (album summaries)."""
-    line = " ".join(str(value or "").split())
-    return line[:limit] + ("…" if len(line) > limit else "")
+def _source_text(value) -> str:
+    """One source caption as a single trimmed line ("" when there is none)."""
+    return " ".join(str(value or "").split())
 
 
-def _album_outcome(results: list) -> SaveOutcome:
-    """Aggregate per-item outcomes — honest about partial success.
+def album_source_text(sources, limit: int = ALBUM_SOURCE_TEXT_MAX_CHARS) -> str:
+    """The album's source text: its members' captions, once each, in order.
 
-    The album is reported as saved only when EVERY resolved item persisted; a
-    partial run states how many items were saved and names the failing ones.
-    Each successful item keeps its own code and metadata row.
+    The deterministic, tested policy:
+
+    * members are read in ALBUM order (by message id);
+    * a member with no text contributes nothing;
+    * a caption Telegram repeats across members is kept ONCE;
+    * distinct captions are separated by one blank line;
+    * the result is bounded to ``limit`` characters; a longer text is cut at
+      the bound with an explicit ``…``, never silently shortened.
+
+    This is the album's ONE text block, appended to the metadata caption once.
     """
-    total = len(results)
-    saved = [result for result in results if getattr(result, "saved", False)]
-    codes = [getattr(result, "save_code", "") for result in saved]
-    codes = [code for code in codes if code]
+    seen: set[str] = set()
+    parts: list[str] = []
+    for member in sources:
+        text = _source_text(getattr(member, "text", None))
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        parts.append(text)
+    joined = "\n\n".join(parts)
+    bound = max(0, int(limit))
+    if len(joined) <= bound:
+        return joined
+    if bound <= 1:
+        return ""
+    return joined[: bound - 1].rstrip() + "…"
 
-    lines: list[str] = []
-    if saved and len(saved) == total:
-        lines.append(f"{sym.STATE_COMPLETED} **Album saved — {total} of {total} items**")
-    elif saved:
-        lines.append(f"{sym.STATE_WARNING} **Album saved — {len(saved)} of {total} items**")
-    else:
-        lines.append(f"{sym.STATE_FAILED} **Album save failed — 0 of {total} items**")
-    lines.append("")
 
-    for index, result in enumerate(results, 1):
-        if getattr(result, "saved", False):
-            code = getattr(result, "save_code", "") or "—"
-            media_type = getattr(result, "media_type", "") or "Item"
-            lines.append(f"{sym.OP_SAVE} `{code}` · {media_type}")
+def build_album_caption(
+    save_code: str,
+    sender: str,
+    chat_id: int,
+    msg_id: int,
+    dt: datetime,
+    member_count: int,
+    total_size: int | None,
+    tags: list[str],
+    sources,
+    owner_tags=(),
+) -> str:
+    """The ONE caption of a saved album.
+
+    The LifeOS metadata block is written ONCE — on the album's first message,
+    because the album is one item — and the album's own source text follows
+    it. Both are bounded to Telegram's caption limit, so an album caption can
+    never be rejected for length.
+    """
+    block = build_caption(
+        save_code=save_code,
+        sender=sender,
+        chat_id=chat_id,
+        msg_id=msg_id,
+        dt=dt,
+        media_type=MEDIA_TYPE_ALBUM,
+        mime=None,
+        file_size=total_size,
+        file_name=None,
+        tags=tags,
+        owner_tags=owner_tags,
+        album_count=member_count,
+    )
+    budget = min(ALBUM_SOURCE_TEXT_MAX_CHARS, max(0, CAPTION_MAX_CHARS - len(block) - 2))
+    text = album_source_text(sources, budget)
+    return f"{block}\n\n{text}" if text else block
+
+
+def _album_media_item(media, handle, mime_type: str | None, file_name: str | None):
+    """One ALREADY-UPLOADED album member as the ``InputMedia`` to group.
+
+    The handle comes from ``client.upload_file``, so sending the album never
+    re-uploads a byte and every member keeps its real media type: a photo
+    stays a photo and a document keeps its original attributes (video, audio,
+    sticker, filename) instead of degrading into a generic file.
+    """
+    if isinstance(media, MessageMediaPhoto):
+        return InputMediaUploadedPhoto(file=handle)
+
+    doc = getattr(media, "document", None)
+    attributes: list = []
+    has_filename = False
+    for attr in getattr(doc, "attributes", []) or []:
+        if isinstance(attr, DocumentAttributeFilename):
+            has_filename = True
+            attributes.append(DocumentAttributeFilename(file_name or attr.file_name or "file"))
         else:
-            lines.append(f"{sym.STATE_FAILED} Item {index} — {_one_line(result)}")
-
-    fully_saved = bool(total) and len(saved) == total
-    return SaveOutcome(
-        "\n".join(lines),
-        save_code=codes[0] if len(codes) == 1 else "",
-        saved=fully_saved,
+            attributes.append(attr)
+    if not has_filename:
+        attributes.append(DocumentAttributeFilename(file_name or "file"))
+    resolved_mime = mime_type or getattr(doc, "mime_type", None) or "application/octet-stream"
+    return InputMediaUploadedDocument(
+        file=handle,
+        mime_type=resolved_mime,
+        attributes=attributes,
+        force_file=False,
+        nosound_video=str(resolved_mime).split("/")[0] == "video",
     )
 
 
@@ -1128,6 +1425,307 @@ async def _deep_save_one(
     )
 
 
+def _album_failure(index: int, total: int, reason: str) -> SaveOutcome:
+    """The honest refusal of an album that could not be completed as a unit."""
+    return SaveOutcome(
+        f"{sym.STATE_FAILED} Album not saved: file {index} of {total} {reason}. "
+        "Nothing was added to Saved Messages.",
+        saved=False,
+    )
+
+
+async def _deep_save_album(
+    client,
+    owner_id: int,
+    members: list,
+    tz_str: str,
+    *,
+    metadata: SaveMetadata,
+    progress: ProgressCallback | None = None,
+) -> SaveOutcome:
+    """Deep-Save a WHOLE album as ONE saved item.
+
+    The album is the unit of saving and of metadata: ONE save code, ONE new
+    Telegram ALBUM (a single grouped upload, not N independent messages) and
+    ONE ``saved_items`` row whose saved location is the album's first message.
+
+    Each member is downloaded, validated and uploaded before the album is
+    sent, so a failure at any point leaves NOTHING in Saved Messages and no
+    row: an album is never half-saved and never becomes several items.
+    Progress is reported per member (``File i/N``) from the real byte counts of
+    that member's own download and upload. The temporary directory is removed
+    on success, failure and cancellation alike.
+    """
+    total_items = len(members)
+    limit_mb = settings_service.max_deep_save_mb()
+    max_bytes = limit_mb * 1024 * 1024
+
+    # Pre-flight: every member must be saveable before ANY transfer, code or row.
+    for index, member in enumerate(members, 1):
+        media = getattr(member, "media", None)
+        kind = ephemeral_media_kind(media)
+        if kind is not None:
+            label = "view-once" if kind == EPHEMERAL_VIEW_ONCE else "expiring"
+            logger.info(
+                "[SAVE] refused album: member %d/%d is %s media (chat=%s msg=%s)",
+                index, total_items, label,
+                getattr(member, "chat_id", None), getattr(member, "id", None),
+            )
+            return SaveOutcome(
+                f"{sym.STATE_FAILED} Nothing was saved: file {index} of {total_items} in this "
+                f"album is {label} media. An album is saved as one item, so it is saved "
+                "whole or not at all.",
+                saved=False,
+            )
+        if media is None:
+            return SaveOutcome(
+                f"{sym.STATE_FAILED} Nothing was saved: file {index} of {total_items} in this "
+                "album carries no media to save.",
+                saved=False,
+            )
+        declared = _extract_source_media(member, "")[1]
+        if declared and declared > max_bytes:
+            return SaveOutcome(
+                f"{sym.STATE_WARNING} Nothing was saved: file {index} of {total_items} is "
+                f"{declared / (1024 * 1024):.1f} MB — the deep-save limit is {limit_mb} MB "
+                "per file.",
+                saved=False,
+            )
+
+    save_code = await db_client.get_next_save_code()
+    now = datetime.now(_get_tz(tz_str))
+    sender_name, sender_id = await _resolve_sender(members[0])
+    origin_chat_id = getattr(members[0], "chat_id", None)
+    origin_msg_id = getattr(members[0], "id", None)
+
+    media_items: list = []
+    total_size = 0
+    caption = ""
+    sent = None
+    created: list = []
+    tmp_root = tempfile.mkdtemp(prefix="lifeos_dl_")
+    try:
+        for index, member in enumerate(members, 1):
+            media = getattr(member, "media", None)
+            mime_type, declared_size, file_name, _file_id, _media_type = _extract_source_media(
+                member, save_code
+            )
+
+            item_dir = os.path.join(tmp_root, f"item_{index}")
+            os.makedirs(item_dir, exist_ok=True)
+            tmp_path = os.path.join(
+                item_dir, os.path.basename(file_name or f"item_{index}.bin")
+            )
+
+            # STAGE 1 — download THIS member (its own progress, real bytes).
+            await _emit_progress(
+                progress,
+                SaveProgressEvent(
+                    phase="download", completed_bytes=0, total_bytes=declared_size,
+                    item_index=index, item_count=total_items,
+                ),
+            )
+            download_callback = _transfer_progress_callback(
+                progress, "download", index, total_items, declared_size
+            )
+            try:
+                t0 = asyncio.get_event_loop().time()
+                download_kwargs = {"progress_callback": download_callback} if download_callback else {}
+                await client.download_media(member, file=tmp_path, **download_kwargs)
+                record_event(
+                    "save", "download_media",
+                    (asyncio.get_event_loop().time() - t0) * 1000, "SUCCESS",
+                )
+            except Exception as exc:  # noqa: BLE001 — honest per-file failure
+                logger.error("[SAVE] album download failed item=%d/%d: %s", index, total_items, exc)
+                record_event("save", "download_media", 0, "ERROR", str(exc))
+                return _album_failure(index, total_items, f"could not be downloaded ({exc})")
+
+            if not os.path.exists(tmp_path):
+                return _album_failure(index, total_items, "is missing after the download")
+            member_size = os.path.getsize(tmp_path)
+            if member_size == 0:
+                return _album_failure(index, total_items, "is empty after the download")
+            if member_size > max_bytes:
+                return _album_failure(
+                    index, total_items,
+                    f"is {member_size / (1024 * 1024):.1f} MB — over the {limit_mb} MB limit",
+                )
+
+            await _emit_progress(
+                progress,
+                SaveProgressEvent(
+                    phase="download", completed_bytes=member_size,
+                    total_bytes=declared_size or member_size,
+                    item_index=index, item_count=total_items, finished=True,
+                ),
+            )
+
+            # STAGE 2 — upload THIS member to Telegram, keeping its media type.
+            await _emit_progress(
+                progress,
+                SaveProgressEvent(
+                    phase="upload", completed_bytes=0, total_bytes=member_size,
+                    item_index=index, item_count=total_items,
+                ),
+            )
+            upload_callback = _transfer_progress_callback(
+                progress, "upload", index, total_items, member_size
+            )
+            try:
+                t1 = asyncio.get_event_loop().time()
+                upload_kwargs = {"progress_callback": upload_callback} if upload_callback else {}
+                handle = await client.upload_file(tmp_path, **upload_kwargs)
+                record_event(
+                    "save", "upload_file",
+                    (asyncio.get_event_loop().time() - t1) * 1000, "SUCCESS",
+                )
+            except Exception as exc:  # noqa: BLE001 — honest per-file failure
+                logger.error("[SAVE] album upload failed item=%d/%d: %s", index, total_items, exc)
+                record_event("save", "upload_file", 0, "ERROR", str(exc))
+                return _album_failure(index, total_items, f"could not be uploaded ({exc})")
+
+            await _emit_progress(
+                progress,
+                SaveProgressEvent(
+                    phase="upload", completed_bytes=member_size,
+                    total_bytes=member_size, item_index=index,
+                    item_count=total_items, finished=True,
+                ),
+            )
+
+            media_items.append(_album_media_item(media, handle, mime_type, file_name))
+            total_size += member_size
+            shutil.rmtree(item_dir, ignore_errors=True)
+
+        # STAGE 3 — send the uploaded members as ONE Telegram album.
+        caption = build_album_caption(
+            save_code=save_code,
+            sender=sender_name,
+            chat_id=origin_chat_id,
+            msg_id=origin_msg_id,
+            dt=now,
+            member_count=total_items,
+            total_size=total_size,
+            tags=caption_hashtags(MEDIA_TYPE_ALBUM, now),
+            sources=members,
+            owner_tags=metadata.tags,
+        )
+        logger.info(
+            "[SAVE] album upload chat=%s msgs=%s files=%d size=%s code=%s",
+            origin_chat_id, origin_msg_id, total_items, total_size, save_code,
+        )
+        try:
+            t2 = asyncio.get_event_loop().time()
+            sent = await client.send_file("me", media_items, caption=caption)
+            record_event(
+                "save", "send_file",
+                (asyncio.get_event_loop().time() - t2) * 1000, "SUCCESS",
+            )
+        except Exception as exc:  # noqa: BLE001 — nothing reached Saved Messages
+            logger.error("[SAVE] album send failed: %s", exc)
+            record_event("save", "send_file", 0, "ERROR", str(exc))
+            return SaveOutcome(
+                f"{sym.STATE_FAILED} Album not saved: all {total_items} files were uploaded, "
+                f"but Telegram did not accept the album ({exc}). Nothing was added to "
+                "Saved Messages.",
+                saved=False,
+            )
+
+        candidates = sent if isinstance(sent, (list, tuple)) else [sent]
+        created = [
+            message for message in candidates
+            if message is not None and getattr(message, "id", None)
+        ]
+    except asyncio.CancelledError:
+        raise
+    finally:
+        shutil.rmtree(tmp_root, ignore_errors=True)
+
+    if len(created) != total_items:
+        # Telegram did not create the whole album: remove whatever it did
+        # create, so a partial album can never survive as an orphaned save.
+        created_ids = [message.id for message in created]
+        if created_ids:
+            try:
+                await client.delete_messages("me", created_ids)
+            except Exception as exc:  # noqa: BLE001 — cleanup is best effort
+                logger.warning("[SAVE] partial album cleanup failed: %s", exc)
+        logger.error(
+            "[SAVE] album incomplete: %d of %d messages created",
+            len(created), total_items,
+        )
+        return SaveOutcome(
+            f"{sym.STATE_FAILED} Album not saved: Telegram created {len(created)} of "
+            f"{total_items} album messages, so that partial album was removed again. "
+            "Nothing was saved.",
+            saved=False,
+        )
+
+    created.sort(key=lambda message: message.id)
+    anchor = created[0]
+    saved_chat_id = getattr(anchor, "chat_id", None)
+    saved_msg_id = anchor.id
+
+    payload = {
+        "save_code": save_code,
+        "save_type": "deep",
+        "origin_chat_id": origin_chat_id,
+        "origin_msg_id": origin_msg_id,
+        "saved_chat_id": saved_chat_id,
+        "saved_msg_id": saved_msg_id,
+        "sender_name": sender_name,
+        "sender_id": sender_id,
+        "mime_type": None,
+        "file_id": None,
+        "file_size": total_size,
+        "media_type": MEDIA_TYPE_ALBUM,
+        "caption": caption,
+        "owner_id": owner_id,
+        "created_at": now.isoformat(),
+    }
+    payload.update(metadata.insert_fields())
+
+    inserted = None
+    try:
+        inserted = await db_client.insert_save(payload)
+    except Exception as exc:  # noqa: BLE001 — the DB layer already reports None
+        logger.error("[SAVE_DB] insert_save raised for album %s: %s", save_code, exc, exc_info=True)
+
+    if inserted is None:
+        logger.error("[SAVE_DB] album insert returned None — row NOT in database")
+        await db_client.log(owner_id, "ERROR", f"Saved album D {save_code} but DB insert failed", {
+            "save_code": save_code,
+            "origin_chat_id": origin_chat_id,
+            "origin_msg_id": origin_msg_id,
+        })
+        return SaveOutcome(
+            f"{sym.STATE_WARNING} Album uploaded to Saved Messages, but the database record "
+            f"failed for `{save_code}`.",
+            saved=False,
+        )
+
+    await db_client.log(owner_id, "INFO", f"Saved album D {save_code}", {
+        "save_code": save_code,
+        "origin_chat_id": origin_chat_id,
+        "origin_msg_id": origin_msg_id,
+        "items": total_items,
+    })
+    logger.info("[SAVE] album completed: %s (%d files)", save_code, total_items)
+    return SaveOutcome(
+        "\n".join([
+            f"{media_icon(MEDIA_TYPE_ALBUM)} **Album Saved Successfully**",
+            "",
+            f"**Code:** `{save_code}`",
+            f"**Type:** {MEDIA_TYPE_ALBUM} · {total_items} files",
+            f"**Size:** {_format_bytes(total_size)}",
+        ]),
+        save_code=save_code,
+        saved=True,
+        media_type=MEDIA_TYPE_ALBUM,
+    )
+
+
 async def execute_save(
     client,
     owner_id: int,
@@ -1156,9 +1754,10 @@ async def execute_save(
     it is never silently truncated or discarded.
 
     An album source is resolved to its full, bounded member set (see
-    ``resolve_album_messages``) and saved item by item through the SAME
-    per-item pipeline; partial success is reported as partial. Ephemeral media
-    (view-once and expiring) is refused before any transfer.
+    ``resolve_album_messages``) and saved as ONE item through
+    ``_deep_save_album``: one code, one grouped Telegram album, one row.
+    Ephemeral media (view-once and expiring) is refused before any transfer,
+    and an album that cannot be completed as a unit is never reported saved.
 
     ``progress`` is an optional observer of the REAL transfer byte counts. It
     knows nothing about the Glass UI: the caller decides what to render.
@@ -1177,28 +1776,40 @@ async def execute_save(
             f"{sym.STATE_FAILED} Deep Save failed: {album_error}", saved=False
         )
 
-    if len(members) == 1:
+    if len(members) <= 1:
         return await _deep_save_one(
             client, owner_id, reply_msg, tz_str,
             metadata=metadata, progress=progress, item_index=1, item_count=1,
         )
 
-    results: list[SaveOutcome] = []
-    for index, member in enumerate(members, 1):
-        results.append(
-            await _deep_save_one(
-                client, owner_id, member, tz_str,
-                metadata=metadata, progress=progress,
-                item_index=index, item_count=len(members),
-            )
-        )
-
-    outcome = _album_outcome(results)
+    outcome = await _deep_save_album(
+        client, owner_id, members, tz_str,
+        metadata=metadata, progress=progress,
+    )
     logger.info(
-        "[SAVE] album finished: %d/%d items saved",
-        sum(1 for result in results if result.saved), len(results),
+        "[SAVE] album finished: %d files, %s",
+        len(members), "saved" if outcome.saved else "not saved",
     )
     return outcome
+
+
+async def _fetch_linked_message(client, target: LinkTarget):
+    """Fetch the linked message through the ordinary Telethon client.
+
+    A username link is resolved to its entity first; a numeric peer (a private
+    HTTP link or a ``tg://`` id) is read directly. The only fallback is
+    resolving the peer EXPLICITLY when Telethon cannot map the bare id — the
+    case where the id is not in this session's entity cache — never a second
+    API and never a bypass of Telegram's access rules.
+    """
+    if target.username:
+        entity = await client.get_entity(target.username)
+        return await client.get_messages(entity, ids=target.message_id)
+    try:
+        return await client.get_messages(target.chat_id, ids=target.message_id)
+    except ValueError:
+        entity = await client.get_entity(target.chat_id)
+        return await client.get_messages(entity, ids=target.message_id)
 
 
 async def execute_link_save(
@@ -1213,32 +1824,55 @@ async def execute_link_save(
     """Resolve a Telegram link and Deep-Save the linked message.
 
     This is the same Deep Save pipeline as ``execute_save`` — the only
-    difference is the source resolution (a t.me link instead of a reply), so it
-    takes and forwards the same optional ``SaveMetadata`` and progress contracts.
+    difference is the source resolution (a link instead of a reply), so it
+    takes and forwards the same optional ``SaveMetadata`` and progress
+    contracts. Every supported link form goes through ``parse_link_target``
+    (which parses ``tg://openmessage`` as the URI it is) and the fetched
+    message is validated against the requested id/peer before anything is
+    downloaded; a link that resolves to an album is saved as ONE item by the
+    same album pipeline as a reply. Whether the target media is view-once or
+    expiring is decided by the MEDIA, not by the link format.
     """
     logger.info("[LINK_SAVE] resolving link: %s", link)
-    channel, chat_id, msg_id = parse_telegram_link(link)
-    if not channel and not chat_id:
-        logger.warning("[LINK_SAVE] invalid telegram link: %s", link)
-        return f"{sym.STATE_FAILED} Could not parse link. Use https://t.me/channel/123 or https://t.me/c/123/456"
+    target = parse_link_target(link)
+    if target.error:
+        logger.warning("[LINK_SAVE] invalid telegram link: %s (%s)", link, target.error)
+        return f"{sym.STATE_FAILED} Could not parse link: {target.error}."
 
     try:
-        if chat_id:
-            target_msg = await client.get_messages(chat_id, ids=msg_id)
-        else:
-            entity = await client.get_entity(channel)
-            target_msg = await client.get_messages(entity, ids=msg_id)
+        target_msg = await _fetch_linked_message(client, target)
         logger.info(
             "[LINK_SAVE] source message fetched: msg_id=%s chat_id=%s",
             getattr(target_msg, "id", None), getattr(target_msg, "chat_id", None),
         )
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — honest resolution failure
         logger.error("[LINK_SAVE] fetch source message failed: %s", exc, exc_info=True)
-        return f"{sym.STATE_FAILED} Could not resolve link: {exc}"
+        guidance = (
+            " The tg:// form needs a chat this account can already resolve; Telegram "
+            "does not expose an arbitrary id."
+            if target.scheme == "tg" else ""
+        )
+        return f"{sym.STATE_FAILED} Could not resolve link: {exc}.{guidance}"
 
     if target_msg is None:
         logger.warning("[LINK_SAVE] source message not found at link")
         return f"{sym.STATE_FAILED} Message not found at that link."
+
+    # The resolved message must BE the requested one: a peer that answers with
+    # another message (or another chat) is a failure, never a silent save.
+    if getattr(target_msg, "id", None) != target.message_id:
+        logger.warning(
+            "[LINK_SAVE] resolved message id mismatch: wanted=%s got=%s",
+            target.message_id, getattr(target_msg, "id", None),
+        )
+        return f"{sym.STATE_FAILED} The link did not resolve to the requested message."
+    actual_chat = getattr(target_msg, "chat_id", None)
+    if target.chat_id and actual_chat is not None and actual_chat != target.chat_id:
+        logger.warning(
+            "[LINK_SAVE] resolved chat mismatch: wanted=%s got=%s",
+            target.chat_id, actual_chat,
+        )
+        return f"{sym.STATE_FAILED} The link did not resolve to the requested chat."
 
     return await execute_save(
         client, owner_id, target_msg, tz_str, metadata=metadata, progress=progress

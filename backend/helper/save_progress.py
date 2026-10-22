@@ -10,6 +10,8 @@ edits of that message:
 * the cadence depends on the transfer's actual size — ``50/100`` for a file of
   at most 10 MiB, ``20/40/60/80/100`` for a larger one, applied independently
   to the download phase and the upload phase;
+* a known size emits its phase-start line (0%, which is what is actually
+  known) as soon as the phase begins, then each milestone crossed;
 * an unknown size emits ONE phase-start line without a percentage and a
   truthful 100% at the phase boundary — an unknown file is never treated as a
   small one and no percentage is invented;
@@ -104,6 +106,11 @@ class SaveProgressReporter:
             await self._emit(event, None)
             return
 
+        # The phase boundary's own observation (0 bytes moved) is a REAL
+        # update, and it is what makes progress visible the moment a phase
+        # starts instead of only once a milestone is crossed. Later callbacks
+        # cannot repeat it: the key is already claimed.
+        await self._emit(event, 0)
         if percentage is None:
             return
         for milestone in milestones:

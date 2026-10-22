@@ -99,7 +99,15 @@ class WiringClient(MockClient):
 
     async def get_messages(self, chat_id, ids=None, **kwargs):
         self.get_messages_calls.append((chat_id, ids))
-        return self.reply if ids == REPLY_MSG_ID else self.target
+        if ids == REPLY_MSG_ID:
+            return self.reply
+        # Telethon answers with the message AT the requested id and peer — the
+        # link path validates that identity, so the fake models it faithfully.
+        if isinstance(ids, int) and ids != self.target.id:
+            self.target.id = ids
+        if isinstance(chat_id, int) and chat_id < 0 and chat_id != self.target.chat_id:
+            self.target.chat_id = chat_id
+        return self.target
 
     async def delete_messages(self, chat_id, ids):
         self.calls.append(("delete_messages", chat_id, ids))

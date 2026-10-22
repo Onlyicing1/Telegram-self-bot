@@ -17,9 +17,11 @@ this module parses the one-line UI format and nothing else.
 
 Live transfer progress is wired the same way: both user-facing sources (Reply
 Mode and Save by Link) pass a ``save_service`` progress observer bound to the
-SAME status message, which the helper edits in place. Without a helper bot there
-is no inline panel message to edit, so the pipeline simply runs without
-progress instead of inventing a new UI.
+SAME panel message that launched the save. That message was sent by the
+OWNER'S account, so the SELF client edits it in place (through the standard
+panel render path) — a bot cannot edit another account's message. Without a
+panel message there is nothing to edit, so the pipeline runs without progress
+instead of inventing a new UI.
 """
 import logging
 import os
@@ -82,11 +84,16 @@ async def _save_inline_builder(event, extra: str) -> list:
 async def _save_reply_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     from backend.helper.inline_engine import _owner_id
     from backend.helper.input_state import set_pending
+    from backend.helper.panels import resolve_callback_message
 
     owner_id = _owner_id
 
     if not chat_id:
         return "Deep Save", f"{sym.STATE_WARNING} Could not determine the current chat. Please try again.", []
+
+    # The panel message that must later carry live progress is the message the
+    # button was clicked on — resolved the way every other panel resolves it.
+    _panel_chat, panel_msg_id, _inline_id = resolve_callback_message(event)
 
     wait_text = (
         "**Deep Save — Reply Mode**\n\n"
@@ -98,7 +105,7 @@ async def _save_reply_action(event, extra: str, chat_id: int) -> tuple[str, str,
         owner_id, "save_reply", _save_reply_wait_handler,
         chat_id, wait_text,
         inline_chat_id=chat_id,
-        inline_msg_id=getattr(event, "message_id", 0) or 0,
+        inline_msg_id=panel_msg_id or 0,
         extra="",
         timeout=None,
     )
@@ -234,24 +241,56 @@ async def _save_metadata_input_handler(text, chat_id, msg_id, inline_chat_id, in
             pass
 
 
-def _progress_reporter(helper, inline_chat_id, inline_msg_id):
+def _progress_reporter(self_client, inline_chat_id, inline_msg_id, *, title: str = "Deep Save"):
     """Bind save progress to the panel message that launched the operation.
 
-    ``None`` when there is no helper-backed status message: a non-inline save
-    has no message to edit, and a progress UI must not be invented for it.
+    The panel message was sent by the OWNER'S OWN ACCOUNT (an inline result the
+    self-bot clicked), so the SELF client is the only client that may edit it:
+    the helper bot cannot edit another account's message, and editing through it
+    was why progress and the final result never appeared. The edit uses the
+    same render path as every other panel (``render_edit`` plus the shared nav
+    row), so Save progress matches the rest of the Glass UI.
+
+    ``None`` only when there is no self client or no panel coordinates: a save
+    with no status message (the AI tools) invents no progress UI.
     """
-    if not helper or not inline_chat_id or not inline_msg_id:
+    if self_client is None or not inline_chat_id or not inline_msg_id:
         return None
+
+    from backend.helper.panel_render import render_edit
+    from backend.helper.panels import _progress_buttons
 
     async def _edit(text: str) -> bool:
         try:
-            await helper.edit_message(inline_chat_id, inline_msg_id, text, buttons=[])
+            rendered, buttons = render_edit("", text, _progress_buttons())
+            await self_client.edit_message(
+                inline_chat_id, inline_msg_id, message=rendered, buttons=buttons
+            )
             return True
-        except Exception as exc:
-            logger.warning("save progress edit failed: %s", exc)
+        except Exception as exc:  # noqa: BLE001 — progress never aborts a save
+            logger.warning(
+                "save progress edit failed chat=%s msg=%s: %s",
+                inline_chat_id, inline_msg_id, exc,
+            )
             return False
 
-    return SaveProgressReporter(_edit)
+    return SaveProgressReporter(_edit, title=title)
+
+
+async def _edit_status(self_client, inline_chat_id, inline_msg_id, text: str, label: str) -> bool:
+    """Edit the launching panel message with the SELF client (best effort)."""
+    if self_client is None or not inline_chat_id or not inline_msg_id:
+        return False
+    try:
+        from backend.helper.panel_render import render_edit
+        rendered, buttons = render_edit("", text, [])
+        await self_client.edit_message(
+            inline_chat_id, inline_msg_id, message=rendered, buttons=buttons
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001 — the transfer result already exists
+        logger.warning("%s result edit failed: %s", label, exc)
+        return False
 
 
 async def _save_reply_wait_handler(
@@ -264,8 +303,7 @@ async def _save_reply_wait_handler(
     client = _self_client
     clear_pending(owner_id)
 
-    helper = get_client()
-    reporter = _progress_reporter(helper, inline_chat_id, inline_msg_id)
+    reporter = _progress_reporter(client, inline_chat_id, inline_msg_id)
 
     try:
         # Resolve the user's outgoing reply, then the exact message it
@@ -291,11 +329,8 @@ async def _save_reply_wait_handler(
 
     if reporter is not None:
         await reporter.close(result)
-    elif helper and inline_chat_id and inline_msg_id:
-        try:
-            await helper.edit_message(inline_chat_id, inline_msg_id, result, buttons=[])
-        except Exception as exc:
-            logger.warning("save reply result edit failed: %s", exc)
+    else:
+        await _edit_status(client, inline_chat_id, inline_msg_id, result, "save reply")
 
     if client:
         try:
@@ -312,8 +347,9 @@ async def _save_link_input_handler(text, chat_id, msg_id, inline_chat_id, inline
     client = _self_client
     clear_pending(owner_id)
 
-    helper = get_client()
-    reporter = _progress_reporter(helper, inline_chat_id, inline_msg_id)
+    reporter = _progress_reporter(
+        client, inline_chat_id, inline_msg_id, title="Save by Link"
+    )
 
     link = text.strip()
     if not link:
@@ -328,11 +364,8 @@ async def _save_link_input_handler(text, chat_id, msg_id, inline_chat_id, inline
 
     if reporter is not None:
         await reporter.close(result)
-    elif helper and inline_chat_id and inline_msg_id:
-        try:
-            await helper.edit_message(inline_chat_id, inline_msg_id, result, buttons=[])
-        except Exception as exc:
-            logger.warning("[LINK_SAVE] result edit failed: %s", exc)
+    else:
+        await _edit_status(client, inline_chat_id, inline_msg_id, result, "link save")
 
     if client:
         try:
@@ -358,5 +391,11 @@ def register(client, owner_id: int, tz_str: str) -> None:
     })
     register_input("save", "link", {
         "handler": _save_link_input_handler,
-        "prompt": "**Save by Link**\n\nSend a Telegram message link:\n`https://t.me/channel/123`\n`https://t.me/c/123/456`\n\n_Reply with the link below._",
+        "prompt": (
+            "**Save by Link**\n\nSend a Telegram message link:\n"
+            "`https://t.me/channel/123`\n"
+            "`https://t.me/c/123/456`\n"
+            "`tg://openmessage?user_id=123&message_id=456`\n\n"
+            "_Reply with the link below._"
+        ),
     })

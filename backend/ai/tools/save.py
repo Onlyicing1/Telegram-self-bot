@@ -214,10 +214,12 @@ class SaveByLinkTool(Tool):
     def description(self) -> str:
         return (
             "Deep-save a Telegram message given its t.me / telegram.me message "
-            "link. Resolves the linked message and runs the existing Deep Save "
-            "pipeline (download → re-upload as a NEW Saved Messages message). "
-            "Optionally records the owner's own name and tags for the item, but "
-            "ONLY when the owner explicitly asked for them."
+            "link, a private https://t.me/c/... link, or the app's own "
+            "tg://openmessage?user_id=...&message_id=... link. Resolves the linked "
+            "message and runs the existing Deep Save pipeline (download → "
+            "re-upload as a NEW Saved Messages message). Optionally records the "
+            "owner's own name and tags for the item, but ONLY when the owner "
+            "explicitly asked for them."
         )
 
     @property
@@ -226,8 +228,9 @@ class SaveByLinkTool(Tool):
             "link": {
                 "type": "string",
                 "description": (
-                    "Exact Telegram message link, e.g. https://t.me/channel/123 "
-                    "or https://t.me/c/123456789/42. Preserve it verbatim."
+                    "Exact Telegram message link, e.g. https://t.me/channel/123, "
+                    "https://t.me/c/123456789/42 or "
+                    "tg://openmessage?user_id=123&message_id=456. Preserve it verbatim."
                 ),
             },
             "display_name": {
@@ -275,7 +278,10 @@ class SaveByLinkTool(Tool):
         link = str(arguments.get("link", "") or "").strip()
         if not link:
             return ToolResult(success=False, message="No link provided.")
-        if not link.lower().startswith("http"):
+        # Only a bare "t.me/..." needs a scheme. A link that already carries
+        # one (including the app's own ``tg://openmessage`` URI) is preserved
+        # verbatim — prefixing it would corrupt the link.
+        if "://" not in link:
             link = "https://" + link
 
         channel, chat_id, _msg_id = save_service.parse_telegram_link(link)

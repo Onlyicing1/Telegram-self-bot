@@ -24,6 +24,7 @@ _MEDIA_ICON = {
     "Voice": sym.MEDIA_VOICE,
     "Sticker": sym.MEDIA_STICKER,
     "Document": sym.MEDIA_DOCUMENT,
+    "Album": sym.MEDIA_ALBUM,
     "Unknown": sym.MEDIA_UNKNOWN,
 }
 

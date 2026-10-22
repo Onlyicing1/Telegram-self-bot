@@ -269,15 +269,25 @@ source message
   timeout. The separate 120s pending-input **state expiry** is unchanged.
 - **AI Save tool**: `SaveTool` marks `long_running=True`; the
   `ToolExecutor` skips the generic 10s tool timeout for long-running tools.
-- **Albums**: a source carrying `grouped_id` is resolved to its FULL, bounded
-  member set by `resolve_album_messages` (the selected id ± the 10-item album
-  cap, keeping only messages whose `grouped_id` and chat match, deduped by id
-  and ordered by id). Every eligible member is Deep-Saved item by item through
-  the SAME per-item pipeline — one new message and one `saved_items` row each,
-  never a forward and never a duplicate. A partial run reports
-  `◬ Album saved — N of M items` and a total failure reports 0 of M; resolution
-  failure refuses instead of silently saving one item. Album members are saved
-  sequentially, so progress is always per file.
+- **Albums are ONE saved item**: a source carrying `grouped_id` is resolved to
+  its FULL, bounded member set by `resolve_album_messages` (the selected id ±
+  the 10-item album cap, keeping only messages whose `grouped_id` and chat
+  match, deduped by id and ordered by id). `_deep_save_album` then downloads,
+  validates and uploads each member (`client.upload_file`) and sends the
+  uploaded members as ONE real Telegram album (a single grouped `send_file` of
+  `InputMedia` items — never N independent messages). The album gets ONE save
+  code, ONE `saved_items` row and ONE caption (the metadata block on the
+  album's first message only); the row's `media_type` is `Album`, `file_size`
+  is the album total, and `saved_msg_id` is the album's FIRST destination
+  message — its `grouped_id` identifies the rest (see
+  `resolve_saved_album_messages`). The album's own text policy: member captions
+  in album order, each distinct caption once, blank-line separated, bounded
+  with an explicit `…`. A failure before the album is sent leaves nothing in
+  Saved Messages and no row; a partial album Telegram creates is removed
+  again; an ephemeral or over-limit member refuses the WHOLE album before any
+  transfer. Progress is per member (`File i/N`) from that member's own bytes.
+  Retrieval forwards every member, and deletion resolves and deletes every
+  member (never the anchor alone), refusing instead of leaving orphans.
 - **Ephemeral media**: view-once media (Telegram's `ttl_seconds ==
   2147483647` sentinel) and every other positive TTL (secret-chat expiry) are
   refused in `_deep_save_one` BEFORE any download, upload, save code or DB
@@ -285,13 +295,24 @@ source message
 - **Transfer progress**: `execute_save` / `execute_link_save` accept an optional
   `progress` observer (`SaveProgressEvent`, real Telethon byte counts). The
   Glass handlers bind `backend/helper/save_progress.py::SaveProgressReporter`
-  to the SAME status message: the shared five-segment bar
+  to the SAME panel message that launched the save, edited in place by the
+  SELF client — the panel message was sent by the owner's account, so the
+  helper bot cannot edit it. Rendering is the shared five-segment bar
   (`backend/helper/progress.py::render_progress_bar`, also used by the model
-  tester), cadence `50/100` at or below 10 MiB and `20/40/60/80/100` above it,
-  independently per download/upload phase. An unknown size gets one phase line
-  without a percentage and a truthful 100% at the boundary; a terminal result
-  closes the reporter first, so a late event can never overwrite it. A caller
-  with no status message (the AI tools) passes no reporter.
+  tester) through the standard panel render path; cadence is `50/100` at or
+  below 10 MiB and `20/40/60/80/100` above it, independently per
+  download/upload phase, after a truthful phase-start line (0%, or no
+  percentage when the size is unknown). An unknown size gets a truthful 100%
+  at the boundary; a terminal result closes the reporter first, so a late
+  event can never overwrite it. A caller with no status message (the AI tools)
+  passes no reporter.
+- **Save by Link**: `parse_link_target` is the ONE link parser —
+  `https://t.me/<username>/<id>`, `https://t.me/c/<chat>/<id>` and the app's
+  own `tg://openmessage?user_id=<id>&message_id=<id>` URI (also
+  `chat_id`/`channel_id` with `message_id` or `post`). `tg://` is parsed as a
+  URI, never fed to the HTTP regex; the resolved message is validated against
+  the requested id and peer, and an unresolvable peer/message is an honest
+  failure. A linked album goes through the same album pipeline.
 
 **Save code format:** short, human-readable codes — `S` + 4 characters
 (e.g. `S0001`, or a random `SXXXX` on collision). No `SV-NNNNNN` format.

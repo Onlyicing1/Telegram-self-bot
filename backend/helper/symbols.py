@@ -86,6 +86,7 @@ MEDIA_VOICE = "◉"         # U+25C9 FISHEYE
 MEDIA_STICKER = "◈"       # U+25C8 WHITE DIAMOND CONTAINING BLACK SMALL DIAMOND
 MEDIA_DOCUMENT = "▤"      # U+25A4 SQUARE WITH HORIZONTAL FILL
 MEDIA_TEXT = "▥"          # U+25A5 SQUARE WITH VERTICAL FILL
+MEDIA_ALBUM = "◰"         # U+25F0 WHITE SQUARE WITH UPPER LEFT QUADRANT
 MEDIA_UNKNOWN = "◌"       # U+25CC DOTTED CIRCLE
 
 # ── domain icons (Category H) ───────────────────────────────────────────────
@@ -230,6 +231,7 @@ MEDIA_SYMBOLS: dict[str, SymbolSpec] = {
     "sticker": SymbolSpec("media_sticker", MEDIA_STICKER, "sticker media"),
     "document": SymbolSpec("media_document", MEDIA_DOCUMENT, "document media"),
     "text": SymbolSpec("media_text", MEDIA_TEXT, "plain text"),
+    "album": SymbolSpec("media_album", MEDIA_ALBUM, "album (grouped media)"),
     "unknown": SymbolSpec("media_unknown", MEDIA_UNKNOWN, "unknown media"),
 }
 

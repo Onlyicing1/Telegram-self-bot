@@ -74,6 +74,8 @@ def _format_date(created_at) -> str:
 def _type_icon(row: dict) -> str:
     media = (row.get("media_type") or "").lower()
     mime = (row.get("mime_type") or "").lower()
+    if "album" in media:
+        return sym.MEDIA_ALBUM
     if "photo" in media or "image" in mime or media == "photo":
         return sym.MEDIA_PHOTO
     if "video" in media or "video" in mime:
@@ -218,6 +220,23 @@ async def do_retrieve(self_client, owner_id: int, save_code: str, target_chat: i
     logger.info("[RETRIEVE] origin_chat_id=%s", origin_chat_id)
     logger.info("[RETRIEVE] saved_chat_id=%s", saved_chat_id)
 
+    # An album row stores the album's FIRST message: retrieve the WHOLE album
+    # (Telegram's own grouping), never just that one file.
+    message_ids = saved_msg_id
+    if save_service.is_album_row(row):
+        members, album_error = await save_service.resolve_saved_album_messages(
+            self_client, saved_chat_id, saved_msg_id
+        )
+        if album_error:
+            logger.warning("[RETRIEVE] album resolution failed for %s: %s", save_code, album_error)
+            record_event("retrieve", "resolve_saved_album", 0, "ERROR", album_error)
+            return (
+                f"{sym.STATE_FAILED} Could not retrieve `{save_code}`: {album_error}. "
+                "Nothing was forwarded."
+            )
+        message_ids = [member.id for member in members]
+        logger.info("[RETRIEVE] album members=%d", len(message_ids))
+
     try:
         source_peer = await self_client.get_input_entity(saved_chat_id)
         logger.info("[RETRIEVE] resolved origin peer OK")
@@ -247,7 +266,7 @@ async def do_retrieve(self_client, owner_id: int, save_code: str, target_chat: i
     try:
         messages = await self_client.forward_messages(
             entity=dest_peer,
-            messages=saved_msg_id,
+            messages=message_ids,
             from_peer=source_peer,
         )
         record_event("retrieve", "forward_messages", (asyncio.get_event_loop().time() - t1) * 1000, "SUCCESS")
@@ -257,7 +276,7 @@ async def do_retrieve(self_client, owner_id: int, save_code: str, target_chat: i
         traceback.print_exc()
         logger.error(
             "[RETRIEVE] forward_messages params: entity=%r messages=%r from_peer=%r",
-            dest_peer, saved_msg_id, source_peer,
+            dest_peer, message_ids, source_peer,
         )
         logger.error("[RETRIEVE] failed IDs: saved_chat_id=%s target_chat=%s", saved_chat_id, target_chat)
         record_event("retrieve", "forward_messages", 0, "ERROR", str(exc))
@@ -339,6 +358,23 @@ async def do_delete(self_client, owner_id: int, save_code: str) -> str:
     saved_chat_id = row.get("saved_chat_id")
     saved_msg_id = row.get("saved_msg_id")
     sc = row.get("save_code")
+
+    # An album is ONE item: resolve its whole member set BEFORE anything is
+    # removed, so a failed resolution can never leave orphaned album members
+    # or a deleted row pointing at a half-existing album.
+    message_ids = [saved_msg_id] if saved_msg_id else []
+    if save_service.is_album_row(row):
+        members, album_error = await save_service.resolve_saved_album_messages(
+            self_client, saved_chat_id, saved_msg_id
+        )
+        if album_error:
+            logger.warning("delete album resolution failed for %s: %s", save_code, album_error)
+            return (
+                f"{sym.STATE_FAILED} Could not delete `{save_code}`: {album_error}. "
+                "Nothing was deleted."
+            )
+        message_ids = [member.id for member in members]
+
     db = db_client.get_db()
     deleted_db = False
     if db:
@@ -347,9 +383,9 @@ async def do_delete(self_client, owner_id: int, save_code: str) -> str:
             deleted_db = removed is not None
         except Exception as exc:
             logger.warning("delete db failed: %s", exc)
-    if saved_chat_id and saved_msg_id:
+    if saved_chat_id and message_ids:
         try:
-            await self_client.delete_messages(saved_chat_id, [saved_msg_id])
+            await self_client.delete_messages(saved_chat_id, message_ids)
         except Exception as exc:
             logger.warning("delete telegram msg failed: %s", exc)
     await db_client.log(owner_id, "INFO", f"Deleted {save_code}", {"save_code": save_code})
@@ -1045,6 +1081,12 @@ async def do_change_file_name(
         return error
     if row is None:
         return f"{sym.STATE_FAILED} No item found for `{code}`"
+
+    if save_service.is_album_row(row):
+        return (
+            f"{sym.STATE_FAILED} `{code}` is a saved album — a Telegram file name belongs "
+            "to one document, and this item is one album of several files. Nothing was renamed."
+        )
 
     saved_chat_id = row.get("saved_chat_id")
     saved_msg_id = row.get("saved_msg_id")

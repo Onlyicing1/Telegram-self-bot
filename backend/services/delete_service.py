@@ -17,7 +17,7 @@ from backend.db import client as db_client
 from backend.diagnostics import record_event
 from backend.helper import symbols as sym
 from backend.helper.rpc_timeout import rpc_await
-from backend.services import settings_service
+from backend.services import save_service, settings_service
 
 logger = logging.getLogger(__name__)
 
@@ -606,11 +606,27 @@ async def do_del_code(client, owner_id: int, code: str) -> str:
     saved_msg_id = row.get("saved_msg_id")
     display = row.get("save_code") or code
 
+    # One album code covers ONE Telegram album: resolve every member first, so
+    # deleting the item can never leave orphaned album members behind. A
+    # resolution failure deletes NOTHING and keeps the row.
+    message_ids = [saved_msg_id] if saved_msg_id else []
+    if save_service.is_album_row(row):
+        members, album_error = await save_service.resolve_saved_album_messages(
+            client, saved_chat_id, saved_msg_id
+        )
+        if album_error:
+            logger.warning("del %s: album resolution failed: %s", code, album_error)
+            return (
+                f"{sym.STATE_FAILED} Could not delete `{display}`: {album_error}. "
+                "Nothing was deleted."
+            )
+        message_ids = [member.id for member in members]
+
     tg_deleted = False
     tg_error = None
-    if saved_chat_id and saved_msg_id:
+    if saved_chat_id and message_ids:
         try:
-            await client.delete_messages(saved_chat_id, [saved_msg_id])
+            await client.delete_messages(saved_chat_id, message_ids)
             tg_deleted = True
         except Exception as exc:
             tg_error = exc
