@@ -48,6 +48,7 @@ from backend.helper import (
 )
 from backend.helper.client import get_client
 from backend.helper.save_progress import SaveProgressReporter
+from backend.runtime import save_trace
 from backend.helper.styles import PRIMARY
 from backend.helper import symbols as sym
 
@@ -399,7 +400,7 @@ def _status_editor(self_client, chat_id, msg_id):
 
 
 async def _start_status(
-    self_client, chat_id: int, *, title: str, body: str
+    self_client, chat_id: int, *, title: str, body: str, trace=None
 ) -> "SaveProgressReporter | None":
     """Send the ONE dedicated Loading/status message and bind progress to it.
 
@@ -414,7 +415,17 @@ async def _start_status(
     panel as the previous behaviour did. Reply Mode must never come here — it
     edits its existing panel instead (``ExistingPanelEditor``).
     """
+    if trace is not None:
+        trace.event(
+            "status", save_trace.CALL_START, func="_start_status",
+            has_client=self_client is not None, has_chat=bool(chat_id),
+        )
     if self_client is None or not chat_id:
+        if trace is not None:
+            trace.event(
+                "status", save_trace.CALL_END, func="_start_status",
+                outcome=save_trace.OUTCOME_FAILED, reason="no_client_or_chat",
+            )
         return None
 
     from backend.helper.panel_render import render_edit
@@ -424,12 +435,30 @@ async def _start_status(
         message = await self_client.send_message(chat_id, rendered)
     except Exception as exc:  # noqa: BLE001 — a save must not fail on its own UI
         logger.warning("save status message could not be created chat=%s: %s", chat_id, exc)
+        if trace is not None:
+            trace.event(
+                "status", save_trace.CALL_END, func="_start_status",
+                outcome=save_trace.OUTCOME_FAILED, error=type(exc).__name__,
+            )
         return None
 
     msg_id = getattr(message, "id", None)
     if not msg_id:
         logger.warning("save status message has no id chat=%s: no progress shown", chat_id)
+        if trace is not None:
+            trace.event(
+                "status", save_trace.CALL_END, func="_start_status",
+                outcome=save_trace.OUTCOME_FAILED, reason="no_message_id",
+            )
         return None
+
+    if trace is not None:
+        # Postcondition: the message really exists and is the one edited later.
+        trace.event(
+            "status", save_trace.CALL_END, func="_start_status",
+            outcome=save_trace.OUTCOME_OK,
+            msg=save_trace.fingerprint(msg_id),
+        )
 
     # The message's OWN coordinates, not the requested ones: that is the message
     # every later edit must address.
@@ -459,7 +488,9 @@ async def _edit_status(self_client, inline_chat_id, inline_msg_id, text: str, la
         return False
 
 
-async def _delete_trigger_message(client, chat_id: int, msg_id: int) -> None:
+async def _delete_trigger_message(
+    client, chat_id: int, msg_id: int, trace=None
+) -> None:
     """Delete the owner's reply/trigger message — the ONE time it is removed.
 
     The reply exists only to establish ``reply_to_msg_id``, so as soon as the
@@ -472,14 +503,32 @@ async def _delete_trigger_message(client, chat_id: int, msg_id: int) -> None:
     """
     if client is None or not chat_id or not msg_id:
         return
+    if trace is not None:
+        trace.event(
+            "cleanup", save_trace.CALL_START, func="_delete_trigger_message",
+            msg=save_trace.fingerprint(msg_id),
+        )
     try:
         await client.delete_messages(chat_id, [msg_id])
-        logger.info("[SAVE_UI] trigger message deleted chat=%s msg=%s", chat_id, msg_id)
+        logger.info(
+            "[SAVE_UI] trigger message deleted chat=%s msg=%s",
+            save_trace.fingerprint(chat_id), save_trace.fingerprint(msg_id),
+        )
+        if trace is not None:
+            trace.event(
+                "cleanup", save_trace.CALL_END, func="_delete_trigger_message",
+                outcome=save_trace.OUTCOME_OK, deleted=True,
+            )
     except Exception as exc:  # noqa: BLE001 — cleanup never aborts the save
         logger.warning(
             "[SAVE_UI] trigger message delete failed chat=%s msg=%s: %s",
-            chat_id, msg_id, exc,
+            save_trace.fingerprint(chat_id), save_trace.fingerprint(msg_id), exc,
         )
+        if trace is not None:
+            trace.event(
+                "cleanup", save_trace.CALL_END, func="_delete_trigger_message",
+                outcome=save_trace.OUTCOME_FAILED, error=type(exc).__name__,
+            )
 
 
 async def _save_reply_wait_handler(
@@ -497,6 +546,11 @@ async def _save_reply_wait_handler(
     owner_id = _owner_id
     client = _self_client
     clear_pending(owner_id)
+
+    # One trace per attempt. Line capture starts at ``execute_save`` on this
+    # path; the panel/trigger stages below are recorded as stage events.
+    trace = save_trace.SaveTrace.begin("reply_save")
+    trace.event("handler", save_trace.ENTER, func="_save_reply_wait_handler", mode="reply")
 
     # Reply Mode keeps the panel it armed: "Waiting for your reply..." becomes
     # the resolution line, then the transfer milestones, then the result — ONE
@@ -527,11 +581,13 @@ async def _save_reply_wait_handler(
             "inline_id=%s) — the save runs without status updates",
             inline_chat_id, inline_msg_id, bool(inline_id),
         )
+        trace.branch("panel", "editable_panel", False, inline_id=bool(inline_id))
     else:
         logger.info(
             "[SAVE_UI] reply mode panel edit path=%s chat=%s msg=%s",
             editor.path, inline_chat_id, inline_msg_id,
         )
+        trace.branch("panel", "editable_panel", True, path=editor.path)
         await editor(f"**{REPLY_PANEL_TITLE}**\n\nResolving the target message…")
         reporter = SaveProgressReporter(editor, title=REPLY_PANEL_TITLE)
 
@@ -543,31 +599,54 @@ async def _save_reply_wait_handler(
     except Exception as exc:  # noqa: BLE001 — reported as a missing reply below
         logger.warning(
             "[SAVE_UI] trigger message lookup failed chat=%s msg=%s: %s",
-            chat_id, msg_id, exc,
+            save_trace.fingerprint(chat_id), save_trace.fingerprint(msg_id), exc,
         )
+        trace.failed("trigger", "get_messages", exc)
         reply_msg = None
 
     target_id = getattr(reply_msg, "reply_to_msg_id", None)
-    await _delete_trigger_message(client, chat_id, msg_id)
+    trace.branch(
+        "trigger", "trigger_read", reply_msg is not None, is_reply=bool(target_id)
+    )
+    await _delete_trigger_message(client, chat_id, msg_id, trace=trace)
 
     try:
         if target_id:
             # The exact target of the ORIGINAL reply — never the trigger and
             # never a message guessed from chat history.
+            trace.event(
+                "target", save_trace.CALL_START, func="get_messages",
+                msg=save_trace.fingerprint(target_id),
+            )
             target_msg = await client.get_messages(chat_id, ids=target_id)
+            trace.event(
+                "target", save_trace.CALL_END, func="get_messages",
+                outcome=save_trace.OUTCOME_OK if target_msg is not None else save_trace.OUTCOME_FAILED,
+                found=target_msg is not None,
+            )
             if target_msg is None:
                 result = f"{sym.STATE_WARNING} The replied message no longer exists."
             else:
+                trace.event("save", save_trace.CALL_START, func="execute_save")
                 result = await save_service.execute_save(
                     client, owner_id, target_msg, os.getenv("TZ", "Asia/Tehran"),
                     metadata=metadata,
                     progress=reporter.handle if reporter is not None else None,
+                    trace=trace,
+                )
+                trace.event(
+                    "save", save_trace.CALL_END, func="execute_save",
+                    outcome=_save_result_outcome(result),
+                    saved=getattr(result, "saved", None),
                 )
         elif reply_msg:
+            trace.branch("trigger", "is_reply", False)
             result = f"{sym.STATE_WARNING} Your message was not a reply. Please reply to a message to select what to save."
         else:
+            trace.branch("trigger", "trigger_found", False)
             result = f"{sym.STATE_WARNING} Could not find your reply message. Please try again."
     except Exception as exc:
+        trace.failed("save", "execute_save", exc)
         result = f"{sym.STATE_FAILED} Deep Save failed: {exc}"
 
     saved_code = ""
@@ -583,13 +662,40 @@ async def _save_reply_wait_handler(
             # result to wait for.
             await reporter.close(None)
             await editor(result, success_action_rows(saved_code))
+            trace.event(
+                "result", save_trace.CLEANUP, func="_save_reply_wait_handler",
+                outcome=_save_result_outcome(result), surface="inline_edit",
+                actions=True, code=saved_code,
+            )
         else:
             await reporter.close(result)
+            trace.event(
+                "result", save_trace.CLEANUP, func="_save_reply_wait_handler",
+                outcome=_save_result_outcome(result), surface=editor.path,
+                actions=False, code=saved_code,
+            )
+
+    trace.returned("handler", "_save_reply_wait_handler", _save_result_outcome(result))
 
     # The panel keeps its terminal state; releasing the token lets the next
     # Save on this panel become its writer without waiting for a timeout.
     if generation:
         finish_panel_operation(inline_chat_id, inline_msg_id, generation)
+
+
+def _save_result_outcome(result) -> str:
+    """Trace classification of one Save result — never its text.
+
+    ``SaveOutcome.saved`` is authoritative when present (``False`` means the
+    pipeline refused or failed after starting). A plain ``str`` result comes
+    from parse/resolution, which never reached the pipeline at all.
+    """
+    saved = getattr(result, "saved", None)
+    if saved is True:
+        return save_trace.OUTCOME_OK
+    if saved is False:
+        return save_trace.OUTCOME_REFUSED
+    return save_trace.OUTCOME_FAILED
 
 
 async def _save_link_input_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
@@ -600,33 +706,55 @@ async def _save_link_input_handler(text, chat_id, msg_id, inline_chat_id, inline
     client = _self_client
     clear_pending(owner_id)
 
-    # The status message exists BEFORE the link is parsed or resolved, so a
-    # slow lookup is never mistaken for an ignored link.
-    reporter = await _start_status(
-        client, chat_id, title="Save by Link", body="Resolving the link…"
-    )
+    trace = save_trace.SaveTrace.begin("link_save")
+    with trace.capturing():
+        trace.event("handler", save_trace.ENTER, func="_save_link_input_handler", mode="link")
 
-    link = text.strip()
-    if not link:
-        result = f"{sym.STATE_WARNING} Link cannot be empty."
-    else:
-        result = await save_service.execute_link_save(
-            client, owner_id, link, os.getenv("TZ", "Asia/Tehran"),
-            progress=reporter.handle if reporter is not None else None,
+        # The status message exists BEFORE the link is parsed or resolved, so a
+        # slow lookup is never mistaken for an ignored link.
+        reporter = await _start_status(
+            client, chat_id, title="Save by Link", body="Resolving the link…",
+            trace=trace,
         )
+        trace.branch("status", "progress_surface", reporter is not None)
 
-    logger.info("[LINK_SAVE] handler result: %s", result)
+        link = text.strip()
+        trace.branch("handler", "link_provided", bool(link), length=len(link))
+        if not link:
+            result = f"{sym.STATE_WARNING} Link cannot be empty."
+        else:
+            trace.event("handler", save_trace.CALL_START, func="execute_link_save")
+            result = await save_service.execute_link_save(
+                client, owner_id, link, os.getenv("TZ", "Asia/Tehran"),
+                progress=reporter.handle if reporter is not None else None,
+                trace=trace,
+            )
+            trace.event(
+                "handler", save_trace.CALL_END, func="execute_link_save",
+                outcome=_save_result_outcome(result),
+                saved=getattr(result, "saved", None),
+            )
 
-    if reporter is not None:
-        await reporter.close(result)
-    else:
-        await _edit_status(client, inline_chat_id, inline_msg_id, result, "link save")
+        logger.info("[LINK_SAVE] handler result: %s", result)
 
-    if client:
-        try:
-            await client.delete_messages(chat_id, [msg_id])
-        except Exception as exc:
-            logger.warning("[LINK_SAVE] delete trigger msg failed: %s", exc)
+        if reporter is not None:
+            await reporter.close(result)
+            trace.event(
+                "result", save_trace.CLEANUP, func="_save_link_input_handler",
+                outcome=_save_result_outcome(result), surface="status_message",
+            )
+        else:
+            edited = await _edit_status(client, inline_chat_id, inline_msg_id, result, "link save")
+            trace.event(
+                "result", save_trace.CLEANUP, func="_save_link_input_handler",
+                outcome=_save_result_outcome(result), surface="panel", edited=edited,
+            )
+
+        # The link message is temporary input exactly like a Reply Mode reply.
+        await _delete_trigger_message(client, chat_id, msg_id, trace=trace)
+        trace.returned(
+            "handler", "_save_link_input_handler", _save_result_outcome(result)
+        )
 
 
 def register(client, owner_id: int, tz_str: str) -> None:

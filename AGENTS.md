@@ -61,6 +61,7 @@ backend/
 │   ├── tg_retry.py                  # tg_rpc helper (dormant in prod, tested)
 │   ├── startup_check.py             # run_startup_checks (dormant in prod, tested)
 │   ├── crash_diagnostics.py         # exit-reason + crash snapshot capture
+│   ├── save_trace.py                # opt-in [SAVE_TRACE] stage + line tracing
 │   ├── diagnostics.py, health_check.py, memory_cleanup.py, states.py, tracer.py
 │
 ├── bot/
@@ -364,6 +365,18 @@ source message
   reported distinctly (`LinkResolutionError` kinds); nothing is guessed and no
   access rule is bypassed. A linked album goes through the same album pipeline
   (its window is read through the message's own peer).
+- **Diagnostics (opt-in, OFF by default)**: `SAVE_TRACE` enables
+  `backend/runtime/save_trace.py` for one save attempt — structured
+  `[SAVE_TRACE]` stage events plus real line events for the whitelisted Save
+  functions of the SAME asyncio task only. Bounded by
+  `DEFAULT_MAX_EVENTS`/`DEFAULT_MAX_DURATION_S` (a bound writes one
+  `TRUNCATED` record and restores the previous tracer); the tracer is also
+  restored on success, exception, cancellation and timeout, and a trace
+  failure can never change a save result. Records carry `id`, `seq`,
+  `elapsed_ms`, `stage`, `kind`, `mod`/`func`/`line`, `outcome` and safe
+  evidence only: the link, chat/user/message ids and any content are never
+  logged (ids appear as `fp:<hex>` process-local fingerprints). This is
+  instrumentation — it never classifies or decides anything.
 
 **Save code format:** short, human-readable codes — `S` + 4 characters
 (e.g. `S0001`, or a random `SXXXX` on collision). No `SV-NNNNNN` format.
@@ -577,6 +590,7 @@ treated as a disconnect or trigger recovery.
 | `LOG_LEVEL` | `INFO` | Logging level |
 | `AI_PROVIDER` / AI keys | varies | AI provider selection + credentials (see `backend/ai/config/`) |
 | `YDC_API_KEY` | `""` | You.com Web Search API key; empty → search capability unregistered |
+| `SAVE_TRACE` | `""` | `1/true/yes/on` enables bounded `[SAVE_TRACE]` instrumentation of one Save attempt; empty → tracing fully off |
 
 Frontend-only: `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY` (unused by the
 React app; the dashboard reads through the backend API).

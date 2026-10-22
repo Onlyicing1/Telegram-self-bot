@@ -43,6 +43,7 @@ from backend.bio.engine import _get_tz
 from backend.db import client as db_client
 from backend.diagnostics import record_event
 from backend.helper import symbols as sym
+from backend.runtime import save_trace
 from backend.services import settings_service
 
 logger = logging.getLogger(__name__)
@@ -604,6 +605,38 @@ def ephemeral_media_kind(media) -> str | None:
     return EPHEMERAL_VIEW_ONCE if ttl == VIEW_ONCE_TTL_SECONDS else EPHEMERAL_EXPIRING
 
 
+def ephemeral_evidence(media) -> dict:
+    """Safe, non-sensitive evidence for ONE ephemeral-media classification.
+
+    Answers "why was this media classified the way it was" without logging the
+    media, its ids or its content: the media class, whether the TL object
+    carries a ``ttl_seconds`` field at all, and which category that value falls
+    into (``VIEW_ONCE_TTL_SECONDS`` is a sentinel, not a duration). Used by the
+    ``[SAVE_TRACE]`` instrumentation only; it decides nothing.
+    """
+    if media is None:
+        return {
+            "media_class": "none",
+            "ttl_field": "absent",
+            "ttl": "absent",
+            "kind": "no_media",
+        }
+    attributes = getattr(media, "__dict__", None) or {}
+    ttl = media_ttl_seconds(media)
+    if ttl is None:
+        ttl_kind = "no_positive_ttl" if "ttl_seconds" in attributes else "absent"
+    elif ttl == VIEW_ONCE_TTL_SECONDS:
+        ttl_kind = "view_once_sentinel"
+    else:
+        ttl_kind = "expiring_positive"
+    return {
+        "media_class": type(media).__name__,
+        "ttl_field": "present" if "ttl_seconds" in attributes else "missing",
+        "ttl": ttl_kind,
+        "kind": ephemeral_media_kind(media) or "ordinary",
+    }
+
+
 def ephemeral_refusal(media) -> str:
     """The deterministic, pre-transfer refusal text for ephemeral media."""
     kind = ephemeral_media_kind(media)
@@ -871,7 +904,7 @@ def _first_param(params: dict[str, list[str]], name: str) -> str | None:
     return values[0] if values else None
 
 
-def _parse_tg_openmessage(link: str) -> LinkTarget:
+def _parse_tg_openmessage(link: str, trace: "save_trace.SaveTrace | None" = None) -> LinkTarget:
     """Parse ``tg://openmessage`` — the URI scheme, NOT an HTTP URL.
 
     Supported, and nothing else:
@@ -886,11 +919,25 @@ def _parse_tg_openmessage(link: str) -> LinkTarget:
     """
     match = _TG_OPENMESSAGE_RE.match(link.strip())
     if not match:
+        if trace is not None:
+            trace.branch("parse", "tg_openmessage_match", False, scheme="tg")
+            trace.returned("parse", "_parse_tg_openmessage", save_trace.OUTCOME_FAILED)
         return LinkTarget(scheme="tg", error="this tg:// link is not an openmessage link")
+    if trace is not None:
+        trace.branch("parse", "tg_openmessage_match", True, scheme="tg")
 
     params = parse_qs(match.group("query") or "", keep_blank_values=True)
     present = [name for name in _TG_PEER_PARAMS if name in params]
+    if trace is not None:
+        # The PARAMETER NAME is the evidence; the id inside it is fingerprinted.
+        trace.branch(
+            "parse", "peer_parameter_count", len(present) == 1, count=len(present)
+        )
     if len(present) != 1:
+        if trace is not None:
+            trace.returned(
+                "parse", "_parse_tg_openmessage", save_trace.OUTCOME_FAILED
+            )
         return LinkTarget(
             scheme="tg",
             error="a tg://openmessage link needs exactly one of user_id, chat_id or channel_id",
@@ -898,7 +945,13 @@ def _parse_tg_openmessage(link: str) -> LinkTarget:
 
     peer_param = present[0]
     peer_number = _parse_positive_id(_first_param(params, peer_param))
+    if trace is not None:
+        trace.branch("parse", "peer_parameter", peer_param, peer_valid=peer_number is not None)
     if peer_number is None:
+        if trace is not None:
+            trace.returned(
+                "parse", "_parse_tg_openmessage", save_trace.OUTCOME_FAILED
+            )
         return LinkTarget(
             scheme="tg",
             error=f"`{peer_param}` in this tg:// link is not a valid Telegram id",
@@ -909,7 +962,13 @@ def _parse_tg_openmessage(link: str) -> LinkTarget:
         None,
     )
     message_id = _parse_positive_id(raw_message)
+    if trace is not None:
+        trace.branch("parse", "message_id_valid", message_id is not None)
     if message_id is None:
+        if trace is not None:
+            trace.returned(
+                "parse", "_parse_tg_openmessage", save_trace.OUTCOME_FAILED
+            )
         return LinkTarget(
             scheme="tg",
             error="a tg://openmessage link needs a valid message_id",
@@ -923,16 +982,25 @@ def _parse_tg_openmessage(link: str) -> LinkTarget:
         chat_id = peer_number
 
     logger.info(
-        "[LINK_SAVE] parsed type=tg_openmessage peer=%s chat_id=%s msg_id=%s",
-        peer_param, chat_id, message_id,
+        "[LINK_SAVE] parsed type=tg_openmessage peer=%s chat=%s msg=%s",
+        peer_param, save_trace.fingerprint(chat_id), save_trace.fingerprint(message_id),
     )
+    if trace is not None:
+        trace.returned(
+            "parse", "_parse_tg_openmessage", save_trace.OUTCOME_OK,
+            scheme="tg", peer_param=peer_param,
+            peer=save_trace.fingerprint(chat_id),
+            msg=save_trace.fingerprint(message_id),
+        )
     return LinkTarget(chat_id=chat_id, message_id=message_id, scheme="tg")
 
 
-def _parse_http_link(link: str) -> LinkTarget:
+def _parse_http_link(link: str, trace: "save_trace.SaveTrace | None" = None) -> LinkTarget:
     """Parse an http(s) t.me / telegram.me link (username or ``/c/`` form)."""
     match = _LINK_RE.search(link.strip())
     if not match:
+        if trace is not None:
+            trace.branch("parse", "http_link_match", False, scheme="https")
         return LinkTarget()
 
     private_chat, private_msg = match.group(1), match.group(2)
@@ -941,23 +1009,54 @@ def _parse_http_link(link: str) -> LinkTarget:
     if private_chat is not None:
         chat_id = int(f"-100{private_chat}")
         msg_id = int(private_msg)
-        logger.info("[LINK_SAVE] parsed type=private chat_id=%s msg_id=%s", chat_id, msg_id)
+        logger.info(
+            "[LINK_SAVE] parsed type=private chat=%s msg=%s",
+            save_trace.fingerprint(chat_id), save_trace.fingerprint(msg_id),
+        )
+        if trace is not None:
+            trace.branch("parse", "http_link_form", "private", scheme="https")
+            trace.returned(
+                "parse", "_parse_http_link", save_trace.OUTCOME_OK,
+                scheme="https", peer=save_trace.fingerprint(chat_id),
+                msg=save_trace.fingerprint(msg_id),
+            )
         return LinkTarget(chat_id=chat_id, message_id=msg_id)
 
     msg_id = int(username_msg)
-    logger.info("[LINK_SAVE] parsed type=username chat=%s msg_id=%s", username, msg_id)
+    logger.info(
+        "[LINK_SAVE] parsed type=username chat=%s msg=%s",
+        username, save_trace.fingerprint(msg_id),
+    )
+    if trace is not None:
+        trace.branch("parse", "http_link_form", "username", scheme="https")
+        trace.returned(
+            "parse", "_parse_http_link", save_trace.OUTCOME_OK,
+            scheme="https", msg=save_trace.fingerprint(msg_id),
+        )
     return LinkTarget(username=username, message_id=msg_id)
 
 
-def parse_link_target(link: str) -> LinkTarget:
+def parse_link_target(
+    link: str, trace: "save_trace.SaveTrace | None" = None
+) -> LinkTarget:
     """The ONE link parser: ``tg://openmessage`` first, then http(s) links."""
     text = str(link or "").strip()
     if not text:
+        if trace is not None:
+            trace.branch("parse", "link_empty", True)
+            trace.returned("parse", "parse_link_target", save_trace.OUTCOME_FAILED)
         return LinkTarget(error="the link is empty")
     if text.lower().startswith("tg://"):
-        return _parse_tg_openmessage(text)
-    target = _parse_http_link(text)
+        if trace is not None:
+            trace.branch("parse", "scheme", "tg")
+        return _parse_tg_openmessage(text, trace=trace)
+    if trace is not None:
+        trace.branch("parse", "scheme", "https")
+    target = _parse_http_link(text, trace=trace)
     if not target.message_id or not (target.username or target.chat_id):
+        if trace is not None:
+            trace.branch("parse", "http_target_complete", False)
+            trace.returned("parse", "parse_link_target", save_trace.OUTCOME_FAILED)
         return LinkTarget(
             error=(
                 "this is not a Telegram message link "
@@ -965,6 +1064,8 @@ def parse_link_target(link: str) -> LinkTarget:
                 "or tg://openmessage?user_id=<id>&message_id=<id>)"
             )
         )
+    if trace is not None:
+        trace.returned("parse", "parse_link_target", save_trace.OUTCOME_OK)
     return target
 
 
@@ -1013,7 +1114,7 @@ class LinkResolutionError(Exception):
         self.detail = detail
 
 
-async def _dialog_entity(client, peer_id: int):
+async def _dialog_entity(client, peer_id: int, trace: "save_trace.SaveTrace | None" = None):
     """The peer's entity from the account's OWN dialog list, or ``None``.
 
     The scan stops at the first match and is bounded by
@@ -1022,6 +1123,12 @@ async def _dialog_entity(client, peer_id: int):
     dialog list contains exactly the chats this account already has.
     """
     scanned = 0
+    if trace is not None:
+        trace.event(
+            "resolve", save_trace.CALL_START, func="_dialog_entity",
+            path="dialog", peer=save_trace.fingerprint(peer_id),
+            limit=LINK_DIALOG_SCAN_LIMIT,
+        )
     try:
         async for dialog in client.iter_dialogs(limit=LINK_DIALOG_SCAN_LIMIT):
             scanned += 1
@@ -1031,8 +1138,15 @@ async def _dialog_entity(client, peer_id: int):
             try:
                 if utils.get_peer_id(entity) == peer_id:
                     logger.info(
-                        "[LINK_SAVE] peer resolved from the dialog list: %s", peer_id
+                        "[LINK_SAVE] peer resolved from the dialog list: %s",
+                        save_trace.fingerprint(peer_id),
                     )
+                    if trace is not None:
+                        trace.event(
+                            "resolve", save_trace.CALL_END, func="_dialog_entity",
+                            path="dialog", outcome=save_trace.OUTCOME_OK,
+                            scanned=scanned,
+                        )
                     return entity
             except Exception:  # noqa: BLE001 — skip a dialog without a usable id
                 continue
@@ -1040,12 +1154,26 @@ async def _dialog_entity(client, peer_id: int):
         logger.warning(
             "[LINK_SAVE] dialog scan failed after %d dialogs: %s", scanned, exc
         )
+        if trace is not None:
+            trace.event(
+                "resolve", save_trace.EXCEPTION, func="_dialog_entity",
+                path="dialog", outcome=save_trace.OUTCOME_FAILED,
+                error=type(exc).__name__, scanned=scanned,
+            )
         return None
-    logger.info("[LINK_SAVE] peer %s not in the first %d dialogs", peer_id, scanned)
+    logger.info(
+        "[LINK_SAVE] peer %s not in the first %d dialogs",
+        save_trace.fingerprint(peer_id), scanned,
+    )
+    if trace is not None:
+        trace.event(
+            "resolve", save_trace.CALL_END, func="_dialog_entity", path="dialog",
+            outcome=save_trace.OUTCOME_FAILED, scanned=scanned,
+        )
     return None
 
 
-async def _resolve_link_peer(client, target: LinkTarget):
+async def _resolve_link_peer(client, target: LinkTarget, trace: "save_trace.SaveTrace | None" = None):
     """The peer a link points at, through ordinary authenticated APIs only.
 
     In order, and never a second API or an access bypass:
@@ -1060,12 +1188,29 @@ async def _resolve_link_peer(client, target: LinkTarget):
     reason Telegram gave, instead of guessing a peer.
     """
     if target.username:
+        if trace is not None:
+            trace.event(
+                "resolve", save_trace.CALL_START, func="_resolve_link_peer",
+                path="username",
+            )
         try:
-            return await client.get_entity(target.username)
+            entity = await client.get_entity(target.username)
         except Exception as exc:  # noqa: BLE001 — honest resolution failure
+            if trace is not None:
+                trace.event(
+                    "resolve", save_trace.EXCEPTION, func="_resolve_link_peer",
+                    path="username", outcome=save_trace.OUTCOME_FAILED,
+                    error=type(exc).__name__,
+                )
             raise LinkResolutionError(
                 LINK_PEER_UNRESOLVED, f"@{target.username}: {exc}"
             ) from exc
+        if trace is not None:
+            trace.event(
+                "resolve", save_trace.CALL_END, func="_resolve_link_peer",
+                path="username", outcome=save_trace.OUTCOME_OK,
+            )
+        return entity
 
     peer_id = target.peer_id
     last_error = ""
@@ -1074,15 +1219,33 @@ async def _resolve_link_peer(client, target: LinkTarget):
         ("entity", client.get_entity),
     )
     for label, resolver in resolvers:
+        if trace is not None:
+            trace.event(
+                "resolve", save_trace.CALL_START, func="_resolve_link_peer",
+                path=label, peer=save_trace.fingerprint(peer_id),
+            )
         try:
             entity = await resolver(peer_id)
         except Exception as exc:  # noqa: BLE001 — try the next ordinary path
             last_error = f"{label}: {exc}"
+            if trace is not None:
+                trace.event(
+                    "resolve", save_trace.CALL_END, func="_resolve_link_peer",
+                    path=label, outcome=save_trace.OUTCOME_FAILED,
+                    error=type(exc).__name__,
+                )
             continue
         if entity is not None:
+            if trace is not None:
+                trace.event(
+                    "resolve", save_trace.CALL_END, func="_resolve_link_peer",
+                    path=label, outcome=save_trace.OUTCOME_OK,
+                )
             return entity
+        if trace is not None:
+            trace.branch("resolve", f"resolver_{label}_returned_none", True)
 
-    entity = await _dialog_entity(client, peer_id)
+    entity = await _dialog_entity(client, peer_id, trace=trace)
     if entity is not None:
         return entity
     raise LinkResolutionError(
@@ -1290,6 +1453,7 @@ async def _deep_save_one(
     progress: ProgressCallback | None = None,
     item_index: int = 1,
     item_count: int = 1,
+    trace: "save_trace.SaveTrace | None" = None,
 ) -> SaveOutcome:
     """Deep-Save ONE source message — the per-item half of ``execute_save``.
 
@@ -1299,19 +1463,44 @@ async def _deep_save_one(
     progress reporter. The temporary directory is removed on every exit path.
     """
     media = getattr(reply_msg, "media", None)
+    evidence = ephemeral_evidence(media)
+    guard_kind = ephemeral_media_kind(media)
+    if trace is not None:
+        trace.enter("deep_save", "_deep_save_one", item=f"{item_index}/{item_count}")
+        trace.branch(
+            "deep_save", "media_present", media is not None,
+            media_class=evidence["media_class"],
+        )
+        # The guard's own condition, plus the evidence that produced it: the
+        # TTL field's presence and the category its value falls into.
+        trace.branch(
+            "deep_save", "ephemeral_guard", guard_kind or "ordinary",
+            ttl_field=evidence["ttl_field"], ttl=evidence["ttl"],
+        )
 
     # Ephemeral (view-once / expiring) media is refused BEFORE any transfer,
     # any save code, any caption and any database write.
-    if ephemeral_media_kind(media) is not None:
+    if guard_kind is not None:
         logger.info(
             "[SAVE] refused ephemeral media kind=%s chat=%s msg=%s",
-            ephemeral_media_kind(media),
-            getattr(reply_msg, "chat_id", None),
-            getattr(reply_msg, "id", None),
+            guard_kind,
+            save_trace.fingerprint(getattr(reply_msg, "chat_id", None)),
+            save_trace.fingerprint(getattr(reply_msg, "id", None)),
         )
+        if trace is not None:
+            trace.returned(
+                "deep_save", "_deep_save_one", save_trace.OUTCOME_REFUSED,
+                media_kind=guard_kind, ttl=evidence["ttl"],
+            )
+            # The refusal happens before any byte moves: the later stages are
+            # recorded as NOT REACHED, never as failures.
+            for stage in ("download", "upload", "persist"):
+                trace.not_reached(stage, "ephemeral_refusal", func="_deep_save_one")
         return SaveOutcome(ephemeral_refusal(media), saved=False)
 
     save_code = await db_client.get_next_save_code()
+    if trace is not None:
+        trace.branch("save", "save_code_issued", True, code=save_code)
     now = datetime.now(_get_tz(tz_str))
     sender_name, sender_id = await _resolve_sender(reply_msg)
     origin_chat_id = reply_msg.chat_id
@@ -1344,10 +1533,15 @@ async def _deep_save_one(
     if file_size and file_size > max_bytes:
         mb = file_size / (1024 * 1024)
         limit_mb = settings_service.max_deep_save_mb()
+        if trace is not None:
+            trace.branch("deep_save", "size_limit", False, size=file_size, limit=max_bytes)
+            trace.returned("deep_save", "_deep_save_one", save_trace.OUTCOME_REFUSED)
         return SaveOutcome(
             f"{sym.STATE_WARNING} File is {mb:.1f} MB — exceeds the {limit_mb} MB deep-save limit.",
             saved=False,
         )
+    if trace is not None:
+        trace.branch("deep_save", "size_limit", True, size=file_size, limit=max_bytes)
 
     caption_tags = caption_hashtags(media_type, now)
     caption = _append_original_text(
@@ -1398,6 +1592,11 @@ async def _deep_save_one(
             download_callback = _transfer_progress_callback(
                 progress, "download", item_index, item_count, file_size
             )
+            if trace is not None:
+                trace.event(
+                    "download", save_trace.CALL_START, func="download_media",
+                    declared_size=file_size, item=f"{item_index}/{item_count}",
+                )
             try:
                 t0 = asyncio.get_event_loop().time()
                 download_kwargs = {}
@@ -1405,22 +1604,46 @@ async def _deep_save_one(
                     download_kwargs["progress_callback"] = download_callback
                 await client.download_media(reply_msg, file=tmp_path, **download_kwargs)
                 record_event("save", "download_media", (asyncio.get_event_loop().time() - t0) * 1000, "SUCCESS")
+            except asyncio.CancelledError:
+                if trace is not None:
+                    trace.event(
+                        "download", save_trace.CALL_END, func="download_media",
+                        outcome=save_trace.OUTCOME_INCONCLUSIVE, error="CancelledError",
+                    )
+                raise
             except Exception as exc:
                 logger.error("deep save download failed: %s", exc)
                 record_event("save", "download_media", 0, "ERROR", str(exc))
+                if trace is not None:
+                    trace.failed("download", "download_media", exc)
+                    trace.returned("deep_save", "_deep_save_one", save_trace.OUTCOME_FAILED)
                 return SaveOutcome(
                     f"{sym.STATE_FAILED} Deep Save failed: unable to download the source message ({exc})",
                     saved=False,
                 )
+            if trace is not None:
+                trace.event(
+                    "download", save_trace.CALL_END, func="download_media",
+                    outcome=save_trace.OUTCOME_OK,
+                )
 
             # Validate the download before uploading anything.
             if not os.path.exists(tmp_path):
+                if trace is not None:
+                    trace.branch("download", "file_exists", False)
+                    trace.returned("deep_save", "_deep_save_one", save_trace.OUTCOME_FAILED)
                 return SaveOutcome(
                     f"{sym.STATE_FAILED} Deep Save failed: downloaded file is missing.",
                     saved=False,
                 )
             actual_size = os.path.getsize(tmp_path)
+            if trace is not None:
+                trace.branch(
+                    "download", "file_non_empty", actual_size > 0, size=actual_size
+                )
             if actual_size == 0:
+                if trace is not None:
+                    trace.returned("deep_save", "_deep_save_one", save_trace.OUTCOME_FAILED)
                 return SaveOutcome(
                     f"{sym.STATE_FAILED} Deep Save failed: downloaded file is empty.",
                     saved=False,
@@ -1446,6 +1669,11 @@ async def _deep_save_one(
             upload_callback = _transfer_progress_callback(
                 progress, "upload", item_index, item_count, actual_size
             )
+            if trace is not None:
+                trace.event(
+                    "upload", save_trace.CALL_START, func="send_file",
+                    size=actual_size, item=f"{item_index}/{item_count}",
+                )
             try:
                 t1 = asyncio.get_event_loop().time()
                 upload_kwargs = _upload_kwargs_for_media(media, mime_type, file_name)
@@ -1458,12 +1686,27 @@ async def _deep_save_one(
                     **upload_kwargs,
                 )
                 record_event("save", "send_file", (asyncio.get_event_loop().time() - t1) * 1000, "SUCCESS")
+            except asyncio.CancelledError:
+                if trace is not None:
+                    trace.event(
+                        "upload", save_trace.CALL_END, func="send_file",
+                        outcome=save_trace.OUTCOME_INCONCLUSIVE, error="CancelledError",
+                    )
+                raise
             except Exception as exc:
                 logger.error("deep save upload failed: %s", exc)
                 record_event("save", "send_file", 0, "ERROR", str(exc))
+                if trace is not None:
+                    trace.failed("upload", "send_file", exc)
+                    trace.returned("deep_save", "_deep_save_one", save_trace.OUTCOME_FAILED)
                 return SaveOutcome(
                     f"{sym.STATE_FAILED} Deep Save failed: downloaded media could not be uploaded to Saved Messages ({exc})",
                     saved=False,
+                )
+            if trace is not None:
+                trace.event(
+                    "upload", save_trace.CALL_END, func="send_file",
+                    outcome=save_trace.OUTCOME_OK,
                 )
 
             await _emit_progress(
@@ -1475,6 +1718,11 @@ async def _deep_save_one(
                 ),
             )
         except asyncio.CancelledError:
+            if trace is not None:
+                trace.event(
+                    "cleanup", save_trace.CLEANUP, func="_deep_save_one",
+                    outcome=save_trace.OUTCOME_INCONCLUSIVE, reason="cancelled",
+                )
             raise
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -1504,10 +1752,21 @@ async def _deep_save_one(
     payload.update(metadata.insert_fields())
 
     inserted = None
+    if trace is not None:
+        trace.event("persist", save_trace.CALL_START, func="insert_save", code=save_code)
     try:
         inserted = await db_client.insert_save(payload)
     except Exception as exc:
         logger.error("[SAVE_DB] insert_save raised: %s", exc, exc_info=True)
+        if trace is not None:
+            trace.failed("persist", "insert_save", exc, code=save_code)
+
+    if trace is not None:
+        trace.event(
+            "persist", save_trace.CALL_END, func="insert_save",
+            outcome=save_trace.OUTCOME_OK if inserted is not None else save_trace.OUTCOME_FAILED,
+            inserted=inserted is not None, code=save_code,
+        )
 
     if inserted is None:
         logger.error("[SAVE_DB] insert returned None — row NOT in database")
@@ -1527,6 +1786,11 @@ async def _deep_save_one(
         "origin_msg_id": origin_msg_id,
     })
     logger.info("[SAVE] completed: %s", save_code)
+    if trace is not None:
+        trace.returned(
+            "deep_save", "_deep_save_one", save_trace.OUTCOME_OK,
+            code=save_code, media_type=media_type,
+        )
     return SaveOutcome(
         build_confirmation(save_code, media_type, file_name),
         save_code=save_code,
@@ -1552,6 +1816,7 @@ async def _deep_save_album(
     *,
     metadata: SaveMetadata,
     progress: ProgressCallback | None = None,
+    trace: "save_trace.SaveTrace | None" = None,
 ) -> SaveOutcome:
     """Deep-Save a WHOLE album as ONE saved item.
 
@@ -1569,18 +1834,34 @@ async def _deep_save_album(
     total_items = len(members)
     limit_mb = settings_service.max_deep_save_mb()
     max_bytes = limit_mb * 1024 * 1024
+    if trace is not None:
+        trace.enter("album", "_deep_save_album", members=total_items)
 
     # Pre-flight: every member must be saveable before ANY transfer, code or row.
     for index, member in enumerate(members, 1):
         media = getattr(member, "media", None)
         kind = ephemeral_media_kind(media)
+        if trace is not None:
+            evidence = ephemeral_evidence(media)
+            trace.branch(
+                "album", f"member_{index}_ephemeral", kind or "ordinary",
+                ttl_field=evidence["ttl_field"], ttl=evidence["ttl"],
+            )
         if kind is not None:
             label = "view-once" if kind == EPHEMERAL_VIEW_ONCE else "expiring"
             logger.info(
                 "[SAVE] refused album: member %d/%d is %s media (chat=%s msg=%s)",
                 index, total_items, label,
-                getattr(member, "chat_id", None), getattr(member, "id", None),
+                save_trace.fingerprint(getattr(member, "chat_id", None)),
+                save_trace.fingerprint(getattr(member, "id", None)),
             )
+            if trace is not None:
+                trace.returned(
+                    "album", "_deep_save_album", save_trace.OUTCOME_REFUSED,
+                    media_kind=kind, member=index,
+                )
+                for stage in ("download", "upload", "persist"):
+                    trace.not_reached(stage, "album_ephemeral_refusal", func="_deep_save_album")
             return SaveOutcome(
                 f"{sym.STATE_FAILED} Nothing was saved: file {index} of {total_items} in this "
                 f"album is {label} media. An album is saved as one item, so it is saved "
@@ -1822,6 +2103,11 @@ async def _deep_save_album(
         "items": total_items,
     })
     logger.info("[SAVE] album completed: %s (%d files)", save_code, total_items)
+    if trace is not None:
+        trace.returned(
+            "album", "_deep_save_album", save_trace.OUTCOME_OK,
+            code=save_code, members=total_items,
+        )
     return SaveOutcome(
         "\n".join([
             f"{media_icon(MEDIA_TYPE_ALBUM)} **Album Saved Successfully**",
@@ -1844,6 +2130,7 @@ async def execute_save(
     *,
     metadata: SaveMetadata | None = None,
     progress: ProgressCallback | None = None,
+    trace: "save_trace.SaveTrace | None" = None,
 ) -> str:
     """Deep Save — the single authoritative save pipeline.
 
@@ -1872,38 +2159,62 @@ async def execute_save(
     ``progress`` is an optional observer of the REAL transfer byte counts. It
     knows nothing about the Glass UI: the caller decides what to render.
     """
-    if metadata is None:
-        metadata = SaveMetadata()
-    else:
-        try:
-            metadata = SaveMetadata.from_raw(metadata.display_name, list(metadata.tags))
-        except ValueError as exc:
-            return SaveOutcome(f"{sym.STATE_WARNING} Nothing was saved: {exc}", saved=False)
+    trace = trace if trace is not None else save_trace.SaveTrace.begin("save")
+    with trace.capturing():
+        trace.enter("save", "execute_save")
+        if metadata is None:
+            metadata = SaveMetadata()
+            trace.branch("save", "metadata_supplied", False)
+        else:
+            try:
+                metadata = SaveMetadata.from_raw(metadata.display_name, list(metadata.tags))
+            except ValueError as exc:
+                trace.event(
+                    "save", save_trace.BRANCH, outcome=save_trace.OUTCOME_REFUSED,
+                    name="metadata_valid", matched=False, error=type(exc).__name__,
+                )
+                trace.returned("save", "execute_save", save_trace.OUTCOME_REFUSED)
+                return SaveOutcome(f"{sym.STATE_WARNING} Nothing was saved: {exc}", saved=False)
+            trace.branch("save", "metadata_valid", True)
 
-    members, album_error = await resolve_album_messages(client, reply_msg)
-    if album_error:
-        return SaveOutcome(
-            f"{sym.STATE_FAILED} Deep Save failed: {album_error}", saved=False
+        trace.event("save", save_trace.CALL_START, func="resolve_album_messages")
+        members, album_error = await resolve_album_messages(client, reply_msg)
+        trace.event(
+            "save", save_trace.CALL_END, func="resolve_album_messages",
+            outcome=save_trace.OUTCOME_OK if not album_error else save_trace.OUTCOME_FAILED,
+            members=len(members or ()), error=album_error or None,
         )
+        if album_error:
+            trace.returned("save", "execute_save", save_trace.OUTCOME_FAILED)
+            return SaveOutcome(
+                f"{sym.STATE_FAILED} Deep Save failed: {album_error}", saved=False
+            )
 
-    if len(members) <= 1:
-        return await _deep_save_one(
-            client, owner_id, reply_msg, tz_str,
-            metadata=metadata, progress=progress, item_index=1, item_count=1,
+        trace.branch("save", "album_vs_single", "single" if len(members) <= 1 else "album",
+                     members=len(members))
+        if len(members) <= 1:
+            return await _deep_save_one(
+                client, owner_id, reply_msg, tz_str,
+                metadata=metadata, progress=progress, item_index=1, item_count=1,
+                trace=trace,
+            )
+
+        outcome = await _deep_save_album(
+            client, owner_id, members, tz_str,
+            metadata=metadata, progress=progress, trace=trace,
         )
+        logger.info(
+            "[SAVE] album finished: %d files, %s",
+            len(members), "saved" if outcome.saved else "not saved",
+        )
+        trace.returned(
+            "save", "execute_save",
+            save_trace.OUTCOME_OK if outcome.saved else save_trace.OUTCOME_REFUSED,
+        )
+        return outcome
 
-    outcome = await _deep_save_album(
-        client, owner_id, members, tz_str,
-        metadata=metadata, progress=progress,
-    )
-    logger.info(
-        "[SAVE] album finished: %d files, %s",
-        len(members), "saved" if outcome.saved else "not saved",
-    )
-    return outcome
 
-
-async def _fetch_linked_message(client, target: LinkTarget):
+async def _fetch_linked_message(client, target: LinkTarget, trace: "save_trace.SaveTrace | None" = None):
     """Fetch the linked message through the ordinary Telethon client.
 
     A link can name a peer this account cannot turn into an entity at all —
@@ -1926,42 +2237,121 @@ async def _fetch_linked_message(client, target: LinkTarget):
     Raises ``LinkResolutionError`` instead of returning a placeholder, so the
     caller can render an actionable, specific result.
     """
+    trace_id = (
+        save_trace.fingerprint(f"{target.peer_id}:{target.message_id}")
+        if trace is not None and target.peer_id
+        else ""
+    )
+    if trace is not None:
+        trace.event(
+            "resolve", save_trace.ENTER, func="_fetch_linked_message",
+            target=trace_id or "unset",
+        )
+
     peer_error: LinkResolutionError | None = None
     entity = None
+    if trace is not None:
+        trace.event(
+            "resolve", save_trace.CALL_START, func="_resolve_link_peer",
+            target=trace_id or "unset",
+        )
     try:
-        entity = await _resolve_link_peer(client, target)
+        entity = await _resolve_link_peer(client, target, trace=trace)
     except LinkResolutionError as exc:
         peer_error = exc
-        logger.warning("[LINK_SAVE] peer unresolved: %s", exc.detail)
+        # The Telegram error text can echo the peer id, so only the reason kind
+        # and a process-local fingerprint travel to the log.
+        logger.warning(
+            "[LINK_SAVE] peer unresolved kind=%s target=%s",
+            exc.kind,
+            save_trace.fingerprint(target.peer_id or target.username or "unknown"),
+        )
+        if trace is not None:
+            trace.event(
+                "resolve", save_trace.CALL_END, func="_resolve_link_peer",
+                outcome=save_trace.OUTCOME_FAILED, resolution=exc.kind,
+            )
+    else:
+        if trace is not None:
+            trace.event(
+                "resolve", save_trace.CALL_END, func="_resolve_link_peer",
+                outcome=save_trace.OUTCOME_OK if entity is not None else save_trace.OUTCOME_FAILED,
+            )
 
     lookup_error: Exception | None = None
     if entity is not None:
+        if trace is not None:
+            trace.event(
+                "resolve", save_trace.CALL_START, func="get_messages",
+                path="peer", msg=save_trace.fingerprint(target.message_id),
+            )
         try:
             message = await client.get_messages(entity, ids=target.message_id)
         except Exception as exc:  # noqa: BLE001 — try the peer-less lookup too
             lookup_error = exc
             logger.warning(
                 "[LINK_SAVE] peer read failed peer=%s msg=%s: %s",
-                target.peer_id, target.message_id, exc,
+                save_trace.fingerprint(target.peer_id),
+                save_trace.fingerprint(target.message_id), exc,
             )
+            if trace is not None:
+                trace.event(
+                    "resolve", save_trace.CALL_END, func="get_messages",
+                    path="peer", outcome=save_trace.OUTCOME_FAILED,
+                    error=type(exc).__name__,
+                )
         else:
+            if trace is not None:
+                trace.event(
+                    "resolve", save_trace.CALL_END, func="get_messages",
+                    path="peer",
+                    outcome=save_trace.OUTCOME_OK if message is not None else save_trace.OUTCOME_FAILED,
+                    found=message is not None,
+                )
             if message is not None:
                 return message
 
     if target.chat_id:
+        if trace is not None:
+            trace.event(
+                "resolve", save_trace.CALL_START, func="get_messages",
+                path="peerless", msg=save_trace.fingerprint(target.message_id),
+            )
         try:
             message = await client.get_messages(None, ids=target.message_id)
         except Exception as exc:  # noqa: BLE001 — reported as a lookup failure
             lookup_error = lookup_error or exc
             logger.warning(
-                "[LINK_SAVE] peer-less lookup failed msg=%s: %s", target.message_id, exc
+                "[LINK_SAVE] peer-less lookup failed msg=%s: %s",
+                save_trace.fingerprint(target.message_id), exc,
             )
+            if trace is not None:
+                trace.event(
+                    "resolve", save_trace.CALL_END, func="get_messages",
+                    path="peerless", outcome=save_trace.OUTCOME_FAILED,
+                    error=type(exc).__name__,
+                )
         else:
+            if trace is not None:
+                trace.event(
+                    "resolve", save_trace.CALL_END, func="get_messages",
+                    path="peerless",
+                    outcome=save_trace.OUTCOME_OK if message is not None else save_trace.OUTCOME_FAILED,
+                    found=message is not None,
+                )
             if message is not None:
                 # Returned even on a peer mismatch: the caller distinguishes
                 # "wrong chat" from "no such message" and saves neither.
                 return message
 
+    if trace is not None:
+        trace.event(
+            "resolve", save_trace.RETURN, func="_fetch_linked_message",
+            outcome=save_trace.OUTCOME_FAILED,
+            resolution=(peer_error.kind if peer_error is not None else (
+                LINK_LOOKUP_FAILED if lookup_error is not None else LINK_MESSAGE_MISSING
+            )),
+        )
     if peer_error is not None:
         raise peer_error
     if lookup_error is not None:
@@ -1996,6 +2386,7 @@ async def execute_link_save(
     *,
     metadata: SaveMetadata | None = None,
     progress: ProgressCallback | None = None,
+    trace: "save_trace.SaveTrace | None" = None,
 ) -> str:
     """Resolve a Telegram link and Deep-Save the linked message.
 
@@ -2009,44 +2400,110 @@ async def execute_link_save(
     same album pipeline as a reply. Whether the target media is view-once or
     expiring is decided by the MEDIA, not by the link format.
     """
-    logger.info("[LINK_SAVE] resolving link: %s", link)
-    target = parse_link_target(link)
-    if target.error:
-        logger.warning("[LINK_SAVE] invalid telegram link: %s (%s)", link, target.error)
-        return f"{sym.STATE_FAILED} Could not parse link: {target.error}."
+    trace = trace if trace is not None else save_trace.SaveTrace.begin("link_save")
+    # The link itself is never logged: scheme + fingerprinted ids are enough to
+    # correlate the attempt, and a ``tg://`` link names a private chat.
+    with trace.capturing():
+        trace.event("link_save", save_trace.ENTER, func="execute_link_save")
+        logger.info("[LINK_SAVE] resolving link: %s", save_trace.fingerprint(link))
+        trace.event("parse", save_trace.CALL_START, func="parse_link_target")
+        target = parse_link_target(link, trace=trace)
+        if target.error:
+            logger.warning(
+                "[LINK_SAVE] invalid telegram link link=%s reason=%s",
+                save_trace.fingerprint(link), target.error,
+            )
+            trace.event(
+                "parse", save_trace.CALL_END, func="parse_link_target",
+                outcome=save_trace.OUTCOME_FAILED, error=target.error,
+            )
+            trace.returned("link_save", "execute_link_save", save_trace.OUTCOME_FAILED)
+            return f"{sym.STATE_FAILED} Could not parse link: {target.error}."
+        trace.event(
+            "parse", save_trace.CALL_END, func="parse_link_target",
+            outcome=save_trace.OUTCOME_OK,
+        )
 
-    try:
-        target_msg = await _fetch_linked_message(client, target)
-        logger.info(
-            "[LINK_SAVE] source message fetched: msg_id=%s chat_id=%s",
-            getattr(target_msg, "id", None), getattr(target_msg, "chat_id", None),
+        trace.event(
+            "resolve", save_trace.CALL_START, func="_fetch_linked_message",
+            peer=save_trace.fingerprint(target.peer_id) if target.chat_id else "username",
+            msg=save_trace.fingerprint(target.message_id),
         )
-    except LinkResolutionError as exc:
-        logger.error(
-            "[LINK_SAVE] resolution failed kind=%s detail=%s link=%s",
-            exc.kind, exc.detail, link,
+        try:
+            target_msg = await _fetch_linked_message(client, target, trace=trace)
+            logger.info(
+                "[LINK_SAVE] source message fetched: msg=%s chat=%s",
+                save_trace.fingerprint(getattr(target_msg, "id", None)),
+                save_trace.fingerprint(getattr(target_msg, "chat_id", None)),
+            )
+        except LinkResolutionError as exc:
+            logger.error(
+                "[LINK_SAVE] resolution failed kind=%s link=%s",
+                exc.kind, save_trace.fingerprint(link),
+            )
+            trace.event(
+                "resolve", save_trace.CALL_END, func="_fetch_linked_message",
+                outcome=save_trace.OUTCOME_FAILED, resolution=exc.kind,
+            )
+            trace.returned("link_save", "execute_link_save", save_trace.OUTCOME_FAILED)
+            return _link_failure_text(exc)
+        except Exception as exc:  # noqa: BLE001 — honest resolution failure
+            logger.error("[LINK_SAVE] fetch source message failed: %s", exc, exc_info=True)
+            trace.failed("resolve", "_fetch_linked_message", exc)
+            trace.returned("link_save", "execute_link_save", save_trace.OUTCOME_FAILED)
+            return f"{sym.STATE_FAILED} Could not resolve link: {exc}."
+        trace.event(
+            "resolve", save_trace.CALL_END, func="_fetch_linked_message",
+            outcome=save_trace.OUTCOME_OK,
         )
-        return _link_failure_text(exc)
-    except Exception as exc:  # noqa: BLE001 — honest resolution failure
-        logger.error("[LINK_SAVE] fetch source message failed: %s", exc, exc_info=True)
-        return f"{sym.STATE_FAILED} Could not resolve link: {exc}."
 
-    # The resolved message must BE the requested one: a peer that answers with
-    # another message (or another chat) is a failure, never a silent save.
-    if getattr(target_msg, "id", None) != target.message_id:
-        logger.warning(
-            "[LINK_SAVE] resolved message id mismatch: wanted=%s got=%s",
-            target.message_id, getattr(target_msg, "id", None),
+        # The resolved message must BE the requested one: a peer that answers with
+        # another message (or another chat) is a failure, never a silent save.
+        if getattr(target_msg, "id", None) != target.message_id:
+            logger.warning(
+                "[LINK_SAVE] resolved message id mismatch: wanted=%s got=%s",
+                save_trace.fingerprint(target.message_id),
+                save_trace.fingerprint(getattr(target_msg, "id", None)),
+            )
+            trace.branch(
+                "validate", "message_id_match", False,
+                wanted=save_trace.fingerprint(target.message_id),
+                got=save_trace.fingerprint(getattr(target_msg, "id", None)),
+            )
+            trace.returned("link_save", "execute_link_save", save_trace.OUTCOME_FAILED)
+            return f"{sym.STATE_FAILED} The link did not resolve to the requested message."
+        trace.branch("validate", "message_id_match", True)
+        actual_chat = getattr(target_msg, "chat_id", None)
+        if target.chat_id and actual_chat is not None and actual_chat != target.chat_id:
+            logger.warning(
+                "[LINK_SAVE] resolved chat mismatch: wanted=%s got=%s",
+                save_trace.fingerprint(target.chat_id),
+                save_trace.fingerprint(actual_chat),
+            )
+            trace.branch(
+                "validate", "peer_match", False,
+                wanted=save_trace.fingerprint(target.chat_id),
+                got=save_trace.fingerprint(actual_chat),
+            )
+            trace.returned("link_save", "execute_link_save", save_trace.OUTCOME_FAILED)
+            return f"{sym.STATE_FAILED} The link did not resolve to the requested chat."
+        trace.branch(
+            "validate", "peer_match", True,
+            checked=bool(target.chat_id and actual_chat is not None),
         )
-        return f"{sym.STATE_FAILED} The link did not resolve to the requested message."
-    actual_chat = getattr(target_msg, "chat_id", None)
-    if target.chat_id and actual_chat is not None and actual_chat != target.chat_id:
-        logger.warning(
-            "[LINK_SAVE] resolved chat mismatch: wanted=%s got=%s",
-            target.chat_id, actual_chat,
-        )
-        return f"{sym.STATE_FAILED} The link did not resolve to the requested chat."
 
-    return await execute_save(
-        client, owner_id, target_msg, tz_str, metadata=metadata, progress=progress
-    )
+        trace.event("save", save_trace.CALL_START, func="execute_save")
+        result = await execute_save(
+            client, owner_id, target_msg, tz_str,
+            metadata=metadata, progress=progress, trace=trace,
+        )
+        trace.event(
+            "save", save_trace.CALL_END, func="execute_save",
+            outcome=save_trace.OUTCOME_OK if getattr(result, "saved", False) else save_trace.OUTCOME_REFUSED,
+            saved=getattr(result, "saved", False),
+        )
+        trace.returned(
+            "link_save", "execute_link_save",
+            save_trace.OUTCOME_OK if getattr(result, "saved", False) else save_trace.OUTCOME_REFUSED,
+        )
+        return result
