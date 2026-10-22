@@ -459,6 +459,29 @@ async def _edit_status(self_client, inline_chat_id, inline_msg_id, text: str, la
         return False
 
 
+async def _delete_trigger_message(client, chat_id: int, msg_id: int) -> None:
+    """Delete the owner's reply/trigger message — the ONE time it is removed.
+
+    The reply exists only to establish ``reply_to_msg_id``, so as soon as the
+    handler has read it the message is temporary input: it goes BEFORE the
+    target lookup, the transfer and persistence, instead of being cleaned up
+    after a save that may take minutes. Only this exact id is deleted (never
+    the target, never anything inferred from chat history), a refused deletion
+    is logged and swallowed so it can never cancel a valid save, and the caller
+    does not repeat it.
+    """
+    if client is None or not chat_id or not msg_id:
+        return
+    try:
+        await client.delete_messages(chat_id, [msg_id])
+        logger.info("[SAVE_UI] trigger message deleted chat=%s msg=%s", chat_id, msg_id)
+    except Exception as exc:  # noqa: BLE001 — cleanup never aborts the save
+        logger.warning(
+            "[SAVE_UI] trigger message delete failed chat=%s msg=%s: %s",
+            chat_id, msg_id, exc,
+        )
+
+
 async def _save_reply_wait_handler(
     text, chat_id, msg_id, inline_chat_id, inline_msg_id, *,
     metadata=None, inline_id=None,
@@ -513,11 +536,24 @@ async def _save_reply_wait_handler(
         reporter = SaveProgressReporter(editor, title=REPLY_PANEL_TITLE)
 
     try:
-        # Resolve the user's outgoing reply, then the exact message it
-        # replied to. That target — never the reply itself — is Deep Saved.
+        # Read the trigger reply, then delete it IMMEDIATELY: its only job was
+        # to carry reply_to_msg_id, and nothing below (target lookup, download,
+        # upload, persistence) may postpone that cleanup.
         reply_msg = await client.get_messages(chat_id, ids=msg_id)
-        if reply_msg and reply_msg.reply_to_msg_id:
-            target_id = reply_msg.reply_to_msg_id
+    except Exception as exc:  # noqa: BLE001 — reported as a missing reply below
+        logger.warning(
+            "[SAVE_UI] trigger message lookup failed chat=%s msg=%s: %s",
+            chat_id, msg_id, exc,
+        )
+        reply_msg = None
+
+    target_id = getattr(reply_msg, "reply_to_msg_id", None)
+    await _delete_trigger_message(client, chat_id, msg_id)
+
+    try:
+        if target_id:
+            # The exact target of the ORIGINAL reply — never the trigger and
+            # never a message guessed from chat history.
             target_msg = await client.get_messages(chat_id, ids=target_id)
             if target_msg is None:
                 result = f"{sym.STATE_WARNING} The replied message no longer exists."
@@ -539,27 +575,21 @@ async def _save_reply_wait_handler(
         saved_code = str(getattr(result, "save_code", "") or "")
 
     if reporter is not None:
-        # The result text lands first and closes the reporter, so the item's real
-        # details can never be lost to a failed keyboard edit and a late byte
-        # callback can no longer overwrite them.
-        await reporter.close(result)
         if saved_code and editor.path == "helper-inline":
-            # The next actions belong to THIS panel, and only the Helper Bot's
-            # inline edit can replace a bot keyboard — the same message, same
-            # text, new rows. Any other path keeps the keyboard it found rather
-            # than pretending a user account could attach one.
+            # Close the reporter first (it makes no Telegram call of its own)
+            # so a late byte callback can never overwrite the finished panel,
+            # then render the COMPLETE terminal state — the item's real details
+            # AND its actions — in ONE edit, with no intermediate text-only
+            # result to wait for.
+            await reporter.close(None)
             await editor(result, success_action_rows(saved_code))
+        else:
+            await reporter.close(result)
 
     # The panel keeps its terminal state; releasing the token lets the next
     # Save on this panel become its writer without waiting for a timeout.
     if generation:
         finish_panel_operation(inline_chat_id, inline_msg_id, generation)
-
-    if client:
-        try:
-            await client.delete_messages(chat_id, [msg_id])
-        except Exception:
-            pass
 
 
 async def _save_link_input_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):

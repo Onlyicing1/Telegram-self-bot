@@ -14,7 +14,9 @@ The contract under test:
   * the keyboard is left untouched on both paths (no ``buttons`` argument);
   * a newer Save operation on the same panel wins, and a stale one cannot
     overwrite it;
-  * the owner's reply is deleted after the terminal result, and only it.
+  * the owner's reply is temporary input: it is deleted as soon as its reply
+    target has been read — before the target lookup and the transfer — exactly
+    once, and never the target.
 
 The fakes implement pinned Telethon 1.43.0's shapes (``edit_message(entity,
 message=None, text=None, *, buttons=None)``); they prove application behaviour
@@ -333,10 +335,10 @@ def test_loading_progress_and_the_final_result_land_on_that_one_panel(monkeypatc
     assert any("Downloading 50%" in text for text in texts)
     assert any("Uploading 100%" in text for text in texts)
     assert "Saved Successfully" in texts[-1]
-    # The result text is rendered once (closing the reporter), then the SAME
-    # terminal text is written again only to attach the panel's next actions.
-    assert texts[-1] == texts[-2]
-    assert all("Saved Successfully" not in text for text in texts[:-2])
+    # ONE atomic terminal render: details and actions are written together, so
+    # no text-only result ever precedes the finished panel.
+    assert sum("Saved Successfully" in text for text in texts) == 1
+    assert helper.calls[-1]["buttons"], "the terminal edit carries the actions"
 
 
 def test_a_failed_save_reports_its_failure_on_the_same_panel(monkeypatch):
@@ -398,7 +400,7 @@ def test_no_status_or_result_message_is_ever_sent(monkeypatch):
     assert "send_message" not in client.calls
 
 
-def test_the_reply_is_deleted_once_after_the_terminal_result(monkeypatch):
+def test_the_reply_is_deleted_exactly_once_and_never_the_target(monkeypatch):
     inline_id = _inline_id()
     helper = RecordingHelper()
     target, reply = _target_and_reply()
@@ -412,8 +414,181 @@ def test_the_reply_is_deleted_once_after_the_terminal_result(monkeypatch):
         )
     )
 
-    assert client.delete_calls == [(PANEL_CHAT, [REPLY_ID])]
+    assert client.delete_calls == [(PANEL_CHAT, [REPLY_ID])], "one request, one id"
     assert TARGET_ID not in {msg_id for _chat, ids in client.delete_calls for msg_id in ids}
+
+
+# ── 2b. the trigger is temporary input: it goes FIRST ──
+
+
+class TraceClient(FakeClient):
+    """FakeClient that records reads, deletes and transfers in ONE order."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.trace: list[tuple] = []
+
+    async def get_messages(self, chat_id=None, ids=None, **kwargs):
+        self.trace.append(("read", ids))
+        return await super().get_messages(chat_id, ids, **kwargs)
+
+    async def delete_messages(self, chat_id, message_ids):
+        self.trace.append(("delete", list(message_ids)))
+        await super().delete_messages(chat_id, message_ids)
+
+    async def download_media(self, *args, **kwargs):
+        self.trace.append(("download", None))
+        return await super().download_media(*args, **kwargs)
+
+
+def test_the_trigger_is_deleted_before_the_target_is_even_looked_up(monkeypatch):
+    helper = RecordingHelper()
+    target, reply = _target_and_reply()
+    client = TraceClient([target, reply])
+    _wire(client)
+    monkeypatch.setattr(save_handler, "get_client", lambda: helper)
+
+    _run(
+        save_handler._save_reply_wait_handler(
+            "save", PANEL_CHAT, REPLY_ID, PANEL_CHAT, PANEL_MSG,
+            inline_id=_inline_id(),
+        )
+    )
+
+    assert client.trace[0] == ("read", REPLY_ID), "read the reply relationship"
+    assert client.trace[1] == ("delete", [REPLY_ID]), (
+        "deletion is the very next request — no target lookup first"
+    )
+    assert ("read", TARGET_ID) in client.trace[2:], "then the exact target"
+    first_download = client.trace.index(("download", None))
+    assert first_download > 1, "no transfer ran before the deletion"
+
+
+def test_a_slow_save_cannot_postpone_the_deletion(monkeypatch):
+    seen: list[bool] = []
+
+    async def slow_save(client, owner_id, message, tz, **kwargs):
+        seen.append(client.delete_calls == [(PANEL_CHAT, [REPLY_ID])])
+        await asyncio.sleep(0.05)
+        return save_handler.save_service.SaveOutcome(
+            "**Saved Successfully**", saved=True, save_code="S0009",
+            media_type="Photo",
+        )
+
+    monkeypatch.setattr(save_handler.save_service, "execute_save", slow_save)
+    helper = RecordingHelper()
+    target, reply = _target_and_reply()
+    client = FakeClient([target, reply])
+    _wire(client)
+    monkeypatch.setattr(save_handler, "get_client", lambda: helper)
+
+    _run(
+        save_handler._save_reply_wait_handler(
+            "save", PANEL_CHAT, REPLY_ID, PANEL_CHAT, PANEL_MSG,
+            inline_id=_inline_id(),
+        )
+    )
+
+    assert seen == [True], "the trigger was already gone when the save started"
+    assert "Saved Successfully" in _helper_calls_texts(helper)[-1]
+    assert "Deep Save failed" not in _helper_calls_texts(helper)[-1]
+
+
+def test_the_save_receives_the_exact_target_of_the_original_reply(monkeypatch):
+    captured: list[int] = []
+
+    async def capture_save(client, owner_id, message, tz, **kwargs):
+        captured.append(message.id)
+        return save_handler.save_service.SaveOutcome(
+            "**Saved Successfully**", saved=True, save_code="S0007",
+            media_type="Photo",
+        )
+
+    monkeypatch.setattr(save_handler.save_service, "execute_save", capture_save)
+    helper = RecordingHelper()
+    target, reply = _target_and_reply()
+    client = FakeClient([target, reply])
+    _wire(client)
+    monkeypatch.setattr(save_handler, "get_client", lambda: helper)
+
+    _run(
+        save_handler._save_reply_wait_handler(
+            "save", PANEL_CHAT, REPLY_ID, PANEL_CHAT, PANEL_MSG,
+            inline_id=_inline_id(),
+        )
+    )
+
+    assert captured == [TARGET_ID], "the reply's target, never the trigger"
+    assert client.delete_calls == [(PANEL_CHAT, [REPLY_ID])]
+    assert "Saved Successfully" in _helper_calls_texts(helper)[-1]
+
+
+def test_a_missing_reply_message_fails_safely(monkeypatch):
+    helper = RecordingHelper()
+    client = FakeClient([])  # the trigger is gone, so nothing resolves
+    _wire(client)
+    monkeypatch.setattr(save_handler, "get_client", lambda: helper)
+
+    _run(
+        save_handler._save_reply_wait_handler(
+            "save", PANEL_CHAT, REPLY_ID, PANEL_CHAT, PANEL_MSG,
+            inline_id=_inline_id(),
+        )
+    )
+
+    assert "Could not find your reply message" in _helper_calls_texts(helper)[-1]
+    assert client.delete_calls == [(PANEL_CHAT, [REPLY_ID])], (
+        "only the trigger id is ever addressed"
+    )
+    assert "download_media" not in client.calls
+    assert db_client._fallback["saved_items"] == []
+
+
+def test_a_missing_target_reports_it_and_saves_nothing(monkeypatch):
+    helper = RecordingHelper()
+    _target, reply = _target_and_reply()
+    client = FakeClient([reply])  # the target no longer exists
+    _wire(client)
+    monkeypatch.setattr(save_handler, "get_client", lambda: helper)
+
+    _run(
+        save_handler._save_reply_wait_handler(
+            "save", PANEL_CHAT, REPLY_ID, PANEL_CHAT, PANEL_MSG,
+            inline_id=_inline_id(),
+        )
+    )
+
+    assert "no longer exists" in _helper_calls_texts(helper)[-1]
+    assert client.delete_calls == [(PANEL_CHAT, [REPLY_ID])]
+    assert "download_media" not in client.calls
+    assert db_client._fallback["saved_items"] == []
+
+
+def test_a_refused_trigger_deletion_never_cancels_the_save(monkeypatch):
+    class UndeletableTrigger(FakeClient):
+        async def delete_messages(self, chat_id, message_ids):
+            self.delete_calls.append((chat_id, list(message_ids)))
+            raise RuntimeError("message can't be deleted")
+
+    helper = RecordingHelper()
+    target, reply = _target_and_reply()
+    client = UndeletableTrigger([target, reply])
+    _wire(client)
+    monkeypatch.setattr(save_handler, "get_client", lambda: helper)
+
+    _run(
+        save_handler._save_reply_wait_handler(
+            "save", PANEL_CHAT, REPLY_ID, PANEL_CHAT, PANEL_MSG,
+            inline_id=_inline_id(),
+        )
+    )
+
+    assert "Saved Successfully" in _helper_calls_texts(helper)[-1]
+    assert len(db_client._fallback["saved_items"]) == 1
+    assert client.delete_calls == [(PANEL_CHAT, [REPLY_ID])], (
+        "the failed attempt is not retried"
+    )
+    assert client.send_message_calls == []
 
 
 # ── 3. fallbacks and missing identifiers ──

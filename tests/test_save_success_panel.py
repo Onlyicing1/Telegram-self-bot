@@ -182,6 +182,14 @@ def test_the_success_panel_preserves_the_saved_items_real_details(monkeypatch):
     assert f"**Type:** {row['media_type']}" in text
     assert "**Filename:**" in text
     assert f"photo_{code}.jpg" in text
+    # Details AND actions arrive together: one terminal edit, no text-only
+    # result that the buttons then have to catch up with.
+    assert len(helper.calls[-1]["buttons"]) == 5
+    assert sum("Saved Successfully" in call["text"] for call in helper.calls) == 1
+    assert all(
+        "Saved Successfully" not in call["text"]
+        for call in helper.calls[:-1]
+    ), "no intermediate result without its actions"
 
 
 def test_the_terminal_panel_is_the_same_message_and_the_only_surface(monkeypatch):
@@ -485,22 +493,22 @@ def test_a_save_without_a_code_renders_details_only(monkeypatch):
     assert "Saved Successfully" in helper.calls[-1]["text"]
 
 
-def test_a_refused_keyboard_edit_never_loses_the_result(monkeypatch):
-    class KeyboardRefused(RecordingHelper):
+def test_a_refused_terminal_inline_edit_still_lands_the_details(monkeypatch):
+    class TerminalRefused(RecordingHelper):
         async def edit_message(self, entity, message=None, text=None, *, buttons=None, **kw):
             await super().edit_message(entity, message, text, buttons=buttons, **kw)
-            if buttons:
+            if "Saved Successfully" in (text or ""):
                 raise RuntimeError("inline edit refused")
             return True
 
-    helper = KeyboardRefused()
+    helper = TerminalRefused()
     helper, client = _runs_save(monkeypatch=monkeypatch, helper=helper)
 
-    texts = [call["text"] for call in helper.calls if not call["buttons"]]
-    assert "Saved Successfully" in texts[-1], (
-        "the result was already rendered before the keyboard was attached"
+    assert helper.calls[-1]["buttons"], "the ONE terminal edit carried the actions"
+    assert "Saved Successfully" in client.edit_calls[-1]["text"], (
+        "a refused terminal inline edit falls back to the same message's details"
     )
-    assert helper.calls[-1]["buttons"], "the attach was attempted exactly once"
+    assert client.edit_calls[-1]["buttons"] is None
     assert client.send_message_calls == []
 
 

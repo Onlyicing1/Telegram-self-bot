@@ -262,8 +262,12 @@ source message
 ```
 
 - **Glass UI flow**: `Menu` → Save → Deep Save → Reply Mode → reply to the
-  target message. The handler resolves `reply_to_msg_id` to the exact target
-  message and passes that object to `execute_save` — never the user's reply.
+  target message. The handler reads `reply_to_msg_id` from the owner's reply,
+  then **deletes that trigger message immediately** — before the target lookup,
+  the transfer and persistence (`_delete_trigger_message`) — and passes the
+  target object to `execute_save`; never the user's reply, never a message
+  inferred from chat history. Deletion is attempted exactly once, only that id,
+  and a refused deletion is logged and swallowed so it cannot cancel the save.
 - **Reply-mode timeout**: the pending-input listener uses `timeout=None` for
   Deep Save reply mode, so large transfers are not cancelled by a blanket
   timeout. The separate 120s pending-input **state expiry** is unchanged.
@@ -323,12 +327,15 @@ source message
   + plain text (`backend/helper/symbols.py`), never emoji. Every row is
   `PRIMARY`: Telegram has exactly three styles and `backend/helper/styles.py`
   reserves green for confirmation and red for cancellation, so navigation is
-  not (and cannot be) coloured apart from an action. The result text is written
-  first (closing the reporter), then the same text is written once more with
-  the actions — so a refused keyboard edit can never lose the result. Only the
-  Helper Bot's inline edit can replace a bot keyboard: on the self-client
-  fallback the panel keeps the details and the keyboard it found, with no
-  actions. A failed save renders its honest error and no actions.
+  not (and cannot be) coloured apart from an action. The reporter is closed
+  without an edit of its own (so a late byte callback cannot overwrite the
+  finished panel) and then the details AND the actions are written in ONE
+  edit — there is no text-only result that the buttons later catch up with.
+  Only the Helper Bot's inline edit can replace a bot keyboard: on the
+  self-client fallback the panel gets one text-only edit with the details and
+  keeps the keyboard it found, with no actions. A refused terminal inline edit
+  therefore degrades to the same message's details. A failed save renders its
+  honest error and no actions.
   **Save by Link** has no panel to keep, so it first creates ONE dedicated
   Loading/status message with the SELF client (`_start_status`, in the chat the
   owner typed in) immediately after the link arrives and BEFORE it is parsed or
