@@ -14,12 +14,16 @@ failed in production:
 
 The contracts asserted here are the owner's:
 
-  * a DEDICATED status message is created by the self client right after the
-    input arrives, before target/link resolution, and every later update edits
-    that same chat id + message id; the terminal result replaces its text;
-  * exactly one message is sent per save (no per-update spam), the launching
-    panel is not the progress surface, and a late callback can never overwrite
-    the terminal state;
+  * Reply Mode edits the panel it armed, in place: the "Waiting for your
+    reply..." message shows target resolution, the transfer milestones and the
+    terminal result, and the save NEVER adds a message to the chat;
+  * Save by Link creates ONE dedicated status message with the self client
+    right after the link arrives, before it is parsed or resolved, and every
+    later update edits that same chat id + message id;
+  * the exact `(chat_id, message_id)` captured when Reply Mode was armed is the
+    one used for every edit, a missing panel coordinate runs the save with no
+    UI instead of a second message, and a late callback can never overwrite the
+    terminal state;
   * a private link resolves through ordinary authenticated APIs (cache →
     entity → the account's own dialog list → Telegram's peer-less lookup),
     always validated by peer AND message id, with a distinct honest failure
@@ -92,12 +96,13 @@ class OrderingClient(FakeClient):
         return await super().get_messages(chat_id, ids, **kwargs)
 
     async def edit_message(self, entity, message=None, text=None, *, buttons=None, **kwargs):
+        self.order.append("edit_message")
         await super().edit_message(entity, message, text, buttons=buttons, **kwargs)
         self.applied_edits.append({"chat_id": entity, "msg_id": message, "text": text})
 
 
 @pytest.mark.asyncio
-async def test_reply_mode_creates_the_status_message_before_target_lookup():
+async def test_reply_mode_edits_the_existing_panel_before_target_lookup():
     target = photo_message(101, text="hello", download_size=200_000)
     reply = FakeMessage(102, chat_id=PANEL_CHAT, text="save", reply_to_msg_id=101)
     client = OrderingClient([target, reply])
@@ -107,22 +112,118 @@ async def test_reply_mode_creates_the_status_message_before_target_lookup():
         "save", PANEL_CHAT, 102, PANEL_CHAT, PANEL_MSG
     )
 
-    assert len(client.send_message_calls) == 1
-    status = client.send_message_calls[0]
-    assert status["chat_id"] == PANEL_CHAT
-    assert "Deep Save" in status["text"]
-    assert "Resolving" in status["text"]
+    # The panel already on screen is the progress AND result surface: no new
+    # message is created for Reply Mode, at any point of the save.
+    assert client.send_message_calls == []
 
-    # Created BEFORE the reply/target lookup, so resolution delay is visible.
-    assert client.order[0] == "send_message"
-    assert client.order.count("send_message") == 1
+    # Edited BEFORE the reply/target lookup, so resolution delay is visible.
+    assert client.order[0] == "edit_message"
+    assert client.order.index("edit_message") < client.order.index("get_messages")
 
-    # Every applied edit addressed that one message, and the panel never was.
     coords = {(call["chat_id"], call["msg_id"]) for call in client.applied_edits}
-    assert coords == {(status["chat_id"], status["message_id"])}
+    assert coords == {(PANEL_CHAT, PANEL_MSG)}
     texts = [call["text"] for call in client.applied_edits]
+    assert "Resolving the target message" in texts[0]
     assert any("Downloading 100%" in text for text in texts)
     assert "Saved Successfully" in texts[-1]
+    assert len(_rows()) == 1
+
+
+@pytest.mark.asyncio
+async def test_reply_mode_failure_result_lands_on_the_same_panel():
+    reply = FakeMessage(302, chat_id=PANEL_CHAT, text="save", reply_to_msg_id=301)
+    client = OrderingClient([reply])  # the replied-to message is gone
+    _wire(client)
+
+    await save_handler._save_reply_wait_handler(
+        "save", PANEL_CHAT, 302, PANEL_CHAT, PANEL_MSG
+    )
+
+    assert client.send_message_calls == []
+    last = client.applied_edits[-1]
+    assert (last["chat_id"], last["msg_id"]) == (PANEL_CHAT, PANEL_MSG)
+    assert "no longer exists" in last["text"]
+    assert _rows() == []
+
+
+@pytest.mark.asyncio
+async def test_a_late_transfer_callback_cannot_overwrite_the_reply_panel_result(monkeypatch):
+    created: dict = {}
+    real_reporter = save_handler.SaveProgressReporter
+
+    def _capture(edit, **kwargs):
+        reporter = real_reporter(edit, **kwargs)
+        created["reporter"] = reporter
+        return reporter
+
+    monkeypatch.setattr(save_handler, "SaveProgressReporter", _capture)
+
+    target = photo_message(111, text="hello", download_size=200_000)
+    reply = FakeMessage(112, chat_id=PANEL_CHAT, text="save", reply_to_msg_id=111)
+    client = OrderingClient([target, reply])
+    _wire(client)
+
+    await save_handler._save_reply_wait_handler(
+        "save", PANEL_CHAT, 112, PANEL_CHAT, PANEL_MSG
+    )
+
+    terminal = client.applied_edits[-1]["text"]
+    assert "Saved Successfully" in terminal
+    applied = len(client.applied_edits)
+
+    # A callback that arrives after the result can no longer touch the panel.
+    await created["reporter"].handle(
+        save_service.SaveProgressEvent(
+            phase="upload", completed_bytes=10, total_bytes=100,
+            item_index=1, item_count=1, finished=True,
+        )
+    )
+    assert len(client.applied_edits) == applied
+    assert client.applied_edits[-1]["text"] == terminal
+
+
+@pytest.mark.asyncio
+async def test_reply_mode_without_panel_coordinates_never_creates_a_message():
+    target = photo_message(401, text="hello", download_size=200_000)
+    reply = FakeMessage(402, chat_id=PANEL_CHAT, text="save", reply_to_msg_id=401)
+    client = OrderingClient([target, reply])
+    _wire(client)
+
+    await save_handler._save_reply_wait_handler("save", PANEL_CHAT, 402, 0, 0)
+
+    # No panel to edit means no UI — never a replacement status message.
+    assert client.send_message_calls == []
+    assert client.applied_edits == []
+    assert len(_rows()) == 1
+
+
+@pytest.mark.asyncio
+async def test_reply_mode_panel_is_edited_by_the_self_client_only(monkeypatch):
+    """An inline panel is sent BY THE OWNER's account — never by the bot."""
+
+    class ForbiddenHelper:
+        async def edit_message(self, *args, **kwargs):  # pragma: no cover
+            raise AssertionError("the Reply Mode panel is never the helper bot's")
+
+        async def send_message(self, *args, **kwargs):  # pragma: no cover
+            raise AssertionError("Reply Mode must not send any message")
+
+    monkeypatch.setattr(save_handler, "get_client", lambda: ForbiddenHelper())
+
+    target = photo_message(511, text="hello", download_size=200_000)
+    reply = FakeMessage(512, chat_id=PANEL_CHAT, text="save", reply_to_msg_id=511)
+    client = OrderingClient([target, reply])
+    _wire(client)
+
+    await save_handler._save_reply_wait_handler(
+        "save", PANEL_CHAT, 512, PANEL_CHAT, PANEL_MSG
+    )
+
+    assert client.send_message_calls == []
+    assert {(call["chat_id"], call["msg_id"]) for call in client.applied_edits} == {
+        (PANEL_CHAT, PANEL_MSG)
+    }
+    assert "Saved Successfully" in client.applied_edits[-1]["text"]
     assert len(_rows()) == 1
 
 
@@ -149,23 +250,23 @@ async def test_link_mode_creates_the_status_message_before_parsing_the_link():
 
 
 @pytest.mark.asyncio
-async def test_status_message_never_uses_the_helper_bot(monkeypatch):
-    target = photo_message(111, text="hello", download_size=200_000)
-    reply = FakeMessage(112, chat_id=PANEL_CHAT, text="save", reply_to_msg_id=111)
-    client = OrderingClient([target, reply])
+async def test_link_status_message_never_uses_the_helper_bot(monkeypatch):
+    target = photo_message(209974, chat_id=PEER, text="hi", download_size=200_000)
+    client = OrderingClient([target])
     _wire(client)
 
     class ForbiddenHelper:
         async def edit_message(self, *args, **kwargs):  # pragma: no cover
-            raise AssertionError("progress must never be edited by the helper bot")
+            raise AssertionError("the link status message is the self client's")
 
         async def send_message(self, *args, **kwargs):  # pragma: no cover
             raise AssertionError("the status message must be sent by the self client")
 
     monkeypatch.setattr(save_handler, "get_client", lambda: ForbiddenHelper())
 
-    await save_handler._save_reply_wait_handler(
-        "save", PANEL_CHAT, 112, PANEL_CHAT, PANEL_MSG
+    await save_handler._save_link_input_handler(
+        f"tg://openmessage?user_id={PEER}&message_id={MSG_ID}",
+        PANEL_CHAT, 113, PANEL_CHAT, PANEL_MSG,
     )
 
     assert len(_rows()) == 1
@@ -173,10 +274,9 @@ async def test_status_message_never_uses_the_helper_bot(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_status_message_creation_failure_still_saves_and_reports_on_the_panel():
-    target = photo_message(121, text="hello", download_size=200_000)
-    reply = FakeMessage(122, chat_id=PANEL_CHAT, text="save", reply_to_msg_id=121)
-    client = OrderingClient([target, reply])
+async def test_link_status_creation_failure_still_saves_and_reports_on_the_panel():
+    target = photo_message(MSG_ID, chat_id=PEER, text="hi", download_size=200_000)
+    client = OrderingClient([target])
     _wire(client)
 
     async def refusing_send(entity, message="", **kwargs):
@@ -184,8 +284,9 @@ async def test_status_message_creation_failure_still_saves_and_reports_on_the_pa
 
     client.send_message = refusing_send  # type: ignore[assignment]
 
-    await save_handler._save_reply_wait_handler(
-        "save", PANEL_CHAT, 122, PANEL_CHAT, PANEL_MSG
+    await save_handler._save_link_input_handler(
+        f"tg://openmessage?user_id={PEER}&message_id={MSG_ID}",
+        PANEL_CHAT, 123, PANEL_CHAT, PANEL_MSG,
     )
 
     assert len(_rows()) == 1, "the save itself must not depend on its UI"
@@ -225,6 +326,69 @@ async def test_terminal_result_replaces_the_status_text_and_ignores_late_events(
     assert len(client.applied_edits) == terminal_index
     assert "DONE — saved" in client.applied_edits[-1]["text"]
     assert len(client.send_message_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_panel_coordinates_travel_from_arming_to_the_terminal_result(monkeypatch):
+    """The whole Reply Mode contract, from the button to the result."""
+    from backend.helper import input_state
+
+    target = photo_message(601, text="hello", download_size=200_000)
+    reply = FakeMessage(602, chat_id=PANEL_CHAT, text="save", reply_to_msg_id=601)
+    client = OrderingClient([target, reply])
+    _wire(client)
+    input_state.clear_pending(OWNER)
+
+    class _Event:
+        chat_id = PANEL_CHAT
+        message_id = PANEL_MSG
+        inline_message_id = None
+
+    _title, body, _buttons = await save_handler._save_reply_action(
+        _Event(), "", PANEL_CHAT
+    )
+    assert "Waiting for your reply" in body
+
+    pending = input_state.get_pending(OWNER)
+    assert (pending["inline_chat_id"], pending["inline_msg_id"]) == (
+        PANEL_CHAT, PANEL_MSG
+    )
+
+    # Exactly what the input listener does: pop FIRST, then call the handler.
+    entry = input_state.clear_pending(OWNER)
+    await entry["handler"](
+        "ignored", PANEL_CHAT, 602, entry["inline_chat_id"], entry["inline_msg_id"]
+    )
+
+    assert client.send_message_calls == []
+    assert {(call["chat_id"], call["msg_id"]) for call in client.applied_edits} == {
+        (PANEL_CHAT, PANEL_MSG)
+    }
+    assert "Saved Successfully" in client.applied_edits[-1]["text"]
+    assert len(_rows()) == 1
+
+
+def test_an_inline_panel_resolves_its_message_through_the_session():
+    """An inline callback carries only ``inline_message_id`` — find the pair."""
+    from backend.helper.lifecycle import get_lifecycle
+
+    sessions = get_lifecycle().sessions
+    msg_id = 987654
+    sessions.create(
+        PANEL_CHAT, msg_id, panel_type="menu", inline_message_id="inline-under-test"
+    )
+
+    class _InlineEvent:
+        chat_id = PANEL_CHAT
+        message_id = None
+        inline_message_id = "inline-under-test"
+
+    try:
+        assert save_handler._panel_coords(_InlineEvent(), PANEL_CHAT) == (
+            PANEL_CHAT, msg_id
+        )
+    finally:
+        sessions.destroy(PANEL_CHAT, msg_id)
 
 
 def test_production_edit_and_send_shapes_match_real_telethon():

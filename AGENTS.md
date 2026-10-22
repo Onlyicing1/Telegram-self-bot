@@ -294,16 +294,22 @@ source message
   write — there is no workaround and no bypass.
 - **Transfer progress**: `execute_save` / `execute_link_save` accept an optional
   `progress` observer (`SaveProgressEvent`, real Telethon byte counts). Both
-  Glass inputs (Reply Mode, Save by Link) first create ONE dedicated
+  Glass inputs bind
+  `backend/helper/save_progress.py::SaveProgressReporter` to ONE existing-to-the-
+  owner message and edit it in place through the standard panel render path
+  (`edit_message(chat, msg_id, text)` — never the text in the `message`
+  parameter); no update is ever a new message. **Reply Mode** reuses the panel it
+  armed: `_panel_coords` captures its exact chat id + message id when the action
+  fires, they ride the pending input, and the same message shows target
+  resolution, every milestone and the terminal result (`_panel_editor`). The
+  panel is always sent by the owner's own account — an inline panel result is
+  sent by the requesting client — so the self client is the only editor, and a
+  missing panel coordinate runs the save without UI rather than adding a
+  message.
+  **Save by Link** has no panel to keep, so it first creates ONE dedicated
   Loading/status message with the SELF client (`_start_status`, in the chat the
-  owner typed in) — immediately after the input arrives and BEFORE reply/link
-  resolution — and bind
-  `backend/helper/save_progress.py::SaveProgressReporter` to that message's own
-  chat id + message id. Every update edits that same message through the
-  standard panel render path (`edit_message(chat, msg_id, text)` — never the
-  text in the `message` parameter), so link-resolution time is visible and no
-  update is ever a new message; the launching panel is not the progress
-  surface. Rendering is the shared five-segment bar
+  owner typed in) immediately after the link arrives and BEFORE it is parsed or
+  resolved, then edits that message. Rendering is the shared five-segment bar
   (`backend/helper/progress.py::render_progress_bar`, also used by the model
   tester); cadence is `50/100` at or below 10 MiB and `20/40/60/80/100` above
   it, independently per download/upload phase and per album member
@@ -311,8 +317,8 @@ source message
   the size is unknown). An unknown size gets a truthful 100% at the boundary;
   repeated renders are skipped, an edit failure never aborts the transfer, and
   the terminal result closes the reporter first, so a late event can never
-  overwrite it. A caller with no status message (the AI tools, or a failed
-  send) passes no reporter.
+  overwrite it. A caller with no progress surface (the AI tools, missing panel
+  coordinates, or a failed send) passes no reporter.
 - **Save by Link**: `parse_link_target` is the ONE link parser —
   `https://t.me/<username>/<id>`, `https://t.me/c/<chat>/<id>` and the app's
   own `tg://openmessage?user_id=<id>&message_id=<id>` URI (also

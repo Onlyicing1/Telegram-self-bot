@@ -1141,7 +1141,7 @@ def _wire(client: FakeClient) -> None:
 
 
 @pytest.mark.asyncio
-async def test_reply_mode_creates_one_status_message_and_edits_that_message():
+async def test_reply_mode_edits_the_existing_panel_and_sends_no_message():
     target = photo_message(101, text="hello", download_size=200_000)
     reply = FakeMessage(
         102, chat_id=PANEL_CHAT, text="save this", reply_to_msg_id=101
@@ -1153,18 +1153,15 @@ async def test_reply_mode_creates_one_status_message_and_edits_that_message():
         "save this", PANEL_CHAT, 102, PANEL_CHAT, PANEL_MSG,
     )
 
-    assert len(client.send_message_calls) == 1, "exactly ONE status message"
-    status = client.send_message_calls[0]
-    assert status["chat_id"] == PANEL_CHAT
-    assert "Resolving" in status["text"]
+    # Reply Mode reuses the panel it armed — it never adds a message.
+    assert client.send_message_calls == []
 
-    assert client.edit_calls, "progress never reached the status message"
+    assert client.edit_calls, "progress never reached the panel"
     coords = {(call["chat_id"], call["msg_id"]) for call in client.edit_calls}
-    assert coords == {(status["chat_id"], status["message_id"])}
-    # The panel that launched the flow is never the progress surface.
-    assert (PANEL_CHAT, PANEL_MSG) not in coords
+    assert coords == {(PANEL_CHAT, PANEL_MSG)}
 
     texts = [call["text"] for call in client.edit_calls]
+    assert "Resolving the target message" in texts[0]
     for expected in (
         "Downloading 50%", "Downloading 100%", "Uploading 50%", "Uploading 100%",
     ):

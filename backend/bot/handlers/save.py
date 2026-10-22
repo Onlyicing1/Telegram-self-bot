@@ -15,14 +15,21 @@ row, and Reply Mode without it stays exactly as prompt-free as before. The
 metadata always travels as the shared ``save_service.SaveMetadata`` contract —
 this module parses the one-line UI format and nothing else.
 
-Live transfer progress gets a DEDICATED message: as soon as the owner submits
-the reply or the link, the SELF client sends one Loading/status message into
-the chat the owner typed in, and every progress update edits THAT message in
-place (same chat id, same message id) until the terminal result replaces its
-text. The panel that launched the input flow is never the progress surface, so
-link resolution and target lookup are covered, and not one message is sent per
-update. Without a status message (creation failed, or the AI tools that have
-no chat UI) the pipeline runs without inventing progress.
+Live transfer progress always edits a message the owner is ALREADY looking at,
+and neither input mode adds one:
+
+* Reply Mode owns the panel itself. The ``Waiting for your reply...`` panel is
+  replaced — in that same message — by target resolution, every transfer
+  milestone and the terminal result. The panel coordinates captured when Reply
+  Mode was armed travel through the pending input and are used for every edit,
+  so one save never adds a second message to the chat.
+* Save by Link has no panel to keep, so the SELF client sends ONE dedicated
+  Loading/status message right after the link arrives (before it is parsed or
+  resolved), and every update edits that message.
+
+Only real download/upload byte callbacks drive the milestones, and a UI edit
+failure is logged and swallowed — a transfer is never cancelled by its own
+progress surface (the AI tools have no chat UI and simply run without it).
 """
 import logging
 import os
@@ -85,34 +92,67 @@ async def _save_inline_builder(event, extra: str) -> list:
 async def _save_reply_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     from backend.helper.inline_engine import _owner_id
     from backend.helper.input_state import set_pending
-    from backend.helper.panels import resolve_callback_message
 
     owner_id = _owner_id
 
     if not chat_id:
         return "Deep Save", f"{sym.STATE_WARNING} Could not determine the current chat. Please try again.", []
 
-    # The panel that launched the flow is NOT the progress surface any more; it
-    # is kept only as the fallback result surface if the status message cannot
-    # be created. Resolved the way every other panel resolves it.
-    _panel_chat, panel_msg_id, _inline_id = resolve_callback_message(event)
+    # The panel IS the progress surface: these exact coordinates travel through
+    # the pending input and every later edit of this save addresses them, so
+    # Reply Mode never adds a message to the chat.
+    panel_chat, panel_msg_id = _panel_coords(event, chat_id)
 
-    wait_text = (
-        "**Deep Save — Reply Mode**\n\n"
-        "Waiting for your reply...\n"
-        "Reply to any message to save it (download → re-upload)."
-    )
+    wait_text = _reply_wait_text()
 
     set_pending(
         owner_id, "save_reply", _save_reply_wait_handler,
         chat_id, wait_text,
-        inline_chat_id=chat_id,
-        inline_msg_id=panel_msg_id or 0,
+        inline_chat_id=panel_chat or chat_id,
+        inline_msg_id=panel_msg_id,
         extra="",
         timeout=None,
     )
 
     return "Deep Save", wait_text, []
+
+
+REPLY_PANEL_TITLE = "Deep Save — Reply Mode"
+
+
+def _reply_wait_text(metadata=None) -> str:
+    """The ONE Reply Mode panel text, with the optional metadata echo."""
+    lines: list[str] = [f"**{REPLY_PANEL_TITLE}**", ""]
+    if metadata is not None:
+        lines.extend([describe_metadata(metadata), ""])
+    lines.append("Waiting for your reply...")
+    lines.append("Reply to any message to save it (download → re-upload).")
+    return "\n".join(lines)
+
+
+def _panel_coords(event, chat_id: int) -> tuple[int, int]:
+    """The EXACT (chat id, message id) of the panel the owner is looking at.
+
+    ``resolve_callback_message`` answers directly for a normal panel; an inline
+    panel carries only its ``inline_message_id``, so the session that sent it is
+    consulted for the real pair the router itself edits. ``(chat_id, 0)`` when
+    no message id can be established — the caller then runs without UI rather
+    than inventing a second message.
+    """
+    from backend.helper.panels import resolve_callback_message
+
+    panel_chat, panel_msg_id, inline_id = resolve_callback_message(event)
+    panel_chat = panel_chat or chat_id or 0
+    if not panel_msg_id and inline_id:
+        try:
+            from backend.helper.lifecycle import get_lifecycle
+            session = get_lifecycle().sessions.get_by_inline_id(inline_id)
+        except Exception:
+            session = None
+        if session is not None:
+            panel_chat = panel_chat or session.chat_id
+            panel_msg_id = session.msg_id
+    return int(panel_chat or 0), int(panel_msg_id or 0)
 
 
 # ── optional owner metadata (the "Name & tags" step) ──
@@ -215,11 +255,7 @@ async def _save_metadata_input_handler(text, chat_id, msg_id, inline_chat_id, in
     except ValueError as exc:
         result, buttons = await _deep_save_panel_with_notice(f"{sym.STATE_WARNING} {exc}")
     else:
-        wait_text = (
-            "**Deep Save — Reply Mode**\n\n"
-            f"{describe_metadata(metadata)}\n\n"
-            "Reply to any message to save it (download → re-upload)."
-        )
+        wait_text = _reply_wait_text(metadata)
         set_pending(
             owner_id, "save_reply", _reply_handler_with_metadata(metadata),
             chat_id, wait_text,
@@ -244,16 +280,20 @@ async def _save_metadata_input_handler(text, chat_id, msg_id, inline_chat_id, in
 
 
 def _status_editor(self_client, chat_id, msg_id):
-    """An edit callable for ONE status message, deduped and failure-contained.
+    """An edit callable for ONE message, deduped and failure-contained.
+
+    Used for the Save-by-Link status message and for the Reply Mode panel: both
+    are sent by the OWNER'S account (an inline panel result is sent by the
+    requesting client, so the helper bot never owns it), and both are edited
+    through this one callable.
 
     ``edit_message`` is called with Telethon's documented signature
     (``entity, message_id, text``) — passing the text as ``message`` bound it to
     the message-id parameter and every edit raised ``TypeError``, which is why
     no progress could ever appear live even with the right client.
 
-    No reply markup: this message is sent by the OWNER'S account, and a user
-    account cannot attach a bot keyboard, so a rejected send would hide the
-    progress entirely.
+    No reply markup: a user account cannot attach a bot keyboard, so a rejected
+    edit would hide the progress entirely.
     """
     from backend.helper.panel_render import render_edit
 
@@ -280,20 +320,35 @@ def _status_editor(self_client, chat_id, msg_id):
     return _edit
 
 
+def _panel_editor(self_client, chat_id, msg_id):
+    """An edit callable for the panel Reply Mode already shows, or ``None``.
+
+    The panel is the message the owner's own account already sent (an inline
+    panel result is sent by the requesting client, and the fallback panel is
+    sent the same way), so the self client is the one authority that may edit
+    it. ``None`` when there is no client or no panel coordinate: the save then
+    runs without UI — a missing panel is never replaced by a second message.
+    """
+    if self_client is None or not chat_id or not msg_id:
+        return None
+    return _status_editor(self_client, chat_id, msg_id)
+
+
 async def _start_status(
     self_client, chat_id: int, *, title: str, body: str
 ) -> "SaveProgressReporter | None":
     """Send the ONE dedicated Loading/status message and bind progress to it.
 
-    Created by the SELF client in the chat the owner just typed in, immediately
-    after the input arrives and before any link resolution or media work, so a
-    slow lookup never leaves the owner staring at the static prompt. The
-    returned reporter edits that exact message for every update and for the
-    terminal result; the panel that launched the input flow is untouched.
+    Used by Save by Link, which has no panel to keep. Created by the SELF client
+    in the chat the owner just typed in, immediately after the input arrives and
+    before any link resolution or media work, so a slow lookup never leaves the
+    owner staring at the static prompt. The returned reporter edits that exact
+    message for every update and for the terminal result.
 
     ``None`` when there is no client, no chat, or Telegram refused to send the
     message: the save still runs, and the caller renders its result on the
-    panel as the previous behaviour did.
+    panel as the previous behaviour did. Reply Mode must never come here — it
+    edits its existing panel instead (``_panel_editor``).
     """
     if self_client is None or not chat_id:
         return None
@@ -325,7 +380,7 @@ async def _start_status(
 
 
 async def _edit_status(self_client, inline_chat_id, inline_msg_id, text: str, label: str) -> bool:
-    """Fallback: render a result on the panel when no status message exists."""
+    """Fallback for Save by Link: render its result on the panel instead."""
     if self_client is None or not inline_chat_id or not inline_msg_id:
         return False
     try:
@@ -350,11 +405,21 @@ async def _save_reply_wait_handler(
     client = _self_client
     clear_pending(owner_id)
 
-    # The status message exists BEFORE the reply/target lookup, so resolution
-    # time is visible instead of silent.
-    reporter = await _start_status(
-        client, chat_id, title="Deep Save", body="Resolving the target message…"
-    )
+    # Reply Mode keeps the panel it armed: "Waiting for your reply..." becomes
+    # the resolution line, then the transfer milestones, then the result — one
+    # message edited in place, never a second one, and it is touched BEFORE the
+    # reply/target lookup so resolution time is visible instead of silent.
+    editor = _panel_editor(client, inline_chat_id, inline_msg_id)
+    reporter = None
+    if editor is None:
+        logger.warning(
+            "[SAVE_UI] reply mode has no editable panel (chat=%s msg=%s) — "
+            "the save runs without status updates",
+            inline_chat_id, inline_msg_id,
+        )
+    else:
+        await editor(f"**{REPLY_PANEL_TITLE}**\n\nResolving the target message…")
+        reporter = SaveProgressReporter(editor, title=REPLY_PANEL_TITLE)
 
     try:
         # Resolve the user's outgoing reply, then the exact message it
@@ -380,8 +445,6 @@ async def _save_reply_wait_handler(
 
     if reporter is not None:
         await reporter.close(result)
-    else:
-        await _edit_status(client, inline_chat_id, inline_msg_id, result, "save reply")
 
     if client:
         try:
