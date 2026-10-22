@@ -14,10 +14,12 @@ neither of them sends a message:
   (``messages.editMessage``), which is who sent the inline result in the first
   place.
 
-Both paths keep the panel's inline keyboard: ``buttons`` is never passed, and
-MTProto edits leave an omitted ``reply_markup`` untouched. That is deliberate —
-the keyboard belongs to the panel's own design, and a progress edit must not
-remove it (nor send the wrong markup type, which is what ``buttons=[]`` does).
+A progress edit passes no ``buttons``, so MTProto leaves the keyboard it found
+untouched: the keyboard belongs to the panel's own design and a status line must
+not remove it (nor replace it with the wrong markup type, which is what
+``buttons=[]`` does). A FINISHED panel may pass its next actions once — the
+Helper Bot's inline edit accepts a new ``ReplyInlineMarkup``, while a user-account
+edit cannot attach a bot keyboard and therefore renders the text only.
 
 The path is chosen from the identifiers that actually reached the handler,
 never from guesswork. If the inline edit is refused, the SAME message is still
@@ -53,6 +55,18 @@ _counter = 0
 
 def _key(chat_id: int | None, msg_id: int | None) -> tuple[int, int]:
     return (int(chat_id or 0), int(msg_id or 0))
+
+
+def _markup_signature(rows: list) -> tuple:
+    """A hashable identity for one keyboard.
+
+    Dedupe compares text AND markup, so an edit that only changes the buttons
+    is never mistaken for an unchanged render.
+    """
+    return tuple(
+        tuple(getattr(button, "data", None) for button in row)
+        for row in rows or ()
+    )
 
 
 def inline_message_id_from_event(event: Any) -> Any | None:
@@ -148,7 +162,7 @@ class ExistingPanelEditor:
         self._helper = helper
         self._self_client = self_client
         self._generation = int(generation or 0)
-        self._applied: str | None = None
+        self._applied: tuple[str, tuple] | None = None
         self._inline_failed = False
 
     @property
@@ -164,14 +178,22 @@ class ExistingPanelEditor:
     def available(self) -> bool:
         return self.path != "unavailable"
 
-    async def __call__(self, text: str) -> bool:
-        return await self.edit(text)
+    async def __call__(self, text: str, buttons: list | None = None) -> bool:
+        return await self.edit(text, buttons=buttons)
 
-    async def edit(self, text: str) -> bool:
-        """Render ``text`` onto the panel in place. Errors never escape."""
+    async def edit(self, text: str, buttons: list | None = None) -> bool:
+        """Render ``text`` onto the panel in place. Errors never escape.
+
+        ``buttons`` is optional and replaces the panel's keyboard where the
+        path genuinely supports it (the Helper Bot's inline edit). Progress
+        updates pass none, so the keyboard they found is preserved; a finished
+        panel passes its next actions once. Passing an empty list is never
+        forwarded as-is — Telethon would build a REPLY keyboard out of it.
+        """
         from backend.helper.panel_render import render_edit
 
-        rendered, _buttons = render_edit("", text, [])
+        rendered, built = render_edit("", text, buttons or [])
+        markup = _markup_signature(built)
         if self._generation and not panel_operation_is_current(
             self._chat_id, self._msg_id, self._generation
         ):
@@ -180,12 +202,12 @@ class ExistingPanelEditor:
                 self._chat_id, self._msg_id, self._generation,
             )
             return False
-        if rendered == self._applied:
+        if (rendered, markup) == self._applied:
             return True
 
         if self.path == "helper-inline":
-            if await self._edit_inline(rendered):
-                self._applied = rendered
+            if await self._edit_inline(rendered, built):
+                self._applied = (rendered, markup)
                 return True
             logger.warning(
                 "[PANEL_EDIT] inline edit refused for chat=%s msg=%s — "
@@ -194,16 +216,19 @@ class ExistingPanelEditor:
             )
 
         if self._self_client is not None and self._chat_id and self._msg_id:
-            if await self._edit_chat(rendered):
-                self._applied = rendered
+            if await self._edit_chat(rendered, built):
+                self._applied = (rendered, markup)
                 return True
 
         return False
 
-    async def _edit_inline(self, rendered: str) -> bool:
+    async def _edit_inline(self, rendered: str, built: list) -> bool:
         try:
-            # No ``buttons``: the panel keeps the keyboard it already has.
-            await self._helper.edit_message(self._inline_id, text=rendered)
+            # ``buttons=None`` (never ``[]``) leaves the keyboard untouched
+            # when this update carries no new markup of its own.
+            await self._helper.edit_message(
+                self._inline_id, text=rendered, buttons=built or None
+            )
             return True
         except Exception as exc:  # noqa: BLE001 — progress never aborts a save
             if "not modified" in str(exc).lower():
@@ -214,10 +239,17 @@ class ExistingPanelEditor:
             logger.warning("[PANEL_EDIT] inline panel edit failed: %s", exc)
             return False
 
-    async def _edit_chat(self, rendered: str) -> bool:
+    async def _edit_chat(self, rendered: str, built: list) -> bool:
+        if built:
+            # A user account cannot attach a bot keyboard: the same message is
+            # still updated, but its keyboard stays what the panel already had.
+            logger.info(
+                "[PANEL_EDIT] keyboard replacement needs the Helper Bot's inline "
+                "edit; rendering text only (chat=%s msg=%s)",
+                self._chat_id, self._msg_id,
+            )
         try:
-            # No ``buttons``: a user edit cannot attach a bot keyboard, and an
-            # omitted reply_markup keeps the existing one untouched.
+            # No ``buttons``: an omitted reply_markup keeps the existing one.
             await self._self_client.edit_message(self._chat_id, self._msg_id, rendered)
             return True
         except Exception as exc:  # noqa: BLE001 — progress never aborts a save

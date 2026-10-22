@@ -304,8 +304,11 @@ def test_the_existing_panel_is_edited_through_the_inline_identifier(monkeypatch)
     for call in helper.calls:
         assert call["entity"] is inline_id, "every edit addresses that exact panel"
         assert call["message"] is None
-        assert call["buttons"] is None, "the keyboard must be left untouched"
         assert isinstance(call["text"], str) and call["text"]
+    # A status edit carries no markup, so the keyboard it found survives. Only
+    # the FINISHED panel replaces it, with the next actions of this save.
+    assert all(call["buttons"] is None for call in helper.calls[:-1])
+    assert len(helper.calls[-1]["buttons"]) == 5
     assert client.edit_calls == []
     assert client.send_message_calls == []
     assert len(db_client._fallback["saved_items"]) == 1
@@ -330,7 +333,10 @@ def test_loading_progress_and_the_final_result_land_on_that_one_panel(monkeypatc
     assert any("Downloading 50%" in text for text in texts)
     assert any("Uploading 100%" in text for text in texts)
     assert "Saved Successfully" in texts[-1]
-    assert texts.index(texts[-1]) == len(texts) - 1
+    # The result text is rendered once (closing the reporter), then the SAME
+    # terminal text is written again only to attach the panel's next actions.
+    assert texts[-1] == texts[-2]
+    assert all("Saved Successfully" not in text for text in texts[:-2])
 
 
 def test_a_failed_save_reports_its_failure_on_the_same_panel(monkeypatch):

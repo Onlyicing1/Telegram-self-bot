@@ -7,7 +7,7 @@
 
 | Item | Value |
 |---|---|
-| Stage | Reply Mode presentation: the existing panel is the loading/progress/result surface, edited by the Helper Bot when Telegram gives it the handle |
+| Stage | Reply Mode presentation: the existing panel is the loading/progress/result surface, edited by the Helper Bot when Telegram gives it the handle; its FINISHED state carries the next actions (§8) |
 | Date | 2026-10-22 |
 | Project / remote | LifeOS Telegram self-bot, `Onlyicing1/Telegram-self-bot` (`origin`) |
 | Base commit | `f4708f7118f9d965b166d5a56f85cfa9adb7053e` (`docs: record helper inline panel edit investigation`) |
@@ -228,12 +228,71 @@ With the real bot (not from this clone):
 6. If step 1 reported `self-chat`, the Helper-Bot path is unavailable for these
    panels: record it and close U1 as unsupported; the shipped UX is unaffected.
 
-## 8. Limits left in place deliberately
+## 8. Save success panel — the next actions (latest change)
+
+After the terminal success text the panel used to stop. It now renders the
+saved item's real details (unchanged: `Saved Successfully`, `Code`, `Type`,
+`Filename`) followed by five actions, in this order, on the **same** message:
+
+| # | Label | Callback | Existing surface it reaches |
+|---|---|---|---|
+| 1 | `✎ Edit this item` | `panel:retrieve_item:id:<code>` | the item detail/edit panel, resolved by the save code just issued (`Rename`, file name, tags, move, delete) |
+| 2 | `✓ Save another item` | `panel:save:type:d` | the Deep Save selection panel (`Reply Mode`, `Name & tags`, `Save using a link`) |
+| 3 | `⌕ Show the saved items` | `panel:retrieve_saved` | the paginated saved-items list |
+| 4 | `⌂ Home` | `panel:_nav:home` | the Helper Bot mother panel |
+| 5 | `× Close` | `panel:_nav:close` | the lifecycle close (edit `Panel closed`, then the established delayed delete) |
+
+* **Unicode / no emoji** — every label is `sym.label(glyph, text)` from
+  `backend/helper/symbols.py`; the text is plain ASCII and the glyphs are the
+  registry's functional marks. No emoji, no variation selector (`U+FE0F`), no
+  invented typography.
+* **Styles** — `backend/helper/styles.py` documents Telegram's only three
+  styles and assigns them by intent: green = explicit confirmation, red =
+  explicit cancellation, blue = every other action **and all navigation**.
+  Telethon 1.43.0 exposes exactly `primary`/`success`/`danger`
+  (`KeyboardButtonStyle(bg_primary, bg_success, bg_danger)`), so there is no
+  fourth "secondary" colour to give Home/Close. All five rows are `PRIMARY`,
+  which is what every existing panel does; the actions are distinguished by
+  glyph, wording and position (actions first, navigation last), not by colour
+  the protocol does not have.
+* **Order** — the result text is rendered first through the reporter's own
+  close (so the item's details can never be lost), then the same text is
+  written once more with the actions. Status edits still pass no markup.
+* **Keyboard replacement** — only the Helper Bot's inline edit
+  (`messages.editInlineBotMessage`) may replace a bot keyboard, so the actions
+  are attached only when the live path is `helper-inline`
+  (`ExistingPanelEditor.edit(text, buttons)`). On the self-client fallback the
+  same message keeps the details and the keyboard it found, with no actions —
+  a user account cannot attach a bot keyboard, and inert action labels would
+  be a promise the path cannot keep.
+* **Files** — `backend/bot/handlers/save.py`
+  (`SUCCESS_ACTION_ROWS`, `success_action_rows`, the success branch of
+  `_save_reply_wait_handler`), `backend/helper/panel_edit.py` (optional
+  `buttons`, markup-aware dedupe), `tests/test_save_success_panel.py` (**new**),
+  `tests/test_save_reply_panel_edit.py` (terminal edit now carries the actions),
+  `AGENTS.md` §6.
+* **Tests** — `tests/test_save_success_panel.py`: 23 tests covering order,
+  labels (registry glyph + ASCII, no emoji), styles, every callback dispatched
+  through the real `_handle_panel` / `_handle_navigation` router, the
+  item-by-code target, the save-code-driven Edit action, Home/Close, the single
+  panel (no `send_message`), a refused keyboard attach that must not lose the
+  result, failure paths and the fallback surface.
+* **Not verified live** — that Telegram accepts the inline edit that attaches
+  the new keyboard, and that the identifier is delivered at all, remain
+  unproven without one real click (`[SAVE_UI] reply mode panel edit path=…`).
+
+## 9. Limits left in place deliberately
 
 * `Pending input` still expires after 120 s, so the owner must reply within that
   window; this task did not change pending-input lifetime.
 * Navigating away from a panel mid-save supersedes the save's writes (by
   design); the terminal result is then not rendered, while the save still
   completes and is recorded.
+* The finished panel's actions can only be attached as a keyboard through the
+  Helper Bot's inline identifier. When Telegram did not deliver one, the panel
+  shows the same details but keeps the keyboard it already had and offers no
+  actions, because a user account cannot attach a bot keyboard. Telegram's own
+  three button styles also leave no way to colour navigation apart from an
+  action; the project contract keeps both blue.
 * Private `tg://openmessage` link resolution, provider selection, unrelated
   panels, the database schema and Save by Link are untouched.

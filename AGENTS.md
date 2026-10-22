@@ -307,11 +307,28 @@ source message
   with the Helper Bot as its `via_bot`, so the Helper Bot edits its own panel
   with `messages.editInlineBotMessage` (`edit_message(inline_id, text=…)`) and
   the self client edits the same message through `(chat_id, msg_id)` when no
-  identifier reached the handler or the inline edit was refused. Neither path
-  passes `buttons` (the keyboard is preserved), neither ever sends a message,
-  and a panel that cannot be addressed runs the save without UI rather than
-  adding one. A per-panel generation makes the newest Save operation its only
-  writer, and any click on the panel supersedes a background writer.
+  identifier reached the handler or the inline edit was refused. A status line
+  passes no `buttons` on either path, so the keyboard is preserved; neither
+  ever sends a message, and a panel that cannot be addressed runs the save
+  without UI rather than adding one. A per-panel generation makes the newest
+  Save operation its only writer, and any click on the panel supersedes a
+  background writer.
+  **Finished panel**: a successful Reply Mode save replaces the progress bar
+  with the item's real details (code, type, filename) and, once, the next
+  actions in this order — **Edit this item** (`panel:retrieve_item:id:<code>`,
+  the item's own detail/edit panel resolved by the code that was just issued),
+  **Save another item** (`panel:save:type:d`, the existing Save selection
+  flow), **Show the saved items** (`panel:retrieve_saved`), **Home** and
+  **Close** (`panel:_nav:home` / `panel:_nav:close`). Labels are registry glyphs
+  + plain text (`backend/helper/symbols.py`), never emoji. Every row is
+  `PRIMARY`: Telegram has exactly three styles and `backend/helper/styles.py`
+  reserves green for confirmation and red for cancellation, so navigation is
+  not (and cannot be) coloured apart from an action. The result text is written
+  first (closing the reporter), then the same text is written once more with
+  the actions — so a refused keyboard edit can never lose the result. Only the
+  Helper Bot's inline edit can replace a bot keyboard: on the self-client
+  fallback the panel keeps the details and the keyboard it found, with no
+  actions. A failed save renders its honest error and no actions.
   **Save by Link** has no panel to keep, so it first creates ONE dedicated
   Loading/status message with the SELF client (`_start_status`, in the chat the
   owner typed in) immediately after the link arrives and BEFORE it is parsed or

@@ -136,6 +136,38 @@ async def _save_reply_action(event, extra: str, chat_id: int) -> tuple[str, str,
 
 REPLY_PANEL_TITLE = "Deep Save — Reply Mode"
 
+#: The follow-up actions of ONE finished save, in their fixed order. Each row
+#: opens a surface that already exists: the item's own detail/edit panel by its
+#: save code, the Save source panel (the same selection/reply workflow), the
+#: saved-items list, and the panel's own Home/Close navigation.
+#:
+#: Every row is ``PRIMARY``. Telegram supports exactly three named styles and
+#: the project's contract (``backend/helper/styles.py``) assigns green to
+#: confirmation and red to cancellation, leaving blue for actions AND
+#: navigation — there is deliberately no fourth "secondary" colour to give
+#: Home/Close. The rows are therefore distinguished by their registry glyph,
+#: their label and their position (actions first, navigation last), never by a
+#: colour the protocol does not have.
+SUCCESS_ACTION_ROWS: tuple[tuple[str, str, str], ...] = (
+    (sym.OP_EDIT, "Edit this item", "panel:retrieve_item:id:{code}"),
+    (sym.OP_SAVE, "Save another item", "panel:save:type:d"),
+    (sym.OP_SEARCH, "Show the saved items", "panel:retrieve_saved"),
+    (sym.OP_HOME, "Home", "panel:_nav:home"),
+    (sym.OP_CLOSE, "Close", "panel:_nav:close"),
+)
+
+
+def success_action_rows(save_code: str) -> list:
+    """The finished-save panel's keyboard, bound to ``save_code``."""
+    builder = InlinePanelBuilder()
+    for glyph, text, callback in SUCCESS_ACTION_ROWS:
+        builder.add_row(
+            sym.label(glyph, text),
+            callback.format(code=save_code),
+            PRIMARY,
+        )
+    return builder.build()
+
 
 def _reply_wait_text(metadata=None) -> str:
     """The ONE Reply Mode panel text, with the optional metadata echo."""
@@ -502,8 +534,21 @@ async def _save_reply_wait_handler(
     except Exception as exc:
         result = f"{sym.STATE_FAILED} Deep Save failed: {exc}"
 
+    saved_code = ""
+    if getattr(result, "saved", False):
+        saved_code = str(getattr(result, "save_code", "") or "")
+
     if reporter is not None:
+        # The result text lands first and closes the reporter, so the item's real
+        # details can never be lost to a failed keyboard edit and a late byte
+        # callback can no longer overwrite them.
         await reporter.close(result)
+        if saved_code and editor.path == "helper-inline":
+            # The next actions belong to THIS panel, and only the Helper Bot's
+            # inline edit can replace a bot keyboard — the same message, same
+            # text, new rows. Any other path keeps the keyboard it found rather
+            # than pretending a user account could attach one.
+            await editor(result, success_action_rows(saved_code))
 
     # The panel keeps its terminal state; releasing the token lets the next
     # Save on this panel become its writer without waiting for a timeout.
