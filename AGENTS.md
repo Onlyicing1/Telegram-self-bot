@@ -296,16 +296,22 @@ source message
   `progress` observer (`SaveProgressEvent`, real Telethon byte counts). Both
   Glass inputs bind
   `backend/helper/save_progress.py::SaveProgressReporter` to ONE existing-to-the-
-  owner message and edit it in place through the standard panel render path
-  (`edit_message(chat, msg_id, text)` — never the text in the `message`
-  parameter); no update is ever a new message. **Reply Mode** reuses the panel it
-  armed: `_panel_coords` captures its exact chat id + message id when the action
-  fires, they ride the pending input, and the same message shows target
-  resolution, every milestone and the terminal result (`_panel_editor`). The
-  panel is always sent by the owner's own account — an inline panel result is
-  sent by the requesting client — so the self client is the only editor, and a
-  missing panel coordinate runs the save without UI rather than adding a
-  message.
+  owner message and edit it in place; no update is ever a new message. **Reply
+  Mode** reuses the panel it armed: `_panel_coords` captures its exact chat id +
+  message id, `inline_engine`/the callback carries Telegram's inline-message
+  identifier when the click was an inline one, both ride the pending input, and
+  the same message shows target resolution, every milestone and the terminal
+  result. Editing goes through
+  `backend/helper/panel_edit.py::ExistingPanelEditor`: the panel was sent by the
+  owner's own account (an inline panel result is sent by the requesting client)
+  with the Helper Bot as its `via_bot`, so the Helper Bot edits its own panel
+  with `messages.editInlineBotMessage` (`edit_message(inline_id, text=…)`) and
+  the self client edits the same message through `(chat_id, msg_id)` when no
+  identifier reached the handler or the inline edit was refused. Neither path
+  passes `buttons` (the keyboard is preserved), neither ever sends a message,
+  and a panel that cannot be addressed runs the save without UI rather than
+  adding one. A per-panel generation makes the newest Save operation its only
+  writer, and any click on the panel supersedes a background writer.
   **Save by Link** has no panel to keep, so it first creates ONE dedicated
   Loading/status message with the SELF client (`_start_status`, in the chat the
   owner typed in) immediately after the link arrives and BEFORE it is parsed or

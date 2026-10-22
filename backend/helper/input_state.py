@@ -34,12 +34,18 @@ def set_pending(
     inline_msg_id: int = 0,
     extra: str = "",
     timeout: float | None = 60.0,
+    inline_id: Any = None,
 ) -> None:
     """Set a pending input request for the owner. Replaces any previous pending input.
 
     ``timeout`` bounds the handler execution once the owner's reply arrives.
     Pass ``None`` for operations that may legitimately run long (e.g. Deep Save
     media transfer). The separate 120 s pending-state expiry is unaffected.
+
+    ``inline_id`` is the panel's inline-message identifier as Telegram handed it
+    to the Helper Bot at click time (an ``InputBotInlineMessageID``/``…64``).
+    It is the only handle that can edit the panel after the callback is gone, so
+    it travels with the pending entry — a chat/message pair cannot reproduce it.
     """
     _pending[owner_id] = {
         "panel_id": panel_id,
@@ -48,6 +54,7 @@ def set_pending(
         "prompt": prompt,
         "inline_chat_id": inline_chat_id,
         "inline_msg_id": inline_msg_id,
+        "inline_id": inline_id,
         "extra": extra,
         "timeout": timeout,
         "created_at": time.monotonic(),

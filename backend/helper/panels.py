@@ -418,6 +418,18 @@ def register_callback_handlers(client, owner_id: int) -> None:
         chat_id = real_chat_id
         msg_id = real_msg_id
 
+        # A click on a panel a background flow is still editing (Deep Save
+        # progress) makes this click its owner: the older flow must stop
+        # writing instead of overwriting the state this click produces. A
+        # no-op for every panel without a background operation.
+        from backend.helper.panel_edit import supersede_panel_operation
+
+        if supersede_panel_operation(chat_id, msg_id):
+            logger.info(
+                "[CALLBACK] superseded a background panel writer (chat=%s msg=%s)",
+                chat_id, msg_id,
+            )
+
         if debug:
             logger.info("[CALLBACK] DISPATCH: data='%s' session_id=%s chat_id=%s msg_id=%s", data, session.session_id, chat_id, msg_id)
 
@@ -598,10 +610,16 @@ async def _handle_input(event, remainder: str, owner_id: int, chat_id: int, msg_
         logger.warning("[CALLBACK] _handle_input: config has no handler")
         return
 
+    # The inline identifier this click carried is the only handle that can
+    # still edit the panel once the input arrives, so it travels with the
+    # pending entry (empty for an ordinary message click).
+    from backend.helper.panel_edit import inline_message_id_from_event
+
     clear_pending(owner_id)
     set_pending(
         owner_id, panel_id, handler, chat_id or 0, prompt,
         inline_chat_id=chat_id or 0, inline_msg_id=msg_id or 0,
+        inline_id=inline_message_id_from_event(event),
         extra=extra,
     )
 

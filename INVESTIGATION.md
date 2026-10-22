@@ -49,6 +49,24 @@ So: the Helper Bot is the *only* account that can use `messages.editInlineBotMes
 
 **Practical consequence:** the behaviour that already ships — Reply Mode driving progress through the **self client** on the panel it armed — is the supported path *today*. A Helper-Bot editor is a possible refinement, not a requirement, and must not be assumed to work before the live check in §9.
 
+### Implementation status (2026-10-22)
+
+A later change (reported in `IMPLEMENTATION_REPORT.md`) implemented the capture
+step this investigation identified as missing: the identifier is read from
+`event.query.msg_id` only when it is an `InputBotInlineMessageID`/`…64`, carried
+through the pending input, and used by
+`backend/helper/panel_edit.py::ExistingPanelEditor`; the self-client edit of the
+same message remains the fallback when no identifier reached the handler. That
+change also stops the panel's auto-close countdown while Reply Mode owns the
+panel (C11's consequence), and supersedes a background writer on any later
+click.
+
+What that change did **not** do is resolve U1. Source and automated tests prove
+the capture, the propagation and the request the pinned client builds; they
+cannot prove that Telegram supplies the identifier for these panels or accepts
+the deferred edit. §9 remains the gating check, and no live Telegram request was
+made by either round.
+
 ---
 
 ## 2. Current Save Reply Mode Behavior

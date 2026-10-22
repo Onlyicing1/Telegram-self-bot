@@ -106,8 +106,13 @@ def register_input_listener(self_client, owner_id: int) -> None:
         # that do not declare the parameter are called exactly as before.
         handler_kwargs: dict = {}
         try:
-            if "extra" in inspect.signature(handler).parameters:
+            parameters = inspect.signature(handler).parameters
+            if "extra" in parameters:
                 handler_kwargs["extra"] = pending_entry.get("extra", "")
+            # The panel's inline identifier is the only handle that can edit it
+            # after this callback is gone; handlers that can use it declare it.
+            if "inline_id" in parameters:
+                handler_kwargs["inline_id"] = pending_entry.get("inline_id")
         except (TypeError, ValueError):
             pass
         try:

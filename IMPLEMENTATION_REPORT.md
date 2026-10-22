@@ -1,196 +1,239 @@
-# IMPLEMENTATION_REPORT.md — Save: Reply Mode edits its existing panel in place
+# IMPLEMENTATION_REPORT.md — Save Reply Mode drives the existing Helper inline panel
 
 > This file describes ONLY the current state of the repository for this task and
 > **replaces every previous report in full**. Album-as-one-item, the save
-> pipeline, retrieval/preview/deletion, and Save by Link are unchanged and still
-> hold. Older reports remain readable in git history.
+> pipeline, retrieval/preview/deletion, Save by Link and the AI Save tools are
+> unchanged and still hold. Older reports remain readable in Git history.
 
 | Item | Value |
 |---|---|
-| Stage | UX-contract correction for Deep Save → Reply Mode (one defect only) |
+| Stage | Reply Mode presentation: the existing panel is the loading/progress/result surface, edited by the Helper Bot when Telegram gives it the handle |
 | Date | 2026-10-22 |
 | Project / remote | LifeOS Telegram self-bot, `Onlyicing1/Telegram-self-bot` (`origin`) |
-| Base commit | `dc974939a312d7abd80d5f80cde83098c16a5ab3` (`fix(save): create the progress status message and resolve private tg:// links`) |
+| Base commit | `f4708f7118f9d965b166d5a56f85cfa9adb7053e` (`docs: record helper inline panel edit investigation`) |
+| Investigation | `INVESTIGATION.md` (verdict **UNRESOLVED**: the library path is confirmed, the Telegram-side identifier delivery is not) |
 | Delivery | One commit, fast-forward to `origin/main` (SHA + remote equality reported in the delivery message) |
 | Live Telegram / Supabase / Render | **NOT touched.** No session, no RPC, no SQL, no migration, no schema change, no `.env`, no credentials, no deployment, no Render shell |
-| Document NOT modified | `DATABASE_ARCHITECTURE.md` (read only) |
-| Interpreter used for verification | CPython 3.12.3 venv with `backend/requirements.txt` (**pinned Telethon 1.43.0**) + `pytest` + `pytest-asyncio` |
+| Documents not modified | `DATABASE_ARCHITECTURE.md` (read only), `README.md` |
+| Interpreter used for verification | CPython 3.12 venv with `backend/requirements.txt` (**pinned Telethon 1.43.0**) + `pytest` + `pytest-asyncio` |
 
 ---
 
-## 1. Root cause
+## 1. What was missing
 
-The previous round deliberately replaced the panel-bound progress with a
-**dedicated status message**. In `_save_reply_wait_handler` the flow was:
+`INVESTIGATION.md` established that Reply Mode already edited its panel in
+place, but only ever through the **self client**, and that the repository threw
+away the one handle a Helper Bot needs for that same message:
 
-```python
-reporter = await _start_status(client, chat_id, title="Deep Save", body="Resolving the target message…")
-```
+* `trigger()` returned `""` for the inline identifier because it read
+  `Message.inline_message_id`, an attribute pinned Telethon 1.43.0 does not have
+  (`backend/helper/inline_engine.py:265`);
+* the pending Reply Mode entry carried only `inline_chat_id` / `inline_msg_id`
+  integers (`backend/helper/input_state.py`), and
+* `Session.inline_message_id` was permanently `""`, so the session's inline
+  index was dead too.
 
-`_start_status` calls `self_client.send_message(chat_id, …)` and returns a
-reporter bound to that **new** message. So on every Reply Mode save the owner
-was left with:
-
-* the panel showing `Deep Save — Reply Mode / Waiting for your reply...`
-  forever, and
-* a **second** message in the chat carrying the resolution line, the progress
-  bar and the result.
-
-That is exactly the opposite of the required UX: Reply Mode's panel *is* the
-one object the owner is already looking at, so it must be the surface that
-changes. The previous tests encoded the wrong contract (`"the panel that
-launched the flow is never the progress surface"`, `send_message_calls == 1`),
-which is why they were green while the live behaviour was wrong.
-
-Nothing else was broken: target resolution, media handling, the album pipeline
-and the transfer callbacks were already correct.
+The Helper Bot is the account Telegram lets edit a message that was sent after
+a user picked its inline result (`messages.editInlineBotMessage`), and it is the
+presentation owner of these panels. Nothing captured that identifier, so it
+could never present the save.
 
 ## 2. Behavior now
 
-1. `Deep Save` → `Reply Mode` renders the existing panel:
-   `Deep Save — Reply Mode` / `Waiting for your reply...` /
-   `Reply to any message to save it (download → re-upload).`
-2. When the owner replies to a target message, **that same message** is edited
-   to `Resolving the target message…` *before* the reply/target lookup runs.
-3. The existing `SaveProgressReporter` then edits the same message for every
-   real download/upload milestone (shared five-segment bar, `50/100` at or below
-   10 MiB, `20/40/60/80/100` above it, per phase and per album member with
-   `File i/N`, no invented percentage for an unknown size).
-4. The terminal success, refusal or failure **replaces the text in that same
-   message**. `reporter.close()` marks the reporter terminal before rendering,
-   so a late byte callback cannot overwrite the result.
-5. Reply Mode **never sends a message**: `_start_status` / `send_message` are
-   gone from this path, and there is no replacement-message fallback.
-6. The trigger reply message is still deleted after processing, exactly as
-   before.
+1. `Menu` → `Save` → `Deep Save` → `Reply Mode` renders the existing panel:
+   `Deep Save — Reply Mode` / `Waiting for your reply...`.
+2. Arming Reply Mode captures Telegram's inline-message identifier (when the
+   click carried one), claims the panel for this operation, and stops the
+   panel's auto-close countdown so the panel can serve as the workflow surface.
+3. The owner replies to the target. The self-bot resolves the target and runs
+   `execute_save` exactly as before — it remains the only executor.
+4. **The same panel message** is edited to `Resolving the target message…`
+   before the reply/target lookup, then for every real download/upload
+   milestone, then to the terminal success/refusal/failure text.
+5. The owner's reply message is deleted after the terminal result, exactly as
+   before; the target is never deleted.
+6. **No progress or result message is ever sent** on this path. If the panel
+   cannot be addressed at all, the save runs with no UI rather than producing a
+   substitute message.
 
 Save by Link is untouched: it still creates its one dedicated status message
-with the self client immediately after the link arrives (`_start_status`).
+with the self client (`_start_status`).
 
 ## 3. Implementation
 
+### New: `backend/helper/panel_edit.py`
+
+One narrow module for "edit the existing panel from a background flow":
+
+* `inline_message_id_from_event(event)` — returns `event.query.msg_id` only when
+  it is an `InputBotInlineMessageID` / `InputBotInlineMessageID64`, i.e. only
+  for an inline-flavoured callback. It never derives an identifier from
+  chat/message ids, because Telegram offers no lookup that could produce one.
+* `ExistingPanelEditor` — the edit callable the reporter binds to:
+  * **Helper path** (`inline_id` + helper client):
+    `helper.edit_message(inline_id, text=rendered)` → Telethon's
+    `messages.editInlineBotMessage`. No CallbackQuery is involved, so it works
+    after the original callback has returned.
+  * **Self path** (`chat_id` + `msg_id` + self client):
+    `self_client.edit_message(chat_id, msg_id, rendered)` → `messages.editMessage`
+    on the same message, by the account that sent it.
+  * The inline path is tried first; one refusal (invalid/deleted identifier,
+    permission error) marks it unusable and the remaining updates go through the
+    panel's own coordinates — still the same message, still no send.
+  * **The keyboard is never touched.** `buttons` is never passed, so MTProto
+    leaves the existing `reply_markup` in place. Passing `buttons=[]` would send
+    a `ReplyKeyboardMarkup(rows=[])` (verified against the pinned client) — the
+    wrong markup type — so the editor deliberately does not.
+  * Identical renders are skipped, `not modified` counts as success, every other
+    failure is logged and swallowed (progress never aborts a save).
+* Per-panel **generation tokens**: `begin_panel_operation`,
+  `panel_operation_is_current`, `finish_panel_operation`,
+  `supersede_panel_operation`. The newest Save on a panel is its only writer.
+
 ### `backend/bot/handlers/save.py`
 
-* **`_panel_coords(event, chat_id)`** — the exact `(chat_id, message_id)` of the
-  panel. `resolve_callback_message` answers directly for a normal panel; an
-  inline panel carries only `inline_message_id`, so the lifecycle session that
-  sent it supplies the real pair the router itself edits. `(chat_id, 0)` when
-  no message id can be established.
-* **`_save_reply_action`** stores those coordinates in the pending entry
-  (`inline_chat_id`, `inline_msg_id`) — the same pair the handler receives — so
-  the arming step, the processing status, every milestone and the result all
-  address one message.
-* **`REPLY_PANEL_TITLE` + `_reply_wait_text(metadata=None)`** — one source for
-  the panel text, shared by the plain action and the `Name & tags` step (the
-  metadata echo no longer duplicates the string).
-* **`_panel_editor(self_client, chat_id, msg_id)`** — returns `None` when there
-  is no client or no panel coordinate, otherwise the existing
-  `_status_editor` for that message (dedupe of identical renders, `not modified`
-  treated as success, every other failure logged and swallowed, Telethon's
-  documented `edit_message(entity, message_id, text)` shape). It never sends
-  anything. The panel is the message the **owner's own account** sent — an
-  inline panel result is sent by the requesting client, and the fallback panel
-  the same way — so the self client is the only authority that can edit it.
-* **`_save_reply_wait_handler`** builds that editor, renders
-  `Resolving the target message…` immediately, binds
-  `SaveProgressReporter(editor, title=REPLY_PANEL_TITLE)`, passes
-  `reporter.handle` into `execute_save`, and finishes with
-  `reporter.close(result)`. With no panel it logs `[SAVE_UI]` and runs the save
-  without UI instead of inventing a message.
-* Module docstring, `_start_status` and `_edit_status` docstrings now state the
-  split: Reply Mode = existing panel, Save by Link = dedicated status message.
+* `_save_reply_action` captures `inline_message_id_from_event(event)`, claims
+  the panel, stops its countdown (`_keep_panel_as_progress_surface`) and stores
+  `inline_id` alongside `inline_chat_id` / `inline_msg_id` in the pending entry.
+* `_save_metadata_input_handler` (the optional `Name & tags` step) forwards the
+  identifier it received and stops the timer before arming Reply Mode.
+* `_reply_handler_with_metadata` forwards `inline_id` to the wait handler.
+* `_save_reply_wait_handler` starts a new operation generation, builds
+  `ExistingPanelEditor` (helper = `get_client()`), writes the loading line,
+  binds `SaveProgressReporter(editor, …)`, renders the terminal result, releases
+  the generation, then deletes the reply.
+* `_panel_editor` is gone (superseded by the editor); `_status_editor` remains
+  for Save by Link only, with its docstring corrected.
 
-### Unchanged on purpose
+### `backend/helper/input_state.py`
 
-`backend/services/save_service.py` (not touched at all), the Deep Save pipeline,
-album-as-one-item (one grouped `send_file`, one save code, one `saved_items`
-row, anchor + `grouped_id`), retrieval/preview/deletion of album codes,
-view-once/expiry refusal, the progress renderer and cadence, the AI
-`SaveTool`/`SaveByLinkTool` behavior, Save by Link's status-message contract,
-`DATABASE_ARCHITECTURE.md`, and everything outside Save.
+`set_pending(..., inline_id=None)` and a matching entry field — the identifier
+travels with the pending input exactly like `extra`, so it survives the 120 s
+window in the same structure that already carries the panel coordinates.
 
-### `AGENTS.md`
+### `backend/helper/inline_sender.py`
 
-§6 "Transfer progress" now documents the two surfaces precisely: Reply Mode
-edits the panel it armed (coordinates captured at arming, one message for
-resolution + milestones + result), Save by Link creates its one status message;
-a missing panel coordinate runs the save without UI.
+The input listener passes `inline_id=` only to handlers that declare it (the
+same `inspect.signature` mechanism already used for `extra`), so every other
+input handler is called exactly as before.
+
+### `backend/helper/panels.py`
+
+* `_handle_input` stores the identifier carried by the click that opened the
+  input, so a Reply Mode armed through the `Name & tags` step keeps it.
+* `_callback_router` calls `supersede_panel_operation(chat_id, msg_id)` before
+  dispatch: a click on a panel a background flow is still editing becomes the
+  panel's new owner, and the older flow stops writing instead of overwriting it.
+  It is a no-op for every panel without a background operation.
+
+### Ownership boundary (unchanged)
+
+| Responsibility | Owner |
+|---|---|
+| Panel presentation (loading / progress / terminal text) | Helper Bot, via its inline identifier |
+| Panel edit fallback when no identifier reached the handler | self client, same message, its own `(chat_id, msg_id)` |
+| Target resolution, `execute_save`, persistence, media, reply deletion | self-bot only (`save_service`, unchanged) |
+
+No second executor, scheduler, update loop or Save implementation was added.
+`ToolExecutor` and the service layer are untouched.
 
 ## 4. Changed files
 
 | File | Change |
 |---|---|
-| `backend/bot/handlers/save.py` | `_panel_coords`, `_panel_editor`, `_reply_wait_text`, `REPLY_PANEL_TITLE`; Reply Mode edits the armed panel instead of creating a status message; docstrings |
-| `tests/test_save_live_status_and_private_link.py` | Reply Mode expectations rewritten (no message, panel edited, coordinates carried end to end); 7 new/updated regressions; Save-by-Link authority tests retargeted |
-| `tests/test_save_album_view_once_progress.py` | Reply Mode progress test rewritten to the panel contract (no `send_message`) |
-| `AGENTS.md` | §6 save-progress contract |
+| `backend/helper/panel_edit.py` | **new** — identifier extraction, `ExistingPanelEditor`, per-panel generations |
+| `backend/bot/handlers/save.py` | capture + carry the identifier, use the editor, stop the countdown at arming, drop `_panel_editor`, docstrings |
+| `backend/helper/input_state.py` | `inline_id` field on the pending entry |
+| `backend/helper/inline_sender.py` | pass `inline_id` to handlers that declare it |
+| `backend/helper/panels.py` | carry the identifier from an input click; supersede a background writer on any click |
+| `tests/test_save_reply_panel_edit.py` | **new** — 24 focused tests |
+| `AGENTS.md` | §6 transfer-progress contract (no longer "self client is the only editor") |
 | `IMPLEMENTATION_REPORT.md` | this report |
 
 ## 5. Tests
 
-**Reply Mode lifecycle — `tests/test_save_live_status_and_private_link.py` (23 tests)**
+New file `tests/test_save_reply_panel_edit.py`, **24 tests**:
 
-| Test | Proves |
+| Area | Tests |
 |---|---|
-| `test_reply_mode_edits_the_existing_panel_before_target_lookup` | zero `send_message` calls; the panel is edited **before** the first `get_messages`; every applied edit is `(PANEL_CHAT, PANEL_MSG)`; first edit is the resolution line; terminal edit is the success result; one row |
-| `test_panel_coordinates_travel_from_arming_to_the_terminal_result` | the whole contract from `_save_reply_action` → pending entry → the listener's pop-then-call → handler → panel; coordinates identical at every step |
-| `test_an_inline_panel_resolves_its_message_through_the_session` | an `inline_message_id`-only callback yields the session's real `(chat_id, msg_id)` |
-| `test_reply_mode_failure_result_lands_on_the_same_panel` | a gone target renders `no longer exists` on the panel, no new message, no row |
-| `test_a_late_transfer_callback_cannot_overwrite_the_reply_panel_result` | after `close(result)`, a `finished` event produces no further edit and the terminal text is unchanged |
-| `test_reply_mode_without_panel_coordinates_never_creates_a_message` | missing coordinates → save succeeds, zero messages, zero edits |
-| `test_reply_mode_panel_is_edited_by_the_self_client_only` | a helper bot that raises on any send/edit is never reached |
-| `test_link_mode_creates_the_status_message_before_parsing_the_link` | Save by Link contract unchanged (one message before the transfer) |
-| `test_link_status_message_never_uses_the_helper_bot`, `test_link_status_creation_failure_still_saves_and_reports_on_the_panel` | Save by Link keeps its self-client status message, with the panel as the fallback surface |
-| `test_production_edit_and_send_shapes_match_real_telethon` | `inspect.signature(TelegramClient.edit_message).bind(entity, msg_id, text)` is valid; the old `message=text` shape raises `TypeError` |
-| the 12 private-`tg://` / album / signature tests | unchanged, still green (regression guard for the next task) |
+| Identifier capture | read from a REAL `UpdateInlineBotCallbackQuery` event; absent for a `UpdateBotCallbackQuery`; carried by arming; absent when there is none; listener passes it only to handlers that declare it (5) |
+| Panel is the surface | helper performs every edit on that exact identifier; loading → progress → terminal on one message; failure result on the same panel; not-a-reply on the same panel; no `send_message` at all; reply deleted once, target not deleted (6) |
+| Fallbacks | refused inline edit falls back to the panel's coordinates after ONE attempt; no identifier → the sending account edits it; no addressable panel → save runs without UI; `not modified` is success; an editor with no target is unavailable (5) |
+| Staleness / concurrency | stale generation cannot write; a newer arming supersedes an in-flight save; a click supersedes the background writer; the router invokes that supersede; a click mid-transfer stops stale writes; terminal generation is released (6) |
+| Lifecycle | arming stops the panel's auto-close timer; expired pending input never starts a save (2) |
 
-**Reply Mode progress — `tests/test_save_album_view_once_progress.py` (55 tests)**
+The fakes implement pinned Telethon 1.43.0's argument shapes
+(`edit_message(entity, message=None, text=None, *, buttons=None)`), and the
+callback events are **real Telethon event objects** built from real update
+TLObjects — but none of this proves Telegram accepts the requests (§6).
 
-`test_reply_mode_edits_the_existing_panel_and_sends_no_message` replaces the old
-"creates one status message" test: no send, every edit on
-`(PANEL_CHAT, PANEL_MSG)`, resolution line first, `Downloading 50/100%` and
-`Uploading 50/100%`, the shared `render_progress_bar(0.5)` glyphs, success
-result last, real `download_media`/`upload_file`/`send_file` progress callbacks
-attached. Album `File i/N` per-member progress, edit-failure containment,
-unknown size and the request-level one-album test are unchanged.
+**Measured results (this workspace, pinned Telethon 1.43.0, CPython 3.12)**
 
-**Measured results (this workspace, pinned Telethon 1.43.0)**
-
-| Run | Result |
+| Command | Result |
 |---|---|
-| `tests/test_save_live_status_and_private_link.py` | **23 passed** |
-| `tests/test_save_album_view_once_progress.py` | **55 passed** |
-| `tests/test_save_v2_wiring.py` + `tests/test_12_save_engine.py` | **44 + 25 passed** |
-| Full suite `python -m pytest tests -q --deselect tests/test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once` | **6630 passed, 27 skipped, 1 deselected** in 130.4 s |
+| `python -m pytest tests/test_save_reply_panel_edit.py -q` | **24 passed** in 0.92 s |
+| `python -m pytest tests/test_save_live_status_and_private_link.py tests/test_save_album_view_once_progress.py tests/test_save_v2_wiring.py tests/test_save_v2_metadata.py tests/test_save_v2_resolution.py tests/test_helper_callback_receipt.py tests/test_12_save_engine.py tests/test_save_reply_panel_edit.py -q` | **260 passed** in 1.84 s |
+| `python -m pytest tests -q` (full suite) | **6654 passed, 1 failed, 27 skipped** in 131 s |
 | `python -m py_compile` on every changed Python file | exit 0 |
 | `git diff --check` | clean |
 
-The one deselected test
-(`test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`)
-still fails on unmodified code with its pre-existing date-bound reason —
-`Task 1 was not scheduled: interval advancement exceeded bound` — and is
-untouched by this change.
+The single failure is
+`tests/test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`
+(`Task 1 was not scheduled: interval advancement exceeded bound`). It is
+**pre-existing**: the same test fails on a pristine export of the base commit
+(`git archive HEAD` into a clean directory, without these changes), and it is
+unrelated to Save or panels.
 
-## 6. Not verified against a real Telegram account
+## 6. Not verified against Telegram
 
-Offline verification proves call shapes, ordering, byte-callback wiring, the
-coordinate path and every failure branch. It cannot prove Telegram's
-behaviour:
+Automated tests prove application behaviour only. **No live Telegram request was
+made and no session or credential was used**, so the following are explicitly
+**not verified**:
 
-* the panel visibly changing in place on the owner's account (no session or
-  credentials exist here), including that Telegram accepts repeated edits of a
-  message that was a single inline instance;
-* real download/upload progress callbacks (wired and asserted through the
-  production `execute_save` path, fed by the fake client's byte counts);
-* the album's grouped rendering and its retrieval/deletion on a live account;
-* observable behaviour if the Glass panel auto-closes mid-transfer — the edit
-  then fails, is logged, and the save still completes (by design), but this was
-  not exercised against Telegram.
+* that Telegram delivers the panel click to the Helper Bot as
+  `UpdateInlineBotCallbackQuery` carrying an `InputBotInlineMessageID` — this is
+  `UNKNOWN` (U1) in `INVESTIGATION.md` and decides whether the Helper Bot is the
+  account that performs the edits;
+* that Telegram accepts `messages.editInlineBotMessage` from the Helper Bot
+  minutes later, on a panel in a chat the bot may not be a member of;
+* that a real account shows the panel changing in place with its keyboard
+  intact and still clickable;
+* real download/upload byte callbacks through the live MTProto stack (the
+  production `execute_save` path is exercised, fed by a fake client's counts);
+* the actual error Telegram returns when the panel was deleted or the
+  identifier is stale (the code handles any exception, but the code/class is
+  unobserved).
 
-## 7. Intentionally deferred
+What the implementation guarantees regardless of that unknown: the panel is the
+only surface, it is edited in place, no extra message is created, and the save
+runs correctly with or without a usable identifier.
 
-* Private `tg://openmessage` link resolution: **not investigated, not changed,
-  not re-verified** in this task. Its code, tests and behavior are exactly as
-  committed in `dc97493`. A live private-link save remains the next separate
-  task.
-* Save by Link's status-message contract is preserved as-is.
+## 7. Required manual verification
+
+With the real bot (not from this clone):
+
+1. `Menu` → `Save` → `Deep Save` → `Reply Mode`; confirm the panel asks for a
+   reply and that log line `[SAVE_UI] reply mode panel edit path=…` reports
+   `helper-inline` (identifier captured) or `self-chat` (not captured).
+2. Reply to a media message; confirm **the panel itself** first shows
+   `Resolving the target message…`, then the progress bar, then the terminal
+   result — and that the chat contains **no second status message**.
+3. Confirm the panel's buttons are still present and still work after the
+   terminal edit, and that clicking one mid-save stops further progress edits
+   instead of flickering.
+4. Confirm the replied message is gone afterwards and the target still exists
+   (and is in Saved Messages).
+5. Repeat with a save that runs longer than the old 120 s auto-close delay, to
+   confirm the panel is no longer closed or deleted mid-transfer.
+6. If step 1 reported `self-chat`, the Helper-Bot path is unavailable for these
+   panels: record it and close U1 as unsupported; the shipped UX is unaffected.
+
+## 8. Limits left in place deliberately
+
+* `Pending input` still expires after 120 s, so the owner must reply within that
+  window; this task did not change pending-input lifetime.
+* Navigating away from a panel mid-save supersedes the save's writes (by
+  design); the terminal result is then not rendered, while the save still
+  completes and is recorded.
+* Private `tg://openmessage` link resolution, provider selection, unrelated
+  panels, the database schema and Save by Link are untouched.

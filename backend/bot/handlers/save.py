@@ -20,9 +20,12 @@ and neither input mode adds one:
 
 * Reply Mode owns the panel itself. The ``Waiting for your reply...`` panel is
   replaced — in that same message — by target resolution, every transfer
-  milestone and the terminal result. The panel coordinates captured when Reply
-  Mode was armed travel through the pending input and are used for every edit,
-  so one save never adds a second message to the chat.
+  milestone and the terminal result. What travels through the pending input is
+  the panel's chat/message pair AND, when Telegram supplied it at click time,
+  the inline-message identifier: the Helper Bot edits its own inline panel with
+  that identifier, and the self client edits the same message through its
+  coordinates when no identifier reached the handler. One save never adds a
+  second message to the chat.
 * Save by Link has no panel to keep, so the SELF client sends ONE dedicated
   Loading/status message right after the link arrives (before it is parsed or
   resolved), and every update edits that message.
@@ -92,6 +95,10 @@ async def _save_inline_builder(event, extra: str) -> list:
 async def _save_reply_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     from backend.helper.inline_engine import _owner_id
     from backend.helper.input_state import set_pending
+    from backend.helper.panel_edit import (
+        begin_panel_operation,
+        inline_message_id_from_event,
+    )
 
     owner_id = _owner_id
 
@@ -103,6 +110,15 @@ async def _save_reply_action(event, extra: str, chat_id: int) -> tuple[str, str,
     # Reply Mode never adds a message to the chat.
     panel_chat, panel_msg_id = _panel_coords(event, chat_id)
 
+    # Telegram's inline identifier is the ONLY handle that can still edit this
+    # panel once the callback returns, so it rides the pending entry with the
+    # coordinates. Arming also claims the panel, so a Save armed earlier can no
+    # longer write over the state this click just produced.
+    inline_id = inline_message_id_from_event(event)
+    if panel_msg_id:
+        begin_panel_operation(panel_chat or chat_id, panel_msg_id)
+        _keep_panel_as_progress_surface(panel_chat or chat_id, panel_msg_id)
+
     wait_text = _reply_wait_text()
 
     set_pending(
@@ -110,6 +126,7 @@ async def _save_reply_action(event, extra: str, chat_id: int) -> tuple[str, str,
         chat_id, wait_text,
         inline_chat_id=panel_chat or chat_id,
         inline_msg_id=panel_msg_id,
+        inline_id=inline_id,
         extra="",
         timeout=None,
     )
@@ -128,6 +145,25 @@ def _reply_wait_text(metadata=None) -> str:
     lines.append("Waiting for your reply...")
     lines.append("Reply to any message to save it (download → re-upload).")
     return "\n".join(lines)
+
+
+def _keep_panel_as_progress_surface(chat_id: int, msg_id: int) -> None:
+    """Stop the panel's auto-close countdown while it is a workflow surface.
+
+    Reply Mode turns the panel into this save's loading/progress/result surface,
+    and the panel timer edits that same message every 30 s and deletes it when
+    it expires — it would overwrite every milestone and then destroy the panel
+    mid-transfer. The panel stays closable through its own Close button, and the
+    pending input keeps its own 120 s expiry, so nothing becomes immortal here.
+    """
+    if not chat_id or not msg_id:
+        return
+    try:
+        from backend.helper.lifecycle import get_lifecycle
+
+        get_lifecycle().timers.stop(chat_id, msg_id)
+    except Exception:
+        pass
 
 
 def _panel_coords(event, chat_id: int) -> tuple[int, int]:
@@ -220,9 +256,12 @@ def _reply_handler_with_metadata(metadata):
     popped state back inside the handler would not work: the input listener
     clears the entry before it calls the handler.
     """
-    async def _handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
+    async def _handler(
+        text, chat_id, msg_id, inline_chat_id, inline_msg_id, *, inline_id=None
+    ):
         await _save_reply_wait_handler(
-            text, chat_id, msg_id, inline_chat_id, inline_msg_id, metadata=metadata
+            text, chat_id, msg_id, inline_chat_id, inline_msg_id,
+            metadata=metadata, inline_id=inline_id,
         )
 
     return _handler
@@ -241,7 +280,9 @@ async def _deep_save_panel_with_notice(notice: str) -> tuple[str, list]:
     return render_edit("", f"{notice}\n\n{body}", raw_buttons)
 
 
-async def _save_metadata_input_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
+async def _save_metadata_input_handler(
+    text, chat_id, msg_id, inline_chat_id, inline_msg_id, *, inline_id=None
+):
     """Collect the optional name/tags line, then arm Reply Mode with it."""
     from backend.helper.inline_engine import _self_client, _owner_id
     from backend.helper.input_state import clear_pending, set_pending
@@ -256,11 +297,15 @@ async def _save_metadata_input_handler(text, chat_id, msg_id, inline_chat_id, in
         result, buttons = await _deep_save_panel_with_notice(f"{sym.STATE_WARNING} {exc}")
     else:
         wait_text = _reply_wait_text(metadata)
+        panel_chat = inline_chat_id or chat_id
+        panel_msg = inline_msg_id or msg_id
+        _keep_panel_as_progress_surface(panel_chat, panel_msg)
         set_pending(
             owner_id, "save_reply", _reply_handler_with_metadata(metadata),
             chat_id, wait_text,
-            inline_chat_id=inline_chat_id or chat_id,
-            inline_msg_id=inline_msg_id or msg_id,
+            inline_chat_id=panel_chat,
+            inline_msg_id=panel_msg,
+            inline_id=inline_id,
             timeout=None,
         )
         result, buttons = wait_text, []
@@ -282,10 +327,11 @@ async def _save_metadata_input_handler(text, chat_id, msg_id, inline_chat_id, in
 def _status_editor(self_client, chat_id, msg_id):
     """An edit callable for ONE message, deduped and failure-contained.
 
-    Used for the Save-by-Link status message and for the Reply Mode panel: both
-    are sent by the OWNER'S account (an inline panel result is sent by the
-    requesting client, so the helper bot never owns it), and both are edited
-    through this one callable.
+    Used for the Save-by-Link status message, which the SELF client sends and
+    therefore edits. Reply Mode does not come here: its panel is edited by
+    ``backend.helper.panel_edit.ExistingPanelEditor``, which uses the Helper
+    Bot's inline identifier when Telegram gave it one and this same
+    chat/message path otherwise.
 
     ``edit_message`` is called with Telethon's documented signature
     (``entity, message_id, text``) — passing the text as ``message`` bound it to
@@ -320,20 +366,6 @@ def _status_editor(self_client, chat_id, msg_id):
     return _edit
 
 
-def _panel_editor(self_client, chat_id, msg_id):
-    """An edit callable for the panel Reply Mode already shows, or ``None``.
-
-    The panel is the message the owner's own account already sent (an inline
-    panel result is sent by the requesting client, and the fallback panel is
-    sent the same way), so the self client is the one authority that may edit
-    it. ``None`` when there is no client or no panel coordinate: the save then
-    runs without UI — a missing panel is never replaced by a second message.
-    """
-    if self_client is None or not chat_id or not msg_id:
-        return None
-    return _status_editor(self_client, chat_id, msg_id)
-
-
 async def _start_status(
     self_client, chat_id: int, *, title: str, body: str
 ) -> "SaveProgressReporter | None":
@@ -348,7 +380,7 @@ async def _start_status(
     ``None`` when there is no client, no chat, or Telegram refused to send the
     message: the save still runs, and the caller renders its result on the
     panel as the previous behaviour did. Reply Mode must never come here — it
-    edits its existing panel instead (``_panel_editor``).
+    edits its existing panel instead (``ExistingPanelEditor``).
     """
     if self_client is None or not chat_id:
         return None
@@ -396,28 +428,55 @@ async def _edit_status(self_client, inline_chat_id, inline_msg_id, text: str, la
 
 
 async def _save_reply_wait_handler(
-    text, chat_id, msg_id, inline_chat_id, inline_msg_id, *, metadata=None
+    text, chat_id, msg_id, inline_chat_id, inline_msg_id, *,
+    metadata=None, inline_id=None,
 ):
     from backend.helper.inline_engine import _self_client, _owner_id
     from backend.helper.input_state import clear_pending
+    from backend.helper.panel_edit import (
+        ExistingPanelEditor,
+        begin_panel_operation,
+        finish_panel_operation,
+    )
 
     owner_id = _owner_id
     client = _self_client
     clear_pending(owner_id)
 
     # Reply Mode keeps the panel it armed: "Waiting for your reply..." becomes
-    # the resolution line, then the transfer milestones, then the result — one
+    # the resolution line, then the transfer milestones, then the result — ONE
     # message edited in place, never a second one, and it is touched BEFORE the
     # reply/target lookup so resolution time is visible instead of silent.
-    editor = _panel_editor(client, inline_chat_id, inline_msg_id)
+    #
+    # The Helper Bot owns that panel's presentation: Telegram gave it the
+    # inline identifier at click time, and that is what every later edit uses.
+    # Without an identifier the panel is still the SAME message, edited through
+    # its chat/message coordinates by the account that sent it. Neither path
+    # ever sends a message, and a panel that cannot be addressed runs the save
+    # without UI rather than inventing a second surface.
+    generation = 0
+    if inline_msg_id:
+        generation = begin_panel_operation(inline_chat_id, inline_msg_id)
+    editor = ExistingPanelEditor(
+        chat_id=inline_chat_id,
+        msg_id=inline_msg_id,
+        inline_id=inline_id,
+        helper=get_client(),
+        self_client=client,
+        generation=generation,
+    )
     reporter = None
-    if editor is None:
+    if not editor.available:
         logger.warning(
-            "[SAVE_UI] reply mode has no editable panel (chat=%s msg=%s) — "
-            "the save runs without status updates",
-            inline_chat_id, inline_msg_id,
+            "[SAVE_UI] reply mode has no editable panel (chat=%s msg=%s "
+            "inline_id=%s) — the save runs without status updates",
+            inline_chat_id, inline_msg_id, bool(inline_id),
         )
     else:
+        logger.info(
+            "[SAVE_UI] reply mode panel edit path=%s chat=%s msg=%s",
+            editor.path, inline_chat_id, inline_msg_id,
+        )
         await editor(f"**{REPLY_PANEL_TITLE}**\n\nResolving the target message…")
         reporter = SaveProgressReporter(editor, title=REPLY_PANEL_TITLE)
 
@@ -445,6 +504,11 @@ async def _save_reply_wait_handler(
 
     if reporter is not None:
         await reporter.close(result)
+
+    # The panel keeps its terminal state; releasing the token lets the next
+    # Save on this panel become its writer without waiting for a timeout.
+    if generation:
+        finish_panel_operation(inline_chat_id, inline_msg_id, generation)
 
     if client:
         try:
