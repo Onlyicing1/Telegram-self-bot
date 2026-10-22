@@ -1,222 +1,229 @@
-# IMPLEMENTATION_REPORT.md — Save: album as ONE item, `tg://` links, real progress
+# IMPLEMENTATION_REPORT.md — Save: live progress lifecycle + private `tg://` links
 
 > This file describes ONLY the current state of the repository for this task and
-> **replaces every previous report in full**. The previous Save round
-> (`577a65e`, "save full albums, refuse ephemeral media, report live progress")
-> is superseded — its album model (one upload, one code and one row PER member)
-> and its progress wiring were both wrong. Older reports remain readable in git
-> history and in `docs/investigations/`.
+> **replaces every previous report in full**. The album-as-one-item contract from
+> `c127d82` is untouched and still holds; this round fixes the two defects that
+> still failed against the owner's real account. Older reports remain readable in
+> git history and in `docs/investigations/`.
 
 | Item | Value |
 |---|---|
-| Stage | Corrective implementation + regression tests |
+| Stage | Corrective implementation + regression tests (two defects only) |
 | Date | 2026-10-22 |
 | Project / remote | LifeOS Telegram self-bot, `Onlyicing1/Telegram-self-bot` (`origin`) |
-| Base commit | `577a65e35cf295c127c3304b4bd79ae7be91e7c7` (the superseded Save round) |
-| Delivery | One commit; pushed fast-forward to `origin/main` (SHA + remote equality reported in the delivery message, verified with `git fetch` → `git rev-parse origin/main` → `git merge-base --is-ancestor`) |
-| Live Telegram / Supabase / Render | **NOT touched.** No session, no RPC, no SQL, no migration, no schema change, no `.env`, no credentials, no deployment |
+| Base commit | `c127d82aeb115a303e8a07339ed89b69cf182bfe` (`fix(save): save an album as one item, support tg:// links, show real progress`) |
+| Delivery | One commit, fast-forward to `origin/main` (SHA + remote equality reported in the delivery message) |
+| Live Telegram / Supabase / Render shell | **NOT touched.** No session, no RPC, no SQL, no migration, no schema change, no `.env`, no credentials, no deployment, no Render shell |
 | Document NOT modified | `DATABASE_ARCHITECTURE.md` (read only) |
-| Interpreter used for verification | CPython 3.12 venv with `backend/requirements.txt` installed, i.e. **pinned Telethon 1.43.0** |
+| Interpreter used for verification | CPython 3.12.3 venv with `backend/requirements.txt` (**pinned Telethon 1.43.0**) + `pytest` + `pytest-asyncio` |
 
 ---
 
-## 1. What was wrong (source-verified, not assumed)
+## 1. Root causes (source-verified against pinned Telethon 1.43.0)
 
-* **Album ≠ one item.** `execute_save` resolved the album but looped
-  `_deep_save_one` per member: N save codes, N Saved Messages messages, N
-  `saved_items` rows, N metadata captions. The owner's requirement is the
-  opposite: an album is ONE saved item.
-* **`tg://openmessage` was unsupported.** `parse_telegram_link` only ran an
-  HTTP(S) `t.me` regex, so `tg://openmessage?user_id=…&message_id=…` parsed to
-  `(None, 0, 0)` and always failed.
-* **Progress could never appear.** `_progress_reporter()` edited the panel
-  message through `get_client()` — the **helper bot**. The panel message is sent
-  by the OWNER'S account (an inline result the self-bot clicked), so a bot
-  cannot edit it; every edit raised, was logged as a warning and swallowed, and
-  the terminal result edit failed the same way. The passing unit tests only
-  exercised the reporter with an in-memory edit callable, never the real
-  authority.
+### A. Progress could never be displayed
 
-## 2. Pinned Telethon 1.43.0 facts the fix relies on (source read, then exercised)
+Two independent faults, both fatal on their own:
 
-* `send_file(entity, [..])` routes to `_send_album`, which converts each
-  `InputMediaUploadedPhoto`/`InputMediaUploadedDocument` through
-  `UploadMediaRequest` and sends ONE `SendMultiMediaRequest`; the caption list
-  places the single caption on the FIRST media item.
-* `send_file` with a list returns a LIST of `Message` objects (built from the
-  request's `random_id`s) — possibly containing `None` for missing mappings.
-* `_send_album`'s own `progress_callback` reports `(index + fraction, len(files))`
-  — an aggregate across files, not per-file bytes. This is why the album path
-  uploads each member with `client.upload_file` (real per-file byte callbacks)
-  and sends already-uploaded handles, instead of passing a progress callback to
-  the album send.
-* `download_media` calls `progress_callback(bytes_written, file_size)` per chunk
-  and awaits an awaitable result; `upload_file` does the same per part. Part
-  size is 128 KiB up to 100 MB, so real intermediate percentages exist.
-* `utils.get_input_media(InputMedia)` returns the instance unchanged, so a
-  prebuilt `InputMediaUploadedPhoto`/`Document` passes through `_send_album`
-  without re-uploading bytes and without losing its media type.
-* `Message.grouped_id` is the album identity; Telegram caps an album at 10
-  items, so a bounded id window around a member always contains the album.
-* `forward_messages(entity, [ids], from_peer=…)` sends ONE
-  `ForwardMessagesRequest`, so an album's members are forwarded together.
+1. **The edit call itself was invalid.** `save.py` called
 
-## 3. Implementation
+   ```python
+   await self_client.edit_message(chat_id, msg_id, message=rendered, buttons=buttons)
+   ```
 
-### `backend/services/save_service.py`
+   Pinned Telethon's signature is
+   `edit_message(entity, message=None, text=None, *, …)` (`client/messages.py:1085`),
+   where the **second positional parameter is the message id** and the new text is
+   `text`. `msg_id` therefore bound to `message` positionally while
+   `message=rendered` was supplied again as a keyword → every call raised
+   `TypeError: got multiple values for argument 'message'`. The reporter caught
+   and logged that exception (by design: "progress must never abort a save"), so
+   the save succeeded and *nothing at all* appeared on Telegram. The previous
+   round's tests passed only because the test fake accepted the text in the
+   `message` slot, i.e. the fake encoded the bug.
+2. **There was no status message, and the surface was wrong.** Progress was bound
+   to the panel message that launched the input flow — an inline result sent by
+   the owner's account — so it covered neither link resolution nor target lookup,
+   and `_save_reply_action` stored `inline_msg_id=0` whenever the panel id could
+   not be resolved, silently disabling progress entirely.
 
-* **Album = one item** (`_deep_save_album`, replacing the per-member loop and
-  `_album_outcome`):
-  * pre-flight, before ANY transfer/code/row: any view-once or expiring member
-    refuses the WHOLE album; a member without media refuses; a member whose
-    declared size exceeds the deep-save limit refuses;
-  * ONE `get_next_save_code()`, one caption, one temp root directory;
-  * per member, in album order: `download_media` (per-member progress) →
-    validate (exists, non-empty, limit) → `client.upload_file` (per-member
-    progress) → build `InputMediaUploadedPhoto` (photo preserved) or
-    `InputMediaUploadedDocument` (original attributes/mime/filename, video
-    `nosound_video`) → delete that member's temp file;
-  * ONE `client.send_file("me", [media…], caption=…)` — a real grouped album;
-  * the response must contain exactly N messages: fewer means the partial album
-    is deleted again and the save reports failure (no row);
-  * ONE `saved_items` row: `media_type = "Album"`, `file_size` = album total,
-    `origin_*` = the album's first source message, `saved_msg_id` = the album's
-    FIRST destination message, `saved_chat_id` = Saved Messages, no single
-    `file_id`/`mime_type` (an album has neither);
-  * `SaveOutcome` for an album: `saved` = whole album persisted, `save_code` =
-    the album's ONE code, `media_type = "Album"`.
-* **Caption policy** (`build_album_caption` / `album_source_text`): the LifeOS
-  metadata block is written ONCE (it rides the first album message); the album's
-  source text is its member captions in album order, each DISTINCT caption once,
-  blank-line separated, bounded (600 chars) with an explicit `…`, and the whole
-  caption is kept under Telegram's 1024-char limit. `build_caption` gained an
-  optional `album_count` so the media line reads `Album · 3 items · size`.
-* **`tg://openmessage`** (`parse_link_target` → `LinkTarget`, with
-  `parse_telegram_link` kept as the tuple wrapper): `tg://` is parsed as a URI
-  with `parse_qs`. Supported: `user_id` (private chat), `chat_id` (basic group →
-  `-id`), `channel_id` (→ `-100id`), each with `message_id` or `post`. Exactly
-  one peer parameter is required; a missing/duplicated/non-numeric/zero id is
-  refused with a reason. `execute_link_save` fetches through the ordinary
-  Telethon client (`get_messages(peer, ids=…)`, with ONE explicit
-  `get_entity` fallback when a bare id is not in the session cache), then
-  validates `message.id == requested id` and `message.chat_id == requested
-  peer`; a mismatch is an honest failure. HTTP links are unchanged.
-* **Destination album resolution** (`is_album_row`,
-  `resolve_saved_album_messages`): an album row's anchor is re-read and its
-  `grouped_id` used to resolve members inside the bounded window; a non-grouped
-  anchor resolves to itself (single-item behavior untouched); a grouped anchor
-  whose siblings are gone is an ERROR, never a silent single-file result.
-* `resolve_album_messages` additionally logs and enforces Telegram's 10-item cap.
+### B. Private `tg://openmessage` links parsed but could not be saved
 
-### `backend/services/retrieve_service.py`
+`parse_link_target` was correct: the owner's exact URI
+`tg://openmessage?user_id=5406707941&message_id=209974` parses to
+`(username=None, chat_id=5406707941, message_id=209974)`. The failure was one
+step later, in **peer resolution**:
 
-* `do_retrieve`: for an album row, resolve every member and forward the complete
-  id list in ONE request; caption metadata is edited on the first forwarded
-  message only. Resolution failure → honest failure, nothing forwarded. A
-  single-item row keeps the exact previous scalar call.
-* `do_delete`: resolves album members BEFORE anything is deleted; failure deletes
-  nothing and keeps the row; success deletes every member in one call.
-* `do_change_file_name`: an album row is refused with a reason before any
-  Telegram read (a file name belongs to one document; an album has none).
-* `_type_icon`: albums use the new `sym.MEDIA_ALBUM` glyph.
+* `get_messages(peer, ids=…)` resolves the peer first
+  (`_IDsIter._init` → `client.get_input_entity(entity)`,
+  `client/messages.py:290`).
+* `get_input_entity(5406707941)` (`client/users.py:354`) can only answer from the
+  message-box entity cache, the session's stored entities, or — for a `PeerUser`
+  — `users.GetUsersRequest` with `access_hash=0`, which Telegram honours only for
+  contacts. Otherwise it raises
+  `ValueError: Could not find the input entity for PeerUser(5406707941) …`
+  (`users.py:476`).
+* The session here is a **`StringSession`, which persists no entities**, so after
+  a restart an id is resolvable only if a live update or a dialog fetch happened
+  to cache it. The old fallback (`get_entity(chat_id)`) took the *same* code path
+  and raised the same `ValueError`, which the handler wrapped into
+  `Could not resolve link: Could not find the input entity for PeerUser(…)`.
 
-### `backend/services/delete_service.py`
+So the link was parsed, accepted, logged as supported — and then failed on the
+account's own entity cache. Telegram does not expose an arbitrary user id, so no
+`tg://`-specific workaround exists; the resolution path itself had to become
+complete. Reproduced truthfully offline by the new `PeerResolutionClient`
+(`get_input_entity`/`get_entity` raise `ValueError` for an unknown id, exactly as
+pinned Telethon does).
 
-* `do_del_code`: the same album resolution before deletion; every member is
-  deleted in one call, and an unresolvable album deletes nothing and keeps the
-  row.
+## 2. Implementation
 
-### `backend/bot/handlers/save.py`
+### `backend/bot/handlers/save.py` — the status-message lifecycle
 
-* `_progress_reporter(self_client, chat_id, msg_id, title=…)` now edits the
-  panel message with the **SELF** client through the standard panel render path
-  (`render_edit` + `_progress_buttons`), matching every other Glass panel.
-  `None` only when there is no self client or no panel coordinates.
-* Reply Mode resolves the panel message with `resolve_callback_message(event)`
-  instead of hoping for `event.message_id`; both handlers pass
-  `reporter.handle` to the service and close with the terminal result; a
-  fallback `_edit_status` uses the self client if no reporter exists.
-* Save-by-Link title is `Save by Link`; the input prompt now documents
-  `tg://openmessage?user_id=…&message_id=…`.
+* **`_start_status(self_client, chat_id, *, title, body)`** sends ONE dedicated
+  Loading/status message with the **self client** into the chat the owner just
+  typed in, immediately after the input arrives and **before** reply/target
+  resolution (`"Resolving the target message…"`) or link parsing
+  (`"Resolving the link…"`). It keeps the message's **own** `chat_id` + `id` from
+  the send result and returns a `SaveProgressReporter` bound to them. No reply
+  markup is attached: the message is sent by a user account, which cannot carry a
+  bot keyboard, and a rejected send would hide progress again. `None` only when
+  there is no client/chat or Telegram refused the send.
+* **`_status_editor(client, chat_id, msg_id)`** is the one edit callable: it
+  renders through the standard path (`render_edit`, shared five-segment bar) and
+  calls `edit_message(chat_id, msg_id, text)` — the documented shape. It skips a
+  render identical to the last applied one, treats Telegram's "not modified" as
+  success, and logs-and-swallows every other edit failure so a UI problem can
+  never abort a transfer.
+* Both handlers (`_save_reply_wait_handler`, `_save_link_input_handler`) create
+  the status first, pass `reporter.handle` into `execute_save` /
+  `execute_link_save`, and finish with `reporter.close(result)`, so the terminal
+  success/refusal/failure **replaces the status text in the same message**.
+  `_edit_status` (panel edit via the self client) remains only as the fallback
+  when no status message could be created.
+* `_edit_status`, and the pre-existing caption handler, now also use the correct
+  `edit_message` argument shape.
 
-### `backend/helper/save_progress.py`
+### `backend/services/save_service.py` — complete, validated link resolution
 
-* A known size now emits its truthful phase-start line (0%) the moment the
-  phase begins, then each milestone crossed; dedupe keys make that a single edit
-  per phase. Unknown size keeps the indeterminate line. Terminal protection and
-  edit-failure containment are unchanged.
+* **`LinkResolutionError`** with kinds `peer_unresolved`, `message_missing`,
+  `lookup_failed` — the caller can no longer collapse four different failures
+  into one message.
+* **`_resolve_link_peer`** resolves the peer through ordinary authenticated APIs
+  only, in order: (1) the username for `https://t.me/<username>/…`; (2) the
+  session/entity cache; (3) explicit entity resolution (contact / public
+  channel); (4) **the account's own dialog list** (`_dialog_entity`), bounded by
+  `LINK_DIALOG_SCAN_LIMIT = 500` dialogs and stopping at the first match. The
+  dialog list is the account's own surface — it neither widens access nor uses a
+  second API — and it is what makes a chat resolvable again after a restart with
+  a `StringSession`.
+* **`_fetch_linked_message`** (1) reads the requested id inside the resolved peer;
+  (2) when the peer stays unknown (or the read yields nothing), reads the same id
+  through Telegram's **peer-less lookup** (`get_messages(None, ids=…)`,
+  `InputMessageID`), which needs no entity; that result is returned to the caller
+  for validation, so a message from another chat/slot is reported as a mismatch
+  and never saved; (3) otherwise raises the distinct honest error.
+* **`execute_link_save`** validates `id` AND `chat_id` of whatever came back
+  (unchanged, now also the safety net for the peer-less path) and maps each
+  `LinkResolutionError` kind to its own actionable owner-facing text:
+  unknown chat → "open that chat once in Telegram so it appears in the chat list,
+  then send the link again"; missing message → "may have been deleted, or this
+  account may not have access"; lookup failure → the Telegram reason verbatim.
+  Malformed URIs still fail in the parser and touch no Telegram API. Nothing is
+  refused merely for using `tg://`, and view-once/expiring media is still refused
+  by the MEDIA policy (tested through a `tg://` link).
+* **`resolve_album_messages`** reads the album window through the message's own
+  `input_chat` when Telegram supplied one (falling back to the numeric chat id),
+  so a link-resolved album — whose bare peer id may be unresolvable — resolves
+  its members and is still saved as ONE album (one code, one row).
 
-### `backend/helper/symbols.py`, `backend/services/database_service.py`
+### Unchanged on purpose
 
-* New `MEDIA_ALBUM` (`◰`) in the media category/spec map, mapped by the save,
-  retrieve and database icon tables — no glyph literal in a handler.
-
-### `backend/ai/tools/save.py`
-
-* `SaveByLinkTool` only prefixes `https://` when the link has NO scheme, so a
-  `tg://openmessage…` URI reaches the parser verbatim; descriptions document the
-  supported link forms.
+Album-as-one-item (one grouped `send_file`, one save code, one `saved_items` row,
+anchor = first destination message, `grouped_id` resolution), retrieval /
+preview / deletion of album codes, the Deep Save pipeline itself, the progress
+cadence & renderer, the AI `SaveTool`/`SaveByLinkTool` behavior, `DATABASE_ARCHITECTURE.md`,
+and everything outside Save.
 
 ### `AGENTS.md`
 
-* §6 documents the one-album contract, the destination-album resolution, the
-  caption policy, the self-client progress authority, and Save by Link formats.
+§6 now documents the status-message lifecycle (created before resolution, edited
+in place by the self client, terminal result replaces it) and the complete
+`tg://` resolution chain with its distinct failure kinds.
 
-**Unchanged on purpose:** no SQL/schema/table/column, no new supervisor or
-client, no forwarding in Deep Save, single-item result strings, AI tool
-semantics (the tools still pass no progress observer).
+## 3. Changed files
+
+| File | Change |
+|---|---|
+| `backend/bot/handlers/save.py` | `_start_status` + `_status_editor` replace the panel-bound `_progress_reporter`; both input handlers create the status first and close with the terminal result; correct `edit_message` shape; module docstring |
+| `backend/services/save_service.py` | `LinkResolutionError`, `_dialog_entity`, `_resolve_link_peer`, rewritten `_fetch_linked_message`, `_link_failure_text`, distinct failure mapping in `execute_link_save`, album window read through `input_chat` |
+| `tests/test_save_live_status_and_private_link.py` | **NEW** — 17 tests for both defects |
+| `tests/test_save_album_view_once_progress.py` | fake client now mirrors the real `send_message`/`edit_message` signatures; progress assertions moved to the status message; docstring updated |
+| `tests/test_save_v2_wiring.py` | fake client gained the real `get_input_entity`/`get_entity` surface link resolution uses |
+| `AGENTS.md` | §6 save-progress + link-resolution contract |
+| `IMPLEMENTATION_REPORT.md` | this report |
 
 ## 4. Tests
 
-Rewritten `tests/test_save_album_view_once_progress.py` — **55 tests**, with a
-fake client that mirrors pinned Telethon's call surface (including
-`upload_file` + one list `send_file` for a genuine album) and a REAL-Telethon
-request-level test.
+**New file — `tests/test_save_live_status_and_private_link.py` (17 tests)**
 
-| Area | Representative assertions |
+| Area | Assertions |
 |---|---|
-| Album contract | three-member album → exactly ONE `send_file` with a 3-item list, 3 `upload_file`s, ONE row, ONE code, `media_type=Album`, `saved_msg_id` = first destination message, total `file_size`, metadata block once on the first message, hashtags once; album order preserved on download and upload; repeated source caption collapsed, distinct captions kept in order; neighbours from another album/chat excluded; documents/videos keep attributes + filenames; non-album saves keep one message/one row |
-| Failure/cleanup | download failure, upload failure, album-send failure → no row, no messages, no temp dirs; ephemeral or over-limit member → nothing transferred at all; Telegram creating fewer messages than files → partial album deleted again and reported failed |
-| Real Telethon boundary | `client.send_file("me", [InputMediaUploadedPhoto×3], caption=…)` on real Telethon 1.43 produces exactly ONE `SendMultiMediaRequest` of three `InputSingleMedia` items whose media are `InputMediaPhoto`, caption on the first, ZERO `SendMediaRequest`, and returns three messages — i.e. an actual grouped album, not adjacent messages (offline: request objects faked, no network) |
-| Retrieval / deletion | album code forwards `[601,602,603]` in one request and edits the first forwarded caption; single item forwards the scalar; unresolvable album → nothing forwarded; delete removes all members and the row; unresolvable album deletes nothing and keeps the row; album file-name change refused with zero Telegram calls; `resolve_saved_album_messages` uses `grouped_id` (not adjacency), handles single anchors and missing anchors |
-| Links | the owner's exact URI parses to `(None, 5406707941, 209974)`; channel/`post` and group forms; seven invalid forms refused; public and `/c/` regressions; the exact URI resolves and saves; a linked album saves as ONE album/one row; missing message, lookup exception, id mismatch, chat mismatch, malformed URI all honest failures; view-once through a `tg://` link refused by the MEDIA policy (not the link format); `SaveByLinkTool` preserves the scheme |
-| Progress | cadence thresholds at exactly 10 MiB; percentage from bytes only; reporter phase start/milestones/dedupe/unknown size/terminal protection; REAL handler wiring for Reply Mode, Save by Link, and an album (`File 1/3…3/3` with that member's own percentage); all edits use the panel's `(chat, msg)` and none use the reply's id; download/upload callbacks are non-None; edit failures still save; unknown size shows no invented percentage; observer exceptions do not abort the transfer; no panel message → no progress; 12 MiB transfer reports 20/40/60/80/100 in BOTH phases |
+| Status creation | Reply Mode creates exactly ONE status message in the submitted chat, with "Deep Save"/"Resolving…" text, **before** the reply lookup (recorded call order); Save by Link creates it before parsing/resolving the link |
+| One message, one target | every applied edit addresses the created message's own `(chat_id, msg_id)`; the launching panel `(PANEL_CHAT, PANEL_MSG)` is never edited; `send_message` count stays 1 for the whole save |
+| Client authority | a monkeypatched helper bot that raises on any send/edit is never reached — the self client does all of it |
+| Terminal state | `close("**DONE — saved**")` is the last applied edit and a later progress event produces no further edit |
+| Failure containment | a refusing `send_message` still saves the item and renders the result on the panel |
+| Signature truth | `inspect.signature(TelegramClient.edit_message).bind(...)` proves the production shape is valid and the old `message=text` shape raises `TypeError`; `send_message` shape likewise |
+| Private link | the owner's exact URI saves when the peer is unknown to the session (peer-less lookup) and its `origin_chat_id` is the requested user; the peer is resolved from a REAL Telethon `User` entity supplied by the dialog list and the read goes through that entity; the dialog scan is bounded (10) and stops; unresolvable peer → "Could not reach the chat … open that chat once in Telegram"; missing message → "Message not found"; read exception → "Could not read the linked message: FLOOD_WAIT_30"; peer-less message from another chat → "did not resolve to the requested chat"; wrong id → "did not resolve to the requested message"; all of them write no row and download nothing |
+| Album + regressions | a linked album through an unresolvable peer resolves through the message's own `input_chat` and is ONE album send / ONE row; public username and `/c/` links keep their ordinary path (`/c/` needs no dialog scan); a `tg://` view-once message is refused by the media policy, not by the scheme |
 
 **Measured results (this workspace, pinned Telethon 1.43.0)**
 
 | Run | Result |
 |---|---|
+| `tests/test_save_live_status_and_private_link.py` | **17 passed** |
 | `tests/test_save_album_view_once_progress.py` | **55 passed** |
-| Save/handler/retrieval/delete/symbol/AI-action subset (14 files incl. the focused file) | **425 passed** |
-| Full suite `python -m pytest tests -q --deselect tests/test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once` | **6607 passed, 27 skipped, 1 deselected** in 129 s |
+| Save/delete/retrieve/preview/symbol/AI-action subset (23 files) | **639 passed** |
+| Full suite `python -m pytest tests -q --deselect tests/test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once` | **6624 passed, 27 skipped, 1 deselected** in 130 s |
 | `python -m py_compile` on every changed module + test file | exit 0 |
 | `git diff --check` | clean |
 
-The single deselected test fails identically on unmodified `577a65e`
-(verified by stashing this work and re-running): it is a pre-existing,
-date-dependent task-scheduler bound failure unrelated to Save.
+The single deselected test
+(`test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`)
+fails **identically on unmodified `c127d82`** (verified by `git stash -u`, re-run
+on the clean tree, restore): it is a pre-existing, date-dependent task-scheduler
+bound failure ("interval advancement exceeded bound") unrelated to Save.
 
-## 5. Not live-verified / limitations
+## 5. Not verified against a real Telegram account
 
-* **No live Telegram verification.** No session or credentials exist in this
-  environment. Nothing was downloaded, uploaded, sent, forwarded, deleted or
-  edited against a real account; the album's grouped rendering, the panel edits
-  and the `tg://` lookup are proven at the request/library level only.
-* **No Render deployment** was triggered or claimed; deployment state must be
-  read from Render itself.
-* **No schema change was made or needed.** Because there is no column for an
-  album's member count, the album's identity is its anchor message plus
-  Telegram's `grouped_id`; a saved album whose siblings Telegram no longer
-  returns is reported as unresolvable (retrieval/deletion refuse) rather than
-  silently treated as one file.
-* `tg://openmessage` with a `user_id` can only be resolved when that chat is
-  already resolvable by the authenticated account (Telegram does not expose an
-  arbitrary user id); the failure is reported honestly with Telethon's reason.
-* A partially created album is deleted again; an album Telegram rejects wholesale
-  leaves the uploaded (unsent) bytes in Telegram's cache, which expires by
-  itself — no message and no row exist.
-* The AI `SaveTool` / `SaveByLinkTool` still receive no progress observer (no
-  status message exists for them) — unchanged by design.
-* Album documents (PDFs etc.) are sent inside the grouped request; Telegram may
-  render non-media documents outside the album grid. Media-type preservation is
-  per member.
+Offline verification proves the call shapes, the ordering, the byte-callback
+wiring and every failure branch; it cannot prove Telegram's responses:
+
+* an actual status message appearing in the owner's chat and being edited in
+  place by the owner's own account (no session/credentials exist here);
+* a real `tg://openmessage?user_id=5406707941&message_id=209974` read, including
+  how much of it is served by the dialog-list warm-up versus the peer-less
+  `InputMessageID` lookup (Telegram's server-side coverage of the latter for
+  private chats is documented as a global lookup by Telethon but was not
+  exercised live);
+* real download/upload byte callbacks (the real `progress_callback` wiring is
+  asserted through the production `execute_save`/`execute_link_save` paths with
+  the fake client's byte-count callbacks, not with Telegram);
+* the album's grouped rendering, retrieval and deletion on a live account.
+
+## 6. Remaining limitations
+
+* A private user id that is **neither** cached, **nor** a contact, **nor** within
+  the first `LINK_DIALOG_SCAN_LIMIT` (500) dialogs, **nor** reachable through the
+  peer-less lookup cannot be read by this account — Telegram does not expose it.
+  That case returns the actionable "open that chat once in Telegram" failure
+  rather than a false claim of support. No access rule is bypassed.
+* The dialog scan costs up to five `messages.GetDialogs` pages and only runs when
+  the cache and explicit entity resolution both miss.
+* A status message is one extra message per save, in the chat the owner typed in;
+  it is intentionally not deleted, because it carries the result.
+* The status message carries no inline keyboard (user accounts cannot attach bot
+  keyboards), so the Home shortcut from the Glass panels is absent there.
+* `StringSession` still persists no entities; every fresh process pays the
+  resolution cost of the first link to a given chat.

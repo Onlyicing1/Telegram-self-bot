@@ -14,9 +14,11 @@ The contracts under test are the OWNER's, not the previous implementation's:
   * ``tg://openmessage?user_id=…&message_id=…`` parses and resolves as the
     URI it is (public/private HTTP links keep working), and a message that
     does not match the requested id/peer is an honest failure;
-  * progress is edited onto the EXISTING panel message by the SELF client (the
-    account that sent that message) at the real milestone cadence, per phase
-    and per album member, with a terminal result no late event can overwrite.
+  * progress edits ONE dedicated status message created by the SELF client
+    right after the input arrives (before target/link resolution) at the real
+    milestone cadence, per phase and per album member, with a terminal result
+    no late event can overwrite; the launching panel is not the progress
+    surface and each save sends exactly one new message.
 
 No network, no Telegram session, no Supabase: the fake client implements the
 same call surface pinned Telethon 1.43.0 gives the save pipeline, including
@@ -359,13 +361,24 @@ class FakeClient:
         self._by_id[message.id] = message
         return message
 
-    async def send_message(self, entity, text):
+    # Pinned Telethon signatures, not ours: ``send_message(entity, message,
+    # *, buttons=…)`` and ``edit_message(entity, message_id, text, *,
+    # buttons=…)``. A fake that accepts the text in the ``message`` position
+    # would hide the production TypeError that broke every live edit.
+    async def send_message(self, entity, message="", *, buttons=None, **kwargs):
         self.calls.append("send_message")
-        self.send_message_calls.append((entity, text))
         self._next_id += 1
-        message = StoredMessage(self._next_id, SAVED_CHAT, text=text)
-        self._by_id[message.id] = message
-        return message
+        stored = StoredMessage(self._next_id, entity, text=message)
+        self.send_message_calls.append(
+            {
+                "chat_id": getattr(stored, "chat_id", entity),
+                "text": message,
+                "buttons": buttons,
+                "message_id": stored.id,
+            }
+        )
+        self._by_id[stored.id] = stored
+        return stored
 
     async def forward_messages(self, entity=None, messages=None, from_peer=None, **kwargs):
         self.calls.append("forward_messages")
@@ -384,10 +397,10 @@ class FakeClient:
         self.calls.append("delete_messages")
         self.delete_calls.append((chat_id, list(message_ids)))
 
-    async def edit_message(self, chat_id, msg_id, message=None, buttons=None, **kwargs):
+    async def edit_message(self, entity, message=None, text=None, *, buttons=None, **kwargs):
         self.calls.append("edit_message")
         self.edit_calls.append(
-            {"chat_id": chat_id, "msg_id": msg_id, "message": message, "buttons": buttons}
+            {"chat_id": entity, "msg_id": message, "text": text, "buttons": buttons}
         )
         if self.edit_error is not None:
             raise self.edit_error
@@ -691,9 +704,9 @@ async def test_retrieving_an_album_code_forwards_every_member():
     assert len(client.forward_calls) == 1
     assert client.forward_calls[0]["messages"] == [601, 602, 603]
     # The metadata block is injected on the album's FIRST forwarded message only.
-    caption_edits = [call for call in client.edit_calls if call["message"]]
+    caption_edits = [call for call in client.edit_calls if call["text"]]
     assert len(caption_edits) == 1
-    assert "LifeOS" in caption_edits[0]["message"]
+    assert "LifeOS" in caption_edits[0]["text"]
     assert caption_edits[0]["msg_id"] == client.forwarded_ids[0][0]
 
 
@@ -1128,7 +1141,7 @@ def _wire(client: FakeClient) -> None:
 
 
 @pytest.mark.asyncio
-async def test_reply_mode_progress_edits_the_panel_message_in_place():
+async def test_reply_mode_creates_one_status_message_and_edits_that_message():
     target = photo_message(101, text="hello", download_size=200_000)
     reply = FakeMessage(
         102, chat_id=PANEL_CHAT, text="save this", reply_to_msg_id=101
@@ -1140,11 +1153,18 @@ async def test_reply_mode_progress_edits_the_panel_message_in_place():
         "save this", PANEL_CHAT, 102, PANEL_CHAT, PANEL_MSG,
     )
 
-    assert client.edit_calls, "progress never reached the panel message"
-    coords = {(call["chat_id"], call["msg_id"]) for call in client.edit_calls}
-    assert coords == {(PANEL_CHAT, PANEL_MSG)}
-    texts = [call["message"] for call in client.edit_calls]
+    assert len(client.send_message_calls) == 1, "exactly ONE status message"
+    status = client.send_message_calls[0]
+    assert status["chat_id"] == PANEL_CHAT
+    assert "Resolving" in status["text"]
 
+    assert client.edit_calls, "progress never reached the status message"
+    coords = {(call["chat_id"], call["msg_id"]) for call in client.edit_calls}
+    assert coords == {(status["chat_id"], status["message_id"])}
+    # The panel that launched the flow is never the progress surface.
+    assert (PANEL_CHAT, PANEL_MSG) not in coords
+
+    texts = [call["text"] for call in client.edit_calls]
     for expected in (
         "Downloading 50%", "Downloading 100%", "Uploading 50%", "Uploading 100%",
     ):
@@ -1160,7 +1180,7 @@ async def test_reply_mode_progress_edits_the_panel_message_in_place():
 
 
 @pytest.mark.asyncio
-async def test_link_mode_progress_edits_the_panel_message_in_place():
+async def test_link_mode_creates_the_status_message_before_resolution():
     target = photo_message(209974, chat_id=5406707941, text="hi", download_size=300_000)
     client = FakeClient([target])
     _wire(client)
@@ -1170,9 +1190,16 @@ async def test_link_mode_progress_edits_the_panel_message_in_place():
         PANEL_CHAT, 103, PANEL_CHAT, PANEL_MSG,
     )
 
+    assert len(client.send_message_calls) == 1
+    status = client.send_message_calls[0]
+    assert status["chat_id"] == PANEL_CHAT
+    assert "Save by Link" in status["text"]
+    # Created while nothing but the link is known — before any transfer.
+    assert client.calls.index("send_message") < client.calls.index("download_media")
+
     coords = {(call["chat_id"], call["msg_id"]) for call in client.edit_calls}
-    assert coords == {(PANEL_CHAT, PANEL_MSG)}
-    texts = [call["message"] for call in client.edit_calls]
+    assert coords == {(status["chat_id"], status["message_id"])}
+    texts = [call["text"] for call in client.edit_calls]
     assert any("Downloading 50%" in text for text in texts)
     assert any("Uploading 100%" in text for text in texts)
     assert any("Save by Link" in text for text in texts)
@@ -1191,7 +1218,7 @@ async def test_album_progress_names_the_current_member():
         "save", PANEL_CHAT, 102, PANEL_CHAT, PANEL_MSG,
     )
 
-    texts = [call["message"] for call in client.edit_calls]
+    texts = [call["text"] for call in client.edit_calls]
     assert any("File 1/3" in text for text in texts)
     assert any("File 2/3" in text for text in texts)
     assert any("File 3/3" in text for text in texts)
@@ -1226,7 +1253,7 @@ async def test_unknown_size_progress_has_no_invented_percentage():
         "https://t.me/somechannel/131", PANEL_CHAT, 132, PANEL_CHAT, PANEL_MSG,
     )
 
-    texts = [call["message"] for call in client.edit_calls]
+    texts = [call["text"] for call in client.edit_calls]
     assert any("Downloading…" in text for text in texts)
     assert any("Downloading 100%" in text for text in texts)
     assert "Saved Successfully" in texts[-1]
@@ -1261,7 +1288,7 @@ async def test_large_transfer_reports_all_five_milestones_per_phase():
         "https://t.me/somechannel/161", PANEL_CHAT, 162, PANEL_CHAT, PANEL_MSG,
     )
 
-    texts = [call["message"] for call in client.edit_calls]
+    texts = [call["text"] for call in client.edit_calls]
     for milestone in LARGE_FILE_MILESTONES:
         assert any(f"Downloading {milestone}%" in text for text in texts), milestone
         assert any(f"Uploading {milestone}%" in text for text in texts), milestone
@@ -1269,7 +1296,7 @@ async def test_large_transfer_reports_all_five_milestones_per_phase():
 
 
 @pytest.mark.asyncio
-async def test_no_panel_message_means_no_invented_progress():
+async def test_no_self_client_means_no_status_message_and_no_progress():
     target = photo_message(151, text="hello", download_size=200_000)
     client = FakeClient([target])
 
@@ -1277,8 +1304,10 @@ async def test_no_panel_message_means_no_invented_progress():
 
     assert getattr(result, "saved", False) is True
     assert client.edit_calls == []
-    assert save_handler._progress_reporter(None, PANEL_CHAT, PANEL_MSG) is None
-    assert save_handler._progress_reporter(client, 0, 0) is None
+    assert client.send_message_calls == []
+    assert await save_handler._start_status(None, PANEL_CHAT, title="Deep Save", body="x") is None
+    assert await save_handler._start_status(client, 0, title="Deep Save", body="x") is None
+    assert client.send_message_calls == []
 
 
 # ── the REAL Telethon album boundary (offline, no session, no network) ──

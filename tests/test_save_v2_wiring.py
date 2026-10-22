@@ -97,6 +97,13 @@ class WiringClient(MockClient):
         self.reply = _Reply(chat_id=CHAT_ID, msg_id=REPLY_MSG_ID)
         self.get_messages_calls: list = []
 
+    async def get_input_entity(self, entity):
+        # Every real client has it; link resolution consults it first.
+        return entity
+
+    async def get_entity(self, entity):
+        return entity
+
     async def get_messages(self, chat_id, ids=None, **kwargs):
         self.get_messages_calls.append((chat_id, ids))
         if ids == REPLY_MSG_ID:

@@ -15,13 +15,14 @@ row, and Reply Mode without it stays exactly as prompt-free as before. The
 metadata always travels as the shared ``save_service.SaveMetadata`` contract —
 this module parses the one-line UI format and nothing else.
 
-Live transfer progress is wired the same way: both user-facing sources (Reply
-Mode and Save by Link) pass a ``save_service`` progress observer bound to the
-SAME panel message that launched the save. That message was sent by the
-OWNER'S account, so the SELF client edits it in place (through the standard
-panel render path) — a bot cannot edit another account's message. Without a
-panel message there is nothing to edit, so the pipeline runs without progress
-instead of inventing a new UI.
+Live transfer progress gets a DEDICATED message: as soon as the owner submits
+the reply or the link, the SELF client sends one Loading/status message into
+the chat the owner typed in, and every progress update edits THAT message in
+place (same chat id, same message id) until the terminal result replaces its
+text. The panel that launched the input flow is never the progress surface, so
+link resolution and target lookup are covered, and not one message is sent per
+update. Without a status message (creation failed, or the AI tools that have
+no chat UI) the pipeline runs without inventing progress.
 """
 import logging
 import os
@@ -91,8 +92,9 @@ async def _save_reply_action(event, extra: str, chat_id: int) -> tuple[str, str,
     if not chat_id:
         return "Deep Save", f"{sym.STATE_WARNING} Could not determine the current chat. Please try again.", []
 
-    # The panel message that must later carry live progress is the message the
-    # button was clicked on — resolved the way every other panel resolves it.
+    # The panel that launched the flow is NOT the progress surface any more; it
+    # is kept only as the fallback result surface if the status message cannot
+    # be created. Resolved the way every other panel resolves it.
     _panel_chat, panel_msg_id, _inline_id = resolve_callback_message(event)
 
     wait_text = (
@@ -241,51 +243,96 @@ async def _save_metadata_input_handler(text, chat_id, msg_id, inline_chat_id, in
             pass
 
 
-def _progress_reporter(self_client, inline_chat_id, inline_msg_id, *, title: str = "Deep Save"):
-    """Bind save progress to the panel message that launched the operation.
+def _status_editor(self_client, chat_id, msg_id):
+    """An edit callable for ONE status message, deduped and failure-contained.
 
-    The panel message was sent by the OWNER'S OWN ACCOUNT (an inline result the
-    self-bot clicked), so the SELF client is the only client that may edit it:
-    the helper bot cannot edit another account's message, and editing through it
-    was why progress and the final result never appeared. The edit uses the
-    same render path as every other panel (``render_edit`` plus the shared nav
-    row), so Save progress matches the rest of the Glass UI.
+    ``edit_message`` is called with Telethon's documented signature
+    (``entity, message_id, text``) — passing the text as ``message`` bound it to
+    the message-id parameter and every edit raised ``TypeError``, which is why
+    no progress could ever appear live even with the right client.
 
-    ``None`` only when there is no self client or no panel coordinates: a save
-    with no status message (the AI tools) invents no progress UI.
+    No reply markup: this message is sent by the OWNER'S account, and a user
+    account cannot attach a bot keyboard, so a rejected send would hide the
+    progress entirely.
     """
-    if self_client is None or not inline_chat_id or not inline_msg_id:
-        return None
-
     from backend.helper.panel_render import render_edit
-    from backend.helper.panels import _progress_buttons
+
+    applied: dict[str, str | None] = {"last": None}
 
     async def _edit(text: str) -> bool:
+        rendered, _buttons = render_edit("", text, [])
+        if rendered == applied["last"]:
+            return True
         try:
-            rendered, buttons = render_edit("", text, _progress_buttons())
-            await self_client.edit_message(
-                inline_chat_id, inline_msg_id, message=rendered, buttons=buttons
-            )
+            await self_client.edit_message(chat_id, msg_id, rendered)
+            applied["last"] = rendered
             return True
         except Exception as exc:  # noqa: BLE001 — progress never aborts a save
+            if "not modified" in str(exc).lower():
+                # Telegram already shows exactly this text — not a failure.
+                applied["last"] = rendered
+                return True
             logger.warning(
-                "save progress edit failed chat=%s msg=%s: %s",
-                inline_chat_id, inline_msg_id, exc,
+                "save status edit failed chat=%s msg=%s: %s", chat_id, msg_id, exc
             )
             return False
 
-    return SaveProgressReporter(_edit, title=title)
+    return _edit
+
+
+async def _start_status(
+    self_client, chat_id: int, *, title: str, body: str
+) -> "SaveProgressReporter | None":
+    """Send the ONE dedicated Loading/status message and bind progress to it.
+
+    Created by the SELF client in the chat the owner just typed in, immediately
+    after the input arrives and before any link resolution or media work, so a
+    slow lookup never leaves the owner staring at the static prompt. The
+    returned reporter edits that exact message for every update and for the
+    terminal result; the panel that launched the input flow is untouched.
+
+    ``None`` when there is no client, no chat, or Telegram refused to send the
+    message: the save still runs, and the caller renders its result on the
+    panel as the previous behaviour did.
+    """
+    if self_client is None or not chat_id:
+        return None
+
+    from backend.helper.panel_render import render_edit
+
+    try:
+        rendered, _buttons = render_edit(title, body, [])
+        message = await self_client.send_message(chat_id, rendered)
+    except Exception as exc:  # noqa: BLE001 — a save must not fail on its own UI
+        logger.warning("save status message could not be created chat=%s: %s", chat_id, exc)
+        return None
+
+    msg_id = getattr(message, "id", None)
+    if not msg_id:
+        logger.warning("save status message has no id chat=%s: no progress shown", chat_id)
+        return None
+
+    # The message's OWN coordinates, not the requested ones: that is the message
+    # every later edit must address.
+    status_chat_id = getattr(message, "chat_id", None) or chat_id
+    logger.info(
+        "[SAVE_UI] status message created chat=%s msg=%s title=%s",
+        status_chat_id, msg_id, title,
+    )
+    return SaveProgressReporter(
+        _status_editor(self_client, status_chat_id, msg_id), title=title
+    )
 
 
 async def _edit_status(self_client, inline_chat_id, inline_msg_id, text: str, label: str) -> bool:
-    """Edit the launching panel message with the SELF client (best effort)."""
+    """Fallback: render a result on the panel when no status message exists."""
     if self_client is None or not inline_chat_id or not inline_msg_id:
         return False
     try:
         from backend.helper.panel_render import render_edit
         rendered, buttons = render_edit("", text, [])
         await self_client.edit_message(
-            inline_chat_id, inline_msg_id, message=rendered, buttons=buttons
+            inline_chat_id, inline_msg_id, rendered, buttons=buttons
         )
         return True
     except Exception as exc:  # noqa: BLE001 — the transfer result already exists
@@ -303,7 +350,11 @@ async def _save_reply_wait_handler(
     client = _self_client
     clear_pending(owner_id)
 
-    reporter = _progress_reporter(client, inline_chat_id, inline_msg_id)
+    # The status message exists BEFORE the reply/target lookup, so resolution
+    # time is visible instead of silent.
+    reporter = await _start_status(
+        client, chat_id, title="Deep Save", body="Resolving the target message…"
+    )
 
     try:
         # Resolve the user's outgoing reply, then the exact message it
@@ -347,8 +398,10 @@ async def _save_link_input_handler(text, chat_id, msg_id, inline_chat_id, inline
     client = _self_client
     clear_pending(owner_id)
 
-    reporter = _progress_reporter(
-        client, inline_chat_id, inline_msg_id, title="Save by Link"
+    # The status message exists BEFORE the link is parsed or resolved, so a
+    # slow lookup is never mistaken for an ignored link.
+    reporter = await _start_status(
+        client, chat_id, title="Save by Link", body="Resolving the link…"
     )
 
     link = text.strip()

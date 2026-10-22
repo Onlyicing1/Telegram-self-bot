@@ -30,6 +30,7 @@ from datetime import datetime
 from typing import Awaitable, Callable
 from urllib.parse import parse_qs
 
+from telethon import utils
 from telethon.tl.types import (
     DocumentAttributeFilename,
     InputMediaUploadedDocument,
@@ -664,8 +665,14 @@ async def resolve_album_messages(client, target) -> tuple[list, str]:
         )
         if message_id > 0
     ]
+    # The message's own input peer when Telegram supplied one: a link-resolved
+    # message can come from a chat whose bare id the session cannot resolve.
     try:
-        fetched = await client.get_messages(chat_id, ids=window)
+        chat_entity = target.input_chat or chat_id
+    except Exception:  # noqa: BLE001 — a message without a chat entity
+        chat_entity = chat_id
+    try:
+        fetched = await client.get_messages(chat_entity, ids=window)
     except Exception as exc:  # noqa: BLE001 — honest resolution failure
         logger.warning(
             "[SAVE] album resolution failed chat=%s msg=%s: %s", chat_id, base_id, exc
@@ -978,6 +985,109 @@ def parse_telegram_link(link: str) -> tuple[str | None, int, int]:
     if target.error:
         return None, 0, 0
     return target.username, target.chat_id, target.message_id
+
+
+# ── link target resolution (peer → message), never an access bypass ──
+
+#: Bounded scan of the account's OWN dialog list when a link's peer is not
+#: resolvable from the session cache. A ``StringSession`` persists no entity
+#: cache, so after a restart a chat the account really has can still be unknown.
+LINK_DIALOG_SCAN_LIMIT = 500
+
+LINK_PEER_UNRESOLVED = "peer_unresolved"
+LINK_MESSAGE_MISSING = "message_missing"
+LINK_LOOKUP_FAILED = "lookup_failed"
+
+
+class LinkResolutionError(Exception):
+    """Why a link could not be turned into a readable message.
+
+    ``kind`` is one of the module constants above, so the caller never
+    collapses "unknown chat", "missing message", "lookup failed" and
+    "wrong message/chat" into one generic result.
+    """
+
+    def __init__(self, kind: str, detail: str = "") -> None:
+        super().__init__(detail or kind)
+        self.kind = kind
+        self.detail = detail
+
+
+async def _dialog_entity(client, peer_id: int):
+    """The peer's entity from the account's OWN dialog list, or ``None``.
+
+    The scan stops at the first match and is bounded by
+    ``LINK_DIALOG_SCAN_LIMIT``, so resolving a link never turns into an
+    unbounded walk of the account history. Nothing here widens access: the
+    dialog list contains exactly the chats this account already has.
+    """
+    scanned = 0
+    try:
+        async for dialog in client.iter_dialogs(limit=LINK_DIALOG_SCAN_LIMIT):
+            scanned += 1
+            entity = getattr(dialog, "entity", None)
+            if entity is None:
+                continue
+            try:
+                if utils.get_peer_id(entity) == peer_id:
+                    logger.info(
+                        "[LINK_SAVE] peer resolved from the dialog list: %s", peer_id
+                    )
+                    return entity
+            except Exception:  # noqa: BLE001 — skip a dialog without a usable id
+                continue
+    except Exception as exc:  # noqa: BLE001 — the dialog list is only a fallback
+        logger.warning(
+            "[LINK_SAVE] dialog scan failed after %d dialogs: %s", scanned, exc
+        )
+        return None
+    logger.info("[LINK_SAVE] peer %s not in the first %d dialogs", peer_id, scanned)
+    return None
+
+
+async def _resolve_link_peer(client, target: LinkTarget):
+    """The peer a link points at, through ordinary authenticated APIs only.
+
+    In order, and never a second API or an access bypass:
+
+    1. the username (``https://t.me/<username>/…``);
+    2. the session/entity cache — no API call when the chat is already known;
+    3. explicit entity resolution (a contact, a public channel);
+    4. the account's OWN dialog list, which is where a chat becomes resolvable
+       again after a restart.
+
+    Raises ``LinkResolutionError`` with kind ``LINK_PEER_UNRESOLVED`` and the
+    reason Telegram gave, instead of guessing a peer.
+    """
+    if target.username:
+        try:
+            return await client.get_entity(target.username)
+        except Exception as exc:  # noqa: BLE001 — honest resolution failure
+            raise LinkResolutionError(
+                LINK_PEER_UNRESOLVED, f"@{target.username}: {exc}"
+            ) from exc
+
+    peer_id = target.peer_id
+    last_error = ""
+    resolvers = (
+        ("cache", client.get_input_entity),
+        ("entity", client.get_entity),
+    )
+    for label, resolver in resolvers:
+        try:
+            entity = await resolver(peer_id)
+        except Exception as exc:  # noqa: BLE001 — try the next ordinary path
+            last_error = f"{label}: {exc}"
+            continue
+        if entity is not None:
+            return entity
+
+    entity = await _dialog_entity(client, peer_id)
+    if entity is not None:
+        return entity
+    raise LinkResolutionError(
+        LINK_PEER_UNRESOLVED, last_error or f"peer {peer_id} is unknown to this account"
+    )
 
 
 def _format_bytes(n: int | None) -> str:
@@ -1796,20 +1906,86 @@ async def execute_save(
 async def _fetch_linked_message(client, target: LinkTarget):
     """Fetch the linked message through the ordinary Telethon client.
 
-    A username link is resolved to its entity first; a numeric peer (a private
-    HTTP link or a ``tg://`` id) is read directly. The only fallback is
-    resolving the peer EXPLICITLY when Telethon cannot map the bare id — the
-    case where the id is not in this session's entity cache — never a second
-    API and never a bypass of Telegram's access rules.
+    A link can name a peer this account cannot turn into an entity at all —
+    ``tg://openmessage?user_id=…`` carries a bare user id, and Telegram only
+    resolves a user id this account already knows (a ``StringSession`` stores
+    no entity cache). Parsing such a link successfully therefore proved
+    nothing, which is why the peer is resolved first and, when that fails, the
+    message is still read through Telegram's peer-less lookup
+    (``InputMessageID``) and accepted only if its peer IS the requested one.
+
+    Order:
+
+    1. resolve the peer (cache → entity → the account's own dialogs), then read
+       the requested id inside it;
+    2. peer-less read of the same id, validated by the caller against BOTH the
+       id and the peer — so a different chat's message can never be saved;
+    3. otherwise report the distinct reason (unknown peer, missing message,
+       lookup failure).
+
+    Raises ``LinkResolutionError`` instead of returning a placeholder, so the
+    caller can render an actionable, specific result.
     """
-    if target.username:
-        entity = await client.get_entity(target.username)
-        return await client.get_messages(entity, ids=target.message_id)
+    peer_error: LinkResolutionError | None = None
+    entity = None
     try:
-        return await client.get_messages(target.chat_id, ids=target.message_id)
-    except ValueError:
-        entity = await client.get_entity(target.chat_id)
-        return await client.get_messages(entity, ids=target.message_id)
+        entity = await _resolve_link_peer(client, target)
+    except LinkResolutionError as exc:
+        peer_error = exc
+        logger.warning("[LINK_SAVE] peer unresolved: %s", exc.detail)
+
+    lookup_error: Exception | None = None
+    if entity is not None:
+        try:
+            message = await client.get_messages(entity, ids=target.message_id)
+        except Exception as exc:  # noqa: BLE001 — try the peer-less lookup too
+            lookup_error = exc
+            logger.warning(
+                "[LINK_SAVE] peer read failed peer=%s msg=%s: %s",
+                target.peer_id, target.message_id, exc,
+            )
+        else:
+            if message is not None:
+                return message
+
+    if target.chat_id:
+        try:
+            message = await client.get_messages(None, ids=target.message_id)
+        except Exception as exc:  # noqa: BLE001 — reported as a lookup failure
+            lookup_error = lookup_error or exc
+            logger.warning(
+                "[LINK_SAVE] peer-less lookup failed msg=%s: %s", target.message_id, exc
+            )
+        else:
+            if message is not None:
+                # Returned even on a peer mismatch: the caller distinguishes
+                # "wrong chat" from "no such message" and saves neither.
+                return message
+
+    if peer_error is not None:
+        raise peer_error
+    if lookup_error is not None:
+        raise LinkResolutionError(LINK_LOOKUP_FAILED, str(lookup_error))
+    raise LinkResolutionError(LINK_MESSAGE_MISSING)
+
+
+def _link_failure_text(error: LinkResolutionError) -> str:
+    """Owner-facing text for each distinct link resolution failure."""
+    if error.kind == LINK_PEER_UNRESOLVED:
+        detail = f" ({error.detail})" if error.detail else ""
+        return (
+            f"{sym.STATE_FAILED} Could not reach the chat in that link{detail}. "
+            "Telegram only lets this account read a chat it already has access to, "
+            "so open that chat once in Telegram so it appears in the chat list, "
+            "then send the link again."
+        )
+    if error.kind == LINK_LOOKUP_FAILED:
+        detail = f": {error.detail}" if error.detail else ""
+        return f"{sym.STATE_FAILED} Could not read the linked message{detail}."
+    return (
+        f"{sym.STATE_FAILED} Message not found at that link. It may have been "
+        "deleted, or this account may not have access to it."
+    )
 
 
 async def execute_link_save(
@@ -1845,18 +2021,15 @@ async def execute_link_save(
             "[LINK_SAVE] source message fetched: msg_id=%s chat_id=%s",
             getattr(target_msg, "id", None), getattr(target_msg, "chat_id", None),
         )
+    except LinkResolutionError as exc:
+        logger.error(
+            "[LINK_SAVE] resolution failed kind=%s detail=%s link=%s",
+            exc.kind, exc.detail, link,
+        )
+        return _link_failure_text(exc)
     except Exception as exc:  # noqa: BLE001 — honest resolution failure
         logger.error("[LINK_SAVE] fetch source message failed: %s", exc, exc_info=True)
-        guidance = (
-            " The tg:// form needs a chat this account can already resolve; Telegram "
-            "does not expose an arbitrary id."
-            if target.scheme == "tg" else ""
-        )
-        return f"{sym.STATE_FAILED} Could not resolve link: {exc}.{guidance}"
-
-    if target_msg is None:
-        logger.warning("[LINK_SAVE] source message not found at link")
-        return f"{sym.STATE_FAILED} Message not found at that link."
+        return f"{sym.STATE_FAILED} Could not resolve link: {exc}."
 
     # The resolved message must BE the requested one: a peer that answers with
     # another message (or another chat) is a failure, never a silent save.

@@ -293,26 +293,41 @@ source message
   refused in `_deep_save_one` BEFORE any download, upload, save code or DB
   write — there is no workaround and no bypass.
 - **Transfer progress**: `execute_save` / `execute_link_save` accept an optional
-  `progress` observer (`SaveProgressEvent`, real Telethon byte counts). The
-  Glass handlers bind `backend/helper/save_progress.py::SaveProgressReporter`
-  to the SAME panel message that launched the save, edited in place by the
-  SELF client — the panel message was sent by the owner's account, so the
-  helper bot cannot edit it. Rendering is the shared five-segment bar
+  `progress` observer (`SaveProgressEvent`, real Telethon byte counts). Both
+  Glass inputs (Reply Mode, Save by Link) first create ONE dedicated
+  Loading/status message with the SELF client (`_start_status`, in the chat the
+  owner typed in) — immediately after the input arrives and BEFORE reply/link
+  resolution — and bind
+  `backend/helper/save_progress.py::SaveProgressReporter` to that message's own
+  chat id + message id. Every update edits that same message through the
+  standard panel render path (`edit_message(chat, msg_id, text)` — never the
+  text in the `message` parameter), so link-resolution time is visible and no
+  update is ever a new message; the launching panel is not the progress
+  surface. Rendering is the shared five-segment bar
   (`backend/helper/progress.py::render_progress_bar`, also used by the model
-  tester) through the standard panel render path; cadence is `50/100` at or
-  below 10 MiB and `20/40/60/80/100` above it, independently per
-  download/upload phase, after a truthful phase-start line (0%, or no
-  percentage when the size is unknown). An unknown size gets a truthful 100%
-  at the boundary; a terminal result closes the reporter first, so a late
-  event can never overwrite it. A caller with no status message (the AI tools)
-  passes no reporter.
+  tester); cadence is `50/100` at or below 10 MiB and `20/40/60/80/100` above
+  it, independently per download/upload phase and per album member
+  (`File i/N`), after a truthful phase-start line (0%, or no percentage when
+  the size is unknown). An unknown size gets a truthful 100% at the boundary;
+  repeated renders are skipped, an edit failure never aborts the transfer, and
+  the terminal result closes the reporter first, so a late event can never
+  overwrite it. A caller with no status message (the AI tools, or a failed
+  send) passes no reporter.
 - **Save by Link**: `parse_link_target` is the ONE link parser —
   `https://t.me/<username>/<id>`, `https://t.me/c/<chat>/<id>` and the app's
   own `tg://openmessage?user_id=<id>&message_id=<id>` URI (also
   `chat_id`/`channel_id` with `message_id` or `post`). `tg://` is parsed as a
-  URI, never fed to the HTTP regex; the resolved message is validated against
-  the requested id and peer, and an unresolvable peer/message is an honest
-  failure. A linked album goes through the same album pipeline.
+  URI, never fed to the HTTP regex. Resolution is the ordinary authenticated
+  path only (`_fetch_linked_message`): the peer is resolved from the session
+  cache, then explicitly, then from the account's OWN bounded dialog list (a
+  `StringSession` persists no entities, which is why an id that parsed still
+  failed to resolve); when the peer stays unknown the message is read with
+  Telegram's peer-less lookup and accepted ONLY if its peer is the requested
+  one. The resolved message is validated against the requested id AND peer.
+  Unknown peer, missing message, lookup failure and id/peer mismatch are
+  reported distinctly (`LinkResolutionError` kinds); nothing is guessed and no
+  access rule is bypassed. A linked album goes through the same album pipeline
+  (its window is read through the message's own peer).
 
 **Save code format:** short, human-readable codes — `S` + 4 characters
 (e.g. `S0001`, or a random `SXXXX` on collision). No `SV-NNNNNN` format.
