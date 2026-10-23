@@ -8,10 +8,16 @@ Panel IDs (single deterministic workflow):
   retrieve_code  — Manual code entry (secondary path)
 
 Actions:
-  retrieve_item     — Retrieve the file to current chat
-  retrieve_rename   — Rename the item (input prompt)
-  retrieve_move     — Move to a folder (input prompt)
-  retrieve_delete   — Delete the item (with confirmation)
+  retrieve_item        — Retrieve the file to current chat
+  retrieve_item_delete — Delete the item (with confirmation)
+  retrieve_bulk_send   — Send every MULTI-SELECTED item to this chat
+  retrieve_bulk_delete — Delete every MULTI-SELECTED item (after confirmation)
+
+The ``retrieve_saved`` panel also carries the multi-select view: the same
+paginated page renders each item as an exact-code toggle, the selection is
+kept per owner in ``helper.selection_state`` (bounded + expiring), survives
+pagination, and every bulk action re-verifies each code through the existing
+single-item service layer before touching anything.
 
 Inputs:
   retrieve:code     — Manual save code entry
@@ -50,6 +56,7 @@ from backend.helper import (
 )
 from backend.helper.client import get_client
 from backend.helper.styles import PRIMARY
+from backend.helper import selection_state
 from backend.helper import symbols as sym
 from backend.helper.input_state import set_pending
 
@@ -102,23 +109,67 @@ async def _retrieve_inline_builder(event, extra: str) -> list:
     ]
 
 
-# ── Panel: retrieve_saved (paginated browser) ──
+# ── Panel: retrieve_saved (paginated browser + multi-select) ──
+#
+# Grammar of the panel's ``extra`` segment (every callback stays well under
+# Telegram's 64-byte callback-data limit):
+#
+#   ""             browse, page 1
+#   page:N         browse page N
+#   select         start a NEW selection session (page 1)
+#   select:page:N  selection view, page N (selection preserved)
+#   toggle:CODE    tick/untick exactly that saved item, then re-render
+#   back           return to the selection view (selection preserved)
+#   cancel         drop the selection and return to the browse view
+#   bulk:send      review the selected items before sending them
+#   bulk:delete    review the selected items before deleting them
+#
+# Selection state lives in ``helper.selection_state`` (bounded, expiring,
+# per-owner) and holds EXACT save codes. Nothing here re-runs a search, and no
+# action derives an item from position, recency or a query.
 
-async def _retrieve_saved_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
-    from backend.helper.inline_engine import _owner_id
-    page = 1
-    if extra.startswith("page:"):
-        page_str = extra[5:]
-        if page_str.isdigit():
-            page = max(1, int(page_str))
+_SELECT_NEW = "select"
+_SELECT_BACK = "back"
+_SELECT_CANCEL = "cancel"
+_BULK_SEND = "send"
+_BULK_DELETE = "delete"
+
+
+def _page_value(extra: str) -> int:
+    """The page number carried by ``page:N`` or ``select:page:N`` (default 1)."""
+    if "page:" in extra:
+        tail = extra.rsplit("page:", 1)[1]
+        if tail.isdigit():
+            return max(1, int(tail))
+    return 1
+
+
+def _item_row_text(row: dict) -> tuple[str, str]:
+    """The exact ``(label, code)`` pair the browser presents for one row."""
+    code = selection_state.normalize_code(row.get("save_code"))
+    icon = retrieve_service._type_icon(row)
+    name = retrieve_service._display_name(row)
+    if len(name) > 20:
+        name = name[:17] + "…"
+    return f"{icon} {name}", code
+
+
+async def _saved_page(owner_id: int, page: int) -> tuple[list, int, int, int]:
+    """Clamp ``page`` and read it: ``(items, total, page, total_pages)``."""
     per_page = _SAVED_PER_PAGE
     offset = (page - 1) * per_page
-    items, total = await db_client.list_saves(_owner_id, limit=per_page, offset=offset)
+    items, total = await db_client.list_saves(owner_id, limit=per_page, offset=offset)
     total_pages = max(1, (total + per_page - 1) // per_page)
     if page > total_pages:
         page = total_pages
         offset = (page - 1) * per_page
-        items, total = await db_client.list_saves(_owner_id, limit=per_page, offset=offset)
+        items, total = await db_client.list_saves(owner_id, limit=per_page, offset=offset)
+    return items, total, page, total_pages
+
+
+async def _render_saved_browser(owner_id: int, page: int) -> tuple[str, str, list]:
+    """The established single-item browser, plus its multi-select entry."""
+    items, total, page, total_pages = await _saved_page(owner_id, page)
 
     if not items:
         return "Saved Items", f"_No saved items found._\n\nSave something first from the LifeOS menu ({sym.OP_SAVE} Save → Deep Save).", []
@@ -127,13 +178,11 @@ async def _retrieve_saved_panel_handler(event, extra: str) -> tuple[str, str, li
 
     builder = InlinePanelBuilder()
     for item in items:
-        code = item.get("save_code")
+        label, code = _item_row_text(item)
         if code:
-            icon = retrieve_service._type_icon(item)
-            name = retrieve_service._display_name(item)
-            if len(name) > 20:
-                name = name[:17] + "…"
-            builder.add_row(f"{icon} {name} · {code}", f"panel:retrieve_item:id:{code}")
+            builder.add_row(f"{label} · {code}", f"panel:retrieve_item:id:{code}")
+
+    builder.add_row(sym.label(sym.ICON_SELECT, "Select Multiple"), "panel:retrieve_saved:select")
 
     nav_row = []
     if page > 1:
@@ -144,6 +193,139 @@ async def _retrieve_saved_panel_handler(event, extra: str) -> tuple[str, str, li
     builder.add_buttons(*nav_row)
 
     return "Saved Items", body, builder.build()
+
+
+async def _render_selection(owner_id: int, page: int | None = None,
+                            notice: str = "") -> tuple[str, str, list]:
+    """The multi-select view: the same page, each row an exact-code toggle."""
+    page = selection_state.set_page(
+        owner_id, page if page is not None else selection_state.current_page(owner_id)
+    )
+    items, total, page, total_pages = await _saved_page(owner_id, page)
+    selection_state.set_page(owner_id, page)
+    chosen = selection_state.count(owner_id)
+
+    body_lines = [f"_{total} items · page {page}/{total_pages} · {chosen} selected_"]
+    if notice:
+        body_lines += ["", notice]
+
+    builder = InlinePanelBuilder()
+    if not items:
+        body_lines += ["", "_No saved items found._"]
+        builder.add_row(sym.label(sym.OP_CLOSE, "Cancel selection"), "panel:retrieve_saved:cancel")
+        return "Saved Items", "\n".join(body_lines), builder.build()
+
+    body_lines += [
+        "",
+        f"_{sym.SELECT_EMPTY} tap an item to select it · {sym.SELECT_MARKED} selected_",
+    ]
+    for item in items:
+        label, code = _item_row_text(item)
+        if not code:
+            continue
+        mark = (sym.SELECT_MARKED if selection_state.is_selected(owner_id, code)
+                else sym.SELECT_EMPTY)
+        builder.add_row(f"{mark} {label} · {code}", f"panel:retrieve_saved:toggle:{code}")
+
+    nav_row = []
+    if page > 1:
+        nav_row.append(
+            (sym.label(sym.OP_PREV, "Prev"), f"panel:retrieve_saved:select:page:{page - 1}")
+        )
+    nav_row.append((f"{page}/{total_pages}", "panel:_nav:noop"))
+    if page < total_pages:
+        nav_row.append(
+            (f"Next {sym.OP_NEXT}", f"panel:retrieve_saved:select:page:{page + 1}")
+        )
+    builder.add_buttons(*nav_row)
+
+    builder.add_row(sym.label(sym.ICON_SEND, "Send selected"), "panel:retrieve_saved:bulk:send")
+    builder.add_row(sym.label(sym.OP_DELETE, "Delete selected"), "panel:retrieve_saved:bulk:delete")
+    builder.add_row(sym.label(sym.OP_CLOSE, "Cancel selection"), "panel:retrieve_saved:cancel")
+
+    return "Saved Items", "\n".join(body_lines), builder.build()
+
+
+async def _toggle_selected_item(owner_id: int, raw_code: str) -> tuple[str, str, list]:
+    """Tick/untick ONE verified item by the code its button carried."""
+    code = selection_state.normalize_code(raw_code)
+    if not code:
+        return await _render_selection(
+            owner_id, notice=f"{sym.STATE_WARNING} That button named no saved item — nothing was selected."
+        )
+    try:
+        row = await retrieve_service.load_saved_item(code, owner_id)
+    except Exception as exc:
+        logger.warning("saved-items selection lookup failed for %s: %s", code, exc)
+        return await _render_selection(
+            owner_id, notice=f"{sym.STATE_WARNING} Could not verify `{code}` — nothing was selected."
+        )
+    if not row:
+        return await _render_selection(
+            owner_id,
+            notice=f"{sym.STATE_FAILED} `{code}` is no longer in your saved items — nothing was selected.",
+        )
+    label, _code = _item_row_text(row)
+    _selected, reason = selection_state.toggle(owner_id, code, label)
+    notice = f"{sym.STATE_WARNING} `{code}` was not selected: {reason}." if reason else ""
+    return await _render_selection(owner_id, notice=notice)
+
+
+def _bulk_review(owner_id: int, action: str) -> tuple[str, str, list]:
+    """Show exactly what a bulk action will touch, with an explicit confirm."""
+    chosen = selection_state.selected(owner_id)
+    builder = InlinePanelBuilder()
+    if not chosen:
+        builder.add_row(sym.label(sym.OP_BACK, "Back to selection"), "panel:retrieve_saved:back")
+        return (
+            "Saved Items",
+            f"{sym.STATE_WARNING} No items are selected — select at least one item first.",
+            builder.build(),
+        )
+
+    noun = "item" if len(chosen) == 1 else "items"
+    lines = [f"_{len(chosen)} selected {noun}_", ""]
+    for code, label in chosen:
+        lines.append(f"{sym.SELECT_MARKED} {label} · `{code}`")
+
+    if action == _BULK_DELETE:
+        title = "Delete Selected"
+        lines += [
+            "",
+            f"{sym.STATE_WARNING} This deletes every selected item and its saved "
+            "Telegram message. This cannot be undone.",
+        ]
+        builder.add_row(sym.label(sym.OP_DELETE, "Delete these items"), "action:retrieve_bulk_delete:confirm")
+    else:
+        title = "Send Selected"
+        lines += ["", f"{sym.ICON_SEND} Every selected item is sent to this chat as its own message."]
+        builder.add_row(sym.label(sym.ICON_SEND, "Send these items"), "action:retrieve_bulk_send:confirm")
+
+    builder.add_row(sym.label(sym.OP_BACK, "Back to selection"), "panel:retrieve_saved:back")
+    return title, "\n".join(lines), builder.build()
+
+
+async def _retrieve_saved_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
+    from backend.helper.inline_engine import _owner_id
+    owner_id = _owner_id
+    extra = extra or ""
+    if extra == _SELECT_NEW:
+        selection_state.clear(owner_id)
+        return await _render_selection(owner_id, 1)
+    if extra == _SELECT_BACK:
+        return await _render_selection(owner_id)
+    if extra == _SELECT_CANCEL:
+        selection_state.clear(owner_id)
+        return await _render_saved_browser(owner_id, 1)
+    if extra.startswith("toggle:"):
+        return await _toggle_selected_item(owner_id, extra[len("toggle:"):])
+    if extra.startswith(_SELECT_NEW):
+        return await _render_selection(owner_id, _page_value(extra))
+    if extra == "bulk:send":
+        return _bulk_review(owner_id, _BULK_SEND)
+    if extra == "bulk:delete":
+        return _bulk_review(owner_id, _BULK_DELETE)
+    return await _render_saved_browser(owner_id, _page_value(extra))
 
 
 async def _retrieve_saved_inline_builder(event, extra: str) -> list:
@@ -458,6 +640,63 @@ async def _retrieve_item_delete_action(event, extra: str, chat_id: int) -> tuple
     return "Delete", result, builder.build()
 
 
+# ── Multi-select actions ──
+#
+# Both actions consume the SELECTION the owner ticked and nothing else: the
+# codes travel from the bounded store into the service, which re-verifies
+# owner + existence for every one of them. A missing selection, a malformed
+# callback or a repeated click fails honestly and touches nothing.
+
+def _bulk_result_buttons() -> list:
+    builder = InlinePanelBuilder()
+    builder.add_row(sym.label(sym.OP_BACK, "Back to Saved Items"), "panel:retrieve_saved")
+    builder.add_row(sym.label(sym.ICON_SELECT, "Select Multiple"), "panel:retrieve_saved:select")
+    return builder.build()
+
+
+async def _retrieve_bulk_delete_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    from backend.helper.inline_engine import _self_client, _owner_id
+    if (extra or "").strip() != "confirm":
+        return (
+            "Delete Selected",
+            f"{sym.STATE_WARNING} Confirmation is required — nothing was deleted.",
+            _bulk_result_buttons(),
+        )
+    codes = selection_state.codes(_owner_id)
+    if not codes:
+        return (
+            "Delete Selected",
+            f"{sym.STATE_WARNING} No items are selected — nothing was deleted.",
+            _bulk_result_buttons(),
+        )
+    result = await retrieve_service.do_bulk_delete(_self_client, _owner_id, codes)
+    selection_state.clear(_owner_id)
+    return "Delete Selected", retrieve_service.format_bulk_result(result), _bulk_result_buttons()
+
+
+async def _retrieve_bulk_send_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    from backend.helper.inline_engine import _self_client, _owner_id
+    if not chat_id:
+        logger.error("[RETRIEVE] bulk send without a target chat")
+        return "Send Selected", f"{sym.STATE_FAILED} Cannot determine target chat.", []
+    if (extra or "").strip() != "confirm":
+        return (
+            "Send Selected",
+            f"{sym.STATE_WARNING} Confirmation is required — nothing was sent.",
+            _bulk_result_buttons(),
+        )
+    codes = selection_state.codes(_owner_id)
+    if not codes:
+        return (
+            "Send Selected",
+            f"{sym.STATE_WARNING} No items are selected — nothing was sent.",
+            _bulk_result_buttons(),
+        )
+    result = await retrieve_service.do_bulk_send(_self_client, _owner_id, codes, chat_id)
+    selection_state.clear(_owner_id)
+    return "Send Selected", retrieve_service.format_bulk_result(result), _bulk_result_buttons()
+
+
 # ── Input handlers ──
 
 async def _retrieve_code_input_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
@@ -654,6 +893,8 @@ def register(client, owner_id: int):
     register_inline_builder("retrieve_code", _retrieve_code_inline_builder)
     register_action("retrieve_item_exec", _retrieve_item_exec_action)
     register_action("retrieve_item_delete", _retrieve_item_delete_action)
+    register_action("retrieve_bulk_send", _retrieve_bulk_send_action)
+    register_action("retrieve_bulk_delete", _retrieve_bulk_delete_action)
     register_action("resolve_pick", _resolve_pick_action)
     register_input("retrieve", "search", {
         "handler": _retrieve_search_input_handler,

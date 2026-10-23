@@ -228,6 +228,13 @@ layer — an execution interface, never just a text response.
 
 - **Save** (`📥`) → **Deep Save** → **Reply Mode** or **link**; plus **Stash**
   (the saved-items browser; its panel and callback are still named `retrieve`).
+  Stash keeps its single-item preview path and adds a bounded **multi-select**
+  view: every listed row toggles the EXACT save code it presented, the
+  per-owner selection survives pagination and is capped/expiring
+  (`backend/helper/selection_state.py`), and the selected items can be sent to
+  the chat or deleted together through the SAME single-item service operations
+  (`retrieve_service.do_bulk_send` / `do_bulk_delete`), each behind an explicit
+  confirmation panel with an honest per-item report.
 - **Delete** (`🗑`) → reply-from / recent / manual-id modes.
 - **List** (`📋`) and **Find** (`🔍`) — browse/search saved items.
 - **Database** (`🗄`) — DB maintenance.

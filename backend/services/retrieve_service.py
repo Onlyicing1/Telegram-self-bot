@@ -27,6 +27,10 @@ Unified workflow:
   - _sync_saved_caption: the ONE Telegram-caption synchronization authority,
     shared by the tag writer and the file-name replacement
   - do_move / do_delete: item actions from the preview panel
+  - do_bulk_delete / do_bulk_send: the Saved Items multi-select actions —
+    each loops over the SINGLE-item operations above (never a second
+    deletion/retrieval implementation), pre-checks every code through
+    ``load_saved_item``, and reports one honest outcome per item
 """
 import asyncio
 import logging
@@ -390,6 +394,197 @@ async def do_delete(self_client, owner_id: int, save_code: str) -> str:
             logger.warning("delete telegram msg failed: %s", exc)
     await db_client.log(owner_id, "INFO", f"Deleted {save_code}", {"save_code": save_code})
     return f"{sym.OP_SAVE} Deleted `{save_code}`"
+
+
+# ── Bulk item actions (Saved Items multi-select) ────────────────────────────
+#
+# A bulk action is NOT a second implementation of delete/retrieve: it loops
+# over the SAME single-item operation below. What this layer adds is the
+# owner-scoped pre-check (every code is re-read through ``load_saved_item``
+# before any side effect), a hard bound, and one honest outcome per item.
+#
+# Delete success is never inferred from the single-item return string: the row
+# is re-read after ``do_delete`` and the item counts as deleted only when it is
+# really gone. ``do_retrieve`` has no such post-condition, so its documented
+# failure contract — every failure message begins with ``STATE_FAILED`` — is
+# the signal.
+
+#: Hard bound on one bulk request; the browser's selection cap matches it.
+MAX_BULK_ITEMS = 40
+
+_BULK_REASON_MAX_CHARS = 160
+_BULK_DETAIL_LINES = 8
+_BULK_ALREADY_GONE = "not found (it may already be deleted)"
+
+
+@dataclass(frozen=True)
+class BulkItemOutcome:
+    """One item's result inside a bulk action."""
+
+    code: str
+    ok: bool
+    message: str
+
+
+@dataclass(frozen=True)
+class BulkResult:
+    """The per-item truth of one bulk action, plus its bounded summary."""
+
+    action: str
+    done: tuple[BulkItemOutcome, ...] = ()
+    failed: tuple[BulkItemOutcome, ...] = ()
+
+    @property
+    def requested(self) -> int:
+        return len(self.done) + len(self.failed)
+
+    @property
+    def done_count(self) -> int:
+        return len(self.done)
+
+    @property
+    def failed_count(self) -> int:
+        return len(self.failed)
+
+    @property
+    def all_ok(self) -> bool:
+        return self.done_count > 0 and self.failed_count == 0
+
+
+def _bulk_codes(save_codes) -> tuple[list[str], list[str]]:
+    """Normalize + dedupe the requested codes, preserving the given order.
+
+    Returns ``(within_bound, overflow)``. Overflow is reported as failed
+    rather than silently dropped, so a caller can never imply it processed
+    more than it did.
+    """
+    seen: set[str] = set()
+    codes: list[str] = []
+    for value in list(save_codes or ()):
+        code = str(value or "").strip().upper()
+        if not code or code in seen:
+            continue
+        seen.add(code)
+        codes.append(code)
+    return codes[:MAX_BULK_ITEMS], codes[MAX_BULK_ITEMS:]
+
+
+async def _bulk_precheck(owner_id: int, code: str) -> tuple[dict | None, str]:
+    """Owner-verified existence check shared by every bulk action."""
+    try:
+        row = await load_saved_item(code, owner_id)
+    except Exception as exc:
+        return None, f"database error: {exc}"
+    if not row:
+        return None, _BULK_ALREADY_GONE
+    return row, ""
+
+
+def _bulk_overflow(overflow: list[str]) -> list[BulkItemOutcome]:
+    return [
+        BulkItemOutcome(
+            code, False,
+            f"not processed: at most {MAX_BULK_ITEMS} items per bulk action",
+        )
+        for code in overflow
+    ]
+
+
+async def do_bulk_delete(self_client, owner_id: int, save_codes) -> BulkResult:
+    """Delete the explicitly selected owner items, one existing delete at a time."""
+    codes, overflow = _bulk_codes(save_codes)
+    done: list[BulkItemOutcome] = []
+    failed: list[BulkItemOutcome] = []
+    for code in codes:
+        row, reason = await _bulk_precheck(owner_id, code)
+        if row is None:
+            failed.append(BulkItemOutcome(code, False, reason))
+            continue
+        try:
+            await do_delete(self_client, owner_id, code)
+        except Exception as exc:
+            failed.append(BulkItemOutcome(code, False, f"delete failed: {exc}"))
+            continue
+        remaining, verify_reason = await _bulk_precheck(owner_id, code)
+        if remaining is None and verify_reason == _BULK_ALREADY_GONE:
+            done.append(BulkItemOutcome(code, True, f"deleted `{code}`"))
+        elif remaining is None:
+            failed.append(BulkItemOutcome(code, False, verify_reason))
+        else:
+            failed.append(
+                BulkItemOutcome(code, False, "the saved item is still present after deletion")
+            )
+    failed.extend(_bulk_overflow(overflow))
+    return BulkResult("delete", tuple(done), tuple(failed))
+
+
+async def do_bulk_send(self_client, owner_id: int, save_codes,
+                       target_chat: int) -> BulkResult:
+    """Send the explicitly selected owner items to ``target_chat``, one at a time."""
+    codes, overflow = _bulk_codes(save_codes)
+    done: list[BulkItemOutcome] = []
+    failed: list[BulkItemOutcome] = []
+    if not target_chat:
+        failed.extend(BulkItemOutcome(code, False, "no target chat for sending")
+                      for code in codes)
+        failed.extend(_bulk_overflow(overflow))
+        return BulkResult("send", tuple(done), tuple(failed))
+    for code in codes:
+        row, reason = await _bulk_precheck(owner_id, code)
+        if row is None:
+            failed.append(BulkItemOutcome(code, False, reason))
+            continue
+        try:
+            message = await do_retrieve(self_client, owner_id, code, target_chat)
+        except Exception as exc:
+            failed.append(BulkItemOutcome(code, False, f"send failed: {exc}"))
+            continue
+        if str(message or "").startswith(sym.STATE_FAILED):
+            failed.append(BulkItemOutcome(code, False, message))
+        else:
+            done.append(BulkItemOutcome(code, True, message))
+    failed.extend(_bulk_overflow(overflow))
+    return BulkResult("send", tuple(done), tuple(failed))
+
+
+def _bulk_text(value) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) <= _BULK_REASON_MAX_CHARS:
+        return text
+    return text[:_BULK_REASON_MAX_CHARS - 1] + "…"
+
+
+def format_bulk_result(result: BulkResult) -> str:
+    """Owner-facing, honest summary of one bulk action.
+
+    States exactly how many of how many succeeded, names the successful codes,
+    and gives each failure its own reason (bounded). It never turns a partial
+    result into a success.
+    """
+    verb = "Sent" if result.action == "send" else "Deleted"
+    total = result.requested
+    if total == 0:
+        return f"{sym.STATE_WARNING} No items were selected. Nothing was {verb.lower()}."
+
+    lines: list[str] = []
+    noun = "item" if total == 1 else "items"
+    if result.done_count == total:
+        listed = ", ".join(f"`{outcome.code}`" for outcome in result.done)
+        lines.append(f"{sym.OP_SAVE} {verb} {total} {noun}: {listed}")
+    elif result.done_count:
+        lines.append(f"{sym.STATE_WARNING} {verb} {result.done_count} of {total} {noun}.")
+        lines.append(", ".join(f"`{outcome.code}`" for outcome in result.done))
+    else:
+        lines.append(f"{sym.STATE_FAILED} {verb} 0 of {total} {noun}.")
+
+    if result.failed:
+        lines.append("")
+        for outcome in result.failed[:_BULK_DETAIL_LINES]:
+            lines.append(f"{sym.STATE_FAILED} `{outcome.code}` — {_bulk_text(outcome.message)}")
+        hidden = result.failed_count - _BULK_DETAIL_LINES
+        if hidden > 0:
+            lines.append(f"_… and {hidden} more_")
+    return "\n".join(lines)
 
 
 # ── Saved-item resolver (Save V2 Part 3 — deterministic 0/1/N) ────────────

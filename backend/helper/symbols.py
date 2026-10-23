@@ -76,6 +76,8 @@ STEP_COMPLETED = "✓"      # U+2713 — same glyph as STATE_COMPLETED
 PAGE_CURRENT = "▰"        # U+25B0 BLACK PARALLELOGRAM
 PAGE_EMPTY = "▱"          # U+25B1 WHITE PARALLELOGRAM (empty progress segment)
 BULLET = "•"             # U+2022 BULLET (plain list / non-active marker)
+SELECT_EMPTY = "⊡"       # U+22A1 SQUARED DOT OPERATOR (unmarked selection item)
+SELECT_MARKED = "⊠"      # U+22A0 SQUARED TIMES (selected item)
 
 # ── media types (Category F) ────────────────────────────────────────────────
 MEDIA_PHOTO = "▢"         # U+25A2 WHITE SQUARE WITH ROUNDED CORNERS
@@ -219,6 +221,8 @@ STRUCTURE_SYMBOLS: dict[str, SymbolSpec] = {
     "page_current": SymbolSpec("page_current", PAGE_CURRENT, "current page / pagination"),
     "page_empty": SymbolSpec("page_empty", PAGE_EMPTY, "empty pagination / progress segment"),
     "bullet": SymbolSpec("bullet", BULLET, "plain list / non-active marker"),
+    "select_empty": SymbolSpec("select_empty", SELECT_EMPTY, "unselected multi-select item"),
+    "select_marked": SymbolSpec("select_marked", SELECT_MARKED, "selected multi-select item"),
 }
 
 #: Category F — one glyph per media type (Saved-item captions + DB statistics).
