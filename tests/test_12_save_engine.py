@@ -536,6 +536,27 @@ async def test_save_panel_has_no_forward_save():
 
 
 @pytest.mark.asyncio
+async def test_save_panel_saved_items_button_is_named_stash_with_its_original_callback():
+    from backend.bot.handlers import save as save_handler
+
+    _, _, rows = await save_handler._save_panel_handler(None, "")
+    labels = [b.text for row in rows for b in row]
+    assert any("Stash" in label for label in labels)
+    assert not any("Retrieve" in label for label in labels)
+    assert "panel:retrieve" in _panel_button_datas(rows)
+
+    # The inline render of the same panel carries the identical row.
+    inline = await save_handler._save_inline_builder(None, "")
+    inline_rows = inline[0].send_message.reply_markup.rows
+    inline_buttons = [b for row in inline_rows for b in row.buttons]
+    inline_labels = [b.text for b in inline_buttons]
+    inline_datas = [b.data.decode("utf-8") for b in inline_buttons]
+    assert any("Stash" in label for label in inline_labels)
+    assert not any("Retrieve" in label for label in inline_labels)
+    assert "panel:retrieve" in inline_datas
+
+
+@pytest.mark.asyncio
 async def test_save_panel_deep_source_shows_reply_mode():
     from backend.bot.handlers import save as save_handler
 

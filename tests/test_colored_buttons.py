@@ -258,13 +258,13 @@ class TestSubmenuStyles:
         return {b.text: b for r in result.send_message.reply_markup.rows for b in r.buttons}
 
     @pytest.mark.asyncio
-    async def test_save_submenu_deep_save_primary_retrieve_blue(self):
+    async def test_save_submenu_deep_save_primary_stash_blue(self):
         from backend.bot.handlers import save
         _, _, rows = await save._save_panel_handler(None, "")
         buttons = self._by_text(rows)
         # Save is an ordinary action → blue, never green.
         assert _bg(buttons["✓ Deep Save"], "primary") is True
-        assert _bg(buttons["⌕ Retrieve"], "primary") is True
+        assert _bg(buttons["⌕ Stash"], "primary") is True
         assert all(_bg(b, "success") in (None, False) for b in buttons.values())
 
     @pytest.mark.asyncio

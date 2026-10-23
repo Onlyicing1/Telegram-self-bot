@@ -65,7 +65,7 @@ async def _save_panel_handler(event, extra: str) -> tuple[str, str, list] | None
 
     builder = InlinePanelBuilder()
     builder.add_row(sym.label(sym.OP_SAVE, "Deep Save"), "panel:save:type:d", PRIMARY)
-    builder.add_row(sym.label(sym.OP_SEARCH, "Retrieve"), "panel:retrieve", PRIMARY)
+    builder.add_row(sym.label(sym.OP_SEARCH, "Stash"), "panel:retrieve", PRIMARY)
     return (
         "Save",
         "Deep Save downloads the message and re-uploads it as a new Saved Messages message.",
@@ -83,7 +83,7 @@ async def _save_inline_builder(event, extra: str) -> list:
 
     builder = InlinePanelBuilder()
     builder.add_row(sym.label(sym.OP_SAVE, "Deep Save"), "panel:save:type:d", PRIMARY)
-    builder.add_row(sym.label(sym.OP_SEARCH, "Retrieve"), "panel:retrieve", PRIMARY)
+    builder.add_row(sym.label(sym.OP_SEARCH, "Stash"), "panel:retrieve", PRIMARY)
     return [
         render(
             "Save",

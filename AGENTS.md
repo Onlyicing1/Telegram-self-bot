@@ -226,7 +226,8 @@ layer — an execution interface, never just a text response.
 
 `Menu` opens the mother panel. Registered top-level panels:
 
-- **Save** (`📥`) → **Deep Save** → **Reply Mode** or **link**; plus **Retrieve**.
+- **Save** (`📥`) → **Deep Save** → **Reply Mode** or **link**; plus **Stash**
+  (the saved-items browser; its panel and callback are still named `retrieve`).
 - **Delete** (`🗑`) → reply-from / recent / manual-id modes.
 - **List** (`📋`) and **Find** (`🔍`) — browse/search saved items.
 - **Database** (`🗄`) — DB maintenance.
