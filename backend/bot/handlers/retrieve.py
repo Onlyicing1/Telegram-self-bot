@@ -10,6 +10,7 @@ Panel IDs (single deterministic workflow):
 Actions:
   retrieve_item        — Retrieve the file to current chat
   retrieve_item_delete — Delete the item (with confirmation)
+  retrieve_toggle      — Tick/untick one item in the multi-select view
   retrieve_bulk_send   — Send every MULTI-SELECTED item to this chat
   retrieve_bulk_delete — Delete every MULTI-SELECTED item (after confirmation)
 
@@ -118,7 +119,6 @@ async def _retrieve_inline_builder(event, extra: str) -> list:
 #   page:N         browse page N
 #   select         start a NEW selection session (page 1)
 #   select:page:N  selection view, page N (selection preserved)
-#   toggle:CODE    tick/untick exactly that saved item, then re-render
 #   back           return to the selection view (selection preserved)
 #   cancel         drop the selection and return to the browse view
 #   bulk:send      review the selected items before sending them
@@ -127,6 +127,12 @@ async def _retrieve_inline_builder(event, extra: str) -> list:
 # Selection state lives in ``helper.selection_state`` (bounded, expiring,
 # per-owner) and holds EXACT save codes. Nothing here re-runs a search, and no
 # action derives an item from position, recency or a query.
+#
+# A tick is an ACTION (``action:retrieve_toggle:CODE``), not a panel query: the
+# callback router pushes every ``panel:`` extra onto the session's nav stack, so
+# a toggle routed that way would make Back re-run the toggle and silently
+# untick an item. Actions do not touch the nav stack; they re-render the panel
+# the session is already on.
 
 _SELECT_NEW = "select"
 _SELECT_BACK = "back"
@@ -225,7 +231,7 @@ async def _render_selection(owner_id: int, page: int | None = None,
             continue
         mark = (sym.SELECT_MARKED if selection_state.is_selected(owner_id, code)
                 else sym.SELECT_EMPTY)
-        builder.add_row(f"{mark} {label} · {code}", f"panel:retrieve_saved:toggle:{code}")
+        builder.add_row(f"{mark} {label} · {code}", f"action:retrieve_toggle:{code}")
 
     nav_row = []
     if page > 1:
@@ -317,8 +323,6 @@ async def _retrieve_saved_panel_handler(event, extra: str) -> tuple[str, str, li
     if extra == _SELECT_CANCEL:
         selection_state.clear(owner_id)
         return await _render_saved_browser(owner_id, 1)
-    if extra.startswith("toggle:"):
-        return await _toggle_selected_item(owner_id, extra[len("toggle:"):])
     if extra.startswith(_SELECT_NEW):
         return await _render_selection(owner_id, _page_value(extra))
     if extra == "bulk:send":
@@ -654,6 +658,12 @@ def _bulk_result_buttons() -> list:
     return builder.build()
 
 
+async def _retrieve_toggle_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    """Tick/untick ONE selected candidate, re-rendering the selection view."""
+    from backend.helper.inline_engine import _owner_id
+    return await _toggle_selected_item(_owner_id, extra)
+
+
 async def _retrieve_bulk_delete_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     from backend.helper.inline_engine import _self_client, _owner_id
     if (extra or "").strip() != "confirm":
@@ -893,6 +903,7 @@ def register(client, owner_id: int):
     register_inline_builder("retrieve_code", _retrieve_code_inline_builder)
     register_action("retrieve_item_exec", _retrieve_item_exec_action)
     register_action("retrieve_item_delete", _retrieve_item_delete_action)
+    register_action("retrieve_toggle", _retrieve_toggle_action)
     register_action("retrieve_bulk_send", _retrieve_bulk_send_action)
     register_action("retrieve_bulk_delete", _retrieve_bulk_delete_action)
     register_action("resolve_pick", _resolve_pick_action)

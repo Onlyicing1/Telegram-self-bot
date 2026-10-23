@@ -31,8 +31,11 @@ byte-identical.
 
 * each row shows `⊡` (unselected) or `⊠` (selected) + the media glyph + the
   item's presented name + its **exact save code**;
-* its callback is `panel:retrieve_saved:toggle:<code>` and toggles exactly that
-  code — tapping never opens an item and no search is ever re-run;
+* its callback is `action:retrieve_toggle:<code>` and toggles exactly that
+  code — tapping never opens an item and no search is ever re-run. It is an
+  ACTION, not a panel query, because the callback router pushes every
+  `panel:` extra onto the session's nav stack: a panel-routed toggle would make
+  Back re-run it and silently untick an item;
 * `Prev` / `Next` stay inside select mode (`select:page:N`) and preserve the
   selection; a toggle returns to the page being viewed;
 * the footer offers **Send selected**, **Delete selected** and
@@ -82,9 +85,9 @@ deleted only when it is really gone.
 * **Stale / deleted items** — a toggle is re-verified; a bulk action re-verifies
   every code immediately before use and reports vanished items as failures
   while still processing the rest.
-* **Callback budget** — every generated callback is
-  `panel:retrieve_saved:toggle:S0001` (33 bytes) or shorter; a test asserts all
-  of them are ≤ 64 bytes and use a registered `panel:` / `action:` prefix.
+* **Callback budget** — the longest generated callback is
+  `action:retrieve_toggle:S0001` (28 bytes); a test asserts all of them are
+  ≤ 64 bytes and use a registered `panel:` / `action:` prefix.
 * **Empty selection** — review and both actions report "No items are selected"
   and touch nothing.
 
@@ -105,7 +108,7 @@ deleted only when it is really gone.
 | `backend/helper/selection_state.py` | **new** — bounded, expiring, per-owner selection store (toggle/selected/codes/count/clear/page) |
 | `backend/helper/symbols.py` | two structure glyphs: `SELECT_EMPTY = ⊡` (U+22A1), `SELECT_MARKED = ⊠` (U+22A0), registered as `select_empty` / `select_marked` |
 | `backend/services/retrieve_service.py` | `BulkItemOutcome`, `BulkResult`, `do_bulk_delete`, `do_bulk_send`, `format_bulk_result`, `MAX_BULK_ITEMS`, owner-verified pre-check; module docstring |
-| `backend/bot/handlers/retrieve.py` | browse renderer extracted unchanged, selection view, toggle, review panels, two actions, registrations, `extra` grammar documentation |
+| `backend/bot/handlers/retrieve.py` | browse renderer extracted unchanged, selection view, toggle action, review panels, two bulk actions, registrations, `extra` grammar documentation |
 | `tests/test_retrieve_multi_select.py` | **new** — 34 tests (see §5) |
 | `AGENTS.md` | Stash bullet documents the multi-select view and its service reuse |
 | `IMPLEMENTATION_REPORT.md` | this report |
@@ -152,6 +155,8 @@ Coverage in the new suite:
 * empty selection → review and both actions do nothing;
 * service dedupes + preserves order; the 40-item bound is enforced and overflow
   is reported; partial formatting never starts with the success glyph;
+* a tick is registered as an action (never a panel query, so Back cannot
+  re-toggle) and its callback is ≤ 64 bytes;
 * every multi-select callback is ≤ 64 bytes with a known prefix.
 
 ## 6. Limitations / not verified

@@ -76,6 +76,11 @@ async def _panel(extra: str = ""):
     return await handler._retrieve_saved_panel_handler(None, extra)
 
 
+async def _toggle(code: str):
+    """Tick/untick through the registered ACTION (never a panel query)."""
+    return await handler._retrieve_toggle_action(None, code, CHAT)
+
+
 def _delete_double(monkeypatch, *, remove: bool = True) -> list[str]:
     """A stand-in for the single-item delete that records its calls.
 
@@ -124,7 +129,7 @@ async def test_browse_rows_still_open_the_item_and_offer_multi_select():
     datas = _datas(buttons)
     assert "panel:retrieve_item:id:S0001" in datas
     assert "panel:retrieve_saved:select" in datas
-    assert not any(data.startswith("panel:retrieve_saved:toggle:") for data in datas)
+    assert not any(data.startswith("action:retrieve_toggle:") for data in datas)
 
 
 @pytest.mark.asyncio
@@ -149,8 +154,8 @@ async def test_select_view_toggles_the_exact_codes_the_page_presented():
     _title, body, buttons = await _panel("select")
 
     datas = _datas(buttons)
-    assert "panel:retrieve_saved:toggle:S0001" in datas
-    assert "panel:retrieve_saved:toggle:S0002" in datas
+    assert "action:retrieve_toggle:S0001" in datas
+    assert "action:retrieve_toggle:S0002" in datas
     assert not any(data.startswith("panel:retrieve_item:") for data in datas), (
         "select mode must not open an item; tapping toggles the code"
     )
@@ -163,12 +168,12 @@ async def test_select_view_toggles_the_exact_codes_the_page_presented():
 async def test_toggle_selects_and_deselects_the_same_item():
     _seed("S0001", name="Schedule")
 
-    _title, body, buttons = await _panel("toggle:S0001")
+    _title, body, buttons = await _toggle("S0001")
     assert selection_state.codes(OWNER) == ("S0001",)
     assert "1 selected" in body
     assert any(label.startswith(sym.SELECT_MARKED) for label in _texts(buttons))
 
-    _title, body, buttons = await _panel("toggle:S0001")
+    _title, body, buttons = await _toggle("S0001")
     assert selection_state.codes(OWNER) == ()
     assert "0 selected" in body
     assert not any(label.startswith(sym.SELECT_MARKED) for label in _texts(buttons))
@@ -180,7 +185,7 @@ async def test_selection_keeps_exact_codes_and_their_presented_labels():
     _seed("S0002", name="Dentist")
 
     await _panel("select")
-    await _panel("toggle:S0001")
+    await _toggle("S0001")
 
     assert selection_state.selected(OWNER) == (
         ("S0001", f"{sym.MEDIA_PHOTO} University Schedule"),
@@ -195,15 +200,15 @@ async def test_selection_survives_pagination_and_stays_on_its_page():
         _seed(f"S{index:04d}")
 
     await _panel("select")
-    await _panel("toggle:S0001")
+    await _toggle("S0001")
     _title, page2_body, page2_buttons = await _panel("select:page:2")
 
     assert "1 selected" in page2_body
     page2_datas = _datas(page2_buttons)
-    assert "panel:retrieve_saved:toggle:S0009" in page2_datas
-    assert "panel:retrieve_saved:toggle:S0001" not in page2_datas
+    assert "action:retrieve_toggle:S0009" in page2_datas
+    assert "action:retrieve_toggle:S0001" not in page2_datas
 
-    _title, toggled_body, _buttons = await _panel("toggle:S0009")
+    _title, toggled_body, _buttons = await _toggle("S0009")
     assert selection_state.codes(OWNER) == ("S0001", "S0009")
     assert "page 2/2" in toggled_body, "a toggle returns to the page being viewed"
 
@@ -220,7 +225,7 @@ async def test_starting_a_new_selection_discards_the_previous_one():
     _seed("S0001")
 
     await _panel("select")
-    await _panel("toggle:S0001")
+    await _toggle("S0001")
     _title, body, _buttons = await _panel("select")
 
     assert selection_state.codes(OWNER) == ()
@@ -232,7 +237,7 @@ async def test_cancel_clears_the_selection_and_returns_to_the_browse_view():
     _seed("S0001")
 
     await _panel("select")
-    await _panel("toggle:S0001")
+    await _toggle("S0001")
     _title, _body, buttons = await _panel("cancel")
 
     assert selection_state.codes(OWNER) == ()
@@ -244,7 +249,7 @@ async def test_back_from_a_review_keeps_the_selection():
     _seed("S0001", name="Schedule")
 
     await _panel("select")
-    await _panel("toggle:S0001")
+    await _toggle("S0001")
     _title, review_body, _buttons = await _panel("bulk:delete")
     assert "`S0001`" in review_body
 
@@ -260,7 +265,7 @@ async def test_toggling_a_missing_item_selects_nothing():
     _seed("S0001")
 
     await _panel("select")
-    _title, body, _buttons = await _panel("toggle:S9999")
+    _title, body, _buttons = await _toggle("S9999")
 
     assert selection_state.codes(OWNER) == ()
     assert "no longer in your saved items" in body
@@ -271,7 +276,7 @@ async def test_toggling_another_owners_item_selects_nothing():
     _seed("S0001", owner=OTHER_OWNER)
 
     await _panel("select")
-    _title, body, _buttons = await _panel("toggle:S0001")
+    _title, body, _buttons = await _toggle("S0001")
 
     assert selection_state.codes(OWNER) == ()
     # A foreign row is reported exactly like a missing one — no data leak.
@@ -282,7 +287,12 @@ async def test_toggling_another_owners_item_selects_nothing():
 async def test_malformed_toggles_and_pages_are_survivable():
     _seed("S0001")
 
-    for extra in ("toggle:", "toggle:   ", "toggle:S", "select:page:abc", "page:0", "nonsense"):
+    for code in ("", "   ", "S"):
+        title, _body, buttons = await _toggle(code)
+        assert title == "Saved Items"
+        assert isinstance(buttons, list)
+
+    for extra in ("select:page:abc", "page:0", "nonsense"):
         title, _body, buttons = await _panel(extra)
         assert title == "Saved Items"
         assert isinstance(buttons, list)
@@ -299,12 +309,12 @@ async def test_selection_is_bounded_and_the_refusal_is_reported():
 
     await _panel("select")
     for index in range(1, selection_state.MAX_SELECTION + 1):
-        await _panel(f"toggle:S{index:04d}")
+        await _toggle(f"S{index:04d}")
 
     assert selection_state.count(OWNER) == selection_state.MAX_SELECTION
 
     overflow = f"S{selection_state.MAX_SELECTION + 1:04d}"
-    _title, body, _buttons = await _panel(f"toggle:{overflow}")
+    _title, body, _buttons = await _toggle(overflow)
 
     assert overflow not in selection_state.codes(OWNER)
     assert "at most" in body
@@ -344,8 +354,8 @@ async def test_bulk_delete_requires_a_confirmation_and_touches_nothing():
     _seed("S0002")
 
     await _panel("select")
-    await _panel("toggle:S0001")
-    await _panel("toggle:S0002")
+    await _toggle("S0001")
+    await _toggle("S0002")
     title, body, buttons = await _panel("bulk:delete")
 
     assert title == "Delete Selected"
@@ -365,8 +375,8 @@ async def test_bulk_delete_removes_exactly_the_selected_items(monkeypatch):
     calls = _delete_double(monkeypatch)
 
     await _panel("select")
-    await _panel("toggle:S0001")
-    await _panel("toggle:S0003")
+    await _toggle("S0001")
+    await _toggle("S0003")
 
     _title, body, buttons = await handler._retrieve_bulk_delete_action(None, "confirm", CHAT)
 
@@ -386,8 +396,8 @@ async def test_bulk_delete_reports_a_vanished_item_instead_of_full_success(monke
     calls = _delete_double(monkeypatch)
 
     await _panel("select")
-    await _panel("toggle:S0001")
-    await _panel("toggle:S0002")
+    await _toggle("S0001")
+    await _toggle("S0002")
     db_client._fallback["saved_items"].remove(stale)
 
     _title, body, _buttons = await handler._retrieve_bulk_delete_action(None, "confirm", CHAT)
@@ -406,7 +416,7 @@ async def test_bulk_delete_verifies_the_row_is_really_gone(monkeypatch):
     calls = _delete_double(monkeypatch, remove=False)
 
     await _panel("select")
-    await _panel("toggle:S0001")
+    await _toggle("S0001")
 
     _title, body, _buttons = await handler._retrieve_bulk_delete_action(None, "confirm", CHAT)
 
@@ -436,7 +446,7 @@ async def test_a_single_item_delete_still_works_after_a_bulk_session(monkeypatch
     calls = _delete_double(monkeypatch)
 
     await _panel("select")
-    await _panel("toggle:S0001")
+    await _toggle("S0001")
     await _panel("cancel")
     _title, _body, _buttons = await handler._retrieve_item_delete_action(None, "S0001", CHAT)
 
@@ -452,8 +462,8 @@ async def test_bulk_send_calls_the_single_item_retrieval_once_per_selected_code(
         _seed(code)
 
     await _panel("select")
-    await _panel("toggle:S0002")
-    await _panel("toggle:S0003")
+    await _toggle("S0002")
+    await _toggle("S0003")
 
     spy = AsyncMock(return_value=f"{sym.OP_SAVE} Retrieved `S0002` to this chat.")
     monkeypatch.setattr(retrieve_service, "do_retrieve", spy)
@@ -472,8 +482,8 @@ async def test_bulk_send_reports_service_failures_honestly(monkeypatch):
     _seed("S0002")
 
     await _panel("select")
-    await _panel("toggle:S0001")
-    await _panel("toggle:S0002")
+    await _toggle("S0001")
+    await _toggle("S0002")
 
     monkeypatch.setattr(
         retrieve_service, "do_retrieve",
@@ -492,7 +502,7 @@ async def test_bulk_send_reports_service_failures_honestly(monkeypatch):
 async def test_bulk_send_requires_confirmation_and_a_target_chat():
     _seed("S0001")
     await _panel("select")
-    await _panel("toggle:S0001")
+    await _toggle("S0001")
 
     _title, no_chat, _buttons = await handler._retrieve_bulk_send_action(None, "confirm", 0)
     assert "Cannot determine target chat" in no_chat
@@ -573,14 +583,34 @@ def test_bulk_formatting_never_turns_a_partial_result_into_success():
 # ── 11. callback-data budget and routing conventions ──────────────────────
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("extra", ["", "select", "select:page:2", "toggle:S0001", "bulk:send", "bulk:delete"])
+async def test_a_tick_is_an_action_with_a_bounded_callback():
+    """A tick must not be a panel query: panel extras land on the nav stack,
+    which would make Back re-run the toggle and untick an item."""
+    _seed("S0001")
+    handler.register(None, OWNER)
+
+    from backend.helper.panels import get_action
+    assert get_action("retrieve_toggle") is handler._retrieve_toggle_action
+
+    await _panel("select")
+    _title, _body, buttons = await _toggle("S0001")
+
+    datas = _datas(buttons)
+    assert "action:retrieve_toggle:S0001" in datas
+    assert not any(data.startswith("panel:retrieve_saved:toggle:") for data in datas)
+    for data in datas:
+        assert len(data.encode("utf-8")) <= 64, data
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("extra", ["", "select", "select:page:2", "bulk:send", "bulk:delete"])
 async def test_every_multi_select_callback_fits_telegram_and_uses_a_known_prefix(extra):
     for index in range(1, 11):
         _seed(f"S{index:04d}")
 
     await _panel("select")
     if extra.startswith("bulk"):
-        await _panel("toggle:S0001")
+        await _toggle("S0001")
         await _panel("select:page:2")
 
     _title, _body, buttons = await _panel(extra)
