@@ -11,6 +11,7 @@ SESSION LIFECYCLE:
 """
 import asyncio
 import logging
+import time
 from typing import Awaitable, Callable, Any
 
 from telethon import events
@@ -27,6 +28,27 @@ from backend.helper.styles import PRIMARY
 from backend.helper import symbols as sym
 
 logger = logging.getLogger(__name__)
+
+
+class _SkipRender:
+    """A handler's answer: "my state change is applied, a newer click renders".
+
+    Only for handlers whose view is a pure projection of authoritative state
+    and which have just observed that another accepted click is already queued
+    for the same panel (``callback_gate.pending_ahead()``). Skipping the edit
+    loses no click and no state — the queued click renders the newest state —
+    and it is what keeps a 30-click burst at one Telegram edit instead of
+    thirty. Any handler that changes the panel's *kind* (a confirmation, an
+    error, a different sub-view) must render, and therefore never returns this.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "<skip-render>"
+
+
+SKIP_RENDER = _SkipRender()
 
 
 def _buttons_repr(buttons: list) -> tuple[tuple[str, ...], ...]:
@@ -54,6 +76,7 @@ async def _safe_edit(event, text: str, buttons: list, chat_id: int | None, msg_i
     if last == new_repr:
         logger.info("[CALLBACK] edit skipped — content unchanged (key=%s:%s)", chat_id, msg_id)
         return False
+    started = time.monotonic()
     try:
         await event.edit(text, buttons=buttons if buttons else [])
         lifecycle.set_render(chat_id or 0, msg_id or 0, text, new_repr)
@@ -67,6 +90,9 @@ async def _safe_edit(event, text: str, buttons: list, chat_id: int | None, msg_i
             return False
         logger.warning("[CALLBACK] edit FAILED: %s (key=%s:%s)", exc, chat_id, msg_id)
         return False
+    finally:
+        # One Telegram round trip, attributed to the click that caused it.
+        callback_gate.note_edit((time.monotonic() - started) * 1000.0)
 
 
 def _progress_buttons() -> list:
@@ -309,6 +335,13 @@ def _extract_render_result(result) -> tuple[str, str, list]:
 
 
 async def _render_and_edit(event, result, panel_id: str, chat_id: int | None, msg_id: int | None) -> None:
+    if result is SKIP_RENDER:
+        callback_gate.note_coalesced()
+        logger.info(
+            "[CALLBACK] render coalesced into the click queued behind it (panel='%s')",
+            panel_id,
+        )
+        return
     title, body, buttons = _extract_render_result(result)
     if not title and not body and not buttons:
         logger.warning("[CALLBACK] render_and_edit: empty result for panel='%s'", panel_id)
@@ -360,6 +393,22 @@ def _resolve_session(chat_id: int | None, msg_id: int | None, inline_message_id:
     return None, chat_id or 0, msg_id or 0
 
 
+def _will_render(data: str) -> bool:
+    """Whether a click with this callback data ends by editing the panel.
+
+    Used only to decide whether the click queued AHEAD of this one may skip
+    its own render. A click that edits nothing (the page-indicator noop) or
+    removes the panel (close) never supersedes a pending view, so it must not
+    be counted as the render that follows.
+    """
+    if data.startswith("action:") or data.startswith("input:"):
+        return True
+    if data.startswith("panel:"):
+        remainder = data[6:]
+        return remainder not in ("_nav:noop", "_nav:close")
+    return False
+
+
 def register_callback_handlers(client, owner_id: int) -> None:
     logger.info("[PANEL] callback handler registered: owner_id=%s client_id=%s", owner_id, id(client))
 
@@ -394,6 +443,9 @@ def register_callback_handlers(client, owner_id: int) -> None:
             await _safe_answer(event)
             return
         await callback_gate.ack(event, admission)
+        # From here on every observed cost (database round trips, panel edits,
+        # state mutation) is attributed to THIS click's timing record.
+        callback_gate.begin(admission)
 
         sender_id = getattr(event, "sender_id", None)
 
@@ -453,7 +505,9 @@ def register_callback_handlers(client, owner_id: int) -> None:
         # clicks on different messages never wait for each other. Without this
         # two "next page" clicks both render the page they each read, and a slow
         # earlier click can overwrite the newer view it finishes after.
-        turn = await callback_gate.acquire_turn(chat_id, msg_id)
+        turn = await callback_gate.acquire_turn(
+            chat_id, msg_id, renders=_will_render(data)
+        )
         if turn is None:
             callback_gate.finish(admission, "dropped:panel-busy")
             logger.warning(

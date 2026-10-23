@@ -34,6 +34,8 @@ do_edit_tags), so the two surfaces can never drift.
 """
 import json
 import logging
+import time
+from collections import OrderedDict
 from datetime import datetime
 
 from telethon import events
@@ -47,6 +49,7 @@ from backend.services import retrieve_service
 from backend.db import client as db_client
 from backend.helper import (
     InlinePanelBuilder,
+    SKIP_RENDER,
     register_panel,
     register_inline_builder,
     register_action,
@@ -55,6 +58,7 @@ from backend.helper import (
     render,
     to_edit_buttons,
 )
+from backend.helper import callback_gate
 from backend.helper.client import get_client
 from backend.helper.styles import PRIMARY
 from backend.helper import selection_state
@@ -160,8 +164,91 @@ def _item_row_text(row: dict) -> tuple[str, str]:
     return f"{icon} {name}", code
 
 
-async def _saved_page(owner_id: int, page: int) -> tuple[list, int, int, int]:
-    """Clamp ``page`` and read it: ``(items, total, page, total_pages)``."""
+# ── Page snapshot ──
+#
+# The selection view is re-rendered by every tick, and re-reading the page for
+# each tick cost two database round trips (the page plus its exact count) on
+# top of the item lookup — four per tick, which is what made a burst of ticks
+# crawl and queue. A tick only needs the rows that were READ to build the page
+# the owner is already looking at, so those rows are kept for a short, bounded
+# time and reused to validate the exact code its button carried and to label
+# it.
+#
+# Trust model: an entry can only ever be produced by ``db_client.list_saves``
+# for THIS owner, so it cannot carry another owner's row, and a tick may only
+# select a code the page actually presented. ``retrieve_service`` re-verifies
+# owner + existence for every code again before ANY bulk side effect, so a
+# stale snapshot can cost a visible "no longer in your saved items" report —
+# never a wrong transfer. Staleness is bounded by the TTL and is cleared
+# outright when the list is known to have changed (a bulk delete, a failed
+# lookup, or opening the view fresh).
+
+_PAGE_SNAPSHOT_TTL_S = 60.0
+_PAGE_SNAPSHOT_LIMIT = 8
+
+_page_snapshot: "OrderedDict[tuple[int, int], tuple[float, list, int, int]]" = OrderedDict()
+
+
+def _snapshot_invalidate(owner_id: int | None = None) -> None:
+    """Drop every snapshot, or just one owner's."""
+    if owner_id is None:
+        _page_snapshot.clear()
+        return
+    for key in [k for k in _page_snapshot if k[0] == owner_id]:
+        _page_snapshot.pop(key, None)
+
+
+def _snapshot_get(owner_id: int, page: int) -> tuple[list, int, int, int] | None:
+    entry = _page_snapshot.get((owner_id, page))
+    if entry is None:
+        return None
+    stored_at, items, total, total_pages = entry
+    if time.monotonic() - stored_at > _PAGE_SNAPSHOT_TTL_S:
+        _page_snapshot.pop((owner_id, page), None)
+        return None
+    return list(items), total, page, total_pages
+
+
+def _snapshot_put(owner_id: int, page: int, items: list, total: int, total_pages: int) -> None:
+    _page_snapshot[(owner_id, page)] = (time.monotonic(), list(items), total, total_pages)
+    while len(_page_snapshot) > _PAGE_SNAPSHOT_LIMIT:
+        _page_snapshot.popitem(last=False)
+
+
+def _snapshot_row(owner_id: int, code: str) -> dict | None:
+    """The presented row for ``code``, from a live page snapshot or ``None``.
+
+    Only rows this owner's own page reads returned are ever visible here, so a
+    hit is exactly the item whose button the owner tapped.
+    """
+    wanted = selection_state.normalize_code(code)
+    if not wanted:
+        return None
+    now = time.monotonic()
+    for key, entry in list(_page_snapshot.items()):
+        if key[0] != owner_id:
+            continue
+        stored_at, items, _total, _pages = entry
+        if now - stored_at > _PAGE_SNAPSHOT_TTL_S:
+            _page_snapshot.pop(key, None)
+            continue
+        for item in items:
+            if selection_state.normalize_code(item.get("save_code")) == wanted:
+                return item
+    return None
+
+
+async def _saved_page(owner_id: int, page: int, fresh: bool = False) -> tuple[list, int, int, int]:
+    """Clamp ``page`` and read it: ``(items, total, page, total_pages)``.
+
+    ``fresh=True`` reads the database (opening a view); the default reuses a
+    live snapshot so re-rendering the SAME page after a tick costs no round
+    trip.
+    """
+    if not fresh:
+        cached = _snapshot_get(owner_id, page)
+        if cached is not None:
+            return cached
     per_page = _SAVED_PER_PAGE
     offset = (page - 1) * per_page
     items, total = await db_client.list_saves(owner_id, limit=per_page, offset=offset)
@@ -170,12 +257,13 @@ async def _saved_page(owner_id: int, page: int) -> tuple[list, int, int, int]:
         page = total_pages
         offset = (page - 1) * per_page
         items, total = await db_client.list_saves(owner_id, limit=per_page, offset=offset)
-    return items, total, page, total_pages
+    _snapshot_put(owner_id, page, items, total, total_pages)
+    return list(items), total, page, total_pages
 
 
 async def _render_saved_browser(owner_id: int, page: int) -> tuple[str, str, list]:
     """The established single-item browser, plus its multi-select entry."""
-    items, total, page, total_pages = await _saved_page(owner_id, page)
+    items, total, page, total_pages = await _saved_page(owner_id, page, fresh=True)
 
     if not items:
         return "Saved Items", f"_No saved items found._\n\nSave something first from the LifeOS menu ({sym.OP_SAVE} Save → Deep Save).", []
@@ -202,12 +290,12 @@ async def _render_saved_browser(owner_id: int, page: int) -> tuple[str, str, lis
 
 
 async def _render_selection(owner_id: int, page: int | None = None,
-                            notice: str = "") -> tuple[str, str, list]:
+                            notice: str = "", fresh: bool = False) -> tuple[str, str, list]:
     """The multi-select view: the same page, each row an exact-code toggle."""
     page = selection_state.set_page(
         owner_id, page if page is not None else selection_state.current_page(owner_id)
     )
-    items, total, page, total_pages = await _saved_page(owner_id, page)
+    items, total, page, total_pages = await _saved_page(owner_id, page, fresh=fresh)
     selection_state.set_page(owner_id, page)
     chosen = selection_state.count(owner_id)
 
@@ -252,27 +340,49 @@ async def _render_selection(owner_id: int, page: int | None = None,
     return "Saved Items", "\n".join(body_lines), builder.build()
 
 
-async def _toggle_selected_item(owner_id: int, raw_code: str) -> tuple[str, str, list]:
-    """Tick/untick ONE verified item by the code its button carried."""
+async def _toggle_selected_item(owner_id: int, raw_code: str) -> tuple[str, str, list] | object:
+    """Tick/untick ONE verified item by the code its button carried.
+
+    The row comes from the page snapshot that produced the button, so a tick on
+    a presented item costs no database round trip and cannot touch any other
+    item. Only a code the current snapshot does not know (a hand-built
+    callback, or a page read before the snapshot existed) falls back to the
+    verified item lookup.
+    """
     code = selection_state.normalize_code(raw_code)
     if not code:
         return await _render_selection(
             owner_id, notice=f"{sym.STATE_WARNING} That button named no saved item — nothing was selected."
         )
-    try:
-        row = await retrieve_service.load_saved_item(code, owner_id)
-    except Exception as exc:
-        logger.warning("saved-items selection lookup failed for %s: %s", code, exc)
-        return await _render_selection(
-            owner_id, notice=f"{sym.STATE_WARNING} Could not verify `{code}` — nothing was selected."
-        )
-    if not row:
-        return await _render_selection(
-            owner_id,
-            notice=f"{sym.STATE_FAILED} `{code}` is no longer in your saved items — nothing was selected.",
-        )
+    row = _snapshot_row(owner_id, code)
+    if row is None:
+        try:
+            row = await retrieve_service.load_saved_item(code, owner_id)
+        except Exception as exc:
+            logger.warning("saved-items selection lookup failed for %s: %s", code, exc)
+            return await _render_selection(
+                owner_id, notice=f"{sym.STATE_WARNING} Could not verify `{code}` — nothing was selected."
+            )
+        if not row:
+            # The page this view was built from mentioned an item the database
+            # no longer has: drop the stale snapshot and read the page again so
+            # the view cannot keep offering it.
+            _snapshot_invalidate(owner_id)
+            return await _render_selection(
+                owner_id,
+                notice=f"{sym.STATE_FAILED} `{code}` is no longer in your saved items — nothing was selected.",
+                fresh=True,
+            )
     label, _code = _item_row_text(row)
+    started = time.monotonic()
     _selected, reason = selection_state.toggle(owner_id, code, label)
+    callback_gate.note_state((time.monotonic() - started) * 1000.0)
+    if not reason and callback_gate.pending_ahead() > 0:
+        # The state change is applied and an accepted click is already queued
+        # to render this same panel from it. Rendering here would be a round
+        # trip the next click immediately overwrites, and a burst of ticks
+        # would otherwise become a burst of edits.
+        return SKIP_RENDER
     notice = f"{sym.STATE_WARNING} `{code}` was not selected: {reason}." if reason else ""
     return await _render_selection(owner_id, notice=notice)
 
@@ -317,14 +427,18 @@ async def _retrieve_saved_panel_handler(event, extra: str) -> tuple[str, str, li
     extra = extra or ""
     if extra == _SELECT_NEW:
         selection_state.clear(owner_id)
-        return await _render_selection(owner_id, 1)
+        # A new session starts from the list as it is now, never from a page
+        # read for an earlier session.
+        _snapshot_invalidate(owner_id)
+        return await _render_selection(owner_id, 1, fresh=True)
     if extra == _SELECT_BACK:
-        return await _render_selection(owner_id)
+        return await _render_selection(owner_id, fresh=True)
     if extra == _SELECT_CANCEL:
         selection_state.clear(owner_id)
+        _snapshot_invalidate(owner_id)
         return await _render_saved_browser(owner_id, 1)
     if extra.startswith(_SELECT_NEW):
-        return await _render_selection(owner_id, _page_value(extra))
+        return await _render_selection(owner_id, _page_value(extra), fresh=True)
     if extra == "bulk:send":
         return _bulk_review(owner_id, _BULK_SEND)
     if extra == "bulk:delete":
@@ -681,6 +795,8 @@ async def _retrieve_bulk_delete_action(event, extra: str, chat_id: int) -> tuple
         )
     result = await retrieve_service.do_bulk_delete(_self_client, _owner_id, codes)
     selection_state.clear(_owner_id)
+    # The list changed: no snapshot may keep offering a deleted item.
+    _snapshot_invalidate(_owner_id)
     return "Delete Selected", retrieve_service.format_bulk_result(result), _bulk_result_buttons()
 
 

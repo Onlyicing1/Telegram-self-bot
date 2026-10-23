@@ -258,16 +258,41 @@ through `backend/helper` registries and dispatched by `panels._callback_router`.
 - **One FIFO turn per panel.** Clicks on the same `(chat_id, msg_id)` run one at
   a time in arrival order; clicks on different panels never wait for each
   other. A click that queued behind a close is dropped (`dropped:panel-closed`),
-  and one that cannot take its turn within `DEFAULT_TURN_WAIT_S` is dropped with
-  `dropped:panel-busy` and a log line — never executed later against a panel it
-  no longer matches.
+  and one that cannot take its turn is dropped with `dropped:panel-busy` and a
+  log line — never executed later against a panel it no longer matches. The
+  wait is `DEFAULT_TURN_WAIT_S` (20s) plus `PER_PENDING_WAIT_S` per click already
+  queued, capped at `MAX_TURN_WAIT_S` (120s, Telegram's own callback lifetime),
+  so the tail of a burst is never dropped for being queued behind clicks that
+  are themselves progressing.
 - **Duplicate suppression by Telegram's `query_id`** — a re-delivered query runs
   once and is still answered; two genuine clicks are two queries and both run.
   No debounce window, no rate limit, no silent discards.
-- **Every accepted click is accounted for** by one `[CALLBACK] timing` line
-  (`ack_ms`, `wait_ms`, `work_ms`, `total_ms`) and one outcome
-  (`completed` / `failed` / `cancelled` / `rejected:*` / `dropped:*`). Callback
-  data is logged truncated to 64 characters; no message content or credentials.
+- **Renders are coalesced, clicks never are.** A handler whose view is a pure
+  projection of authoritative state may return `panels.SKIP_RENDER` after
+  applying its change when `callback_gate.pending_ahead() > 0` — i.e. an
+  accepted click is already queued to paint this same panel. The last queued
+  click renders the newest state; intermediate edits (N Telegram round trips on
+  one message) are skipped. A confirmation, error or sub-view must always
+  render, and `pending_ahead()` counts only queued clicks that will edit the
+  panel (`_will_render`), never a noop or a close.
+- **Every accepted click is accounted for** by one `[CALLBACK] timing` line and
+  one outcome (`completed` / `failed` / `cancelled` / `rejected:*` /
+  `dropped:*`). The line reports `ack_ms` (receipt → answer), `ack_rpc_ms` (the
+  answer RPC itself), `wait_ms` (answer → dispatch), `work_ms` (dispatch →
+  edit), `total_ms`, plus what the click actually cost: `db`/`db_ms` (observed
+  at `db.client.run_sync_db`), `edits`/`edit_ms` (observed at
+  `panels._safe_edit`), `state_ms`, `coalesced`, and the `backlog` it saw.
+  Callback data is logged truncated to 64 characters; no message content or
+  credentials.
+- **The Stash selection view is snapshot-backed.** `retrieve.py` keeps a bounded
+  (8 pages, 60s, per owner) snapshot of the pages it rendered, so a tick is
+  validated and labelled from the rows its own button came from instead of
+  re-reading the database (`load_saved_item` + `list_saves` = 4 round trips). A
+  snapshot is invalidated on a new selection session, on cancel, after a bulk
+  delete, and whenever a verified lookup contradicts it; `retrieve_service`
+  still re-verifies owner + existence for every code before any bulk side
+  effect, so a stale entry can only cost an honest "no longer in your saved
+  items" report.
 
 ---
 

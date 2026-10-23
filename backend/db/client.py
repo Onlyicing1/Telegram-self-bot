@@ -238,7 +238,19 @@ async def run_sync_db(fn, *args, timeout=_DB_TIMEOUT, **kwargs):
     coro = loop.run_in_executor(
         _get_db_executor(), _timed_db_call, fn, args, kwargs
     )
-    return await guarded_await(coro, name=f"db:{op_name}", timeout=timeout)
+    started = time.monotonic()
+    try:
+        return await guarded_await(coro, name=f"db:{op_name}", timeout=timeout)
+    finally:
+        # Attribute the round trip to the callback click currently being served,
+        # when there is one. A no-op for every other caller (startup, tasks, AI
+        # persistence), so this adds no bookkeeping outside the click path.
+        try:
+            from backend.helper.callback_gate import note_db
+
+            note_db((time.monotonic() - started) * 1000.0)
+        except Exception:
+            pass
 
 
 async def _run_sync(fn, *args, **kwargs):

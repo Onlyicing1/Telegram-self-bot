@@ -108,6 +108,7 @@ def _clean_state():
     db_client._fallback["saved_items"] = []
     db_client._fallback["bot_logs"] = []
     selection_state.clear_all()
+    handler._snapshot_invalidate()
     inline_engine.set_owner_id(OWNER)
     inline_engine.set_self_client(None)
     yield
