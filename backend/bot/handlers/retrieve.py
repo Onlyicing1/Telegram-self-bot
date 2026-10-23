@@ -49,7 +49,6 @@ from backend.services import retrieve_service
 from backend.db import client as db_client
 from backend.helper import (
     InlinePanelBuilder,
-    SKIP_RENDER,
     register_panel,
     register_inline_builder,
     register_action,
@@ -340,7 +339,7 @@ async def _render_selection(owner_id: int, page: int | None = None,
     return "Saved Items", "\n".join(body_lines), builder.build()
 
 
-async def _toggle_selected_item(owner_id: int, raw_code: str) -> tuple[str, str, list] | object:
+async def _toggle_selected_item(owner_id: int, raw_code: str) -> tuple[str, str, list]:
     """Tick/untick ONE verified item by the code its button carried.
 
     The row comes from the page snapshot that produced the button, so a tick on
@@ -377,12 +376,9 @@ async def _toggle_selected_item(owner_id: int, raw_code: str) -> tuple[str, str,
     started = time.monotonic()
     _selected, reason = selection_state.toggle(owner_id, code, label)
     callback_gate.note_state((time.monotonic() - started) * 1000.0)
-    if not reason and callback_gate.pending_ahead() > 0:
-        # The state change is applied and an accepted click is already queued
-        # to render this same panel from it. Rendering here would be a round
-        # trip the next click immediately overwrites, and a burst of ticks
-        # would otherwise become a burst of edits.
-        return SKIP_RENDER
+    # The view is built for every tick; the panel's single writer keeps only the
+    # newest one, so a burst of ticks costs at most two Telegram edits without
+    # this handler having to know how many clicks are queued behind it.
     notice = f"{sym.STATE_WARNING} `{code}` was not selected: {reason}." if reason else ""
     return await _render_selection(owner_id, notice=notice)
 

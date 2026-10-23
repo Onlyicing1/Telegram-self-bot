@@ -727,7 +727,7 @@ async def test_back_from_stt_settings_returns_to_speech_to_text(monkeypatch):
     )
     monkeypatch.setattr(panels_module, "_render_and_edit", no_render)
 
-    await panels_module._handle_navigation(None, "back", 910001, 910002, 4242)
+    await panels_module.dispatch_click(None, "panel:_nav:back", 910001, 910002, 4242)
 
     assert visited == [""]
     assert sessions.current_nav(910001, 910002) == ("ai_media_stt", "")

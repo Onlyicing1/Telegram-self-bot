@@ -41,15 +41,18 @@ called by the ONE bounded database dispatcher (``db.client.run_sync_db``),
 record therefore states how many database round trips and how many Telegram
 edits it actually cost — the two things a burst multiplies.
 
-``pending_ahead``
-    How many clicks are already queued behind the one this task is serving. A
-    handler that has applied its state change can use it to skip a render that
-    the next click is about to supersede: every click is still applied exactly
-    once, in order, and the queue renders the newest state instead of N
-    intermediate ones.
+``PanelPainter`` (``painter`` / ``forget_painter``)
+    One message's single writer for view updates, where the newest view wins.
+    A panel is a state machine on one message, but PAINTING is only a projection
+    of that state: with N clicks queued, painting view 1..N is N Telegram round
+    trips that all end on the same message — and, because the turn used to cover
+    the paint, each paint also held up the handlers behind it. The painter keeps
+    at most ONE pending view, always paints the newest, never runs two edits on
+    one message at a time, and lets a click return as soon as its handler is
+done.
 
-Every function is loop-local and synchronous except ``ack`` and
-``acquire_turn``; nothing here blocks the event loop.
+Every function is loop-local and synchronous except ``ack``, ``acquire_turn``
+and ``PanelPainter.drain``; nothing here blocks the event loop.
 """
 from __future__ import annotations
 
@@ -96,6 +99,7 @@ class CallbackAdmission:
         "received_at",
         "acked_at",
         "dispatch_at",
+        "handled_at",
         "rendered_at",
         "finished_at",
         "outcome",
@@ -115,6 +119,7 @@ class CallbackAdmission:
         self.received_at = time.monotonic()
         self.acked_at: float | None = None
         self.dispatch_at: float | None = None
+        self.handled_at: float | None = None
         self.rendered_at: float | None = None
         self.finished_at: float | None = None
         self.outcome = "pending"
@@ -137,8 +142,14 @@ class CallbackAdmission:
     def mark_dispatch(self) -> None:
         self.dispatch_at = time.monotonic()
 
+    def mark_handled(self) -> None:
+        """The handler finished: its state change is applied and its view built."""
+        if self.handled_at is None:
+            self.handled_at = time.monotonic()
+
     def mark_rendered(self) -> None:
-        self.rendered_at = time.monotonic()
+        if self.rendered_at is None:
+            self.rendered_at = time.monotonic()
 
     # ── measured stages (milliseconds) ──
 
@@ -160,8 +171,17 @@ class CallbackAdmission:
 
     @property
     def work_ms(self) -> float:
-        """Dispatch start → edit attempted: handler work plus the UI response."""
-        return self._ms(self.dispatch_at, self.rendered_at)
+        """Dispatch start → handler finished: the click's own state work.
+
+        Deliberately excludes the paint, which is a Telegram round trip the
+        click may not have performed at all (a superseded view).
+        """
+        return self._ms(self.dispatch_at, self.handled_at)
+
+    @property
+    def paint_ms(self) -> float:
+        """Handler finished → paint finished (0 when the view was superseded)."""
+        return self._ms(self.handled_at, self.rendered_at)
 
     @property
     def total_ms(self) -> float:
@@ -240,22 +260,82 @@ def note_coalesced() -> None:
         admission.coalesced += 1
 
 
-def pending_ahead() -> int:
-    """Clicks already queued for the panel turn this task holds.
+class PanelPainter:
+    """The single writer for one panel message; the newest view wins.
 
-    ``0`` when no click is queued behind this one — the caller must render,
-    because nothing else is going to. A positive count means another accepted
-    click is already waiting to render this same panel from the same
-    authoritative state, so a render here would only be overwritten.
+    ``publish`` is synchronous: it stores the view and says whether THIS caller
+    must drive the paint. When a paint is already in flight the view is simply
+    left in the slot, and the writer picks it up on its next iteration — so
+    nothing is lost and no second task is created.
     """
-    task = _task()
-    entry = _held.get(task) if task is not None else None
-    if entry is None:
-        return 0
-    return sum(
-        1 for waiter in entry.waiters
-        if waiter.renders and not waiter.future.done()
-    )
+
+    __slots__ = ("generation", "pending", "in_flight", "closed")
+
+    def __init__(self) -> None:
+        self.generation = 0
+        self.pending: tuple[int, object] | None = None
+        self.in_flight = False
+        self.closed = False
+
+    def publish(self, view: object) -> bool:
+        """Store ``view`` as the newest one; True when the caller must paint."""
+        self.generation += 1
+        self.pending = (self.generation, view)
+        if self.in_flight:
+            return False
+        self.in_flight = True
+        return True
+
+    def take(self) -> tuple[int, object] | None:
+        item = self.pending
+        self.pending = None
+        return item
+
+    def discard(self) -> None:
+        """Drop any pending view and refuse further ones (panel is gone)."""
+        self.closed = True
+        self.pending = None
+
+    async def drain(self, paint, alive=None) -> int:
+        """Paint the newest published view until no newer one is pending.
+
+        Returns how many edits this caller actually performed. Every iteration
+        takes the NEWEST slot, so a view superseded while an edit was in flight
+        is never painted after the newer one.
+        """
+        painted = 0
+        try:
+            while not self.closed:
+                item = self.take()
+                if item is None:
+                    return painted
+                if alive is not None and not alive():
+                    return painted
+                await paint(item[1])
+                painted += 1
+            return painted
+        finally:
+            self.in_flight = False
+
+
+_painters: dict[tuple[int, int], PanelPainter] = {}
+
+
+def painter(chat_id: int | None, msg_id: int | None) -> PanelPainter:
+    """The single writer for this panel message (created on first use)."""
+    key = _key(chat_id, msg_id)
+    entry = _painters.get(key)
+    if entry is None or entry.closed:
+        entry = _painters[key] = PanelPainter()
+    return entry
+
+
+def forget_painter(chat_id: int | None, msg_id: int | None) -> None:
+    """Drop this panel's writer and any view still waiting to be painted."""
+    key = _key(chat_id, msg_id)
+    entry = _painters.pop(key, None)
+    if entry is not None:
+        entry.discard()
 
 
 def query_id_of(event) -> int | None:
@@ -303,16 +383,6 @@ async def ack(event, admission: CallbackAdmission) -> None:
     admission.mark_ack(error)
 
 
-class _Waiter:
-    """One queued click: its turn future and whether it will edit the panel."""
-
-    __slots__ = ("future", "renders")
-
-    def __init__(self, future: asyncio.Future, renders: bool) -> None:
-        self.future = future
-        self.renders = renders
-
-
 class _Turn:
     """The one FIFO turn for a panel message."""
 
@@ -320,7 +390,7 @@ class _Turn:
 
     def __init__(self) -> None:
         self.busy = False
-        self.waiters: deque[_Waiter] = deque()
+        self.waiters: deque[asyncio.Future] = deque()
 
 
 _turns: dict[tuple[int, int], _Turn] = {}
@@ -340,9 +410,9 @@ def _grant(entry: _Turn) -> None:
     """Hand the turn to the next waiter, or mark the panel idle."""
     while entry.waiters:
         waiter = entry.waiters.popleft()
-        if waiter.future.done():
+        if waiter.done():
             continue
-        waiter.future.set_result(True)
+        waiter.set_result(True)
         return
     entry.busy = False
 
@@ -351,15 +421,8 @@ async def acquire_turn(
     chat_id: int | None,
     msg_id: int | None,
     wait: float | None = None,
-    *,
-    renders: bool = True,
 ) -> _Turn | None:
-    """Take this panel's turn, or ``None`` if it could not be taken in time.
-
-    ``renders`` states whether THIS click will edit the panel message; the
-    click ahead of it uses that to decide whether its own render is already
-    superseded (see ``pending_ahead``).
-    """
+    """Take this panel's turn, or ``None`` if it could not be taken in time."""
     wait = DEFAULT_TURN_WAIT_S if wait is None else wait
     key = _key(chat_id, msg_id)
     entry = _turns.get(key)
@@ -370,11 +433,11 @@ async def acquire_turn(
         _bind_turn(entry)
         return entry
 
-    waiter = _Waiter(asyncio.get_running_loop().create_future(), renders)
-    pending = sum(1 for other in entry.waiters if not other.future.done())
+    waiter = asyncio.get_running_loop().create_future()
+    pending = sum(1 for other in entry.waiters if not other.done())
     entry.waiters.append(waiter)
     try:
-        await asyncio.wait_for(waiter.future, turn_deadline(wait, pending))
+        await asyncio.wait_for(waiter, turn_deadline(wait, pending))
         _bind_turn(entry)
         return entry
     except asyncio.TimeoutError:
@@ -421,14 +484,15 @@ def finish(admission: CallbackAdmission, outcome: str) -> None:
         _current.pop(task, None)
     logger.info(
         "[CALLBACK] timing data='%s' outcome=%s ack_ms=%.1f ack_rpc_ms=%.1f "
-        "wait_ms=%.1f work_ms=%.1f total_ms=%.1f db=%d db_ms=%.1f edits=%d "
-        "edit_ms=%.1f state_ms=%.2f coalesced=%d backlog=%d%s",
+        "wait_ms=%.1f work_ms=%.1f paint_ms=%.1f total_ms=%.1f db=%d db_ms=%.1f "
+        "edits=%d edit_ms=%.1f state_ms=%.2f coalesced=%d%s",
         _short(admission.data),
         outcome,
         admission.ack_ms,
         admission.ack_rpc_ms,
         admission.wait_ms,
         admission.work_ms,
+        admission.paint_ms,
         admission.total_ms,
         admission.db_calls,
         admission.db_ms,
@@ -436,7 +500,6 @@ def finish(admission: CallbackAdmission, outcome: str) -> None:
         admission.edit_ms,
         admission.state_ms,
         admission.coalesced,
-        pending_ahead(),
         f" ack_error={admission.ack_error}" if admission.ack_error else "",
     )
 
@@ -453,3 +516,4 @@ def reset() -> None:
     _turns.clear()
     _held.clear()
     _current.clear()
+    _painters.clear()

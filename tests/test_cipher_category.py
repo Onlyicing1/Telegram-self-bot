@@ -190,7 +190,7 @@ def _navigate(monkeypatch, action: str, chat_id: int = CHAT_ID, msg_id: int = MS
         "_safe_edit",
         AsyncMock(side_effect=lambda *a, **k: edits.append(a) or True),
     )
-    _run(panels._handle_navigation(AsyncMock(), action, chat_id, msg_id, OWNER))
+    _run(panels.dispatch_click(AsyncMock(), f"panel:_nav:{action}", chat_id, msg_id, OWNER))
     assert edits, f"{action} must re-render through the existing edit path"
     return edits[-1]
 

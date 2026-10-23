@@ -379,9 +379,9 @@ def _dispatch(data: str) -> _ClickEvent:
     remainder = data[len("panel:"):]
     if remainder.startswith("_nav:"):
         action = remainder[len("_nav:"):]
-        _run(panels_module._handle_navigation(event, action, PANEL_CHAT, PANEL_MSG, OWNER))
+        _run(panels_module.dispatch_click(event, f"panel:_nav:{action}", PANEL_CHAT, PANEL_MSG, OWNER))
     else:
-        _run(panels_module._handle_panel(event, remainder, PANEL_CHAT, PANEL_MSG, OWNER))
+        _run(panels_module.dispatch_click(event, f"panel:{remainder}", PANEL_CHAT, PANEL_MSG, OWNER))
     return event
 
 

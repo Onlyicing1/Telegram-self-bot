@@ -163,7 +163,7 @@ def test_shared_navigation_uses_registry_glyphs():
 
 
 def test_input_prompt_navigation_uses_registry_glyphs():
-    from backend.helper.panels import _handle_input, register_input
+    from backend.helper.panels import dispatch_click, register_input
     from backend.helper import panels
 
     captured: list = []
@@ -178,7 +178,7 @@ def test_input_prompt_navigation_uses_registry_glyphs():
     original = panels._safe_edit
     panels._safe_edit = _capture
     try:
-        _run(_handle_input(object(), "_sym_probe:field", OWNER, 11, 22))
+        _run(dispatch_click(object(), "input:_sym_probe:field", 11, 22, OWNER))
     finally:
         panels._safe_edit = original
     _text, buttons = captured[-1]

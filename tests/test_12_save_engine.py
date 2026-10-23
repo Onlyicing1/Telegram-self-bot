@@ -160,7 +160,7 @@ async def test_menu_has_settings_button():
 
 @pytest.mark.asyncio
 async def test_settings_callback_dispatch_renders_panel():
-    from backend.helper.panels import _handle_panel
+    from backend.helper.panels import dispatch_click
     from backend.helper.lifecycle import get_lifecycle
     from backend.bot.handlers import misc
 
@@ -182,7 +182,7 @@ async def test_settings_callback_dispatch_renders_panel():
     lifecycle.sessions.create(111, 222, panel_type="menu", owner_id=12345)
 
     ev = FakeCbEvent()
-    await _handle_panel(ev, "settings", 111, 222, 12345)
+    await dispatch_click(ev, "panel:settings", 111, 222, 12345)
     assert getattr(ev, "edited", None) is not None
     assert "**Settings**" in ev.edited
     assert "Auto-close:" in ev.edited

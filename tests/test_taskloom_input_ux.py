@@ -91,7 +91,7 @@ def test_field_input_prompt_offers_back_and_a_real_cancel(wizard, monkeypatch):
         return True
 
     monkeypatch.setattr(panels, "_safe_edit", _capture)
-    _run(panels._handle_input(object(), "taskloom_new:interval", OWNER, 111, 222))
+    _run(panels.dispatch_click(object(), "input:taskloom_new:interval", 111, 222, OWNER))
 
     assert captured, "the input prompt was never rendered"
     _text, buttons = captured[-1]
@@ -264,7 +264,7 @@ def test_back_from_a_field_input_returns_to_the_same_step_with_the_draft(wizard,
 
     monkeypatch.setattr(panels, "_safe_edit", _capture)
     # The prompt's "← Back" is the panel query that owns the input.
-    _run(panels._handle_panel(object(), "taskloom_new", 111, 222, OWNER))
+    _run(panels.dispatch_click(object(), "panel:taskloom_new", 111, 222, OWNER))
 
     draft = handler._draft(OWNER)
     assert draft.step == handler.STEP_SCHEDULE
@@ -434,7 +434,7 @@ def test_field_input_back_inside_an_edit_reopens_the_editor_not_taskloom_home(wi
         return True
 
     monkeypatch.setattr(panels, "_safe_edit", _capture)
-    _run(panels._handle_input(object(), "taskloom_new:interval", OWNER, 111, 222))
+    _run(panels.dispatch_click(object(), "input:taskloom_new:interval", 111, 222, OWNER))
     _text, buttons = captured[-1]
     pairs = _pairs(buttons)
     assert ("❮ Back", "panel:taskloom_new") in pairs
@@ -447,7 +447,7 @@ def test_field_input_back_inside_an_edit_reopens_the_editor_not_taskloom_home(wi
         return True
 
     monkeypatch.setattr(panels, "_safe_edit", _capture_panel)
-    _run(panels._handle_panel(object(), "taskloom_new", 111, 222, OWNER))
+    _run(panels.dispatch_click(object(), "panel:taskloom_new", 111, 222, OWNER))
 
     draft = handler._draft(OWNER)
     assert draft.editing_task_id == task.id            # still the editor

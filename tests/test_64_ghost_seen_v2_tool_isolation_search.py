@@ -315,7 +315,7 @@ async def test_main_search_callback_reaches_registered_open_action(search_state,
 
     monkeypatch.setattr(panels, "_render_and_edit", capture_render)
     event = SimpleNamespace(chat_id=60, message_id=0)
-    await panels._handle_action(event, "ghost_seen_v2_open:101", 60, 5, 999)
+    await panels.dispatch_click(event, "action:ghost_seen_v2_open:101", 60, 5, 999)
 
     assert captured["chat_id"] == 60
     assert captured["msg_id"] == 5

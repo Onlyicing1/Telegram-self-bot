@@ -267,23 +267,33 @@ through `backend/helper` registries and dispatched by `panels._callback_router`.
 - **Duplicate suppression by Telegram's `query_id`** — a re-delivered query runs
   once and is still answered; two genuine clicks are two queries and both run.
   No debounce window, no rate limit, no silent discards.
-- **Renders are coalesced, clicks never are.** A handler whose view is a pure
-  projection of authoritative state may return `panels.SKIP_RENDER` after
-  applying its change when `callback_gate.pending_ahead() > 0` — i.e. an
-  accepted click is already queued to paint this same panel. The last queued
-  click renders the newest state; intermediate edits (N Telegram round trips on
-  one message) are skipped. A confirmation, error or sub-view must always
-  render, and `pending_ahead()` counts only queued clicks that will edit the
-  panel (`_will_render`), never a noop or a close.
+- **The turn covers the handler, never the paint.** The per-panel turn is
+  released as soon as the handler has applied its state change and built its
+  view; the Telegram edit happens afterwards. A queued click therefore never
+  waits for an edit it is about to supersede (this was the remaining burst
+  cost: N clicks used to mean N serialised edit round trips on one message).
+- **One writer per message, newest view wins.** `callback_gate.PanelPainter`
+  (`painter` / `forget_painter`) keeps at most ONE pending view per
+  `(chat_id, msg_id)`, paints the newest, never runs two edits on one message
+  at once, and lets the first click's task paint the latest view the queue
+  produced. A view superseded before it was painted is recorded (`coalesced`)
+  — the click itself is still applied exactly once, and only a *paint* can be
+  dropped. `panel:_nav:close` forgets the writer so nothing paints a closed
+  message afterwards.
 - **Every accepted click is accounted for** by one `[CALLBACK] timing` line and
   one outcome (`completed` / `failed` / `cancelled` / `rejected:*` /
   `dropped:*`). The line reports `ack_ms` (receipt → answer), `ack_rpc_ms` (the
   answer RPC itself), `wait_ms` (answer → dispatch), `work_ms` (dispatch →
-  edit), `total_ms`, plus what the click actually cost: `db`/`db_ms` (observed
-  at `db.client.run_sync_db`), `edits`/`edit_ms` (observed at
-  `panels._safe_edit`), `state_ms`, `coalesced`, and the `backlog` it saw.
-  Callback data is logged truncated to 64 characters; no message content or
-  credentials.
+  handler done), `paint_ms` (handler done → paint done, 0 when superseded),
+  `total_ms`, plus what the click actually cost: `db`/`db_ms` (observed at
+  `db.client.run_sync_db`), `edits`/`edit_ms` (observed at
+  `panels._safe_edit`), `state_ms` and `coalesced`. Callback data is logged
+  truncated to 64 characters; no message content or credentials.
+- **The lifecycle lock never spans a Telegram round trip.**
+  `PanelLifecycleManager.close_panel` / `timeout_panel` release every resource
+  under the lock (`_cleanup_state_locked`, synchronous) and then perform the
+  closing edit outside it (`_close_message`). Holding it across the edit
+  serialised unrelated panel create/close operations process-wide.
 - **The Stash selection view is snapshot-backed.** `retrieve.py` keeps a bounded
   (8 pages, 60s, per owner) snapshot of the pages it rendered, so a tick is
   validated and labelled from the rows its own button came from instead of

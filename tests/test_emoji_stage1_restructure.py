@@ -198,7 +198,7 @@ def test_back_navigation_uses_the_existing_handler(monkeypatch):
         panels, "_safe_edit", AsyncMock(side_effect=lambda *a, **k: edits.append(a) or True)
     )
     event = AsyncMock()
-    _run(panels._handle_navigation(event, "back", chat_id, msg_id, OWNER))
+    _run(panels.dispatch_click(event, "panel:_nav:back", chat_id, msg_id, OWNER))
     assert edits, "back must re-render through the existing edit path"
     # the nav stack popped back to the parent (menu)
     assert lifecycle.sessions.current_nav(chat_id, msg_id)[0] == "menu"
@@ -217,7 +217,7 @@ def test_home_navigation_resets_to_menu(monkeypatch):
 
     monkeypatch.setattr(panels, "_safe_edit", AsyncMock(return_value=True))
     event = AsyncMock()
-    _run(panels._handle_navigation(event, "home", chat_id, msg_id, OWNER))
+    _run(panels.dispatch_click(event, "panel:_nav:home", chat_id, msg_id, OWNER))
     assert lifecycle.sessions.current_nav(chat_id, msg_id)[0] == "menu"
 
 
@@ -237,7 +237,7 @@ def test_close_navigation_calls_the_existing_close_path(monkeypatch):
 
     monkeypatch.setattr(PanelLifecycleManager, "close_panel", _fake_close_panel)
     event = AsyncMock()
-    _run(panels._handle_navigation(event, "close", chat_id, msg_id, OWNER))
+    _run(panels.dispatch_click(event, "panel:_nav:close", chat_id, msg_id, OWNER))
     assert called.get("close") == (chat_id, msg_id)
 
 
@@ -253,7 +253,7 @@ def test_expired_nav_state_fails_safe(monkeypatch):
     monkeypatch.setattr(panels, "_safe_edit", AsyncMock(return_value=True))
     event = AsyncMock()
     # No exception expected even with no session for this chat/msg.
-    _run(panels._handle_navigation(event, "back", 99999, 88888, OWNER))
+    _run(panels.dispatch_click(event, "panel:_nav:back", 99999, 88888, OWNER))
 
 
 # ── 3. General → Auto-Reaction setting ───────────────────────────────────────

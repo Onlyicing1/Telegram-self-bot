@@ -469,7 +469,7 @@ async def test_input_prompt_offers_no_panel_stack_back(monkeypatch):
     monkeypatch.setattr(panels, "_safe_answer", lambda event: asyncio.sleep(0))
     monkeypatch.setattr(panels, "_sync_timer", lambda *a, **k: None)
     panels.register_input("_test_prompt", "field", {"handler": lambda *a: None, "prompt": "p"})
-    await panels._handle_input(_Event(), "_test_prompt:field:", OWNER, 1, 2)
+    await panels.dispatch_click(_Event(), "input:_test_prompt:field:", 1, 2, OWNER)
 
     data = []
     for row in captured["buttons"]:

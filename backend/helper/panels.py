@@ -30,27 +30,6 @@ from backend.helper import symbols as sym
 logger = logging.getLogger(__name__)
 
 
-class _SkipRender:
-    """A handler's answer: "my state change is applied, a newer click renders".
-
-    Only for handlers whose view is a pure projection of authoritative state
-    and which have just observed that another accepted click is already queued
-    for the same panel (``callback_gate.pending_ahead()``). Skipping the edit
-    loses no click and no state — the queued click renders the newest state —
-    and it is what keeps a 30-click burst at one Telegram edit instead of
-    thirty. Any handler that changes the panel's *kind* (a confirmation, an
-    error, a different sub-view) must render, and therefore never returns this.
-    """
-
-    __slots__ = ()
-
-    def __repr__(self) -> str:
-        return "<skip-render>"
-
-
-SKIP_RENDER = _SkipRender()
-
-
 def _buttons_repr(buttons: list) -> tuple[tuple[str, ...], ...]:
     result = []
     for row in buttons:
@@ -335,13 +314,6 @@ def _extract_render_result(result) -> tuple[str, str, list]:
 
 
 async def _render_and_edit(event, result, panel_id: str, chat_id: int | None, msg_id: int | None) -> None:
-    if result is SKIP_RENDER:
-        callback_gate.note_coalesced()
-        logger.info(
-            "[CALLBACK] render coalesced into the click queued behind it (panel='%s')",
-            panel_id,
-        )
-        return
     title, body, buttons = _extract_render_result(result)
     if not title and not body and not buttons:
         logger.warning("[CALLBACK] render_and_edit: empty result for panel='%s'", panel_id)
@@ -350,7 +322,7 @@ async def _render_and_edit(event, result, panel_id: str, chat_id: int | None, ms
     from backend.helper.panel_render import render_edit
     text, built_buttons = render_edit(title, body, buttons)
     _sync_timer(chat_id or 0, msg_id or 0, title, body, buttons)
-    await _safe_edit(event, text, built_buttons, chat_id, msg_id)
+    await _present(event, text, built_buttons, chat_id, msg_id)
 
 
 def _resolve_session(chat_id: int | None, msg_id: int | None, inline_message_id: str | None) -> tuple[Session | None, int, int]:
@@ -393,20 +365,29 @@ def _resolve_session(chat_id: int | None, msg_id: int | None, inline_message_id:
     return None, chat_id or 0, msg_id or 0
 
 
-def _will_render(data: str) -> bool:
-    """Whether a click with this callback data ends by editing the panel.
+async def _present(event, text: str, buttons: list, chat_id: int | None, msg_id: int | None) -> None:
+    """Paint one view through the panel's single writer, outside the turn.
 
-    Used only to decide whether the click queued AHEAD of this one may skip
-    its own render. A click that edits nothing (the page-indicator noop) or
-    removes the panel (close) never supersedes a pending view, so it must not
-    be counted as the render that follows.
+    The newest view wins: a view superseded while another paint is in flight is
+    simply replaced in the slot, so N queued clicks cost at most two Telegram
+    round trips instead of N, and the clicks behind them never wait for an edit
+    they are about to overwrite.
     """
-    if data.startswith("action:") or data.startswith("input:"):
-        return True
-    if data.startswith("panel:"):
-        remainder = data[6:]
-        return remainder not in ("_nav:noop", "_nav:close")
-    return False
+    painter = callback_gate.painter(chat_id, msg_id)
+
+    async def _paint(view) -> None:
+        if painter.closed:
+            return
+        view_text, view_buttons = view
+        await _safe_edit(event, view_text, view_buttons, chat_id, msg_id)
+
+    if painter.publish((text, buttons)):
+        await painter.drain(_paint)
+    else:
+        callback_gate.note_coalesced()
+        logger.info(
+            "[CALLBACK] view superseded before painting (key=%s:%s)", chat_id, msg_id
+        )
 
 
 def register_callback_handlers(client, owner_id: int) -> None:
@@ -502,12 +483,12 @@ def register_callback_handlers(client, owner_id: int) -> None:
             )
 
         # One turn per panel: clicks on the SAME message run in arrival order,
-        # clicks on different messages never wait for each other. Without this
-        # two "next page" clicks both render the page they each read, and a slow
-        # earlier click can overwrite the newer view it finishes after.
-        turn = await callback_gate.acquire_turn(
-            chat_id, msg_id, renders=_will_render(data)
-        )
+        # clicks on different messages never wait for each other. The turn now
+        # covers ONLY the handler (state change + building the view): painting
+        # is a projection of that state and goes through the panel's single
+        # writer afterwards, so a queued click never waits for an edit it is
+        # about to supersede.
+        turn = await callback_gate.acquire_turn(chat_id, msg_id)
         if turn is None:
             callback_gate.finish(admission, "dropped:panel-busy")
             logger.warning(
@@ -517,32 +498,33 @@ def register_callback_handlers(client, owner_id: int) -> None:
             )
             return
 
+        paint: tuple[str, object] | None = None
+        outcome = "completed"
         try:
-            # A click that queued behind another click may have been aimed at a
-            # panel that click CLOSED: re-check before touching the message, so
-            # a queued click can never edit a panel that is gone.
-            if get_lifecycle().sessions.get(chat_id, msg_id) is None:
-                callback_gate.finish(admission, "dropped:panel-closed")
-                logger.info(
-                    "[CALLBACK] panel closed while this click waited — dropped "
-                    "data='%s' chat=%s msg=%s", data[:64], chat_id, msg_id,
-                )
-                return
-
-            if debug:
-                logger.info("[CALLBACK] DISPATCH: data='%s' session_id=%s chat_id=%s msg_id=%s", data, session.session_id, chat_id, msg_id)
-
-            admission.mark_dispatch()
-            outcome = "completed"
             try:
+                # A click that queued behind another click may have been aimed
+                # at a panel that click CLOSED: re-check before touching the
+                # message, so a queued click can never edit a panel that is gone.
+                if get_lifecycle().sessions.get(chat_id, msg_id) is None:
+                    outcome = "dropped:panel-closed"
+                    logger.info(
+                        "[CALLBACK] panel closed while this click waited — dropped "
+                        "data='%s' chat=%s msg=%s", data[:64], chat_id, msg_id,
+                    )
+                    return
+
+                if debug:
+                    logger.info("[CALLBACK] DISPATCH: data='%s' session_id=%s chat_id=%s msg_id=%s", data, session.session_id, chat_id, msg_id)
+
+                admission.mark_dispatch()
                 if data.startswith("panel:"):
                     if debug:
                         logger.info("[CALLBACK] → panel handler: remainder='%s'", data[6:])
-                    await _handle_panel(event, data[6:], chat_id, msg_id, owner_id, inline_msg_id)
+                    paint = await _handle_panel(event, data[6:], chat_id, msg_id, owner_id, inline_msg_id)
                 elif data.startswith("action:"):
                     if debug:
                         logger.info("[CALLBACK] → action handler: remainder='%s'", data[7:])
-                    await _handle_action(event, data[7:], chat_id, msg_id, owner_id)
+                    paint = await _handle_action(event, data[7:], chat_id, msg_id, owner_id)
                 elif data.startswith("input:"):
                     if debug:
                         logger.info("[CALLBACK] → input handler: remainder='%s'", data[6:])
@@ -551,20 +533,29 @@ def register_callback_handlers(client, owner_id: int) -> None:
                     outcome = "rejected:unknown-prefix"
                     if debug:
                         logger.warning("[CALLBACK] unknown callback prefix: '%s'", data)
-            except asyncio.CancelledError:
-                outcome = "cancelled"
-                raise
-            except Exception as exc:
-                outcome = "failed"
-                logger.exception("[CALLBACK] callback router error (data='%s'): %s", data, exc)
             finally:
-                admission.mark_rendered()
-                callback_gate.finish(admission, outcome)
+                # The turn is released BEFORE the paint: the handler's state
+                # change is complete, and the next accepted click must not wait
+                # for a Telegram edit it is going to supersede.
+                admission.mark_handled()
+                callback_gate.release_turn(chat_id, msg_id, turn)
+
+            if paint is not None and outcome == "completed":
+                panel_id, result = paint
+                await _render_and_edit(event, result, panel_id, chat_id, msg_id)
+        except asyncio.CancelledError:
+            outcome = "cancelled"
+            raise
+        except Exception as exc:
+            outcome = "failed"
+            logger.exception("[CALLBACK] callback router error (data='%s'): %s", data, exc)
         finally:
-            callback_gate.release_turn(chat_id, msg_id, turn)
+            admission.mark_rendered()
+            callback_gate.finish(admission, outcome)
 
 
-async def _handle_panel(event, remainder: str, chat_id: int, msg_id: int, owner_id: int, inline_msg_id: str | None = None) -> None:
+async def _handle_panel(event, remainder: str, chat_id: int, msg_id: int, owner_id: int, inline_msg_id: str | None = None) -> tuple[str, object] | None:
+    """Run one panel query and RETURN what to paint; the router paints it."""
     parts = remainder.split(":", 1)
     panel_id = parts[0]
     extra = parts[1] if len(parts) > 1 else ""
@@ -576,8 +567,7 @@ async def _handle_panel(event, remainder: str, chat_id: int, msg_id: int, owner_
 
     if panel_id == "_nav":
         logger.info("[CALLBACK] → navigation: action='%s'", extra)
-        await _handle_navigation(event, extra, chat_id, msg_id, owner_id)
-        return
+        return await _handle_navigation(event, extra, chat_id, msg_id, owner_id)
 
     handler = get_panel(panel_id)
     if handler is None:
@@ -586,7 +576,7 @@ async def _handle_panel(event, remainder: str, chat_id: int, msg_id: int, owner_
             "registered panels: %s",
             panel_id, get_registry().all_ids(),
         )
-        return
+        return None
 
     logger.info("[CALLBACK] _handle_panel: handler found for '%s', calling...", panel_id)
 
@@ -594,27 +584,57 @@ async def _handle_panel(event, remainder: str, chat_id: int, msg_id: int, owner_
     lifecycle.sessions.push_nav(chat_id, msg_id, panel_id, extra)
     clear_pending(owner_id)
 
-    try:
-        result = await handler(event, extra)
-        logger.info("[CALLBACK] _handle_panel: handler returned, rendering... (panel='%s')", panel_id)
+    result = await handler(event, extra)
+    logger.info("[CALLBACK] _handle_panel: handler returned (panel='%s')", panel_id)
+    return panel_id, result
+
+
+async def dispatch_click(
+    event,
+    data: str,
+    chat_id: int,
+    msg_id: int,
+    owner_id: int,
+    inline_msg_id: str | None = None,
+) -> None:
+    """Run one already-admitted callback and paint its result.
+
+    The same two phases the gated router performs (handler, then paint) without
+    the admission gates and the per-panel turn — for callers that already own
+    the click, so a dispatch + render can never be written twice and drift.
+    """
+    paint = None
+    if data.startswith("panel:"):
+        paint = await _handle_panel(event, data[6:], chat_id, msg_id, owner_id, inline_msg_id)
+    elif data.startswith("action:"):
+        paint = await _handle_action(event, data[7:], chat_id, msg_id, owner_id)
+    elif data.startswith("input:"):
+        await _handle_input(event, data[6:], owner_id, chat_id, msg_id)
+        return
+    else:
+        raise ValueError(f"unknown callback prefix: {data[:64]}")
+    if paint is not None:
+        panel_id, result = paint
         await _render_and_edit(event, result, panel_id, chat_id, msg_id)
-        logger.info("[CALLBACK] _handle_panel: COMPLETE for panel='%s'", panel_id)
-    except Exception as exc:
-        logger.exception("[CALLBACK] _handle_panel: handler '%s' FAILED: %s", panel_id, exc)
 
 
 async def close_panel(event, chat_id: int, msg_id: int, owner_id: int) -> None:
     """Delegate to the lifecycle manager for cleanup."""
     logger.info("[CLOSE] close_panel: chat_id=%s msg_id=%s", chat_id, msg_id)
-    await get_lifecycle().close_panel(chat_id, msg_id, event=event)
+    try:
+        await get_lifecycle().close_panel(chat_id, msg_id, event=event)
+    finally:
+        # A closed panel has nothing left to paint: drop any pending view so a
+        # paint in flight cannot edit the closed message afterwards.
+        callback_gate.forget_painter(chat_id, msg_id)
 
 
-async def _handle_navigation(event, action: str, chat_id: int, msg_id: int, owner_id: int) -> None:
+async def _handle_navigation(event, action: str, chat_id: int, msg_id: int, owner_id: int) -> tuple[str, object] | None:
     logger.info("[CALLBACK] _handle_navigation: action='%s' chat_id=%s msg_id=%s", action, chat_id, msg_id)
 
     if action == "close":
         await close_panel(event, chat_id, msg_id, owner_id)
-        return
+        return None
 
     if action == "home":
         lifecycle = get_lifecycle()
@@ -623,14 +643,10 @@ async def _handle_navigation(event, action: str, chat_id: int, msg_id: int, owne
         handler = get_panel("menu")
         if handler is None:
             logger.warning("[CALLBACK] _handle_navigation: no 'menu' panel registered")
-            return
-        try:
-            result = await handler(event, "")
-            await _render_and_edit(event, result, "menu", chat_id, msg_id)
-            logger.info("[CALLBACK] _handle_navigation: home COMPLETE")
-        except Exception as exc:
-            logger.exception("[CALLBACK] _handle_navigation: home FAILED: %s", exc)
-        return
+            return None
+        result = await handler(event, "")
+        logger.info("[CALLBACK] _handle_navigation: home handled")
+        return "menu", result
 
     if action == "back":
         lifecycle = get_lifecycle()
@@ -654,20 +670,16 @@ async def _handle_navigation(event, action: str, chat_id: int, msg_id: int, owne
             handler = get_panel("menu")
         if handler is None:
             logger.warning("[CALLBACK] _handle_navigation: back — no handler for '%s'", prev_panel)
-            return
-        try:
-            result = await handler(event, prev_extra)
-            await _render_and_edit(event, result, prev_panel, chat_id, msg_id)
-            logger.info("[CALLBACK] _handle_navigation: back COMPLETE")
-        except Exception as exc:
-            logger.exception("[CALLBACK] _handle_navigation: back FAILED: %s", exc)
-        return
+            return None
+        result = await handler(event, prev_extra)
+        logger.info("[CALLBACK] _handle_navigation: back handled")
+        return prev_panel, result
 
     if action == "noop":
-        return
+        return None
 
 
-async def _handle_action(event, remainder: str, chat_id: int, msg_id: int, owner_id: int) -> None:
+async def _handle_action(event, remainder: str, chat_id: int, msg_id: int, owner_id: int) -> tuple[str, object] | None:
     parts = remainder.split(":", 1)
     action_id = parts[0]
     extra = parts[1] if len(parts) > 1 else ""
@@ -681,18 +693,15 @@ async def _handle_action(event, remainder: str, chat_id: int, msg_id: int, owner
             "registered actions: %s",
             action_id, list(_actions.keys()),
         )
-        return
+        return None
 
     clear_pending(owner_id)
 
-    try:
-        result = await handler(event, extra, chat_id)
-        nav = get_lifecycle().sessions.current_nav(chat_id, msg_id)
-        current_panel = nav[0] if nav else action_id
-        await _render_and_edit(event, result, current_panel, chat_id, msg_id)
-        logger.info("[CALLBACK] _handle_action: COMPLETE for action='%s'", action_id)
-    except Exception as exc:
-        logger.exception("[CALLBACK] _handle_action: '%s' FAILED: %s", action_id, exc)
+    result = await handler(event, extra, chat_id)
+    nav = get_lifecycle().sessions.current_nav(chat_id, msg_id)
+    current_panel = nav[0] if nav else action_id
+    logger.info("[CALLBACK] _handle_action: handled action='%s'", action_id)
+    return current_panel, result
 
 
 async def _handle_input(event, remainder: str, owner_id: int, chat_id: int, msg_id: int) -> None:
@@ -757,5 +766,5 @@ async def _handle_input(event, remainder: str, owner_id: int, chat_id: int, msg_
         styled_prompt = _style(prompt)
     except Exception:
         styled_prompt = prompt
-    await _safe_edit(event, styled_prompt, built, chat_id, msg_id)
+    await _present(event, styled_prompt, built, chat_id, msg_id)
     logger.info("[CALLBACK] _handle_input: prompt sent for panel='%s'", panel_id)

@@ -694,7 +694,7 @@ def test_stored_edit_extra_through_the_panel_router_preserves_the_draft(wizard, 
             pass
 
     event = _Ev()
-    _run(panels._handle_panel(event, f"taskloom_new:edit:{task.id}", 111, 222, OWNER))
+    _run(panels.dispatch_click(event, f"panel:taskloom_new:edit:{task.id}", 111, 222, OWNER))
 
     assert wizard._draft(OWNER).show_source is False
     assert wizard._draft(OWNER).step == wizard.STEP_DETAILS

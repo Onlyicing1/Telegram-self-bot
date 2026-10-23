@@ -627,8 +627,8 @@ def test_stored_edit_extra_through_the_panel_router_resumes_the_draft(editor, mo
         return True
 
     monkeypatch.setattr(panels, "_safe_edit", _capture)
-    _run(panels._handle_panel(
-        object(), f"taskloom_new:edit:{task.id}", 111, 222, OWNER
+    _run(panels.dispatch_click(
+        object(), f"panel:taskloom_new:edit:{task.id}", 111, 222, OWNER
     ))
 
     assert taskloom._draft(OWNER).interval_minutes == 11

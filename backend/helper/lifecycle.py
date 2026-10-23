@@ -251,14 +251,24 @@ class PanelLifecycleManager:
         msg_id: int,
         event: Any = None,
     ) -> None:
-        """Close a panel: cleanup all resources, edit message to closed state."""
+        """Close a panel: release every resource, then edit the message.
+
+        The lock guards the STATE transition only. It used to be held across the
+        closing edit — one Telegram round trip — so a Close click (or an
+        auto-close timer) serialised every other panel's create/close in the
+        process for the length of that RPC. The edit is a courtesy to the
+        client and cannot affect the state, so it now runs after the lock is
+        released.
+        """
         async with self._lock:
-            await self._cleanup_locked(chat_id, msg_id, edit_message=True, event=event)
+            self._cleanup_state_locked(chat_id, msg_id)
+        await self._close_message(chat_id, msg_id, event)
 
     async def timeout_panel(self, chat_id: int, msg_id: int) -> None:
         """Called by the timer when it expires. Delegates to cleanup."""
         async with self._lock:
-            await self._cleanup_locked(chat_id, msg_id, edit_message=True, event=None)
+            self._cleanup_state_locked(chat_id, msg_id)
+        await self._close_message(chat_id, msg_id, None)
 
     async def destroy_panel(self, chat_id: int, msg_id: int) -> None:
         """Destroy a panel without editing the message (e.g. replacement)."""
@@ -293,7 +303,13 @@ class PanelLifecycleManager:
         edit_message: bool,
         event: Any = None,
     ) -> None:
-        """THE ONE cleanup function. Every exit path goes through here.
+        """THE ONE cleanup function. Every exit path goes through here."""
+        self._cleanup_state_locked(chat_id, msg_id)
+        if edit_message:
+            await self._close_message(chat_id, msg_id, event)
+
+    def _cleanup_state_locked(self, chat_id: int, msg_id: int) -> None:
+        """Release every resource of a panel. Synchronous: no I/O, no awaits.
 
         Releases:
           - Session registry
@@ -312,32 +328,32 @@ class PanelLifecycleManager:
             clear_pending(self._owner_id)
 
         self._set_state(chat_id, msg_id, PanelState.IDLE)
-
-        if edit_message:
-            closed_text = f"{sym.OP_CLOSE} **Panel closed**"
-            edited = False
-            if event is not None:
-                try:
-                    await event.edit(closed_text, buttons=[])
-                    edited = True
-                except Exception as exc:
-                    logger.debug("[LIFECYCLE] cleanup event.edit: %s", exc)
-            elif self._self_client is not None and chat_id and msg_id:
-                try:
-                    await self._self_client.edit_message(
-                        chat_id, msg_id, message=closed_text, buttons=[]
-                    )
-                    edited = True
-                except Exception as exc:
-                    logger.debug("[LIFECYCLE] cleanup edit_message: %s", exc)
-
-            if edited and self._self_client is not None and chat_id and msg_id:
-                guarded_create_task(
-                    _delayed_delete(self._self_client, chat_id, msg_id),
-                    name="panel:delayed-delete",
-                )
-
         logger.info("[LIFECYCLE] CLEANUP chat=%s msg=%s", chat_id, msg_id)
+
+    async def _close_message(self, chat_id: int, msg_id: int, event: Any = None) -> None:
+        """Show the closed state on the message, OUTSIDE the lifecycle lock."""
+        closed_text = f"{sym.OP_CLOSE} **Panel closed**"
+        edited = False
+        if event is not None:
+            try:
+                await event.edit(closed_text, buttons=[])
+                edited = True
+            except Exception as exc:
+                logger.debug("[LIFECYCLE] cleanup event.edit: %s", exc)
+        elif self._self_client is not None and chat_id and msg_id:
+            try:
+                await self._self_client.edit_message(
+                    chat_id, msg_id, message=closed_text, buttons=[]
+                )
+                edited = True
+            except Exception as exc:
+                logger.debug("[LIFECYCLE] cleanup edit_message: %s", exc)
+
+        if edited and self._self_client is not None and chat_id and msg_id:
+            guarded_create_task(
+                _delayed_delete(self._self_client, chat_id, msg_id),
+                name="panel:delayed-delete",
+            )
 
     # ── Shutdown ──
 

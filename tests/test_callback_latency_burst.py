@@ -70,6 +70,7 @@ class _Click:
         self.created_at = time.monotonic()
         self.answer_count = 0
         self.edits: list[tuple[str, list]] = []
+        self.edit_times: list[float] = []
 
     @property
     def texts(self) -> list[str]:
@@ -99,6 +100,7 @@ class _Click:
         if self.edit_delay:
             await asyncio.sleep(self.edit_delay)
         self.edits.append((text, buttons))
+        self.edit_times.append(time.monotonic())
 
 
 class _Db:
@@ -227,6 +229,23 @@ async def _open_selection(rig, count: int = 8) -> list[str]:
     return codes
 
 
+def _last_paint(clicks: list[_Click]) -> _Click:
+    """The click that performed the NEWEST edit (the panel's final view).
+
+    The newest view may be painted by an earlier click whose paint was already
+    in flight — that is the whole point of the writer — so the panel's final
+    content is "whichever edit happened last", not "the last click's edit".
+    """
+    latest: tuple[float, _Click] | None = None
+    for click in clicks:
+        if click.edit_times:
+            stamp = max(click.edit_times)
+            if latest is None or stamp > latest[0]:
+                latest = (stamp, click)
+    assert latest is not None, "nothing was painted"
+    return latest[1]
+
+
 def _marks(click: _Click) -> tuple[int, int]:
     """Selected / unselected ROW marks in the panel's buttons."""
     labels = click.labels()
@@ -281,8 +300,9 @@ async def test_burst_of_ticks_costs_one_view_and_no_rereads(rig, burst):
 
     # The last click leaves the newest state on screen: every presented row
     # carries the mark of its final state and the counter agrees.
-    last_text = clicks[-1].texts[-1]
-    marked, empty = _marks(clicks[-1])
+    painted = _last_paint(clicks)
+    last_text = painted.texts[-1]
+    marked, empty = _marks(painted)
     assert marked == len(final)
     assert marked + empty == len(codes)
     assert f"{len(final)} selected" in last_text
@@ -308,7 +328,7 @@ async def test_burst_of_ticks_costs_one_view_and_no_rereads(rig, burst):
 
 @pytest.mark.asyncio
 async def test_burst_edits_are_fewer_than_clicks_and_coalesced(rig):
-    """The ticks that do not render record that a newer click superseded them."""
+    """Views superseded while a paint is in flight are recorded as such."""
     codes = await _open_selection(rig, count=4)
     clicks = [rig.click(f"action:retrieve_toggle:{codes[i % 4]}") for i in range(15)]
     await asyncio.gather(*(rig.router(click) for click in clicks))
@@ -319,8 +339,8 @@ async def test_burst_edits_are_fewer_than_clicks_and_coalesced(rig):
     ]
     assert sum(record.coalesced for record in records) >= 10
     assert sum(record.edit_calls for record in records) <= 3
-    # Exactly one click rendered the final state, and that is the last one.
-    assert clicks[-1].edits
+    # The final state reached the panel, whoever happened to paint it.
+    assert _last_paint(clicks).texts[-1]
 
 
 @pytest.mark.asyncio
@@ -456,6 +476,150 @@ async def test_selection_and_review_agree_after_a_burst(rig):
 
 
 @pytest.mark.asyncio
+async def test_a_failed_paint_does_not_wedge_the_panel(rig):
+    """A raising edit is recorded and the next click still paints."""
+    codes = await _open_selection(rig, count=3)
+    calls = {"n": 0}
+    real_edit = _Click.edit
+
+    async def flaky_edit(self, text, buttons=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("EDIT_FAILED")
+        await real_edit(self, text, buttons)
+
+    _Click.edit = flaky_edit
+    try:
+        first = rig.click(f"action:retrieve_toggle:{codes[0]}")
+        await rig.router(first)
+        assert not first.edits
+        assert callback_gate.painter(CHAT, MSG).in_flight is False
+
+        second = rig.click(f"action:retrieve_toggle:{codes[1]}")
+        await asyncio.wait_for(rig.router(second), 2.0)
+        assert second.edits
+    finally:
+        _Click.edit = real_edit
+    assert set(selection_state.codes(OWNER)) == {codes[0], codes[1]}
+
+
+@pytest.mark.asyncio
+async def test_a_slow_paint_does_not_hold_the_next_click(rig):
+    """The turn ends with the handler, so queued handlers run during an edit."""
+    codes = await _open_selection(rig, count=3)
+    first = rig.click(f"action:retrieve_toggle:{codes[0]}", edit_delay=0.30)
+    second = rig.click(f"action:retrieve_toggle:{codes[1]}")
+
+    started = time.monotonic()
+    await asyncio.gather(rig.router(first), rig.router(second))
+    elapsed = time.monotonic() - started
+
+    # Both state changes are applied without waiting for the first edit...
+    assert set(selection_state.codes(OWNER)) == {codes[0], codes[1]}
+    second_record = [
+        r for r in callback_gate.recent_timings()
+        if r.data == f"action:retrieve_toggle:{codes[1]}"
+    ][0]
+    assert second_record.work_ms < 100.0, "the handler waited for a paint"
+    # ...and the exchange costs two 300 ms paints (the first view and the
+    # newest one), not one paint per click.
+    assert elapsed < 0.75
+    assert sum(len(click.edits) for click in (first, second)) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_pending_view_is_dropped_when_the_panel_closes(rig):
+    """Closing a panel must not leave a paint that edits the closed message."""
+    painter = callback_gate.painter(CHAT, MSG)
+    assert painter.publish(("old view", [])) is True
+    painter.in_flight = True  # pretend another click is painting it
+
+    callback_gate.forget_painter(CHAT, MSG)
+    assert painter.closed is True
+    assert painter.pending is None
+    # The same click publishing again lands on a FRESH writer, not the dead one.
+    assert callback_gate.painter(CHAT, MSG) is not painter
+
+
+@pytest.mark.asyncio
+async def test_a_saturated_database_pool_stays_bounded_and_spares_the_panel(rig):
+    """Four slow Supabase workers must not freeze the process or a paint."""
+    import threading
+
+    from backend.db.client import run_sync_db
+    from backend.runtime.operation_watchdog import OperationTimeoutError
+
+    release = threading.Event()
+
+    def _blocking() -> str:
+        release.wait(2.0)
+        return "late"
+
+    # Fill the whole bounded pool with calls that cannot finish yet.
+    saturating = [
+        asyncio.create_task(run_sync_db(_blocking, timeout=2.0)) for _ in range(4)
+    ]
+    await asyncio.sleep(0.02)  # let them reach the workers
+
+    # One more call is bounded by the watchdog instead of hanging forever.
+    with pytest.raises(OperationTimeoutError):
+        await run_sync_db(_blocking, timeout=0.05)
+
+    # And a click whose handler touches no database still answers and paints.
+    panels.register_panel("_free_panel", lambda event, extra: _free_view(extra))
+    get_lifecycle().sessions.create(CHAT, MSG, "_free_panel")
+    callback_gate.reset()
+    click = rig.click("panel:_free_panel:live")
+    await asyncio.wait_for(rig.router(click), 1.0)
+    assert click.answer_count == 1
+    assert any("free:live" in text for text in click.texts)
+
+    release.set()
+    await asyncio.wait_for(asyncio.gather(*saturating, return_exceptions=True), 3.0)
+
+
+async def _free_view(extra: str):
+    return "Free Panel", f"free:{extra}", []
+
+
+@pytest.mark.asyncio
+async def test_a_slow_close_does_not_block_another_panel(rig):
+    """The lifecycle lock must not be held across the closing edit."""
+    slow_edit_started = asyncio.Event()
+    release = asyncio.Event()
+
+    class _SlowEvent:
+        async def edit(self, text, buttons=None):
+            slow_edit_started.set()
+            await release.wait()
+
+    close_task = asyncio.create_task(
+        get_lifecycle().close_panel(CHAT, 9999, event=_SlowEvent())
+    )
+    await asyncio.wait_for(slow_edit_started.wait(), 2.0)
+
+    # While the closing edit is in flight, another panel can still be created.
+    async def _open() -> bool:
+        ok, chat, msg = await get_lifecycle().create_panel(CHAT, "retrieve")
+        return ok
+
+    from backend.helper import inline_engine
+
+    async def _fake_trigger(self_client, chat_id, query):
+        return True, chat_id, 9001, ""
+
+    original = inline_engine.trigger
+    inline_engine.trigger = _fake_trigger
+    try:
+        opened = await asyncio.wait_for(_open(), 0.5)
+    finally:
+        inline_engine.trigger = original
+        release.set()
+        await asyncio.wait_for(close_task, 2.0)
+    assert opened is True
+
+
+@pytest.mark.asyncio
 async def test_a_failing_tick_does_not_block_the_next_click(rig):
     codes = await _open_selection(rig, count=3)
     real_query = db_client.query_save
@@ -480,42 +644,28 @@ async def test_a_failing_tick_does_not_block_the_next_click(rig):
 # ── 4. gating helpers ─────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_pending_ahead_counts_only_clicks_that_will_render(rig):
-    """A queued noop must not be mistaken for the render that follows."""
-    async def _queued(renders: bool) -> bool:
-        turn = await callback_gate.acquire_turn(CHAT, MSG, renders=renders)
-        if turn is None:
-            return False
-        callback_gate.release_turn(CHAT, MSG, turn)
-        return True
+async def test_the_painter_keeps_only_the_newest_view_and_never_overlaps(rig):
+    """Three views published during one paint cost two edits, newest last."""
+    painter = callback_gate.painter(CHAT, MSG)
+    painted: list[str] = []
+    started = asyncio.Event()
 
-    turn = await callback_gate.acquire_turn(CHAT, MSG)
-    assert turn is not None
-    try:
-        assert callback_gate.pending_ahead() == 0
+    async def _paint(view) -> None:
+        painted.append(view)
+        started.set()
+        await asyncio.sleep(0.05)
 
-        noop = asyncio.create_task(_queued(False))
-        await asyncio.sleep(0.01)
-        assert callback_gate.pending_ahead() == 0, "a noop click cannot supersede a view"
+    assert painter.publish("v1") is True
+    task = asyncio.create_task(painter.drain(_paint))
+    await asyncio.wait_for(started.wait(), 1.0)
 
-        rendering = asyncio.create_task(_queued(True))
-        await asyncio.sleep(0.01)
-        assert callback_gate.pending_ahead() == 1
-    finally:
-        callback_gate.release_turn(CHAT, MSG, turn)
-    assert await asyncio.wait_for(noop, 2.0) is True
-    assert await asyncio.wait_for(rendering, 2.0) is True
-    assert callback_gate.pending_ahead() == 0
+    assert painter.publish("v2") is False   # superseded, no second painter
+    assert painter.publish("v3") is False   # v2 is dropped, never painted
+    await asyncio.wait_for(task, 2.0)
 
-
-def test_render_classification_of_callback_data():
-    assert panels._will_render("action:retrieve_toggle:S0001")
-    assert panels._will_render("input:retrieve_item:rename")
-    assert panels._will_render("panel:retrieve_saved:select")
-    assert panels._will_render("panel:_nav:home")
-    assert panels._will_render("panel:_nav:back")
-    assert not panels._will_render("panel:_nav:noop")
-    assert not panels._will_render("panel:_nav:close")
+    assert painted == ["v1", "v3"]
+    assert painter.in_flight is False
+    assert painter.pending is None
 
 
 def test_turn_deadline_scales_with_backlog_and_stays_bounded():

@@ -155,7 +155,10 @@ async def test_burst_of_fifteen_clicks_is_acknowledged_and_accounted_for(router,
     # The acknowledgement never waits for the 50 ms handler, let alone for the
     # 14 clicks queued behind it.
     assert max(click.ack_latency for click in clicks) < 0.05
-    assert all(click.edits for click in clicks)
+    # Every click is applied; how many of them painted is the writer's business
+    # (the newest view always reaches the panel).
+    painted = [text for click in clicks for text in click.edits]
+    assert any("view:14" in text for text in painted)
     records = [t for t in callback_gate.recent_timings() if t.data.startswith("panel:_backlog_panel:")]
     assert len(records) == 15
     assert {t.outcome for t in records} == {"completed"}
@@ -214,9 +217,11 @@ async def test_same_panel_clicks_run_in_arrival_order(router, panel):
 
     assert order == ["1", "2", "3"]
     assert peak == 1
-    assert all(click.edits for click in clicks)
-    # The LAST handler's view is the one left on the panel.
-    assert "view:3" in clicks[-1].edits[-1]
+    # The LAST handler's view is the one left on the panel, whichever click's
+    # paint task happened to write it.
+    painted = [text for click in clicks for text in click.edits]
+    assert painted, "the panel was never painted"
+    assert "view:3" in painted[-1]
 
 
 @pytest.mark.asyncio
