@@ -247,7 +247,27 @@ layer — an execution interface, never just a text response.
 - **Settings / General**, **Context Panel**, **Health Dashboard**.
 
 Actions (`action:*`), panels (`panel:*`), and inputs (`input:*`) are registered
-through `backend/helper` registries and dispatched by `inline_engine`.
+through `backend/helper` registries and dispatched by `panels._callback_router`.
+
+**Callback admission contract** (`backend/helper/callback_gate.py`):
+
+- **Acknowledge first.** A delivered `CallbackQuery` is answered before any
+  session lookup, database read, render or edit, so the client's progress state
+  never waits on handler work. A refused answer is recorded and the click still
+  runs.
+- **One FIFO turn per panel.** Clicks on the same `(chat_id, msg_id)` run one at
+  a time in arrival order; clicks on different panels never wait for each
+  other. A click that queued behind a close is dropped (`dropped:panel-closed`),
+  and one that cannot take its turn within `DEFAULT_TURN_WAIT_S` is dropped with
+  `dropped:panel-busy` and a log line — never executed later against a panel it
+  no longer matches.
+- **Duplicate suppression by Telegram's `query_id`** — a re-delivered query runs
+  once and is still answered; two genuine clicks are two queries and both run.
+  No debounce window, no rate limit, no silent discards.
+- **Every accepted click is accounted for** by one `[CALLBACK] timing` line
+  (`ack_ms`, `wait_ms`, `work_ms`, `total_ms`) and one outcome
+  (`completed` / `failed` / `cancelled` / `rejected:*` / `dropped:*`). Callback
+  data is logged truncated to 64 characters; no message content or credentials.
 
 ---
 

@@ -16,6 +16,7 @@ from typing import Awaitable, Callable, Any
 from telethon import events
 
 from backend.bot.handlers.guard import is_owner
+from backend.helper import callback_gate
 from backend.helper.context import truncate_callback_data
 from backend.helper.input_state import set_pending, clear_pending, get_pending
 from backend.helper.lifecycle import get_lifecycle
@@ -376,6 +377,24 @@ def register_callback_handlers(client, owner_id: int) -> None:
         data_raw = event.data
         data = data_raw.decode("utf-8") if data_raw else ""
 
+        # Admission and acknowledgement come FIRST, before any session lookup,
+        # database read, render or edit. The answer is what the owner's client
+        # is waiting on, and Telegram expires it long before a slow handler
+        # returns; everything below is allowed to take its time, the answer is
+        # not. A query delivered twice is answered and then dropped: its
+        # handler already ran once and must not run (or repeat its side
+        # effects) again.
+        query_id = callback_gate.query_id_of(event)
+        admission = callback_gate.admit(data, query_id)
+        if admission is None:
+            logger.info(
+                "[CALLBACK] duplicate query ignored (query_id=%s data='%s')",
+                query_id, data[:64],
+            )
+            await _safe_answer(event)
+            return
+        await callback_gate.ack(event, admission)
+
         sender_id = getattr(event, "sender_id", None)
 
         debug = settings_service.is_debug_callbacks()
@@ -390,19 +409,19 @@ def register_callback_handlers(client, owner_id: int) -> None:
         if chat_id is None and not inline_msg_id:
             if debug:
                 logger.warning("[CALLBACK] REJECT: unresolvable — no chat_id and no inline_message_id")
-            await _safe_answer(event)
+            callback_gate.finish(admission, "rejected:no-coordinates")
             return
 
         if settings_service.is_owner_only() and not is_owner(event, owner_id):
             if debug:
                 logger.info("[CALLBACK] REJECT: not owner (sender_id=%s owner_id=%s)", sender_id, owner_id)
-            await _safe_answer(event)
+            callback_gate.finish(admission, "rejected:not-owner")
             return
 
         if not data:
             if debug:
                 logger.warning("[CALLBACK] REJECT: empty callback data")
-            await _safe_answer(event)
+            callback_gate.finish(admission, "rejected:empty-data")
             return
 
         session, real_chat_id, real_msg_id = _resolve_session(chat_id, msg_id, inline_msg_id)
@@ -412,7 +431,7 @@ def register_callback_handlers(client, owner_id: int) -> None:
                     "[CALLBACK] REJECT: no session for chat_id=%s msg_id=%s inline_msg_id='%s'",
                     chat_id, msg_id, inline_msg_id or "",
                 )
-            await _safe_answer(event)
+            callback_gate.finish(admission, "rejected:no-session")
             return
 
         chat_id = real_chat_id
@@ -430,29 +449,65 @@ def register_callback_handlers(client, owner_id: int) -> None:
                 chat_id, msg_id,
             )
 
-        if debug:
-            logger.info("[CALLBACK] DISPATCH: data='%s' session_id=%s chat_id=%s msg_id=%s", data, session.session_id, chat_id, msg_id)
+        # One turn per panel: clicks on the SAME message run in arrival order,
+        # clicks on different messages never wait for each other. Without this
+        # two "next page" clicks both render the page they each read, and a slow
+        # earlier click can overwrite the newer view it finishes after.
+        turn = await callback_gate.acquire_turn(chat_id, msg_id)
+        if turn is None:
+            callback_gate.finish(admission, "dropped:panel-busy")
+            logger.warning(
+                "[CALLBACK] panel turn unavailable after %.0fs — click dropped "
+                "data='%s' chat=%s msg=%s",
+                callback_gate.DEFAULT_TURN_WAIT_S, data[:64], chat_id, msg_id,
+            )
+            return
 
         try:
-            if data.startswith("panel:"):
-                if debug:
-                    logger.info("[CALLBACK] → panel handler: remainder='%s'", data[6:])
-                await _handle_panel(event, data[6:], chat_id, msg_id, owner_id, inline_msg_id)
-            elif data.startswith("action:"):
-                if debug:
-                    logger.info("[CALLBACK] → action handler: remainder='%s'", data[7:])
-                await _handle_action(event, data[7:], chat_id, msg_id, owner_id)
-            elif data.startswith("input:"):
-                if debug:
-                    logger.info("[CALLBACK] → input handler: remainder='%s'", data[6:])
-                await _handle_input(event, data[6:], owner_id, chat_id, msg_id)
-            else:
-                if debug:
-                    logger.warning("[CALLBACK] unknown callback prefix: '%s'", data)
-        except Exception as exc:
-            logger.exception("[CALLBACK] callback router error (data='%s'): %s", data, exc)
+            # A click that queued behind another click may have been aimed at a
+            # panel that click CLOSED: re-check before touching the message, so
+            # a queued click can never edit a panel that is gone.
+            if get_lifecycle().sessions.get(chat_id, msg_id) is None:
+                callback_gate.finish(admission, "dropped:panel-closed")
+                logger.info(
+                    "[CALLBACK] panel closed while this click waited — dropped "
+                    "data='%s' chat=%s msg=%s", data[:64], chat_id, msg_id,
+                )
+                return
+
+            if debug:
+                logger.info("[CALLBACK] DISPATCH: data='%s' session_id=%s chat_id=%s msg_id=%s", data, session.session_id, chat_id, msg_id)
+
+            admission.mark_dispatch()
+            outcome = "completed"
+            try:
+                if data.startswith("panel:"):
+                    if debug:
+                        logger.info("[CALLBACK] → panel handler: remainder='%s'", data[6:])
+                    await _handle_panel(event, data[6:], chat_id, msg_id, owner_id, inline_msg_id)
+                elif data.startswith("action:"):
+                    if debug:
+                        logger.info("[CALLBACK] → action handler: remainder='%s'", data[7:])
+                    await _handle_action(event, data[7:], chat_id, msg_id, owner_id)
+                elif data.startswith("input:"):
+                    if debug:
+                        logger.info("[CALLBACK] → input handler: remainder='%s'", data[6:])
+                    await _handle_input(event, data[6:], owner_id, chat_id, msg_id)
+                else:
+                    outcome = "rejected:unknown-prefix"
+                    if debug:
+                        logger.warning("[CALLBACK] unknown callback prefix: '%s'", data)
+            except asyncio.CancelledError:
+                outcome = "cancelled"
+                raise
+            except Exception as exc:
+                outcome = "failed"
+                logger.exception("[CALLBACK] callback router error (data='%s'): %s", data, exc)
+            finally:
+                admission.mark_rendered()
+                callback_gate.finish(admission, outcome)
         finally:
-            await _safe_answer(event)
+            callback_gate.release_turn(chat_id, msg_id, turn)
 
 
 async def _handle_panel(event, remainder: str, chat_id: int, msg_id: int, owner_id: int, inline_msg_id: str | None = None) -> None:

@@ -1,180 +1,235 @@
-# IMPLEMENTATION_REPORT.md — multi-select in the Saved Items (Stash) browser
+# IMPLEMENTATION_REPORT.md — callback acknowledgement, ordering and accounting
 
 > This file describes ONLY the current state of the repository for this task and
-> **replaces every previous report in full**. Earlier phases (view-once media,
-> SAVE_TRACE, the Save panel rename) remain in the history and their contracts
-> are unchanged by this work.
+> **replaces every previous report in full**. Earlier work (multi-select in the
+> Stash browser, view-once media, SAVE_TRACE, the Save panel rename) is
+> unchanged in behaviour; its history stays in git and its contracts are still
+> listed in `AGENTS.md`.
 
 | Item | Value |
 |---|---|
-| Task | Add multi-select to the Saved Items browser reached from Save → **Stash** |
-| Branch / base | `freebuff/99799eefb106784388e20bc8` at `d96d70b` (= `origin/main` before this change) |
+| Task | Diagnose and eliminate the Telegram button-callback backlog; low ack latency, zero lost valid clicks |
+| Branch / base | `freebuff/99799eefb106784388e20bc8` at `7d4a838` (= `origin/main` before this change) |
 | Date | 2026-10-23 |
 | Live Telegram / Supabase / Render | **NOT touched.** No session, no RPC, no SQL, no migration, no `.env`, no deployment |
-| Documents not modified | `DATABASE_ARCHITECTURE.md`, `README.md`, `INVESTIGATION.md` |
-| Interpreter | CPython 3.12 venv with `backend/requirements.txt` + pytest + pytest-asyncio |
+| Documents not modified | `DATABASE_ARCHITECTURE.md`, `README.md` |
+| Interpreter | CPython 3.12 venv, `telethon==1.43.0` (pinned, `backend/requirements.txt`) |
+| New dependency | **none** |
 
 ---
 
-## 1. What was implemented
+## 1. Symptom and confirmed root cause
 
-The existing paginated browser (`panel:retrieve_saved`) now has a second mode.
-Nothing about the single-item workflow changed: in browse mode every row still
-opens that item's own preview panel (`panel:retrieve_item:id:<code>`), and the
-preview panel's Retrieve / Rename / File name / Tags / Move / Delete rows are
-byte-identical.
+**Symptom reported:** pressing ~10–15 inline buttons in quick succession makes the
+interface unresponsive for a moment, after which the presses execute in a burst.
 
-**Entry point.** Browse mode gains one row, **Select Multiple**
-(`panel:retrieve_saved:select`). It starts a fresh selection session.
+**Confirmed root cause (source + measurement, §5):** the callback path answered
+Telegram *last* and let every click on the same panel run *concurrently*.
 
-**Selection view.** The same page is rendered with one toggle per item:
+1. **The acknowledgement trailed the whole handler.** `panels.py` dispatched the
+   panel/action handler, awaited its database reads, rendered, awaited the
+   `editMessage` round trip, and only then — in the router's `finally` — called
+   `event.answer()`. The client's progress indicator therefore stayed up for the
+   entire handler, and Telegram expires that query (``BOT_RESPONSE_TIMEOUT``)
+   long before a slow handler returns. Measured before the change, with a fake
+   200 ms handler: **ack 210.8 ms**; with 15 clicks and a 50 ms handler:
+   **ack 62.7 ms** — i.e. ack latency WAS handler latency.
+2. **Clicks on the same panel ran at the same time.** Telethon dispatches each
+   update as its own task (verified in the pinned source, `updates.py:289`), so
+   nothing serialised them — but a panel is a state machine on ONE message. Two
+   clicks that both read the view before either rendered produce two views from
+   the same starting state, and the slower edit lands last. Measured before the
+   change (3 concurrent clicks, the first deliberately slow): handler order
+   **`['2', '3', '1']`** with **3 concurrent handlers** — the panel kept the
+   FIRST click's view and the third click's render was overwritten.
+3. **No duplicate-delivery suppression.** A query delivered twice ran its
+   handler (and its side effects) twice.
 
-* each row shows `⊡` (unselected) or `⊠` (selected) + the media glyph + the
-  item's presented name + its **exact save code**;
-* its callback is `action:retrieve_toggle:<code>` and toggles exactly that
-  code — tapping never opens an item and no search is ever re-run. It is an
-  ACTION, not a panel query, because the callback router pushes every
-  `panel:` extra onto the session's nav stack: a panel-routed toggle would make
-  Back re-run it and silently untick an item;
-* `Prev` / `Next` stay inside select mode (`select:page:N`) and preserve the
-  selection; a toggle returns to the page being viewed;
-* the footer offers **Send selected**, **Delete selected** and
-  **Cancel selection** (clears the selection and returns to browse).
+The burst itself is the visible shape of (1)+(2): every press is answered late,
+and the edits that finally arrive are the concurrent handlers finishing in
+arbitrary order — a stall, then a clump of updates.
 
-**Bulk review + confirmation.** `bulk:send` / `bulk:delete` render a review
-panel that lists the selected items as `label · `code`` and carries ONE explicit
-confirm action (`action:retrieve_bulk_send:confirm` /
-`action:retrieve_bulk_delete:confirm`), plus **Back to selection** (keeps the
-selection). Nothing is executed by merely opening the review.
+**Not the cause (checked, §2 of `INVESTIGATION.md`):** Telethon's update queue
+(`sequential_updates` is left at its default `False`, so updates are dispatched
+concurrently), event-loop blocking (every Supabase call goes through the bounded
+4-worker `run_sync_db` pool; panel settings are cached in memory and loaded at
+startup by the supervisor), and the lifecycle lock (it is only taken by
+create/close, never by click dispatch).
 
-**Execution.** The actions hand the selection to
-`retrieve_service.do_bulk_send` / `do_bulk_delete`, which loop over the SAME
-single-item operations (`do_retrieve` / `do_delete`). There is no second
-deletion or retrieval implementation. After the run the selection is cleared and
-the panel reports one honest outcome per item.
+**Not confirmed (honest boundary):** Telegram's own rapid-edit throttling is a
+plausible *amplifier*. Fifteen concurrent edits to one message is exactly the
+pattern official guidance warns about, and Telethon transparently sleeps up to
+`flood_sleep_threshold` (60 s, `backend/bot/client.py`) on a flood answer — which
+would look like this exact stall. That behaviour was **not** observed live and is
+reported as a hypothesis, not a finding.
 
-**Honest reporting.** `format_bulk_result` names how many of how many succeeded,
-lists the successful codes, and gives each failure its own bounded reason
-(`not found (it may already be deleted)`, `database error: …`, `the saved item
-is still present after deletion`, the service's own failure text, …). A partial
-result is never rendered as a success. Delete success is not inferred from the
-single-item return string: the row is re-read after `do_delete` and counts as
-deleted only when it is really gone.
+## 2. Execution path inspected
 
-## 2. Determinism, ownership and bounds
+| Stage | Source |
+|---|---|
+| Update reception / dispatch | pinned `telethon/client/updates.py` (`_update_loop`, `_dispatch_update`, `task = self.loop.create_task(...)` line 289) |
+| Client construction (no `sequential_updates`; `flood_sleep_threshold=60`) | `backend/bot/client.py`, `backend/helper/client.py` |
+| Callback receipt hook (log only) | `backend/helper/client.py::register_helper_hooks` |
+| Callback router, gates, dispatch | `backend/helper/panels.py::_callback_router` (line 367), `_handle_panel` (513), `_handle_action`, `_handle_input`, `_handle_navigation` |
+| Panel/action/input registries | `backend/helper/panel_registry.py`, `backend/helper/panels.py` |
+| Session/render state | `backend/helper/lifecycle.py`, `backend/helper/session_manager.py` |
+| Panel editing (inline vs self) | `backend/helper/panel_edit.py` |
+| Database dispatch | `backend/db/client.py::run_sync_db` (bounded 4-worker pool, `guarded_await` watchdog) |
+| Settings read on every click | `backend/services/settings_service.py` (in-memory cache; `load_all()` at startup, `supervisor.py:178`) |
+| AI handler (checked, not on this path) | `backend/bot/handlers/ai_unified.py` — registered on the **self** client for *outgoing messages*; callback queries arrive on the **helper** client |
+| Tests | `tests/test_helper_callback_receipt.py`, `tests/test_task_reliability_repair.py`, and the new `tests/test_callback_backlog.py` |
 
-* **Exact identity** — the selection stores save codes, never positions or
-  query results. A toggle is accepted only after `load_saved_item(code, owner)`
-  verifies both existence and ownership; a missing or foreign row is refused
-  with the same "no longer in your saved items" wording (never distinguishable).
-* **Per-owner state** — `backend/helper/selection_state.py`, one bounded
-  insertion-ordered `code → presented label` map per owner, plus the page being
-  viewed. Synchronous and loop-local, like `input_state`; it never awaits, so a
-  toggle cannot interleave with another.
-* **Bounds** — at most 40 selected items (`MAX_SELECTION`, mirrored by
-  `retrieve_service.MAX_BULK_ITEMS`); the 41st toggle is refused *and the
-  refusal is shown*, never silently dropped. The service also reports any
-  overflow as a failed item rather than implying it processed more than it did.
-* **Expiry** — an untouched selection expires after 15 minutes; the next
-  access reports an empty selection.
-* **Clearing** — Cancel, a new selection session, and every bulk execution drop
-  the selection. Back from a review keeps it. Leaving the panel via the
-  standard Back/Home/Close is covered by the TTL and by "select starts fresh".
-* **Pagination** — the selection is page-independent; the review lists every
-  selected code across pages.
-* **Stale / deleted items** — a toggle is re-verified; a bulk action re-verifies
-  every code immediately before use and reports vanished items as failures
-  while still processing the rest.
-* **Callback budget** — the longest generated callback is
-  `action:retrieve_toggle:S0001` (28 bytes); a test asserts all of them are
-  ≤ 64 bytes and use a registered `panel:` / `action:` prefix.
-* **Empty selection** — review and both actions report "No items are selected"
-  and touch nothing.
-
-## 3. Which existing operations support bulk (and which do not)
-
-| Existing operation | Bulk? | Why |
-|---|---|---|
-| `do_delete` | **yes** | per-item, owner-verified, album-aware; deletion is meaningful for any set |
-| `do_retrieve` | **yes** | per-item forward to the current chat; reuses the single authority |
-| `do_rename` | no | each item needs its own name — a bulk name would overwrite distinct labels |
-| `do_change_file_name` | no | re-uploads the document per item with a per-item name |
-| `do_edit_tags` / `do_move` | no | deliberately left to the single-item panel in this task (see §6) |
-
-## 4. Changed files
+## 3. What changed
 
 | File | Change |
 |---|---|
-| `backend/helper/selection_state.py` | **new** — bounded, expiring, per-owner selection store (toggle/selected/codes/count/clear/page) |
-| `backend/helper/symbols.py` | two structure glyphs: `SELECT_EMPTY = ⊡` (U+22A1), `SELECT_MARKED = ⊠` (U+22A0), registered as `select_empty` / `select_marked` |
-| `backend/services/retrieve_service.py` | `BulkItemOutcome`, `BulkResult`, `do_bulk_delete`, `do_bulk_send`, `format_bulk_result`, `MAX_BULK_ITEMS`, owner-verified pre-check; module docstring |
-| `backend/bot/handlers/retrieve.py` | browse renderer extracted unchanged, selection view, toggle action, review panels, two bulk actions, registrations, `extra` grammar documentation |
-| `tests/test_retrieve_multi_select.py` | **new** — 34 tests (see §5) |
-| `AGENTS.md` | Stash bullet documents the multi-select view and its service reuse |
-| `IMPLEMENTATION_REPORT.md` | this report |
+| `backend/helper/callback_gate.py` | **new** — callback admission (duplicate suppression by Telegram `query_id`), `ack()` (answer first), per-panel FIFO turns (`acquire_turn` / `release_turn`, bounded wait), and per-stage timing records (`CallbackAdmission`, `finish`, `recent_timings`) |
+| `backend/helper/panels.py` | `_callback_router`: admit → **acknowledge** → gates → **per-panel turn** → re-check the panel still exists → dispatch → record outcome; the trailing `finally: await _safe_answer(event)` is gone (one answer per click, not two); every early-return gate records its outcome |
+| `tests/test_callback_backlog.py` | **new** — 16 tests (§5) that also produce the before/after measurements |
+| `AGENTS.md` | Glass UI section documents the callback admission contract |
+| `IMPLEMENTATION_REPORT.md`, `INVESTIGATION.md` | this report and the root-cause investigation |
 
-No database change, no migration, no new dependency, no change to Save, the AI
-tools, providers, runtime, or Telegram connection code.
+No new dependency, no database change, no migration, no change to Save, the AI
+runtime, providers, the Taskloom scheduler, the runtime supervisor, or the
+Telegram connection code. No second dispatcher, queue, executor or update loop
+was introduced: Telethon still decides what runs and when, and the existing
+`ToolExecutor`/service layer is untouched.
 
-## 5. Tests executed (all actually run)
+## 4. Concurrency and ordering guarantees
 
-| Command | Result |
+* **Acknowledgement first.** A delivered query is answered before any session
+  lookup, database read, render or edit. Ack latency is one
+  `messages.setBotCallbackAnswer` round trip, independent of the handler. A
+  refused answer (expired query, disconnected helper) is recorded and logged,
+  and the click is still dispatched — the answer is never a precondition.
+* **One FIFO turn per panel.** Clicks on the same `(chat_id, msg_id)` run one at
+  a time in arrival order through a ticket queue (no lock, no task per waiter —
+  one future per waiting click). Clicks on **different** panels never wait for
+  each other: a blocked panel cannot delay any other panel's click.
+* **Bounded wait.** A click waits at most `DEFAULT_TURN_WAIT_S` (20 s) for its
+  turn. If the turn cannot be taken it is dropped with `outcome=dropped:panel-busy`
+  and a `WARNING` line naming the callback — a deliberate, traceable rejection,
+  never a silent discard.
+* **Closed-panel guard.** A click that queued behind another click re-checks the
+  panel's session after acquiring its turn; if the earlier click closed the
+  panel the queued click is dropped (`dropped:panel-closed`) and never edits a
+  message that is gone.
+* **Duplicate suppression.** The key is Telegram's own `query_id`, bounded to
+  128 recent ids. The same query delivered twice runs its handler once (and is
+  still answered); two genuine taps are two distinct query ids and both run.
+  Suppression is exact, not a debounce window and not a rate limit.
+* **Cancellation and failure release the turn.** `CancelledError` propagates
+  after removing the waiter (or handing the granted turn on); exceptions are
+  logged and the turn is released in the router's `finally`. A stuck handler can
+  hold only its own panel's turn.
+* **Ordering preserved where it matters.** A click's handler always sees the
+  state left by every earlier click on that panel, so "next page" twice advances
+  two pages and a confirm click acts on the review the owner actually saw.
+  Independent panels, background flows and Telegram RPCs remain concurrent.
+
+## 5. Measurements
+
+Same harness, same fake RPCs (`answer` = 1 event-loop tick, `edit` = 10 ms),
+same machine, CPython 3.12. "Before" = the pre-fix router at `HEAD` (`7d4a838`),
+measured with the change stashed; "after" = this working tree.
+
+| Scenario | Before | After |
+|---|---|---|
+| Ack latency, single click, 200 ms handler | **210.8 ms** | **0.00 ms** (one answer RPC; the 200 ms is `work_ms`) |
+| Ack latency, burst of 15, 50 ms handler (max over clicks) | **62.7 ms** | **0.79 ms** |
+| Handler order, 3 concurrent clicks on one panel (first one slow) | **`['2','3','1']`** (wrong) | **`['1','2','3']`** |
+| Peak concurrent handlers on one panel | **3** | **1** |
+| Wall time for the 15-click burst | 62.7 ms | 758.0 ms |
+
+The last row is the deliberate cost and it is reported plainly: clicks on ONE
+panel are now a sequence (15 × (50 ms handler + 10 ms edit)), because running
+them concurrently is what corrupted the view and what produced the clump of
+edits. What the owner perceives changes from "frozen, then a burst" to "every
+press acknowledged instantly, updates landing in order". Clicks on different
+panels are still fully concurrent (asserted by
+`test_independent_panels_progress_while_one_is_blocked`).
+
+## 6. How every accepted click is accounted for
+
+Each click creates one `CallbackAdmission` and exactly one timing record. The
+`outcome` is one of:
+
+`completed` · `failed` · `cancelled` · `rejected:no-coordinates` ·
+`rejected:not-owner` · `rejected:empty-data` · `rejected:no-session` ·
+`rejected:unknown-prefix` · `dropped:panel-busy` · `dropped:panel-closed`
+
+and one INFO line reports the measured stages:
+
+```
+[CALLBACK] timing data='panel:retrieve_saved' outcome=completed ack_ms=0.4
+           wait_ms=0.0 work_ms=41.2 total_ms=41.6
+```
+
+`ack_ms` (receipt → answer), `wait_ms` (answer → dispatch, i.e. time queued for
+the panel), `work_ms` (dispatch → edit attempted: handler work and UI response),
+`total_ms`. Callback data is logged truncated to 64 characters — the same
+bounded identity the router and the helper receipt hook already logged. No
+message content, credential or session data is logged.
+
+Guarantee boundary, stated precisely: a click that reaches the router is
+answered, recorded, and either executed exactly once or rejected with a logged
+reason. A click that never reaches the process (dropped on the wire, process
+killed, helper disconnected) cannot be accounted for, and an answer refused by
+Telegram is recorded as `ack_error` on the click that still runs. No claim is
+made beyond that.
+
+## 7. Validation actually run
+
+| Check | Result |
 |---|---|
-| `python -m py_compile` on every changed module | **OK** |
-| `pytest tests/test_retrieve_multi_select.py -q` | **34 passed** |
-| `pytest tests/test_symbols.py tests/test_colored_buttons.py tests/test_retrieve_owner_isolation.py tests/test_saved_item_sender_and_retrieve.py tests/test_save_v2_resolution.py tests/test_save_success_panel.py tests/test_save_v2_wiring.py tests/test_12_save_engine.py -q` | **254 passed** |
-| `pytest tests -q -p no:randomly` (full suite) | **6752 passed, 27 skipped, 1 failed** |
+| `py_compile` on `backend/helper/callback_gate.py`, `backend/helper/panels.py`, `tests/test_callback_backlog.py` | **OK** |
+| `pytest tests/test_callback_backlog.py -q` | **16 passed** |
+| `pytest tests/test_task_reliability_repair.py tests/test_helper_callback_receipt.py tests/test_retrieve_multi_select.py -q` | **85 passed** |
+| `pytest tests -q -p no:randomly` (full suite) | **6768 passed, 27 skipped, 1 failed** |
+| `git diff --check` | clean |
 
-The one full-suite failure is
-`tests/test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`
-("interval advancement exceeded bound"). It reproduces with this working tree
-stashed at `HEAD` (verified with `git stash push -u` → the same test fails →
-`git stash pop`), so it is pre-existing and unrelated to this change.
+Focused coverage added by `tests/test_callback_backlog.py`:
 
-Coverage in the new suite:
+* 15 clicks arriving together: each answered once, each handler run exactly
+  once, 15 `completed` records, ack never waiting for the 50 ms handler;
+* ack latency excludes slow work (200 ms handler, ack < 50 ms, `work_ms` ≥ 200);
+* same-panel clicks execute in arrival order with no overlap, and the last
+  handler's view is the one left on the panel;
+* an independent panel completes while another panel's handler is blocked;
+* the same query delivered twice runs the handler once but is still answered;
+* two distinct clicks on the same button both run;
+* a click queued for a panel closed meanwhile is dropped and edits nothing;
+* a raising handler does not block the next click;
+* a cancelled handler releases the turn and the next click completes;
+* a refused ack is recorded, and the click still dispatches;
+* an unobtainable turn drops the click with `dropped:panel-busy` after the bound;
+* action dispatch still receives its `extra` and renders; `panel:_nav:noop`
+  renders nothing; `panel:_nav:home` still renders the menu;
+* unauthorized and unknown-panel clicks are answered and edit nothing;
+* per-stage timings are monotonic and the record buffer is bounded.
 
-* browse rows still open their own item panel, plus the Select entry;
-* the single-item preview keeps its Retrieve / Rename / Delete callbacks;
-* select view renders the exact presented codes as toggles and marks;
-* select → deselect → select; labels captured exactly as presented;
-* selection survives `select:page:2` and returns to the viewed page on toggle;
-* a new selection session discards the previous one; Cancel clears; Back keeps;
-* missing / foreign codes are refused with identical wording;
-* malformed `extra` values (`toggle:`, `select:page:abc`, `page:0`, …) survive;
-* the 40-item cap refuses the 41st item *and* reports it;
-* store-level: malformed input, `clear` return value, TTL expiry;
-* bulk delete needs the explicit confirm callback and deletes nothing without it;
-* bulk delete calls `do_delete` only for ticked codes and removes exactly those;
-* a vanished item is never sent to the delete and is reported (1 of 2);
-* a delete that leaves the row behind is reported as 0 of 1, not success;
-* a foreign-owner row never reaches the delete and is reported as 0 of 1;
-* single-item delete still works after a bulk session;
-* bulk send calls `do_retrieve` once per ticked code with owner + chat;
-* send failures are reported as "Sent 0 of 2" with the service's reason;
-* send requires confirmation and a resolvable target chat;
-* empty selection → review and both actions do nothing;
-* service dedupes + preserves order; the 40-item bound is enforced and overflow
-  is reported; partial formatting never starts with the success glyph;
-* a tick is registered as an action (never a panel query, so Back cannot
-  re-toggle) and its callback is ≤ 64 bytes;
-* every multi-select callback is ≤ 64 bytes with a known prefix.
+Full-suite failure: `tests/test_task_scheduler.py::
+test_recovered_interrupted_occurrence_is_picked_up_by_run_once`
+("interval advancement exceeded bound"). It was re-run with this working tree
+stashed at `HEAD` (`git stash push -u` → same failure → `git stash pop`), so it
+is pre-existing and unrelated.
 
-## 6. Limitations / not verified
+## 8. Limitations / not verified
 
-* **No live Telegram verification.** No panel was rendered by a real Helper
-  Bot, no button was tapped by a real owner, and no saved item was really
-  forwarded/deleted. All evidence is application-level against the in-memory DB
-  fallback and fakes.
-* **In-memory fallback quirk.** `retrieve_service.do_delete` only removes the DB
-  row when a Supabase client is configured (`if db:`); with the fallback it
-  deletes the Telegram message but leaves the row. The bulk layer surfaces that
-  honestly ("the saved item is still present after deletion"), so a bulk delete
-  in a Supabase-less deployment would report failure even though Telegram
-  accepted the message deletion. Fixing `do_delete` was deliberately out of
-  scope.
-* **Not in this task:** bulk rename, bulk move, bulk tag editing, and a
-  "select all on this page" convenience row. They were left out to keep the
-  change narrow; the selection model already supports them without new state.
-* Pagination is page-index based on `list_saves`; if items are saved/deleted by
-  another surface between two pages, a page can shift. Ticking is always by code,
-  so a shifted row can never be deleted by accident.
+* **No live Telegram verification.** No real Helper Bot answered a callback, no
+  button was pressed by an owner, no message was edited on Telegram. Every RPC
+  in the tests and in the measurements above is a fake with a chosen latency.
+  The measured improvements are therefore the click path's own structure, and
+  the production magnitude of `ack_ms` will be one real answer RPC.
+* **Flood/rapid-edit throttling is unconfirmed** (§1). If production logs show
+  `FloodWaitError` on `EditInlineBotMessage`, that is the amplifier to address
+  next — the serialised per-panel edit rate is already the recommended remedy,
+  but no claim is made that it was observed.
+* **Ordering is per panel process-locally.** Two processes serving the same
+  owner (not a supported deployment) would each have their own turns.
+* **A handler that never returns holds its own panel's turn** until the waiter's
+  bound expires; queued clicks for that panel are then dropped with a reason.
+  No handler timeout/cancellation was added, because cancelling panel work
+  mid-flight could interrupt a destructive action that has already started.
+* Panel telemetry is in-process only (`callback_gate.recent_timings()`, 64
+  records); nothing is exposed on the web API.
