@@ -176,3 +176,103 @@ observed here, so it is not claimed as a cause.
 * **Live proof is missing.** That a real client sees a 30-click burst answered
   immediately and the panel ending on the newest view must be observed in
   production; the report does not claim it.
+
+---
+
+## Appendix A — Cloudflare Workers AI provider evidence (separate implementation task, 2026-10-25)
+
+> This appendix documents a DIFFERENT task from the responsiveness investigation
+> above, which is left intact. Every API claim is taken from current official
+> Cloudflare documentation, cited inline. **No live Cloudflare request was
+> made** — the repository side is source-verified, the API side is
+> documentation-verified.
+
+### A.1 Which endpoint, and why it is account-scoped
+
+Workers AI's OpenAI-compatible surface is
+
+```
+POST https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1/chat/completions
+```
+
+with `Authorization: Bearer <api_token>` and a standard OpenAI body (`model`,
+`messages`, `temperature`, `max_tokens`, `tools`/`tool_choice`,
+`response_format`), answering the standard OpenAI `choices[].message` / `usage`
+shape. The same page documents `/v1/embeddings`, and `/v1/responses` for the
+GPT-OSS models only. — [OpenAI compatible API endpoints](https://developers.cloudflare.com/workers-ai/configuration/open-ai-compatibility/)
+
+Consequence for this repository: there is **no host root** to put in a static
+`base_url`, which is why `cloudflare` is the only provider whose endpoint is
+composed in the factory rather than in `defaults.py`. A token alone is not a
+usable configuration.
+
+The native (non-OpenAI) REST endpoint `/ai/run/{model}` answers
+`{"result": {"response": …}, "success": true, "errors": [], "messages": []}` —
+[REST API quickstart](https://developers.cloudflare.com/workers-ai/get-started/rest-api/).
+It is **not** used: the provider layer is an OpenAI-compatible client and the
+compatible endpoint is the documented one for SDK use.
+
+### A.2 Authentication
+
+A Cloudflare API token in the standard Bearer header; for a manually created
+token the guide grants **Workers AI – Read** and **Workers AI – Edit**. The
+legacy *global API key* is a different credential and is not a Bearer token,
+which is why only `*_API_TOKEN` names are accepted
+([REST API quickstart](https://developers.cloudflare.com/workers-ai/get-started/rest-api/)).
+
+### A.3 Errors are a different envelope, with meaningful codes
+
+`{"success": false, "errors": [{"code": …, "message": …}], "result": null}` — not
+the OpenAI `{"error": {…}}` object. Documented codes that change classification
+([Workers AI errors](https://developers.cloudflare.com/workers-ai/platform/errors/)):
+
+| Code | HTTP | Meaning | Classification |
+|---|---|---|---|
+| `5007` | 400 | `No such model … or task` | `model_not_found` (never retried; model marked unavailable) |
+| `3042` | 404 | invalid model id | `model_not_found` (already the status rule) |
+| `5035` | 403 | model requires a Workers Paid plan | `request` — **not** `auth`, so one paid-only model cannot disable the provider |
+| `3007`/`3008` | 408 | request timeout / aborted | `timeout` (retryable) |
+| `3036` | 429 | daily free neuron allocation exhausted | `rate_limited` |
+| `3040` | 429 | capacity temporarily exceeded | `rate_limited` |
+
+The `retry-after` header (when present) is honored by the existing 429 path.
+Nothing in `ProviderManager` needed to change: its retry / cooldown / quarantine
+/ fallback ownership is untouched, and only the adapter's two classification
+hooks are overridden.
+
+### A.4 There is no OpenAI-style `/models`
+
+The compatible surface documents chat completions, embeddings and (GPT-OSS only)
+responses — no model-list endpoint. `GET …/ai/v1/models` therefore cannot verify
+anything (a 404), so:
+
+* the adapter's `list_models()` returns `[]` without a request;
+* discovery's probe keeps its existing conservative policy (a non-auth status
+  leaves the provider configured and selectable, `validated=False`);
+* the model selector is fed from the curated `_FALLBACK_CATALOG` entry, the
+  repository's documented place for offline model lists.
+
+### A.5 Model ids and the free tier
+
+Ids are `@cf/<vendor>/<model>` and are forwarded verbatim in the JSON body (the
+OpenAI-compatible endpoint takes the model in the body, not in the path, so the
+`@` and `/` need no encoding). Documented as function-calling capable:
+`@cf/meta/llama-3.3-70b-instruct-fp8-fast`,
+`@cf/meta/llama-4-scout-17b-16e-instruct`, `@cf/openai/gpt-oss-120b`,
+`@cf/openai/gpt-oss-20b`, `@cf/qwen/qwen3-30b-a3b-fp8`,
+`@cf/zai-org/glm-4.7-flash` — per their model pages under
+[Workers AI models](https://developers.cloudflare.com/workers-ai/models/). The
+chosen default is `@cf/meta/llama-3.3-70b-instruct-fp8-fast`
+([model page](https://developers.cloudflare.com/workers-ai/models/llama-3.3-70b-instruct-fp8-fast/)).
+
+The Free plan includes **10,000 Neurons/day**, reset at 00:00 UTC, shared across
+models; some models require the Workers Paid plan
+([pricing](https://developers.cloudflare.com/workers-ai/platform/pricing/)).
+
+### A.6 What is still unproven
+
+No Cloudflare account, token or account id was used, so nothing here proves that
+the token's permissions are sufficient, that the account id matches the
+deployment, that the default model is enabled for that account, or that the free
+allocation has headroom. Those are live checks for the owner after the
+deployment variables are set.

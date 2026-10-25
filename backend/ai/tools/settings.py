@@ -115,12 +115,22 @@ async def _set_ai_config(context: ToolContext, key: str, value: Any) -> ToolResu
             logger.warning("settings_set: provider registration check failed: %s", exc)
             registered = []
         if provider not in registered:
-            env_var = str((info.get("env_vars") or [""])[0] or "")
+            # Account-scoped providers also need their account id, so the
+            # instruction names every variable that is actually required.
+            required = [
+                str(name)
+                for name in [
+                    (info.get("env_vars") or [""])[0],
+                    (info.get("account_id_env") or [""])[0],
+                ]
+                if name
+            ]
+            env_vars = " and ".join(required) or "its API key"
             return ToolResult(
                 success=False,
                 message=(
                     f"Provider '{provider}' is not available on this server "
-                    f"(no API key configured — set {env_var} and restart)."
+                    f"(not configured — set {env_vars} and restart)."
                 ),
             )
         model = str(info.get("default_model", "") or "")

@@ -153,6 +153,7 @@ _PROVIDER_DISPLAY_FALLBACK = {
     "siliconflow": "SiliconFlow",
     "fireworks": "Fireworks",
     "nararouter": "NaraRouter",
+    "cloudflare": "Cloudflare",
     "dummy": "Built-in",
     "local": "Built-in",
 }
@@ -520,7 +521,8 @@ async def _ai_wizard_panel_handler(event, extra: str) -> tuple[str, str, list] |
     ]
     for p in wizard_info:
         lines.append(f"  {sym.ICON_PROVIDER} **{p['display_name']}**")
-        lines.append(f"     Set: `{p['env_var']}`")
+        for env_name in [p["env_var"], *p.get("extra_env", [])]:
+            lines.append(f"     Set: `{env_name}`")
         lines.append("")
     if invalid:
         lines.append("! **Invalid keys detected:**")

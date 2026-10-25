@@ -152,6 +152,15 @@ _FALLBACK_CATALOG: dict[str, list[str]] = {
         "kimi-k2.5",
         "gemini-3.1-pro",
     ],
+    # Workers AI answers no OpenAI-style /models request, so its catalog is
+    # always this list. Ids are the full ``@cf/...`` model names (documented
+    # function-calling capable); a paid-plan-only model is never listed.
+    "cloudflare": [
+        "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+        "@cf/meta/llama-4-scout-17b-16e-instruct",
+        "@cf/openai/gpt-oss-120b",
+        "@cf/qwen/qwen3-30b-a3b-fp8",
+    ],
 }
 
 

@@ -223,6 +223,21 @@ _PROVIDERS: list[dict[str, Any]] = [
         "icon": sym.ICON_P_NARAROUTER,
     },
     {
+        "name": "cloudflare",
+        "display_name": "Cloudflare Workers AI",
+        "env_vars": ["AI_CLOUDFLARE_API_TOKEN", "CLOUDFLARE_API_TOKEN"],
+        "model_env": ["AI_CLOUDFLARE_MODEL", "CLOUDFLARE_MODEL"],
+        "base_url_env": ["AI_CLOUDFLARE_BASE_URL", "CLOUDFLARE_BASE_URL"],
+        # Workers AI is account-scoped: the endpoint embeds the account id, so
+        # both the token and the account id are required configuration.
+        "account_id_env": ["AI_CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_ACCOUNT_ID"],
+        "default_base_url": (
+            "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1"
+        ),
+        "default_model": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+        "icon": sym.ICON_P_CLOUDFLARE,
+    },
+    {
         "name": "you",
         "display_name": "You.com Search",
         "env_vars": ["YDC_API_KEY"],
@@ -314,7 +329,15 @@ def _scan_provider(p: dict[str, Any]) -> ProviderStatus:
     capability_kind = p.get("capability_kind", "chat")
     capabilities = list(p.get("capabilities", []))
 
-    if not api_key:
+    # Account-scoped providers have no addressable endpoint without their
+    # account id, so an incomplete configuration is reported as not_configured
+    # instead of advertising a URL that cannot resolve.
+    account_id_env = p.get("account_id_env") or []
+    account_id = _get_env(account_id_env) if account_id_env else ""
+    if account_id_env:
+        base_url = base_url.format(account_id=account_id) if account_id else ""
+
+    if not api_key or (account_id_env and not base_url):
         return ProviderStatus(
             name=p["name"],
             display_name=p["display_name"],
@@ -528,6 +551,7 @@ def get_wizard_info() -> list[dict[str, str]]:
             "name": p["name"],
             "display_name": p["display_name"],
             "env_var": p["env_vars"][0],
+            "extra_env": list(p.get("account_id_env", [])[:1]),
             "icon": p["icon"],
             "capability_kind": p.get("capability_kind", "chat"),
             "capabilities": list(p.get("capabilities", [])),

@@ -136,29 +136,12 @@ class OpenAICompatProvider(BaseProvider):
                 )
 
             if resp.status_code >= 400:
-                error_msg = "Unknown error"
-                provider_error_code = ""
-                provider_error_type = ""
-                provider_request_id = ""
-                try:
-                    error_data = resp.json()
-                    err_obj = error_data.get("error", {})
-                    error_msg = err_obj.get("message", error_msg)
-                    provider_error_code = str(err_obj.get("code", ""))
-                    provider_error_type = err_obj.get("type", "")
-                    provider_request_id = str(
-                        err_obj.get("request_id") or error_data.get("request_id") or ""
-                    )
-                except Exception:
-                    error_msg = resp.text[:200]
-                if resp.status_code in (401, 403):
-                    failure_type = "auth"
-                elif resp.status_code == 404:
-                    failure_type = "model_not_found"
-                elif resp.status_code >= 500:
-                    failure_type = "server"
-                else:
-                    failure_type = "request"
+                fields = self._error_fields(resp)
+                error_msg = fields["message"]
+                provider_error_code = fields["code"]
+                provider_error_type = fields["type"]
+                provider_request_id = fields["request_id"]
+                failure_type = self._failure_type_for(resp.status_code, fields)
                 logger.warning("%s API error %d: %s", self.name, resp.status_code, error_msg)
                 return ProviderResponse(
                     text=f"API error ({resp.status_code}): {error_msg}",
@@ -249,6 +232,39 @@ class OpenAICompatProvider(BaseProvider):
                 success=False,
                 metadata={"failure_type": "network", "error": f"{type(exc).__name__}: {exc}"},
             )
+
+    def _error_fields(self, response: Any) -> dict[str, str]:
+        """Extract the provider's error fields from a failed response.
+
+        The OpenAI envelope (``{"error": {"message", "code", "type",
+        "request_id"}}``) is the default. A provider whose documented error
+        body differs overrides THIS hook (and ``_failure_type_for`` when its
+        codes carry their own meaning) instead of duplicating ``chat()`` —
+        request construction, retries, cooldowns and fallback stay unchanged.
+        """
+        fields = {"message": "Unknown error", "code": "", "type": "", "request_id": ""}
+        try:
+            error_data = response.json()
+            err_obj = error_data.get("error", {})
+            fields["message"] = err_obj.get("message", fields["message"])
+            fields["code"] = str(err_obj.get("code", ""))
+            fields["type"] = err_obj.get("type", "")
+            fields["request_id"] = str(
+                err_obj.get("request_id") or error_data.get("request_id") or ""
+            )
+        except Exception:
+            fields["message"] = response.text[:200]
+        return fields
+
+    def _failure_type_for(self, status_code: int, fields: dict[str, str]) -> str:
+        """Classify an HTTP failure into the manager's existing taxonomy."""
+        if status_code in (401, 403):
+            return "auth"
+        if status_code == 404:
+            return "model_not_found"
+        if status_code >= 500:
+            return "server"
+        return "request"
 
     async def vision(self, messages: list[dict[str, Any]], images: list[bytes], **kwargs: Any) -> ProviderResponse:
         return ProviderResponse(

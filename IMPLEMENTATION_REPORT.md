@@ -252,3 +252,175 @@ restored → identical failure. Pre-existing, unrelated to the callback path.
 * Phase 1/2's "each click's `work_ms` includes the UI response" is superseded:
   `work_ms` is now handler-only and the paint is reported separately as
   `paint_ms`.
+
+---
+
+# Cloudflare Workers AI provider — separate task report (2026-10-25)
+
+> This part documents a DIFFERENT task from the callback-responsiveness report
+> above, which is left intact. Nothing here changes the callback path, the Save
+> pipeline, Taskloom or the database.
+
+| Item | Value |
+|---|---|
+| Task | Add Cloudflare Workers AI as a supported provider through the EXISTING provider architecture |
+| Result | **Implemented and unit-verified.** The bot recognises `cloudflare`: it registers from ENV, routes through the existing `ProviderManager`, and its failures use the existing taxonomy |
+| Live Cloudflare call | **NONE.** No account, token, account id or live API request was used |
+| Render | **NOT touched, NOT configured, NOT deployed.** `render.yaml` is unchanged |
+| Telegram / Supabase / `.env` | **Not touched.** No session, no RPC, no SQL, no migration, no secret read |
+| Base commit | `8a0c5b9` (the report above's HEAD); the provider change is independent of it |
+| Documents not modified | `DATABASE_ARCHITECTURE.md` |
+| New dependency | **none** (`httpx` already carried the provider transport) |
+
+## C1. Implemented — exact files and capabilities
+
+| File | Change |
+|---|---|
+| `backend/ai/providers/cloudflare.py` | **New.** `CloudflareProvider(OpenAICompatProvider)`: `PROVIDER_NAME="cloudflare"`, capabilities (tools / function calling / JSON / streaming / long context), `_error_fields` (Cloudflare's `errors[]` envelope), `_failure_type_for` (codes `5007`, `5035`, `408`), `list_models()` → `[]` with no request, plus `BASE_URL_TEMPLATE` and `resolve_base_url(account_id)` |
+| `backend/ai/providers/openai_compat.py` | Error parsing moved behind two overridable hooks — `_error_fields(response)` and `_failure_type_for(status_code, fields)`. The default is the previous OpenAI envelope + status classification, behavior-equivalent; `chat()` construction, retries and timeouts are untouched |
+| `backend/ai/providers/base/defaults.py` | `_cloudflare_default()` — `base_url=""` (account-scoped, resolved by the factory), `default_model=@cf/meta/llama-3.3-70b-instruct-fp8-fast`, `timeout=60`, `enabled=False` |
+| `backend/ai/providers/factory.py` | Class registry entry, `_ENV_KEY_MAP` / `_ENV_MODEL_MAP` / `_ENV_BASE_URL_MAP` entries, `_ENV_ACCOUNT_ID_MAP` + resolution: the account id is composed into the endpoint, and **a token without an account id leaves the provider unregistered** (a warning names the missing variable) |
+| `backend/ai/providers/__init__.py` | `CloudflareProvider` import + `__all__` |
+| `backend/ai/discovery.py` | Provider metadata row (display name, env vars, account id env, endpoint template, default model, icon); `_scan_provider` composes account-scoped base URLs and reports an incomplete configuration as `not_configured` **without issuing a probe**; `get_wizard_info` exposes the additional required variable |
+| `backend/ai/model_discovery.py` | `_FALLBACK_CATALOG["cloudflare"]` — four documented function-calling models, full `@cf/...` ids |
+| `backend/helper/symbols.py` | `ICON_P_CLOUDFLARE = "⌬"` (registry glyph, no emoji, no variation selector) |
+| `backend/bot/handlers/ai.py` | Display-name fallback entry; the setup wizard prints every required variable (token **and** account id) |
+| `backend/ai/tools/settings.py` | The "provider not available" message now names every required variable (account id included) |
+| `tests/test_cloudflare_provider.py` | **New.** 49 mocked-HTTP/unit tests (§C5) |
+| `tests/test_17_providers.py` | `cloudflare` added to the core-registration assertion |
+
+No second dispatcher/manager/scheduler, no new config system, no migration.
+
+## C2. Configuration (derived from the final source code)
+
+| Variable | Required | Meaning |
+|---|---|---|
+| `AI_CLOUDFLARE_API_TOKEN` *(alias `CLOUDFLARE_API_TOKEN`)* | **yes** | Cloudflare API token with Workers AI read (held only in `ProviderConfig.api_key` and the Bearer header; never logged) |
+| `AI_CLOUDFLARE_ACCOUNT_ID` *(alias `CLOUDFLARE_ACCOUNT_ID`)* | **yes**, unless `AI_CLOUDFLARE_BASE_URL` is set | Cloudflare account id — part of the endpoint: `https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1` |
+| `AI_CLOUDFLARE_MODEL` | no | Full `@cf/...` model id; default `@cf/meta/llama-3.3-70b-instruct-fp8-fast` |
+| `AI_CLOUDFLARE_BASE_URL` | no | Explicit endpoint override (internal proxy); when set, the account id is not required |
+| `AI_PROVIDER` | no | Set to `cloudflare` to make it the active reasoning engine |
+
+A legacy Cloudflare **global API key** is deliberately not accepted: it is not a
+Bearer token, so `AI_CLOUDFLARE_API_KEY` is not read.
+
+## C3. Behavior
+
+* **Selection / discovery**: `cloudflare` appears in the provider list once the
+  token **and** account id are present; selection flows through the existing
+  `apply_runtime_selection` path (no parallel config store).
+* **Request**: `POST {base}/chat/completions` with
+  `Authorization: Bearer <token>`, `model`, `messages`, `temperature`,
+  `max_tokens`; `tools` + `tool_choice=auto` when tools are supplied;
+  `response_format` for structured output. A per-call `model=` override is
+  forwarded verbatim (Workers AI ids are opaque `@cf/...` strings).
+* **Response**: standard OpenAI `choices[].message` / `usage`; `tool_calls`
+  normalized, and **malformed tool arguments are flagged, never executed**
+  (unchanged `openai_compat` behavior).
+* **Failures** (existing taxonomy, existing manager ownership): `401/403` →
+  `auth` (provider disabled); `429` → `rate_limited` with `retry_after`; `5xx`
+  → `server` (one bounded retry); `408` → `timeout` (retryable); code
+  `5007`/`404` → `model_not_found` (no retry, model marked unavailable); code
+  `5035` (paid-only model, HTTP 403) → `request`, **not** `auth`, so one
+  paid-only model cannot disable the provider.
+* **Missing configuration**: no token → not registered (unchanged policy);
+  token without account id → not registered with a warning naming the missing
+  variable, and discovery reports `not_configured` without probing.
+
+## C4. Safety behavior preserved
+
+* `ProviderManager` remains the sole owner of retries, cooldowns, quarantine,
+  capability routing and fallback — no line of it changed.
+* The adapter performs exactly one HTTP attempt per call, as every other
+  OpenAI-compatible provider does.
+* No token, header or `Authorization` value appears in logs; discovery's probe
+  trace keeps its existing sanitization.
+* Nothing in the callback path, Save, Taskloom or the supervisor was touched.
+
+## C5. Tests — commands and actual results
+
+| Command | Result |
+|---|---|
+| `.venv/bin/python -m pytest tests/test_cloudflare_provider.py -q` | **49 passed** |
+| `.venv/bin/python -m pytest tests/test_17_providers.py tests/test_nararouter_provider.py tests/test_52_you_search.py tests/test_provider_structured_output.py tests/test_provider_tool_boundary.py tests/test_provider_system_instruction_contract.py tests/test_23_provider_mesh.py -q` | **162 passed** |
+| `.venv/bin/python -m pytest tests -q` | **6838 passed, 27 skipped, 1 failed** (138.39 s) — the failure is the pre-existing `test_task_scheduler` one described below |
+| `.venv/bin/python -m compileall -q <every modified Python file>` | OK |
+| `git diff --check` | clean |
+
+The single failure is
+`tests/test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`
+(`interval advancement exceeded bound`). It is **pre-existing and unrelated**:
+no task-scheduler code was touched, and it reproduces identically on a clean
+`git archive 8a0c5b9` copy of the base commit (`1 failed`, task-scheduler code
+only).
+
+Coverage in `tests/test_cloudflare_provider.py` (all HTTP mocked, no network):
+
+1. registration: factory list, defaults, token+account registration, the
+   unprefixed alias, missing account id → unregistered (warning logged, secret
+   absent), explicit base-url override, model override, no token →
+   unregistered, other providers unaffected;
+2. request: exact account-scoped URL, Bearer header, timeout, payload
+   (`model`/`messages`/`temperature`/`max_tokens`), per-call model override
+   verbatim, `tools` + `tool_choice`, `response_format`;
+3. response: text/usage/finish_reason, native `tool_calls` normalization,
+   malformed arguments flagged, empty `choices` stays honestly empty;
+4. errors: envelope message+code surfaced, `5007` → `model_not_found`,
+   `5035` → `request` (not `auth`), `401` → `auth`, `408` → `timeout`,
+   `429` + `retry-after`, transport timeout, non-JSON error body, malformed
+   success body, disabled provider short-circuit, `list_models()` makes no
+   request, health without a key, **token never logged**;
+5. shared manager: 5xx → one retry then fallback + cooldown; `401` → disabled
+   with no retry and the backup serving; `429` → cooldown then re-entry;
+   `5007` → no retry; `5035` → provider not disabled;
+6. discovery: available+validated on 200 (probe URL and header checked),
+   missing account id → `not_configured` with **no** probe, `401/403` →
+   `invalid`, `404/429/5xx` → available but unvalidated, metadata and wizard
+   entries;
+7. model catalog: fallback catalog used when `/models` 404s; ids keep their
+   `@cf/` form and survive the chat-capability filter;
+8. regressions: the OpenAI `error` envelope still parses for `groq`
+   (message/code/type/request_id) and `groq` auth / model-not-found / server
+   classification is unchanged after the hook extraction.
+
+## C6. Not tested (requires the owner's Cloudflare account)
+
+* That the token's permissions actually allow Workers AI inference, and that the
+  account id matches the token's account.
+* That the configured default model is enabled for that account/plan, and any
+  free-tier headroom (10,000 Neurons/day, shared, resets 00:00 UTC).
+* Whether a specific model honors `tools`/`response_format` — Workers AI
+  documents these per model, exactly like the other OpenAI-compatible providers
+  here.
+* The live conversation path (`Nova …`) through the active provider.
+
+Nothing above is claimed to work in production.
+
+## C7. Known limitations
+
+* **No live model list.** The OpenAI-compatible surface exposes no `/models`
+  endpoint, so the selector uses the curated catalog (four documented
+  function-calling models). Any model id can still be set explicitly through
+  `AI_CLOUDFLARE_MODEL`.
+* **The discovery probe is inconclusive by design.** `GET …/ai/v1/models`
+  returns 404, which the existing policy treats as "configured, unverified"
+  (`validated=False`) — never as a bad key. A real `401/403` still marks the
+  provider invalid.
+* **Vision is not implemented** (same as every other OpenAI-compatible provider
+  here); the capability flag stays `False`.
+* **Free-tier exhaustion** surfaces as `rate_limited` (`3036`) with the
+  documented window; it keeps failing until the daily allocation resets.
+* `ProviderConfigManager` keeps `base_url=""` for `cloudflare` until the
+  factory resolves it; the registered provider instance is the authoritative
+  config, so this affects only RAM snapshots, never a request.
+
+## C8. Next step for the owner (deployment is theirs)
+
+1. Create a Cloudflare API token with Workers AI access and copy the account id.
+2. Add `AI_CLOUDFLARE_API_TOKEN` and `AI_CLOUDFLARE_ACCOUNT_ID` (optionally
+   `AI_CLOUDFLARE_MODEL`) to the Render service, then redeploy.
+3. In the bot: `Menu` → AI → Provider → refresh → select **Cloudflare Workers
+   AI**, pick a model, then send `Nova ping` and confirm a real answer.
+4. If it fails, read `ProviderFactory: … not registered`,
+   `AI_PROVIDER_FAILURE … category=…` and `API error <status>: <message>` —
+   none of which contain the token.
