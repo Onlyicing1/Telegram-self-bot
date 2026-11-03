@@ -119,7 +119,11 @@ _PROVIDERS: list[dict[str, Any]] = [
         "model_env": ["AI_GEMINI_MODEL", "GEMINI_MODEL"],
         "base_url_env": [],
         "default_base_url": "https://generativelanguage.googleapis.com/v1beta",
-        "default_model": "gemini-2.0-flash",
+        # ONE source of truth for the default: the same id the runtime
+        # provider is configured with (providers/base/defaults.py). Keeping a
+        # retired id here made discovery advertise a model the API no longer
+        # serves and injected it into every model test as a phantom target.
+        "default_model": "gemini-2.5-flash",
         "icon": sym.ICON_P_GEMINI,
     },
     {
@@ -382,16 +386,21 @@ async def _validate_provider(status: ProviderStatus) -> ProviderStatus:
     if status.capability_kind != "chat":
         return _make_available(status)
 
+    params: dict[str, Any] | None = None
     if status.name == "gemini":
-        url = f"{status.base_url}/models?key={api_key}&pageSize=1"
-        headers: dict[str, str] = {}
+        # Gemini documents the key in ``x-goog-api-key``, so the probe URL never
+        # carries the credential (and the sanitized trace records a key-free
+        # URL by construction, not only because the query was stripped).
+        url = f"{status.base_url}/models"
+        headers: dict[str, str] = {"x-goog-api-key": api_key}
+        params = {"pageSize": 1}
     else:
         url = f"{status.base_url}/models"
         headers = {"Authorization": f"Bearer {api_key}"}
 
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(url, headers=headers)
+            resp = await client.get(url, headers=headers, params=params)
         return _classify_probe(status, resp.status_code, url)
     except Exception as exc:
         # A transport failure (timeout, connection error, ...) says nothing

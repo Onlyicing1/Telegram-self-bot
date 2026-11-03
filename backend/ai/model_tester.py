@@ -33,17 +33,22 @@ import logging
 import os
 import re
 import time
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any, Callable
 
 from backend.ai.config_store import get_config
 from backend.ai.discovery import discover_providers, _get_env, get_provider_info, _PROVIDERS
 from backend.ai.model_discovery import (
+    fallback_models,
     fetch_models,
+    get_last_fetch_source,
     is_chat_capable,
     order_models_for_selector,
+    reset_fetch_source,
 )
 from backend.ai.providers.base.config import ProviderConfig
+from backend.ai.providers.base.defaults import resolve_model
 from backend.ai.providers.factory import ProviderFactory
 
 logger = logging.getLogger(__name__)
@@ -187,6 +192,11 @@ async def test_single_model(
         # Never waste a network request on a provider without a key.
         return _not_configured_result(provider_name, display_name, icon, model_id)
 
+    # Test the id that would actually be sent: a retired id is substituted at
+    # request construction, so reporting the requested id as AVAILABLE would
+    # claim a model the provider no longer serves.
+    model_id = resolve_model(provider_name, model_id)
+
     base_url = (
         _get_env(p_info["base_url_env"]) if p_info.get("base_url_env") else ""
     ) or p_info.get("default_base_url", "")
@@ -326,8 +336,12 @@ async def _build_targets(
     model is kept first, the remainder is distributed round-robin across
     providers in discovery order. Priority per provider:
       1. the user's currently selected model (when this provider is active)
-      2. the provider's default model
+      2. the provider's default model — only when the LIVE catalog contains
+         it (a default the provider no longer serves is a phantom target)
       3. discovered chat-capable models, FREE-FIRST ordered (deduped)
+
+    Every id is deprecation-resolved before it becomes a target, so a target
+    is always the model that would actually be requested.
     ``max_per_provider`` is accepted and ignored for backward compatibility
     with the existing batch runner signature.
     """
@@ -349,23 +363,36 @@ async def _build_targets(
         base_url = p.base_url or info.get("default_base_url", "")
 
         models = []
+        discovery_source = ""
         if api_key:
             try:
+                # Claim THIS fetch's provenance only: an earlier provider's
+                # source (or an injected fetch that records nothing) must not
+                # decide whether the default model is a real catalog member.
+                reset_fetch_source(p.name)
                 models = await fetch_models(p.name, api_key, base_url, force_refresh=True)
+                discovery_source = get_last_fetch_source(p.name)
             except Exception as exc:
+                # Discovery failing here is still discovery failing: use the
+                # SAME curated catalog the fetch itself falls back to, never an
+                # empty list that would leave only the provider default.
                 logger.warning("Model discovery failed for %s: %s", p.name, exc)
-                models = []
+                models = fallback_models(p.name)
+                discovery_source = "fallback" if models else ""
 
         # COMPLETE production feed: every chat-capable model from this
         # discovery result, uncapped and deduped — never sliced by the
-        # display limit below.
+        # display limit below. Ids are deprecation-resolved HERE, so a target
+        # is always a model the provider would actually serve: a retired id
+        # can neither be tested nor labelled.
         full: list[Any] = []
         seen_full: set[str] = set()
         for m in models:
-            if m.id in seen_full or not is_chat_capable(m.id):
+            model_id = resolve_model(p.name, m.id)
+            if not model_id or model_id in seen_full or not is_chat_capable(model_id):
                 continue
-            seen_full.add(m.id)
-            full.append(m)
+            seen_full.add(model_id)
+            full.append(m if model_id == m.id else replace(m, id=model_id, name=model_id))
         complete_models[p.name] = full
 
         # FREE-FIRST ordering, using the SAME deterministic selector order
@@ -385,16 +412,24 @@ async def _build_targets(
         candidates: list[str] = []
         seen: set[str] = set()
 
-        # 1. currently selected model for this provider
+        # 1. the model this provider is actually configured to use (the
+        #    owner's selection): always tested, so a stale selection surfaces
+        #    as a real failure instead of being hidden.
         if active_config.get("provider") == p.name:
-            sel = active_config.get("model")
-            if sel and sel not in seen:
-                seen.add(sel)
-                candidates.append(sel)
-        # 2. provider default model
-        if p.default_model and p.default_model not in seen:
-            seen.add(p.default_model)
-            candidates.append(p.default_model)
+            selected = resolve_model(p.name, active_config.get("model") or "")
+            if selected and selected not in seen:
+                seen.add(selected)
+                candidates.append(selected)
+        # 2. the provider default, but ONLY when it is part of the catalog
+        #    that was just fetched. A default the provider does not serve (a
+        #    retired id, or a stale env value) is a phantom target: testing it
+        #    reports a model that can be neither selected nor used. Curated
+        #    fallback catalogs ARE the list, so their default is kept.
+        default_model = resolve_model(p.name, p.default_model or "")
+        if default_model and (discovery_source != "api" or default_model in seen_full):
+            if default_model not in seen:
+                seen.add(default_model)
+                candidates.append(default_model)
         # 3. discovered chat-capable models (free-first, deduped)
         for m in ordered:
             if m.id in seen:
@@ -402,8 +437,8 @@ async def _build_targets(
             seen.add(m.id)
             candidates.append(m.id)
 
-        if not candidates and p.default_model:
-            candidates = [p.default_model]
+        if not candidates and default_model:
+            candidates = [default_model]
 
         for mid in candidates:
             targets.append({**base, "model": mid})
@@ -499,7 +534,9 @@ def proven_usable_candidates(
         if model not in bucket:
             bucket.append(model)
 
-    configured = {p.name: (p.default_model or "") for p in providers_status}
+    configured = {
+        p.name: resolve_model(p.name, p.default_model or "") for p in providers_status
+    }
     feed: dict[str, list[str]] = {}
     for provider, ids in usable.items():
         infos = complete_models.get(provider, [])
