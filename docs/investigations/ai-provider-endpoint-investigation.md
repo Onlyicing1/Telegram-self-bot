@@ -494,6 +494,12 @@ No **Critical** finding was identified.
 - **Minimal fix:** on `apply_selection()` (and only there), call a tracker
   reset for the provider whose configuration changed; optionally add an
   explicit "retry provider now" action. Keep `401` semantics; pair with H2.
+- **Status after remediation (2026-11-03, commit `b203685`):** fixed. The
+  tracker gained `clear_disabled()`, called by `ProviderManager.recover_provider()`,
+  by a valid `update_provider_config()`, by `reset_provider_config()`, and by a
+  model-writing `apply_selection()`; only the untimed disabled flag is cleared
+  (cooldowns, quarantine and model-unavailability records survive). Covered by
+  `tests/test_17_providers.py`.
 
 #### H2 — All 403 responses are classified as invalid credentials
 
@@ -514,6 +520,13 @@ No **Critical** finding was identified.
 - **Minimal fix:** classify on provider code/type where present; add a
   `policy`/`forbidden` category with a bounded cooldown. This intentionally
   changes a pinned test and must be accompanied by updating it.
+- **Status after remediation (2026-11-03, commit `b203685`):** fixed. `401`
+  stays `auth`; a `403` is `auth` only when the provider's own code/type names
+  a rejected credential, otherwise it becomes the new bounded `access_denied`
+  category (cooldown, never a disable). Gemini keeps its documented
+  `UNAUTHENTICATED` / `API_KEY_INVALID` signals. Covered by
+  `tests/test_nararouter_provider.py`, `tests/test_17_providers.py` (Gemini) and
+  `tests/test_cloudflare_provider.py`.
 
 #### H3 — Health surfaces disagree with the router; `disabled` is invisible
 
