@@ -832,7 +832,7 @@ async def test_openai_error_envelope_still_parses_for_existing_providers():
 
 
 @pytest.mark.asyncio
-async def test_existing_provider_auth_and_5xx_classification_is_unchanged():
+async def test_existing_provider_403_and_5xx_classification():
     from backend.ai.providers.groq import GroqProvider
 
     def _provider() -> GroqProvider:
@@ -847,7 +847,9 @@ async def test_existing_provider_auth_and_5xx_classification_is_unchanged():
     unauthorised._http_client.post = AsyncMock(return_value=_http_response(
         403, {"error": {"message": "forbidden"}},
     ))
-    assert (await unauthorised.chat([{"role": "user", "content": "x"}])).metadata["failure_type"] == "auth"
+    # A bare 403 carries no credential signal: it is an access restriction,
+    # cooled down but never a permanent provider disable.
+    assert (await unauthorised.chat([{"role": "user", "content": "x"}])).metadata["failure_type"] == "access_denied"
 
     missing = _provider()
     missing._http_client.post = AsyncMock(return_value=_http_response(

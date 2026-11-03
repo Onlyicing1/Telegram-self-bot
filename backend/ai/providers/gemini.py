@@ -19,6 +19,11 @@ logger = logging.getLogger(__name__)
 
 _GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
 
+#: Google API ``error.status`` values that mean the CREDENTIAL itself was
+#: rejected (documented ``UNAUTHENTICATED`` / ``API_KEY_INVALID``), even when
+#: surfaced with HTTP 403. Any other 403 is an access/policy restriction.
+_GEMINI_AUTH_STATUSES = frozenset({"UNAUTHENTICATED", "API_KEY_INVALID", "INVALID_API_KEY"})
+
 
 def _to_gemini_schema(value: Any) -> Any:
     """Recursively convert schema ``type`` values to Gemini's Type spelling.
@@ -178,8 +183,23 @@ class GeminiProvider(BaseProvider):
                     provider_error_type = err_obj.get("status", "")
                 except Exception:
                     pass
-                if resp.status_code in (401, 403):
+                if resp.status_code == 401:
                     failure_type = "auth"
+                elif resp.status_code == 403:
+                    # Gemini documents 403 for PERMISSION_DENIED (policy, region,
+                    # key restriction, disabled API), not only for a bad key;
+                    # only the credential-specific signals keep the auth
+                    # classification that disables the provider.
+                    status_name = str(provider_error_type or "").strip().upper()
+                    code_name = str(provider_error_code or "").strip().upper()
+                    message_lower = str(error_msg or "").lower()
+                    rejected_key = (
+                        status_name in _GEMINI_AUTH_STATUSES
+                        or code_name in _GEMINI_AUTH_STATUSES
+                        or "api key not valid" in message_lower
+                        or "api_key_invalid" in message_lower
+                    )
+                    failure_type = "auth" if rejected_key else "access_denied"
                 elif resp.status_code == 404:
                     failure_type = "model_not_found"
                 elif resp.status_code >= 500:

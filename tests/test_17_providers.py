@@ -384,3 +384,162 @@ async def test_delete_tool_routes_through_service_not_client():
 
     svc.assert_awaited_once()
     assert results[0].success is True
+
+
+# ── Disabled-provider recovery (H1) ──
+
+
+def _three_providers():
+    providers = [_StubProvider(name, []) for name in ("prov-a", "prov-b", "prov-c")]
+    pm = ProviderManager()
+    for provider in providers:
+        pm.register_provider(provider)
+    pm.switch_provider("prov-a")
+    return pm, providers
+
+
+def test_recover_provider_clears_only_the_affected_disabled_state():
+    pm, _providers = _three_providers()
+    pm._health.mark_disabled("prov-a")
+    pm._health.mark_disabled("prov-b")
+    pm._health.mark_cooling_down("prov-c", 60.0)
+    pm._mark_model_unavailable("prov-a", "dead-model")
+
+    state = pm.recover_provider("prov-a")
+
+    assert state["recovered"] is True
+    assert state["available"] is True
+    assert state["state"] == "healthy"
+    assert pm._health.state("prov-b") == "disabled"
+    assert pm._health.state("prov-c") == "cooling_down"
+    assert pm._model_unavailable("prov-a", "dead-model") is True
+
+
+def test_recover_provider_rejects_an_unregistered_provider():
+    pm = ProviderManager()
+    state = pm.recover_provider("ghost")
+    assert state["recovered"] is False
+    assert state["available"] is False
+    assert state["state"] == "unregistered"
+
+
+@pytest.mark.asyncio
+async def test_explicit_recovery_makes_a_disabled_provider_routable_again():
+    provider = _StubProvider("auth", [_failure("bad key", http_status=401)])
+    pm = ProviderManager()
+    pm.register_provider(provider)
+    pm.switch_provider("auth")
+    pm._fallback_chain = []
+
+    assert (await pm.chat([{"role": "user", "content": "hi"}])).success is False
+    assert pm.health_snapshot()["auth"]["state"] == "disabled"
+    # A disabled provider is not even attempted.
+    assert (await pm.chat([{"role": "user", "content": "hi"}])).success is False
+    assert provider.calls == 1
+
+    assert pm.recover_provider("auth")["available"] is True
+    assert (await pm.chat([{"role": "user", "content": "hi"}])).success is True
+    assert provider.calls == 2
+
+
+def test_valid_config_update_clears_disabled_state():
+    pm, _providers = _three_providers()
+    pm.get_provider_config("prov-a").api_key = "test-key"
+    pm._health.mark_disabled("prov-a")
+
+    result = pm.update_provider_config("prov-a", "temperature", 0.3)
+
+    assert result.valid is True
+    assert pm._health.state("prov-a") == "healthy"
+
+
+def test_rejected_config_update_keeps_disabled_state():
+    pm, _providers = _three_providers()
+    pm._health.mark_disabled("prov-a")
+
+    result = pm.update_provider_config("prov-a", "no_such_field", 1)
+
+    assert result.valid is False
+    assert pm._health.state("prov-a") == "disabled"
+
+
+def test_reset_provider_config_clears_disabled_state():
+    pm, _providers = _three_providers()
+    pm._health.mark_disabled("prov-a")
+
+    pm.reset_provider_config("prov-a")
+
+    assert pm._health.state("prov-a") == "healthy"
+
+
+def test_model_selection_clears_disabled_for_that_provider_only():
+    pm, _providers = _three_providers()
+    pm._health.mark_disabled("prov-a")
+    pm._health.mark_disabled("prov-b")
+
+    assert pm.apply_selection("prov-a", "selected-model") is True
+
+    assert pm.get_provider_config("prov-a").default_model == "selected-model"
+    assert pm._health.state("prov-a") == "healthy"
+    assert pm._health.state("prov-b") == "disabled"
+
+
+def test_bare_provider_switch_does_not_clear_disabled_state():
+    pm, _providers = _three_providers()
+    pm._health.mark_disabled("prov-a")
+    pm._health.mark_disabled("prov-b")
+
+    assert pm.apply_selection("prov-b") is True
+
+    assert pm._health.state("prov-a") == "disabled"
+    assert pm._health.state("prov-b") == "disabled"
+
+
+# ── HTTP 403 classification (H2) ──
+
+
+def _gemini_provider():
+    from backend.ai.providers.gemini import GeminiProvider
+
+    provider = GeminiProvider(ProviderConfig(
+        api_key="gemini-test-key", enabled=True, default_model="gemini-2.5-flash",
+    ))
+    provider._http_client = MagicMock()
+    return provider
+
+
+def _gemini_error(status_code: int, status: str, message: str) -> MagicMock:
+    resp = MagicMock()
+    resp.status_code = status_code
+    resp.text = message
+    resp.json.return_value = {
+        "error": {"code": status_code, "message": message, "status": status},
+    }
+    return resp
+
+
+@pytest.mark.asyncio
+async def test_gemini_permission_denied_403_is_an_access_restriction():
+    provider = _gemini_provider()
+    provider._http_client.post = AsyncMock(return_value=_gemini_error(
+        403, "PERMISSION_DENIED", "Method doesn't allow unregistered callers.",
+    ))
+
+    result = await provider.chat([{"role": "user", "content": "hi"}])
+
+    assert result.success is False
+    assert result.metadata["http_status"] == 403
+    assert result.metadata["failure_type"] == "access_denied"
+
+
+@pytest.mark.asyncio
+async def test_gemini_rejected_key_403_remains_an_auth_failure():
+    provider = _gemini_provider()
+    provider._http_client.post = AsyncMock(return_value=_gemini_error(
+        403, "UNAUTHENTICATED", "API key not valid. Please pass a valid API key.",
+    ))
+
+    result = await provider.chat([{"role": "user", "content": "hi"}])
+
+    assert result.metadata["http_status"] == 403
+    assert result.metadata["failure_type"] == "auth"

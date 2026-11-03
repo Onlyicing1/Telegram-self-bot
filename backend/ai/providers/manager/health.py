@@ -34,6 +34,8 @@ logger = logging.getLogger(__name__)
 #: Failures eligible for ONE immediate retry before cooldown.
 RETRYABLE_FAILURES = frozenset({"network", "timeout", "server"})
 #: Auth failures are terminal for the provider until configuration changes.
+#: Only a 401 (or a provider's documented invalid-credential code) lands
+#: here; a bare 403 is ``access_denied`` — never a rejected key.
 AUTH_FAILURES = frozenset({"auth"})
 
 DEFAULT_COOLDOWN_SECONDS = 60.0
@@ -53,6 +55,7 @@ FAILURE_PENALTIES: dict[str, float] = {
     "timeout": 30.0,
     "server": 60.0,
     "network": 60.0,
+    "access_denied": 120.0,
     "malformed": 120.0,
     "quality": 120.0,
     "empty_response": 30.0,
@@ -65,7 +68,10 @@ FAILURE_PENALTIES: dict[str, float] = {
 #: (HTTP status, provider error codes, vendor messages) never travel past
 #: this layer — the rest of LifeOS reasons about these categories only.
 FAILURE_CATEGORIES: frozenset[str] = frozenset({
-    "auth",              # 401/403 — disabled until configuration changes
+    "auth",              # 401 / documented invalid-credential code — disabled
+                         # until a configuration change or explicit recovery
+    "access_denied",     # 403 policy/plan/region restriction — bounded
+                         # cooldown, never a permanent disable
     "rate_limited",      # 429 / quota — cooldown, honor Retry-After
     "model_not_found",   # 404 dead/retired model — (provider, model) unavailable
     "timeout",           # request timeout — retry once, then fail over
@@ -150,6 +156,21 @@ class ProviderHealthTracker:
         self._quarantine_until.pop(name, None)
         self._consecutive_failures.pop(name, None)
         logger.warning("provider-health: '%s' disabled until configuration changes", name)
+
+    def clear_disabled(self, name: str) -> bool:
+        """Clear ONLY the auth-derived ``disabled`` flag for one provider.
+
+        The recovery primitive behind an explicit repair (a config write or
+        the manager's recover action): cooldowns, quarantine deadlines,
+        streaks and every other provider are deliberately left untouched, so
+        repairing one provider never erases unrelated penalties. Returns True
+        when the provider was actually disabled.
+        """
+        if name not in self._disabled:
+            return False
+        self._disabled.discard(name)
+        self._last_failure_category.pop(name, None)
+        return True
 
     def mark_healthy(self, name: str) -> None:
         """Fully reset a provider's health (cooldown, quarantine, streaks)."""

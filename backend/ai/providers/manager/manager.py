@@ -477,6 +477,12 @@ class ProviderManager:
             if config is not None:
                 config.default_model = model
                 logger.info("ProviderManager: applied model '%s' to runtime provider '%s'", model, provider)
+                # An explicit model selection writes this provider's
+                # authoritative config, so it is a genuine configuration
+                # change: a provider disabled by an earlier auth failure must
+                # become routable again without a restart. A bare provider
+                # switch (no model) writes nothing and clears nothing.
+                self._clear_disabled_on_config_change(provider, "model_selection")
         return True
 
     def get_active_name(self) -> str:
@@ -540,12 +546,57 @@ class ProviderManager:
         return self._config_for(name)
 
     def update_provider_config(self, name: str, field: str, value: Any) -> Any:
-        """Update a provider config field. Returns the ValidationResult."""
-        return self._config_mgr.update(name, field, value, config=self._config_for(name))
+        """Update a provider config field. Returns the ValidationResult.
+
+        A valid update is a genuine configuration change, so it also clears
+        that provider's DISABLED health state (a corrected key or model must
+        be routable again without a process restart).
+        """
+        result = self._config_mgr.update(name, field, value, config=self._config_for(name))
+        if getattr(result, "valid", False):
+            self._clear_disabled_on_config_change(name, "config_update")
+        return result
 
     def reset_provider_config(self, name: str) -> ProviderConfig:
-        """Reset a provider's config to factory defaults."""
-        return self._config_mgr.reset(name, config=self._config_for(name))
+        """Reset a provider's config to factory defaults (a config change)."""
+        config = self._config_mgr.reset(name, config=self._config_for(name))
+        self._clear_disabled_on_config_change(name, "config_reset")
+        return config
+
+    def recover_provider(self, name: str) -> dict[str, Any]:
+        """Explicit recovery action: clear ONE provider's DISABLED state.
+
+        Returns the same read-only state dict ``reset_state`` exposes, plus
+        ``recovered`` (whether the flag was actually set). Only that provider
+        is touched — cooldowns, quarantine, other providers and
+        (provider, model) unavailability records survive.
+        """
+        if not self._registry.has(name):
+            logger.warning("ProviderManager: recover_provider: '%s' not registered", name)
+            return {
+                "provider": name,
+                "recovered": False,
+                "available": False,
+                "state": "unregistered",
+                "reason": "",
+                "cooldown_remaining_s": 0.0,
+                "quarantine_remaining_s": 0.0,
+            }
+        recovered = self._clear_disabled_on_config_change(name, "explicit_recovery")
+        state = self.reset_state(name)
+        state["recovered"] = recovered
+        return state
+
+    def _clear_disabled_on_config_change(self, name: str, trigger: str) -> bool:
+        """Clear a provider's DISABLED state after an explicit repair.
+
+        The health tracker stays the single source of provider health; this
+        removes only the untimed auth flag, never the timed penalties.
+        """
+        recovered = self._health.clear_disabled(name)
+        if recovered:
+            logger.info("PROVIDER_RECOVERY provider=%s trigger=%s", name, trigger)
+        return recovered
 
     def validate_provider(self, name: str) -> Any:
         """Validate a provider's config. Returns ValidationResult."""
@@ -949,8 +1000,11 @@ class ProviderManager:
         status = meta.get("http_status")
         if status == 429:
             return "rate_limited"
-        if status in (401, 403):
+        if status == 401:
             return "auth"
+        if status == 403:
+            # A bare 403 is an access/policy restriction, not a rejected key.
+            return "access_denied"
         if status == 404:
             return "model_not_found"
         if isinstance(status, int) and 500 <= status < 600:

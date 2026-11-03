@@ -256,10 +256,36 @@ class OpenAICompatProvider(BaseProvider):
             fields["message"] = response.text[:200]
         return fields
 
+    #: Provider error codes/types that name a REJECTED CREDENTIAL, used when a
+    #: gateway reports the rejection with HTTP 403 instead of 401.
+    _AUTH_ERROR_MARKERS = frozenset({
+        "invalid_api_key",
+        "invalid_key",
+        "invalid_api_token",
+        "authentication_error",
+        "unauthorized",
+    })
+
+    def _is_auth_rejection(self, fields: dict[str, str]) -> bool:
+        """True when the error envelope itself names a rejected credential."""
+        code = str(fields.get("code", "") or "").strip().lower()
+        etype = str(fields.get("type", "") or "").strip().lower()
+        return code in self._AUTH_ERROR_MARKERS or etype in self._AUTH_ERROR_MARKERS
+
     def _failure_type_for(self, status_code: int, fields: dict[str, str]) -> str:
-        """Classify an HTTP failure into the manager's existing taxonomy."""
-        if status_code in (401, 403):
+        """Classify an HTTP failure into the manager's existing taxonomy.
+
+        ``401`` is always a rejected credential. A ``403`` is only one when
+        the provider's own error code/type says the credential was rejected
+        (``invalid_api_key``, ``authentication_error``, ...); every other 403
+        is an access/policy/plan/region restriction (``access_denied``) that
+        the manager cools down but never permanently disables. Subclasses
+        with documented 403 codes override this hook (see ``cloudflare.py``).
+        """
+        if status_code == 401:
             return "auth"
+        if status_code == 403:
+            return "auth" if self._is_auth_rejection(fields) else "access_denied"
         if status_code == 404:
             return "model_not_found"
         if status_code >= 500:

@@ -253,7 +253,7 @@ async def test_malformed_tool_arguments_flagged_not_executed():
 @pytest.mark.parametrize("status,expected_type,error_type", [
     (400, "request", "validation_error"),
     (401, "auth", "unauthorized"),
-    (403, "auth", "forbidden"),
+    (403, "access_denied", "forbidden"),
     (404, "model_not_found", "not_found"),
     (413, "request", "bad_request"),
     (415, "request", "unsupported_media_type"),
@@ -603,3 +603,74 @@ async def test_probe_trace_never_contains_credentials(monkeypatch, caplog):
     assert "***" in caplog.text
     assert "Authorization" not in caplog.text
     assert "Bearer" not in caplog.text
+
+
+# ── HTTP 403 is not automatically a rejected key (H2) ──
+
+
+def _gateway_provider() -> Any:
+    return _make_provider(ProviderConfig(
+        api_key="sk-nry-secret", enabled=True,
+        base_url="https://router.bynara.id/v1", default_model="deepseek-v4-flash",
+    ))
+
+
+@pytest.mark.asyncio
+async def test_generic_403_cools_the_provider_down_without_disabling_it():
+    provider = _gateway_provider()
+    provider._http_client.post = AsyncMock(return_value=_http_response(
+        403, {"error": {"type": "forbidden", "message": "no access", "request_id": "req_403"}},
+    ))
+
+    pm = ProviderManager()
+    pm.register_provider(provider)
+    pm.switch_provider("nararouter")
+    pm._fallback_chain = []
+
+    response = await pm.chat([{"role": "user", "content": "hi"}])
+
+    assert response.success is False
+    assert provider._http_client.post.await_count == 1, "403 is never retried"
+    state = pm.reset_state("nararouter")
+    assert state["state"] == "cooling_down"
+    assert state["reason"] == "access_denied"
+    assert state["available"] is False
+
+
+@pytest.mark.asyncio
+async def test_documented_invalid_key_403_still_disables_the_provider():
+    provider = _gateway_provider()
+    provider._http_client.post = AsyncMock(return_value=_http_response(
+        403, {
+            "error": {
+                "type": "invalid_api_key", "code": "invalid_api_key",
+                "message": "bad key", "request_id": "req_403_key",
+            },
+        },
+    ))
+
+    pm = ProviderManager()
+    pm.register_provider(provider)
+    pm.switch_provider("nararouter")
+    pm._fallback_chain = []
+
+    response = await pm.chat([{"role": "user", "content": "hi"}])
+
+    assert response.success is False
+    assert pm.health_snapshot()["nararouter"]["state"] == "disabled"
+    assert pm.recover_provider("nararouter")["available"] is True
+
+
+@pytest.mark.asyncio
+async def test_discovery_403_does_not_touch_runtime_health_state(monkeypatch):
+    provider = _gateway_provider()
+    pm = ProviderManager()
+    pm.register_provider(provider)
+    pm.switch_provider("nararouter")
+    before = pm.health_snapshot()
+
+    status = await _nararouter_status(monkeypatch, _probe_client(403))
+
+    assert status.status == "invalid"
+    assert pm.health_snapshot() == before
+    assert pm.reset_state("nararouter")["state"] == "healthy"
