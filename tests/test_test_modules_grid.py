@@ -306,3 +306,131 @@ def test_grid_keeps_the_summary_and_existing_actions_without_emoji():
     forbidden = "🧪🟢✅⚠️🔄🤖🔍💳🚫🔵🟡🟠🔴⚪❓⚡🧠"
     assert not any(ch in body for ch in forbidden)
     assert not any(ch in label for label in _labels(buttons) for ch in forbidden)
+
+
+# ── All Results: provider-attributed diagnostics ──────────────────────────
+
+
+def _diagnostic_payload() -> dict:
+    return {
+        "results": [
+            {
+                "provider": "gemini", "display_name": "Google Gemini", "icon": "◇",
+                "model": "gemini-2.5-flash", "requested_model": "gemini-2.5-flash",
+                "status": "AVAILABLE", "error": None, "latency_s": 0.4,
+                "http_status": 200, "retry_after": None, "error_type": None,
+                "provider_code": None, "provider_error_type": None,
+                "provider_error_message": None, "failure_origin": None,
+                "operation": "generateContent", "api_version": "v1beta",
+                "endpoint": "models/gemini-2.5-flash:generateContent",
+            },
+            {
+                "provider": "gemini", "display_name": "Google Gemini", "icon": "◇",
+                "model": "gemini-2.5-pro", "requested_model": "gemini-2.0-flash",
+                "status": "INVALID_MODEL", "error": "models/gemini-2.5-pro is not found",
+                "latency_s": 1.2, "http_status": 404, "retry_after": None,
+                "error_type": "model_not_found", "provider_code": "404",
+                "provider_error_type": "NOT_FOUND",
+                "provider_error_message": "models/gemini-2.5-pro is not found for API version v1beta",
+                "failure_origin": "model_lookup",
+                "operation": "generateContent", "api_version": "v1beta",
+                "endpoint": "models/gemini-2.5-pro:generateContent",
+            },
+        ],
+        "summary": {
+            "available": 1, "failed": 1, "rate_limited": 0,
+            "not_configured": 0, "invalid": 1, "insufficient_credits": 0,
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_all_results_shows_provider_attribution_endpoint_and_message():
+    ai_module._last_test_payload = _diagnostic_payload()
+
+    _, body, _ = await ai_module._ai_test_details_action(None, "", 0)
+
+    assert "Google Gemini" in body
+    assert "gemini-2.5-pro" in body
+    assert "INVALID_MODEL" in body
+    assert "1.2s" in body
+    assert "HTTP 404" in body
+    assert "NOT_FOUND" in body
+    assert "model_lookup" in body
+    assert "models/gemini-2.5-pro:generateContent (v1beta)" in body
+    assert "is not found" in body
+    # The provider code equals the HTTP status here — it is not repeated.
+    assert "code 404" not in body
+    # A successful model has no failure block to explain.
+    assert "HTTP 200" not in body
+
+
+@pytest.mark.asyncio
+async def test_all_results_shows_retry_after_and_rate_limit_origin():
+    payload = _diagnostic_payload()
+    payload["results"] = [{
+        "provider": "gemini", "display_name": "Google Gemini", "icon": "◇",
+        "model": "gemini-2.5-flash", "status": "RATE_LIMITED",
+        "error": "Rate limited by provider (retry-after: 17s)",
+        "latency_s": 0.9, "http_status": 429, "retry_after": 17,
+        "provider_code": "429",        "provider_error_type": "RESOURCE_EXHAUSTED",
+        "provider_error_message": "Resource has been exhausted (e.g. check quota).",
+        "provider_error_reasons": ["RATE_LIMIT_EXCEEDED"],
+        "failure_origin": "rate_limit",
+        "operation": "generateContent", "api_version": "v1beta",
+        "endpoint": "models/gemini-2.5-flash:generateContent",
+    }]
+    ai_module._last_test_payload = payload
+
+    _, body, _ = await ai_module._ai_test_details_action(None, "", 0)
+
+    assert "HTTP 429" in body
+    assert "RESOURCE_EXHAUSTED" in body
+    assert "rate_limit" in body
+    assert "retry-after: 17s" in body
+    assert "RATE_LIMIT_EXCEEDED" in body
+
+
+@pytest.mark.asyncio
+async def test_all_results_renders_without_optional_metadata():
+    ai_module._last_test_payload = {
+        "results": [{
+            "provider": "groq", "display_name": "Groq", "icon": "◇",
+            "model": "llama-3.3-70b-versatile", "status": "PROVIDER_ERROR",
+            "error": None, "latency_s": None,
+        }],
+        "summary": {"available": 0, "failed": 1},
+    }
+
+    _, body, _ = await ai_module._ai_test_details_action(None, "", 0)
+
+    assert "PROVIDER_ERROR" in body
+    assert "llama-3.3-70b-versatile" in body
+    assert "None" not in body
+
+
+@pytest.mark.asyncio
+async def test_all_results_bounds_a_long_provider_message():
+    long_message = "z" * 1000
+    ai_module._last_test_payload = {
+        "results": [{
+            "provider": "gemini", "display_name": "Google Gemini", "icon": "◇",
+            "model": "gemini-2.5-pro", "status": "PROVIDER_ERROR",
+            "error": long_message, "provider_error_message": long_message,
+            "latency_s": 0.1, "http_status": 500,
+        }],
+        "summary": {"available": 0, "failed": 1},
+    }
+
+    _, body, _ = await ai_module._ai_test_details_action(None, "", 0)
+
+    assert "z" * 200 not in body
+    assert "…" in body
+
+
+def test_only_available_models_are_selectable_in_the_grid():
+    payload = _diagnostic_payload()
+    _, buttons = ai_module._render_test_results(payload, current=("gemini", "gemini-2.5-flash"))
+
+    picks = [d for d in _flatten(buttons) if d.startswith(_PICK)]
+    assert picks == ["action:ai_pick_model:gemini:gemini-2.5-flash"]

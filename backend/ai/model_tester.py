@@ -50,17 +50,13 @@ from backend.ai.model_discovery import (
 from backend.ai.providers.base.config import ProviderConfig
 from backend.ai.providers.base.defaults import resolve_model
 from backend.ai.providers.factory import ProviderFactory
+from backend.ai.redaction import redact_secrets
 
 logger = logging.getLogger(__name__)
 
-# Sanitization regex patterns for secrets/credentials
-_SECRET_PATTERNS = [
-    re.compile(r"sk-[a-zA-Z0-9_\-]{8,}", re.IGNORECASE),
-    re.compile(r"gsk_[a-zA-Z0-9_\-]{8,}", re.IGNORECASE),
-    re.compile(r"ms-key-[a-zA-Z0-9_\-]{8,}", re.IGNORECASE),
-    re.compile(r"Bearer\s+[a-zA-Z0-9_\.\-]{8,}", re.IGNORECASE),
-    re.compile(r"key=[a-zA-Z0-9_\-]{8,}", re.IGNORECASE),
-]
+# Bounded diagnostic text: All Results shows ONE short message per failed
+# model, so a provider body is never carried through unbounded.
+_MAX_ERROR_CHARS = 300
 
 # Explicit GLOBAL diagnostic budget for one complete Test Modules run —
 # deliberately NOT a per-provider cap. Discovery may surface hundreds of
@@ -80,12 +76,79 @@ _MODELS_IN_RESPONSE = 30
 
 def sanitize_error_message(msg: str) -> str:
     """Sanitize error messages to ensure no API keys or credentials leak to UI."""
-    if not msg:
-        return ""
-    sanitized = str(msg)
-    for pattern in _SECRET_PATTERNS:
-        sanitized = pattern.sub("***REDACTED***", sanitized)
-    return sanitized
+    return redact_secrets(msg)
+
+
+def _bounded_error_message(msg: str, limit: int = _MAX_ERROR_CHARS) -> str:
+    """One-line, sanitized, bounded provider message for diagnostics."""
+    clean = " ".join(sanitize_error_message(msg).split())
+    if len(clean) <= limit:
+        return clean
+    return clean[: limit - 1].rstrip() + "…"
+
+
+def _model_lookup_evidence(provider_type: str, err_text: str) -> bool:
+    """Whether a 404's own details actually name a missing MODEL.
+
+    A bare HTTP 404 proves only that the route did not resolve. Treating it
+    as an invalid model turns a wrong endpoint, a base-URL typo or a gateway
+    route into a false model verdict, so the body must name a model
+    (``models/x is not found``, ``model_not_found``) before that conclusion
+    is drawn.
+    """
+    text = (err_text or "").lower()
+    mentions_model = "model" in text or "models/" in text
+    missing = (
+        "not found" in text
+        or "does not exist" in text
+        or "unknown model" in text
+        or "unsupported model" in text
+        or provider_type in ("not_found", "model_not_found")
+    )
+    return mentions_model and missing
+
+
+_ORIGIN_BY_STATUS = {
+    "INVALID_MODEL": "model_lookup",
+    "AUTH_ERROR": "authentication",
+    "RATE_LIMITED": "rate_limit",
+    "INSUFFICIENT_CREDITS": "quota",
+    "TIMEOUT": "timeout",
+    "BLOCKED": "content_policy",
+    "PROVIDER_ERROR": "provider",
+    "UNKNOWN_ERROR": "unknown",
+}
+
+
+def _failure_fields(
+    metadata: dict[str, Any],
+    status: str,
+    response_text: str,
+    requested_model: str,
+) -> dict[str, Any]:
+    """Provider-attributed diagnostics kept beside the classification.
+
+    The status says WHAT the tester concluded; these fields say WHY — the id
+    actually requested, the operation/endpoint, the provider's own code and
+    status, and one bounded sanitized message. ``error_type`` is never reused
+    for the provider's status: a local transport class and a provider verdict
+    are different facts.
+    """
+    provider_message = metadata.get("provider_error_message") or response_text or ""
+    return {
+        "requested_model": requested_model,
+        "provider_error_type": metadata.get("provider_error_type"),
+        "provider_error_message": _bounded_error_message(provider_message) or None,
+        "provider_error_reasons": [
+            _bounded_error_message(reason, 80)
+            for reason in (metadata.get("provider_error_reasons") or [])[:5]
+            if reason
+        ],
+        "failure_origin": metadata.get("failure_origin") or _ORIGIN_BY_STATUS.get(status, "unknown"),
+        "operation": metadata.get("operation"),
+        "api_version": metadata.get("api_version"),
+        "endpoint": metadata.get("endpoint"),
+    }
 
 
 def _classify_failure(metadata: dict[str, Any], err_text: str) -> tuple[str, str]:
@@ -128,8 +191,15 @@ def _classify_failure(metadata: dict[str, Any], err_text: str) -> tuple[str, str
         suffix = f" (retry-after: {retry_after}s)" if retry_after else ""
         return "INSUFFICIENT_CREDITS", f"Insufficient credits/quota{suffix}"
 
-    if http_status == 404 or "not found" in err_lower or "unknown model" in err_lower:
-        return "INVALID_MODEL", sanitize_error_message(err_text)
+    if http_status == 404:
+        if _model_lookup_evidence(provider_type, err_text):
+            return "INVALID_MODEL", _bounded_error_message(err_text)
+        return "PROVIDER_ERROR", _bounded_error_message(
+            f"HTTP 404 from the provider (no model-not-found evidence): {err_text}"
+        )
+
+    if provider_type in ("not_found", "model_not_found") and "model" in err_lower:
+        return "INVALID_MODEL", _bounded_error_message(err_text)
 
     if http_status and http_status >= 500:
         return "PROVIDER_ERROR", sanitize_error_message(err_text)
@@ -194,7 +264,10 @@ async def test_single_model(
 
     # Test the id that would actually be sent: a retired id is substituted at
     # request construction, so reporting the requested id as AVAILABLE would
-    # claim a model the provider no longer serves.
+    # claim a model the provider no longer serves. Both ids are kept: the
+    # resolved one is what the provider was asked for, the requested one is
+    # what the caller selected.
+    requested_model = model_id
     model_id = resolve_model(provider_name, model_id)
 
     base_url = (
@@ -234,6 +307,7 @@ async def test_single_model(
                 "display_name": display_name,
                 "icon": icon,
                 "model": model_id,
+                "requested_model": requested_model,
                 "status": "AVAILABLE",
                 "error": None,
                 "latency_s": latency_s,
@@ -255,12 +329,13 @@ async def test_single_model(
             "display_name": display_name,
             "icon": icon,
             "model": model_id,
+            **_failure_fields(metadata, status, err_text, requested_model),
             "status": status,
             "error": clean_err,
             "latency_s": latency_s,
             "http_status": http_status,
             "retry_after": metadata.get("retry_after"),
-            "error_type": metadata.get("error_type") or metadata.get("provider_error_type"),
+            "error_type": metadata.get("error_type") or metadata.get("failure_type"),
             "provider_code": metadata.get("provider_error_code"),
             "finish_reason": finish_reason,
             "capabilities": [],
@@ -273,6 +348,13 @@ async def test_single_model(
             "display_name": display_name,
             "icon": icon,
             "model": model_id,
+            "requested_model": requested_model,
+            "provider_error_type": None,
+            "provider_error_message": None,
+            "failure_origin": "timeout",
+            "operation": None,
+            "api_version": None,
+            "endpoint": None,
             "status": "TIMEOUT",
             "error": f"Request timed out after {timeout}s",
             "latency_s": latency_s,
@@ -291,6 +373,13 @@ async def test_single_model(
             "display_name": display_name,
             "icon": icon,
             "model": model_id,
+            "requested_model": requested_model,
+            "provider_error_type": None,
+            "provider_error_message": None,
+            "failure_origin": "unknown",
+            "operation": None,
+            "api_version": None,
+            "endpoint": None,
             "status": "UNKNOWN_ERROR",
             "error": clean_err,
             "latency_s": latency_s,

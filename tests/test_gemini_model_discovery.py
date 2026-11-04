@@ -486,3 +486,188 @@ def test_cohere_and_groq_fallback_catalogs_are_unchanged():
     assert "command-a-03-2025" in [m.id for m in fallback_models("cohere")]
     assert fallback_models("groq")[0].id == "llama-3.3-70b-versatile"
     assert _FALLBACK_CATALOG["gemini"] == ["gemini-2.5-flash", "gemini-2.5-pro"]
+
+
+# ── 7. Structured Gemini failures reach the diagnostic payload ─────────────
+
+
+class _FakeHTTPResponse:
+    def __init__(self, status_code, payload=None, text="", headers=None):
+        import json as _json
+
+        self.status_code = status_code
+        self._payload = payload
+        self.text = text or (_json.dumps(payload) if payload is not None else "")
+        self.headers = headers or {}
+
+    def json(self):
+        import json as _json
+
+        if self._payload is None:
+            raise ValueError("no json body")
+        return _json.loads(_json.dumps(self._payload))
+
+
+class _FakeGeminiClient:
+    def __init__(self, response):
+        self.response = response
+        self.calls: list[tuple[str, dict]] = []
+
+    async def post(self, url, json=None):
+        self.calls.append((url, json))
+        return self.response
+
+
+def _gemini_provider(response):
+    from backend.ai.providers.base.config import ProviderConfig
+    from backend.ai.providers.gemini import GeminiProvider
+
+    provider = GeminiProvider(ProviderConfig(
+        provider_name="gemini",
+        base_url=GEMINI_BASE,
+        api_key="fake-key",
+        default_model="gemini-2.5-flash",
+        temperature=0.0,
+        max_tokens=5,
+        timeout=5,
+        retry_count=0,
+        enabled=True,
+    ))
+    provider._http_client = _FakeGeminiClient(response)
+    return provider
+
+
+_GEMINI_ERROR_CASES = [
+    (
+        404,
+        {"error": {"code": 404, "status": "NOT_FOUND",
+                   "message": "models/gemini-2.5-pro is not found for API version v1beta"}},
+        "INVALID_MODEL", "model_lookup",
+    ),
+    (
+        400,
+        {"error": {"code": 400, "status": "INVALID_ARGUMENT",
+                   "message": "Invalid JSON payload received. Unknown name 'contents'"}},
+        "PROVIDER_ERROR", "request_validation",
+    ),
+    (
+        401,
+        {"error": {"code": 401, "status": "UNAUTHENTICATED",
+                   "message": "API key not valid. Please pass a valid API key.",
+                   "details": [{"reason": "API_KEY_INVALID"}]}},
+        "AUTH_ERROR", "authentication",
+    ),
+    (
+        403,
+        {"error": {"code": 403, "status": "PERMISSION_DENIED",
+                   "message": "Permission denied on the requested resource."}},
+        "AUTH_ERROR", "authentication",
+    ),
+    (
+        429,
+        {"error": {"code": 429, "status": "RESOURCE_EXHAUSTED",
+                   "message": "Resource has been exhausted (e.g. check quota)."}},
+        "RATE_LIMITED", "rate_limit",
+    ),
+    (
+        500,
+        {"error": {"code": 500, "status": "INTERNAL",
+                   "message": "Internal error encountered."}},
+        "PROVIDER_ERROR", "server",
+    ),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("http_status,payload,expected_status,expected_origin", _GEMINI_ERROR_CASES)
+async def test_gemini_structured_failure_reaches_the_test_payload(
+    http_status, payload, expected_status, expected_origin
+):
+    response = _FakeHTTPResponse(http_status, payload, headers={"retry-after": "17"})
+    provider = _gemini_provider(response)
+    with patch("backend.ai.model_tester._get_env", return_value="fake-key"), \
+         patch("backend.ai.model_tester.ProviderFactory.create_provider", return_value=provider):
+        result = await model_tester.test_single_model(
+            "gemini", "Google Gemini", "◇", "gemini-2.5-flash"
+        )
+
+    assert result["status"] == expected_status
+    assert result["http_status"] == http_status
+    assert result["provider_code"] == str(payload["error"]["code"])
+    assert result["provider_error_type"] == payload["error"]["status"]
+    assert result["failure_origin"] == expected_origin
+    assert result["operation"] == "generateContent"
+    assert result["api_version"] == "v1beta"
+    assert result["endpoint"] == "models/gemini-2.5-flash:generateContent"
+    assert result["model"] == "gemini-2.5-flash"
+    assert result["requested_model"] == "gemini-2.5-flash"
+    assert result["provider_error_message"]
+    expected_reasons = [d["reason"] for d in (payload["error"].get("details") or [])]
+    assert result["provider_error_reasons"] == expected_reasons
+    assert "key=" not in (result["endpoint"] or "")
+    if http_status == 429:
+        assert result["retry_after"] == 17
+
+
+@pytest.mark.asyncio
+async def test_gemini_resolves_the_model_but_reports_both_ids():
+    response = _FakeHTTPResponse(404, {"error": {
+        "code": 404, "status": "NOT_FOUND",
+        "message": "models/gemini-2.5-pro is not found for API version v1beta",
+    }})
+    provider = _gemini_provider(response)
+    client = provider._http_client
+    with patch("backend.ai.model_tester._get_env", return_value="fake-key"), \
+         patch("backend.ai.model_tester.ProviderFactory.create_provider", return_value=provider):
+        result = await model_tester.test_single_model(
+            "gemini", "Google Gemini", "◇", "gemini-2.0-flash"
+        )
+
+    assert result["requested_model"] == "gemini-2.0-flash"
+    assert result["model"] == "gemini-2.5-flash"
+    assert result["endpoint"] == "models/gemini-2.5-flash:generateContent"
+    assert len(client.calls) == 1
+    assert "gemini-2.5-flash:generateContent" in client.calls[0][0]
+
+
+@pytest.mark.asyncio
+async def test_gemini_error_text_is_redacted_bounded_and_never_logged(caplog):
+    secret = "AIzaSyD-verySecretKey123456"
+    response = _FakeHTTPResponse(400, {"error": {
+        "code": 400, "status": "INVALID_ARGUMENT",
+        "message": f"API key not valid: key={secret} " + ("boom " * 200),
+    }})
+    provider = _gemini_provider(response)
+    with patch("backend.ai.model_tester._get_env", return_value="fake-key"), \
+         patch("backend.ai.model_tester.ProviderFactory.create_provider", return_value=provider), \
+         caplog.at_level(logging.WARNING, logger="backend.ai.providers.gemini"):
+        result = await model_tester.test_single_model(
+            "gemini", "Google Gemini", "◇", "gemini-2.5-flash"
+        )
+
+    assert result["status"] == "PROVIDER_ERROR"
+    assert secret not in result["provider_error_message"]
+    assert "***REDACTED***" in result["provider_error_message"]
+    assert len(result["provider_error_message"]) <= 300
+    assert secret not in (result["error"] or "")
+    trace = "\n".join(record.getMessage() for record in caplog.records)
+    assert secret not in trace
+    assert "key=" not in trace
+
+
+@pytest.mark.asyncio
+async def test_gemini_rate_limit_without_a_json_body_stays_classified():
+    response = _FakeHTTPResponse(429, None, text="Too Many Requests", headers={"retry-after": "9"})
+    provider = _gemini_provider(response)
+    with patch("backend.ai.model_tester._get_env", return_value="fake-key"), \
+         patch("backend.ai.model_tester.ProviderFactory.create_provider", return_value=provider):
+        result = await model_tester.test_single_model(
+            "gemini", "Google Gemini", "◇", "gemini-2.5-flash"
+        )
+
+    assert result["status"] == "RATE_LIMITED"
+    assert result["retry_after"] == 9
+    assert result["http_status"] == 429
+    assert result["failure_origin"] == "rate_limit"
+    assert result["provider_code"] == ""
+    assert result["provider_error_type"] == ""

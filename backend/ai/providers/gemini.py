@@ -14,10 +14,103 @@ from backend.ai.providers.base.capabilities import ProviderCapabilities
 from backend.ai.providers.base.config import ProviderConfig
 from backend.ai.providers.base.contract import BaseProvider, ProviderResponse
 from backend.ai.providers.base.defaults import get_provider_default, resolve_model
+from backend.ai.redaction import redact_secrets
 
 logger = logging.getLogger(__name__)
 
 _GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
+_GEMINI_VERSION = _GEMINI_BASE.rsplit("/", 1)[-1]
+_OPERATION = "generateContent"
+_MAX_ERROR_MESSAGE = 300
+
+
+def _bounded_text(value: Any, limit: int = _MAX_ERROR_MESSAGE) -> str:
+    clean = " ".join(redact_secrets(str(value or "")).split())
+    if len(clean) <= limit:
+        return clean
+    return clean[: limit - 1].rstrip() + "…"
+
+
+def _gemini_diagnostics(model: str) -> dict[str, str]:
+    """Safe request identity: no base URL, no query, never the API key."""
+    return {
+        "model": model,
+        "operation": _OPERATION,
+        "api_version": _GEMINI_VERSION,
+        "endpoint": f"models/{model}:{_OPERATION}",
+    }
+
+
+def _retry_after_seconds(headers: Any, default: int = 5) -> int:
+    try:
+        raw = str(headers.get("retry-after") or "").strip()
+    except Exception:
+        return default
+    if raw.isdigit():
+        return max(0, min(int(raw), 3600))
+    return default
+
+
+def _error_fields(resp: Any) -> tuple[str, str, str, list[str]]:
+    """Google's structured error, bounded — never the raw response body.
+
+    Returns ``(code, status, message, reasons)``. The message is sanitized
+    and bounded here, so a credential echoed into an error body is removed at
+    the source, before any log line or diagnostic payload can carry it.
+    """
+    raw_text = ""
+    try:
+        raw_text = resp.text or ""
+    except Exception:
+        raw_text = ""
+    message = _bounded_text(raw_text)
+    code = ""
+    provider_status = ""
+    reasons: list[str] = []
+    try:
+        data = resp.json()
+        err = data.get("error", {}) if isinstance(data, dict) else {}
+        if isinstance(err, dict):
+            if err.get("message"):
+                message = _bounded_text(err.get("message"))
+            code = str(err.get("code") or "")
+            provider_status = str(err.get("status") or "")
+            for item in err.get("details") or []:
+                if isinstance(item, dict):
+                    reason = str(item.get("reason") or "").strip()
+                    if reason and reason not in reasons:
+                        reasons.append(_bounded_text(reason, 80))
+                if len(reasons) >= 5:
+                    break
+    except Exception:
+        pass
+    return code, provider_status, message, reasons
+
+
+def _failure_origin(status_code: int, provider_status: str, message: str) -> str:
+    """Where the failure actually came from, from Google's own signals."""
+    state = (provider_status or "").upper()
+    text = (message or "").lower()
+    if status_code in (401, 403) or state in ("UNAUTHENTICATED", "PERMISSION_DENIED"):
+        return "authentication"
+    if status_code == 429 or state == "RESOURCE_EXHAUSTED":
+        return "rate_limit"
+    if status_code == 404:
+        return "model_lookup" if ("model" in text or "models/" in text) else "endpoint"
+    if status_code == 400:
+        return "request_validation"
+    if status_code >= 500 or state == "INTERNAL":
+        return "server"
+    return "provider"
+
+
+_FAILURE_TYPES = {
+    "authentication": "auth",
+    "model_lookup": "model_not_found",
+    "rate_limit": "rate_limited",
+    "request_validation": "request",
+    "server": "server",
+}
 
 
 def _to_gemini_schema(value: Any) -> Any:
@@ -162,32 +255,51 @@ class GeminiProvider(BaseProvider):
             latency = time.perf_counter() - t0
 
             if resp.status_code == 429:
-                retry_after = 5
-                logger.warning("Gemini rate limited (retry_after=%ds)", retry_after)
-                return ProviderResponse(text="Rate limited.", provider_name=self.name, success=False, metadata={"http_status": 429, "retry_after": retry_after, "failure_type": "rate_limited"})
+                code, provider_status, message, reasons = _error_fields(resp)
+                retry_after = _retry_after_seconds(resp.headers)
+                logger.warning(
+                    "Gemini rate limited (retry_after=%ds code=%s status=%s)",
+                    retry_after, code or "-", provider_status or "-",
+                )
+                return ProviderResponse(
+                    text=f"Rate limited. {message}".strip(),
+                    provider_name=self.name,
+                    success=False,
+                    metadata={
+                        **_gemini_diagnostics(model),
+                        "http_status": 429,
+                        "retry_after": retry_after,
+                        "provider_error_code": code,
+                        "provider_error_type": provider_status,
+                        "provider_error_message": message,
+                        "provider_error_reasons": reasons,
+                        "failure_type": "rate_limited",
+                        "failure_origin": "rate_limit",
+                    },
+                )
 
             if resp.status_code >= 400:
-                error_msg = resp.text[:200]
-                provider_error_code = ""
-                provider_error_type = ""
-                try:
-                    error_data = resp.json()
-                    err_obj = error_data.get("error", {})
-                    error_msg = err_obj.get("message", error_msg)
-                    provider_error_code = str(err_obj.get("code", ""))
-                    provider_error_type = err_obj.get("status", "")
-                except Exception:
-                    pass
-                if resp.status_code in (401, 403):
-                    failure_type = "auth"
-                elif resp.status_code == 404:
-                    failure_type = "model_not_found"
-                elif resp.status_code >= 500:
-                    failure_type = "server"
-                else:
-                    failure_type = "request"
-                logger.warning("Gemini API error %d: %s", resp.status_code, error_msg)
-                return ProviderResponse(text=f"API error ({resp.status_code}): {error_msg}", provider_name=self.name, success=False, metadata={"http_status": resp.status_code, "provider_error_code": provider_error_code, "provider_error_type": provider_error_type, "failure_type": failure_type, "model": model})
+                code, provider_status, message, reasons = _error_fields(resp)
+                origin = _failure_origin(resp.status_code, provider_status, message)
+                logger.warning(
+                    "Gemini API error %d (%s/%s, origin=%s): %s",
+                    resp.status_code, code or "-", provider_status or "-", origin, message,
+                )
+                return ProviderResponse(
+                    text=f"API error ({resp.status_code}): {message}",
+                    provider_name=self.name,
+                    success=False,
+                    metadata={
+                        **_gemini_diagnostics(model),
+                        "http_status": resp.status_code,
+                        "provider_error_code": code,
+                        "provider_error_type": provider_status,
+                        "provider_error_message": message,
+                        "provider_error_reasons": reasons,
+                        "failure_type": _FAILURE_TYPES.get(origin, "provider"),
+                        "failure_origin": origin,
+                    },
+                )
 
             data = resp.json()
             candidates = data.get("candidates", [])
@@ -218,13 +330,28 @@ class GeminiProvider(BaseProvider):
             return ProviderResponse(
                 text=text, provider_name=self.name, success=True, tool_calls=tool_calls,
                 usage={"prompt_tokens": usage.get("promptTokenCount", 0), "completion_tokens": usage.get("candidatesTokenCount", 0), "total_tokens": usage.get("totalTokenCount", 0)},
-                metadata={"latency": latency, "model": model, "finish_reason": finish_reason},
+                metadata={"latency": latency, **_gemini_diagnostics(model), "finish_reason": finish_reason},
             )
 
         except httpx.TimeoutException:
-            return ProviderResponse(text=f"Timeout after {self._config.timeout}s.", provider_name=self.name, success=False, metadata={"failure_type": "timeout"})
+            return ProviderResponse(
+                text=f"Timeout after {self._config.timeout}s.",
+                provider_name=self.name,
+                success=False,
+                metadata={**_gemini_diagnostics(model), "failure_type": "timeout", "failure_origin": "timeout"},
+            )
         except Exception as exc:
-            return ProviderResponse(text=f"Error: {exc}", provider_name=self.name, success=False, metadata={"failure_type": "network", "error": f"{type(exc).__name__}: {exc}"})
+            return ProviderResponse(
+                text=f"Error: {_bounded_text(exc)}",
+                provider_name=self.name,
+                success=False,
+                metadata={
+                    **_gemini_diagnostics(model),
+                    "failure_type": "network",
+                    "failure_origin": "network",
+                    "error": f"{type(exc).__name__}: {_bounded_text(exc)}",
+                },
+            )
 
     async def list_models(self) -> list[dict[str, Any]]:
         if not self._config.api_key or not self._config.enabled:

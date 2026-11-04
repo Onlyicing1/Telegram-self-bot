@@ -1532,12 +1532,68 @@ if get_action("ai_test_page") is None:
     register_action("ai_test_page", _test_modules_page_dispatch)
 
 
+def _diag_text(value, limit: int = 160) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
+
+
+def _failure_diagnostic_lines(r: dict) -> list[str]:
+    """'Why it failed' lines for one model in the All Results view.
+
+    Renders only facts the result actually carries — HTTP status, the
+    provider's own code/status, the failure origin, the exact operation and
+    endpoint, retry-after, and one bounded sanitized message. Missing
+    metadata renders nothing (no empty placeholders), and a code/type equal
+    to the HTTP status is not repeated.
+    """
+    lines: list[str] = []
+    http_status = r.get("http_status")
+    provider_code = r.get("provider_code")
+    provider_type = r.get("provider_error_type")
+    origin = r.get("failure_origin")
+
+    facts: list[str] = []
+    if http_status:
+        facts.append(f"HTTP {http_status}")
+    if provider_code and str(provider_code) != str(http_status):
+        facts.append(f"code {provider_code}")
+    if provider_type and str(provider_type) != str(http_status):
+        facts.append(str(provider_type))
+    if origin:
+        facts.append(str(origin))
+    if facts:
+        lines.append("      " + " · ".join(facts))
+
+    target = r.get("endpoint") or r.get("operation")
+    if target:
+        version = r.get("api_version")
+        suffix = f" ({version})" if version else ""
+        lines.append(f"      _{_diag_text(target, 120)}{suffix}_")
+
+    if r.get("retry_after"):
+        lines.append(f"      _retry-after: {r['retry_after']}s_")
+
+    reasons = r.get("provider_error_reasons") or []
+    if reasons:
+        joined = ", ".join(str(reason) for reason in reasons)
+        lines.append(f"      _reason: {_diag_text(joined, 120)}_")
+
+    message = r.get("provider_error_message") or r.get("error")
+    if message:
+        lines.append(f"      _{_diag_text(message)}_")
+    return lines
+
+
 async def _ai_test_details_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     """Show the full per-model diagnostics from the last Test Models run.
 
-    Keeps the main model-selection message compact while preserving full
-    failure details (HTTP status, retry-after, sanitized errors) one tap
-    away. Uses the cached payload — never re-runs the tests.
+    Keeps the main model-selection message compact while preserving the full
+    failure evidence one tap away: HTTP status, the provider's own code and
+    status, the attributed failure origin, the exact operation/endpoint, a
+    bounded sanitized provider message and retry-after. Uses the cached
+    payload — never re-runs the tests.
     """
     results = (_last_test_payload or {}).get("results", [])
     if not results:
@@ -1561,12 +1617,8 @@ async def _ai_test_details_action(event, extra: str, chat_id: int) -> tuple[str,
         if latency is not None:
             line += f" · {latency}s"
         lines.append(line)
-        if r.get("http_status"):
-            lines.append(f"      _HTTP {r['http_status']}_")
-        if r.get("retry_after"):
-            lines.append(f"      _retry-after: {r['retry_after']}s_")
-        if r.get("error"):
-            lines.append(f"      _{r['error'][:160]}_")
+        if status != "AVAILABLE":
+            lines.extend(_failure_diagnostic_lines(r))
         lines.append("")
 
     builder = InlinePanelBuilder()
