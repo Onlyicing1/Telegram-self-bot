@@ -33,7 +33,6 @@ import logging
 import os
 import re
 import time
-from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any, Callable
 
@@ -48,7 +47,6 @@ from backend.ai.model_discovery import (
     reset_fetch_source,
 )
 from backend.ai.providers.base.config import ProviderConfig
-from backend.ai.providers.base.defaults import resolve_model
 from backend.ai.providers.factory import ProviderFactory
 from backend.ai.redaction import redact_secrets
 
@@ -262,13 +260,12 @@ async def test_single_model(
         # Never waste a network request on a provider without a key.
         return _not_configured_result(provider_name, display_name, icon, model_id)
 
-    # Test the id that would actually be sent: a retired id is substituted at
-    # request construction, so reporting the requested id as AVAILABLE would
-    # claim a model the provider no longer serves. Both ids are kept: the
-    # resolved one is what the provider was asked for, the requested one is
-    # what the caller selected.
+    # The id tested is the id the caller selected, sent verbatim — the same id
+    # the runtime would request. Nothing is substituted here, so a retired or
+    # unknown id reports as a real failure of THAT model instead of borrowing
+    # the result of another one.
     requested_model = model_id
-    model_id = resolve_model(provider_name, model_id)
+    model_id = (model_id or "").strip()
 
     base_url = (
         _get_env(p_info["base_url_env"]) if p_info.get("base_url_env") else ""
@@ -429,8 +426,8 @@ async def _build_targets(
          it (a default the provider no longer serves is a phantom target)
       3. discovered chat-capable models, FREE-FIRST ordered (deduped)
 
-    Every id is deprecation-resolved before it becomes a target, so a target
-    is always the model that would actually be requested.
+    Every id is used verbatim — a target is always the model that would
+    actually be requested, and a newly discovered id needs no code change.
     ``max_per_provider`` is accepted and ignored for backward compatibility
     with the existing batch runner signature.
     """
@@ -471,17 +468,16 @@ async def _build_targets(
 
         # COMPLETE production feed: every chat-capable model from this
         # discovery result, uncapped and deduped — never sliced by the
-        # display limit below. Ids are deprecation-resolved HERE, so a target
-        # is always a model the provider would actually serve: a retired id
-        # can neither be tested nor labelled.
+        # display limit below. Ids are used exactly as discovered, so a newly
+        # released model is a target with no code change and no substitution.
         full: list[Any] = []
         seen_full: set[str] = set()
         for m in models:
-            model_id = resolve_model(p.name, m.id)
+            model_id = (m.id or "").strip()
             if not model_id or model_id in seen_full or not is_chat_capable(model_id):
                 continue
             seen_full.add(model_id)
-            full.append(m if model_id == m.id else replace(m, id=model_id, name=model_id))
+            full.append(m)
         complete_models[p.name] = full
 
         # FREE-FIRST ordering, using the SAME deterministic selector order
@@ -505,7 +501,7 @@ async def _build_targets(
         #    owner's selection): always tested, so a stale selection surfaces
         #    as a real failure instead of being hidden.
         if active_config.get("provider") == p.name:
-            selected = resolve_model(p.name, active_config.get("model") or "")
+            selected = (active_config.get("model") or "").strip()
             if selected and selected not in seen:
                 seen.add(selected)
                 candidates.append(selected)
@@ -514,7 +510,7 @@ async def _build_targets(
         #    retired id, or a stale env value) is a phantom target: testing it
         #    reports a model that can be neither selected nor used. Curated
         #    fallback catalogs ARE the list, so their default is kept.
-        default_model = resolve_model(p.name, p.default_model or "")
+        default_model = (p.default_model or "").strip()
         if default_model and (discovery_source != "api" or default_model in seen_full):
             if default_model not in seen:
                 seen.add(default_model)
@@ -624,7 +620,7 @@ def proven_usable_candidates(
             bucket.append(model)
 
     configured = {
-        p.name: resolve_model(p.name, p.default_model or "") for p in providers_status
+        p.name: (p.default_model or "").strip() for p in providers_status
     }
     feed: dict[str, list[str]] = {}
     for provider, ids in usable.items():

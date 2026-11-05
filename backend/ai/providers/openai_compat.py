@@ -16,7 +16,7 @@ import httpx
 from backend.ai.providers.base.capabilities import ProviderCapabilities
 from backend.ai.providers.base.config import ProviderConfig
 from backend.ai.providers.base.contract import BaseProvider, ProviderResponse
-from backend.ai.providers.base.defaults import get_provider_default, resolve_model
+from backend.ai.providers.base.defaults import get_provider_default
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +76,8 @@ class OpenAICompatProvider(BaseProvider):
             )
 
         url = f"{self._config.base_url}/chat/completions"
-        model = resolve_model(self.name, kwargs.get("model") or self._config.default_model)
+        # The selected id is sent VERBATIM — same rule as every provider above.
+        model = str(kwargs.get("model") or self._config.default_model or "").strip()
         payload: dict[str, Any] = {
             "model": model,
             "messages": messages,

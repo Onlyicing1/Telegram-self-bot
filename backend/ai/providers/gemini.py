@@ -13,7 +13,7 @@ import httpx
 from backend.ai.providers.base.capabilities import ProviderCapabilities
 from backend.ai.providers.base.config import ProviderConfig
 from backend.ai.providers.base.contract import BaseProvider, ProviderResponse
-from backend.ai.providers.base.defaults import get_provider_default, resolve_model
+from backend.ai.providers.base.defaults import get_provider_default
 from backend.ai.redaction import redact_secrets
 
 logger = logging.getLogger(__name__)
@@ -173,7 +173,10 @@ class GeminiProvider(BaseProvider):
         if self._http_client is None:
             self._http_client = httpx.AsyncClient(timeout=self._config.timeout)
 
-        model = resolve_model(self.name, kwargs.get("model") or self._config.default_model)
+        # The selected id is sent VERBATIM: the request must be for exactly the
+        # model the owner chose. A retired id fails as that id (this provider's
+        # own 404, attributed to it) — never as a substituted model.
+        model = str(kwargs.get("model") or self._config.default_model or "").strip()
         url = f"{_GEMINI_BASE}/models/{model}:generateContent?key={self._config.api_key}"
 
         # Gemini takes ONE systemInstruction; the dispatcher may legitimately

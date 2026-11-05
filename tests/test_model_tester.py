@@ -926,19 +926,20 @@ async def test_400_request_validation_is_not_an_invalid_model():
 
 
 @pytest.mark.asyncio
-async def test_failure_payload_keeps_provider_attribution_and_both_model_ids():
+async def test_failure_payload_keeps_provider_attribution_and_the_exact_model_id():
+    """The tested id is the requested id — the payload never renames a model."""
     mock_response = ProviderResponse(
-        text="models/gemini-2.5-flash is not found", provider_name="gemini", success=False,
+        text="models/gemini-2.0-flash is not found", provider_name="gemini", success=False,
         metadata={
             "http_status": 404,
             "failure_type": "model_not_found",
             "failure_origin": "model_lookup",
             "provider_error_code": "404",
             "provider_error_type": "NOT_FOUND",
-            "provider_error_message": "models/gemini-2.5-flash is not found",
+            "provider_error_message": "models/gemini-2.0-flash is not found",
             "operation": "generateContent",
             "api_version": "v1beta",
-            "endpoint": "models/gemini-2.5-flash:generateContent",
+            "endpoint": "models/gemini-2.0-flash:generateContent",
         },
     )
     with patch("backend.ai.model_tester._get_env", return_value="fake_key"), \
@@ -946,7 +947,7 @@ async def test_failure_payload_keeps_provider_attribution_and_both_model_ids():
                new_callable=AsyncMock, return_value=mock_response):
         res = await test_single_model("gemini", "Google Gemini", "◇", "gemini-2.0-flash")
 
-    assert res["model"] == "gemini-2.5-flash"
+    assert res["model"] == "gemini-2.0-flash"
     assert res["requested_model"] == "gemini-2.0-flash"
     assert res["status"] == "INVALID_MODEL"
     assert res["error_type"] == "model_not_found"
@@ -955,8 +956,8 @@ async def test_failure_payload_keeps_provider_attribution_and_both_model_ids():
     assert res["failure_origin"] == "model_lookup"
     assert res["operation"] == "generateContent"
     assert res["api_version"] == "v1beta"
-    assert res["endpoint"] == "models/gemini-2.5-flash:generateContent"
-    assert res["provider_error_message"] == "models/gemini-2.5-flash is not found"
+    assert res["endpoint"] == "models/gemini-2.0-flash:generateContent"
+    assert res["provider_error_message"] == "models/gemini-2.0-flash is not found"
 
 
 @pytest.mark.asyncio

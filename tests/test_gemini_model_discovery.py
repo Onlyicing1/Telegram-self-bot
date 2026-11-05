@@ -34,7 +34,7 @@ from backend.ai.model_discovery import (
     get_last_fetch_source,
 )
 from backend.ai.providers.base.contract import ProviderResponse
-from backend.ai.providers.base.defaults import get_provider_default, resolve_model
+from backend.ai.providers.base.defaults import get_provider_default
 
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
 GEMINI_ENTRY = next(p for p in discovery_mod._PROVIDERS if p["name"] == "gemini")
@@ -93,8 +93,12 @@ def _status(name: str, default_model: str, base_url: str = GEMINI_BASE, **kwargs
 def test_discovery_and_runtime_advertise_the_same_default_model():
     assert GEMINI_ENTRY["default_model"] == get_provider_default("gemini").default_model
     assert GEMINI_ENTRY["default_model"] == "gemini-2.5-flash"
-    # The retired id is still understood, but only as a stored-config rewrite.
-    assert resolve_model("gemini", "gemini-2.0-flash") == "gemini-2.5-flash"
+    # The default is used ONLY when nothing is selected: there is no per-model
+    # rewrite table anywhere in the selection or execution path.
+    from backend.ai.providers.base import defaults as provider_defaults
+
+    assert not hasattr(provider_defaults, "resolve_model")
+    assert not hasattr(provider_defaults, "DEPRECATED_MODELS")
 
 
 # ── 2. the /models contract ──────────────────────────────────────────────────
@@ -252,7 +256,7 @@ async def test_a_default_the_live_catalog_lacks_is_not_tested():
 
 
 @pytest.mark.asyncio
-async def test_the_retired_default_is_resolved_and_never_labelled():
+async def test_a_retired_provider_default_never_becomes_a_target():
     status = _status("gemini", "gemini-2.0-flash")
     targets, _discovered, complete = await _targets(
         status,
@@ -285,10 +289,12 @@ async def test_an_explicit_selection_is_always_tested_even_if_stale():
 
 
 @pytest.mark.asyncio
-async def test_fallback_source_keeps_the_curated_default():
+async def test_fallback_source_keeps_the_provider_default_verbatim():
+    """Without an API catalog the curated list IS the catalog, so the
+    provider's own default stays a target — used exactly as written."""
     fallback = [ModelInfo(id=mid, name=mid, provider="gemini") for mid in _FALLBACK_CATALOG["gemini"]]
     targets, _discovered, _complete = await _targets(
-        _status("gemini", "gemini-2.0-flash"), models=fallback, source="fallback"
+        _status("gemini", "gemini-2.5-flash"), models=fallback, source="fallback"
     )
     models = [t["model"] for t in targets]
     assert models == ["gemini-2.5-flash", "gemini-2.5-pro"]
@@ -302,7 +308,7 @@ async def test_discovery_exception_uses_the_same_fallback_catalog():
     with patch("backend.ai.model_tester._get_env", return_value="fake-key"), \
          patch("backend.ai.model_tester.fetch_models", side_effect=exploding_fetch):
         targets, _discovered, complete = await model_tester._build_targets(
-            [_status("gemini", "gemini-2.0-flash")], {}
+            [_status("gemini", "gemini-2.5-flash")], {}
         )
 
     models = [t["model"] for t in targets]
@@ -314,7 +320,7 @@ async def test_discovery_exception_uses_the_same_fallback_catalog():
 
 
 @pytest.mark.asyncio
-async def test_a_404_tests_the_resolved_id_and_does_not_disable_gemini():
+async def test_a_404_is_reported_against_the_exact_id_that_was_requested():
     not_found = ProviderResponse(
         text="models/gemini-2.5-flash is not found for API version v1beta",
         provider_name="gemini",
@@ -333,10 +339,10 @@ async def test_a_404_tests_the_resolved_id_and_does_not_disable_gemini():
 
     assert result["status"] == "INVALID_MODEL"
     assert result["http_status"] == 404
-    # The id actually requested (and reported) is the current one, not the
-    # retired id the caller asked about.
-    assert result["model"] == "gemini-2.5-flash"
-    assert chat.await_args.kwargs["model"] == "gemini-2.5-flash"
+    # No substitution: the requested id is the reported id, so the owner sees
+    # the truth about THEIR selection and the provider stays enabled.
+    assert result["model"] == "gemini-2.0-flash"
+    assert chat.await_args.kwargs["model"] == "gemini-2.0-flash"
 
 
 def _pm_engine():
@@ -610,10 +616,11 @@ async def test_gemini_structured_failure_reaches_the_test_payload(
 
 
 @pytest.mark.asyncio
-async def test_gemini_resolves_the_model_but_reports_both_ids():
+async def test_gemini_tests_the_exact_selected_id_without_substitution():
+    """A retired selection is tested AS ITSELF, so the failure is attributable."""
     response = _FakeHTTPResponse(404, {"error": {
         "code": 404, "status": "NOT_FOUND",
-        "message": "models/gemini-2.5-pro is not found for API version v1beta",
+        "message": "models/gemini-2.0-flash is not found for API version v1beta",
     }})
     provider = _gemini_provider(response)
     client = provider._http_client
@@ -624,10 +631,11 @@ async def test_gemini_resolves_the_model_but_reports_both_ids():
         )
 
     assert result["requested_model"] == "gemini-2.0-flash"
-    assert result["model"] == "gemini-2.5-flash"
-    assert result["endpoint"] == "models/gemini-2.5-flash:generateContent"
+    assert result["model"] == "gemini-2.0-flash"
+    assert result["status"] == "INVALID_MODEL"
+    assert result["endpoint"] == "models/gemini-2.0-flash:generateContent"
     assert len(client.calls) == 1
-    assert "gemini-2.5-flash:generateContent" in client.calls[0][0]
+    assert "gemini-2.0-flash:generateContent" in client.calls[0][0]
 
 
 @pytest.mark.asyncio
