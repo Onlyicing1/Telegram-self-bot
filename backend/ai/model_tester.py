@@ -489,6 +489,10 @@ def proven_usable_candidates(
     """
     usable: dict[str, list[str]] = {}
     for item in results:
+        # A CACHED result is a stored diagnostic record, never live proof: it
+        # may never arm the production pool on the strength of a cache read.
+        if item.get("cached"):
+            continue
         if item.get("status") != "AVAILABLE":
             continue
         provider = str(item.get("provider") or "")
@@ -643,6 +647,7 @@ def _build_summary(results: list[dict[str, Any]], discovered_count: int) -> dict
         "error": 0,
         "timeout": 0,
         "not_configured": 0,
+        "not_tested": 0,
         "discovered": discovered_count,
         "tested": 0,
         "failed": 0,
@@ -661,6 +666,8 @@ def _build_summary(results: list[dict[str, Any]], discovered_count: int) -> dict
             summary["available"] += 1
         elif status == "NOT_CONFIGURED":
             summary["not_configured"] += 1
+        elif status == "NOT_TESTED":
+            summary["not_tested"] += 1
         elif status == "TIMEOUT":
             summary["timeout"] += 1
             summary["error"] += 1
@@ -686,7 +693,9 @@ def _build_summary(results: list[dict[str, Any]], discovered_count: int) -> dict
             summary["error"] += 1
             summary["unknown_error"] += 1
 
-    summary["tested"] = summary["total"] - summary["not_configured"]
+    summary["tested"] = (
+        summary["total"] - summary["not_configured"] - summary["not_tested"]
+    )
     summary["failed"] = summary["unavailable"] + summary["error"] + summary["timeout"]
     return summary
 

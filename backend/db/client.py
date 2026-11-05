@@ -2879,6 +2879,30 @@ async def aed_put_document(key: str, value: str) -> bool:
         return False
 
 
+async def settings_document_state(key: str) -> tuple[str | None, bool]:
+    """``(document, readable)`` for one durable ``bot_settings`` JSON document.
+
+    The generic entry point for features that persist their own bounded
+    document (the latest Test Modules snapshot). ``readable=False`` means the
+    store could not be read — never that the document is missing — so a caller
+    can refuse to treat an outage as "nothing was ever stored".
+    """
+    try:
+        return await _run_sync(_bot_settings_get_state_sync, key)
+    except Exception as exc:
+        logger.error("[SETTINGS_DB] read %s FAILED: %s", key, exc)
+        return None, False
+
+
+async def settings_document_write(key: str, value: str) -> bool:
+    """Upsert one JSON document. True only when the durable write landed."""
+    try:
+        return await _run_sync(_bot_settings_put_sync, key, value)
+    except Exception as exc:
+        logger.error("[SETTINGS_DB] write %s FAILED: %s", key, exc)
+        return False
+
+
 def _aed_load_shards_sync(shard_keys: list[str]) -> list[list] | None:
     """Read every archive shard document. ``None`` means the store could not be
     read (an unreadable store is never shown as an empty one)."""
