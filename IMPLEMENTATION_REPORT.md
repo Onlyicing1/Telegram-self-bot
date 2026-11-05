@@ -1,410 +1,374 @@
-# IMPLEMENTATION_REPORT.md — whole-runtime responsiveness of the callback path
+# IMPLEMENTATION_REPORT — the owner's selected model is now the model that is used
 
-> This file describes ONLY the current state of the repository for this task and
-> **replaces the previous report in full**. Earlier phases (callback
-> acknowledgement + per-panel ordering; the Stash page snapshot) are unchanged
-> in behaviour where they still apply; their history is in git, their contracts
-> are in `AGENTS.md`, and the parts this phase supersedes are marked in §3 and
-> §9. Section §10 (2026-11-05) additionally covers the Test Modules
-> diagnostic-coverage change.
+> Replaces every previous report in full. Scope: the Gemini model-selection path
+> (chat **and** Media/STT), its regression tests, and these two documents. No
+> other behaviour was changed.
+> §9 additionally covers the Test Modules diagnostic-coverage
+> change (2026-11-05).
 
 | Item | Value |
 |---|---|
-| Task | Whole-self-bot responsiveness: eliminate the remaining click backlog, keep every valid action |
-| Branch / base | `freebuff/99799eefb106784388e20bc8` at `a4b6e4f` (= `origin/main` before this change) |
-| Date | 2026-10-23 |
-| Live Telegram / Supabase / Render | **NOT touched.** No session, no RPC, no SQL, no migration, no `.env`, no deployment, no Render shell |
-| Documents not modified | `DATABASE_ARCHITECTURE.md`, `README.md` |
-| Interpreter | CPython 3.12 venv, `telethon==1.43.0` (pinned) |
-| New dependency | **none** |
+| Stage | Fix: remove the per-model substitution table that rewrote the owner's selection at request construction |
+| Date | 2026-11-05 (UTC) |
+| Project / remote | LifeOS Telegram self-bot, `Onlyicing1/Telegram-self-bot` (`origin`), branch `main` |
+| Base commit | `fd547c9f1134d481d626e253f4fd313c43a85929` — `fix(ai): page the All Results diagnostics instead of a rejected oversized edit` |
+| Root cause | `backend/ai/providers/base/defaults.py::resolve_model` / `DEPRECATED_MODELS` rewrote a configured model id (`gemini-2.0-flash` → `gemini-2.5-flash`) inside the request builder and in every layer that named a model, so the outbound request, router bookkeeping and the model tester disagreed with the persisted selection (`INVESTIGATION.md` §1–2) |
+| Production files changed | `backend/ai/providers/base/defaults.py`, `backend/ai/providers/gemini.py`, `backend/ai/providers/openai_compat.py`, `backend/ai/providers/manager/manager.py`, `backend/ai/model_tester.py`, `backend/services/gemini_media_engine.py` |
+| Tests | `tests/test_gemini_model_selection.py` (new, 13 tests) + 5 existing suites updated to the same contract |
+| Interpreter | CPython 3.12 venv (`/tmp/repoenv`), project `backend/requirements.txt` (Telethon 1.43.0) + `pytest 9.2.0` + `pytest-asyncio` |
+| Live Telegram / Render / provider API | **NOT used.** No session, no RPC, no deployment, no Render shell, no credential, no live Gemini request |
+| Not touched | SQL / Supabase, `DATABASE_ARCHITECTURE.md`, runtime-behaviour environment migration, the direct-STT architecture, provider fallback/retry/cooldown, `ToolRegistry`/`ToolExecutor`, `RuntimeSupervisor` lifecycle, discovery/selection caching, unrelated providers |
 
----
+## 1. Root cause
 
-## 1. Observed symptom and the evidence actually available
+One helper — a pure data lookup — was the interception point for every model id in
+the system:
 
-**Reported by the owner:** after rapid inline-button presses the self-bot still
-freezes and then applies the presses in a burst, *after* the previous callback
-optimisation shipped.
-
-**Evidence obtainable here:** this workspace has no Render log access and no
-Telegram session, so production logs could not be re-read. What was available
-and is used throughout:
-
-* the current source at `a4b6e4f` (every claim below is traced to a line of it);
-* the previous phase's live-log numbers, which remain the only production
-  measurements on record: `ack_ms` 160–296, `wait_ms` ≤ 352, `work_ms` 368–668,
-  `total_ms` 528–1095, low CPU;
-* a local harness that installs the **real** router, the **real** panel
-  handlers and the **real** lifecycle/gate, with only the two network ends
-  faked at the log-implied latencies (answer 180 ms, edit 250 ms, Supabase call
-  120 ms).
-
-**Reproduced locally, deterministically** (real router + real handlers, three
-repetitions, `logs/bench_panel_burst.py`):
-
-| Panel | 15 rapid clicks, before | Edits | DB calls |
-|---|---|---|---|
-| `menu` (no DB work) | **3943 ms** | 15 | 0 |
-| `health` (no DB work) | **3946 ms** | 15 | 0 |
-| `retrieve_saved` (one DB read per click) | **5753 ms** | 15 | 15 |
-| 30 clicks on `menu` | **7707 ms** | 30 | 0 |
-
-That is the reported symptom in numbers: half a second of work per press,
-serialised, so a burst keeps the panel updating for seconds. It is not the
-acknowledgement (that was fixed and stays at one answer RPC) and it is not CPU.
-
-## 2. Root cause, ranked by confidence
-
-**1 — CONFIRMED (source + measurement). Every click painted its own view inside
-the panel's FIFO turn.** `_callback_router` held the per-panel turn across
-`handler → render → event.edit`, and every handler returns a view. So N clicks
-on one message meant N serialised Telegram edits, and every click behind the
-first waited for an edit it was about to overwrite. Measured: 15 clicks where
-the handler is trivial still cost 15 × 250 ms = 3.9 s, with 15 edits.
-
-**2 — CONFIRMED (source + measurement). The previous fix coalesced only one
-handler.** `SKIP_RENDER` was opt-in and only `retrieve`'s multi-select tick
-returned it, so every other panel (Menu, Save, Settings, Health, Item, Taskloom,
-Cipher, Emoji, …) kept the paint-per-click behaviour of (1). The mechanism was
-right; its scope was one handler.
-
-**3 — CONFIRMED (source + measurement). The lifecycle lock was held across a
-Telegram round trip.** `PanelLifecycleManager.close_panel` / `timeout_panel` ran
-`_cleanup_locked(edit_message=True)` inside `async with self._lock`, and
-`create_panel` / `try_reuse_panel` hold the same lock across
-`inline_engine.trigger` plus an edit. A Close click (or an auto-close timer)
-therefore serialised every unrelated panel create/close in the process for the
-length of one RPC. Measured: opening a panel while a Close's edit is in flight
-took **230.6 ms** before this change.
-
-**4 — CONFIRMED, bound-checked, not fixed (out of scope). A DB-backed panel
-re-reads the database once per click inside the turn.** With ordered views on
-one message that is inherent (see §5 and §7): 30 clicks on `retrieve_saved`
-still cost 30 sequential reads ≈ 3.6 s of the 4.1 s total. Removing it would
-mean concurrent reads for ordered views, which is the corruption phase 1
-removed.
-
-### Checked and NOT the cause (this phase, against current source)
-
-| Candidate | Evidence |
-|---|---|
-| Telethon serialising updates | `telethon/client/updates.py:289` — one task per update; `sequential_updates` unset on both clients |
-| Event-loop blocking (sync I/O, CPU) | Only two `time.sleep` sites in the runtime (`speechmatics_stt_engine._sleep_briefly`, `gemini_media_engine._await_file_ready`); both are inside synchronous engine methods documented and called through `asyncio.to_thread` (`stt_provider_probe.py:329`, media engines). No `requests`, `subprocess`, `.result()` or `run_until_complete` on a request path |
-| Database pool saturation as the burst cause | Bounded 4-worker `run_sync_db` pool; a *saturated* pool is now covered by a test that proves it degrades to a bounded `OperationTimeoutError` and does not stop an unrelated panel from answering and painting |
-| Duplicate callback delivery | Suppressed by Telegram `query_id` since phase 1 (re-observed in the harness: a probe that reused query ids had 15 clicks suppressed as duplicates) |
-| Heartbeat / keepalive / failsafe | They do no database work and never take the panel turn (`heartbeat.py`, `keepalive.py`, `failsafe.py`) |
-| `callback_trace` flush lock | The module is not imported by any runtime path (dead code, untouched) |
-| AI handler / providers / tool executor | `ai_unified` fires on the **self** client for outgoing messages; provider calls are `httpx` awaits in their own task, behind `ProviderManager` semaphores that bound *AI* concurrency only. A slow provider cannot block a click (asserted by the saturated-pool/no-DB-panel test's shape and by the pre-existing independent-panel test) |
-| Task accumulation / unbounded queues | The turn is one future per waiting click (bounded by delivered updates); painters are one per active panel and are forgotten on close; timing/duplicate stores are bounded (64/128) |
-
-## 3. Why the previous callback optimisation was insufficient
-
-Phase 1 stopped a click from waiting on its **own** work (acknowledgement) and
-stopped two clicks from **corrupting** one panel (FIFO + `query_id`). Phase 2
-removed the redundant **reads and paints of one handler** (Stash ticks). Neither
-changed the structural fact that the FIFO turn spanned the Telegram edit, and
-neither applied to the other ~20 panels. A burst on any non-Stash panel
-therefore still cost one edit round trip per click, serialised — and on a panel
-that reads the database, one read per click as well. The 15-click figure in this
-phase's predecessor report (that serialising is "the deliberate trade") is
-superseded: the paint was never part of the ordering guarantee.
-
-## 4. Fixes implemented
-
-| File | Change |
-|---|---|
-| `backend/helper/callback_gate.py` | **`PanelPainter`** + `painter()` / `forget_painter()`: one writer per message, one pending slot, newest view wins, never two concurrent edits on one message, `discard()` on close. `CallbackAdmission` gains `handled_at` / `paint_ms` (so `work_ms` is the handler's own cost, never a network round trip the click may not have made). `note_coalesced` retained. `pending_ahead` / `_Waiter.renders` removed (the painter subsumes them). |
-| `backend/helper/panels.py` | The turn is released in a `finally` **before** the paint; dispatch helpers (`_handle_panel`, `_handle_navigation`, `_handle_action`) now *return* `(panel_id, result)` instead of painting; new `_present()` publishes the view to the painter and paints outside the turn; `_handle_input`'s prompt is painted through the same writer; new `dispatch_click()` = handler + paint for callers that already own the click (inline entry point, tests); `SKIP_RENDER` and `_will_render` removed; `close_panel` forgets the writer. |
-| `backend/helper/lifecycle.py` | `_cleanup_locked` split into the synchronous `_cleanup_state_locked` (all state, no I/O) and `_close_message` (the edit + delayed delete). `close_panel` / `timeout_panel` take the lock only for the state transition. |
-| `backend/bot/handlers/retrieve.py` | The Stash tick no longer needs `SKIP_RENDER`: it always builds its view and the panel writer coalesces it. Page snapshot from the previous phase unchanged. |
-| `backend/helper/__init__.py` | `SKIP_RENDER` export removed. |
-| tests | `tests/test_callback_latency_burst.py` reworked (painter semantics, failed paint, slow paint, closed panel, saturated pool, slow close); 11 existing suites updated from "the handler paints" to the `dispatch_click` contract; `tests/test_callback_backlog.py` assertions made independent of *who* painted. |
-| `AGENTS.md` | Callback contract updated (turn covers the handler only; single-writer painting; lifecycle lock never spans an RPC). |
-
-No new dependency, no schema change, no SQL, no migration. No second
-dispatcher, scheduler, executor or update loop: `RuntimeSupervisor → Dispatcher
-→ ProviderManager / ToolRegistry → ToolExecutor` is untouched, and the painter
-is a slot plus the click's own await, not a task.
-
-### Guarantees
-
-* **Ordering:** the FIFO turn still serialises every handler on one panel, so a
-  handler always sees the state left by the previous click. Ordering-sensitive
-  panels (`Next`/`Prev`, Save's type selection, Taskloom steps, Cipher) keep
-  their existing semantics.
-* **Every accepted click is applied exactly once.** The painter can only skip a
-  *paint*; state changes and side effects happen in the handler, inside the
-  turn, exactly as before. A superseded view is counted (`coalesced=1`).
-* **The newest view is the one on screen.** `drain()` always takes the newest
-  pending view, so a stale view is never painted after a newer one.
-* **No concurrent edits to one message.** One writer per message; a second click
-  publishes into the slot instead of starting a rival edit.
-* **A closed panel is never painted.** `forget_painter` discards the slot and
-  stops the drain loop; the paint also re-checks `closed` before editing.
-* **A wrapper for `_handle_input` prompts** keeps the prompt behind any in-flight
-  view (the prompt is the newest view, so it lands last).
-* **Failure is honest:** a raising handler is recorded as `failed` (previously
-  the dispatch helpers swallowed it and reported `completed`); a raising edit is
-  recorded and the panel is not wedged (next click paints).
-
-## 5. Measurements (mocked network, identical workload before/after)
-
-`logs/bench_panel_burst.py`: real router + real handlers, 3 repetitions per
-cell, CPython 3.12, same machine. "Before" = `a4b6e4f` with this change stashed;
-"after" = this tree. Network latencies are **fixed fakes** (answer 180 ms, edit
-250 ms, DB call 120 ms); nothing below was measured against Telegram or
-Supabase.
-
-| Panel (work per click) | Burst | Before p50 → After p50 | Before p95 → After p95 | Δ | Edits before → after |
-|---|---|---|---|---|---|
-| `menu` (no DB) | 10 | 2689.6 → **682.9 ms** | 2690.0 → 683.9 | −74.6 % | 10 → **2** |
-| `menu` | 15 | 3943.4 → **682.5 ms** | 3943.5 → 682.8 | −82.7 % | 15 → **2** |
-| `menu` | 30 | 7706.9 → **682.5 ms** | 7711.8 → 682.7 | −91.1 % | 30 → **2** |
-| `health` (no DB) | 15 | 3945.5 → **682.9 ms** | 3946.7 → 683.1 | −82.7 % | 15 → **2** |
-| `retrieve_saved` (1 DB read/click) | 10 | 3896.0 → **1806.5 ms** | 3896.2 → 1808.3 | −53.6 % | 10 → **6** |
-| `retrieve_saved` | 15 | 5752.7 → **2310.6 ms** | 5753.2 → 2311.5 | −59.8 % | 15 → **8** |
-| `retrieve_saved` | 30 | 11327.1 → **4068.7 ms** | 11327.4 → 4316.1 | −64.1 % | 30 → **15.3** |
-| `retrieve_item` (1 DB read/click) | 15 | 5753.6 → **2309.7 ms** | 5755.1 → 2311.2 | −59.9 % | 15 → **8** |
-| Open a panel while a Close's edit is in flight | — | 230.6 → **0.1 ms** | — | −99.9 % | 1 → 1 |
-
-Reading the table: on a panel whose handler does no I/O, a burst is now
-**constant** (682 ms for 10, 15 and 30 clicks — one ack round trip plus two
-paints), because only the paints were ever the cost. On a panel that reads the
-database per click the paint saving is the same, but the serialised reads remain
-(§7). The Stash multi-select path keeps its previous result (15 ticks: 684 ms,
-2 edits, 0 DB reads) because the page snapshot is still in place.
-
-The in-suite deterministic numbers (20 ms edit, 10 ms DB, `pytest -s`) remain:
-
-```
-[burst-10] total_ms=42.2  edits=2 db_reads=0 state_p50_ms=21.39 p95_ms=21.51 ack_max_ms=0.01
-[burst-15] total_ms=43.0  edits=2 db_reads=0 state_p50_ms=21.93 p95_ms=22.25 ack_max_ms=0.02
-[burst-30] total_ms=44.6  edits=2 db_reads=0 state_p50_ms=23.52 p95_ms=23.88 ack_max_ms=0.02
+```python
+# backend/ai/providers/base/defaults.py  (before)
+DEPRECATED_MODELS: dict[str, str] = {"gemini-2.0-flash": "gemini-2.5-flash"}
+def resolve_model(provider_name: str, model: str) -> str: ...
 ```
 
-## 6. Tests
+Its five callers were: `GeminiProvider.chat` (the URL actually called),
+`OpenAICompatProvider.chat` (same helper, every OpenAI-compatible provider),
+`ProviderManager._effective_model` (candidate list + unavailable-model marking),
+`model_tester.test_single_model` and `_build_targets`/`proven_usable_candidates`
+(test target + reported id), and `gemini_media_engine` (`stt_settings_from`,
+`resolve_stt_model`, `resolve_media_model`). A selection saved as `gemini-2.0-flash`
+therefore persisted unchanged, was displayed unchanged, and was **requested** as
+`gemini-2.5-flash`, with only a `WARNING` log line as evidence.
 
-| Check | Result |
+## 2. Production changes
+
+### 2.1 `backend/ai/providers/base/defaults.py` — remove the table
+
+`DEPRECATED_MODELS` and `resolve_model` are deleted, replaced by a comment block
+stating the contract: a configured model id is used **verbatim** everywhere, and a
+retired/unknown id must fail **as that id** (the provider's own error, attributed to
+the model the owner chose) instead of being rewritten into a model nobody selected.
+Nothing else in the module changed — the provider defaults (category 2, "initial
+setup") stay.
+
+### 2.2 `backend/ai/providers/gemini.py` — send the selected id
+
+```python
+model = str(kwargs.get("model") or self._config.default_model or "").strip()
+url = f"{_GEMINI_BASE}/models/{model}:generateContent?key=..."
+```
+
+The provider's existing 404 → `failure_type="model_not_found"` mapping (which already
+carries `metadata["model"]` and `metadata["endpoint"]`) is now the honest report for a
+retired id, and the provider is not disabled by a per-model 404.
+
+### 2.3 `backend/ai/providers/openai_compat.py` — same rule
+
+Identical change for every OpenAI-compatible provider (`model` in the JSON payload),
+so the fix is not Gemini-shaped: a provider-specific rewrite never existed after this
+change, for any provider.
+
+### 2.4 `backend/ai/providers/manager/manager.py` — the effective model is the configured model
+
+`_effective_model` returns `(provider.config.default_model or "").strip()`. The router
+therefore builds its candidate list, marks unavailable models and explains skips using
+the **same** id it will request. `apply_selection` is unchanged: it still sets
+`config.default_model` on the registered provider and still refuses an unregistered
+provider (returning `False` and logging). ProviderManager keeps sole ownership of
+selection, fallback order, retry and cooldown — model-level failover to *other
+candidates* is intact; only each candidate's id is now literal.
+
+### 2.5 `backend/ai/model_tester.py` — test what would be sent
+
+`test_single_model` no longer resolves: it reports `model` = the id it requested, and
+`_build_targets` keeps each id as discovered/selected (`replace(...)` and the
+`dataclasses.replace` import are gone). The "provider default only when the live
+catalogue contains it" rule is unchanged, so a phantom default still never becomes a
+target; the curated fallback catalogue is still the list when discovery fails. A newly
+released model id is a target with no code change.
+
+### 2.6 `backend/services/gemini_media_engine.py` — both resolvers are verbatim
+
+`stt_settings_from(config)`, `resolve_stt_model()` and `resolve_media_model()` return
+the configured value unchanged. `resolve_media_model()` falls back to
+`DEFAULT_MEDIA_MODEL` **only** when neither `AI_GEMINI_MEDIA_MODEL` nor the chat model
+env value is set. The dedicated transcription model is still an explicit owner choice
+and still disjoint from the media/chat model.
+
+## 3. Resulting flow
+
+**Chat:** picker → `config_store.save_config(owner, {provider, model})` →
+`Engine.apply_persisted_config` → `ProviderManager.apply_selection` (sets
+`provider.config.default_model`) → `_effective_model` (same id) → `GeminiProvider.chat`
+→ `POST /v1beta/models/<the selected id>:generateContent`. Every hop is a no-op for the
+id itself; there is no substitution step left to fail.
+
+**Media/STT:** AI → Settings → Speech → persisted `stt_model`/`stt_language` →
+`stt_control_plane.stt_settings_from` → `stt_engine_factory.apply_stt_config` →
+`GeminiMediaEngine(stt_model=…)` → `POST /v1beta/interactions` with `{"model": …}`
+(or, with no selection, the documented general media route
+`/models/<media model>:generateContent`). `RuntimeSupervisor` re-applies the persisted
+settings, so a changed selection takes effect **without a process restart**; direct STT
+still never calls `ProviderManager`.
+
+## 4. Tests
+
+New: `tests/test_gemini_model_selection.py` (13 tests) — real `config_store`, real
+`Engine`/`ProviderManager`/`GeminiProvider`, real `stt_engine_factory` →
+`GeminiMediaEngine`; only HTTP and the Telegram owner lookup are fakes. Every chat test
+asserts the **URL** the provider was asked to call, not a helper's return value.
+
+*Discovery / selection* — dynamic catalogue from `/models`; a never-hardcoded id
+(`gemini-future-9-pro`) is selectable, persisted and applied to the provider instance;
+a persisted selection survives a boot whose env default differs (the env value never
+reaches the wire); the request names the selection; `_build_targets` keeps ids verbatim.
+*Failure honesty* — a retired selection is requested **as itself**, returns the
+provider's 404, is never swapped for `gemini-2.5-flash`, and the stored selection is
+left untouched; an unregistered provider/model selection fails with `False` and leaves
+the active provider alone; owner A and owner B never see each other's model.
+*Testing* — `test_single_model` and `_build_targets` both use the exact id the picker
+shows.
+*Media/STT* — persisted `stt_model` → engine → `/interactions` body `{"model": <selected>}`;
+a separate chat model never becomes the transcription model; an explicit STT selection
+is never replaced by the media default; no selection keeps the documented
+`generate_content` default route; changing the selection re-provisions a new engine
+in place; the direct-STT path never touches `ProviderManager.chat`.
+
+Updated existing suites (same contract, old assertions replaced):
+`tests/test_gemini_model_discovery.py`, `tests/test_model_tester.py`,
+`tests/test_24_execution_reliability.py`, `tests/test_media_dedicated_stt.py`,
+`tests/test_media_gemini_engine.py`.
+
+Commands and results (all from the repository root, `PYTHONPATH=.`):
+
+| Command | Result |
 |---|---|
-| `py_compile` on every changed module and test file | **OK** |
-| `pytest tests/test_callback_latency_burst.py -q` | **21 passed** |
-| `pytest` focused callback/panel suites (backlog, burst, multi-select, owner isolation, receipt, cipher, emoji, save success panel, taskloom input/editor, symbols, save engine, bio, ghost-seen, ai stt, task reliability) | **460 passed** |
-| `pytest tests -q` (full suite) | **6789 passed, 27 skipped, 1 failed** |
-| `git diff --check` | clean |
+| `pytest tests/test_gemini_model_selection.py -q -p no:cacheprovider` | **13 passed** |
+| `pytest tests/test_gemini_model_discovery.py tests/test_model_tester.py tests/test_24_execution_reliability.py -q -p no:cacheprovider` | **77 passed** |
+| `pytest` on the provider/config/runtime/UI selection suites (`test_17_providers`, `test_23_provider_mesh`, `test_34_ai_model_ui`, `test_36_ai_settings_ux`, `test_provider_*`, `test_cloudflare_provider`, `test_nararouter_provider`, `test_ai_state_consistency`, `test_02_ai_flow`, `test_18_ai_execution_agent`) | **224 passed** |
+| `pytest tests/test_media_gemini_engine.py tests/test_media_dedicated_stt.py` + every other `tests/test_*stt*.py` (15 suites) | **980 passed, 2 skipped** |
+| `pytest tests -q -p no:cacheprovider` (full suite) | **6902 passed, 27 skipped, 1 failed** |
+| `python -m compileall -q backend tests` | exit **0** |
+| `git diff --check` | exit **0** (no whitespace errors) |
 
-Coverage added/changed for this phase:
+The single full-suite failure is
+`tests/test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`,
+which is **pre-existing and unrelated**: it reproduces on a clean `git archive` of the
+base commit `fd547c9` and touches no file in this change.
 
-* burst of 10/15/30 ticks: every click applied once, ≤ 3 edits, 0 DB reads, final
-  panel agrees with authoritative state (`_last_paint` so the assertion no longer
-  assumes *which* click painted);
-* painter: newest-wins, one pending slot, no second painter task, `closed`
-  discard, failed paint does not wedge, a slow paint does not hold the next
-  click's handler (`work_ms < 100 ms` while an edit is in flight);
-* saturated DB pool: a 5th call is bounded by the watchdog
-  (`OperationTimeoutError`) instead of hanging, and an unrelated panel still
-  answers and paints during saturation;
-* a slow Close does not block opening another panel (`< 0.5 s`, measured 0.1 ms);
-* lifecycle/ordering regressions: all existing panel, navigation, Taskloom,
-  Cipher, Emoji, Save-success and input-prompt suites pass unchanged apart from
-  the dispatch entry point.
+## 5. Hardcode audit
 
-Full-suite failure: `tests/test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`.
-Re-run with this tree stashed at `a4b6e4f` → identical failure; with the tree
-restored → identical failure. Pre-existing, unrelated to the callback path.
+No hardcoded model id remains in any generic discovery, selection, testing or provider
+execution path. The remaining ids are listed with their classification in
+`INVESTIGATION.md` §4; in summary they are all **category 2 (initial setup default)** or
+presentation labels, and each one is used only while the owner has made no choice:
 
-## 7. Remaining limitations and unverified hypotheses
+| Remaining id | Where | Why it is legitimate |
+|---|---|---|
+| `gemini-2.5-flash` | `backend/ai/providers/base/defaults.py` (`_gemini_default`), `backend/ai/discovery.py` provider entry | the boot default for an unconfigured provider; `apply_persisted_config` always overwrites it with the owner's stored selection |
+| `gemini-2.5-flash`, `gemini-2.5-pro` | `backend/ai/model_discovery.py::_FALLBACK_CATALOG` | degraded-mode catalogue used **only** when the live `/models` call fails; a live result always replaces it, so new models need no code change |
+| `gemini-3.5-flash-lite` | `backend/services/gemini_media_engine.py::DEFAULT_MEDIA_MODEL` | media default applied only when no media model is configured |
+| `gemini-3.5-transcribe` | `backend/services/gemini_media_engine.py::DEDICATED_TRANSCRIPTION_MODEL` | owner-selectable candidate; an explicit `stt_model` always wins |
+| TTS ids | `backend/ai/tts_control_plane.py`, `backend/services/gemini_tts_engine.py` | a different setting (TTS), each value only a default/candidate |
+| `gemini-stt-deterministic` | `backend/services/media_ai_service.py` | not a model id — a label on the deterministic direct-STT answer (no request is built) |
 
-* **No production evidence was available in this workspace.** The Render logs
-  the owner referred to could not be read here, no Telegram RPC was made, and the
-  measurements above are the application's own structure with faked network
-  latency. They are *not* production performance.
-* **The residual serialised read.** For panels that load from the database on
-  every click, a burst still costs ≈ N × read (30 clicks ≈ 3.6 s of the 4.1 s).
-  Ordered views on one message require it; removing it needs a read-only/mutating
-  taxonomy or concurrent reads for ordered views, which this change deliberately
-  does not introduce.
-* **Telegram rapid-edit throttling** remains an unconfirmed amplifier. Edits per
-  burst are down 87–93 % on I/O-free panels, which reduces the exposure but is not
-  proof that a `FLOOD_WAIT` was ever returned.
-* **A paint racing a close is narrowed, not eliminated.** The close edit is not
-  routed through the painter; the window is one edit RPC and the outcome is a
-  stale (unclickable) panel.
-* **Live confirmation is missing:** that a real Helper Bot answers a 30-click
-  burst, that the panel ends on the newest view, and the real `ack_ms`/`db_ms`
-  must be observed in production logs. Nothing in this report should be read as
-  "the live freeze is fixed".
+`resolve_model` / `DEPRECATED_MODELS` have no remaining reference in `backend/`. The
+only textual mentions are the regression test that asserts their absence and the dated
+historical report `docs/investigations/ai-provider-endpoint-investigation.md`, which is
+a point-in-time document for commit `909bc3f` and was deliberately not rewritten.
 
-## 8. Deliberately not done
-
-* No second dispatcher/queue/executor and no task per click.
-* No debounce window, no rate limit, no dropped clicks to make the bot look
-  faster (the turn's queue is still drained in full; only paints coalesce).
-* No concurrent edits to one message, and no concurrent handlers on one panel.
-* No changes to Save semantics, the AI runtime, Taskloom scheduling, Supabase
-  schema or `DATABASE_ARCHITECTURE.md`.
-
-## 9. Superseded statements from earlier phases
-
-* Phase 2's claim that a serialised burst is necessarily slower than
-  `N × (read + edit)` is superseded: the edit was never part of the ordering
-  guarantee, and a burst on an I/O-free panel is now constant-time.
-* Phase 2's `SKIP_RENDER` opt-in is replaced by the painter (one mechanism for
-  every panel). The Stash page snapshot it came with is unchanged.
-* Phase 1/2's "each click's `work_ms` includes the UI response" is superseded:
-  `work_ms` is now handler-only and the paint is reported separately as
-  `paint_ms`.
-
----
-
-## 10. Test Modules diagnostic — every chat model of every provider (2026-11-05)
-
-> Scope: the Test Modules diagnostic only. ProviderManager, fallback/retry/
-> cooldown, model selection and persistence, the RuntimeSupervisor, the
-> Engine/Dispatcher and ToolRegistry/ToolExecutor were not touched, and no
-> SQL, Supabase call or migration was executed.
+## 6. Git
 
 | Item | Value |
 |---|---|
-| Task | Test every chat-capable model of every chat provider, independently of the owner's selected model |
-| Base | `main` @ `8a0c5b9` |
-| Date | 2026-11-05 |
-| Live Telegram / Supabase / Render | **NOT touched** |
-| New dependency | **none** |
-| Documents not modified | `DATABASE_ARCHITECTURE.md`, `README.md`, `AGENTS.md` (no statement in it was invalidated — it carries no test-budget sentence) |
+| Branch | `main` (no branch, PR, rebase or history rewrite) |
+| Commit | one commit for this task, parent `fd547c9f1134d481d626e253f4fd313c43a85929` (`git log --oneline -1` after the commit) |
+| Push | `origin/main`, fast-forward, verified after the push with `git fetch origin` + `git rev-parse origin/main` + `git merge-base --is-ancestor HEAD origin/main` (exit 0) |
+| Working tree | clean after the commit (the pre-existing untracked `telegram-self-bot/` directory was never touched) |
 
-### 10.1 Root cause
+No force-push, no rebase, no `rebase --skip`, no second branch, no PR, no history
+rewrite, and no unrelated file in the commit.
 
-`backend/ai/model_tester.py` coupled target selection to things that must not
-influence a diagnostic:
+## 7. Not live-verified
+
+The deployed Telegram runtime was **not** exercised. Specifically, none of the
+following was confirmed against a live deployment, and no claim here depends on it:
+
+* that a real `POST /v1beta/models/<id>:generateContent` with the owner's real
+  credential succeeds or fails as expected (the tests fake the HTTP boundary);
+* that the live `/v1beta/models` catalogue returns the ids the tests synthesise
+  (discovery itself is covered by the existing paginated-fetch tests);
+* that the AI → Settings → Speech panel renders the new selection in a live chat, and
+  that re-applying a changed STT selection re-provisions the engine mid-run on the
+  deployed process (the re-provisioning path is covered at the factory/engine level,
+  not through a live `RuntimeSupervisor` start);
+* that Telegram's edit/acknowledgement behaviour around the AI panels is unchanged
+  (untouched by this change; covered by the existing callback-gate suites).
+
+## 8. User action
+
+No configuration action is required for the fix to take effect: the code now uses
+whatever provider and model are already persisted.
+
+What the owner should know / may want to do:
+
+* If `ai_config` currently stores a retired id (for example `gemini-2.0-flash`), the
+  runtime will now request **that** id and the provider will answer
+  `404 model_not_found`. The fix is to re-select a current model once in
+  **Menu → AI → Model** (the panel now lists exactly the discovered catalogue); the
+  system will no longer silently move the owner onto another model.
+* The same applies to a dedicated transcription model: if
+  `AI_GEMINI_STT_MODEL` / the Speech panel points at a retired id, transcription will
+  fail with a clear provider error instead of being quietly rerouted; select a current
+  transcription model in **Menu → AI → Settings → Speech**.
+* A live Telegram confirmation (one chat request with the chosen model, plus one voice
+  message if dedicated STT is enabled) is recommended — it is the only check that can
+  confirm deployed behaviour, and it was not performed here.
+
+---
+
+## 9. Test Modules diagnostic coverage (2026-11-05)
+
+> Scope: the Test Modules diagnostic only. This section is folded into the same
+> task increment as the model-selection fix above and reconciles it with the
+> diagnostics work that landed on `main` meanwhile (provider-attributed failure
+> fields, `backend/ai/redaction.py`, All Results paging, Cloudflare provider).
+
+### 9.1 Root cause
+
+`backend/ai/model_tester.py` coupled target selection to things a diagnostic
+must not depend on:
 
 1. **The owner's selection.** `_build_targets()` read `get_config()` and, for the
-   active provider, put the owner's selected model first and ordered the rest
-   around it, so both the target set and its order depended on what was chosen
-   for normal usage.
+   active provider, inserted the selected model first and ordered the rest around
+   it, so the target set and its order followed the runtime selection.
 2. **A global budget.** `_GLOBAL_TEST_BUDGET` (`MODEL_TEST_GLOBAL_TEST_BUDGET`,
    default 60) sliced the flat target list, so a catalog with more than 60
    eligible models could never be fully tested and the cut-off fell on whichever
-   providers sorted last.
-3. **A phantom-default shortcut.** A provider without an API key contributed only
-   its `default_model` as `NOT_CONFIGURED`; the rest of its known catalog was
-   silently absent.
+   providers came last.
+3. **A phantom/default shortcut.** A provider without an API key contributed only
+   its `default_model` as `NOT_CONFIGURED`, dropping the rest of its known
+   catalog.
 
 `_MODELS_IN_RESPONSE` — a response/display limit — was also applied while
-building the target list, so a display cap doubled as an execution cap.
+building targets, so a display cap doubled as an execution cap.
 
-### 10.2 Target selection now (`_build_targets`)
+### 9.2 Target selection now (`_build_targets`)
 
-* No configuration read at all: `get_config` is no longer imported by the
-  module, so selection cannot influence the targets.
-* Every provider whose `capability_kind == "chat"` is included — configured or
-  not, validated or not. Non-chat capabilities (`you` → web search) keep their
-  own path and produce no chat targets.
+* `get_config` is no longer imported or read; `active_config` is accepted for
+  call-site compatibility and ignored, so selection cannot add, drop or reorder
+  a target.
+* Every provider with `capability_kind == "chat"` is included, configured or
+  not. Non-chat capabilities (`you` → web search) keep their own path and
+  produce no chat targets.
 * With a key → that provider's live discovery result. Without a key, or when
   discovery fails / returns nothing usable → `fallback_models(name)`, the one
-  existing centralized catalog (`_FALLBACK_CATALOG`) reached through a new
-  public wrapper. No second catalog, no duplicated provider metadata.
-* Every `is_chat_capable()` model of that catalog is scheduled; a
-  `(provider, model)` pair is scheduled at most once (`seen_pairs`).
-* A provider default that is not a member of the applicable catalog is never
-  invented as a target.
+  existing `_FALLBACK_CATALOG` (the same list `fetch_models` itself falls back
+  to). No second catalog, no duplicated provider metadata.
+* Every `is_chat_capable()` model is scheduled; a `(provider, model)` pair is
+  scheduled at most once. Ids are used verbatim (`strip()` only), so nothing is
+  renamed or substituted.
+* No provider default is ever *added*; a default that is a real catalog member
+  is only moved to the front of that provider's list (ordering, not coverage).
 * Nothing truncates: no budget, per-provider cap, slice or priority queue.
   `_TEST_CONCURRENCY` bounds in-flight tests and the per-model timeout bounds
-  each one; free-first ordering only orders, it never drops.
-* `_MODELS_IN_RESPONSE` caps only the `models` payload; the production feed
-  (`complete_models`) and the target list are complete.
+  each one. `_MODELS_IN_RESPONSE` caps the `models` payload only — the target
+  list and the production feed are complete.
 
-### 10.3 Unconfigured providers
+### 9.3 Unconfigured providers
 
-Scheduled like any other provider, then answered offline:
-`test_single_model()` sees no key and returns `NOT_CONFIGURED` /
-`API key not configured in environment` with `latency_s` and `http_status`
-`None`. No provider client is constructed (no `ProviderFactory` call) and no
-discovery or chat request is made.
+Scheduled like any other, then answered offline: `test_single_model()` sees no
+key and returns `NOT_CONFIGURED` / `API key not configured in environment` with
+`latency_s` and `http_status` `None`. No provider client is constructed and no
+discovery or chat request is made (asserted by tests that make both raise).
 
-### 10.4 Specialized (non-chat) models
+### 9.4 Specialized (non-chat) models
 
-`is_chat_capable()` gained evidence-based exclusions for dedicated transcription
-(`transcribe`), speech synthesis (`-tts`, `speech`) and audio/video generation
-(`sora`, `veo`) on top of the existing embedding / image / moderation /
-realtime / audio blocklist. Gemini's Interactions-only models were already
-filtered through `supportedGenerationMethods`. These models are therefore not
-targets of the generic chat probe and are not reported as broken chat models.
-No new modality test path was invented — no such path existed.
+`is_chat_capable()` excludes dedicated transcription (`transcribe`), speech
+synthesis (`-tts`, `tts_`, `speech`), audio/video generation (`sora`, `veo`) and
+the pre-existing embedding / image / moderation / realtime / audio / search
+families. Gemini Interactions-only models stay filtered through
+`supportedGenerationMethods`. They are not targets of the generic chat probe and
+not reported as broken chat models; no modality-specific path was invented
+because none existed.
 
-### 10.5 Honest deadlines
+### 9.5 Honest deadlines
 
-`overall_timeout` now defaults to `None` (run to completion). When a caller
-imposes one, unreached targets are reported as the new `NOT_ATTEMPTED` status
-(`partial: true`, summary bucket `not_attempted`), never as `TIMEOUT` and never
-as a provider response; `summary.tested` excludes both `not_configured` and
-`not_attempted`. Only `AVAILABLE` results feed `proven_usable_candidates()`, so
-unattempted, unconfigured, timed-out and failed models never become production
-candidates.
+`overall_timeout` defaults to `None` (run to completion). When a caller imposes
+one, unreached targets get the new `NOT_ATTEMPTED` status (`partial: true`,
+summary bucket `not_attempted`) instead of `TIMEOUT`/a provider response;
+`summary.tested` excludes both `not_configured` and `not_attempted`. Only
+`AVAILABLE` results feed `proven_usable_candidates()`, so unattempted,
+unconfigured, timed-out and failed models never become production candidates.
 
-### 10.6 UI
+### 9.6 UI
 
-`NOT_ATTEMPTED` uses the pending mark `…` (plain Unicode, already part of the
-documented status vocabulary). All Results now paginates the COMPLETE result set
-(`action:ai_test_details:<page>`, 3000-character pages, Prev/Next) instead of
-trying to fit every line into one message: a 200-result run renders as 6 pages of
-at most 3013 characters and every model stays reachable.
+`NOT_ATTEMPTED` is rendered with the pending mark `…` (plain Unicode, inside the
+already-documented status vocabulary). All Results paging from `main` — complete
+diagnostics packed into ≤3500-character pages — is kept unchanged; it pages the
+whole result list, so the complete run (including every `NOT_CONFIGURED` entry)
+stays reachable.
 
-### 10.7 Coverage measured in this environment
+### 9.7 Coverage measured in this environment
 
-No provider API key exists here, so live discovery could not run and the
+No provider API key exists here, so discovery could not run live and the
 diagnostic exercised the unconfigured path end to end:
 
 | | |
 |---|---|
 | Chat providers in the registry | 13 (`openrouter, openai, nararouter, groq, mistral, zai, sambanova, cohere, siliconflow, gemini, cerebras, nvidia, fireworks`) plus `you` (web search → 0 chat targets) |
-| Eligible (chat-capable) models discovered | **39** |
-| Models actually tested | **0** (no key) |
+| Eligible chat-capable models discovered | **39** |
+| Models actually tested | **0** (no key available) |
 | `NOT_CONFIGURED` results | **39** |
-| Targets left untested (not attempted) | **0**, `partial: false` |
+| Targets left untested | **0**, `partial: false` |
 | Per provider | openrouter 4 · openai 5 · nararouter 4 · groq 3 · mistral 3 · zai 3 · sambanova 3 · cohere 3 · siliconflow 3 · gemini 2 · cerebras 2 · nvidia 2 · fireworks 2 |
 
-Because no key was available this run does **not** show any real model
-answering; it shows complete, selection-independent target construction and the
-offline `NOT_CONFIGURED` path for all 39 catalog models.
+No key was available, so this does **not** show any model answering; it shows
+complete, selection-independent target construction and the offline
+`NOT_CONFIGURED` path for all 39 catalog models.
 
-### 10.8 Tests
+### 9.8 Tests
 
-`tests/test_model_tester.py` — new cases exercise real target construction and
-execution: selection independence (no active-config read; identical targets for
-two different selections), complete configured-provider coverage, the whole
-fallback catalog of an unconfigured provider with no client and no network, a
-75-model catalog, 120 models across three providers, a 100-model early catalog
-that cannot starve later providers, no duplicate pairs, no phantom default, the
-exact catalog id recorded as passed to `test_single_model()`, specialized models
-excluded, batch/streaming coverage parity, cancellation propagation, unattempted
-targets kept out of the production feed, and one-provider-failure isolation. The
-budget, overall-timeout and display-cap tests were rewritten for the new
-semantics. `tests/test_model_discovery.py` gained the specialized-model
+`tests/test_model_tester.py` gained target-construction/execution cases:
+selection independence (no config read; identical targets under two different
+selections), complete configured-provider coverage, the whole fallback catalog of
+an unconfigured provider with no client and no network, a 75-model catalog, 120
+models across three providers, a 100-model early catalog that cannot starve later
+providers, no duplicate pairs, no phantom default, the exact id recorded as
+passed to `test_single_model()`, specialized models excluded, batch/streaming
+parity, cancellation propagation, unattempted targets kept out of the production
+feed, and one-provider-failure isolation; its budget/timeout/display-cap tests
+were rewritten. `tests/test_model_discovery.py` gained the specialized-model
 capability case.
 
-### 10.9 Results
+Two upstream tests encoded the behaviour this task forbids and now assert the new
+contract instead of being deleted:
+`test_an_explicit_selection_is_always_tested_even_if_stale` (renamed
+`test_an_explicit_selection_never_changes_the_target_set`) and
+`test_targets_keep_discovered_and_selected_ids_unrenamed` (now asserts a
+configured id outside the catalog is not injected, ids stay verbatim, no
+duplicates).
+
+### 9.9 Results
 
 | Check | Result |
 |---|---|
-| Focused (`test_model_tester.py`, `test_model_discovery.py`) | 58 passed |
-| Symbols/UI vocabulary + provider mesh + focused | 121 passed |
-| Full suite | 6803 passed, 27 skipped, **1 failed** |
+| Focused (`test_model_tester.py`, `test_model_discovery.py`) | 63 passed |
+| Gemini discovery/selection + Test Modules UI + focused | 136 passed |
+| Full suite | **6916 passed, 27 skipped, 1 failed** |
 | `python -m compileall -q backend tests` | exit 0 |
 | `git diff --check` | clean |
 
 The single failure is
 `tests/test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`
 ("interval advancement exceeded bound"). It reproduces unchanged at `HEAD` in a
-detached worktree without this change, touches no file in this change, and its 10
-sibling scheduler tests pass: pre-existing and unrelated, reported rather than
-hidden.
+detached worktree without this change, touches no file here, and its 10 sibling
+scheduler tests pass: pre-existing, reported rather than hidden.
 
-### 10.10 Limitations
+### 9.10 Limitations
 
-* No API key here: no live provider was contacted, so no real latency was
-  measured and only the fallback catalogs were exercised.
-* Catalogs larger than 60 models are exercised with `fetch_models` stubbed
-  because no key exists; the un-truncated scheduling path around it is real code
-  under test.
-* No Telegram client was available: All Results pagination was verified by
-  calling the handler with a 200-result payload, not on a live message.
+* No API key: no live provider was contacted, so only fallback catalogs were
+  exercised and no real latency was measured.
+* Catalogs larger than 60 models are tested with `fetch_models` stubbed because
+  no key exists; the scheduling path around it is real code under test.
+* No Telegram client: All Results paging was checked by calling the handler with
+  a 200-result payload, not on a live message.

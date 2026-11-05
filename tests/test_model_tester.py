@@ -1182,3 +1182,114 @@ async def test_one_provider_failure_does_not_stop_other_providers():
     assert by_provider["openai"] == {"PROVIDER_ERROR"}
     assert by_provider["groq"] == {"AVAILABLE"}
     assert len(data["results"]) == 4
+
+
+# ── Provider-attributed diagnostics on failed Test Modules results ─────────
+
+
+@pytest.mark.asyncio
+async def test_404_without_model_evidence_is_not_an_invalid_model():
+    """A bare 404 proves the route failed, not that a model is missing."""
+    mock_response = ProviderResponse(
+        text="Not Found", provider_name="gemini", success=False,
+        metadata={"http_status": 404},
+    )
+    with patch("backend.ai.model_tester._get_env", return_value="fake_key"), \
+         patch("backend.ai.providers.gemini.GeminiProvider.chat",
+               new_callable=AsyncMock, return_value=mock_response):
+        res = await test_single_model("gemini", "Google Gemini", "◇", "gemini-2.5-flash")
+
+    assert res["status"] == "PROVIDER_ERROR"
+    assert "no model-not-found evidence" in res["error"]
+    assert res["failure_origin"] == "provider"
+
+
+@pytest.mark.asyncio
+async def test_400_request_validation_is_not_an_invalid_model():
+    mock_response = ProviderResponse(
+        text="Requested method not found", provider_name="gemini", success=False,
+        metadata={
+            "http_status": 400,
+            "provider_error_code": "400",
+            "provider_error_type": "INVALID_ARGUMENT",
+            "provider_error_message": "Unknown name 'contents' at 'request'",
+            "failure_type": "request",
+            "failure_origin": "request_validation",
+        },
+    )
+    with patch("backend.ai.model_tester._get_env", return_value="fake_key"), \
+         patch("backend.ai.providers.gemini.GeminiProvider.chat",
+               new_callable=AsyncMock, return_value=mock_response):
+        res = await test_single_model("gemini", "Google Gemini", "◇", "gemini-2.5-flash")
+
+    assert res["status"] == "PROVIDER_ERROR"
+    assert res["failure_origin"] == "request_validation"
+    assert res["provider_error_type"] == "INVALID_ARGUMENT"
+    assert res["provider_error_message"] == "Unknown name 'contents' at 'request'"
+    assert res["error_type"] == "request"
+
+
+@pytest.mark.asyncio
+async def test_failure_payload_keeps_provider_attribution_and_the_exact_model_id():
+    """The tested id is the requested id — the payload never renames a model."""
+    mock_response = ProviderResponse(
+        text="models/gemini-2.0-flash is not found", provider_name="gemini", success=False,
+        metadata={
+            "http_status": 404,
+            "failure_type": "model_not_found",
+            "failure_origin": "model_lookup",
+            "provider_error_code": "404",
+            "provider_error_type": "NOT_FOUND",
+            "provider_error_message": "models/gemini-2.0-flash is not found",
+            "operation": "generateContent",
+            "api_version": "v1beta",
+            "endpoint": "models/gemini-2.0-flash:generateContent",
+        },
+    )
+    with patch("backend.ai.model_tester._get_env", return_value="fake_key"), \
+         patch("backend.ai.providers.gemini.GeminiProvider.chat",
+               new_callable=AsyncMock, return_value=mock_response):
+        res = await test_single_model("gemini", "Google Gemini", "◇", "gemini-2.0-flash")
+
+    assert res["model"] == "gemini-2.0-flash"
+    assert res["requested_model"] == "gemini-2.0-flash"
+    assert res["status"] == "INVALID_MODEL"
+    assert res["error_type"] == "model_not_found"
+    assert res["provider_code"] == "404"
+    assert res["provider_error_type"] == "NOT_FOUND"
+    assert res["failure_origin"] == "model_lookup"
+    assert res["operation"] == "generateContent"
+    assert res["api_version"] == "v1beta"
+    assert res["endpoint"] == "models/gemini-2.0-flash:generateContent"
+    assert res["provider_error_message"] == "models/gemini-2.0-flash is not found"
+
+
+@pytest.mark.asyncio
+async def test_failure_payload_tolerates_missing_optional_metadata():
+    mock_response = ProviderResponse(
+        text="boom", provider_name="cerebras", success=False, metadata={},
+    )
+    with patch("backend.ai.model_tester._get_env", return_value="fake_key"), \
+         patch("backend.ai.providers.cerebras.CerebrasProvider.chat",
+               new_callable=AsyncMock, return_value=mock_response):
+        res = await test_single_model("cerebras", "Cerebras", "◇", "llama-3.3-70b")
+
+    assert res["status"] == "UNKNOWN_ERROR"
+    assert res["provider_error_message"] == "boom"
+    assert res["provider_error_type"] is None
+    assert res["operation"] is None
+    assert res["api_version"] is None
+    assert res["endpoint"] is None
+    assert res["failure_origin"] == "unknown"
+    assert res["requested_model"] == "llama-3.3-70b"
+    assert res["provider_error_reasons"] == []
+
+
+def test_provider_diagnostics_are_sanitized_and_bounded():
+    from backend.ai.model_tester import _MAX_ERROR_CHARS, _bounded_error_message
+
+    out = _bounded_error_message("key=AIzaSecret1234567890 Bearer abcdefgh12345 " + "x" * 1000)
+    assert "AIzaSecret" not in out
+    assert "abcdefgh12345" not in out
+    assert out.endswith("…")
+    assert len(out) <= _MAX_ERROR_CHARS

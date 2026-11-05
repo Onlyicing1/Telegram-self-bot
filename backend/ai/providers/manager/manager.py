@@ -46,7 +46,6 @@ from typing import Any, Iterator
 
 from backend.ai.providers.base.config import ProviderConfig
 from backend.ai.providers.base.contract import BaseProvider, ProviderResponse
-from backend.ai.providers.base.defaults import resolve_model
 from backend.ai.providers.base.exceptions import ProviderUnavailable
 from backend.ai.providers.manager.config_manager import ProviderConfigManager
 from backend.ai.providers.manager.health import (
@@ -708,9 +707,15 @@ class ProviderManager:
         return round(max(0.0, score), 4)
 
     def _effective_model(self, provider: BaseProvider) -> str:
-        """Return the provider's resolved model name (deprecation-substituted)."""
+        """Return the model this provider instance will actually request.
+
+        The configured value IS the model (the owner's selection, applied by
+        ``apply_selection``) — returned verbatim, with no substitution, so the
+        router's candidate list, its unavailable-model marking and the request
+        all name the same id.
+        """
         try:
-            return resolve_model(self._safe_provider_name(provider), provider.config.default_model or "")
+            return (provider.config.default_model or "").strip()
         except Exception:
             return ""
 

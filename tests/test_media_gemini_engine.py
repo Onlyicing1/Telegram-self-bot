@@ -585,12 +585,14 @@ def test_media_model_resolution_order(monkeypatch):
     assert engine is not None and engine.model == "gemini-2.5-flash-lite"
 
 
-def test_a_deprecated_configured_model_is_resolved_before_use(monkeypatch):
+def test_a_configured_media_model_is_used_verbatim(monkeypatch):
     monkeypatch.setenv("AI_GEMINI_API_KEY", API_KEY)
     monkeypatch.setenv("AI_GEMINI_MEDIA_MODEL", "gemini-2.0-flash")
 
-    # The project's existing deprecation map is reused — no second one.
-    assert resolve_media_model() == ("gemini-2.5-flash", "AI_GEMINI_MEDIA_MODEL")
+    # No substitution table: the configured id is what gets requested. If the
+    # provider has retired it, the API says so — the owner is never silently
+    # moved onto a model they did not configure.
+    assert resolve_media_model() == ("gemini-2.0-flash", "AI_GEMINI_MEDIA_MODEL")
 
 
 def test_provisioning_never_raises_and_never_makes_a_request():

@@ -37,7 +37,6 @@ from backend.helper import symbols as sym
 import asyncio
 import logging
 import os
-import re
 import time
 from datetime import datetime, timezone
 from typing import Any, Callable
@@ -46,22 +45,20 @@ from backend.ai.discovery import discover_providers, _get_env, get_provider_info
 from backend.ai.model_discovery import (
     fallback_models,
     fetch_models,
+    get_last_fetch_source,
     is_chat_capable,
     order_models_for_selector,
+    reset_fetch_source,
 )
 from backend.ai.providers.base.config import ProviderConfig
 from backend.ai.providers.factory import ProviderFactory
+from backend.ai.redaction import redact_secrets
 
 logger = logging.getLogger(__name__)
 
-# Sanitization regex patterns for secrets/credentials
-_SECRET_PATTERNS = [
-    re.compile(r"sk-[a-zA-Z0-9_\-]{8,}", re.IGNORECASE),
-    re.compile(r"gsk_[a-zA-Z0-9_\-]{8,}", re.IGNORECASE),
-    re.compile(r"ms-key-[a-zA-Z0-9_\-]{8,}", re.IGNORECASE),
-    re.compile(r"Bearer\s+[a-zA-Z0-9_\.\-]{8,}", re.IGNORECASE),
-    re.compile(r"key=[a-zA-Z0-9_\-]{8,}", re.IGNORECASE),
-]
+# Bounded diagnostic text: All Results shows ONE short message per failed
+# model, so a provider body is never carried through unbounded.
+_MAX_ERROR_CHARS = 300
 
 # Bounded concurrency: never spawn an unbounded task explosion. This is the
 # ONLY bound on how many models a run tests — every eligible target is
@@ -75,12 +72,79 @@ _MODELS_IN_RESPONSE = 30
 
 def sanitize_error_message(msg: str) -> str:
     """Sanitize error messages to ensure no API keys or credentials leak to UI."""
-    if not msg:
-        return ""
-    sanitized = str(msg)
-    for pattern in _SECRET_PATTERNS:
-        sanitized = pattern.sub("***REDACTED***", sanitized)
-    return sanitized
+    return redact_secrets(msg)
+
+
+def _bounded_error_message(msg: str, limit: int = _MAX_ERROR_CHARS) -> str:
+    """One-line, sanitized, bounded provider message for diagnostics."""
+    clean = " ".join(sanitize_error_message(msg).split())
+    if len(clean) <= limit:
+        return clean
+    return clean[: limit - 1].rstrip() + "…"
+
+
+def _model_lookup_evidence(provider_type: str, err_text: str) -> bool:
+    """Whether a 404's own details actually name a missing MODEL.
+
+    A bare HTTP 404 proves only that the route did not resolve. Treating it
+    as an invalid model turns a wrong endpoint, a base-URL typo or a gateway
+    route into a false model verdict, so the body must name a model
+    (``models/x is not found``, ``model_not_found``) before that conclusion
+    is drawn.
+    """
+    text = (err_text or "").lower()
+    mentions_model = "model" in text or "models/" in text
+    missing = (
+        "not found" in text
+        or "does not exist" in text
+        or "unknown model" in text
+        or "unsupported model" in text
+        or provider_type in ("not_found", "model_not_found")
+    )
+    return mentions_model and missing
+
+
+_ORIGIN_BY_STATUS = {
+    "INVALID_MODEL": "model_lookup",
+    "AUTH_ERROR": "authentication",
+    "RATE_LIMITED": "rate_limit",
+    "INSUFFICIENT_CREDITS": "quota",
+    "TIMEOUT": "timeout",
+    "BLOCKED": "content_policy",
+    "PROVIDER_ERROR": "provider",
+    "UNKNOWN_ERROR": "unknown",
+}
+
+
+def _failure_fields(
+    metadata: dict[str, Any],
+    status: str,
+    response_text: str,
+    requested_model: str,
+) -> dict[str, Any]:
+    """Provider-attributed diagnostics kept beside the classification.
+
+    The status says WHAT the tester concluded; these fields say WHY — the id
+    actually requested, the operation/endpoint, the provider's own code and
+    status, and one bounded sanitized message. ``error_type`` is never reused
+    for the provider's status: a local transport class and a provider verdict
+    are different facts.
+    """
+    provider_message = metadata.get("provider_error_message") or response_text or ""
+    return {
+        "requested_model": requested_model,
+        "provider_error_type": metadata.get("provider_error_type"),
+        "provider_error_message": _bounded_error_message(provider_message) or None,
+        "provider_error_reasons": [
+            _bounded_error_message(reason, 80)
+            for reason in (metadata.get("provider_error_reasons") or [])[:5]
+            if reason
+        ],
+        "failure_origin": metadata.get("failure_origin") or _ORIGIN_BY_STATUS.get(status, "unknown"),
+        "operation": metadata.get("operation"),
+        "api_version": metadata.get("api_version"),
+        "endpoint": metadata.get("endpoint"),
+    }
 
 
 def _classify_failure(metadata: dict[str, Any], err_text: str) -> tuple[str, str]:
@@ -123,8 +187,15 @@ def _classify_failure(metadata: dict[str, Any], err_text: str) -> tuple[str, str
         suffix = f" (retry-after: {retry_after}s)" if retry_after else ""
         return "INSUFFICIENT_CREDITS", f"Insufficient credits/quota{suffix}"
 
-    if http_status == 404 or "not found" in err_lower or "unknown model" in err_lower:
-        return "INVALID_MODEL", sanitize_error_message(err_text)
+    if http_status == 404:
+        if _model_lookup_evidence(provider_type, err_text):
+            return "INVALID_MODEL", _bounded_error_message(err_text)
+        return "PROVIDER_ERROR", _bounded_error_message(
+            f"HTTP 404 from the provider (no model-not-found evidence): {err_text}"
+        )
+
+    if provider_type in ("not_found", "model_not_found") and "model" in err_lower:
+        return "INVALID_MODEL", _bounded_error_message(err_text)
 
     if http_status and http_status >= 500:
         return "PROVIDER_ERROR", sanitize_error_message(err_text)
@@ -206,6 +277,13 @@ async def test_single_model(
         # Never waste a network request on a provider without a key.
         return _not_configured_result(provider_name, display_name, icon, model_id)
 
+    # The id tested is the id the caller selected, sent verbatim — the same id
+    # the runtime would request. Nothing is substituted here, so a retired or
+    # unknown id reports as a real failure of THAT model instead of borrowing
+    # the result of another one.
+    requested_model = model_id
+    model_id = (model_id or "").strip()
+
     base_url = (
         _get_env(p_info["base_url_env"]) if p_info.get("base_url_env") else ""
     ) or p_info.get("default_base_url", "")
@@ -243,6 +321,7 @@ async def test_single_model(
                 "display_name": display_name,
                 "icon": icon,
                 "model": model_id,
+                "requested_model": requested_model,
                 "status": "AVAILABLE",
                 "error": None,
                 "latency_s": latency_s,
@@ -264,12 +343,13 @@ async def test_single_model(
             "display_name": display_name,
             "icon": icon,
             "model": model_id,
+            **_failure_fields(metadata, status, err_text, requested_model),
             "status": status,
             "error": clean_err,
             "latency_s": latency_s,
             "http_status": http_status,
             "retry_after": metadata.get("retry_after"),
-            "error_type": metadata.get("error_type") or metadata.get("provider_error_type"),
+            "error_type": metadata.get("error_type") or metadata.get("failure_type"),
             "provider_code": metadata.get("provider_error_code"),
             "finish_reason": finish_reason,
             "capabilities": [],
@@ -282,6 +362,13 @@ async def test_single_model(
             "display_name": display_name,
             "icon": icon,
             "model": model_id,
+            "requested_model": requested_model,
+            "provider_error_type": None,
+            "provider_error_message": None,
+            "failure_origin": "timeout",
+            "operation": None,
+            "api_version": None,
+            "endpoint": None,
             "status": "TIMEOUT",
             "error": f"Request timed out after {timeout}s",
             "latency_s": latency_s,
@@ -300,6 +387,13 @@ async def test_single_model(
             "display_name": display_name,
             "icon": icon,
             "model": model_id,
+            "requested_model": requested_model,
+            "provider_error_type": None,
+            "provider_error_message": None,
+            "failure_origin": "unknown",
+            "operation": None,
+            "api_version": None,
+            "endpoint": None,
             "status": "UNKNOWN_ERROR",
             "error": clean_err,
             "latency_s": latency_s,
@@ -323,6 +417,7 @@ test_single_model.__test__ = False  # Tell pytest not to collect this as a test 
 
 async def _build_targets(
     providers_status: list[Any],
+    active_config: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, str]], list[dict[str, Any]], dict[str, list[Any]]]:
     """Select every chat-capable model of every chat provider.
 
@@ -350,7 +445,11 @@ async def _build_targets(
     Nothing truncates the target list — no global budget, no per-provider
     cap, no slice, no priority queue. Only ``_TEST_CONCURRENCY`` bounds how
     many run at once and the per-model timeout bounds each one.
+
+    ``active_config`` is accepted for call-site compatibility and IGNORED: it
+    is never read, so the selection cannot add, remove or reorder a target.
     """
+    _ = active_config
     targets: list[dict[str, str]] = []
     discovered_models: list[dict[str, Any]] = []
     complete_models: dict[str, list[Any]] = {}
@@ -362,52 +461,74 @@ async def _build_targets(
         base = {"provider": p.name, "display_name": p.display_name, "icon": p.icon}
 
         models: list[Any] = []
+        discovery_source = ""
         if p.has_key:
             info = get_provider_info(p.name) or {}
             api_key = _get_env(info.get("env_vars", []))
             base_url = p.base_url or info.get("default_base_url", "")
             if api_key:
                 try:
+                    # Provenance of THIS fetch only: an earlier provider's
+                    # source must never be inherited.
+                    reset_fetch_source(p.name)
                     models = await fetch_models(
                         p.name, api_key, base_url, force_refresh=True
                     )
+                    discovery_source = get_last_fetch_source(p.name)
                 except Exception as exc:
                     logger.warning("Model discovery failed for %s: %s", p.name, exc)
                     models = []
+                    discovery_source = "fallback"
 
         if not models:
             # No key, or a discovery result with nothing usable: the ONE
             # centralized catalog. A provider default that is not a catalog
             # member is never added as a phantom model.
             models = fallback_models(p.name)
+            discovery_source = discovery_source or "fallback"
+
+        logger.debug(
+            "Test Modules catalog for %s: %s (%d models)",
+            p.name, discovery_source or "unknown", len(models),
+        )
 
         # COMPLETE feed: every chat-capable model of this catalog, uncapped
         # and deduped — never sliced by the display limit below.
         full: list[Any] = []
         seen_full: set[str] = set()
         for m in models:
-            if m.id in seen_full or not is_chat_capable(m.id):
+            model_id = (m.id or "").strip()
+            if not model_id or model_id in seen_full or not is_chat_capable(model_id):
                 continue
-            seen_full.add(m.id)
+            seen_full.add(model_id)
             full.append(m)
         complete_models[p.name] = full
 
         # FREE-FIRST ordering, using the SAME deterministic selector order
         # the model picker already applies, so a genuinely-free catalog is
         # both visible and tested first as a matter of ordering only — never
-        # of truncation.
+        # of truncation. The provider's default is then moved to the front IF
+        # it is a real member of this catalog (order only, never an addition).
         ordered = order_models_for_selector(full)
+        default_model = (p.default_model or "").strip()
+        if default_model and any((m.id or "").strip() == default_model for m in ordered):
+            ordered = sorted(
+                ordered, key=lambda m: 0 if (m.id or "").strip() == default_model else 1
+            )
 
         for m in ordered[: _MODELS_IN_RESPONSE]:
             # Response payload list must contain only chat-capable models.
             discovered_models.append(m.__dict__)
 
         for m in ordered:
-            pair = (p.name, m.id)
+            model_id = (m.id or "").strip()
+            if not model_id:
+                continue
+            pair = (p.name, model_id)
             if pair in seen_pairs:
                 continue
             seen_pairs.add(pair)
-            targets.append({**base, "model": m.id})
+            targets.append({**base, "model": model_id})
 
     return targets, discovered_models, complete_models
 
@@ -477,7 +598,9 @@ def proven_usable_candidates(
         if model not in bucket:
             bucket.append(model)
 
-    configured = {p.name: (p.default_model or "") for p in providers_status}
+    configured = {
+        p.name: (p.default_model or "").strip() for p in providers_status
+    }
     feed: dict[str, list[str]] = {}
     for provider, ids in usable.items():
         infos = complete_models.get(provider, [])

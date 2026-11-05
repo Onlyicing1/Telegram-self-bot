@@ -119,7 +119,11 @@ _PROVIDERS: list[dict[str, Any]] = [
         "model_env": ["AI_GEMINI_MODEL", "GEMINI_MODEL"],
         "base_url_env": [],
         "default_base_url": "https://generativelanguage.googleapis.com/v1beta",
-        "default_model": "gemini-2.0-flash",
+        # ONE source of truth for the default: the same id the runtime
+        # provider is configured with (providers/base/defaults.py). Keeping a
+        # retired id here made discovery advertise a model the API no longer
+        # serves and injected it into every model test as a phantom target.
+        "default_model": "gemini-2.5-flash",
         "icon": sym.ICON_P_GEMINI,
     },
     {
@@ -223,6 +227,21 @@ _PROVIDERS: list[dict[str, Any]] = [
         "icon": sym.ICON_P_NARAROUTER,
     },
     {
+        "name": "cloudflare",
+        "display_name": "Cloudflare Workers AI",
+        "env_vars": ["AI_CLOUDFLARE_API_TOKEN", "CLOUDFLARE_API_TOKEN"],
+        "model_env": ["AI_CLOUDFLARE_MODEL", "CLOUDFLARE_MODEL"],
+        "base_url_env": ["AI_CLOUDFLARE_BASE_URL", "CLOUDFLARE_BASE_URL"],
+        # Workers AI is account-scoped: the endpoint embeds the account id, so
+        # both the token and the account id are required configuration.
+        "account_id_env": ["AI_CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_ACCOUNT_ID"],
+        "default_base_url": (
+            "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1"
+        ),
+        "default_model": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+        "icon": sym.ICON_P_CLOUDFLARE,
+    },
+    {
         "name": "you",
         "display_name": "You.com Search",
         "env_vars": ["YDC_API_KEY"],
@@ -314,7 +333,15 @@ def _scan_provider(p: dict[str, Any]) -> ProviderStatus:
     capability_kind = p.get("capability_kind", "chat")
     capabilities = list(p.get("capabilities", []))
 
-    if not api_key:
+    # Account-scoped providers have no addressable endpoint without their
+    # account id, so an incomplete configuration is reported as not_configured
+    # instead of advertising a URL that cannot resolve.
+    account_id_env = p.get("account_id_env") or []
+    account_id = _get_env(account_id_env) if account_id_env else ""
+    if account_id_env:
+        base_url = base_url.format(account_id=account_id) if account_id else ""
+
+    if not api_key or (account_id_env and not base_url):
         return ProviderStatus(
             name=p["name"],
             display_name=p["display_name"],
@@ -359,16 +386,21 @@ async def _validate_provider(status: ProviderStatus) -> ProviderStatus:
     if status.capability_kind != "chat":
         return _make_available(status)
 
+    params: dict[str, Any] | None = None
     if status.name == "gemini":
-        url = f"{status.base_url}/models?key={api_key}&pageSize=1"
-        headers: dict[str, str] = {}
+        # Gemini documents the key in ``x-goog-api-key``, so the probe URL never
+        # carries the credential (and the sanitized trace records a key-free
+        # URL by construction, not only because the query was stripped).
+        url = f"{status.base_url}/models"
+        headers: dict[str, str] = {"x-goog-api-key": api_key}
+        params = {"pageSize": 1}
     else:
         url = f"{status.base_url}/models"
         headers = {"Authorization": f"Bearer {api_key}"}
 
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(url, headers=headers)
+            resp = await client.get(url, headers=headers, params=params)
         return _classify_probe(status, resp.status_code, url)
     except Exception as exc:
         # A transport failure (timeout, connection error, ...) says nothing
@@ -528,6 +560,7 @@ def get_wizard_info() -> list[dict[str, str]]:
             "name": p["name"],
             "display_name": p["display_name"],
             "env_var": p["env_vars"][0],
+            "extra_env": list(p.get("account_id_env", [])[:1]),
             "icon": p["icon"],
             "capability_kind": p.get("capability_kind", "chat"),
             "capabilities": list(p.get("capabilities", [])),

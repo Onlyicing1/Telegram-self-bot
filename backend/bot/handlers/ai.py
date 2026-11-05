@@ -153,6 +153,7 @@ _PROVIDER_DISPLAY_FALLBACK = {
     "siliconflow": "SiliconFlow",
     "fireworks": "Fireworks",
     "nararouter": "NaraRouter",
+    "cloudflare": "Cloudflare",
     "dummy": "Built-in",
     "local": "Built-in",
 }
@@ -520,7 +521,8 @@ async def _ai_wizard_panel_handler(event, extra: str) -> tuple[str, str, list] |
     ]
     for p in wizard_info:
         lines.append(f"  {sym.ICON_PROVIDER} **{p['display_name']}**")
-        lines.append(f"     Set: `{p['env_var']}`")
+        for env_name in [p["env_var"], *p.get("extra_env", [])]:
+            lines.append(f"     Set: `{env_name}`")
         lines.append("")
     if invalid:
         lines.append("! **Invalid keys detected:**")
@@ -1264,8 +1266,8 @@ async def _ai_start_chat_action(event, extra: str, chat_id: int) -> tuple[str, s
 _TEST_STATUS_ICONS: dict[str, str] = {
     "AVAILABLE": sym.OP_SAVE,
     "NOT_CONFIGURED": "·",
-    # Unreached targets are marked pending (plain Unicode, like the rest of
-    # the status vocabulary) so they read as "not asked", not as a failure.
+    # A target the run never reached: pending mark, never a failure mark, so
+    # an unattempted model is not shown as a broken one.
     "NOT_ATTEMPTED": "…",
     "AUTH_ERROR": sym.STATE_FAILED,
     "RATE_LIMITED": sym.STATE_FAILED,
@@ -1472,10 +1474,6 @@ def _render_test_results(
     return "\n".join(lines).rstrip(), builder.build()
 
 
-#: Character budget for one All Results page. Telegram rejects a message over
-#: 4096 characters, and a complete run now spans every provider's catalog.
-_ALL_RESULTS_PAGE_CHARS = 3000
-
 _test_running = False
 
 
@@ -1537,12 +1535,129 @@ if get_action("ai_test_page") is None:
     register_action("ai_test_page", _test_modules_page_dispatch)
 
 
+def _diag_text(value, limit: int = 160) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
+
+
+def _failure_diagnostic_lines(r: dict) -> list[str]:
+    """'Why it failed' lines for one model in the All Results view.
+
+    Renders only facts the result actually carries — HTTP status, the
+    provider's own code/status, the failure origin, the exact operation and
+    endpoint, retry-after, and one bounded sanitized message. Missing
+    metadata renders nothing (no empty placeholders), and a code/type equal
+    to the HTTP status is not repeated.
+    """
+    lines: list[str] = []
+    http_status = r.get("http_status")
+    provider_code = r.get("provider_code")
+    provider_type = r.get("provider_error_type")
+    origin = r.get("failure_origin")
+
+    facts: list[str] = []
+    if http_status:
+        facts.append(f"HTTP {http_status}")
+    if provider_code and str(provider_code) != str(http_status):
+        facts.append(f"code {provider_code}")
+    if provider_type and str(provider_type) != str(http_status):
+        facts.append(str(provider_type))
+    if origin:
+        facts.append(str(origin))
+    if facts:
+        lines.append("      " + " · ".join(facts))
+
+    target = r.get("endpoint") or r.get("operation")
+    if target:
+        version = r.get("api_version")
+        suffix = f" ({version})" if version else ""
+        lines.append(f"      _{_diag_text(target, 120)}{suffix}_")
+
+    if r.get("retry_after"):
+        lines.append(f"      _retry-after: {r['retry_after']}s_")
+
+    reasons = r.get("provider_error_reasons") or []
+    if reasons:
+        joined = ", ".join(str(reason) for reason in reasons)
+        lines.append(f"      _reason: {_diag_text(joined, 120)}_")
+
+    message = r.get("provider_error_message") or r.get("error")
+    if message:
+        lines.append(f"      _{_diag_text(message)}_")
+    return lines
+
+
+# Telegram rejects any single message text longer than 4096 characters. The
+# All Results view is built from the LAST run's COMPLETE result list — every
+# model of every provider, each failing model with up to six diagnostic lines —
+# and a run has no per-provider cap, so one body is routinely far longer than a
+# message. Rendering it as one body made the edit fail with "Message is too
+# long"; the click had already been acknowledged, so the tap ended with no
+# change on screen, which is exactly the dead "All Results" button. The view
+# therefore pages itself under this budget: complete diagnostics, every field
+# preserved, and never a message the API rejects.
+_TEST_DETAILS_BODY_BUDGET = 3500
+
+
+def _test_detail_blocks(results: list[dict]) -> list[str]:
+    """One diagnostic block per model, provider-grouped, deterministic.
+
+    A block carries its provider header whenever the provider changes, so a
+    page can never split an entry or lose a model's provider attribution.
+    """
+    blocks: list[str] = []
+    current_provider = None
+    for r in sorted(results, key=lambda x: (x.get("provider", ""), x.get("model", ""))):
+        provider = r.get("provider", "?")
+        lines: list[str] = []
+        if provider != current_provider:
+            current_provider = provider
+            lines.append(f"**{r.get('display_name', provider)}**")
+        status = r.get("status", "UNKNOWN_ERROR")
+        icon = _TEST_STATUS_ICONS.get(status, "×")
+        model = str(r.get("model", "?"))[:80]
+        line = f"  {icon} `{model}` — {status}"
+        latency = r.get("latency_s")
+        if latency is not None:
+            line += f" · {latency}s"
+        lines.append(line)
+        if status != "AVAILABLE":
+            lines.extend(_failure_diagnostic_lines(r))
+        blocks.append("\n".join(lines))
+    return blocks
+
+
+def _detail_pages(
+    blocks: list[str], budget: int = _TEST_DETAILS_BODY_BUDGET,
+) -> list[list[str]]:
+    """Greedily pack diagnostic blocks into pages that fit one message."""
+    pages: list[list[str]] = []
+    page: list[str] = []
+    size = 0
+    for block in blocks:
+        cost = len(block) + 2
+        if page and size + cost > budget:
+            pages.append(page)
+            page, size = [], 0
+        page.append(block)
+        size += cost
+    if page:
+        pages.append(page)
+    return pages or [[]]
+
+
 async def _ai_test_details_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     """Show the full per-model diagnostics from the last Test Models run.
 
-    Keeps the main model-selection message compact while preserving full
-    failure details (HTTP status, retry-after, sanitized errors) one tap
-    away. Uses the cached payload — never re-runs the tests.
+    Keeps the main model-selection message compact while preserving the full
+    failure evidence one tap away: HTTP status, the provider's own code and
+    status, the attributed failure origin, the exact operation/endpoint, a
+    bounded sanitized provider message and retry-after. Uses the cached
+    payload — never re-runs the tests. ``extra`` is the page index: the body
+    pages itself so a complete run's diagnostics always fit one Telegram
+    message and the tap always produces a visible edit.
     """
     results = (_last_test_payload or {}).get("results", [])
     if not results:
@@ -1551,72 +1666,28 @@ async def _ai_test_details_action(event, extra: str, chat_id: int) -> tuple[str,
         _nav_buttons(builder)
         return "Test Modules", "**All Results**\n\n_◌ No results yet. Tap **Run Tests** first._", builder.build()
 
-    # One block per result; a provider heading is carried into whichever page
-    # its first model lands on, so a page never shows a bare model list.
-    blocks: list[tuple[str, list[str]]] = []
-    current_provider = None
-    heading = ""
-    for r in sorted(results, key=lambda x: (x.get("provider", ""), x.get("model", ""))):
-        provider = r.get("provider", "?")
-        block: list[str] = []
-        if provider != current_provider:
-            current_provider = provider
-            heading = f"**{r.get('display_name', provider)}**"
-            block.append(heading)
-        status = r.get("status", "UNKNOWN_ERROR")
-        icon = _TEST_STATUS_ICONS.get(status, "×")
-        model = r.get("model", "?")
-        line = f"  {icon} `{model}` — {status}"
-        latency = r.get("latency_s")
-        if latency is not None:
-            line += f" · {latency}s"
-        block.append(line)
-        if r.get("http_status"):
-            block.append(f"      _HTTP {r['http_status']}_")
-        if r.get("retry_after"):
-            block.append(f"      _retry-after: {r['retry_after']}s_")
-        if r.get("error"):
-            block.append(f"      _{r['error'][:160]}_")
-        block.append("")
-        blocks.append((heading, block))
-
-    # Pagination over the COMPLETE result set: a full-coverage run can be far
-    # larger than one Telegram message, so every result stays reachable
-    # instead of the message being rejected as too long.
-    pages: list[list[str]] = []
-    page: list[str] = []
-    size = 0
-    for heading, block in blocks:
-        block_size = sum(len(item) + 1 for item in block)
-        if page and size + block_size > _ALL_RESULTS_PAGE_CHARS:
-            pages.append(page)
-            page, size = [], 0
-            if heading and heading not in block:
-                page.append(heading)
-                size += len(heading) + 1
-        page.extend(block)
-        size += block_size
-    if page or not pages:
-        pages.append(page)
-
+    pages = _detail_pages(_test_detail_blocks(results))
     try:
-        page_no = max(0, min(int((extra or "0").strip() or 0), len(pages) - 1))
-    except (TypeError, ValueError):
-        page_no = 0
+        page = max(0, int((extra or "0").strip()))
+    except ValueError:
+        page = 0
+    page = min(page, len(pages) - 1)
 
-    lines = [f"**All Results** · {len(results)} models · page {page_no + 1}/{len(pages)}\n"]
-    lines.extend(pages[page_no])
+    lines = ["**All Results**\n"]
+    lines.extend(pages[page])
+    if len(pages) > 1:
+        lines.append(f"_Page {page + 1}/{len(pages)} · full diagnostics, nothing omitted_")
 
     builder = InlinePanelBuilder()
+    builder.add_row(sym.label(sym.OP_REFRESH, "Re-run Tests"), "action:ai_test_models")
     if len(pages) > 1:
         nav: list[tuple[str, str]] = []
-        if page_no > 0:
-            nav.append((sym.label(sym.OP_PREV, "Prev"), f"action:ai_test_details:{page_no - 1}"))
-        nav.append((f"{page_no + 1}/{len(pages)}", "panel:_nav:noop"))
-        if page_no < len(pages) - 1:
-            nav.append((sym.label(sym.OP_NEXT, "Next"), f"action:ai_test_details:{page_no + 1}"))
+        if page > 0:
+            nav.append((sym.label(sym.OP_PREV, "Prev"), f"action:ai_test_details:{page - 1}"))
+        nav.append((f"{page + 1}/{len(pages)}", "panel:_nav:noop"))
+        if page < len(pages) - 1:
+            nav.append((sym.label(sym.OP_NEXT, "Next"), f"action:ai_test_details:{page + 1}"))
         builder.add_buttons(*nav)
-    builder.add_row(sym.label(sym.OP_REFRESH, "Re-run Tests"), "action:ai_test_models")
     builder.add_row(sym.label(sym.CONTENT_STATIC, "Pick Model"), "panel:ai_model")
     _nav_buttons(builder)
     return "Test Modules", "\n".join(lines).rstrip(), builder.build()

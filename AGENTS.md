@@ -498,7 +498,11 @@ error.
 - **Providers**: `dummy`, `gemini`, `openai`, `openrouter`, `groq`,
   `cerebras`, `mistral`, `zai`, `sambanova`, `nvidia`, `cohere`,
   `siliconflow`, `fireworks`, `nararouter` (OpenAI-compatible gateway,
-  base URL `https://router.bynara.id/v1`), and `you` (web-search
+  base URL `https://router.bynara.id/v1`), `cloudflare` (Cloudflare
+  Workers AI, OpenAI-compatible and ACCOUNT-SCOPED: the endpoint is
+  `https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1`, so
+  both `AI_CLOUDFLARE_API_TOKEN` and `AI_CLOUDFLARE_ACCOUNT_ID` are
+  required before the factory registers it), and `you` (web-search
   capability, never a chat engine). Provider selection and fallback live
   in `backend/ai/providers/`.
 - **Web search capability**: the `you` provider (You.com Search API,
@@ -655,6 +659,9 @@ treated as a disconnect or trigger recovery.
 | `USERNAME_UPDATE_ENABLED` | `false` | Auto-start Username engine on boot |
 | `LOG_LEVEL` | `INFO` | Logging level |
 | `AI_PROVIDER` / AI keys | varies | AI provider selection + credentials (see `backend/ai/config/`) |
+| `AI_CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_API_TOKEN` | `""` | Cloudflare API token (Workers AI Read). Empty → provider unregistered |
+| `AI_CLOUDFLARE_ACCOUNT_ID` / `CLOUDFLARE_ACCOUNT_ID` | `""` | Cloudflare account id for the account-scoped Workers AI endpoint. Empty → provider unregistered (or set `AI_CLOUDFLARE_BASE_URL` explicitly) |
+| `AI_CLOUDFLARE_MODEL` | `@cf/meta/llama-3.3-70b-instruct-fp8-fast` | Workers AI model override (full `@cf/...` id) |
 | `YDC_API_KEY` | `""` | You.com Web Search API key; empty → search capability unregistered |
 | `SAVE_TRACE` | `""` | `1/true/yes/on` enables bounded `[SAVE_TRACE]` instrumentation of one Save attempt; empty → tracing fully off |
 

@@ -22,6 +22,7 @@ from backend.ai.providers.base.contract import BaseProvider
 from backend.ai.providers.base.defaults import get_provider_default
 from backend.ai.providers.base.exceptions import ProviderNotFound
 from backend.ai.providers.cerebras import CerebrasProvider
+from backend.ai.providers.cloudflare import CloudflareProvider, resolve_base_url
 from backend.ai.providers.cohere import CohereProvider
 from backend.ai.providers.dummy.provider import DummyProvider
 from backend.ai.providers.fireworks import FireworksProvider
@@ -56,6 +57,7 @@ _PROVIDER_CLASSES: dict[str, Type[BaseProvider]] = {
     "siliconflow": SiliconFlowProvider,
     "fireworks": FireworksProvider,
     "nararouter": NaraRouterProvider,
+    "cloudflare": CloudflareProvider,
     "you": YouSearchProvider,
 }
 
@@ -73,8 +75,18 @@ _ENV_KEY_MAP: dict[str, list[str]] = {
     "siliconflow": ["AI_SILICONFLOW_API_KEY", "SILICONFLOW_API_KEY"],
     "fireworks": ["AI_FIREWORKS_API_KEY", "FIREWORKS_API_KEY"],
     "nararouter": ["AI_NARAROUTER_API_KEY", "NARAROUTER_API_KEY"],
+    # Cloudflare calls the credential an API token (a legacy "global API key"
+    # is not a Bearer token and is deliberately not accepted).
+    "cloudflare": ["AI_CLOUDFLARE_API_TOKEN", "CLOUDFLARE_API_TOKEN"],
     # Web-search capability (You.com Search API) — never an LLM key.
     "you": ["YDC_API_KEY"],
+}
+
+#: Providers whose endpoint embeds an account id that is not part of the key.
+#: Without it there is no addressable URL, so the provider stays unregistered
+#: instead of being registered against a URL that cannot work.
+_ENV_ACCOUNT_ID_MAP: dict[str, list[str]] = {
+    "cloudflare": ["AI_CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_ACCOUNT_ID"],
 }
 
 _ENV_MODEL_MAP: dict[str, str] = {
@@ -91,6 +103,7 @@ _ENV_MODEL_MAP: dict[str, str] = {
     "siliconflow": "AI_SILICONFLOW_MODEL",
     "fireworks": "AI_FIREWORKS_MODEL",
     "nararouter": "AI_NARAROUTER_MODEL",
+    "cloudflare": "AI_CLOUDFLARE_MODEL",
 }
 
 _ENV_BASE_URL_MAP: dict[str, str] = {
@@ -103,7 +116,16 @@ _ENV_BASE_URL_MAP: dict[str, str] = {
     "siliconflow": "AI_SILICONFLOW_BASE_URL",
     "fireworks": "AI_FIREWORKS_BASE_URL",
     "nararouter": "AI_NARAROUTER_BASE_URL",
+    "cloudflare": "AI_CLOUDFLARE_BASE_URL",
 }
+
+
+def _first_env(keys: list[str]) -> str:
+    for key in keys:
+        value = os.getenv(key, "").strip()
+        if value:
+            return value
+    return ""
 
 
 class ProviderFactory:
@@ -164,6 +186,19 @@ class ProviderFactory:
                 base_url = os.getenv(base_url_env, "").strip()
                 if base_url:
                     provider_config.base_url = base_url
+
+            if provider_name in _ENV_ACCOUNT_ID_MAP and not provider_config.base_url:
+                account_id = _first_env(_ENV_ACCOUNT_ID_MAP[provider_name])
+                if not account_id:
+                    logger.warning(
+                        "ProviderFactory: '%s' not registered — set %s (or %s) so its "
+                        "account-scoped endpoint can be resolved",
+                        provider_name,
+                        _ENV_ACCOUNT_ID_MAP[provider_name][0],
+                        _ENV_BASE_URL_MAP[provider_name],
+                    )
+                    continue
+                provider_config.base_url = resolve_base_url(account_id)
 
             try:
                 provider = ProviderFactory.create_provider(provider_name, provider_config)

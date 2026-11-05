@@ -281,14 +281,14 @@ async def test_gemini_discovery_follows_every_page():
             "models": [
                 {"name": "models/gemini-2.5-flash", "supportedGenerationMethods": ["generateContent"]},
             ],
-            "nextPageToken": "tok-2",
+            "nextPageToken": "tok+2/=",
         },
         {
             "models": [
                 {"name": "models/gemini-2.5-pro", "supportedGenerationMethods": ["generateContent"]},
                 {"name": "models/text-embedding-004", "supportedGenerationMethods": ["embedContent"]},
             ],
-            "nextPageToken": "tok-3",
+            "nextPageToken": "tok+3==",
         },
         {
             "models": [
@@ -309,9 +309,16 @@ async def test_gemini_discovery_follows_every_page():
 
     assert [m.id for m in models] == ["gemini-2.5-flash", "gemini-2.5-pro"]
     assert mock_client.get.call_count == 3
-    urls = [call.args[0] for call in mock_client.get.call_args_list]
-    assert "pageToken=tok-2" in urls[1]
-    assert "pageToken=tok-3" in urls[2]
+    calls = mock_client.get.call_args_list
+    # The opaque token is passed as a PARAMETER (raw), so a "+" is never
+    # decoded as a space and the follow-up page is not lost to a 400.
+    assert [c.kwargs["params"].get("pageToken") for c in calls] == [
+        None, "tok+2/=", "tok+3==",
+    ]
+    assert all(c.kwargs["params"]["pageSize"] == 100 for c in calls)
+    # Authentication is the documented header; the key is never in a URL.
+    assert all(c.args[0] == "https://generativelanguage.googleapis.com/v1beta/models" for c in calls)
+    assert all(c.kwargs["headers"] == {"x-goog-api-key": "fake_key"} for c in calls)
 
 
 @pytest.mark.asyncio

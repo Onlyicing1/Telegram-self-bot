@@ -21,7 +21,14 @@ Behavior:
     (OpenRouter, OpenAI, Groq, Mistral, Cerebras, ...) need no paging —
     for those the single response IS the complete list, so a "missing
     free model" there is an ordering/filtering problem, never a page.
+    Gemini's page token is opaque and may contain URL-reserved
+    characters, so query parameters are always handed to httpx
+    (never concatenated) and the key travels in the documented
+    ``x-goog-api-key`` header — a key never appears in a URL.
   - Per-provider fetch locks: a slow provider never blocks another.
+  - The cache is tied to the credential + base URL it was fetched with,
+    so configuring a new key (or endpoint) refreshes the catalog instead
+    of serving the previous key's result until the TTL expires.
 
 Usage:
     from backend.ai.model_discovery import fetch_models, get_cached_models
@@ -31,6 +38,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 import time
@@ -163,6 +171,15 @@ _FALLBACK_CATALOG: dict[str, list[str]] = {
         "kimi-k2.5",
         "gemini-3.1-pro",
     ],
+    # Workers AI answers no OpenAI-style /models request, so its catalog is
+    # always this list. Ids are the full ``@cf/...`` model names (documented
+    # function-calling capable); a paid-plan-only model is never listed.
+    "cloudflare": [
+        "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+        "@cf/meta/llama-4-scout-17b-16e-instruct",
+        "@cf/openai/gpt-oss-120b",
+        "@cf/qwen/qwen3-30b-a3b-fp8",
+    ],
 }
 
 
@@ -260,6 +277,26 @@ def get_last_fetch_source(provider_name: str) -> str:
     return _last_source.get(provider_name, "")
 
 
+def reset_fetch_source(provider_name: str) -> None:
+    """Forget a provider's recorded provenance before a fresh fetch.
+
+    A caller that needs THIS fetch's provenance must not inherit an earlier
+    one — including from an injected fetch that records nothing, where the
+    answer is "unknown" rather than a stale claim.
+    """
+    _last_source.pop(provider_name, None)
+
+
+def _config_fingerprint(api_key: str, base_url: str) -> str:
+    """Cache key material for ONE credential + endpoint pair.
+
+    A digest, never the key: the cache holds no secret, and a changed key or
+    base URL can never be served a previous configuration's catalog.
+    """
+    material = f"{api_key}\u0000{base_url}".encode("utf-8")
+    return hashlib.sha256(material).hexdigest()
+
+
 async def fetch_models(
     provider_name: str,
     api_key: str,
@@ -273,13 +310,24 @@ async def fetch_models(
     the API is unreachable or returns no chat-capable models.
     """
     now = time.time()
+    fingerprint = _config_fingerprint(api_key, base_url)
     cached = _model_cache.get(provider_name)
-    if not force_refresh and cached and (now - cached["timestamp"]) < _CACHE_TTL:
+    if (
+        not force_refresh
+        and cached
+        and cached.get("fingerprint") == fingerprint
+        and (now - cached["timestamp"]) < _CACHE_TTL
+    ):
         return cached["models"]
 
     async with _get_lock(provider_name):
         cached = _model_cache.get(provider_name)
-        if not force_refresh and cached and (now - cached["timestamp"]) < _CACHE_TTL:
+        if (
+            not force_refresh
+            and cached
+            and cached.get("fingerprint") == fingerprint
+            and (time.time() - cached["timestamp"]) < _CACHE_TTL
+        ):
             return cached["models"]
 
         if provider_name == "gemini":
@@ -293,11 +341,19 @@ async def fetch_models(
                 logger.info("Model discovery: %s API empty/unreachable — using fallback catalog (%d models)",
                             provider_name, len(fallback))
                 _last_source[provider_name] = "fallback"
-            _model_cache[provider_name] = {"models": fallback, "timestamp": time.time()}
+            _model_cache[provider_name] = {
+                "models": fallback,
+                "timestamp": time.time(),
+                "fingerprint": fingerprint,
+            }
             return fallback
 
         _last_source[provider_name] = "api"
-        _model_cache[provider_name] = {"models": models, "timestamp": time.time()}
+        _model_cache[provider_name] = {
+            "models": models,
+            "timestamp": time.time(),
+            "fingerprint": fingerprint,
+        }
         return models
 
 
@@ -374,18 +430,26 @@ async def _fetch_gemini_models(api_key: str, base_url: str) -> list[ModelInfo]:
     remaining models. Reading only the first page silently hides every
     model beyond it, so the full chain is followed (bounded by
     ``_MAX_DISCOVERY_PAGES``).
+
+    The token is opaque (base64url, may contain ``+``/``/``/``=``), so it is
+    passed as an httpx query PARAMETER — raw concatenation let a ``+`` decode
+    as a space, the follow-up request 400ed, and every model on the later
+    pages silently disappeared. Authentication uses Gemini's documented
+    ``x-goog-api-key`` header, so no key-bearing URL is ever built.
     """
     models: list[ModelInfo] = []
     seen: set[str] = set()
     page_token = ""
+    url = f"{base_url}/models"
+    headers = {"x-goog-api-key": api_key}
 
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             for _ in range(_MAX_DISCOVERY_PAGES):
-                url = f"{base_url}/models?key={api_key}&pageSize=100"
+                params: dict[str, Any] = {"pageSize": 100}
                 if page_token:
-                    url += f"&pageToken={page_token}"
-                resp = await client.get(url)
+                    params["pageToken"] = page_token
+                resp = await client.get(url, params=params, headers=headers)
                 if resp.status_code != 200:
                     logger.warning("Model discovery: gemini returned %d", resp.status_code)
                     break
@@ -420,6 +484,11 @@ async def _fetch_gemini_models(api_key: str, base_url: str) -> list[ModelInfo]:
                 page_token = str(data.get("nextPageToken") or "")
                 if not page_token:
                     break
+            else:
+                logger.warning(
+                    "Model discovery: gemini pagination stopped at the %d-page bound",
+                    _MAX_DISCOVERY_PAGES,
+                )
 
         models.sort(key=lambda m: m.name.lower())
         return models
