@@ -1586,6 +1586,65 @@ def _failure_diagnostic_lines(r: dict) -> list[str]:
     return lines
 
 
+# Telegram rejects any single message text longer than 4096 characters. The
+# All Results view is built from the LAST run's COMPLETE result list — every
+# model of every provider, each failing model with up to six diagnostic lines —
+# and a run has no per-provider cap, so one body is routinely far longer than a
+# message. Rendering it as one body made the edit fail with "Message is too
+# long"; the click had already been acknowledged, so the tap ended with no
+# change on screen, which is exactly the dead "All Results" button. The view
+# therefore pages itself under this budget: complete diagnostics, every field
+# preserved, and never a message the API rejects.
+_TEST_DETAILS_BODY_BUDGET = 3500
+
+
+def _test_detail_blocks(results: list[dict]) -> list[str]:
+    """One diagnostic block per model, provider-grouped, deterministic.
+
+    A block carries its provider header whenever the provider changes, so a
+    page can never split an entry or lose a model's provider attribution.
+    """
+    blocks: list[str] = []
+    current_provider = None
+    for r in sorted(results, key=lambda x: (x.get("provider", ""), x.get("model", ""))):
+        provider = r.get("provider", "?")
+        lines: list[str] = []
+        if provider != current_provider:
+            current_provider = provider
+            lines.append(f"**{r.get('display_name', provider)}**")
+        status = r.get("status", "UNKNOWN_ERROR")
+        icon = _TEST_STATUS_ICONS.get(status, "×")
+        model = str(r.get("model", "?"))[:80]
+        line = f"  {icon} `{model}` — {status}"
+        latency = r.get("latency_s")
+        if latency is not None:
+            line += f" · {latency}s"
+        lines.append(line)
+        if status != "AVAILABLE":
+            lines.extend(_failure_diagnostic_lines(r))
+        blocks.append("\n".join(lines))
+    return blocks
+
+
+def _detail_pages(
+    blocks: list[str], budget: int = _TEST_DETAILS_BODY_BUDGET,
+) -> list[list[str]]:
+    """Greedily pack diagnostic blocks into pages that fit one message."""
+    pages: list[list[str]] = []
+    page: list[str] = []
+    size = 0
+    for block in blocks:
+        cost = len(block) + 2
+        if page and size + cost > budget:
+            pages.append(page)
+            page, size = [], 0
+        page.append(block)
+        size += cost
+    if page:
+        pages.append(page)
+    return pages or [[]]
+
+
 async def _ai_test_details_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     """Show the full per-model diagnostics from the last Test Models run.
 
@@ -1593,7 +1652,9 @@ async def _ai_test_details_action(event, extra: str, chat_id: int) -> tuple[str,
     failure evidence one tap away: HTTP status, the provider's own code and
     status, the attributed failure origin, the exact operation/endpoint, a
     bounded sanitized provider message and retry-after. Uses the cached
-    payload — never re-runs the tests.
+    payload — never re-runs the tests. ``extra`` is the page index: the body
+    pages itself so a complete run's diagnostics always fit one Telegram
+    message and the tap always produces a visible edit.
     """
     results = (_last_test_payload or {}).get("results", [])
     if not results:
@@ -1602,27 +1663,28 @@ async def _ai_test_details_action(event, extra: str, chat_id: int) -> tuple[str,
         _nav_buttons(builder)
         return "Test Modules", "**All Results**\n\n_◌ No results yet. Tap **Run Tests** first._", builder.build()
 
+    pages = _detail_pages(_test_detail_blocks(results))
+    try:
+        page = max(0, int((extra or "0").strip()))
+    except ValueError:
+        page = 0
+    page = min(page, len(pages) - 1)
+
     lines = ["**All Results**\n"]
-    current_provider = None
-    for r in sorted(results, key=lambda x: (x.get("provider", ""), x.get("model", ""))):
-        provider = r.get("provider", "?")
-        if provider != current_provider:
-            current_provider = provider
-            lines.append(f"**{r.get('display_name', provider)}**")
-        status = r.get("status", "UNKNOWN_ERROR")
-        icon = _TEST_STATUS_ICONS.get(status, "×")
-        model = r.get("model", "?")
-        line = f"  {icon} `{model}` — {status}"
-        latency = r.get("latency_s")
-        if latency is not None:
-            line += f" · {latency}s"
-        lines.append(line)
-        if status != "AVAILABLE":
-            lines.extend(_failure_diagnostic_lines(r))
-        lines.append("")
+    lines.extend(pages[page])
+    if len(pages) > 1:
+        lines.append(f"_Page {page + 1}/{len(pages)} · full diagnostics, nothing omitted_")
 
     builder = InlinePanelBuilder()
     builder.add_row(sym.label(sym.OP_REFRESH, "Re-run Tests"), "action:ai_test_models")
+    if len(pages) > 1:
+        nav: list[tuple[str, str]] = []
+        if page > 0:
+            nav.append((sym.label(sym.OP_PREV, "Prev"), f"action:ai_test_details:{page - 1}"))
+        nav.append((f"{page + 1}/{len(pages)}", "panel:_nav:noop"))
+        if page < len(pages) - 1:
+            nav.append((sym.label(sym.OP_NEXT, "Next"), f"action:ai_test_details:{page + 1}"))
+        builder.add_buttons(*nav)
     builder.add_row(sym.label(sym.CONTENT_STATIC, "Pick Model"), "panel:ai_model")
     _nav_buttons(builder)
     return "Test Modules", "\n".join(lines).rstrip(), builder.build()

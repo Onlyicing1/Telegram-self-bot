@@ -1,95 +1,65 @@
-# INVESTIGATION — Test Modules diagnostic visibility for model failures
+# INVESTIGATION — the dead "All Results" button in Test Modules
+
+## Metadata
 
 | Item | Value |
 |---|---|
-| Repository | `Onlyicing1/Telegram-self-bot` |
-| Branch / HEAD at start | `main` at `8873b4bbafb96c206d937ff420671e9948b7ed27` |
-| Date | 2026-11-04 |
-| Scope | the failure path of one model test: `GeminiProvider.chat()` → `test_single_model()` → `_classify_failure()` → Test Modules payload → All Results renderer |
-| Out of scope | model-ID migration, provider architecture, `ProviderManager`, Supabase/SQL, Render/env, unrelated providers |
-| Live account / API key used | **no** — no Telegram session, no Gemini key, no network call |
-| Status | Diagnostic gaps CONFIRMED in source and closed; Gemini's live failure cause remains UNKNOWN (not observable here) |
+| Repository | `Onlyicing1/Telegram-self-bot` (`origin`) |
+| Branch | `freebuff/3ac6db55494250a4a63f4039`, fast-forwarded onto `origin/main` before any edit |
+| `origin/main` at investigation time | `21f3df0d9e0a01ed31c10b3891eb280120726cf7` — `feat: expose provider-attributed failure diagnostics in Test Modules` (read with `git fetch origin main` + `git ls-remote origin refs/heads/main`) |
+| Working tree at start | clean; `HEAD` (`586d073`) was an ancestor of `21f3df0`, so the worktree was fast-forwarded first and every finding below was re-established on `21f3df0` |
+| Investigation date | 2026-11-05 (UTC) |
+| Question | Why does tapping **All Results** in the Test Modules panel produce no visible reaction at all? |
+| Not touched | SQL / Supabase, `DATABASE_ARCHITECTURE.md`, model selection, availability classification, provider fallback, Render, any live Telegram session |
 
-## 1. Symptom
+## 1. Verdict
 
-The owner selects models manually from Test Modules, so a row is only useful if
-it says WHY it failed. The reported row (`gemini-2.0-flash — INVALID_MODEL`)
-carried no HTTP status, no Google error code/status, no endpoint and no
-provider message in the detailed view, so an invalid model, a wrong endpoint,
-a key restriction and a bad request were indistinguishable. The earlier Gemini
-catalog work fixed which model is tested; it did not make the failure itself
-diagnosable.
+The click **is received, admitted, acknowledged, routed, resolved, authorized, dispatched and executed**. It stops at the last step: the panel **edit**.
 
-## 2. Method and its limits
+`_ai_test_details_action` renders the *entire* diagnostic for the last run into **one** message body. A run has no per-provider cap (`backend/ai/model_tester.py::_build_targets`: "There is deliberately NO per-provider cap"), and every failing model now contributes up to six diagnostic lines. Telegram rejects any message text above **4096 characters**. The edit therefore fails with *Message is too long*, `backend/helper/panels.py::_safe_edit` logs a warning and returns `False`, and because the callback was already answered (acknowledgement moved before dispatch in `5b34a3a`), the owner's client shows a completed tap and **no change on screen**. That is exactly the reported symptom: nothing happens, no transition, no visible error.
 
-* Every claim below was re-read from the working tree at `8873b4b`.
-* Deterministic unit tests exercise the chain with mocked provider responses
-  (structured Google bodies, missing bodies, hostile text). No live call was
-  made: there is no API key in this workspace and no Telegram session.
-* Consequence: the display, attribution and classification behaviour is
-  proven; the actual cause of any specific production failure is **not**
-  established by this work.
+## 2. The runtime path, stage by stage
 
-## 3. The path that was reviewed
+| # | Stage | Where | Result |
+|---|---|---|---|
+| 1 | Button data | `ai.py` `_render_test_results` | `action:ai_test_details` (21 bytes, far below Telegram's 64-byte callback-data cap; `truncate_callback_data` leaves it intact) |
+| 2 | Telegram delivery | `/* → */` | The update arrives as a `CallbackQuery` (the helper hook in `backend/helper/client.py::register_helper_hooks` records every delivered query before any gate) |
+| 3 | Admission + ack | `panels.py` `_callback_router` → `callback_gate.admit` / `callback_gate.ack` | Admitted; answered **first**, before any lookup or render — so the ack is not the bottleneck and cannot be delayed by diagnostic work |
+| 4 | Coordinates / owner / session | `resolve_callback_message`, `is_owner`, `_resolve_session` | All pass for a click on a live Test Modules panel |
+| 5 | Prefix dispatch | `data.startswith("action:")` → `_handle_action(event, "ai_test_details", …)` | Correct branch |
+| 6 | Registry resolution | `get_action("ai_test_details")` | Registered by `register()` (`register_action("ai_test_details", _ai_test_details_action)`), same id as the button data — no id mismatch |
+| 7 | Handler call | `await handler(event, extra, chat_id)` | Signature matches `ActionHandler`; returns `("Test Modules", body, buttons)` |
+| 8 | Render | `_render_and_edit` → `_finalize_panel` → `render_edit` | Succeeds; produces one text |
+| 9 | Paint | `_present` → `_safe_edit` → `event.edit(...)` | **FAILS** — the text exceeds Telegram's 4096-character message limit; the exception is caught, logged as `[CALLBACK] edit FAILED: …`, and the click finishes with `outcome="completed"` |
+| 10 | User-visible outcome | — | Nothing. The ack already happened, the edit was dropped, no error surfaced |
 
-```
-GeminiProvider.chat()            # Google response -> ProviderResponse.metadata
-  -> test_single_model()         # resolve id, classify, build result dict
-     -> _classify_failure()      # status + human error
-        -> _last_test_payload   # cached run payload
-           -> _ai_test_details_action()   # "All Results"
-              -> _render_test_results()   # compact grid (unchanged contract)
-```
+Stage 9 is the first — and only — break. Registration, routing, registry, authorization, session and acknowledgement are all correct, which is why the existing renderer tests kept passing while the live button did nothing.
 
-## 4. Confirmed findings
+## 3. Why the body exceeds the limit
 
-**F1 — The detailed view discarded captured fields.** `_ai_test_details_action`
-rendered status, model, latency, `HTTP`, `retry-after` and `error[:160]` only.
-`provider_code` and `provider_error_type` were already collected but never
-shown, so Google's `NOT_FOUND` / `INVALID_ARGUMENT` / `UNAUTHENTICATED` /
-`RESOURCE_EXHAUSTED` distinction was invisible.
+* `_build_targets` deliberately tests **every** chat-capable model of every provider (only the explicit global budget truncates it), so a real run's `results` list is dozens to hundreds of entries.
+* The All Results view emitted one line per model **plus**, for each failing model, `_failure_diagnostic_lines()`: HTTP status · provider code · provider error type · failure origin, the endpoint/operation with API version, retry-after, provider reason list, and a bounded (160-char) sanitized provider message.
+* So the body grows with `O(results)` and nothing bounded its total size. Measured on the previous tree with 45 results and only the simpler diagnostics of that commit, the rendered text was **5408 characters** — already 31 % over the cap. The current renderer adds more lines per failure, so it is larger.
 
-**F2 — Two different facts shared one name.** The tester stored
-`error_type = metadata["error_type"] or metadata["provider_error_type"]`, so a
-local transport class and a provider's own status were conflated and the
-provider type was overwritten by whichever arrived first.
+Telegram's per-message text limit is 4096 characters; the edit RPC is rejected outright, not truncated. There is no fallback path that re-sends a shorter message, and `_safe_edit`'s contract is "best effort, never raise", so the failure is silent by design.
 
-**F3 — 404 was treated as a model verdict unconditionally.** `_classify_failure`
-returned `INVALID_MODEL` for any HTTP 404, and also for any error text
-containing "not found" at ANY status. A 400 request-validation error whose body
-said "method not found" would therefore be reported as an invalid model,
-blaming the model for a request/endpoint defect.
+## 4. Secondary defect found in the same path
 
-**F4 — Gemini parsed structured errors but threw the evidence away.**
-`GeminiProvider.chat()` read `error.message`, `error.code` and `error.status`,
-then dropped `error.details[].reason` (e.g. `API_KEY_INVALID`), hardcoded
-`retry_after = 5` while ignoring Google's `Retry-After` header, and recorded
-neither the operation (`generateContent`), the API version (`v1beta`) nor the
-endpoint path. The raw message was truncated to 200 chars and logged with no
-redaction, even though a provider can echo a credential into an error body.
+Handler exceptions were also silent. `_handle_action` lets exceptions escape, the router's `except Exception` logs `[CALLBACK] callback router error` and finishes the click as `failed` — but the click has already been acknowledged and nothing is painted. A bug in any action therefore looks exactly like the dead All Results button: acknowledged, no change, no message.
 
-**F5 — No bounded, sanitized provider message existed in the payload.** The
-panel rendered `error[:160]` (already a classification string), never the
-provider's own message, and nothing bounded what a provider could contribute.
+## 5. What was ruled out
 
-## 5. What is established — and what is not
+| Candidate | Why it is not the cause |
+|---|---|
+| Button renderer / label glyph | The data string is present in the rendered keyboard and correct |
+| Action id mismatch | Button data and `register_action` id are identical; `get_action` resolves the handler (asserted by test) |
+| Handler signature / argument parsing | `(event, extra, chat_id)` matches `ActionHandler`; `extra` is empty for the un-paged button |
+| Missing registration at startup | `backend/bot/router.py` imports `ai` and `register()` wires the action; the import-time pager registration is a separate, additional wiring |
+| Owner gate / session gate | Both pass for the owner's own live panel; a rejection there answers the click immediately, which is not "no reaction on a live panel" |
+| Delayed acknowledgement | Ack now runs before dispatch (`5b34a3a`); measured order asserted by the new tests |
+| `_last_test_payload` empty | The payload is set by `ai_test_progress.run_streaming_test`; when it *is* empty the handler returns an explicit "No results yet" explanation — the opposite of silence |
+| Message-edit failure due to `message not modified` | `_safe_edit` already treats that as a benign no-op; this failure is a different, length-related rejection |
 
-Established by source and deterministic tests:
+## 6. Diagnosis summary
 
-* The failure chain preserves what the provider returns (status, code, type,
-  message, retry-after) and the tester classifies from those facts.
-* A 404 is now a model verdict only with model-not-found evidence; otherwise it
-  is an honest provider/endpoint error.
-* Auth, request-validation, rate-limit, quota and server failures never become
-  `INVALID_MODEL`.
-* Credentials are redacted at the provider (before logging) and messages are
-  bounded before they can reach the panel.
-
-Not established:
-
-* The real cause of the owner's Gemini `INVALID_MODEL` observation. It could be
-  a genuinely unavailable model, an endpoint restriction, or a key/project
-  limitation. Only a live run with the owner's key can answer it — and the new
-  All Results view is what makes that answer readable.
-* Google's live response shapes for this account (the tests use documented
-  shapes, not captured traffic).
+The interaction does not stop in the panel architecture at all: it stops in **message-size accounting**. The view that must open is unbounded by construction, and Telegram refuses the resulting edit. Any fix must bound the rendered body while keeping the diagnostic content — truncating it would defeat the feature, which exists precisely to show the failures.

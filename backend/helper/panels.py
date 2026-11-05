@@ -549,6 +549,22 @@ def register_callback_handlers(client, owner_id: int) -> None:
         except Exception as exc:
             outcome = "failed"
             logger.exception("[CALLBACK] callback router error (data='%s'): %s", data, exc)
+            # The click was acknowledged before dispatch, so a failure that only
+            # logs leaves the owner with an acknowledged tap and nothing on
+            # screen. Say so on the panel instead. Only the exception TYPE is
+            # shown: messages can carry provider internals or credentials.
+            builder = InlinePanelBuilder()
+            builder.add_row(sym.label(sym.OP_HOME, "Home"), "panel:_nav:home")
+            builder.add_row(sym.label(sym.OP_CLOSE, "Close"), "panel:_nav:close")
+            try:
+                await _present(
+                    event,
+                    f"{sym.STATE_FAILED} This action failed ({type(exc).__name__}). Nothing was changed.",
+                    builder.build(),
+                    chat_id, msg_id,
+                )
+            except Exception:
+                logger.exception("[CALLBACK] failure notice could not be painted")
         finally:
             admission.mark_rendered()
             callback_gate.finish(admission, outcome)
