@@ -32,9 +32,10 @@ AI inference and it never changes provider selection, fallback, retry or cooldow
 - Durable JSON documents already exist in the EXISTING `bot_settings` table
   (`aed_get_document_state` / `aed_put_document`); no new table, migration or SQL was
   needed.
-- `NOT_ATTEMPTED` does not exist in the Model Tester: models that were never targeted
-  are simply absent from `results`. The snapshot preserves that distinction by
-  presenting catalog models with no result as `NOT_TESTED`, never as a failure.
+- `NOT_ATTEMPTED` (upstream) means an imposed overall deadline ended the run before
+  a target was tried; `NOT_TESTED` is the cached-reconciliation mark for a catalog
+  model with no stored result. Both stay distinct from `NOT_CONFIGURED` and from a
+  provider failure.
 - Credential changes are read from the environment on every run; there is no
   credential revision/version exposed by the architecture, so no cache
   invalidation by credential revision is implemented (see Known limitations).
@@ -91,8 +92,11 @@ no migration, no SQL executed, `DATABASE_ARCHITECTURE.md` unchanged.
   `(CACHED)` suffix on statuses (`AVAILABLE (CACHED)`, `RATE_LIMITED (CACHED)`, …).
 - The results view keeps the existing grid, provider grouping, summary chips and
   pagination, and adds the `↻ Refresh All Models` row plus a `≡ Saved Results` row.
-- All Results stays a bounded transcript (`_TEST_DETAILS_LIMIT = 60`) and lists
-  historical (removed-model) results separately (`_TEST_HISTORICAL_LIMIT = 20`).
+- All Results keeps its upstream self-paging (`_detail_pages`, the message-size fix)
+  and adds historical (removed-model) results as a bounded appendix
+  (`_TEST_HISTORICAL_LIMIT = 20`). Cached statuses keep their `(CACHED)` suffix on
+  every page; action rows are Refresh All Models, Saved Results and the existing page
+  navigation.
 - New status glyph `NOT_TESTED` uses the registry mark `·`.
 
 ### 3.4 Run completion — `backend/bot/handlers/ai_test_progress.py`
@@ -115,8 +119,9 @@ and the previous snapshot stays authoritative.
 - `proven_usable_candidates()` now ignores every result carrying `cached: True`, so a
   stored AVAILABLE can never re-enter the runtime model pool on a cache read. Cached
   payloads are never passed to `_feed_production_candidates()` at all.
-- `_build_summary()` gains `not_tested` and excludes `NOT_TESTED` from `tested`;
-  `NOT_CONFIGURED` and `TIMEOUT` keep their existing, distinct buckets.
+- `_build_summary()` gains `not_tested` beside the upstream `not_attempted` bucket
+  and excludes both from `tested`; `NOT_CONFIGURED`, `NOT_ATTEMPTED` and `TIMEOUT` keep
+  their existing, distinct meanings.
 
 ## 4. Cache reconciliation and invalidation rules
 
@@ -146,19 +151,31 @@ and the previous snapshot stays authoritative.
 | `tests/test_11_runtime_wiring.py` | launch test waits for the run (which now includes a DB write) instead of a fixed number of event-loop turns |
 | `IMPLEMENTATION_REPORT.md`, `ROADMAP.md`, `INVESTIGATION.md` | replaced with this feature's canonical state |
 
+Remote `main` had advanced while this feature was being implemented (provider-attributed
+failure diagnostics, `NOT_ATTEMPTED`, paged All Results, Cloudflare provider). It was
+integrated with an ordinary merge commit — no rebase, no force-push, no history
+rewriting — and the snapshot layer composes with those changes: cached `(CACHED)`
+statuses live inside the paged All Results view, and both summary buckets
+(`not_attempted`, `not_tested`) exist side by side.
+
 ## 6. Test results (exact)
 
-- Focused group
-  (`tests/test_model_tester_snapshot.py`, `tests/test_model_tester.py`,
-  `tests/test_test_modules_grid.py`, `tests/test_11_runtime_wiring.py`,
+- Post-merge focused group (`tests/test_model_tester_snapshot.py`,
+  `tests/test_model_tester.py`, `tests/test_test_modules_grid.py`,
+  `tests/test_test_modules_details_callback.py`, `tests/test_11_runtime_wiring.py`,
   `tests/test_13_model_selection.py`, `tests/test_14_tool_honesty_glass.py`):
-  **134 passed**.
+  **170 passed**.
 - New snapshot suite: **36 passed**.
-- Full suite (`.venv/bin/python -m pytest tests -q`):
-  **6825 passed, 27 skipped, 1 failed** in 136.86 s.
-  The single failure is the pre-existing
+- Full suite after merging remote `main`
+  (`.venv/bin/python -m pytest tests -q`):
+  **6951 passed, 27 skipped, 2 failed** in 141.85 s.
+  Failures: the pre-existing
   `tests/test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`
-  (reproduced on the unchanged baseline; unrelated to this feature).
+  (reproduced on the unchanged baseline, unrelated), and
+  `tests/test_private_message_scope.py::test_concurrent_messages_from_one_person_cannot_exceed_the_limit`,
+  which passes 3/3 in isolation (load-dependent timing flake, unrelated). Before the
+  merge the same suite was **6825 passed, 27 skipped, 1 failed** (136.86 s) — only the
+  pre-existing scheduler failure.
 - `python -m py_compile` on every changed module and the new test file: exit 0.
 - `git diff --check`: clean.
 

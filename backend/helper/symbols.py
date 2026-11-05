@@ -134,6 +134,7 @@ ICON_P_COHERE = "✧"       # U+2727 WHITE FOUR POINTED STAR
 ICON_P_SILICONFLOW = "≈"  # U+2248 ALMOST EQUAL TO
 ICON_P_FIREWORKS = "✺"    # U+273A SIXTEEN POINTED ASTERISK
 ICON_P_NARAROUTER = "⊕"   # U+2295 CIRCLED PLUS
+ICON_P_CLOUDFLARE = "⌬"   # U+232C BENZENE RING (edge network)
 ICON_P_YOU = "⌘"          # U+2318 PLACE OF INTEREST SIGN (search capability)
 
 # ── saved-item caption metadata (Category G) ────────────────────────────────

@@ -73,6 +73,7 @@ from backend.ai.providers.base.validation import (
     validate_provider_config,
 )
 from backend.ai.providers.cerebras import CerebrasProvider
+from backend.ai.providers.cloudflare import CloudflareProvider
 from backend.ai.providers.cohere import CohereProvider
 from backend.ai.providers.dummy.provider import DummyProvider
 from backend.ai.providers.factory import ProviderFactory
@@ -142,4 +143,5 @@ __all__ = [
     "SiliconFlowProvider",
     "FireworksProvider",
     "NaraRouterProvider",
+    "CloudflareProvider",
 ]

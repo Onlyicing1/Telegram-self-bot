@@ -526,11 +526,14 @@ def test_stt_model_selection_requires_the_explicit_override(monkeypatch):
     assert engine.model == DEFAULT_MEDIA_MODEL == model
 
 
-def test_a_deprecated_stt_model_is_resolved_before_use(monkeypatch):
+def test_an_explicit_stt_model_is_used_verbatim(monkeypatch):
+    """A configured STT model is never rewritten into another model."""
     monkeypatch.setenv(STT_MODEL_ENV_VAR, "gemini-2.0-flash")
 
-    # The project's existing deprecation map is reused — no second one.
-    assert resolve_stt_model() == ("gemini-2.5-flash", STT_MODEL_ENV_VAR)
+    assert resolve_stt_model() == ("gemini-2.0-flash", STT_MODEL_ENV_VAR)
+
+    monkeypatch.setenv(STT_MODEL_ENV_VAR, "gemini-3.5-transcribe")
+    assert resolve_stt_model() == ("gemini-3.5-transcribe", STT_MODEL_ENV_VAR)
 
 
 def test_language_is_automatic_unless_explicitly_pinned(monkeypatch):

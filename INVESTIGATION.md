@@ -22,9 +22,9 @@ queried; every finding below was read from the repository at the implementation 
   `_build_targets` + `test_single_model`.
 - Both return the same payload keys: `success`, `tested_at`, `partial`, `providers`,
   `models`, `results`, `summary`.
-- `_build_targets` selects every chat-capable candidate; the only truncation is the
-  explicit `MODEL_TEST_GLOBAL_TEST_BUDGET` (default 60, 0 = uncapped), applied once to
-  the flat target list with a fair round-robin. `_MODELS_IN_RESPONSE` (30/provider) is a
+- `_build_targets` selects every chat-capable model of every chat provider with NO
+  budget, cap, slice or priority queue (this branch inherited the upstream change that
+  removed `MODEL_TEST_GLOBAL_TEST_BUDGET`); `_MODELS_IN_RESPONSE` (30/provider) is a
   DISPLAY cap only.
 - Results are classified deterministically (`AVAILABLE`, `NOT_CONFIGURED`,
   `AUTH_ERROR`, `RATE_LIMITED`, `INSUFFICIENT_CREDITS`, `TIMEOUT`, `INVALID_MODEL`,
@@ -44,8 +44,9 @@ queried; every finding below was read from the repository at the implementation 
   usable grid (12/18 per page) plus pagination, and the action rows.
 - `action:ai_test_page:<n>` (`_ai_test_page_action`) re-renders another page from
   `_last_test_payload` and never re-runs the tester.
-- `action:ai_test_details` ("All Results") renders every result from
-  `_last_test_payload` — previously unbounded.
+- `action:ai_test_details` ("All Results") pages the complete diagnostics from
+  `_last_test_payload` under `_TEST_DETAILS_BODY_BUDGET` (the upstream fix for
+  Telegram's 4096-character message limit).
 - Consequence: the pager and All Results already work from a payload dict, so a
   snapshot only has to produce a payload-shaped dict; no second renderer is needed.
 
@@ -90,9 +91,11 @@ queried; every finding below was read from the repository at the implementation 
   and excluded from the current-catalog list and from the usable grid.
 - **Exact identity.** Model ids are used verbatim (no display-name matching); the pair
   `(provider, model_id)` is the identity everywhere.
-- **NOT_ATTEMPTED.** No such status exists in the runtime; "never targeted" is the
-  absence of a result. `NOT_TESTED` is therefore the honest cached representation, and
-  `NOT_CONFIGURED` / `TIMEOUT` keep their existing meanings.
+- **NOT_ATTEMPTED / NOT_TESTED.** Upstream's `NOT_ATTEMPTED` means the imposed
+  overall deadline ended the run before a target was tried. The snapshot adds
+  `NOT_TESTED` for a catalog model with no stored result; otherwise "never targeted"
+  remains the absence of a result. `NOT_CONFIGURED`, `NOT_ATTEMPTED` and `TIMEOUT`
+  stay distinct.
 - **Partial runs.** `test_all_models*` sets `partial=True` when the overall timeout
   leaves targets pending and records TIMEOUT for each. The persistence step refuses to
   save a partial payload, so an interrupted refresh cannot masquerade as a complete
@@ -113,5 +116,6 @@ queried; every finding below was read from the repository at the implementation 
   Keeping that id as the OPEN action (cached when possible, initial run when nothing is
   saved) preserves those contracts; the explicit refresh is a NEW
   `action:ai_test_refresh`.
-- No message-size truncation exists in the helper layer, so All Results was given an
-  explicit row bound instead of relying on an implicit limit.
+- The helper layer has no message-size truncation; upstream's All Results now pages
+  itself under a 3500-character body budget, and the snapshot appends a bounded
+  (20-row) historical section instead of introducing a second pager.

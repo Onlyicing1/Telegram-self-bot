@@ -107,15 +107,22 @@ counts                results, catalog, historical, dropped, truncated
 - Unreadable / malformed / unsupported snapshots show an honest notice and offer
   Refresh; they never start a run implicitly.
 - Existing provider grouping, summary chips, usable-model grid, All Results and
-  pagination are preserved; All Results is bounded (60 current + 20 historical rows).
+  pagination are preserved; All Results keeps its self-paging, plus a bounded
+  historical appendix (20 rows).
+- Upstream `NOT_ATTEMPTED` (deadline reached before a target was tried) and the
+  snapshot's `NOT_TESTED` (catalog model with no stored result) are separate statuses.
 
 ## Tests and exact results
 
-- Focused group (6 files): **134 passed**.
+- Post-merge focused group (7 files, incl. the upstream All Results callback suite):
+  **170 passed**.
 - New `tests/test_model_tester_snapshot.py`: **36 passed**.
-- Full suite: **6825 passed, 27 skipped, 1 failed** (136.86 s). The failure is the
-  pre-existing `tests/test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`,
-  reproduced on the unchanged baseline.
+- Full suite after merging remote `main`: **6951 passed, 27 skipped, 2 failed**
+  (141.85 s). The failures are the pre-existing
+  `tests/test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`
+  (reproduced on the unchanged baseline) and a load-dependent timing flake
+  (`tests/test_private_message_scope.py::test_concurrent_messages_from_one_person_cannot_exceed_the_limit`,
+  3/3 passing in isolation).
 - `py_compile` on changed modules: exit 0. `git diff --check`: clean.
 
 ## Known limitations

@@ -104,7 +104,6 @@ from typing import Any, Mapping
 
 import httpx
 
-from backend.ai.providers.base.defaults import resolve_model
 from backend.services import media_service
 from backend.services.media_service import MediaError
 from backend.services.stt_consensus import reconcile_hypotheses
@@ -527,8 +526,6 @@ def stt_settings_from(config: Mapping[str, Any] | None) -> dict[str, Any]:
     """
     config = config or {}
     model = str(config.get("stt_model") or "").strip()
-    if model:
-        model = resolve_model("gemini", model)
     language = str(config.get("stt_language") or "").strip()
     if language.lower() == STT_LANGUAGE_AUTO:
         language = ""
@@ -1748,13 +1745,14 @@ def resolve_stt_model() -> tuple[str, str]:
 
     No default and no substitution: an unset variable means the EXISTING
     general media route (the general model answering ``STT_INSTRUCTION``), which
-    is exactly why activating the dedicated model is an explicit act. The value
-    passes through the project's existing deprecation map.
+    is exactly why activating the dedicated model is an explicit act. A
+    configured value is used VERBATIM — a retired id fails as that id instead of
+    being silently replaced.
     """
     value = (os.getenv(STT_MODEL_ENV_VAR) or "").strip()
     if not value:
         return "", ""
-    return resolve_model("gemini", value), STT_MODEL_ENV_VAR
+    return value, STT_MODEL_ENV_VAR
 
 
 def resolve_stt_language() -> tuple[str, str]:
@@ -1774,14 +1772,14 @@ def resolve_stt_language() -> tuple[str, str]:
 def resolve_media_model() -> tuple[str, str]:
     """``(model, env_var_name)``; the media override wins, then the chat model.
 
-    Falls back to :data:`DEFAULT_MEDIA_MODEL`. The resolved value passes through
-    the project's existing deprecation map (``resolve_model``), so a retired model
-    configured in ENV can never poison the request.
+    Falls back to :data:`DEFAULT_MEDIA_MODEL` ONLY when nothing is configured —
+    an explicit value (including a stale one) is used verbatim, so the request
+    always names the model that was chosen.
     """
     for name in (MEDIA_MODEL_ENV_VAR, CHAT_MODEL_ENV_VAR):
         value = (os.getenv(name) or "").strip()
         if value:
-            return resolve_model("gemini", value), name
+            return value, name
     return DEFAULT_MEDIA_MODEL, ""
 
 
