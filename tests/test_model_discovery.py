@@ -27,6 +27,34 @@ def test_is_chat_capable():
     assert is_chat_capable("") is False
 
 
+def test_specialized_models_are_not_chat_targets():
+    """A generic text-chat ping must never be sent to a model whose catalog
+    entry says it serves another operation — that is a capability mismatch,
+    not a broken chat model."""
+    for model_id in (
+        "gpt-4o-transcribe",
+        "gpt-4o-mini-tts",
+        "gpt-4o-search-preview",
+        "gpt-4o-audio-preview",
+        "gpt-4o-realtime-preview",
+        "text-embedding-3-small",
+        "whisper-1",
+        "dall-e-3",
+        "gpt-image-1",
+        "sora-2",
+        "veo-3",
+    ):
+        assert is_chat_capable(model_id) is False, model_id
+    for model_id in (
+        "gpt-4o",
+        "gpt-4o-mini",
+        "gemini-2.5-flash",
+        "llama-3.3-70b-versatile",
+        "openrouter/auto",
+    ):
+        assert is_chat_capable(model_id) is True, model_id
+
+
 def _mock_response(status_code: int, payload: dict):
     resp = MagicMock()
     resp.status_code = status_code

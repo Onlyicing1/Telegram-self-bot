@@ -5,7 +5,8 @@
 > acknowledgement + per-panel ordering; the Stash page snapshot) are unchanged
 > in behaviour where they still apply; their history is in git, their contracts
 > are in `AGENTS.md`, and the parts this phase supersedes are marked in §3 and
-> §9.
+> §9. Section §10 (2026-11-05) additionally covers the Test Modules
+> diagnostic-coverage change.
 
 | Item | Value |
 |---|---|
@@ -252,3 +253,158 @@ restored → identical failure. Pre-existing, unrelated to the callback path.
 * Phase 1/2's "each click's `work_ms` includes the UI response" is superseded:
   `work_ms` is now handler-only and the paint is reported separately as
   `paint_ms`.
+
+---
+
+## 10. Test Modules diagnostic — every chat model of every provider (2026-11-05)
+
+> Scope: the Test Modules diagnostic only. ProviderManager, fallback/retry/
+> cooldown, model selection and persistence, the RuntimeSupervisor, the
+> Engine/Dispatcher and ToolRegistry/ToolExecutor were not touched, and no
+> SQL, Supabase call or migration was executed.
+
+| Item | Value |
+|---|---|
+| Task | Test every chat-capable model of every chat provider, independently of the owner's selected model |
+| Base | `main` @ `8a0c5b9` |
+| Date | 2026-11-05 |
+| Live Telegram / Supabase / Render | **NOT touched** |
+| New dependency | **none** |
+| Documents not modified | `DATABASE_ARCHITECTURE.md`, `README.md`, `AGENTS.md` (no statement in it was invalidated — it carries no test-budget sentence) |
+
+### 10.1 Root cause
+
+`backend/ai/model_tester.py` coupled target selection to things that must not
+influence a diagnostic:
+
+1. **The owner's selection.** `_build_targets()` read `get_config()` and, for the
+   active provider, put the owner's selected model first and ordered the rest
+   around it, so both the target set and its order depended on what was chosen
+   for normal usage.
+2. **A global budget.** `_GLOBAL_TEST_BUDGET` (`MODEL_TEST_GLOBAL_TEST_BUDGET`,
+   default 60) sliced the flat target list, so a catalog with more than 60
+   eligible models could never be fully tested and the cut-off fell on whichever
+   providers sorted last.
+3. **A phantom-default shortcut.** A provider without an API key contributed only
+   its `default_model` as `NOT_CONFIGURED`; the rest of its known catalog was
+   silently absent.
+
+`_MODELS_IN_RESPONSE` — a response/display limit — was also applied while
+building the target list, so a display cap doubled as an execution cap.
+
+### 10.2 Target selection now (`_build_targets`)
+
+* No configuration read at all: `get_config` is no longer imported by the
+  module, so selection cannot influence the targets.
+* Every provider whose `capability_kind == "chat"` is included — configured or
+  not, validated or not. Non-chat capabilities (`you` → web search) keep their
+  own path and produce no chat targets.
+* With a key → that provider's live discovery result. Without a key, or when
+  discovery fails / returns nothing usable → `fallback_models(name)`, the one
+  existing centralized catalog (`_FALLBACK_CATALOG`) reached through a new
+  public wrapper. No second catalog, no duplicated provider metadata.
+* Every `is_chat_capable()` model of that catalog is scheduled; a
+  `(provider, model)` pair is scheduled at most once (`seen_pairs`).
+* A provider default that is not a member of the applicable catalog is never
+  invented as a target.
+* Nothing truncates: no budget, per-provider cap, slice or priority queue.
+  `_TEST_CONCURRENCY` bounds in-flight tests and the per-model timeout bounds
+  each one; free-first ordering only orders, it never drops.
+* `_MODELS_IN_RESPONSE` caps only the `models` payload; the production feed
+  (`complete_models`) and the target list are complete.
+
+### 10.3 Unconfigured providers
+
+Scheduled like any other provider, then answered offline:
+`test_single_model()` sees no key and returns `NOT_CONFIGURED` /
+`API key not configured in environment` with `latency_s` and `http_status`
+`None`. No provider client is constructed (no `ProviderFactory` call) and no
+discovery or chat request is made.
+
+### 10.4 Specialized (non-chat) models
+
+`is_chat_capable()` gained evidence-based exclusions for dedicated transcription
+(`transcribe`), speech synthesis (`-tts`, `speech`) and audio/video generation
+(`sora`, `veo`) on top of the existing embedding / image / moderation /
+realtime / audio blocklist. Gemini's Interactions-only models were already
+filtered through `supportedGenerationMethods`. These models are therefore not
+targets of the generic chat probe and are not reported as broken chat models.
+No new modality test path was invented — no such path existed.
+
+### 10.5 Honest deadlines
+
+`overall_timeout` now defaults to `None` (run to completion). When a caller
+imposes one, unreached targets are reported as the new `NOT_ATTEMPTED` status
+(`partial: true`, summary bucket `not_attempted`), never as `TIMEOUT` and never
+as a provider response; `summary.tested` excludes both `not_configured` and
+`not_attempted`. Only `AVAILABLE` results feed `proven_usable_candidates()`, so
+unattempted, unconfigured, timed-out and failed models never become production
+candidates.
+
+### 10.6 UI
+
+`NOT_ATTEMPTED` uses the pending mark `…` (plain Unicode, already part of the
+documented status vocabulary). All Results now paginates the COMPLETE result set
+(`action:ai_test_details:<page>`, 3000-character pages, Prev/Next) instead of
+trying to fit every line into one message: a 200-result run renders as 6 pages of
+at most 3013 characters and every model stays reachable.
+
+### 10.7 Coverage measured in this environment
+
+No provider API key exists here, so live discovery could not run and the
+diagnostic exercised the unconfigured path end to end:
+
+| | |
+|---|---|
+| Chat providers in the registry | 13 (`openrouter, openai, nararouter, groq, mistral, zai, sambanova, cohere, siliconflow, gemini, cerebras, nvidia, fireworks`) plus `you` (web search → 0 chat targets) |
+| Eligible (chat-capable) models discovered | **39** |
+| Models actually tested | **0** (no key) |
+| `NOT_CONFIGURED` results | **39** |
+| Targets left untested (not attempted) | **0**, `partial: false` |
+| Per provider | openrouter 4 · openai 5 · nararouter 4 · groq 3 · mistral 3 · zai 3 · sambanova 3 · cohere 3 · siliconflow 3 · gemini 2 · cerebras 2 · nvidia 2 · fireworks 2 |
+
+Because no key was available this run does **not** show any real model
+answering; it shows complete, selection-independent target construction and the
+offline `NOT_CONFIGURED` path for all 39 catalog models.
+
+### 10.8 Tests
+
+`tests/test_model_tester.py` — new cases exercise real target construction and
+execution: selection independence (no active-config read; identical targets for
+two different selections), complete configured-provider coverage, the whole
+fallback catalog of an unconfigured provider with no client and no network, a
+75-model catalog, 120 models across three providers, a 100-model early catalog
+that cannot starve later providers, no duplicate pairs, no phantom default, the
+exact catalog id recorded as passed to `test_single_model()`, specialized models
+excluded, batch/streaming coverage parity, cancellation propagation, unattempted
+targets kept out of the production feed, and one-provider-failure isolation. The
+budget, overall-timeout and display-cap tests were rewritten for the new
+semantics. `tests/test_model_discovery.py` gained the specialized-model
+capability case.
+
+### 10.9 Results
+
+| Check | Result |
+|---|---|
+| Focused (`test_model_tester.py`, `test_model_discovery.py`) | 58 passed |
+| Symbols/UI vocabulary + provider mesh + focused | 121 passed |
+| Full suite | 6803 passed, 27 skipped, **1 failed** |
+| `python -m compileall -q backend tests` | exit 0 |
+| `git diff --check` | clean |
+
+The single failure is
+`tests/test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`
+("interval advancement exceeded bound"). It reproduces unchanged at `HEAD` in a
+detached worktree without this change, touches no file in this change, and its 10
+sibling scheduler tests pass: pre-existing and unrelated, reported rather than
+hidden.
+
+### 10.10 Limitations
+
+* No API key here: no live provider was contacted, so no real latency was
+  measured and only the fallback catalogs were exercised.
+* Catalogs larger than 60 models are exercised with `fetch_models` stubbed
+  because no key exists; the un-truncated scheduling path around it is real code
+  under test.
+* No Telegram client was available: All Results pagination was verified by
+  calling the handler with a 200-result payload, not on a live message.

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import pytest
+from contextlib import ExitStack
 from unittest.mock import patch, AsyncMock, MagicMock
 from fastapi.testclient import TestClient
 
@@ -214,8 +215,8 @@ async def test_single_model_not_configured_makes_no_request():
 
 @pytest.mark.asyncio
 async def test_test_all_models_covers_full_discovery_and_filters():
-    """No hidden per-provider truncation: EVERY chat-capable candidate is
-    tested, bounded only by the explicit global diagnostic budget."""
+    """No hidden per-provider truncation: EVERY chat-capable catalog model is
+    tested."""
     from backend.ai.discovery import ProviderStatus
     from backend.ai.model_discovery import ModelInfo
 
@@ -247,26 +248,27 @@ async def test_test_all_models_covers_full_discovery_and_filters():
         data = await test_all_models(owner_id=0, per_model_timeout=0.5, overall_timeout=10)
 
     results = data["results"]
-    # Full candidate coverage: default model + all 20 discovered chat
-    # models per provider (whisper filtered by capability) — far beyond the
-    # old hidden 6-per-provider truncation.
-    assert len(results) == 42
+    # Complete catalog coverage: all 20 discovered chat models per provider
+    # (whisper filtered by capability). The provider default is NOT a member
+    # of this catalog and is therefore never invented as an extra target.
+    assert len(results) == 40
     by_provider: dict[str, list[str]] = {}
     for r in results:
         by_provider.setdefault(r["provider"], []).append(r["model"])
-    assert len(by_provider["openai"]) == 21
-    assert len(by_provider["groq"]) == 21
+    assert len(by_provider["openai"]) == 20
+    assert len(by_provider["groq"]) == 20
+    assert "gpt-4o" not in by_provider["openai"]
     all_models = by_provider["openai"] + by_provider["groq"]
     assert all("whisper" not in m and "embedding" not in m for m in all_models)
-    assert data["summary"]["available"] == 42
+    assert data["summary"]["available"] == 40
     assert data["summary"]["discovered"] >= 1
     assert data["summary"]["total"] == len(results)
 
 
 @pytest.mark.asyncio
-async def test_test_all_models_global_budget_is_explicit_not_per_provider():
-    """The ONLY truncation is the explicit global diagnostic budget,
-    applied once to the flat target list (configured model first)."""
+async def test_the_global_budget_argument_no_longer_truncates_targets():
+    """The legacy ``global_budget`` argument is accepted and IGNORED: every
+    eligible model of every provider is still tested."""
     from backend.ai.discovery import ProviderStatus
     from backend.ai.model_discovery import ModelInfo
 
@@ -303,14 +305,10 @@ async def test_test_all_models_global_budget_is_explicit_not_per_provider():
     by_provider: dict[str, list[str]] = {}
     for r in data["results"]:
         by_provider.setdefault(r["provider"], []).append(r["model"])
-    # Fair distribution: BOTH providers keep their configured/default
-    # model, then the remaining budget is split round-robin — one large
-    # catalog can never push a later provider out of the run.
-    assert "gpt-4o" in by_provider.get("openai", [])
-    assert "llama-3.3-70b-versatile" in by_provider.get("groq", [])
-    assert len(data["results"]) == 7
-    assert len(by_provider.get("openai", [])) == 4
-    assert len(by_provider.get("groq", [])) == 3
+    # ``global_budget=7`` was requested above and had no effect.
+    assert len(data["results"]) == 40
+    assert len(by_provider.get("openai", [])) == 20
+    assert len(by_provider.get("groq", [])) == 20
 
 
 @pytest.mark.asyncio
@@ -338,8 +336,14 @@ async def test_test_all_models_partial_on_overall_timeout():
         data = await test_all_models(owner_id=0, per_model_timeout=5, overall_timeout=0.2)
 
     assert data["partial"] is True
-    assert any(r["status"] == "TIMEOUT" for r in data["results"])
-    assert data["summary"]["timeout"] >= 1
+    # A target cancelled before it started is UNATTEMPTED, never a provider
+    # timeout: the provider was never asked, and claiming otherwise would
+    # present an untested model as a real response.
+    assert any(r["status"] == "NOT_ATTEMPTED" for r in data["results"])
+    assert all(r["status"] != "TIMEOUT" for r in data["results"])
+    assert data["summary"]["not_attempted"] >= 1
+    assert data["summary"]["timeout"] == 0
+    assert data["summary"]["tested"] + data["summary"]["not_configured"] + data["summary"]["not_attempted"] == data["summary"]["total"]
 
 
 @pytest.mark.asyncio
@@ -397,13 +401,13 @@ async def test_streaming_twin_covers_full_discovery_and_feeds_candidate_pool():
             on_result=lambda item: result_events.append(item),
         )
 
-    # All 12 candidates tested (configured model + 11 discovered) — the old
-    # hidden 6-per-provider cap would have produced exactly 6.
-    assert len(data["results"]) == 12
-    assert data["summary"]["available"] == 12
+    # All 11 catalog models tested — the old hidden 6-per-provider cap would
+    # have produced exactly 6, and no provider default is invented.
+    assert len(data["results"]) == 11
+    assert data["summary"]["available"] == 11
     # Streaming callbacks fired per completion.
-    assert progress_events[-1] == (12, 12)
-    assert len(result_events) == 12
+    assert progress_events[-1] == (11, 11)
+    assert len(result_events) == 11
     # One discovery pass armed the production candidate pool (free-first,
     # configured model excluded).
     assert fake_pm.candidates.get("openai") == [f"m{i:02d}" for i in range(11)]
@@ -471,15 +475,14 @@ async def test_production_feed_exceeds_display_cap_and_payload_stays_bounded():
     assert f"m{total_models - 1:03d}" in fed
     # The response/display payload stays bounded by the display cap.
     assert len(data["models"]) <= _MODELS_IN_RESPONSE
-    # Diagnostic test execution ran the full set (no global budget passed).
-    assert len(data["results"]) == total_models + 1  # configured model + all discovered
+    # Diagnostic test execution ran the full set — every catalog model.
+    assert len(data["results"]) == total_models
 
 
 @pytest.mark.asyncio
-async def test_global_budget_limits_test_execution_not_production_feed():
-    """The explicit diagnostic budget bounds TEST EXECUTION only. The
-    production pool receives exactly the AVAILABLE tested models — never the
-    raw discovery set, and never a model the budget never tested."""
+async def test_the_budget_argument_does_not_bound_execution_or_the_feed():
+    """``global_budget`` is legacy and ignored: the production pool receives
+    exactly the AVAILABLE tested models — never the raw discovery set."""
     from backend.ai.discovery import ProviderStatus
     from backend.ai.model_discovery import ModelInfo
     from backend.ai.model_tester import _MODELS_IN_RESPONSE
@@ -526,18 +529,16 @@ async def test_global_budget_limits_test_execution_not_production_feed():
 
         data = await test_all_models_streaming(owner_id=0, global_budget=5)
 
-    # Diagnostic execution bounded by the explicit budget (fair round-robin
-    # keeps the configured/default model first).
-    assert len(data["results"]) == 5
+    # ``global_budget=5`` was requested above and had no effect: the whole
+    # catalog was executed and proven.
+    assert len(data["results"]) == total_models
     proven = {r["model"] for r in data["results"] if r["status"] == "AVAILABLE"}
-    assert "gpt-4o" in proven
+    assert proven == {f"m{i:03d}" for i in range(total_models)}
     # Production pool = the AVAILABLE test result minus the configured model
-    # (the router already tries it first) — never the raw discovery set, and
-    # never a model the diagnostic budget skipped.
+    # (the router already tries it first).
     fed = fake_pm.candidates.get("openai", [])
     assert set(fed) == proven - {"gpt-4o"}
-    assert len(fed) == 4
-    assert f"m{total_models - 1:03d}" not in fed
+    assert len(fed) == total_models
     # The display payload stays bounded by the display cap while the pool is
     # bounded only by what was proven usable.
     assert len(data["models"]) <= _MODELS_IN_RESPONSE
@@ -600,7 +601,7 @@ async def test_multiple_providers_each_feed_complete_sets():
     assert sum(
         1 for r in data["results"]
         if r["provider"] == "openai" and r["status"] == "AVAILABLE"
-    ) == per_provider + 1
+    ) == per_provider
     assert len(fake_pm.candidates.get("openai", [])) == per_provider
     assert len(fake_pm.candidates.get("groq", [])) == per_provider
     assert fake_pm.candidates["openai"][-1] == f"openai-m{per_provider - 1:03d}"
@@ -798,25 +799,21 @@ async def test_a_provider_with_no_available_model_gets_no_candidates():
     assert pm.candidates.get("groq") == []
 
 
-@pytest.mark.asyncio
-async def test_dummy_is_never_a_production_candidate():
-    pm, engine = _pm_engine()
-    providers = [_provider_status("dummy", "dummy-model")]
+def test_dummy_is_never_a_production_candidate():
+    """The local echo provider is never a runtime fallback candidate, even
+    when a diagnostic run reports it AVAILABLE."""
+    from backend.ai.model_tester import proven_usable_candidates
 
-    async def fake_test(provider, display, icon, model, timeout=8.0):
-        return _result(provider, model, "AVAILABLE")
+    results = [
+        _result("dummy", "dummy-model", "AVAILABLE"),
+        _result("groq", "groq-ok", "AVAILABLE"),
+    ]
+    providers = [_provider_status("dummy", "dummy-model"), _provider_status("groq", "llama")]
 
-    with patch("backend.ai.model_tester.discover_providers", new_callable=AsyncMock) as disc, \
-         patch("backend.ai.model_tester._get_env", return_value="fake_key"), \
-         patch("backend.ai.model_tester.test_single_model", side_effect=fake_test), \
-         patch("backend.ai.engine.engine.get_engine", return_value=engine):
-        disc.return_value = providers
-        from backend.ai.model_tester import test_all_models_streaming
+    feed = proven_usable_candidates(results, {}, providers)
 
-        data = await test_all_models_streaming(owner_id=0, global_budget=0)
-
-    assert any(r["provider"] == "dummy" for r in data["results"])
-    assert "dummy" not in pm.candidates
+    assert "dummy" not in feed
+    assert feed["groq"] == ["groq-ok"]
 
 
 @pytest.mark.asyncio
@@ -851,9 +848,12 @@ async def test_free_models_are_tested_before_paid_ones_under_the_budget():
         data = await test_all_models_streaming(owner_id=0, global_budget=4)
 
     tested = [r["model"] for r in data["results"]]
-    assert tested[0] == "openrouter/auto"
-    assert {"free-00", "free-01", "free-02"} <= set(tested)
-    assert "paid-00" not in tested
+    # Free-first ordering is about ORDER only now: every model is tested (the
+    # ``global_budget=4`` above is legacy and ignored).
+    assert tested[:3] == ["free-00", "free-01", "free-02"]
+    assert len(tested) == 23
+    assert "paid-00" in tested
+    assert "openrouter/auto" not in tested  # default, not a catalog member
     # The display payload follows the same free-first order.
     assert [m["id"] for m in data["models"]][:3] == ["free-00", "free-01", "free-02"]
     # Free metadata is carried into the results for the UI.
@@ -878,3 +878,307 @@ def test_is_free_annotation_uses_discovery_metadata_only():
     assert results[1]["is_free"] is False
     # No discovery metadata -> not claimed free.
     assert results[2]["is_free"] is False
+
+
+# ── Complete, selection-independent target coverage ──────────────────────
+
+
+def _catalog(*model_ids, provider="openai", free=()):
+    from backend.ai.model_discovery import ModelInfo
+
+    return [
+        ModelInfo(id=model_id, name=model_id, provider=provider, is_free=model_id in free)
+        for model_id in model_ids
+    ]
+
+
+def _unconfigured(name, default_model):
+    from backend.ai.discovery import ProviderStatus
+
+    return ProviderStatus(
+        name=name, display_name=name.title(), env_var=f"AI_{name.upper()}_API_KEY",
+        status="not_configured", has_key=False, validated=False,
+        default_model=default_model, base_url=f"https://{name}.example/v1", icon="◇",
+    )
+
+
+async def _run_diagnostic(providers, catalogs, impl, *, streaming=False, engine=None, **kwargs):
+    """Run one diagnostic with discovery/network/chat fully stubbed."""
+    from backend.ai import model_tester
+
+    async def fake_fetch(provider_name, api_key, base_url, force_refresh=False):
+        return catalogs.get(provider_name, [])
+
+    with ExitStack() as stack:
+        stack.enter_context(patch(
+            "backend.ai.model_tester.discover_providers",
+            AsyncMock(return_value=providers)))
+        stack.enter_context(patch("backend.ai.model_tester._get_env", return_value="fake_key"))
+        stack.enter_context(patch("backend.ai.model_tester.fetch_models", side_effect=fake_fetch))
+        mock_test = stack.enter_context(patch(
+            "backend.ai.model_tester.test_single_model", side_effect=impl))
+        if engine is not None:
+            stack.enter_context(patch("backend.ai.engine.engine.get_engine", return_value=engine))
+        if streaming:
+            data = await model_tester.test_all_models_streaming(owner_id=0, **kwargs)
+        else:
+            data = await model_tester.test_all_models(owner_id=0, **kwargs)
+    return data, mock_test
+
+
+async def _available(provider, display, icon, model, timeout=8.0):
+    return _result(provider, model, "AVAILABLE")
+
+
+@pytest.mark.asyncio
+async def test_selected_provider_and_model_never_change_the_target_set():
+    """The diagnostic is independent of the owner's selection: no active
+    config is read, and switching it changes neither targets nor ordering."""
+    from backend.ai import model_tester
+
+    providers = [_provider_status("openai", "gpt-4o"), _provider_status("groq", "llama")]
+    catalogs = {
+        "openai": _catalog("gpt-4o", "o3"),
+        "groq": _catalog("llama", "mixtral", provider="groq"),
+    }
+
+    assert not hasattr(model_tester, "get_config"), (
+        "the tester must not read the owner's active configuration"
+    )
+
+    async def _targets(active):
+        with patch("backend.ai.config_store.get_config", AsyncMock(return_value=active)):
+            data, _ = await _run_diagnostic(providers, catalogs, _available)
+        return [(r["provider"], r["model"]) for r in data["results"]]
+
+    first = await _targets({"provider": "openai", "model": "gpt-4o"})
+    second = await _targets({"provider": "groq", "model": "mixtral"})
+
+    assert first == second
+    assert first == [
+        ("openai", "gpt-4o"),
+        ("openai", "o3"),
+        ("groq", "llama"),
+        ("groq", "mixtral"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_every_chat_capable_catalog_model_of_a_configured_provider_is_tested():
+    providers = [_provider_status("openai", "gpt-4o")]
+    catalogs = {"openai": _catalog(
+        "gpt-4o", "gpt-4o-mini", "o3",
+        "text-embedding-3-small", "gpt-4o-transcribe", "gpt-4o-mini-tts",
+        "gpt-image-1", "sora-2", "gpt-4o-realtime-preview",
+    )}
+
+    data, _ = await _run_diagnostic(providers, catalogs, _available)
+
+    assert {r["model"] for r in data["results"]} == {"gpt-4o", "gpt-4o-mini", "o3"}
+    assert data["summary"]["available"] == 3
+
+
+@pytest.mark.asyncio
+async def test_an_unconfigured_provider_tests_its_whole_fallback_catalog_offline():
+    """No key: every known model of that provider is reported NOT_CONFIGURED
+    with no provider client, no discovery call and no network request."""
+    from backend.ai.model_discovery import fallback_models
+
+    providers = [_unconfigured("openai", "gpt-4o")]
+    expected = {model.id for model in fallback_models("openai")}
+    assert len(expected) > 1
+
+    async def _no_network(*args, **kwargs):
+        raise AssertionError("no discovery request may be made without a key")
+
+    with ExitStack() as stack:
+        stack.enter_context(patch(
+            "backend.ai.model_tester.discover_providers",
+            AsyncMock(return_value=providers)))
+        stack.enter_context(patch("backend.ai.model_tester._get_env", return_value=""))
+        stack.enter_context(patch("backend.ai.model_tester.fetch_models", side_effect=_no_network))
+        stack.enter_context(patch(
+            "backend.ai.model_tester.ProviderFactory.create_provider",
+            side_effect=AssertionError("no provider client may be created")))
+        data = await test_all_models(owner_id=0)
+
+    assert {r["model"] for r in data["results"]} == expected
+    assert all(r["status"] == "NOT_CONFIGURED" for r in data["results"])
+    assert all(
+        r["error"] == "API key not configured in environment" for r in data["results"]
+    )
+    assert all(r["latency_s"] is None and r["http_status"] is None for r in data["results"])
+    assert all(r["provider"] == "openai" for r in data["results"])
+    assert all(r["display_name"] == "Openai" and r["icon"] == "◇" for r in data["results"])
+    assert data["summary"]["not_configured"] == len(expected)
+    assert data["summary"]["tested"] == 0
+
+
+@pytest.mark.asyncio
+async def test_a_catalog_with_more_than_sixty_models_is_fully_tested():
+    providers = [_provider_status("openai", "gpt-4o")]
+    ids = [f"m{i:03d}" for i in range(75)]
+
+    data, _ = await _run_diagnostic(providers, {"openai": _catalog(*ids)}, _available)
+
+    assert len(data["results"]) == 75
+    assert [r["model"] for r in data["results"]] == ids
+    assert data["summary"]["available"] == 75
+
+
+@pytest.mark.asyncio
+async def test_a_combined_multi_provider_catalog_over_sixty_is_fully_tested():
+    providers = [
+        _provider_status("openai", "gpt-4o"),
+        _provider_status("groq", "llama"),
+        _provider_status("mistral", "mistral"),
+    ]
+    catalogs = {
+        "openai": _catalog(*[f"o{i:03d}" for i in range(40)]),
+        "groq": _catalog(*[f"g{i:03d}" for i in range(40)], provider="groq"),
+        "mistral": _catalog(*[f"m{i:03d}" for i in range(40)], provider="mistral"),
+    }
+
+    batch, _ = await _run_diagnostic(providers, catalogs, _available)
+
+    assert len(batch["results"]) == 120
+    assert len({(r["provider"], r["model"]) for r in batch["results"]}) == 120
+    assert {r["provider"] for r in batch["results"]} == {"openai", "groq", "mistral"}
+
+
+@pytest.mark.asyncio
+async def test_a_large_early_catalog_cannot_starve_later_providers():
+    providers = [_provider_status("openai", "gpt-4o"), _provider_status("groq", "llama")]
+    catalogs = {
+        "openai": _catalog(*[f"o{i:03d}" for i in range(100)]),
+        "groq": _catalog(*[f"g{i:03d}" for i in range(4)], provider="groq"),
+    }
+
+    data, _ = await _run_diagnostic(providers, catalogs, _available)
+
+    groq = [r["model"] for r in data["results"] if r["provider"] == "groq"]
+    assert groq == [f"g{i:03d}" for i in range(4)]
+    assert len(data["results"]) == 104
+
+
+@pytest.mark.asyncio
+async def test_no_provider_model_pair_is_tested_twice():
+    providers = [_provider_status("openai", "gpt-4o")]
+    catalogs = {"openai": _catalog("gpt-4o", "gpt-4o", "o3", "o3", "gpt-4o-mini")}
+
+    data, mock_test = await _run_diagnostic(providers, catalogs, _available)
+
+    pairs = [(r["provider"], r["model"]) for r in data["results"]]
+    assert sorted(set(pairs)) == sorted(pairs)
+    assert len(pairs) == 3
+    assert len(mock_test.call_args_list) == 3
+
+
+@pytest.mark.asyncio
+async def test_a_default_model_outside_the_catalog_is_never_a_phantom_target():
+    providers = [_provider_status("openai", "ghost-default")]
+    catalogs = {"openai": _catalog("real-1", "real-2")}
+
+    data, mock_test = await _run_diagnostic(providers, catalogs, _available)
+
+    assert {r["model"] for r in data["results"]} == {"real-1", "real-2"}
+    assert "ghost-default" not in [c.args[3] for c in mock_test.call_args_list]
+
+
+@pytest.mark.asyncio
+async def test_the_exact_catalog_model_id_is_sent_to_test_single_model():
+    providers = [_provider_status("openai", "gpt-4o")]
+    ids = ["gpt-4o", "o3-mini", "gpt-4.1-nano"]
+
+    _, mock_test = await _run_diagnostic(providers, {"openai": _catalog(*ids)}, _available)
+
+    sent = sorted(call.args[3] for call in mock_test.call_args_list)
+    assert sent == sorted(ids)
+    assert all(call.args[0] == "openai" for call in mock_test.call_args_list)
+
+
+@pytest.mark.asyncio
+async def test_batch_and_streaming_runners_share_identical_coverage():
+    providers = [_provider_status("openai", "gpt-4o"), _provider_status("groq", "llama")]
+    catalogs = {
+        "openai": _catalog(*[f"o{i:03d}" for i in range(35)]),
+        "groq": _catalog(*[f"g{i:03d}" for i in range(35)], provider="groq"),
+    }
+
+    batch, _ = await _run_diagnostic(providers, catalogs, _available)
+    streamed, _ = await _run_diagnostic(providers, catalogs, _available, streaming=True)
+
+    assert [(r["provider"], r["model"]) for r in batch["results"]] == [
+        (r["provider"], r["model"]) for r in streamed["results"]
+    ]
+    assert batch["summary"]["available"] == streamed["summary"]["available"] == 70
+    assert batch["partial"] is False and streamed["partial"] is False
+
+
+@pytest.mark.asyncio
+async def test_cancellation_propagates_instead_of_claiming_completeness():
+    providers = [_provider_status("openai", "gpt-4o")]
+    catalogs = {"openai": _catalog(*[f"m{i:03d}" for i in range(20)])}
+
+    async def _slow(provider, display, icon, model, timeout=8.0):
+        await asyncio.sleep(5)
+        return _result(provider, model, "AVAILABLE")
+
+    async def fake_fetch(provider_name, api_key, base_url, force_refresh=False):
+        return catalogs[provider_name]
+
+    with patch("backend.ai.model_tester.discover_providers", AsyncMock(return_value=providers)), \
+         patch("backend.ai.model_tester._get_env", return_value="fake_key"), \
+         patch("backend.ai.model_tester.fetch_models", side_effect=fake_fetch), \
+         patch("backend.ai.model_tester.test_single_model", side_effect=_slow):
+        task = asyncio.create_task(test_all_models(owner_id=0))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+@pytest.mark.asyncio
+async def test_unattempted_targets_never_enter_the_production_feed():
+    pm, engine = _pm_engine()
+    providers = [_provider_status("openai", "gpt-4o")]
+    catalogs = {"openai": _catalog(*[f"m{i:02d}" for i in range(24)])}
+
+    async def _slow(provider, display, icon, model, timeout=8.0):
+        await asyncio.sleep(1)
+        return _result(provider, model, "AVAILABLE")
+
+    data, _ = await _run_diagnostic(
+        providers, catalogs, _slow, streaming=True, engine=engine, overall_timeout=0.1
+    )
+
+    unattempted = {r["model"] for r in data["results"] if r["status"] == "NOT_ATTEMPTED"}
+    assert len(data["results"]) == 24
+    assert unattempted
+    assert data["partial"] is True
+    fed = set(pm.candidates.get("openai", []))
+    assert fed.isdisjoint(unattempted)
+    assert fed <= {r["model"] for r in data["results"] if r["status"] == "AVAILABLE"}
+
+
+@pytest.mark.asyncio
+async def test_one_provider_failure_does_not_stop_other_providers():
+    providers = [_provider_status("openai", "gpt-4o"), _provider_status("groq", "llama")]
+    catalogs = {
+        "openai": _catalog("a", "b"),
+        "groq": _catalog("c", "d", provider="groq"),
+    }
+
+    async def _mixed(provider, display, icon, model, timeout=8.0):
+        if provider == "openai":
+            return _result(provider, model, "PROVIDER_ERROR")
+        return _result(provider, model, "AVAILABLE")
+
+    data, _ = await _run_diagnostic(providers, catalogs, _mixed)
+
+    by_provider: dict[str, set[str]] = {}
+    for r in data["results"]:
+        by_provider.setdefault(r["provider"], set()).add(r["status"])
+    assert by_provider["openai"] == {"PROVIDER_ERROR"}
+    assert by_provider["groq"] == {"AVAILABLE"}
+    assert len(data["results"]) == 4

@@ -51,11 +51,20 @@ _locks: dict[str, asyncio.Lock] = {}
 _last_source: dict[str, str] = {}  # provider_name -> "api" | "fallback"
 
 # Substrings that identify models NOT usable for normal text chat.
+#
+# This is a diagnostic-correctness list, not decoration: the chat diagnostic
+# sends ONE standard text completion, so a model that only transcribes,
+# speaks, generates images/video, embeds, reranks or guards must never be
+# offered as a chat target — it would be reported as a broken chat model for
+# refusing an operation it never claimed to support.
 _EXCLUDE_SUBSTRINGS = (
     "embedding",
     "whisper",
+    "transcribe",
     "tts-",
     "tts_",
+    "-tts",
+    "speech",
     "moderation",
     "dall-e",
     "dall_e",
@@ -66,6 +75,8 @@ _EXCLUDE_SUBSTRINGS = (
     "guard",
     "search",
     "stt",
+    "sora",
+    "veo",
 )
 
 
@@ -232,6 +243,16 @@ def _build_fallback_models(provider_name: str) -> list[ModelInfo]:
         )
         for mid in ids
     ]
+
+
+def fallback_models(provider_name: str) -> list[ModelInfo]:
+    """The provider's curated catalog — the ONE offline model list.
+
+    Public accessor for the single ``_FALLBACK_CATALOG`` above. A diagnostic
+    that cannot (or must not) query a provider reads the same catalog the
+    live discovery path falls back to, so there is never a second list.
+    """
+    return _build_fallback_models(provider_name)
 
 
 def get_last_fetch_source(provider_name: str) -> str:

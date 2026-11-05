@@ -5,25 +5,31 @@ Tests configured AI providers and models to determine real-time usability
 without polluting conversation history or database state.
 
 Flow:
-  1. Discover which providers have API keys (ENV scan).
-  2. For each configured provider, discover live models via the provider
-     API (falling back to the centralized catalog) and select every
-     chat-capable candidate — bounded only by the explicit global
-     diagnostic budget (``MODEL_TEST_GLOBAL_TEST_BUDGET``), never by a
-     hidden per-provider cap.
+  1. Enumerate EVERY chat provider in the registry — configured or not. The
+     owner's selected provider/model is never consulted: this is an
+     independent diagnostic, not a test of the current selection.
+  2. For a provider with a key, discover its live model catalog (falling
+     back to the centralized catalog when that is empty or unusable);
+     without a key, read that same catalog and issue NO request. Every
+     model that genuinely accepts the standard chat completion becomes a
+     target — no budget, cap, slice or priority queue drops one.
   3. Test candidates concurrently (bounded semaphore) with per-model
      timeouts; a slow/failed provider never blocks the others.
   4. Classify every result deterministically and return a structured
      payload with a rich summary.
   5. Publish the AVAILABLE results as the runtime model-level fallback
      pool (free-first, configured model excluded). Discovery alone never
-     qualifies a model, and neither the response/display cap nor the
-     diagnostic budget bounds the pool.
+     qualifies a model, and neither the response/display cap nor an
+     unattempted target can enter the pool.
 
 Classification statuses:
   AVAILABLE, NOT_CONFIGURED, AUTH_ERROR, RATE_LIMITED,
   INSUFFICIENT_CREDITS, TIMEOUT, INVALID_MODEL, BLOCKED,
-  PROVIDER_ERROR, UNKNOWN_ERROR
+  PROVIDER_ERROR, UNKNOWN_ERROR, NOT_ATTEMPTED
+
+``NOT_ATTEMPTED`` is never a provider response: it exists only for a
+caller-imposed overall deadline that ended the run before a target could
+be tried, so a partial run can never be reported as a complete one.
 """
 from __future__ import annotations
 from backend.helper import symbols as sym
@@ -36,9 +42,9 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Callable
 
-from backend.ai.config_store import get_config
 from backend.ai.discovery import discover_providers, _get_env, get_provider_info, _PROVIDERS
 from backend.ai.model_discovery import (
+    fallback_models,
     fetch_models,
     is_chat_capable,
     order_models_for_selector,
@@ -57,19 +63,13 @@ _SECRET_PATTERNS = [
     re.compile(r"key=[a-zA-Z0-9_\-]{8,}", re.IGNORECASE),
 ]
 
-# Explicit GLOBAL diagnostic budget for one complete Test Modules run —
-# deliberately NOT a per-provider cap. Discovery may surface hundreds of
-# chat-capable models; a complete run must not silently drop eligible
-# candidates, but it also must not spend unbounded API calls. The whole
-# flat target list is truncated once at this budget (configured/default
-# model first, then discovery order). ``MODEL_TEST_GLOBAL_TEST_BUDGET=0``
-# removes the cap entirely — a resource tradeoff chosen explicitly.
-_GLOBAL_TEST_BUDGET = int(os.getenv("MODEL_TEST_GLOBAL_TEST_BUDGET", "60"))
-# Bounded concurrency: never spawn an unbounded task explosion.
+# Bounded concurrency: never spawn an unbounded task explosion. This is the
+# ONLY bound on how many models a run tests — every eligible target is
+# scheduled, so a catalog of 200 models produces 200 results.
 _TEST_CONCURRENCY = int(os.getenv("MODEL_TEST_CONCURRENCY", "4"))
 # Cap on discovered models included in the RESPONSE PAYLOAD (per provider).
-# Display/diagnostic metadata ONLY — it must NEVER bound the production
-# candidate feed, which uses the complete discovery result separately.
+# Display metadata ONLY — it never bounds which models are TESTED, and never
+# bounds the production candidate feed.
 _MODELS_IN_RESPONSE = 30
 
 
@@ -149,6 +149,25 @@ def _not_configured_result(
         "http_status": None,
         "retry_after": None,
         "error_type": None,
+        "provider_code": None,
+        "finish_reason": None,
+        "capabilities": [],
+    }
+
+
+def _not_attempted_result(target: dict[str, str]) -> dict[str, Any]:
+    """A target the run never reached — explicitly NOT a provider response."""
+    return {
+        "provider": target.get("provider", "unknown"),
+        "display_name": target.get("display_name", "Unknown"),
+        "icon": target.get("icon", sym.MEDIA_STICKER),
+        "model": target.get("model", "unknown"),
+        "status": "NOT_ATTEMPTED",
+        "error": "Not attempted — overall diagnostic deadline reached",
+        "latency_s": None,
+        "http_status": None,
+        "retry_after": None,
+        "error_type": "not_attempted",
         "provider_code": None,
         "finish_reason": None,
         "capabilities": [],
@@ -304,61 +323,66 @@ test_single_model.__test__ = False  # Tell pytest not to collect this as a test 
 
 async def _build_targets(
     providers_status: list[Any],
-    active_config: dict[str, Any],
-    max_per_provider: int | None = None,
-    global_budget: int | None = None,
 ) -> tuple[list[dict[str, str]], list[dict[str, Any]], dict[str, list[Any]]]:
-    """Select models to test per provider (discovery-driven).
+    """Select every chat-capable model of every chat provider.
 
     Returns ``(targets, discovered_models, complete_models)`` where:
       - ``targets`` is the flat list of (provider, display_name, icon,
-        model) to test (bounded by the explicit global diagnostic budget)
-      - ``discovered_models`` is the CAPPED model list for the response
-        payload (``_MODELS_IN_RESPONSE`` per provider — display only)
-      - ``complete_models`` is the COMPLETE chat-capable ModelInfo list per
-        provider — the production candidate feed. A display cap must never
-        determine which models production fallback is allowed to see.
+        model) to test — the COMPLETE eligible set
+      - ``discovered_models`` is the display-capped model list for the
+        response payload (``_MODELS_IN_RESPONSE`` per provider)
+      - ``complete_models`` is the complete chat-capable ModelInfo list per
+        provider — the production candidate feed
 
-    There is deliberately NO per-provider test cap: every chat-capable
-    candidate is eligible. The ONLY truncation of the TEST target list is
-    the explicit global diagnostic budget (``global_budget``), applied
-    ONCE to the flat list — fairly: every provider's configured/default
-    model is kept first, the remainder is distributed round-robin across
-    providers in discovery order. Priority per provider:
-      1. the user's currently selected model (when this provider is active)
-      2. the provider's default model
-      3. discovered chat-capable models, FREE-FIRST ordered (deduped)
-    ``max_per_provider`` is accepted and ignored for backward compatibility
-    with the existing batch runner signature.
+    Selection depends on the catalogs ALONE: the owner's active
+    provider/model is never read here, so the same catalogs always produce
+    the same target set. Per provider:
+      * API key present → the live discovery result, falling back to the
+        centralized catalog when it is empty or has nothing usable;
+      * no API key → that same centralized catalog, with NO request.
+
+    A missing key therefore removes neither the provider nor its models from
+    the diagnosis: they are scheduled and answer NOT_CONFIGURED without any
+    client construction or network call. Provider defaults that are not
+    members of the applicable catalog are never invented as targets, and a
+    (provider, model) pair is scheduled at most once.
+
+    Nothing truncates the target list — no global budget, no per-provider
+    cap, no slice, no priority queue. Only ``_TEST_CONCURRENCY`` bounds how
+    many run at once and the per-model timeout bounds each one.
     """
     targets: list[dict[str, str]] = []
     discovered_models: list[dict[str, Any]] = []
     complete_models: dict[str, list[Any]] = {}
+    seen_pairs: set[tuple[str, str]] = set()
 
     for p in providers_status:
         if p.capability_kind != "chat":
             continue
         base = {"provider": p.name, "display_name": p.display_name, "icon": p.icon}
 
-        if not p.has_key:
-            targets.append({**base, "model": p.default_model or ""})
-            continue
+        models: list[Any] = []
+        if p.has_key:
+            info = get_provider_info(p.name) or {}
+            api_key = _get_env(info.get("env_vars", []))
+            base_url = p.base_url or info.get("default_base_url", "")
+            if api_key:
+                try:
+                    models = await fetch_models(
+                        p.name, api_key, base_url, force_refresh=True
+                    )
+                except Exception as exc:
+                    logger.warning("Model discovery failed for %s: %s", p.name, exc)
+                    models = []
 
-        info = get_provider_info(p.name) or {}
-        api_key = _get_env(info.get("env_vars", []))
-        base_url = p.base_url or info.get("default_base_url", "")
+        if not models:
+            # No key, or a discovery result with nothing usable: the ONE
+            # centralized catalog. A provider default that is not a catalog
+            # member is never added as a phantom model.
+            models = fallback_models(p.name)
 
-        models = []
-        if api_key:
-            try:
-                models = await fetch_models(p.name, api_key, base_url, force_refresh=True)
-            except Exception as exc:
-                logger.warning("Model discovery failed for %s: %s", p.name, exc)
-                models = []
-
-        # COMPLETE production feed: every chat-capable model from this
-        # discovery result, uncapped and deduped — never sliced by the
-        # display limit below.
+        # COMPLETE feed: every chat-capable model of this catalog, uncapped
+        # and deduped — never sliced by the display limit below.
         full: list[Any] = []
         seen_full: set[str] = set()
         for m in models:
@@ -369,68 +393,22 @@ async def _build_targets(
         complete_models[p.name] = full
 
         # FREE-FIRST ordering, using the SAME deterministic selector order
-        # the model picker already applies. A provider's raw ``/models``
-        # order is arbitrary with respect to cost, and the diagnostic budget
-        # truncates the flat target list — so without this the budget could
-        # be spent on paid models before a single genuinely-free candidate
-        # was ever reached (e.g. OpenRouter's ``:free`` catalog, which sorts
-        # late in a raw alphabetical list). Ordering here makes free models
-        # testable AND visible within the same explicit budget.
+        # the model picker already applies, so a genuinely-free catalog is
+        # both visible and tested first as a matter of ordering only — never
+        # of truncation.
         ordered = order_models_for_selector(full)
 
         for m in ordered[: _MODELS_IN_RESPONSE]:
             # Response payload list must contain only chat-capable models.
             discovered_models.append(m.__dict__)
 
-        candidates: list[str] = []
-        seen: set[str] = set()
-
-        # 1. currently selected model for this provider
-        if active_config.get("provider") == p.name:
-            sel = active_config.get("model")
-            if sel and sel not in seen:
-                seen.add(sel)
-                candidates.append(sel)
-        # 2. provider default model
-        if p.default_model and p.default_model not in seen:
-            seen.add(p.default_model)
-            candidates.append(p.default_model)
-        # 3. discovered chat-capable models (free-first, deduped)
         for m in ordered:
-            if m.id in seen:
+            pair = (p.name, m.id)
+            if pair in seen_pairs:
                 continue
-            seen.add(m.id)
-            candidates.append(m.id)
+            seen_pairs.add(pair)
+            targets.append({**base, "model": m.id})
 
-        if not candidates and p.default_model:
-            candidates = [p.default_model]
-
-        for mid in candidates:
-            targets.append({**base, "model": mid})
-
-    budget = _GLOBAL_TEST_BUDGET if global_budget is None else max(0, global_budget)
-    if budget and len(targets) > budget:
-        # Fair distribution under the explicit budget: configured/default
-        # model of EVERY provider first, then round-robin the rest across
-        # providers in discovery order. Deterministic; no provider is
-        # silently dropped just because an earlier catalog is larger.
-        by_provider: dict[str, list[dict[str, str]]] = {}
-        for t in targets:
-            by_provider.setdefault(t["provider"], []).append(t)
-        fair: list[dict[str, str]] = [rows[0] for rows in by_provider.values()]
-        idx = 1
-        while len(fair) < budget:
-            progressed = False
-            for rows in by_provider.values():
-                if idx < len(rows):
-                    fair.append(rows[idx])
-                    progressed = True
-                    if len(fair) >= budget:
-                        break
-            if not progressed:
-                break
-            idx += 1
-        targets = fair[:budget]
     return targets, discovered_models, complete_models
 
 
@@ -545,21 +523,25 @@ def _feed_production_candidates(
 async def test_all_models(
     owner_id: int = 0,
     per_model_timeout: float = 8.0,
-    overall_timeout: float = 60.0,
+    overall_timeout: float | None = None,
     global_budget: int | None = None,
 ) -> dict[str, Any]:
-    """Discover configured providers/models and run availability tests.
+    """Test every chat-capable model of every chat provider.
 
+    - Every eligible target is scheduled (no budget/cap/slice).
     - Concurrent, bounded (semaphore) execution with per-model timeouts.
     - One provider failure never aborts testing of other providers.
-    - On overall timeout, completed results are kept and remaining
-      targets are reported as TIMEOUT (``partial=True``).
+    - ``overall_timeout`` defaults to None (run to completion). A caller that
+      imposes one gets every unreached target as ``NOT_ATTEMPTED`` — never as
+      a provider response — and ``partial=True``.
+    - ``global_budget`` is accepted for call-site compatibility and IGNORED:
+      it no longer truncates the target list.
     """
+    _ = global_budget  # deliberately unused: complete coverage
     providers_status = await discover_providers(force_refresh=True)
-    active_config = await get_config(owner_id)
 
     targets, discovered_models, complete_models = await _build_targets(
-        providers_status, active_config, global_budget=global_budget,
+        providers_status,
     )
 
     sem = asyncio.Semaphore(_TEST_CONCURRENCY)
@@ -578,21 +560,9 @@ async def test_all_models(
     for idx, task in enumerate(tasks):
         target_info = targets[idx] if idx < len(targets) else {"provider": "unknown", "display_name": "Unknown", "icon": sym.MEDIA_STICKER, "model": "unknown"}
         if task in pending:
-            results.append({
-                "provider": target_info["provider"],
-                "display_name": target_info["display_name"],
-                "icon": target_info["icon"],
-                "model": target_info["model"],
-                "status": "TIMEOUT",
-                "error": "Overall diagnostic timeout reached",
-                "latency_s": None,
-                "http_status": None,
-                "retry_after": None,
-                "error_type": "timeout",
-                "provider_code": None,
-                "finish_reason": None,
-                "capabilities": [],
-            })
+            # Cancelled before it ran: report it as unattempted, never as a
+            # provider TIMEOUT (the provider was never asked).
+            results.append(_not_attempted_result(target_info))
             continue
         try:
             item = task.result()
@@ -643,6 +613,7 @@ def _build_summary(results: list[dict[str, Any]], discovered_count: int) -> dict
         "error": 0,
         "timeout": 0,
         "not_configured": 0,
+        "not_attempted": 0,
         "discovered": discovered_count,
         "tested": 0,
         "failed": 0,
@@ -661,6 +632,8 @@ def _build_summary(results: list[dict[str, Any]], discovered_count: int) -> dict
             summary["available"] += 1
         elif status == "NOT_CONFIGURED":
             summary["not_configured"] += 1
+        elif status == "NOT_ATTEMPTED":
+            summary["not_attempted"] += 1
         elif status == "TIMEOUT":
             summary["timeout"] += 1
             summary["error"] += 1
@@ -686,7 +659,9 @@ def _build_summary(results: list[dict[str, Any]], discovered_count: int) -> dict
             summary["error"] += 1
             summary["unknown_error"] += 1
 
-    summary["tested"] = summary["total"] - summary["not_configured"]
+    summary["tested"] = (
+        summary["total"] - summary["not_configured"] - summary["not_attempted"]
+    )
     summary["failed"] = summary["unavailable"] + summary["error"] + summary["timeout"]
     return summary
 
@@ -697,7 +672,7 @@ test_all_models.__test__ = False  # Tell pytest not to collect this as a test fu
 async def test_all_models_streaming(
     owner_id: int = 0,
     per_model_timeout: float = 8.0,
-    overall_timeout: float = 60.0,
+    overall_timeout: float | None = None,
     global_budget: int | None = None,
     on_progress: Callable[[int, int], None] | None = None,
     on_result: Callable[[dict[str, Any]], None] | None = None,
@@ -705,17 +680,17 @@ async def test_all_models_streaming(
     """Streaming twin of ``test_all_models`` (same targets, same results).
 
     Identical discovery, target selection, bounded concurrency, per-model
-    timeout, overall timeout, and result shape as the batch runner — the
-    only difference is that ``on_progress`` fires after every completion and
-    ``on_result`` after every result. Used by the Telegram Test Modules UI
-    to drive a throttled progress panel; the batch runner stays untouched
-    for the web dashboard.
+    timeout, overall-timeout semantics and result shape as the batch runner —
+    the only difference is that ``on_progress`` fires after every completion
+    and ``on_result`` after every result. The two paths therefore always
+    cover the same models; a run cannot be complete in one and truncated in
+    the other. ``global_budget`` is accepted and IGNORED.
     """
+    _ = global_budget  # deliberately unused: complete coverage
     providers_status = await discover_providers(force_refresh=True)
-    active_config = await get_config(owner_id)
 
     targets, discovered_models, complete_models = await _build_targets(
-        providers_status, active_config, global_budget=global_budget,
+        providers_status,
     )
 
     total = len(targets)
@@ -782,21 +757,7 @@ async def test_all_models_streaming(
             "provider": "unknown", "display_name": "Unknown", "icon": sym.MEDIA_STICKER, "model": "unknown",
         }
         if task in pending:
-            results.append(await _note({
-                "provider": target_info["provider"],
-                "display_name": target_info["display_name"],
-                "icon": target_info["icon"],
-                "model": target_info["model"],
-                "status": "TIMEOUT",
-                "error": "Overall diagnostic timeout reached",
-                "latency_s": None,
-                "http_status": None,
-                "retry_after": None,
-                "error_type": "timeout",
-                "provider_code": None,
-                "finish_reason": None,
-                "capabilities": [],
-            }))
+            results.append(await _note(_not_attempted_result(target_info)))
             continue
         try:
             item = task.result()

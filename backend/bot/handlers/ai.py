@@ -1264,6 +1264,9 @@ async def _ai_start_chat_action(event, extra: str, chat_id: int) -> tuple[str, s
 _TEST_STATUS_ICONS: dict[str, str] = {
     "AVAILABLE": sym.OP_SAVE,
     "NOT_CONFIGURED": "·",
+    # Unreached targets are marked pending (plain Unicode, like the rest of
+    # the status vocabulary) so they read as "not asked", not as a failure.
+    "NOT_ATTEMPTED": "…",
     "AUTH_ERROR": sym.STATE_FAILED,
     "RATE_LIMITED": sym.STATE_FAILED,
     "TIMEOUT": "…",
@@ -1469,6 +1472,10 @@ def _render_test_results(
     return "\n".join(lines).rstrip(), builder.build()
 
 
+#: Character budget for one All Results page. Telegram rejects a message over
+#: 4096 characters, and a complete run now spans every provider's catalog.
+_ALL_RESULTS_PAGE_CHARS = 3000
+
 _test_running = False
 
 
@@ -1544,13 +1551,18 @@ async def _ai_test_details_action(event, extra: str, chat_id: int) -> tuple[str,
         _nav_buttons(builder)
         return "Test Modules", "**All Results**\n\n_◌ No results yet. Tap **Run Tests** first._", builder.build()
 
-    lines = ["**All Results**\n"]
+    # One block per result; a provider heading is carried into whichever page
+    # its first model lands on, so a page never shows a bare model list.
+    blocks: list[tuple[str, list[str]]] = []
     current_provider = None
+    heading = ""
     for r in sorted(results, key=lambda x: (x.get("provider", ""), x.get("model", ""))):
         provider = r.get("provider", "?")
+        block: list[str] = []
         if provider != current_provider:
             current_provider = provider
-            lines.append(f"**{r.get('display_name', provider)}**")
+            heading = f"**{r.get('display_name', provider)}**"
+            block.append(heading)
         status = r.get("status", "UNKNOWN_ERROR")
         icon = _TEST_STATUS_ICONS.get(status, "×")
         model = r.get("model", "?")
@@ -1558,16 +1570,52 @@ async def _ai_test_details_action(event, extra: str, chat_id: int) -> tuple[str,
         latency = r.get("latency_s")
         if latency is not None:
             line += f" · {latency}s"
-        lines.append(line)
+        block.append(line)
         if r.get("http_status"):
-            lines.append(f"      _HTTP {r['http_status']}_")
+            block.append(f"      _HTTP {r['http_status']}_")
         if r.get("retry_after"):
-            lines.append(f"      _retry-after: {r['retry_after']}s_")
+            block.append(f"      _retry-after: {r['retry_after']}s_")
         if r.get("error"):
-            lines.append(f"      _{r['error'][:160]}_")
-        lines.append("")
+            block.append(f"      _{r['error'][:160]}_")
+        block.append("")
+        blocks.append((heading, block))
+
+    # Pagination over the COMPLETE result set: a full-coverage run can be far
+    # larger than one Telegram message, so every result stays reachable
+    # instead of the message being rejected as too long.
+    pages: list[list[str]] = []
+    page: list[str] = []
+    size = 0
+    for heading, block in blocks:
+        block_size = sum(len(item) + 1 for item in block)
+        if page and size + block_size > _ALL_RESULTS_PAGE_CHARS:
+            pages.append(page)
+            page, size = [], 0
+            if heading and heading not in block:
+                page.append(heading)
+                size += len(heading) + 1
+        page.extend(block)
+        size += block_size
+    if page or not pages:
+        pages.append(page)
+
+    try:
+        page_no = max(0, min(int((extra or "0").strip() or 0), len(pages) - 1))
+    except (TypeError, ValueError):
+        page_no = 0
+
+    lines = [f"**All Results** · {len(results)} models · page {page_no + 1}/{len(pages)}\n"]
+    lines.extend(pages[page_no])
 
     builder = InlinePanelBuilder()
+    if len(pages) > 1:
+        nav: list[tuple[str, str]] = []
+        if page_no > 0:
+            nav.append((sym.label(sym.OP_PREV, "Prev"), f"action:ai_test_details:{page_no - 1}"))
+        nav.append((f"{page_no + 1}/{len(pages)}", "panel:_nav:noop"))
+        if page_no < len(pages) - 1:
+            nav.append((sym.label(sym.OP_NEXT, "Next"), f"action:ai_test_details:{page_no + 1}"))
+        builder.add_buttons(*nav)
     builder.add_row(sym.label(sym.OP_REFRESH, "Re-run Tests"), "action:ai_test_models")
     builder.add_row(sym.label(sym.CONTENT_STATIC, "Pick Model"), "panel:ai_model")
     _nav_buttons(builder)
