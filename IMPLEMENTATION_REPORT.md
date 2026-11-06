@@ -185,7 +185,8 @@ Added (no existing test modified):
 | Check | Command | Result |
 |---|---|---|
 | Focused new tests | `.venv/bin/python -m pytest tests/test_aed_silent_logging.py tests/test_ai_tool_lifecycle_observability.py -q` | **24 passed** |
-| Broader relevant suite | AED + AI tool/dispatcher/task/todo/memory/scope suites (20 files, listed in §6) | **630 passed** |
+| Broader relevant suite (task tree) | AED + AI tool/dispatcher/task/todo/memory/scope suites (20 files) | **630 passed** |
+| Post-merge verification (delivered HEAD) | AED + AI tool/dispatcher + provider-policy/fallback-logging/runtime-wiring suites (14 files) | **328 passed** |
 | Compilation | `python -m py_compile` on all changed/new modules, then the whole `backend/` tree | passed |
 | Whitespace | `git diff --check` | clean |
 
