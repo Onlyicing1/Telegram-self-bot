@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 from urllib.parse import quote, unquote
 
 from telethon import types
+from telethon.errors import FloodWaitError
 
 from backend.helper import (
     InlinePanelBuilder,
@@ -187,7 +188,12 @@ async def _send_text(client, chat_id: int, text: str, label: str) -> bool:
 
 async def _resolve_entity(event, name: str):
     """Resolve ONE entity through the event. A failure is a verdict, never a
-    fallback to a weaker check (the gate then rejects the event)."""
+    fallback to a weaker check or to a second RPC (the gate rejects instead).
+
+    A FloodWait is not a generic failure: it is recorded as a bounded
+    process-local deadline so the NEXT messages do not spend another entity
+    RPC while Telegram is still rate limiting us.
+    """
     getter = getattr(event, name, None)
     if getter is None:
         return None
@@ -195,6 +201,13 @@ async def _resolve_entity(event, name: str):
         return await getter()
     except asyncio.CancelledError:
         raise
+    except FloodWaitError as exc:
+        wait_s = service.note_entity_floodwait(getattr(exc, "seconds", 0))
+        logger.warning(
+            "PRIVATE_MESSAGE_TRACE stage=entity_floodwait entity=%s wait_s=%s",
+            name, wait_s,
+        )
+        return None
     except Exception as exc:
         logger.warning(
             "PRIVATE_MESSAGE_TRACE stage=%s_unresolved error=%s", name, type(exc).__name__
@@ -202,33 +215,56 @@ async def _resolve_entity(event, name: str):
         return None
 
 
+def _scope_facts(event, owner_id: int) -> dict:
+    """The event's own identity facts — no I/O, no configuration load."""
+    message = getattr(event, "message", None)
+    peer = getattr(message, "peer_id", None)
+    return {
+        "owner_id": owner_id,
+        "is_private": getattr(event, "is_private", None),
+        "is_group": getattr(event, "is_group", None),
+        "is_channel": getattr(event, "is_channel", None),
+        "chat_id": getattr(event, "chat_id", None),
+        "sender_id": getattr(event, "sender_id", None),
+        "message_id": _event_message_id(event),
+        "peer_user_id": getattr(peer, "user_id", None),
+    }
+
+
 async def resolve_scope(event, owner_id: int) -> service.ScopeVerdict:
     """The enforcement entry point's scope gate.
 
-    Gathers the event's own chat/sender facts AND resolves both entities through
-    the EXISTING self client, then lets ``private_message_service.classify_scope``
-    decide. A private chat with a BOT, a group, a supergroup, a channel, a linked
-    discussion group, an outgoing message, a contradictory id set, a missing
-    entity or an entity that is not a real user all end in a rejection — and a
+    The identity prefilter runs FIRST and performs no I/O: only an event whose
+    own facts describe a strict direct-private chat (``peer == chat ==
+    sender``, a positive message id, not the owner) may reach entity
+    resolution. In such a chat chat and sender are the SAME Telegram user, so
+    ONE authoritative ``get_sender`` lookup supplies both entity halves; the
+    existing classifier still proves the User type, the matching id, the bot
+    flag and deletion state, and a failure is a rejection — never a fallback to
+    a second getter or a weaker check. A private chat with a BOT, a group, a
+    supergroup, a channel, a linked discussion group, an outgoing message, a
+    contradictory id set or an unresolved entity all end in a rejection, and a
     rejection performs no action of any kind.
     """
-    message = getattr(event, "message", None)
-    peer = getattr(message, "peer_id", None)
-    chat_entity = await _resolve_entity(event, "get_chat")
-    sender_entity = await _resolve_entity(event, "get_sender")
+    facts = _scope_facts(event, owner_id)
+    reason = service.identity_rejection(**facts)
+    if reason is not None:
+        return service.ScopeVerdict(False, reason)
+
+    # An active FloodWait is a verdict, not a retry: no RPC until it expires.
+    if service.entity_floodwait_remaining() > 0:
+        logger.debug("PRIVATE_MESSAGE_TRACE stage=entity_floodwait_suppressed")
+        return service.ScopeVerdict(False, service.SCOPE_ENTITY_FLOODWAIT)
+
+    entity = await _resolve_entity(event, "get_sender")
+    if entity is None:
+        return service.ScopeVerdict(False, service.SCOPE_SENDER_UNRESOLVED)
     return service.classify_scope(
-        owner_id=owner_id,
-        is_private=getattr(event, "is_private", None),
-        is_group=getattr(event, "is_group", None),
-        is_channel=getattr(event, "is_channel", None),
-        chat_id=getattr(event, "chat_id", None),
-        sender_id=getattr(event, "sender_id", None),
-        message_id=_event_message_id(event),
-        peer_user_id=getattr(peer, "user_id", None),
-        chat_is_user=isinstance(chat_entity, types.User),
-        sender_is_user=isinstance(sender_entity, types.User),
-        chat_entity=chat_entity,
-        sender_entity=sender_entity,
+        **facts,
+        chat_is_user=isinstance(entity, types.User),
+        sender_is_user=isinstance(entity, types.User),
+        chat_entity=entity,
+        sender_entity=entity,
     )
 
 
@@ -417,6 +453,14 @@ async def enforce_incoming(client, event, owner_id: int) -> bool:
     mark: tuple[int, int] | None = None
     try:
         if getattr(event, "out", None) is True:
+            return True
+
+        # Zero-I/O prefilter FIRST: a group, channel, outgoing or contradictory
+        # event must not load configuration or resolve any entity.
+        facts = _scope_facts(event, owner_id)
+        precheck = service.identity_rejection(**facts)
+        if precheck is not None:
+            logger.debug("PRIVATE_MESSAGE_TRACE stage=out_of_scope reason=%s", precheck)
             return True
 
         # The persisted policy is resolved before the FIRST decision, so a
