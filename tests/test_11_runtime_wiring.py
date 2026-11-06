@@ -555,7 +555,10 @@ async def test_gemini_continuation_through_dispatcher():
     # (GeminiProvider does not record calls; verify via the mock instead)
     post_kwargs = provider._http_client.post.call_args_list[1].kwargs
     payload = post_kwargs["json"]
-    assert any(p.get("role") == "model" for p in payload["contents"])
+    # The continuation must be user(text) -> model(functionCall) ->
+    # user(functionResponse): responses belong to a USER turn.
+    assert [p.get("role") for p in payload["contents"]] == ["user", "model", "user"]
+    assert "functionResponse" in payload["contents"][-1]["parts"][0]
 
 
 # ── 9. OpenAI-compatible continuation with multiple tool calls ──

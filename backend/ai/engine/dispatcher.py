@@ -90,26 +90,43 @@ _VERBATIM_READ_TOOLS = frozenset(
     {"get_bio", "task_list", "translate_history", "summarize_history", "preview_save"}
 )
 
-# Read tools whose result is a PREREQUISITE for a CAS-guarded mutation in the
-# same request: task_transition/task_delete need the task's CURRENT version,
-# which only task_list/task_inspect can supply. A round that executed only
-# these tools therefore gets one continuation round before the verbatim
-# short-circuit applies (see Dispatcher._read_round_may_continue).
-_CAS_READ_TOOLS = frozenset({"task_list", "task_inspect"})
+# Read-then-act continuation policy (no tool-name subset any more): a read is a
+# PREREQUISITE for a later action just as often outside the task lifecycle: "pause task 11" needed task_list's CURRENT version (and
+# task_transition's CAS check), but "preview save 3 then rename it", "what's my
+# bio, then set it to ..." and a translate/summarize followed by "now send it"
+# are the same shape. The short-circuit therefore defers the verbatim text for
+# ONE continuation round for EVERY verbatim read tool (see
+# ``verbatim_read_pending`` in ``dispatch``) instead of a hard-coded subset.
+# The anti-paraphrase guarantee is unchanged: when the continuation produces no
+# tool call, the tool's own text is delivered verbatim.
 
 
-def _read_round_may_continue(tool_calls: list[dict[str, Any]]) -> bool:
-    """True when a read-only round may be a prerequisite for a mutation.
+_PARAM_DESCRIPTION_CHARS = 60
 
-    ``task_list``/``task_inspect`` feed the CAS-guarded task lifecycle tools,
-    which require the task's CURRENT version -- so a request such as "pause
-    task 11" legitimately reads first and mutates in the next round. Such a
-    round gets one continuation instead of the immediate verbatim
-    short-circuit; when the continuation produces no further tool call, the
-    verbatim tool output is delivered exactly as before.
+
+def _render_param(name: str, descriptor: Any, required: bool) -> str:
+    """Render one declared parameter as ``name*(type: description)``.
+
+    ``*`` marks a DECLARED required parameter (never inferred from a missing
+    ``default``); the type and description come from the registry descriptor,
+    and the description is whitespace-normalized and bounded so all 55 tools
+    stay a compact prompt block.
     """
-    names = {call.get("name", "") for call in tool_calls}
-    return bool(names) and names <= _CAS_READ_TOOLS
+    param_type = "any"
+    description = ""
+    if isinstance(descriptor, dict):
+        raw_type = descriptor.get("type")
+        if isinstance(raw_type, str) and raw_type.strip():
+            param_type = raw_type.strip()
+        raw_description = descriptor.get("description")
+        if isinstance(raw_description, str):
+            description = " ".join(raw_description.split())
+    if len(description) > _PARAM_DESCRIPTION_CHARS:
+        description = description[: _PARAM_DESCRIPTION_CHARS - 1].rstrip() + "…"
+    mark = "*" if required else ""
+    if description:
+        return f"{name}{mark}({param_type}: {description})"
+    return f"{name}{mark}({param_type})"
 
 
 _BLOCKED_FINISH_TOKENS = ("SAFETY", "RECITATION", "CONTENT_FILTER", "BLOCKED")
@@ -753,9 +770,12 @@ class Dispatcher:
         # the exhaustion handler never re-executes and never discards.
         last_round_executed = False
         # Verbatim read result held back for one continuation round so a
-        # read-then-mutate request can finish (see _read_round_may_continue).
+        # read-then-act request can finish (see the deferral inside the loop).
         verbatim_read_pending: str | None = None
         round_execution_failed = False
+        # A tool result that EXECUTED but could not be written to conversation
+        # history is its own condition -- never reported as "not executed".
+        tool_result_recording_failed = False
 
         for round_num in range(MAX_TOOL_ROUNDS):
             round_no = round_num + 1
@@ -822,6 +842,11 @@ class Dispatcher:
                     context_override=per_request_ctx,
                     round_no=round_no,
                 )
+                # EXECUTION happened. This is recorded BEFORE any history or
+                # metadata write, so a later bookkeeping failure can never
+                # classify an executed call as "not executed" at the limit.
+                tool_rounds_executed = round_num + 1
+                last_round_executed = True
                 for index, er in enumerate(exec_results):
                     tool_events.emit(
                         "AI_TOOL_RESULT_RETURNED",
@@ -855,16 +880,26 @@ class Dispatcher:
                     # failures never silently disappear from history.
                     marker = sym.OP_SAVE if er.success else sym.STATE_FAILED
                     detail = er.message or er.error or "no message"
-                    self._conversation.add_tool_result(
-                        owner_id=request.owner_id,
-                        tool_name=er.tool_name,
-                        result=f"{marker} {detail}",
-                    )
+                    try:
+                        self._conversation.add_tool_result(
+                            owner_id=request.owner_id,
+                            tool_name=er.tool_name,
+                            result=f"{marker} {detail}",
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        # The tool RAN; only recording its outcome failed. A
+                        # history write must not abort the round, drop the real
+                        # result, or become "the call never executed".
+                        tool_result_recording_failed = True
+                        warnings.append(
+                            f"tool_history_round_{round_num + 1}: "
+                            f"{type(exc).__name__}"
+                        )
                 metadata["tool_results"] = all_tool_results
                 metadata["tool_rounds"] = round_num + 1
                 metadata["stages"].append(f"tool_execution_round_{round_num + 1}")
-                tool_rounds_executed = round_num + 1
-                last_round_executed = True
+                if tool_result_recording_failed:
+                    metadata["tool_result_recording_failed"] = True
 
                 # Permission-gated outcomes: create the bounded pending
                 # owner approval and stop the round (no continuation round
@@ -891,31 +926,20 @@ class Dispatcher:
                 # (production: a real bio was regenerated as unrelated text).
                 # Same contract as the structured-action path above.
                 if self._read_results_authoritative(response.tool_calls, exec_results):
-                    if _read_round_may_continue(response.tool_calls):
-                        # Live regression: "pause task 11" resolved to a single
-                        # task_list round, the verbatim short-circuit returned
-                        # the list, and the requested mutation was never
-                        # requested again. The calls already ran, so they are
-                        # never re-executed; the verbatim text is delivered
-                        # below unless the continuation proves the request
-                        # continues with a real tool call.
-                        verbatim_read_pending = self._summarize_tool_results(all_tool_results)
-                        response = replace(response, tool_calls=[], text="")
-                        logger.info(
-                            "AI_EXEC_TRACE id=%s stage=verbatim_tool_result_deferred tools=%s",
-                            rid or "-", [er.tool_name for er in exec_results],
-                        )
-                    else:
-                        logger.info(
-                            "AI_EXEC_TRACE id=%s stage=verbatim_tool_result tools=%s",
-                            rid or "-", [er.tool_name for er in exec_results],
-                        )
-                        response = replace(
-                            response,
-                            tool_calls=[],
-                            text=self._summarize_tool_results(all_tool_results),
-                        )
-                        break
+                    # Live regressions: "pause task 11" resolved to a single
+                    # task_list round and the verbatim short-circuit returned
+                    # the list, so the requested mutation was never requested
+                    # again. The calls already ran, so they are never
+                    # re-executed; the verbatim text is delivered below unless
+                    # the continuation proves the request continues with a real
+                    # tool call. This applies to EVERY verbatim read tool, not
+                    # a hard-coded task-only subset.
+                    verbatim_read_pending = self._summarize_tool_results(all_tool_results)
+                    response = replace(response, tool_calls=[], text="")
+                    logger.info(
+                        "AI_EXEC_TRACE id=%s stage=verbatim_tool_result_deferred tools=%s",
+                        rid or "-", [er.tool_name for er in exec_results],
+                    )
             except Exception as exc:  # noqa: BLE001
                 round_execution_failed = True
                 warnings.append(f"tool_execution_round_{round_num + 1}: {exc}")
@@ -1079,6 +1103,7 @@ class Dispatcher:
                     f"after {tool_rounds_executed} round(s) (MAX_TOOL_ROUNDS={MAX_TOOL_ROUNDS})"
                 )
             else:
+                salvage_executed = False
                 try:
                     _stage("TOOL_EXECUTION")
                     logger.info(
@@ -1098,17 +1123,26 @@ class Dispatcher:
                         context_override=per_request_ctx,
                         round_no=tool_rounds_executed + 1,
                     )
+                    salvage_executed = True
                     for er in salvage_results:
                         all_tool_results.append(er.as_dict())
                         if er.needs_confirmation:
                             continue
                         marker = sym.OP_SAVE if er.success else sym.STATE_FAILED
                         detail = er.message or er.error or "no message"
-                        self._conversation.add_tool_result(
-                            owner_id=request.owner_id,
-                            tool_name=er.tool_name,
-                            result=f"{marker} {detail}",
-                        )
+                        try:
+                            self._conversation.add_tool_result(
+                                owner_id=request.owner_id,
+                                tool_name=er.tool_name,
+                                result=f"{marker} {detail}",
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            # Executed, but not recorded: a distinct state from
+                            # "never executed", and never a re-execution.
+                            tool_result_recording_failed = True
+                            warnings.append(
+                                f"tool_history_at_limit: {type(exc).__name__}"
+                            )
                         tool_events.emit(
                             "AI_TOOL_RESULT_RETURNED",
                             request_id=rid,
@@ -1125,6 +1159,8 @@ class Dispatcher:
                     metadata["tool_results"] = all_tool_results
                     metadata["stages"].append("pending_tool_execution_at_limit")
                     metadata["pending_calls_executed_at_limit"] = True
+                    if tool_result_recording_failed:
+                        metadata["tool_result_recording_failed"] = True
                     # Permission-gated salvage: turn the blocked call into a
                     # pending owner approval instead of claiming it ran.
                     salvage_confirmation = self._gate_confirmation_results(
@@ -1149,20 +1185,31 @@ class Dispatcher:
                         rid or "-", len(salvage_results), tool_rounds_executed, MAX_TOOL_ROUNDS,
                     )
                 except Exception as exc:  # noqa: BLE001
-                    rounds_exhausted = True
-                    metadata["tool_rounds_exhausted"] = True
-                    metadata["tool_rounds_executed"] = tool_rounds_executed
-                    metadata["pending_tool_calls"] = [
-                        {"name": tc.get("name", ""), "id": tc.get("id", "")}
-                        for tc in salvage_calls
-                    ]
                     warnings.append(f"pending_tool_execution_at_limit: {exc}")
-                    warnings.append(
-                        f"tool_round_limit_reached: {len(salvage_calls)} pending tool call(s) "
-                        f"after {tool_rounds_executed} round(s) (MAX_TOOL_ROUNDS={MAX_TOOL_ROUNDS})"
-                    )
+                    if salvage_executed:
+                        # They RAN. Claiming "not executed" here is exactly the
+                        # misclassification this handler must never produce: no
+                        # re-execution, no round-limit claim, real results kept.
+                        tool_result_recording_failed = True
+                        metadata["tool_result_recording_failed"] = True
+                        metadata["pending_calls_executed_at_limit"] = True
+                        metadata["tool_results"] = all_tool_results
+                        response = replace(response, tool_calls=[])
+                    else:
+                        rounds_exhausted = True
+                        metadata["tool_rounds_exhausted"] = True
+                        metadata["tool_rounds_executed"] = tool_rounds_executed
+                        metadata["pending_tool_calls"] = [
+                            {"name": tc.get("name", ""), "id": tc.get("id", "")}
+                            for tc in salvage_calls
+                        ]
+                        warnings.append(
+                            f"tool_round_limit_reached: {len(salvage_calls)} pending tool call(s) "
+                            f"after {tool_rounds_executed} round(s) (MAX_TOOL_ROUNDS={MAX_TOOL_ROUNDS})"
+                        )
                     logger.warning(
-                        "AI_TOOL_PENDING_EXEC_FAILED id=%s error=%s", rid or "-", exc
+                        "AI_TOOL_PENDING_EXEC_FAILED id=%s executed=%s error=%s",
+                        rid or "-", salvage_executed, exc,
                     )
 
         logger.info(
@@ -2071,24 +2118,38 @@ class Dispatcher:
 
         Required parameters are marked with ``*`` from the SAME declared
         requiredness the native schemas carry, so the two representations of
-        the tool contract cannot disagree.
+        the tool contract cannot disagree. Parameter names, types and available
+        descriptions are rendered for every tool, whatever the schema shape.
         """
         if not schemas:
             return ""
         lines = ["[Available Tools] (name* = required)"]
         for s in schemas:
-            params = s.get("parameters", {})
-            required = set(s.get("required") or [])
+            raw_params = s.get("parameters") or {}
+            # ``list_schemas()`` returns a FLAT property map (param name ->
+            # descriptor) plus the DECLARED requiredness; only a full JSON
+            # schema carries a "properties" key. Reading "properties" alone
+            # rendered no parameter at all for all 55 tools (0/55 measured),
+            # so the model never saw the arguments of the tools it was asked to
+            # call. Mirror ``_build_tool_definitions``: handle BOTH shapes.
+            props: dict[str, Any] = {}
+            if isinstance(raw_params, dict):
+                if "properties" in raw_params:
+                    raw_props = raw_params.get("properties")
+                    props = raw_props if isinstance(raw_props, dict) else {}
+                    required = set(raw_params.get("required") or [])
+                else:
+                    props = raw_params
+                    required = set(s.get("required") or [])
+            else:
+                required = set()
             param_str = ""
-            if isinstance(params, dict):
-                props = params.get("properties", {})
-                if props:
-                    parts = []
-                    for pname, pinfo in props.items():
-                        ptype = pinfo.get("type", "any") if isinstance(pinfo, dict) else "any"
-                        mark = "*" if pname in required else ""
-                        parts.append(f"{pname}{mark}({ptype})")
-                    param_str = ", ".join(parts)
+            if props:
+                parts = [
+                    _render_param(pname, pinfo, pname in required)
+                    for pname, pinfo in props.items()
+                ]
+                param_str = ", ".join(parts)
             level = s.get("permission_level", "")
             if level in ("admin_only", "confirmation_required"):
                 safe_badge = "needs-confirm"

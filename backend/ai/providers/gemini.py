@@ -186,22 +186,45 @@ class GeminiProvider(BaseProvider):
         # dropping the rules/output contract for every Gemini-routed request.
         system_parts: list[str] = []
         contents: list[dict[str, Any]] = []
+        # Gemini's contract puts function responses in a USER turn, and every
+        # response answering one function-call turn belongs to the SAME
+        # Content, in call order. The previous mapping emitted one ``model``
+        # turn per response, which Gemini does not accept: a two-call turn
+        # became model(functionCall, functionCall) -> model(functionResponse)
+        # -> model(functionResponse), so the conversation could not continue.
+        # Responses are accumulated here and flushed as ONE user Content
+        # immediately before the next non-response turn.
+        pending_responses: list[dict[str, Any]] = []
+
+        def _flush_tool_responses() -> None:
+            if pending_responses:
+                contents.append({"role": "user", "parts": list(pending_responses)})
+                pending_responses.clear()
+
         for msg in messages:
             role = msg.get("role", "user")
             content = msg.get("content", "")
-            if role == "system":
-                if isinstance(content, str) and content:
-                    system_parts.append(content)
-            elif role == "tool":
-                tool_name = msg.get("name", "")
+            if role == "tool":
+                tool_name = str(msg.get("name", "") or "")
                 try:
                     result_data = json.loads(content) if isinstance(content, str) else content
                 except (json.JSONDecodeError, TypeError):
                     result_data = {"raw": content}
-                contents.append({
-                    "role": "model",
-                    "parts": [{"functionResponse": {"name": tool_name, "response": {"name": tool_name, "content": result_data}}}],
-                })
+                function_response: dict[str, Any] = {
+                    "name": tool_name,
+                    "response": {"name": tool_name, "content": result_data},
+                }
+                call_id = str(msg.get("tool_call_id", "") or "").strip()
+                if call_id:
+                    # Echo the id of the call this response answers, so a
+                    # multi-call turn's responses stay matched to their calls.
+                    function_response["id"] = call_id
+                pending_responses.append({"functionResponse": function_response})
+                continue
+            _flush_tool_responses()
+            if role == "system":
+                if isinstance(content, str) and content:
+                    system_parts.append(content)
             elif role == "assistant" and msg.get("tool_calls"):
                 parts: list[dict[str, Any]] = []
                 if content:
@@ -213,11 +236,20 @@ class GeminiProvider(BaseProvider):
                         args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
                     except (json.JSONDecodeError, TypeError):
                         args = {}
-                    parts.append({"functionCall": {"name": fn.get("name", ""), "args": args}})
+                    function_call: dict[str, Any] = {
+                        "name": fn.get("name", ""), "args": args,
+                    }
+                    call_id = str(tc.get("id", "") or "").strip()
+                    if call_id:
+                        # Gemini echoes this id back on the function call, so
+                        # the response can be matched to the exact call.
+                        function_call["id"] = call_id
+                    parts.append({"functionCall": function_call})
                 contents.append({"role": "model", "parts": parts})
             else:
                 gemini_role = "user" if role == "user" else "model"
                 contents.append({"role": gemini_role, "parts": [{"text": content}]})
+        _flush_tool_responses()
 
         payload: dict[str, Any] = {
             "contents": contents,

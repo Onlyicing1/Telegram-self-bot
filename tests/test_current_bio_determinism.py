@@ -72,11 +72,14 @@ async def test_bio_engine_state_never_reaches_current_bio_result():
 
 
 @pytest.mark.asyncio
-async def test_native_tool_call_round_returns_bio_verbatim_without_continuation():
+async def test_native_tool_call_round_returns_bio_verbatim_and_rejects_the_restyle():
     """If the PROVIDER path emits get_bio natively, the result is still verbatim.
 
-    The continuation provider round (where the model could restyle the
-    value) is skipped for verbatim-read tools.
+    A verbatim-read round defers its text for ONE continuation round so a
+    read-then-act request can still request its action ("what's my bio, then
+    set it to ..."). When that continuation does not continue the request,
+    the tool's own text is delivered unchanged -- the model's restyle attempt
+    never reaches the owner.
     """
     from backend.ai.engine.dispatcher import Dispatcher
     from backend.ai.engine.hooks import NOOP_HOOKS
@@ -174,8 +177,9 @@ async def test_native_tool_call_round_returns_bio_verbatim_without_continuation(
     assert REAL_BIO in result.response
     assert ENGINE_STATE not in result.response
     assert "𝓝" not in result.response
-    # Round 1 ran the tool; the restyling continuation round never happened.
-    assert provider.calls == 1
+    # Round 1 ran the tool and exactly ONE continuation was attempted; its
+    # restyled text was discarded in favour of the tool's own output.
+    assert provider.calls == 2
 
 
 @pytest.mark.asyncio

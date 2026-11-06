@@ -107,10 +107,15 @@ async def test_gemini_maps_non_system_turns_in_order():
     await provider.chat(messages)
 
     contents = _payload(provider)["contents"]
-    assert [c["role"] for c in contents] == ["user", "model", "model", "user"]
+    # Gemini's contract sends function responses in a USER turn — the call
+    # turn is ``model`` and its response turn is ``user``. The previous
+    # expectation (["user", "model", "model", "user"]) pinned the defect.
+    assert [c["role"] for c in contents] == ["user", "model", "user", "user"]
     assert contents[0]["parts"][0]["text"] == "first"
     assert "functionCall" in contents[1]["parts"][0]
+    assert contents[1]["parts"][0]["functionCall"]["id"] == "c1"
     assert "functionResponse" in contents[2]["parts"][0]
+    assert contents[2]["parts"][0]["functionResponse"]["id"] == "c1"
     assert contents[3]["parts"][0]["text"] == "second"
 
 
