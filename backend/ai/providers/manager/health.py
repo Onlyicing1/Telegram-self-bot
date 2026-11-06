@@ -80,6 +80,67 @@ FAILURE_CATEGORIES: frozenset[str] = frozenset({
 })
 
 
+#: What a provider's own 429 body establishes about the limit's scope. The
+#: router must not invent a scope the response does not prove.
+_PROVIDER_QUOTA_MARKERS: tuple[str, ...] = (
+    "insufficient_quota",
+    "insufficient quota",
+    "exceeded your current quota",
+    "billing",
+    "credit balance",
+    "out of credits",
+    "account_deactivated",
+    "account deactivated",
+    "payment required",
+)
+
+#: Markers of a limit the provider describes PER MODEL.
+_MODEL_SCOPE_MARKERS: tuple[str, ...] = (
+    "rate limit reached for model",
+    "rate limit reached for",
+    "model rate limit",
+    "requests per minute for",
+    "tokens per minute for",
+)
+
+
+def classify_rate_limit_scope(metadata: dict[str, Any] | None, model: str = "") -> str:
+    """Return the rate-limit scope the provider's own 429 evidence establishes.
+
+    ``"model"`` only when the response names THIS model and describes a
+    model-level limit; ``"provider"`` for account/quota/billing limits;
+    otherwise ``"unknown"`` — which the router treats as provider-wide,
+    because firing a possibly-exhausted shared quota at every sibling model
+    is exactly what this distinction exists to prevent.
+    """
+    meta = metadata or {}
+    explicit = str(meta.get("rate_limit_scope") or "").strip().lower()
+    if explicit in ("model", "provider"):
+        return explicit
+    text = " ".join(
+        str(meta.get(key) or "")
+        for key in (
+            "provider_error_message",
+            "provider_error_code",
+            "provider_error_type",
+            "error",
+            "text",
+        )
+    ).lower()
+    if not text.strip():
+        return "unknown"
+    if any(marker in text for marker in _PROVIDER_QUOTA_MARKERS):
+        return "provider"
+    model_id = (model or "").strip().lower()
+    if (
+        model_id
+        and model_id in text
+        and any(marker in text for marker in _MODEL_SCOPE_MARKERS)
+    ):
+        return "model"
+    return "unknown"
+
+
 class ProviderHealthState:
     HEALTHY = "healthy"
     COOLING_DOWN = "cooling_down"
@@ -106,6 +167,8 @@ class ProviderHealthTracker:
         "_consecutive_successes",
         "_quarantine_until",
         "_last_failure_category",
+        "_model_until",
+        "_model_failures",
     )
 
     def __init__(
@@ -122,6 +185,8 @@ class ProviderHealthTracker:
         self._consecutive_successes: dict[str, int] = {}
         self._quarantine_until: dict[str, float] = {}
         self._last_failure_category: dict[str, str] = {}
+        self._model_until: dict[tuple[str, str], float] = {}
+        self._model_failures: dict[tuple[str, str], int] = {}
 
     # ── State ──
 
@@ -238,6 +303,64 @@ class ProviderHealthTracker:
         already recovered) — callers must not guess a reason.
         """
         return self._last_failure_category.get(name, "")
+
+    # ── Model-level state ──
+
+    def model_state(self, name: str, model: str) -> str:
+        if not model:
+            return ProviderHealthState.HEALTHY
+        until = self._model_until.get((name, model))
+        if until is not None and time.monotonic() < until:
+            return ProviderHealthState.COOLING_DOWN
+        return ProviderHealthState.HEALTHY
+
+    def is_model_available(self, name: str, model: str) -> bool:
+        return self.model_state(name, model) == ProviderHealthState.HEALTHY
+
+    def model_cooldown_remaining(self, name: str, model: str) -> float:
+        until = self._model_until.get((name, model))
+        if until is None:
+            return 0.0
+        return max(0.0, until - time.monotonic())
+
+    def model_failure_streak(self, name: str, model: str) -> int:
+        return self._model_failures.get((name, model), 0)
+
+    def record_model_failure(
+        self,
+        name: str,
+        model: str,
+        category: str = "unknown",
+        retry_after: float | None = None,
+    ) -> str:
+        """Cool down ONE (provider, model) pair; the provider keeps its state."""
+        if not model:
+            return ProviderHealthState.HEALTHY
+        key = (name, model)
+        self._model_failures[key] = self._model_failures.get(key, 0) + 1
+        if category == "rate_limited" and retry_after is not None:
+            seconds = float(retry_after)
+        else:
+            seconds = FAILURE_PENALTIES.get(category, DEFAULT_COOLDOWN_SECONDS)
+        self.mark_model_cooling(name, model, seconds)
+        return ProviderHealthState.COOLING_DOWN
+
+    def mark_model_cooling(self, name: str, model: str, seconds: float) -> None:
+        if not model:
+            return
+        seconds = min(max(0.0, float(seconds)), MAX_COOLDOWN_SECONDS)
+        self._model_until[(name, model)] = time.monotonic() + seconds
+        logger.info(
+            "PROVIDER_MODEL_COOLDOWN provider=%s model=%s seconds=%.1f",
+            name, model, seconds,
+        )
+
+    def record_model_success(self, name: str, model: str) -> None:
+        if not model:
+            return
+        key = (name, model)
+        self._model_until.pop(key, None)
+        self._model_failures.pop(key, None)
 
     # ── Concurrency ──
 

@@ -53,6 +53,7 @@ from backend.ai.providers.manager.health import (
     DEFAULT_COOLDOWN_SECONDS,
     RETRYABLE_FAILURES,
     ProviderHealthTracker,
+    classify_rate_limit_scope,
 )
 from backend.ai.providers.manager.metrics import ProviderMetricsRegistry
 from backend.ai.providers.registry.registry import ProviderRegistry
@@ -70,6 +71,11 @@ _RATE_LIMIT_MAX_WAIT_SECONDS = 5.0
 _DEFAULT_CONCURRENCY = 4
 _PROVIDER_CONCURRENCY: dict[str, int] = {"zai": 2}
 _MODEL_UNAVAILABLE_TTL = 3600.0
+#: Distinct models of ONE provider failing inside this window is provider
+#: evidence, not a model-specific problem.
+_PROVIDER_OUTAGE_WINDOW = 60.0
+#: How many distinct failing models it takes to open the provider circuit.
+_PROVIDER_OUTAGE_MODELS = 3
 
 
 class ProviderManager:
@@ -81,7 +87,7 @@ class ProviderManager:
 
     __slots__ = (
         "_registry", "_metrics", "_config_mgr", "_fallback_chain", "_health",
-        "_unavailable_models", "_model_candidates",
+        "_unavailable_models", "_model_candidates", "_provider_model_failures",
     )
 
     def __init__(self, registry: ProviderRegistry | None = None) -> None:
@@ -95,6 +101,9 @@ class ProviderManager:
         )
         self._unavailable_models: dict[tuple[str, str], float] = {}
         self._model_candidates: dict[str, list[str]] = {}
+        # Which DIFFERENT models of one provider failed recently — the
+        # evidence that turns model-level failures into a provider outage.
+        self._provider_model_failures: dict[str, dict[str, float]] = {}
         self._load_env_fallback_chain()
 
     # ── Public API ──
@@ -188,6 +197,25 @@ class ProviderManager:
 
         total = len(eligible)
         for idx, (score, name, model, provider) in enumerate(eligible):
+            # A candidate that stopped being eligible WHILE this request ran
+            # (its provider was disabled/cooled down by an earlier candidate,
+            # or the pair itself was just proved dead) is not contacted. The
+            # pool was built up front; eligibility is re-proved per attempt.
+            if not self._health.is_available(name) or self._model_unavailable(name, model):
+                reason = (
+                    f"state={self._health.state(name)}"
+                    if not self._health.is_available(name)
+                    else f"model={model}:unavailable"
+                )
+                matrix.append({
+                    "provider": name, "model": model or "-",
+                    "outcome": "skipped", "reason": reason, "score": round(score, 3),
+                })
+                logger.info(
+                    "PROVIDER_SKIPPED provider=%s model=%s reason=%s",
+                    name, model or "-", reason,
+                )
+                continue
             logger.info(
                 "ROUTER_SELECTED provider=%s model=%s score=%.3f",
                 name, model or "-", score,
@@ -659,9 +687,6 @@ class ProviderManager:
             return f"state={self._health.state(name)}"
         if not self._provider_healthy(provider):
             return "unhealthy"
-        model = self._effective_model(provider)
-        if model and self._model_unavailable(name, model):
-            return f"model={model}:unavailable"
         if needs_tools and not self._supports_tools(provider):
             return "capability=no_tool_calls"
         return ""
@@ -720,9 +745,50 @@ class ProviderManager:
             return ""
 
     def _model_unavailable(self, name: str, model: str) -> bool:
-        """True when (name, model) was marked unavailable and the TTL is live."""
+        """True when the (name, model) pair is out of the pool right now.
+
+        A permanent configuration error (``model_not_found``) and a transient
+        model-level cooldown share this ONE check, so neither is ever turned
+        into a provider-wide skip.
+        """
+        if not model:
+            return False
         until = self._unavailable_models.get((name, model))
-        return until is not None and time.monotonic() < until
+        if until is not None and time.monotonic() < until:
+            return True
+        return not self._health.is_model_available(name, model)
+
+    def _mark_model_cooling(
+        self, name: str, model: str, seconds: float | None, category: str,
+    ) -> None:
+        """Cool down ONE (provider, model) pair, never the provider."""
+        self._health.record_model_failure(name, model, category, seconds)
+
+    def _escalate_if_provider_wide(
+        self, name: str, model: str, ftype: str, retry_after: float | None = None,
+    ) -> None:
+        """Open the provider circuit when DIFFERENT models keep failing.
+
+        One model timing out is that model's problem; three distinct models
+        of the same provider failing inside the window is the provider
+        (or its account) failing, so the EXISTING circuit breaker takes
+        over — cooldown now, quarantine on a run of failures.
+        """
+        now = time.monotonic()
+        recent = {
+            mid: ts for mid, ts in self._provider_model_failures.get(name, {}).items()
+            if now - ts <= _PROVIDER_OUTAGE_WINDOW
+        }
+        recent[model] = now
+        self._provider_model_failures[name] = recent
+        if len(recent) < _PROVIDER_OUTAGE_MODELS:
+            return
+        logger.warning(
+            "PROVIDER_OUTAGE provider=%s distinct_models=%d category=%s",
+            name, len(recent), ftype,
+        )
+        self._provider_model_failures.pop(name, None)
+        self._health.record_failure(name, ftype, retry_after)
 
     def _mark_model_unavailable(self, name: str, model: str) -> None:
         """Mark a (provider, model) pair unavailable so it is not retried.
@@ -763,7 +829,13 @@ class ProviderManager:
                 continue
             seen.add(mid)
             pool.append(mid)
-        return pool or [""]
+        # A pair the router already proved dead (or is cooling down) leaves the
+        # pool here — never by disabling the provider, whose other models stay
+        # eligible. Nothing left to try means the provider contributes nothing.
+        available = [mid for mid in pool if not self._model_unavailable(name, mid)]
+        if available:
+            return available
+        return [] if (configured and self._model_unavailable(name, configured)) else [""]
 
     def set_model_candidates(self, provider_name: str, models: list[str]) -> None:
         """Feed discovery-derived candidate models for one provider.
@@ -882,7 +954,7 @@ class ProviderManager:
             logger.info("AI_PROVIDER_ATTEMPT provider=%s model=%s attempt=1", name, label)
             response = await self._call_once(provider, messages, kwargs, model)
             if response.success:
-                self._health.record_success(name)
+                self._record_model_success(name, model or self._effective_model(provider))
                 self._note_response_quality(name, response, kwargs)
                 return response
 
@@ -905,7 +977,9 @@ class ProviderManager:
                         )
                         retry_response = await self._call_once(provider, messages, kwargs, model)
                         if retry_response.success:
-                            self._health.record_success(name)
+                            self._record_model_success(
+                                name, model or self._effective_model(provider)
+                            )
                             self._note_response_quality(name, retry_response, kwargs)
                             logger.info(
                                 "AI_PROVIDER_FAILURE provider=%s model=%s category=RATE_LIMIT_RECOVERED",
@@ -925,7 +999,7 @@ class ProviderManager:
             logger.info("AI_PROVIDER_ATTEMPT provider=%s model=%s attempt=2", name, model)
             retry_response = await self._call_once(provider, messages, kwargs, model)
             if retry_response.success:
-                self._health.record_success(name)
+                self._record_model_success(name, model or self._effective_model(provider))
                 self._note_response_quality(name, retry_response, kwargs)
                 logger.info(
                     "AI_PROVIDER_FAILURE provider=%s model=%s category=TRANSIENT_RECOVERED",
@@ -937,6 +1011,12 @@ class ProviderManager:
             # The retry DID happen — stamp it so a later fallback success
             # (or the terminal failure) can report the true retry count.
             return self._with_retry_metadata(retry_response, 1)
+
+    def _record_model_success(self, name: str, model: str) -> None:
+        """A served request proves BOTH the provider and that model healthy."""
+        self._health.record_success(name)
+        self._health.record_model_success(name, model)
+        self._provider_model_failures.pop(name, None)
 
     @staticmethod
     def _retry_after_seconds(response: ProviderResponse) -> float:
@@ -980,8 +1060,25 @@ class ProviderManager:
             return True
         return all(bool(c.get("malformed_arguments")) for c in calls)
 
-    def _apply_failure(self, name: str, ftype: str, response: ProviderResponse) -> None:
+    def _apply_failure(
+        self, name: str, ftype: str, response: ProviderResponse, model: str = "",
+    ) -> None:
+        """Apply a failure at the SCOPE its own evidence supports.
+
+        A dead, slow or model-throttled single model cools down that
+        ``(provider, model)`` pair only. Provider/account-level evidence
+        (auth, an account quota, or an opaque 429 whose scope the response
+        does not establish) keeps the existing provider-wide circuit
+        breaker — and deliberately does NOT fire the same possibly-exhausted
+        quota at every sibling model.
+        """
         meta = response.metadata or {}
+        provider = self._registry.get(name)
+        effective_model = (
+            model
+            or str(meta.get("requested_model") or "")
+            or (self._effective_model(provider) if provider is not None else "")
+        )
         if ftype in AUTH_FAILURES:
             self._health.mark_disabled(name)
             return
@@ -990,17 +1087,14 @@ class ProviderManager:
             # API does not recognize). Never retried, never cooled down — the
             # caller advances to the next fallback candidate deterministically.
             if ftype == "model_not_found":
-                provider = self._registry.get(name)
-                model = (response.metadata or {}).get("model") or (
-                    self._effective_model(provider) if provider is not None else ""
-                )
-                if model:
-                    self._mark_model_unavailable(name, model)
-                    # The adapter's failure metadata carries the override
-                    # model when the candidate pool supplied one.
-                    override = str((response.metadata or {}).get("requested_model") or "")
-                    if override:
-                        self._mark_model_unavailable(name, override)
+                dead = str(meta.get("model") or "") or effective_model
+                if dead:
+                    self._mark_model_unavailable(name, dead)
+                # The adapter's failure metadata carries the override model
+                # when the candidate pool supplied one.
+                override = str(meta.get("requested_model") or "")
+                if override:
+                    self._mark_model_unavailable(name, override)
             logger.warning(
                 "provider-health: '%s' config/request error (%s) — not cooling down",
                 name, ftype,
@@ -1012,8 +1106,28 @@ class ProviderManager:
                 retry_after = float(meta.get("retry_after", DEFAULT_COOLDOWN_SECONDS))
             except (TypeError, ValueError):
                 retry_after = DEFAULT_COOLDOWN_SECONDS
-        # Transient failures feed the circuit breaker: per-category cooldown
-        # now, quarantine after a run of consecutive failures.
+            scope = classify_rate_limit_scope(
+                {**meta, "text": response.text or ""}, effective_model
+            )
+            if scope == "model" and effective_model:
+                self._mark_model_cooling(name, effective_model, retry_after, ftype)
+                return
+            self._health.record_failure(name, ftype, retry_after)
+            return
+        if effective_model:
+            # With no sibling model to protect, a transient failure IS the
+            # provider's state — keep the pre-existing provider-wide penalty.
+            siblings = (
+                [mid for mid in self._candidate_models(provider) if mid and mid != effective_model]
+                if provider is not None else []
+            )
+            if not siblings:
+                self._health.record_failure(name, ftype, retry_after)
+                return
+            self._mark_model_cooling(name, effective_model, None, ftype)
+            self._escalate_if_provider_wide(name, effective_model, ftype, retry_after)
+            return
+        # No identifiable model to scope the failure to: provider-wide, as before.
         self._health.record_failure(name, ftype, retry_after)
 
     def _note_response_quality(

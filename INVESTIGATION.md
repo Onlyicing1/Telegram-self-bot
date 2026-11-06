@@ -1,121 +1,161 @@
-# Investigation — Persistent Test Modules Results + Explicit Full Refresh
+# Investigation — Dynamic Test-Verified Production Model Fallback
 
-Scope: source-level investigation that shaped this feature. No production system was
-queried; every finding below was read from the repository at the implementation commit.
+Scope: how a user request travels from the AI Engine into `ProviderManager`, what
+decides a model's production eligibility, and how failures are attributed to a
+model vs. a provider. Everything below is source-verified in this tree; nothing
+is inferred from intent or documentation alone.
 
-## 1. How Test Modules is opened
+---
 
-- There is no dedicated `panel:*` for Test Modules. It is an ACTION button
-  (`action:ai_test_models`) rendered in the AI panels (`_ai_main_panel_handler`, both
-  the unconfigured and ready branches) and in the model-pick confirmation view.
-- `_ai_test_models_action` used to launch the streaming diagnostic on EVERY tap:
-  set `_test_running = True`, `guarded_create_task(run_streaming_test(...))`, return a
-  "Starting the model test run" view. Opening the panel therefore always spent a full
-  provider-catalog diagnostic — the root cause of this feature.
-- A second tap while running rendered "Already running" and started nothing. That flag
-  is the existing concurrency guard and is reused unchanged.
+## 1. The routing path (unchanged boundaries)
 
-## 2. How the batch and streaming runs are produced
+```
+ai_unified / task_execution
+        │
+        ▼
+Engine → Dispatcher._call_provider()          backend/ai/engine/dispatcher.py:282
+        │        await self._provider_manager.chat(provider_messages, **kwargs)
+        ▼
+ProviderManager.chat()                        backend/ai/providers/manager/manager.py
+        │  1. enumerate providers (active first, then AI_PROVIDER_FALLBACK,
+        │     then every other registered non-dummy provider)
+        │  2. _skip_reason() per provider, _score() per provider
+        │  3. _candidate_models() per provider → the MODEL-level pool
+        │  4. sort (JSON capability, active first, score)
+        │  5. sequential loop → _attempt_with_retry() per (provider, model)
+        ▼
+provider.chat(messages, model=…)             backend/ai/providers/openai_compat.py
+                                                                  gemini.py, cloudflare.py
+```
 
-- `backend/ai/model_tester.py` exposes two twins: `test_all_models` (batch, used by the
-  web endpoint) and `test_all_models_streaming` (Test Modules), both built on
-  `_build_targets` + `test_single_model`.
-- Both return the same payload keys: `success`, `tested_at`, `partial`, `providers`,
-  `models`, `results`, `summary`.
-- `_build_targets` selects every chat-capable model of every chat provider with NO
-  budget, cap, slice or priority queue (this branch inherited the upstream change that
-  removed `MODEL_TEST_GLOBAL_TEST_BUDGET`); `_MODELS_IN_RESPONSE` (30/provider) is a
-  DISPLAY cap only.
-- Results are classified deterministically (`AVAILABLE`, `NOT_CONFIGURED`,
-  `AUTH_ERROR`, `RATE_LIMITED`, `INSUFFICIENT_CREDITS`, `TIMEOUT`, `INVALID_MODEL`,
-  `BLOCKED`, `PROVIDER_ERROR`, `UNKNOWN_ERROR`), then annotated with `is_free` from
-  discovery pricing metadata.
-- After a run, `_feed_production_candidates` publishes only `AVAILABLE` results through
-  `ProviderManager.set_model_candidates`. That is the ONE place a diagnostic result can
-  influence production routing.
+`ProviderManager.chat()` is the only production caller of `provider.chat()`. The
+loop is a plain `for … await …` — there is no `asyncio.gather`, no task creation,
+no speculative request. One user request therefore reaches exactly one model at a
+time and stops at the first usable response.
 
-## 3. How results are rendered and paged
+## 2. What already fed the pool (and what did not)
 
-- `ai_test_progress.run_streaming_test` drives a coalescing edit guardian over the
-  launching panel, keeps the last payload in the module-level `_last_test_payload`, and
-  renders the terminal view through `ai._render_test_results`.
-- `_render_test_results` builds: summary chip line, authoritative "Current:" pair,
-  provider-grouped usable list, compact failed list (≤8 lines), adaptive 2/3-column
-  usable grid (12/18 per page) plus pagination, and the action rows.
-- `action:ai_test_page:<n>` (`_ai_test_page_action`) re-renders another page from
-  `_last_test_payload` and never re-runs the tester.
-- `action:ai_test_details` ("All Results") pages the complete diagnostics from
-  `_last_test_payload` under `_TEST_DETAILS_BODY_BUDGET` (the upstream fix for
-  Telegram's 4096-character message limit).
-- Consequence: the pager and All Results already work from a payload dict, so a
-  snapshot only has to produce a payload-shaped dict; no second renderer is needed.
+- `backend/ai/model_tester.py::test_all_models()` runs the complete diagnostic
+  (every chat model of every chat provider, bounded concurrency, no budget) and
+  then calls `_feed_production_candidates(results, …)`.
+- `proven_usable_candidates()` keeps ONLY `status == "AVAILABLE"` results, skips
+  every result carrying `cached: True`, drops the provider's configured model
+  (the router already tries it first), and orders the remainder with the same
+  deterministic free-first selector used by the UI.
+- `_feed_production_candidates()` publishes that map through the existing
+  `ProviderManager.set_model_candidates(provider, models)` contract.
+- `_candidate_models()` returns configured model first, then EVERY fed model,
+  de-duplicated and empty-free — deliberately no per-provider cap.
 
-## 4. Durable document persistence available today
+So the dynamic, all-AVAILABLE pool was already wired. This task did **not** add a
+second feed: it hardened eligibility and failure attribution around that pool.
 
-- `backend/db/client.py` owns a Supabase-or-in-memory singleton. `bot_settings` is a
-  key/value table (`key`, `value`, `value_type`, `updated_at`) already used by
-  Ghost Seen and (historically) by Anti-Edit/Anti-Delete and Private Messages.
-- `_bot_settings_get_state_sync` returns `(document, readable)` so a caller can tell an
-  outage from a missing document; `_bot_settings_put_sync` performs one upsert and
-  returns success. Both are wrapped by `aed_get_document_state`/`aed_put_document`,
-  which are AED-named but otherwise generic.
-- `run_sync_db` dispatches the synchronous PostgREST call to a bounded 4-worker pool
-  with a 10s application deadline and an 8s transport deadline, so a document read or
-  write cannot block the event loop.
-- Decision: add two neutrally named wrappers (`settings_document_state`,
-  `settings_document_write`) over the same helpers instead of reusing AED-named public
-  functions, and store the snapshot as ONE bounded document. No migration, no new
-  table, no SQL — the schema in `DATABASE_ARCHITECTURE.md` is untouched.
+## 3. Defects this task corrects
 
-## 5. Why one document instead of shards
+### 3.1 A model failure disabled the whole provider
 
-- The AED archive shards because it grows without bound (one row per observed edit or
-  delete). A diagnostic result set is bounded by the provider catalog (today ~615
-  models, hard-capped here at 1000 normalized results).
-- A single upsert is atomic: a failed write leaves the previous complete snapshot
-  intact. A sharded layout would need generation keys or cleanup to avoid a torn
-  "new shards + old meta" state, which is more machinery than a bounded payload needs.
-- Worst-case size is bounded by `MAX_DOCUMENT_BYTES` (512 KiB) with deterministic
-  trimming and a `counts.truncated` marker.
+`_apply_failure()` recorded every `timeout` / `network` / `server` /
+`rate_limited` failure through `ProviderHealthTracker.record_failure(name, …)`,
+i.e. at PROVIDER scope. One slow model therefore put a provider with dozens of
+tested-available models into cooldown, and `_skip_reason()` then skipped the
+provider entirely.
 
-## 6. Cache-correctness questions answered in source
+`_skip_reason()` also skipped the whole provider when its CONFIGURED model was
+marked unavailable:
 
-- **AVAILABLE and production fallback.** `proven_usable_candidates` is the only path
-  into the runtime model pool. Cached results are never fed (the open path never calls
-  `_feed_production_candidates`), and the function now also skips any result carrying
-  `cached: True`, so a cache read cannot arm production even if a caller makes a
-  mistake.
-- **New / removed models.** The run's catalog is the union of discovery metadata,
-  tested pairs and provider defaults. A catalog entry with no result is surfaced as
-  `NOT_TESTED`; a result whose pair is absent from the catalog is kept as `historical`
-  and excluded from the current-catalog list and from the usable grid.
-- **Exact identity.** Model ids are used verbatim (no display-name matching); the pair
-  `(provider, model_id)` is the identity everywhere.
-- **NOT_ATTEMPTED / NOT_TESTED.** Upstream's `NOT_ATTEMPTED` means the imposed
-  overall deadline ended the run before a target was tried. The snapshot adds
-  `NOT_TESTED` for a catalog model with no stored result; otherwise "never targeted"
-  remains the absence of a result. `NOT_CONFIGURED`, `NOT_ATTEMPTED` and `TIMEOUT`
-  stay distinct.
-- **Partial runs.** `test_all_models*` sets `partial=True` when the overall timeout
-  leaves targets pending and records TIMEOUT for each. The persistence step refuses to
-  save a partial payload, so an interrupted refresh cannot masquerade as a complete
-  diagnostic; cancellation propagates without writing.
-- **Credential changes.** API keys are read from the environment per probe
-  (`discovery._get_env`); there is no revision/version token exposed anywhere. No
-  fingerprinting was invented (it would be a new credential-derived value persisted in
-  a document). The UI instead always stamps cached views with their last-test time and
-  never calls them live verification.
+```python
+model = self._effective_model(provider)
+if model and self._model_unavailable(name, model):
+    return f"model={model}:unavailable"
+```
 
-## 7. UI constraints discovered
+That turned a single dead model id into a provider outage.
 
-- `AGENTS.md` §16 and `tests/test_symbols.py` forbid emoji in panel labels; glyphs come
-  from `backend/helper/symbols.py` via `sym.label`. The requested refresh action is
-  therefore `↻ Refresh All Models` (`sym.OP_REFRESH`), not the emoji spelling.
-- Existing tests pin `action:ai_test_models` in the AI panel and in the results view,
-  and pin `_ai_test_models_action` launching a streaming run when nothing is saved.
-  Keeping that id as the OPEN action (cached when possible, initial run when nothing is
-  saved) preserves those contracts; the explicit refresh is a NEW
-  `action:ai_test_refresh`.
-- The helper layer has no message-size truncation; upstream's All Results now pages
-  itself under a 3500-character body budget, and the snapshot appends a bounded
-  (20-row) historical section instead of introducing a second pager.
+### 3.2 Unavailable pairs were not removed from the pool
+
+`_candidate_models()` never consulted `_unavailable_models`, so a model already
+proved dead by a 404 stayed in the candidate list on subsequent requests (it was
+only skipped when it happened to be the configured model).
+
+### 3.3 Rate-limit scope was not established
+
+Both `openai_compat.py` and `gemini.py` returned `failure_type="rate_limited"`
+with `http_status=429` and `retry_after`. Neither adapter reported what the 429
+was about. `openai_compat` discarded the error body for 429 entirely (it only
+kept `request_id`), so no consumer could distinguish
+
+| Provider evidence | Actual scope | Source |
+|---|---|---|
+| OpenAI `code: insufficient_quota` / "exceeded your current quota … billing" | account/project | `openai_compat._error_fields` |
+| Groq "Rate limit reached for model \`<id>\` … requests per min (RPM)" | that model | Groq error message |
+| Gemini 429 "You exceeded your current quota …" (free-tier per-project metric) | project/account | `gemini._error_fields` |
+| Cloudflare Workers AI 429 (account-scoped endpoint, no model field) | account (not established in body) | `cloudflare.py` |
+| Any 429 with no recognizable body | **unknown** | — |
+
+Before this task all five were handled identically at provider scope. That is
+safe for account quotas but wrong for per-model limits, and it is also the reason
+sibling models were never tried after a model-specific 429.
+
+### 3.4 Mid-request eligibility was never re-proved
+
+The candidate list is built ONCE before the loop. A provider disabled or cooled
+down by candidate #1 was still asked for candidates #2..#N, because only the
+pre-loop `_skip_reason()` had checked health.
+
+## 4. Decisions
+
+1. **Model-level state belongs to the existing health tracker.** `ProviderHealthState`
+   / `ProviderHealthTracker` gained a parallel model clock
+   (`_model_until`, `_model_failures`, `is_model_available`,
+   `record_model_failure`, `record_model_success`). No new manager, router or
+   executor; `ProviderManager` still owns the decision and calls it.
+2. **Scope follows evidence, never assumption.** `classify_rate_limit_scope()`
+   in `manager/health.py` returns `model` only when the body names THIS model
+   and describes a model-level limit, `provider` for quota/billing/account
+   markers, and `unknown` otherwise. `unknown` is treated as provider-wide —
+   the conservative direction: one possibly shared exhausted quota is not fired
+   at every sibling model.
+3. **Transient failures are model-scoped only when there is a sibling to
+   protect.** With a single candidate model, the pre-existing provider-wide
+   penalty is kept (nothing else could be spared).
+4. **Provider-wide evidence still opens the existing circuit breaker.** Auth
+   disables the provider; provider-scope/unknown 429 cools it down; three
+   DISTINCT models of one provider failing inside 60 s escalates the transient
+   failure to the provider circuit (`PROVIDER_OUTAGE_MODELS`,
+   `PROVIDER_OUTAGE_WINDOW`).
+5. **Eligibility is re-proved per attempt.** The in-loop check skips a candidate
+   whose provider stopped being available, or whose pair became unavailable, and
+   records it in the failure matrix (`outcome: skipped`).
+6. **`model_not_found` keeps its 3600 s pair TTL** (`_unavailable_models`) — a
+   permanent configuration error for that id, never a provider penalty.
+
+## 5. What is NOT established
+
+- No live provider was contacted in this environment. The scope classifier is
+  verified against the documented/observed error shapes listed in §3.3, not
+  against a fresh 429 from each vendor.
+- Cloudflare's 429 body is not parsed for a model field; it therefore lands in
+  the `unknown` → provider-wide branch by construction.
+- Model and provider health state is in-memory (process lifetime), exactly like
+  the pre-existing provider state; a restart clears every cooldown.
+- The escalation threshold (3 distinct models / 60 s) is a policy choice, not a
+  measurement of any provider's failure correlation.
+- No UI surface shows model-level cooldowns; only the router and its logs do.
+
+## 6. Current test coverage of this area
+
+`tests/test_dynamic_model_fallback.py` (new, 22 tests) drives the real
+`ProviderManager.chat()` with scripted providers that record `(provider, model,
+messages)` and concurrent overlap: 20-model pool completeness, primary-first
+order, deterministic candidate order, request identity across candidates,
+first-usable-wins, no fan-out, model-vs-provider health, the three rate-limit
+scopes, cached/untested exclusion, bounded retry, cross-provider fallback,
+tool-call/structured-output preservation and honest exhaustion.
+
+Existing suites that also cover this path and still pass: `test_23_provider_mesh.py`,
+`test_24_execution_reliability.py`, `test_17_providers.py`,
+`test_provider_structured_output.py`, `test_provider_tool_boundary.py`,
+`test_provider_system_instruction_contract.py`,
+`test_task_fallback_classification.py`, `test_task_fallback_cooldown.py`,
+`test_13_model_selection.py`, `test_model_tester.py`,
+`test_model_tester_snapshot.py`.

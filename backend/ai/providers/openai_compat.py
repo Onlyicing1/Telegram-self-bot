@@ -117,10 +117,16 @@ class OpenAICompatProvider(BaseProvider):
                 except (TypeError, ValueError):
                     retry_after = 5.0
                 provider_request_id = ""
+                provider_error_code = ""
+                provider_error_type = ""
+                provider_error_message = ""
                 try:
                     error_data = resp.json()
                     err_obj = error_data.get("error", {}) if isinstance(error_data, dict) else {}
                     provider_request_id = str(err_obj.get("request_id") or "")
+                    provider_error_code = str(err_obj.get("code") or "")
+                    provider_error_type = str(err_obj.get("type") or "")
+                    provider_error_message = str(err_obj.get("message") or "")
                 except Exception:
                     pass
                 logger.warning("%s rate limited (retry_after=%ss)", self.name, retry_after)
@@ -133,6 +139,10 @@ class OpenAICompatProvider(BaseProvider):
                         "retry_after": retry_after,
                         "failure_type": "rate_limited",
                         "provider_request_id": provider_request_id,
+                        "provider_error_code": provider_error_code,
+                        "provider_error_type": provider_error_type,
+                        "provider_error_message": provider_error_message,
+                        "model": model,
                     },
                 )
 

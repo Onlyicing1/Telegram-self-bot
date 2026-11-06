@@ -1,147 +1,39 @@
-# Roadmap — Persistent Test Modules Results + Explicit Full Refresh
+# Roadmap — Dynamic Test-Verified Model Fallback
 
-This roadmap covers ONLY the current feature. No historical roadmap is appended.
+Status legend: **IMPLEMENTED + TESTED** = code in this tree with regression
+coverage; **IMPLEMENTED, NOT LIVE-VERIFIED** = code exists, no real provider was
+exercised; **LIMITATION** = deliberately not done / not provable here.
 
-## Objective
-
-Opening Test Modules must not re-run a ~615-model live diagnostic. Results are saved
-durably, displayed as cached, and refreshed only on an explicit action.
-
-```
-OPEN TEST MODULES
-       |
-       v
-LOAD PERSISTENT SNAPSHOT
-       |
-       +---- valid snapshot ----> DISPLAY CACHED RESULTS
-       |                                |
-       |                                v
-       |                         OWNER PRESSES REFRESH ALL MODELS
-       |                                |
-       |                                v
-       |                       FULL EXISTING DIAGNOSTIC
-       |                                |
-       |                                v
-       |                       SAVE NEW COMPLETE SNAPSHOT
-       |                                |
-       |                                v
-       |                       DISPLAY FRESH RESULTS
-       |
-       +---- no snapshot -----> INITIAL FULL DIAGNOSTIC
-                                        |
-                                        v
-                               SAVE INITIAL SNAPSHOT
-                                        |
-                                        v
-                               DISPLAY FRESH RESULTS
-```
-
-## Current implementation status
-
-| Item | Status |
-|---|---|
-| Versioned snapshot build + validation (`backend/ai/test_snapshot.py`) | IMPLEMENTED + unit-TESTED |
-| Durable storage in the existing `bot_settings` document store | IMPLEMENTED + unit-TESTED (fake store; real Supabase unverified) |
-| `ok` / `missing` / `malformed` / `unsupported_version` / `unavailable` load states | IMPLEMENTED + unit-TESTED |
-| Cached display with `(CACHED)` labels and last full-test timestamp | IMPLEMENTED + unit-TESTED |
-| Explicit Refresh All Models (new `action:ai_test_refresh`) | IMPLEMENTED + unit-TESTED |
-| First visit with no snapshot runs the initial diagnostic | IMPLEMENTED + unit-TESTED |
-| Exact `(provider, model_id)` reconciliation, `NOT_TESTED`, historical split | IMPLEMENTED + unit-TESTED |
-| Partial / cancelled / failed-write safety | IMPLEMENTED + unit-TESTED |
-| Cached AVAILABLE excluded from `proven_usable_candidates()` | IMPLEMENTED + unit-TESTED |
-| Live provider verification | **NOT DONE** — no provider was called |
-| Live Telegram verification | **NOT DONE** — handler output checked in tests only |
-| Credential-revision invalidation | **NOT IMPLEMENTED** (no revision mechanism exists) |
-
-## Storage design
-
-- One durable JSON document in the EXISTING `bot_settings` table, key
-  `ai_test_snapshot:v1`, written through the generic
-  `db_client.settings_document_write` / read through
-  `db_client.settings_document_state`.
-- No new table, no migration, no SQL, no `DATABASE_ARCHITECTURE.md` change.
-- One atomic upsert: a failed write leaves the previous complete snapshot intact.
-- Bounded: `MAX_RESULTS=1000`, `MAX_HISTORICAL=500`, `MAX_MODELS=4000`,
-  `MAX_ERROR_CHARS=200`, `MAX_DOCUMENT_BYTES=512 KiB`, with deterministic trimming and
-  a `counts.truncated` marker.
-- No module-level cache, no temporary file, no ephemeral filesystem.
-
-## Snapshot format (schema v1)
-
-```
-schema_version        1
-created_at            ISO-8601 UTC (snapshot write)
-last_completed_at     ISO-8601 UTC (this diagnostic run)
-complete / partial    booleans (partial runs are never persisted)
-summary               tester summary buckets incl. not_tested
-providers[]           name, display_name, icon, status, has_key, validated,
-                      default_model, capability_kind
-models[]              id, name, provider, context_length, is_free
-results[]             provider, model, display_name, icon, status, error (bounded,
-                      redacted), latency_s, http_status, retry_after, error_type,
-                      provider_code, finish_reason, is_free, tested_at
-historical[]          results whose pair is not in the latest catalog
-counts                results, catalog, historical, dropped, truncated
-```
-
-## Cache reconciliation and invalidation rules
-
-1. Match only on the exact `(provider, model_id)` pair.
-2. Catalog = discovery metadata ∪ tested pairs ∪ provider default models.
-3. Catalog model without a result → `NOT_TESTED` (never usable, never failed).
-4. Result not in the catalog → `historical`, shown apart from the current catalog.
-5. Duplicate pairs collapse to the first record.
-6. A complete refresh replaces the snapshot; partial / cancelled runs and failed
-   writes never replace it.
-7. Read failure is `unavailable` — never treated as "no snapshot".
-8. Credential-revision invalidation is not implemented; cached views always carry
-   their timestamp and are never presented as live verification.
-
-## UI behaviour
-
-- AI panel → **Test Modules** opens the saved snapshot (`action:ai_test_models`).
-- Cached header: `Cached snapshot · last full test <ts> · N results · catalog C ·
-  complete|partial`, with per-result `·cached` markers and `(CACHED)` statuses.
-- **↻ Refresh All Models** (`action:ai_test_refresh`) runs the complete diagnostic; a
-  second tap during a run shows "Already running" and starts nothing.
-- Unreadable / malformed / unsupported snapshots show an honest notice and offer
-  Refresh; they never start a run implicitly.
-- Existing provider grouping, summary chips, usable-model grid, All Results and
-  pagination are preserved; All Results keeps its self-paging, plus a bounded
-  historical appendix (20 rows).
-- Upstream `NOT_ATTEMPTED` (deadline reached before a target was tried) and the
-  snapshot's `NOT_TESTED` (catalog model with no stored result) are separate statuses.
-
-## Tests and exact results
-
-- Post-merge focused group (7 files, incl. the upstream All Results callback suite):
-  **170 passed**.
-- New `tests/test_model_tester_snapshot.py`: **36 passed**.
-- Full suite after merging remote `main`: **6951 passed, 27 skipped, 2 failed**
-  (141.85 s). The failures are the pre-existing
-  `tests/test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`
-  (reproduced on the unchanged baseline) and a load-dependent timing flake
-  (`tests/test_private_message_scope.py::test_concurrent_messages_from_one_person_cannot_exceed_the_limit`,
-  3/3 passing in isolation).
-- `py_compile` on changed modules: exit 0. `git diff --check`: clean.
-
-## Known limitations
-
-- Cached results are a historical diagnostic record, never live proof.
-- An extreme catalog is truncated at the document bound (`counts.truncated` is stored
-  but not yet rendered in the panel).
-- Credential changes are not detected; the old snapshot is shown until Refresh.
-- With no Supabase configured, `bot_settings` falls back to process memory and does
-  not survive a restart (pre-existing platform behaviour).
+| Capability | Status | Where |
+|---|---|---|
+| Production pool sourced from Model Tester `AVAILABLE` results, every model, no cap | IMPLEMENTED + TESTED | `model_tester.proven_usable_candidates` → `ProviderManager.set_model_candidates` → `_candidate_models` |
+| Configured user-selected model remains the first candidate | IMPLEMENTED + TESTED | `_candidate_models`, `_build_targets` order |
+| Deterministic candidate order preserved (free-first selector, then stable leftovers) | IMPLEMENTED + TESTED | `proven_usable_candidates`, `_candidate_models` |
+| Cached `AVAILABLE` results can never arm production | IMPLEMENTED + TESTED | `proven_usable_candidates` skips `cached`; snapshot payload never fed |
+| Failed / untested / `NOT_ATTEMPTED` / `NOT_CONFIGURED` / discovery-only models excluded | IMPLEMENTED + TESTED | `proven_usable_candidates`, `_feed_production_candidates` |
+| Strictly sequential fallback, one model at a time, first usable response wins | IMPLEMENTED + TESTED | `ProviderManager.chat` loop (no gather/tasks) |
+| Same original request sent to each sequential candidate | IMPLEMENTED + TESTED | `chat()` passes `messages` unchanged |
+| Bounded retry (one immediate retry per candidate) and request timeout preserved | IMPLEMENTED + TESTED | `_attempt_with_retry`, `_PROVIDER_RPC_TIMEOUT` |
+| Model-level failure tracked per exact `(provider, model_id)` | IMPLEMENTED + TESTED | `ProviderHealthTracker.record_model_failure` |
+| A model failure no longer disables sibling models of the same provider | IMPLEMENTED + TESTED | `_apply_failure`, `_skip_reason`, `_candidate_models` |
+| Provider/account failures still take the provider down (auth, quota, opaque 429) | IMPLEMENTED + TESTED | `_apply_failure`, `classify_rate_limit_scope` |
+| Provider circuit breaker retained for genuinely provider-wide outages | IMPLEMENTED + TESTED | `_escalate_if_provider_wide` (3 distinct models / 60 s) |
+| Unavailable/cooling `(provider, model)` pairs removed from the pool | IMPLEMENTED + TESTED | `_candidate_models`, `_model_unavailable` |
+| Mid-request eligibility re-check (no blind requests after a provider cools) | IMPLEMENTED + TESTED | `chat()` per-attempt check → `outcome: skipped` matrix entries |
+| Rate-limit scope from the provider's own body (model / provider / unknown) | IMPLEMENTED, NOT LIVE-VERIFIED | `classify_rate_limit_scope`, `openai_compat` 429 metadata |
+| Gemini/Cloudflare 429 scope | IMPLEMENTED for preserved error text; scope usually `unknown` → provider-wide | `gemini.py`, `cloudflare.py` |
+| Honest exhaustion response with failure matrix and retry count | IMPLEMENTED + TESTED | `_fallback` |
+| Tool-call and structured-output contracts across fallback | IMPLEMENTED + TESTED | `_has_no_usable_output`, `output_validator` path |
+| Persisted model health across restarts | LIMITATION | in-memory, same as provider health |
+| Model-level health in the Glass/Web UI | LIMITATION (not requested) | — |
+| Live provider reliability of the 600+ model catalog | LIMITATION (untestable here) | — |
 
 ## Remaining work
 
-- Surface `counts.truncated` in the cached header when it is set.
-- If the architecture later exposes a credential revision, invalidate affected
-  provider results on change.
-- Live verification of one real full refresh on the deployed bot (owner action).
-
-## Live verification status
-
-Not live-verified. No provider call, no Telegram client, no Supabase deploy was made
-while implementing or testing this feature.
+1. Live-verify the 429 scope classifier against real OpenAI/Groq/Gemini/Cloudflare
+   responses (each vendor's current error body).
+2. Optionally surface per-model cooldowns in the AI diagnostics panel so an
+   operator can see why a tested model is temporarily absent from the pool.
+3. Re-run the Model Tester on a schedule if the AVAILABLE pool is expected to
+   track provider catalog changes — the pool is only as fresh as the last run
+   (a cached snapshot never arms it).
