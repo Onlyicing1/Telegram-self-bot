@@ -313,3 +313,40 @@ registry and wraps it).
 - Cooldown/level values are unchanged, so log volume is added only at real state
   transitions (one line per fallback, one per provider attempt, one per request
   result), plus per-model DEBUG that is invisible at the deployed `LOG_LEVEL=INFO`.
+
+## B.14 AED log noise and the AI tool lifecycle (2026-11-06)
+
+Investigated at the then-current `main` tip `6958985`.
+
+**Finding 1 — the AED log lines had three distinct sources, all in AED code.**
+The `[AED] … skipped: peer is not a confirmed human` lines were emitted by the
+handlers in `backend/bot/handlers/anti_edit_delete.py`, not by the service gate;
+the service produced the DEBUG "edit-shaped update ignored" lines and the
+WARNING/INFO configuration, flood-wait, media and retention lines. Removing
+them required no change to the classification itself: the tri-state
+(`True` / `False` / `None`) from the resolved `User.bot` flag already existed and
+is kept intact.
+
+**Finding 2 — the tool lifecycle was observable at the batch level only.**
+Before this change the Dispatcher logged one start/end pair per tool batch and
+one line per result (`AI_TOOL_EXECUTION_START/END`, `AI_EXECUTION_RESULT/ERROR`),
+while the `ToolExecutor` logged only timeouts and exceptions. Consequently a
+call that never reached the executor (unknown tool, malformed arguments,
+confirmation gate, absent executor) produced no line distinguishing it from a
+call that ran and failed, and a multi-call batch could not be split per call.
+The executor is the only place that knows the per-call outcome, which is why the
+per-call events are emitted there rather than reconstructed in the Dispatcher.
+
+**Finding 3 — `request_id` was already available at the executor boundary.**
+`Dispatcher._build_tool_context` is the single construction site for the
+per-request `ToolContext` and already sets `extra["request_id"]` (used by
+`DELETE_TIMEOUT`). No new id, context, or propagation channel was needed; only
+`provider`/`model` labels were added to that same dict.
+
+**Finding 4 — a continuation round is not an executor retry.** The tool loop's
+round number is the continuation index, while the executor has no retry budget;
+the new `round` field therefore comes from the loop (1 for the initial round,
+n+1 for the nth continuation).
+
+Not investigated / unchanged: provider HTTP retry and fallback behaviour, tool
+selection quality, Taskloom scheduling.

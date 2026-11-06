@@ -45,12 +45,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import logging
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-logger = logging.getLogger(__name__)
 
 # ── Content categories ───────────────────────────────────────────────────────
 
@@ -254,21 +252,18 @@ async def _read_config(owner: int) -> dict[str, Any] | None:
         await _import_legacy_store(owner)
         row, readable = await db_client.aed_load_config_state(owner)
         if not readable:
-            logger.warning("[AED] configuration store unreadable — feature stays OFF")
             return None
         if row is None:
             return default_state()
         return sanitize_state(row)
     raw, readable = await db_client.aed_get_document_state(_config_key(owner))
     if not readable:
-        logger.warning("[AED] legacy configuration store unreadable — feature stays OFF")
         return None
     if raw is None:
         return default_state()
     try:
         return sanitize_state(json.loads(raw))
     except Exception:
-        logger.warning("[AED] config document is not valid JSON — using defaults")
         return default_state()
 
 
@@ -312,7 +307,6 @@ async def _import_legacy_store(owner: int) -> None:
     if not existing:
         shards = await db_client.aed_load_archive(list(_SHARD_KEYS))
         if shards is None:
-            logger.warning("[AED] legacy archive unreadable — import deferred")
             return
         legacy_rows = [
             dict(row)
@@ -324,28 +318,20 @@ async def _import_legacy_store(owner: int) -> None:
             legacy_rows.sort(key=lambda r: str(r.get("captured_at") or ""), reverse=True)
             legacy_rows = legacy_rows[:MAX_ARCHIVE_ROWS]
             if not await db_client.aed_save_entries(owner, legacy_rows):
-                logger.warning("[AED] legacy archive import failed — retried on the next start")
                 return
-            logger.info(
-                "[AED] imported %s legacy archive row(s) into aed_archive_entries",
-                len(legacy_rows),
-            )
 
     raw, readable = await db_client.aed_get_document_state(_config_key(owner))
     if not readable:
-        logger.warning("[AED] legacy configuration unreadable — import deferred")
         return
     imported = default_state()
     if raw:
         try:
             imported = sanitize_state(json.loads(raw))
         except Exception:
-            logger.warning("[AED] legacy configuration is not valid JSON — importing defaults")
+            pass
     if not await db_client.aed_save_config(owner, imported):
-        logger.warning("[AED] legacy configuration import failed — retried on the next start")
         return
     _legacy_import_done = True
-    logger.info("[AED] legacy configuration imported into aed_config")
 
 
 async def ensure_loaded_async() -> None:
@@ -401,7 +387,6 @@ async def _persist_state(candidate: dict[str, Any]) -> bool:
     if not _loaded:
         # The stored configuration was never read, so this candidate is built on
         # defaults. Writing it would erase the owner's real settings.
-        logger.warning("[AED] configuration not loaded — refusing to overwrite it")
         return False
     owner = _owner_id
     if await db_client.aed_store_mode() == "dedicated":
@@ -585,20 +570,8 @@ async def _resolve_peer_bot(client: Any, chat_id: int) -> bool:
             if not isinstance(seconds, int) or isinstance(seconds, bool) or seconds <= 0:
                 seconds = _PEER_FLOOD_DEFAULT_S
             defer = min(seconds, _PEER_FLOOD_MAX_S)
-            if seconds > _PEER_FLOOD_MAX_S:
-                logger.warning(
-                    "[AED] Telegram flood wait %ss exceeds the %ss deadline — "
-                    "peer %s resolution deferred until then (no early retry)",
-                    seconds, _PEER_FLOOD_MAX_S, chat_id,
-                )
-            else:
-                logger.warning(
-                    "[AED] Telegram flood wait %ss — peer %s resolution deferred "
-                    "(ONE shared rate-limited attempt, no retry storm)", defer, chat_id,
-                )
             _defer_resolution(chat_id, defer)
             return False
-        logger.debug("[AED] peer bot resolution failed for %s: %s", chat_id, type(exc).__name__)
         _defer_resolution(chat_id, _PEER_FAIL_COOLDOWN_S)
         return False
     # A confirmed classification needs a resolved Telegram User and a REAL
@@ -610,10 +583,6 @@ async def _resolve_peer_bot(client: Any, chat_id: int) -> bool:
         return False
     flagged = getattr(entity, "bot") is True
     _cache_peer_bot(chat_id, flagged)
-    if flagged:
-        logger.info("[AED] peer %s resolved as a Telegram BOT — excluded from the archive", chat_id)
-    else:
-        logger.info("[AED] peer %s resolved as a human user", chat_id)
     return flagged
 
 
@@ -1064,10 +1033,6 @@ async def record_message(
         # exactly what archived an unchanged message as an "edit".
         edited_at = _iso(getattr(msg, "edit_date", None))
         if edited_at is None:
-            logger.debug(
-                "[AED] edit-shaped update ignored: no content edit chat=%s msg=%s",
-                getattr(msg, "chat_id", None), getattr(msg, "id", None),
-            )
             return None
         version = edited_at
     else:
@@ -1104,7 +1069,6 @@ async def record_message(
     async with _lock_for_loop():
         rows = await load_rows_async(force=True)
         if rows is None:
-            logger.warning("[AED] archive store unreadable — capture skipped (fail closed)")
             return None
         existing = [r for r in rows if r.get("id") == archive_id]
         if existing:
@@ -1116,10 +1080,6 @@ async def record_message(
             previous = _latest_content(rows, chat_id, message_id)
             if previous is not None and content_signature(previous) == content_signature(msg):
                 if not _edit_advanced(previous, edited_at):
-                    logger.debug(
-                        "[AED] edit-shaped update ignored: content unchanged chat=%s msg=%s",
-                        chat_id, message_id,
-                    )
                     return None
         # Bound the number of versions kept for one message.
         same = _versions_for(rows, chat_id, message_id)
@@ -1129,7 +1089,6 @@ async def record_message(
             rows = [r for r in rows if r.get("id") != oldest]
         rows.insert(0, row)
         if not await _save_rows(rows):
-            logger.warning("[AED] archive write failed — capture not persisted")
             return None
     return row
 
@@ -1174,7 +1133,6 @@ async def record_deletion(
     async with _lock_for_loop():
         rows = await load_rows_async(force=True)
         if rows is None:
-            logger.warning("[AED] archive store unreadable — deletion not recorded (fail closed)")
             return []
         for message_id in deleted_ids:
             message_id = _as_id(message_id)
@@ -1219,7 +1177,6 @@ async def record_deletion(
             rows.insert(0, row)
             recorded.append(row)
         if recorded and not await _save_rows(rows):
-            logger.warning("[AED] archive write failed — deletion(s) not persisted")
             return []
     return recorded
 
@@ -1540,7 +1497,6 @@ async def cleanup_expired(now: datetime | None = None) -> dict[str, int]:
                 expired_objects.append(row.get("media_object"))
 
         if expired_ids and not await db_client.aed_delete_entries(expired_ids):
-            logger.warning("[AED] retention delete failed — nothing was deleted durably")
             return {"archive_deleted": 0, "snapshots_deleted": 0, "objects_deleted": 0}
         for path in expired_objects:
             if _delete_media_object(path):
@@ -1591,7 +1547,6 @@ async def cleanup_expired(now: datetime | None = None) -> dict[str, int]:
 
     if stats["archive_deleted"] or stats["snapshots_deleted"]:
         if not await db_client.aed_save_archive(list(_SHARD_KEYS), kept_shards):
-            logger.warning("[AED] retention save failed — nothing was deleted durably")
             return {"archive_deleted": 0, "snapshots_deleted": 0, "objects_deleted": 0}
 
     for path in expired_objects:
@@ -1630,8 +1585,7 @@ def _delete_media_object(path: Any) -> bool:
             return False
         db.storage.from_(bucket).remove([path])
         return True
-    except Exception as exc:
-        logger.warning("[AED] media object delete failed: %s", type(exc).__name__)
+    except Exception:
         return False
 
 
@@ -1645,7 +1599,6 @@ async def store_media_snapshot(client: Any, msg: Any, row: dict[str, Any]) -> bo
         return False
     size = row.get("media_size")
     if isinstance(size, int) and size > MAX_MEDIA_BYTES:
-        logger.info("[AED] media exceeds snapshot limit (%s bytes) — metadata only", size)
         return False
     try:
         import tempfile
@@ -1673,8 +1626,7 @@ async def store_media_snapshot(client: Any, msg: Any, row: dict[str, Any]) -> bo
             shutil.rmtree(tmp_dir, ignore_errors=True)
     except asyncio.CancelledError:
         raise
-    except Exception as exc:
-        logger.warning("[AED] media snapshot failed: %s", type(exc).__name__)
+    except Exception:
         return False
 
 

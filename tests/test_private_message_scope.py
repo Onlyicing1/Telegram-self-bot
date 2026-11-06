@@ -18,13 +18,16 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import logging
 import re
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from telethon import types
+from telethon.errors import FloodWaitError
 
 from backend.bot.handlers import private_message as pm
 from backend.bot.handlers import task_events
@@ -230,17 +233,23 @@ def _event(
     sender_entity="default",
     chat_fails=False,
     sender_fails=False,
+    sender_floodwait=None,
     message=True,
 ):
     resolved_chat = _user(chat_id) if chat_entity == "default" else chat_entity
     resolved_sender = _user(sender_id) if sender_entity == "default" else sender_entity
+    entity_calls: list[str] = []
 
     async def get_chat():
+        entity_calls.append("get_chat")
         if chat_fails:
             raise ValueError("cannot resolve chat")
         return resolved_chat
 
     async def get_sender():
+        entity_calls.append("get_sender")
+        if sender_floodwait is not None:
+            raise FloodWaitError(request=None, capture=sender_floodwait)
         if sender_fails:
             raise ValueError("cannot resolve sender")
         return resolved_sender
@@ -267,6 +276,7 @@ def _event(
         ),
         get_chat=get_chat,
         get_sender=get_sender,
+        entity_calls=entity_calls,
     )
 
 
@@ -477,12 +487,26 @@ def test_g_a_missing_sender_entity_is_rejected(db, client):
     assert db.senders == []
 
 
-def test_g_a_missing_chat_entity_is_rejected(db, client):
+def test_g_a_missing_chat_getter_never_replaces_the_authoritative_entity(db, client):
+    """In a direct private chat chat and sender are the SAME user, so the one
+    authoritative sender lookup supplies both entity halves; the chat getter is
+    never consulted (and a synthetic failure on it cannot block enforcement)."""
     _restricted(db, delete_incoming=True)
     handler = _handler(client)
-    _run(handler(_event(STRANGER, STRANGER, chat_entity=None)))
+    event = _event(STRANGER, STRANGER, chat_entity=None, chat_fails=True)
 
-    assert client.deleted == []
+    _run(handler(event))
+
+    assert event.entity_calls == ["get_sender"]
+    assert client.deleted == [(STRANGER, [7])]
+
+
+def test_g_the_classifier_still_rejects_an_unresolved_chat_entity():
+    """Defense in depth: a caller that supplies no chat entity is rejected by
+    the classifier itself, whatever the handler resolves."""
+    verdict = _classify(chat_entity=None)
+    assert verdict.eligible is False
+    assert verdict.reason == svc.SCOPE_CHAT_UNRESOLVED
 
 
 def test_h_an_entity_without_a_usable_bot_flag_is_rejected():
@@ -498,16 +522,112 @@ def test_h_a_sender_entity_that_is_not_a_user_is_rejected():
     assert _classify(sender_is_user=False).reason == svc.SCOPE_SENDER_NOT_USER
 
 
-def test_i_an_entity_resolution_failure_is_rejected(db, client):
+def test_i_an_authoritative_resolution_failure_is_rejected_without_a_second_rpc(db, client):
     _restricted(db, delete_incoming=True, fixed_response_enabled=True)
     _run(svc.set_fixed_response_text("closed"))
     handler = _handler(client)
 
-    _run(handler(_event(STRANGER, STRANGER, message_id=31, sender_fails=True)))
-    _run(handler(_event(STRANGER, STRANGER, message_id=32, chat_fails=True)))
+    failed = _event(STRANGER, STRANGER, message_id=31, sender_fails=True)
+    _run(handler(failed))
 
+    assert failed.entity_calls == ["get_sender"]
     assert client.deleted == [] and client.sent == []
     assert db.senders == []
+
+
+def test_a_valid_private_message_uses_exactly_one_entity_lookup(db, client):
+    _restricted(db, delete_incoming=True)
+    handler = _handler(client)
+    event = _event(STRANGER, STRANGER, message_id=99)
+
+    _run(handler(event))
+
+    assert event.entity_calls == ["get_sender"]
+    assert client.deleted == [(STRANGER, [99])]
+
+
+def test_non_private_group_channel_unknown_and_outgoing_events_do_no_rpc(db, client):
+    _restricted(db, delete_incoming=True, fixed_response_enabled=True)
+    _run(svc.set_fixed_response_text("closed"))
+    handler = _handler(client)
+    events = [
+        _event(STRANGER, STRANGER, is_private=False, is_group=True),
+        _event(-1009876543210, STRANGER, is_private=False, is_channel=True),
+        _event(STRANGER, STRANGER, is_private=None),
+        _event(STRANGER, STRANGER, is_group=None),
+        _event(STRANGER, STRANGER, out=True),
+        _event(STRANGER, OTHER),                      # contradictory ids
+        _event(STRANGER, STRANGER, message=False),    # no message id
+    ]
+
+    for event in events:
+        _run(handler(event))
+        assert event.entity_calls == []
+
+    assert client.deleted == [] and client.sent == []
+
+
+def test_entity_floodwait_suppresses_further_lookups_and_actions(db, client):
+    _restricted(db, delete_incoming=True, fixed_response_enabled=True)
+    _run(svc.set_fixed_response_text("closed"))
+    handler = _handler(client)
+
+    flooded = _event(STRANGER, STRANGER, message_id=41, sender_floodwait=120)
+    _run(handler(flooded))
+
+    assert flooded.entity_calls == ["get_sender"]
+    assert svc.entity_floodwait_remaining() > 0
+    assert client.deleted == [] and client.sent == []
+
+    # Suppression is checked BEFORE resolution: no second RPC, no action.
+    suppressed = _event(STRANGER, STRANGER, message_id=42)
+    _run(handler(suppressed))
+    assert suppressed.entity_calls == []
+    assert client.deleted == [] and client.sent == []
+
+
+def test_entity_floodwait_expires_and_resolution_resumes(db, client):
+    _restricted(db, delete_incoming=True)
+    handler = _handler(client)
+    _run(handler(_event(STRANGER, STRANGER, message_id=51, sender_floodwait=60)))
+    assert svc.entity_floodwait_remaining() > 0
+
+    svc.clear_entity_floodwait()
+    resumed = _event(STRANGER, STRANGER, message_id=52)
+    _run(handler(resumed))
+
+    assert resumed.entity_calls == ["get_sender"]
+    assert client.deleted == [(STRANGER, [52])]
+
+
+def test_entity_floodwait_is_bounded_and_monotonic():
+    svc.clear_entity_floodwait()
+    try:
+        assert svc.note_entity_floodwait(999999) == int(svc._ENTITY_FLOODWAIT_MAX_S)
+        now = time.monotonic()
+        assert svc.entity_floodwait_remaining(now=now) > 0
+        assert svc.entity_floodwait_remaining(now=now + 3601) == 0
+        # A shorter later value never shortens the active deadline.
+        svc.clear_entity_floodwait()
+        svc.note_entity_floodwait(30)
+        before = svc.entity_floodwait_remaining()
+        svc.note_entity_floodwait(1)
+        assert svc.entity_floodwait_remaining() >= before - 0.5
+    finally:
+        svc.clear_entity_floodwait()
+
+
+def test_floodwait_logging_is_one_warning_not_one_per_message(db, client, caplog):
+    _restricted(db, delete_incoming=True)
+    handler = _handler(client)
+
+    with caplog.at_level(logging.WARNING, logger=pm.__name__):
+        _run(handler(_event(STRANGER, STRANGER, message_id=61, sender_floodwait=120)))
+        for message_id in range(62, 67):
+            _run(handler(_event(STRANGER, STRANGER, message_id=message_id)))
+
+    warnings = [r for r in caplog.records if "stage=entity_floodwait" in r.getMessage()]
+    assert len(warnings) == 1
 
 
 # ── K. contradictory or unsupported events ───────────────────────────────────

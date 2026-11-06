@@ -62,12 +62,13 @@ private content, probe-failure isolation, unchanged health/metrics, and
 secret-free logging.
 
 **Status.** IMPLEMENTED + TESTED in this tree; NOT LIVE-VERIFIED (no deployed
-run and no real provider request). Source inspection additionally found that
-`gemini.py` serializes `role: "tool"` messages as `role: "model"` Contents
-(Google requires the `functionResponse` turn to be `user`, and parallel
-responses in ONE Content) — the strongest source-backed candidate for the
-observed Gemini continuation `request` failure. It is NOT changed in this
-diagnostic phase.
+run and no real provider request). Source inspection independently identified
+the Gemini continuation defect (`gemini.py` emitted one `role: "model"` Content
+per tool result instead of ONE `user` Content per call batch, in call order) —
+the strongest source-backed candidate for the observed Gemini `request`
+failure. That defect was repaired upstream in `0d07dc1` before this branch
+merged, so the probe is now the live way to confirm the repair holds for each
+`(provider, model)` pair.
 
 ## Remaining work
 
@@ -79,8 +80,8 @@ diagnostic phase.
    track provider catalog changes — the pool is only as fresh as the last run
    (a cached snapshot never arms it).
 4. Read `PROVIDER_CONTINUATION_DIAGNOSTIC` on the next real continuation
-   failure; if it reports `CONTINUATION_REJECTED` for `gemini`, fix the
-   adapter's function-response serialization (role `user`, all responses in
-   ONE Content) in a separate, behaviour-scoped change.
+   failure to confirm the `0d07dc1` Gemini repair holds live; a
+   `CONTINUATION_REJECTED` for any OTHER `(provider, model)` pair is the new
+   evidence that pair's serialization or capability is the defect.
 5. Optionally surface the latest per-pair diagnostic result in the AI
    diagnostics panel so it does not require reading Render logs.

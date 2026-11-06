@@ -39,7 +39,6 @@ Business logic and persistence live in the service; these handlers are thin.
 from __future__ import annotations
 
 import asyncio
-import logging
 from typing import Any
 
 from telethon import events
@@ -57,8 +56,6 @@ from backend.helper import inline_engine
 from backend.helper import symbols as sym
 from backend.helper.styles import DANGER, PRIMARY
 from backend.services import anti_edit_delete_service as service
-
-logger = logging.getLogger(__name__)
 
 PANEL_ID = "archive"
 LIST_ID = "archive_list"
@@ -129,8 +126,7 @@ async def _resolve_peer_identity(event, chat_id: Any) -> tuple[dict | None, bool
         entity = await event.get_chat()
     except asyncio.CancelledError:
         raise
-    except Exception as exc:
-        logger.debug("[AED] peer entity unresolved: %s", type(exc).__name__)
+    except Exception:  # AED emits no logs at any level; unresolved means UNKNOWN
         return identity, None
     if entity is None:
         return identity, None
@@ -484,8 +480,8 @@ async def _retention_input_handler(text, chat_id, msg_id, inline_chat_id, inline
     if helper and inline_chat_id and inline_msg_id:
         try:
             await helper.edit_message(inline_chat_id, inline_msg_id, notice)
-        except Exception as exc:
-            logger.warning("aed retention inline edit failed: %s", exc)
+        except Exception:  # AED emits no logs at any level
+            pass
     client = inline_engine.get_self_client()
     if client is not None and msg_id:
         try:
@@ -527,10 +523,6 @@ def register(client, owner_id: int, tz_str: str = "UTC") -> None:
                 return
             identity, peer_is_bot = await _resolve_peer_identity(event, getattr(msg, "chat_id", None))
             if peer_is_bot is not False:
-                logger.info(
-                    "[AED] snapshot skipped: peer is not a confirmed human (bot=%s) chat_id=%s",
-                    peer_is_bot, getattr(msg, "chat_id", None),
-                )
                 return
             await service.record_message(
                 msg=msg, kind=service.KIND_SNAPSHOT, owner=owner_id,
@@ -538,8 +530,8 @@ def register(client, owner_id: int, tz_str: str = "UTC") -> None:
             )
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
-            logger.warning("[AED] snapshot capture failed: %s", type(exc).__name__)
+        except Exception:  # AED emits no logs at any level; the capture is an honest miss
+            pass
 
     @client.on(events.MessageEdited())
     async def _aed_message_edited(event):
@@ -552,10 +544,6 @@ def register(client, owner_id: int, tz_str: str = "UTC") -> None:
                 return
             identity, peer_is_bot = await _resolve_peer_identity(event, getattr(msg, "chat_id", None))
             if peer_is_bot is not False:
-                logger.info(
-                    "[AED] edit skipped: peer is not a confirmed human (bot=%s) chat_id=%s",
-                    peer_is_bot, getattr(msg, "chat_id", None),
-                )
                 return
             await service.record_message(
                 msg=msg, kind=service.KIND_EDIT, owner=owner_id,
@@ -563,8 +551,8 @@ def register(client, owner_id: int, tz_str: str = "UTC") -> None:
             )
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
-            logger.warning("[AED] edit capture failed: %s", type(exc).__name__)
+        except Exception:  # AED emits no logs at any level; the capture is an honest miss
+            pass
 
     @client.on(events.MessageDeleted())
     async def _aed_message_deleted(event):
@@ -579,16 +567,12 @@ def register(client, owner_id: int, tz_str: str = "UTC") -> None:
                 else (None, None)
             )
             if peer_is_bot is not False:
-                logger.info(
-                    "[AED] deletion skipped: peer is not a confirmed human (bot=%s) chat_id=%s",
-                    peer_is_bot, chat_id,
-                )
                 return
             await service.record_deletion(event=event, owner=owner_id, peer_is_bot=peer_is_bot)
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
-            logger.warning("[AED] deletion capture failed: %s", type(exc).__name__)
+        except Exception:  # AED emits no logs at any level; the capture is an honest miss
+            pass
 
     register_panel(PANEL_ID, lambda event, extra: _panel_result(PANEL_ID, extra, owner_id), parent="cipher", title="Anti-Edit / Anti-Delete")
     register_panel(LIST_ID, lambda event, extra: _panel_result(LIST_ID, extra, owner_id), parent=PANEL_ID, title="Archive")

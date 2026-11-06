@@ -103,6 +103,8 @@ async def test_gemini_handles_tool_result_messages():
     payload = provider._http_client.post.call_args.kwargs["json"]
     contents = payload["contents"]
     assert len(contents) == 3
+    # The response turn is a ``user`` turn in Gemini's contract, never ``model``.
+    assert [c["role"] for c in contents] == ["user", "model", "user"]
     assert "functionCall" in contents[1]["parts"][0]
     assert "functionResponse" in contents[2]["parts"][0]
 

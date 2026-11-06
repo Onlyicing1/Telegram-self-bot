@@ -134,6 +134,15 @@ SCOPE_SENDER_TYPE_UNKNOWN = "sender_type_unknown"
 SCOPE_BOT = "bot_sender"
 SCOPE_DELETED = "deleted_sender"
 SCOPE_SELF = "own_account_chat"
+#: Telegram asked us to wait before resolving entities again. The event is out
+#: of scope for that window: no RPC, no action, and the message continues.
+SCOPE_ENTITY_FLOODWAIT = "entity_floodwait"
+
+#: Entity-resolution FloodWait is bounded: a longer server wait is re-probed
+#: after an hour rather than remembered for days, and the deadline is monotonic
+#: so a wall-clock change cannot shorten it.
+_ENTITY_FLOODWAIT_MAX_S = 3600.0
+_entity_floodwait_until = 0.0
 
 SOURCE_MANUAL = "manual"
 SOURCE_TEMPORARY = "temporary"
@@ -582,6 +591,76 @@ def _bot_flag(entity: Any) -> bool | None:
     return flag if isinstance(flag, bool) else None
 
 
+def entity_floodwait_remaining(now: float | None = None) -> float:
+    """Seconds left before entity resolution is attempted again (0 = allowed)."""
+    current = time.monotonic() if now is None else now
+    return max(0.0, _entity_floodwait_until - current)
+
+
+def note_entity_floodwait(seconds: Any) -> int:
+    """Remember Telegram's entity-resolution FloodWait as a monotonic deadline.
+
+    No sleep and no task: a message that arrives while the deadline is active
+    is simply out of scope. The wait is clamped to [1, 3600] seconds so a huge
+    value cannot silence the feature for days.
+    """
+    global _entity_floodwait_until
+    try:
+        wait_s = int(seconds or 0)
+    except (TypeError, ValueError):
+        wait_s = 0
+    wait_s = max(1, min(wait_s or 1, int(_ENTITY_FLOODWAIT_MAX_S)))
+    _entity_floodwait_until = max(_entity_floodwait_until, time.monotonic() + wait_s)
+    return wait_s
+
+
+def clear_entity_floodwait() -> None:
+    global _entity_floodwait_until
+    _entity_floodwait_until = 0.0
+
+
+def identity_rejection(
+    *,
+    owner_id: Any,
+    is_private: Any,
+    is_group: Any,
+    is_channel: Any,
+    chat_id: Any,
+    sender_id: Any,
+    message_id: Any,
+    peer_user_id: Any,
+) -> str | None:
+    """The identity-only half of the scope gate — performs NO Telegram I/O.
+
+    Returns a rejection reason, or ``None`` when the event MAY be a genuine
+    direct private chat and one authoritative entity lookup is still required.
+    Every check is a pure function of the event's own facts, so a group, a
+    channel, an outgoing message, an unknown chat type, a missing id or a
+    contradictory id set is rejected before the handler loads configuration or
+    performs any entity RPC.
+    """
+    if not _valid_owner(owner_id):
+        return SCOPE_INCONSISTENT
+    if is_group is True:
+        return SCOPE_GROUP
+    if is_channel is True:
+        return SCOPE_CHANNEL
+    if is_private is not True or is_group is not False or is_channel is not False:
+        return SCOPE_CHAT_UNKNOWN
+
+    chat = _positive_id(chat_id)
+    sender = _positive_id(sender_id)
+    message = _positive_id(message_id)
+    peer = _positive_id(peer_user_id)
+    if chat is None or sender is None or message is None or peer is None:
+        return SCOPE_INCONSISTENT
+    if not (peer == chat == sender):
+        return SCOPE_INCONSISTENT
+    if chat == owner_id:
+        return SCOPE_SELF
+    return None
+
+
 def classify_scope(
     *,
     owner_id: Any,
@@ -607,25 +686,22 @@ def classify_scope(
     contradictory fails closed, and the caller performs NO action whatsoever on
     a rejection (no delete, no response, no AI request, no counter, no record).
     """
-    if not _valid_owner(owner_id):
-        return ScopeVerdict(False, SCOPE_INCONSISTENT)
-    if is_group is True:
-        return ScopeVerdict(False, SCOPE_GROUP)
-    if is_channel is True:
-        return ScopeVerdict(False, SCOPE_CHANNEL)
-    if is_private is not True or is_group is not False or is_channel is not False:
-        return ScopeVerdict(False, SCOPE_CHAT_UNKNOWN)
+    reason = identity_rejection(
+        owner_id=owner_id,
+        is_private=is_private,
+        is_group=is_group,
+        is_channel=is_channel,
+        chat_id=chat_id,
+        sender_id=sender_id,
+        message_id=message_id,
+        peer_user_id=peer_user_id,
+    )
+    if reason is not None:
+        return ScopeVerdict(False, reason)
 
     chat = _positive_id(chat_id)
     sender = _positive_id(sender_id)
     message = _positive_id(message_id)
-    peer = _positive_id(peer_user_id)
-    if chat is None or sender is None or message is None or peer is None:
-        return ScopeVerdict(False, SCOPE_INCONSISTENT)
-    if not (peer == chat == sender):
-        return ScopeVerdict(False, SCOPE_INCONSISTENT)
-    if chat == owner_id:
-        return ScopeVerdict(False, SCOPE_SELF)
     if not chat_is_user:
         return ScopeVerdict(False, SCOPE_NOT_PRIVATE)
     if chat_entity is None:
@@ -707,6 +783,7 @@ def reset_in_memory() -> None:
     _load_retry_at = 0.0
     _handled.clear()
     _locks.clear()
+    clear_entity_floodwait()
 
 
 def configure_owner(owner_id: Any) -> None:

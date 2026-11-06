@@ -439,6 +439,29 @@ def _describe_empty_result(result) -> str:
     return "AI returned no response."
 
 
+def _tool_execution_note(metadata: dict) -> str:
+    """Truthful owner-facing note about tool execution, or ``""``.
+
+    The round-limit sentence is only true when the calls were never
+    dispatched. A call that EXECUTED but whose result could not be recorded
+    gets its own sentence: telling the owner it "was not executed" would be
+    false, and it also hides a real side effect that already happened.
+    """
+    notes: list[str] = []
+    if metadata.get("tool_rounds_exhausted"):
+        pending = len(metadata.get("pending_tool_calls") or [])
+        notes.append(
+            f"{sym.STATE_WARNING} Tool round limit reached — "
+            f"{pending} pending tool call(s) were not executed."
+        )
+    if metadata.get("tool_result_recording_failed"):
+        notes.append(
+            f"{sym.STATE_WARNING} The action ran, but its result could not be "
+            "saved to history."
+        )
+    return "\n\n".join(notes)
+
+
 def _humanize_error(error: str) -> str:
     """Convert an internal AI failure into a clean, provider-agnostic message.
 
@@ -839,12 +862,9 @@ async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
             is_media_answer = _is_media_result(result)
             if wizard_unavailable:
                 response_text = f"{response_text}\n\n_{_WIZARD_UNAVAILABLE_HINT}_"
-            if result.metadata.get("tool_rounds_exhausted"):
-                pending = len(result.metadata.get("pending_tool_calls", []))
-                response_text = (
-                    f"{response_text}\n\n{sym.STATE_WARNING} Tool round limit reached — "
-                    f"{pending} pending tool call(s) were not executed."
-                )
+            execution_note = _tool_execution_note(result.metadata or {})
+            if execution_note:
+                response_text = f"{response_text}\n\n{execution_note}"
             # Secondary status under the answer — never a diagnostic block.
             # A fallback recovery gets its own one-line note (the user should
             # know a backup model answered); the optional compact per-request
