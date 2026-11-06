@@ -903,33 +903,44 @@ class ProviderManager:
             latency = time.perf_counter() - start
             self._metrics.record(name, latency=latency, error=f"timeout: {exc}")
             logger.warning("ProviderManager: '%s' timed out during chat", name)
+            attempted = model or self._effective_model(provider)
             task_trace(
-                "provider_response", provider=name, model=self._effective_model(provider) or "-",
+                "provider_response", provider=name, model=attempted or "-",
                 success="false", elapsed_ms=int(latency * 1000), output_category="empty",
                 response_length=0, response_preview="", failure_category="timeout",
                 error_detail=bound_text(str(exc), 200),
             )
+            # The candidate that actually timed out must stay identifiable: a
+            # later health decision must never fall back to the configured
+            # default model when a non-default candidate was being tried.
+            meta: dict[str, Any] = {"failure_type": "timeout", "error": str(exc)}
+            if model:
+                meta["requested_model"] = model
             return ProviderResponse(
                 text=f"Request timed out: {exc}",
                 provider_name=name,
                 success=False,
-                metadata={"failure_type": "timeout", "error": str(exc)},
+                metadata=meta,
             )
         except Exception as exc:
             latency = time.perf_counter() - start
             self._metrics.record(name, latency=latency, error=f"{type(exc).__name__}: {exc}")
             logger.warning("ProviderManager: '%s' crashed during chat: %s", name, exc)
+            attempted = model or self._effective_model(provider)
             task_trace(
-                "provider_response", provider=name, model=self._effective_model(provider) or "-",
+                "provider_response", provider=name, model=attempted or "-",
                 success="false", elapsed_ms=int(latency * 1000), output_category="empty",
                 response_length=0, response_preview="", failure_category="network",
                 error_detail=bound_text(f"{type(exc).__name__}: {exc}", 200),
             )
+            meta = {"failure_type": "network", "error": f"{type(exc).__name__}: {exc}"}
+            if model:
+                meta["requested_model"] = model
             return ProviderResponse(
                 text=f"Request failed: {type(exc).__name__}: {exc}",
                 provider_name=name,
                 success=False,
-                metadata={"failure_type": "network", "error": f"{type(exc).__name__}: {exc}"},
+                metadata=meta,
             )
 
     async def _attempt_with_retry(
@@ -949,12 +960,16 @@ class ProviderManager:
         default model is used otherwise.
         """
         name = self._safe_provider_name(provider)
-        label = model or self._effective_model(provider) or "-"
+        # The model this attempt actually asks for — carried explicitly through
+        # every failure decision instead of being re-derived from response
+        # metadata, which a timeout/exception response may not carry.
+        current_model = model or self._effective_model(provider)
+        label = current_model or "-"
         async with self._health.acquire(name):
             logger.info("AI_PROVIDER_ATTEMPT provider=%s model=%s attempt=1", name, label)
             response = await self._call_once(provider, messages, kwargs, model)
             if response.success:
-                self._record_model_success(name, model or self._effective_model(provider))
+                self._record_model_success(name, current_model)
                 self._note_response_quality(name, response, kwargs)
                 return response
 
@@ -977,9 +992,7 @@ class ProviderManager:
                         )
                         retry_response = await self._call_once(provider, messages, kwargs, model)
                         if retry_response.success:
-                            self._record_model_success(
-                                name, model or self._effective_model(provider)
-                            )
+                            self._record_model_success(name, current_model)
                             self._note_response_quality(name, retry_response, kwargs)
                             logger.info(
                                 "AI_PROVIDER_FAILURE provider=%s model=%s category=RATE_LIMIT_RECOVERED",
@@ -987,10 +1000,11 @@ class ProviderManager:
                             )
                             return self._with_retry_metadata(retry_response, 1)
                         self._apply_failure(
-                            name, self._failure_type(retry_response), retry_response
+                            name, self._failure_type(retry_response), retry_response,
+                            current_model,
                         )
                         return self._with_retry_metadata(retry_response, 1)
-                self._apply_failure(name, ftype, response)
+                self._apply_failure(name, ftype, response, current_model)
                 return response
 
             # ONE bounded retry for transient/network/server errors, after a
@@ -999,7 +1013,7 @@ class ProviderManager:
             logger.info("AI_PROVIDER_ATTEMPT provider=%s model=%s attempt=2", name, model)
             retry_response = await self._call_once(provider, messages, kwargs, model)
             if retry_response.success:
-                self._record_model_success(name, model or self._effective_model(provider))
+                self._record_model_success(name, current_model)
                 self._note_response_quality(name, retry_response, kwargs)
                 logger.info(
                     "AI_PROVIDER_FAILURE provider=%s model=%s category=TRANSIENT_RECOVERED",
@@ -1007,7 +1021,9 @@ class ProviderManager:
                 )
                 return self._with_retry_metadata(retry_response, 1)
 
-            self._apply_failure(name, self._failure_type(retry_response), retry_response)
+            self._apply_failure(
+                name, self._failure_type(retry_response), retry_response, current_model
+            )
             # The retry DID happen — stamp it so a later fallback success
             # (or the terminal failure) can report the true retry count.
             return self._with_retry_metadata(retry_response, 1)

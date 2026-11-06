@@ -692,3 +692,236 @@ async def test_exhausting_every_candidate_returns_honest_failure():
     assert meta.get("fallback_exhausted") is True
     assert len(meta.get("errors") or []) == 3
     assert "All AI providers failed" in response.text
+
+
+# ── Actual model identity across real timeout/exception failures ──
+
+
+class _RaisingProvider(_ModelProvider):
+    """Provider whose ``chat()`` RAISES for named models, and can script others.
+
+    Unlike a scripted ``ProviderResponse``, this exercises the manager's own
+    timeout/exception handlers, which is where the attempted model used to be
+    lost.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        faults: dict[str, list[BaseException]] | None = None,
+        responses: dict[str, list[ProviderResponse]] | None = None,
+        model: str = "",
+        probe: _Probe | None = None,
+    ) -> None:
+        super().__init__(name, [], model=model, probe=probe)
+        self._faults = {mid: list(queue) for mid, queue in (faults or {}).items()}
+        self._by_model = {mid: list(queue) for mid, queue in (responses or {}).items()}
+
+    async def chat(self, messages: list[dict[str, Any]], **kwargs: Any) -> ProviderResponse:
+        model = str(kwargs.get("model") or self._config.default_model or "")
+        self.calls += 1
+        self._probe.enter(self._name, model, messages)
+        try:
+            await asyncio.sleep(0)
+            scripted = self._by_model.get(model)
+            if scripted:
+                step = scripted.pop(0)
+                if isinstance(step, BaseException):
+                    raise step
+                return step
+            faults = self._faults.get(model)
+            if faults:
+                raise faults.pop(0)
+            return ProviderResponse(text="ok", provider_name=self._name, success=True)
+        finally:
+            self._probe.exit()
+
+
+def _health_neutral_failure() -> ProviderResponse:
+    """A 400 'request' failure: advances the router without touching health."""
+    return _fail("bad request for this model", http_status=400, failure_type="request")
+
+
+@pytest.mark.asyncio
+async def test_call_once_preserves_requested_model_on_timeout_and_exception():
+    """The real failure handlers keep the attempted model in metadata."""
+    pm = ProviderManager()
+    p = _RaisingProvider(
+        "p",
+        {"model-B": [asyncio.TimeoutError("slow"), RuntimeError("boom")]},
+        model="model-A",
+    )
+    pm.register_provider(p)
+
+    timed_out = await pm._call_once(p, [{"role": "user", "content": "x"}], {}, "model-B")
+    assert timed_out.success is False
+    assert (timed_out.metadata or {})["failure_type"] == "timeout"
+    assert (timed_out.metadata or {})["requested_model"] == "model-B"
+
+    crashed = await pm._call_once(p, [{"role": "user", "content": "x"}], {}, "model-B")
+    assert crashed.success is False
+    assert (crashed.metadata or {})["failure_type"] == "network"
+    assert (crashed.metadata or {})["requested_model"] == "model-B"
+
+    # A configured-default call is not mislabelled with an override model.
+    defaulted = await pm._call_once(p, [{"role": "user", "content": "x"}], {}, "")
+    assert defaulted.success is True
+    assert "requested_model" not in (defaulted.metadata or {})
+
+
+@pytest.mark.asyncio
+async def test_backup_model_real_timeout_cools_only_that_model():
+    pm = ProviderManager()
+    probe = _Probe()
+    p = _RaisingProvider(
+        "p",
+        {"model-B": [asyncio.TimeoutError(), asyncio.TimeoutError()]},
+        responses={"model-A": [_health_neutral_failure()]},
+        model="model-A",
+        probe=probe,
+    )
+    pm.register_provider(p)
+    pm.switch_provider("p")
+    pm.set_model_candidates("p", ["model-B"])
+
+    response = await pm.chat([{"role": "user", "content": "hi"}])
+
+    assert response.success is False
+    assert [model for _, model in probe.calls] == ["model-A", "model-B", "model-B"]
+    assert pm._health.model_cooldown_remaining("p", "model-B") > 0
+    assert pm._health.model_cooldown_remaining("p", "model-A") == 0
+    assert pm._health.is_model_available("p", "model-A") is True
+    assert pm._health.state("p") == ProviderHealthState.HEALTHY
+    assert ("p", "model-A") not in pm._unavailable_models
+
+
+@pytest.mark.asyncio
+async def test_backup_model_real_exception_cools_only_that_model():
+    pm = ProviderManager()
+    probe = _Probe()
+    p = _RaisingProvider(
+        "p",
+        {"model-B": [RuntimeError("socket exploded"), RuntimeError("again")]},
+        responses={"model-A": [_health_neutral_failure()]},
+        model="model-A",
+        probe=probe,
+    )
+    pm.register_provider(p)
+    pm.switch_provider("p")
+    pm.set_model_candidates("p", ["model-B"])
+
+    await pm.chat([{"role": "user", "content": "hi"}])
+
+    assert pm._health.model_cooldown_remaining("p", "model-B") > 0
+    assert pm._health.model_cooldown_remaining("p", "model-A") == 0
+    assert pm._health.state("p") == ProviderHealthState.HEALTHY
+
+
+@pytest.mark.asyncio
+async def test_retry_failure_stays_attributed_to_the_backup_model():
+    """Initial attempt AND its bounded retry both fail on model-B."""
+    pm = ProviderManager()
+    probe = _Probe()
+    p = _RaisingProvider(
+        "p",
+        {"model-B": [asyncio.TimeoutError(), asyncio.TimeoutError()]},
+        responses={"model-A": [_health_neutral_failure()]},
+        model="model-A",
+        probe=probe,
+    )
+    pm.register_provider(p)
+    pm.switch_provider("p")
+    pm.set_model_candidates("p", ["model-B"])
+
+    await pm.chat([{"role": "user", "content": "hi"}])
+
+    assert [model for _, model in probe.calls] == ["model-A", "model-B", "model-B"]
+    assert pm._health.model_cooldown_remaining("p", "model-B") > 0
+    # Exactly one model owns the cooldown.
+    assert pm._health.is_model_available("p", "model-A") is True
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_retry_failure_attributes_the_attempted_model():
+    pm = ProviderManager()
+    probe = _Probe()
+    p = _RaisingProvider(
+        "p",
+        responses={
+            "model-A": [_health_neutral_failure()],
+            "model-B": [
+                _fail(
+                    "429 per model",
+                    http_status=429,
+                    failure_type="rate_limited",
+                    retry_after=0.01,
+                    rate_limit_scope="model",
+                ),
+                asyncio.TimeoutError(),
+            ],
+        },
+        model="model-A",
+        probe=probe,
+    )
+    pm.register_provider(p)
+    pm.switch_provider("p")
+    pm.set_model_candidates("p", ["model-B"])
+
+    await pm.chat([{"role": "user", "content": "hi"}])
+
+    # The short Retry-After retry ran on model-B and raised a real timeout.
+    assert [model for _, model in probe.calls] == ["model-A", "model-B", "model-B"]
+    assert pm._health.model_cooldown_remaining("p", "model-B") > 0
+    assert pm._health.model_cooldown_remaining("p", "model-A") == 0
+    # A model-scoped limit never takes the provider down.
+    assert pm._health.state("p") == ProviderHealthState.HEALTHY
+
+
+@pytest.mark.asyncio
+async def test_configured_primary_failure_still_names_the_primary():
+    pm = ProviderManager()
+    probe = _Probe()
+    p = _RaisingProvider(
+        "p",
+        {"model-A": [asyncio.TimeoutError(), asyncio.TimeoutError()]},
+        model="model-A",
+        probe=probe,
+    )
+    pm.register_provider(p)
+    pm.switch_provider("p")
+    pm.set_model_candidates("p", ["model-B"])
+
+    response = await pm.chat([{"role": "user", "content": "hi"}])
+
+    assert response.success is True
+    assert [model for _, model in probe.calls] == ["model-A", "model-A", "model-B"]
+    assert pm._health.model_cooldown_remaining("p", "model-A") > 0
+    assert pm._health.is_model_available("p", "model-B") is True
+
+
+@pytest.mark.asyncio
+async def test_sibling_model_stays_eligible_after_backup_cooldown():
+    pm = ProviderManager()
+    probe = _Probe()
+    p = _RaisingProvider(
+        "p",
+        {"model-B": [asyncio.TimeoutError(), asyncio.TimeoutError()]},
+        responses={"model-A": [_health_neutral_failure()]},
+        model="model-A",
+        probe=probe,
+    )
+    pm.register_provider(p)
+    pm.switch_provider("p")
+    pm.set_model_candidates("p", ["model-B"])
+
+    await pm.chat([{"role": "user", "content": "hi"}])
+    assert pm._health.model_cooldown_remaining("p", "model-B") > 0
+
+    # The next request must be served by the healthy primary, never by a
+    # globally cooled provider and never by the cooling pair.
+    probe.calls.clear()
+    second = await pm.chat([{"role": "user", "content": "hi again"}])
+
+    assert second.success is True
+    assert [model for _, model in probe.calls] == ["model-A"]
+    assert pm._health.state("p") == ProviderHealthState.HEALTHY

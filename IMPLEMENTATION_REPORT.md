@@ -100,13 +100,26 @@ model-level limit phrase (Groq's documented shape); quota/billing/account marker
 return `provider`; everything else is `unknown`, which is treated as
 provider-wide.
 
+**Model identity across timeout/exception failures (targeted fix).** The model an
+attempt actually asks for is carried explicitly rather than re-derived from
+response metadata: `_attempt_with_retry` computes `current_model = model or
+self._effective_model(provider)` once and passes it to every `_apply_failure()`
+call (initial failure, transient retry failure, short-Retry-After retry
+failure), and `_call_once()`'s own `asyncio.TimeoutError` and generic-exception
+handlers now record `requested_model` in their metadata. Before this fix a
+non-default candidate that timed out or raised had no model in its metadata, so
+`_apply_failure()` fell back to the provider's configured default model and
+cooled down the WRONG `(provider, model_id)` pair — leaving the failing backup
+eligible and disabling the healthy primary. A configured-default attempt still
+carries no `requested_model`, so an override never silently relabels it.
+
 ## 6. Exact tests executed and results
 
 | Command | Result |
 |---|---|
-| `.venv/bin/python -m pytest tests/test_dynamic_model_fallback.py -q` | **22 passed** |
-| focused group: `test_dynamic_model_fallback.py`, `test_23_provider_mesh.py`, `test_24_execution_reliability.py`, `test_17_providers.py`, `test_provider_structured_output.py`, `test_provider_tool_boundary.py`, `test_provider_system_instruction_contract.py`, `test_task_fallback_classification.py`, `test_task_fallback_cooldown.py`, `test_13_model_selection.py` | **151 passed** in 10.75 s |
-| full suite: `.venv/bin/python -m pytest tests -q --tb=line -p no:cacheprovider` | **6973 passed, 27 skipped, 2 failed** in 135.59 s |
+| `.venv/bin/python -m pytest tests/test_dynamic_model_fallback.py -q` | **29 passed** |
+| focused group: `test_dynamic_model_fallback.py`, `test_23_provider_mesh.py`, `test_24_execution_reliability.py`, `test_17_providers.py`, `test_provider_structured_output.py`, `test_provider_tool_boundary.py`, `test_provider_system_instruction_contract.py`, `test_task_fallback_classification.py`, `test_task_fallback_cooldown.py`, `test_13_model_selection.py` | **158 passed** in 10.52 s |
+| full suite: `.venv/bin/python -m pytest tests -q --tb=line -p no:cacheprovider` | **6980 passed, 27 skipped, 2 failed** in 135.04 s |
 | `.venv/bin/python -m py_compile` on every changed Python file + the new test | exit 0 |
 | `git diff --check` | exit 0 (no whitespace errors) |
 
@@ -143,6 +156,23 @@ maximum concurrent candidate calls):
 20. Exhausting every candidate returns the honest failure response.
 21. Scope classifier: Groq model message → `model`; `insufficient_quota`/Gemini quota → `provider`; opaque → `unknown`.
 22. A provider with only one candidate keeps the pre-existing provider-wide penalty.
+
+Added for the model-identity fix (real `chat()` exceptions, not scripted
+failures):
+
+23. `_call_once()` preserves `requested_model` on a real `asyncio.TimeoutError`
+    and on a real exception, and never invents one for a configured-default call.
+24. A backup model that really raises a timeout cools ONLY that pair; the
+    configured primary stays `healthy` and the provider stays `healthy`.
+25. A backup model that raises a general exception is attributed to that pair.
+26. Initial attempt + bounded retry both failing keep the failure on that model.
+27. The short Retry-After retry failing (real timeout on the retry) is
+    attributed to the attempted backup model, keeping model-scoped limits
+    out of the provider circuit.
+28. The configured primary still cools down under its own id, with the backup
+    left eligible.
+29. A sibling model stays eligible after a backup cooldown, and the next
+    request is served by the primary rather than by a globally cooled provider.
 
 ## 7. Untested behaviour
 
