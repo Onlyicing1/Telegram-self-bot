@@ -206,6 +206,47 @@ async def test_qualifying_continuation_failure_runs_one_probe(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_probe_config_is_cheap_and_leaves_live_config_untouched(monkeypatch):
+    diag.reset_state()
+    config = ProviderConfig(
+        provider_name="gemini",
+        api_key="sk-live-secret",
+        base_url="https://example.test/v1beta",
+        default_model="gemini-2.5-pro",
+        temperature=0.9,
+        max_tokens=8192,
+        enabled=True,
+    )
+    registry = ProviderRegistry()
+    registry.register(_ScriptedProvider("gemini", config=config))
+    registry.switch_provider("gemini")
+    manager = ProviderManager(registry)
+    factory = _patch_factory(monkeypatch, _FakeFactory())
+
+    task = diag.schedule_continuation_diagnostic(manager, _failure(), request_id="rid")
+    assert task is not None
+    await task
+
+    _, probe_config = factory.created[0]
+    assert diag.PROBE_MAX_TOKENS == 64
+    assert probe_config.max_tokens == 64
+    assert probe_config.temperature == 0.0
+    # Credential, endpoint and requested model are preserved exactly.
+    assert probe_config.api_key == "sk-live-secret"
+    assert probe_config.base_url == "https://example.test/v1beta"
+    assert probe_config.default_model == "gemini-2.5-pro"
+    assert factory.calls[0]["kwargs"]["model"] == "gemini-2.5-pro"
+    # The live config is the very object production reads and is NOT mutated.
+    live = manager.get_provider_config("gemini")
+    assert live is config
+    assert live.max_tokens == 8192
+    assert live.temperature == 0.9
+    assert live.api_key == "sk-live-secret"
+    assert live.base_url == "https://example.test/v1beta"
+    assert live.default_model == "gemini-2.5-pro"
+
+
+@pytest.mark.asyncio
 async def test_repeated_failure_inside_cooldown_skips_the_probe(monkeypatch, caplog):
     diag.reset_state()
     manager, _ = _manager()

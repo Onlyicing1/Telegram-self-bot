@@ -52,6 +52,10 @@ PROBE_COOLDOWN_SECONDS = 1800.0
 #: Strict per-probe timeout. A probe that hangs is a TIMEOUT result, not a
 #: lingering task.
 PROBE_TIMEOUT_SECONDS = 12.0
+#: Output budget for the probe request. 64 tokens is enough for a short
+#: acknowledgement or one function call and keeps the diagnostic cheap; the
+#: production generation budget is never spent on it.
+PROBE_MAX_TOKENS = 64
 
 #: Only these continuation failure categories get a probe. ``auth``,
 #: ``rate_limited``, ``model_not_found``, ``timeout``, ``network`` and
@@ -326,9 +330,11 @@ def _probe_instance(
     config = getattr(live, "config", None)
     if not isinstance(config, ProviderConfig):
         return UNSUPPORTED
-    # A COPY: the probe's timeout/HTTP client must never be the production
-    # instance's, and nothing here mutates the live config.
+    # A COPY: the probe's timeout/HTTP client and generation budget must never
+    # be the production instance's, and nothing here mutates the live config.
     probe_config = replace(config, extra=dict(config.extra or {}))
+    probe_config.max_tokens = PROBE_MAX_TOKENS
+    probe_config.temperature = 0.0
     if model and not probe_config.default_model:
         probe_config.default_model = model
     return ProviderFactory.create_provider(provider_name, probe_config)
