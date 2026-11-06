@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -483,7 +484,13 @@ async def test_model_scoped_rate_limit_keeps_siblings_eligible():
 
 
 @pytest.mark.asyncio
-async def test_ambiguous_rate_limit_is_handled_conservatively():
+async def test_ambiguous_rate_limit_does_not_immediately_disable_the_provider():
+    """An opaque 429 alone is no longer proof of a provider-wide limit.
+
+    It gets the bounded middle ground: ONE tentative model cooldown plus ONE
+    sibling probe for this invocation. A second 429 (or no sibling at all)
+    is what establishes provider-wide evidence.
+    """
     pm = ProviderManager()
     probe = _Probe()
     p = _ModelProvider(
@@ -501,9 +508,11 @@ async def test_ambiguous_rate_limit_is_handled_conservatively():
 
     response = await pm.chat([{"role": "user", "content": "hi"}])
 
-    assert response.success is False
-    assert pm._health.state("p") == ProviderHealthState.COOLING_DOWN
-    assert [model for _, model in probe.calls] == ["m1"]
+    assert response.success is True
+    assert [model for _, model in probe.calls] == ["m1", "m2"]
+    assert pm._health.state("p") == ProviderHealthState.HEALTHY
+    assert pm._health.model_cooldown_remaining("p", "m1") > 0
+    assert pm._health.is_model_available("p", "m3") is True
 
 
 def test_rate_limit_scope_only_follows_established_evidence():
@@ -925,3 +934,324 @@ async def test_sibling_model_stays_eligible_after_backup_cooldown():
     assert second.success is True
     assert [model for _, model in probe.calls] == ["model-A"]
     assert pm._health.state("p") == ProviderHealthState.HEALTHY
+
+
+# ── Ambiguous 429: ONE bounded sibling probe, local to the invocation ──
+
+
+def _ambiguous_429(retry_after: float = 30.0) -> ProviderResponse:
+    """A 429 whose body establishes NO scope — the ambiguous middle case."""
+    return _fail(
+        "429 opaque", http_status=429, failure_type="rate_limited",
+        retry_after=retry_after,
+    )
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_429_probes_one_sibling_and_cools_only_that_model():
+    pm = ProviderManager()
+    probe = _Probe()
+    p = _ModelProvider(
+        "p", [_ambiguous_429(), _ok()], model="m1", probe=probe,
+    )
+    pm.register_provider(p)
+    pm.switch_provider("p")
+    pm.set_model_candidates("p", ["m2", "m3"])
+
+    response = await pm.chat([{"role": "user", "content": "hi"}])
+
+    assert response.success is True
+    assert [model for _, model in probe.calls] == ["m1", "m2"]
+    assert pm._health.state("p") == ProviderHealthState.HEALTHY
+    assert pm._health.model_cooldown_remaining("p", "m1") > 0
+    assert pm._health.is_model_available("p", "m2") is True
+    meta = response.metadata or {}
+    assert meta.get("model") == "m2"
+    assert meta.get("fallback") is True
+    assert meta.get("model_fallback") is True
+    assert meta.get("fallback_from_model") == "m1"
+    assert meta.get("fallback_to_model") == "m2"
+    assert meta.get("candidates_attempted") == 2
+
+
+@pytest.mark.asyncio
+async def test_second_429_during_the_probe_cools_the_provider_and_stops_siblings():
+    pm = ProviderManager()
+    probe = _Probe()
+    p = _ModelProvider(
+        "p", [_ambiguous_429(), _ambiguous_429(), _ok()], model="m1", probe=probe,
+    )
+    pm.register_provider(p)
+    pm.switch_provider("p")
+    pm.set_model_candidates("p", ["m2", "m3"])
+
+    response = await pm.chat([{"role": "user", "content": "hi"}])
+
+    assert response.success is False
+    # The probe was spent on m2; m3 was never contacted after the second 429.
+    assert [model for _, model in probe.calls] == ["m1", "m2"]
+    assert pm._health.state("p") == ProviderHealthState.COOLING_DOWN
+
+    # A confirmed provider-wide cooldown stays effective for later calls.
+    probe.calls.clear()
+    second = await pm.chat([{"role": "user", "content": "again"}])
+    assert second.success is False
+    assert probe.calls == [], "a cooling provider must not be contacted again"
+
+
+@pytest.mark.asyncio
+async def test_probe_sibling_non_429_failure_keeps_normal_classification():
+    pm = ProviderManager()
+    probe = _Probe()
+    p = _ModelProvider(
+        "p",
+        [
+            _ambiguous_429(),
+            _fail("timeout", failure_type="timeout"),
+            _fail("timeout", failure_type="timeout"),
+            _ok(),
+        ],
+        model="m1",
+        probe=probe,
+    )
+    pm.register_provider(p)
+    pm.switch_provider("p")
+    pm.set_model_candidates("p", ["m2", "m3"])
+
+    response = await pm.chat([{"role": "user", "content": "hi"}])
+
+    assert response.success is True
+    assert [model for _, model in probe.calls] == ["m1", "m2", "m2", "m3"]
+    # The probe's timeout is an ORDINARY model failure, not provider evidence.
+    assert pm._health.state("p") == ProviderHealthState.HEALTHY
+    assert pm._health.model_cooldown_remaining("p", "m1") > 0
+    assert pm._health.model_cooldown_remaining("p", "m2") > 0
+    assert pm._health.is_model_available("p", "m3") is True
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_429_without_a_sibling_stays_provider_wide():
+    pm = ProviderManager()
+    probe = _Probe()
+    p = _ModelProvider("p", [_ambiguous_429(), _ok()], model="m1", probe=probe)
+    pm.register_provider(p)
+    pm.switch_provider("p")
+
+    response = await pm.chat([{"role": "user", "content": "hi"}])
+
+    assert response.success is False
+    assert [model for _, model in probe.calls] == ["m1"]
+    assert pm._health.state("p") == ProviderHealthState.COOLING_DOWN
+    assert pm._health.model_cooldown_remaining("p", "m1") == 0
+
+
+@pytest.mark.asyncio
+async def test_each_chat_invocation_gets_a_fresh_ambiguity_probe_budget():
+    pm = ProviderManager()
+    probe = _Probe()
+    p = _ModelProvider(
+        "p", [_ambiguous_429(), _ok(), _ambiguous_429(), _ok()],
+        model="m1", probe=probe,
+    )
+    pm.register_provider(p)
+    pm.switch_provider("p")
+    pm.set_model_candidates("p", ["m2"])
+
+    first = await pm.chat([{"role": "user", "content": "hi"}])
+    assert first.success is True
+    assert [model for _, model in probe.calls] == ["m1", "m2"]
+
+    # Clear ONLY the primary's tentative model cooldown: the probe budget is
+    # per invocation, never a sticky flag that keeps m1 out of the pool.
+    pm._health.record_model_success("p", "m1")
+    probe.calls.clear()
+
+    second = await pm.chat([{"role": "user", "content": "hi again"}])
+    assert second.success is True
+    assert [model for _, model in probe.calls] == ["m1", "m2"]
+
+
+@pytest.mark.asyncio
+async def test_model_scoped_limits_never_cap_the_pool_before_later_models():
+    pm = ProviderManager()
+    probe = _Probe()
+    p = _ModelProvider(
+        "p",
+        [
+            _fail(
+                "429 per model", http_status=429, failure_type="rate_limited",
+                retry_after=30, rate_limit_scope="model",
+            )
+            for _ in range(5)
+        ] + [_ok()],
+        model="m0",
+        probe=probe,
+    )
+    pm.register_provider(p)
+    pm.switch_provider("p")
+    pm.set_model_candidates("p", [f"m{i}" for i in range(1, 6)])
+
+    response = await pm.chat([{"role": "user", "content": "hi"}])
+
+    assert response.success is True
+    assert [model for _, model in probe.calls] == ["m0", "m1", "m2", "m3", "m4", "m5"]
+    assert pm._health.state("p") == ProviderHealthState.HEALTHY
+    assert (response.metadata or {}).get("candidates_attempted") == 6
+
+
+@pytest.mark.asyncio
+async def test_same_model_retries_are_not_inflated_by_candidate_fallback():
+    pm = ProviderManager()
+    probe = _Probe()
+    p = _ModelProvider(
+        "p",
+        [
+            _fail("timeout", failure_type="timeout"),
+            _fail("timeout", failure_type="timeout"),
+            _ok(),
+        ],
+        model="m1",
+        probe=probe,
+    )
+    pm.register_provider(p)
+    pm.switch_provider("p")
+    pm.set_model_candidates("p", ["m2"])
+
+    response = await pm.chat([{"role": "user", "content": "hi"}])
+
+    assert response.success is True
+    assert [model for _, model in probe.calls] == ["m1", "m1", "m2"]
+    meta = response.metadata or {}
+    # TWO distinct models were attempted, but only ONE same-model retry ran.
+    assert meta.get("candidates_attempted") == 2
+    assert meta.get("ai_retry_count") == 1
+    assert meta.get("model_fallback") is True
+    assert meta.get("fallback_from_model") == "m1"
+    assert meta.get("fallback_to_model") == "m2"
+
+
+def test_failure_notice_reports_retries_and_backup_without_provider_bodies():
+    from types import SimpleNamespace
+
+    from backend.bot.handlers.ai_unified import _failure_notice
+
+    notice = _failure_notice(SimpleNamespace(
+        metadata={
+            "failure_type": "rate_limited",
+            "retry_count": 2,
+            "fallback_used": True,
+            "model_fallback_used": True,
+        },
+        errors=["All AI providers failed. Last error: p/m2: 429 opaque key=SECRET"],
+        response="",
+    ))
+
+    assert "2 retries" in notice
+    assert "backup model tried" in notice
+    assert "429" not in notice
+    assert "opaque" not in notice
+    assert "SECRET" not in notice
+
+
+# ── A healthy backup stays reusable across tool continuations ──
+
+
+def _dispatcher_with(pm: ProviderManager, tool_executor: Any):
+    from backend.ai.engine.dispatcher import Dispatcher
+    from backend.ai.engine.hooks import NOOP_HOOKS
+    from backend.ai.engine.metrics import EngineMetrics
+
+    conversation = MagicMock()
+    session = MagicMock()
+    session.session_id = "s"
+    session.owner_id = 123
+    session.active_provider = "p"
+    conversation.get_session.return_value = session
+    conversation.restore_history = AsyncMock()
+    conversation.get_history.return_value = []
+
+    builder = MagicMock()
+    package = MagicMock()
+    package.system_prompt = "sys"
+    package.runtime_context = ""
+    package.conversation_context = ""
+    package.tool_context = ""
+    package.user_input = "run the tools"
+    package.estimated_tokens.estimated_input_tokens = 50
+    package.estimated_tokens.prompt_size_chars = 100
+    builder.build.return_value = package
+
+    return Dispatcher(
+        conversation, builder, pm, NOOP_HOOKS, EngineMetrics(),
+        tool_executor=tool_executor,
+    )
+
+
+def _tool_response(call_id: str) -> ProviderResponse:
+    return ProviderResponse(
+        text="", provider_name="p", success=True,
+        tool_calls=[{"id": call_id, "name": "probe", "arguments": {}}],
+        metadata={"finish_reason": "tool_calls"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_healthy_backup_serves_every_tool_continuation_without_replaying_tools():
+    from backend.ai.session.request import AIRequest
+    from backend.ai.tools.executor import ToolExecutionResult
+
+    tool_executor = MagicMock()
+    tool_executor.execute_calls = AsyncMock(
+        return_value=[ToolExecutionResult(tool_name="probe", success=True, message="ok")]
+    )
+    context = MagicMock()
+    context.extra = {}
+    context.telegram = None
+    context.tz_str = "UTC"
+    context.client = None
+    tool_executor._context = context
+
+    probe = _Probe()
+    p = _RaisingProvider(
+        "p",
+        responses={
+            "m1": [_ambiguous_429()],
+            "m2": [
+                _tool_response("c1"),
+                _tool_response("c2"),
+                ProviderResponse(text="done", provider_name="p", success=True,
+                                 metadata={"finish_reason": "stop"}),
+                ProviderResponse(text="done", provider_name="p", success=True,
+                                 metadata={"finish_reason": "stop"}),
+            ],
+        },
+        model="m1",
+        probe=probe,
+    )
+    pm = ProviderManager()
+    pm.register_provider(p)
+    pm.switch_provider("p")
+    pm.set_model_candidates("p", ["m2"])
+
+    dispatcher = _dispatcher_with(pm, tool_executor)
+    result = await dispatcher.dispatch(AIRequest(
+        session_id="s1", message_id=1, owner_id=123,
+        user_message="run the tools", chat_id=456,
+    ))
+
+    assert result.success is True
+    assert result.response == "done"
+    assert probe.max_active == 1, "sequential fallback must never overlap calls"
+    assert probe.calls[0] == ("p", "m1"), "the ambiguous 429 came first"
+    assert all(model == "m2" for _, model in probe.calls[1:])
+    assert probe.calls.count(("p", "m2")) >= 3, (
+        "the healthy backup must serve the initial fallback AND every continuation"
+    )
+    # Two tool rounds, each dispatched exactly once, with distinct call ids.
+    assert tool_executor.execute_calls.await_count == 2
+    executed = [call.args[0][0]["id"] for call in tool_executor.execute_calls.await_args_list]
+    assert executed == ["c1", "c2"], "no already-executed tool call may be replayed"
+    assert result.metadata["fallback_used"] is True
+    assert result.metadata["model_fallback_used"] is True
+    assert result.metadata["fallback_to_model"] == "m2"
+    assert result.metadata["retry_count"] == 0, "a model fallback is not a same-model retry"

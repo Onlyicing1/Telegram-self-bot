@@ -394,7 +394,14 @@ def _failure_notice(result) -> str:
     if retries > 0:
         recovery.append(f"{retries} retr{'y' if retries == 1 else 'ies'}")
     if metadata.get("fallback_used"):
-        recovery.append("backup tried")
+        # A same-provider model backup is a different recovery step from a
+        # provider failover; state which one actually ran when the dispatcher
+        # preserved that detail.
+        recovery.append(
+            "backup model tried"
+            if metadata.get("model_fallback_used")
+            else "backup tried"
+        )
     lines = [f"{sym.STATE_FAILED} Couldn't get a response", reason]
     if ftype == "auth":
         lines.append("Check your API key configuration.")

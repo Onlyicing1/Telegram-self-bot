@@ -8,8 +8,10 @@ pool for its provider, with no fixed count and no hardcoded backup list. For one
 user request the manager walks that pool strictly one model at a time, returns
 the first usable response and never contacts another model afterwards. Failures
 are attributed at the scope their own evidence supports — a dead or throttled
-model cools down that `(provider, model)` pair, while auth, account quota and
-opaque rate limits still take the whole provider down.
+model cools down that `(provider, model)` pair, while auth and account quota
+evidence take the whole provider down. An opaque 429 no longer disables the
+provider on its own: it cools only the pair that produced it and spends ONE
+sibling probe for that invocation; a second 429 is what opens the circuit.
 
 ## 2. Exact files changed
 
@@ -18,7 +20,9 @@ opaque rate limits still take the whole provider down.
 | `backend/ai/providers/manager/manager.py` | Model-scoped failure handling, pool filtering of unavailable pairs, per-attempt eligibility re-check, sibling-based escalation, model success reset |
 | `backend/ai/providers/manager/health.py` | Per-`(provider, model)` health state + `classify_rate_limit_scope()` |
 | `backend/ai/providers/openai_compat.py` | 429 metadata now carries the provider error code/type/message and model (used for scope) |
-| `tests/test_dynamic_model_fallback.py` | NEW — 22 regression tests driving the real `ProviderManager.chat()` |
+| `backend/ai/engine/dispatcher.py` | Aggregates `model_fallback_used` / `fallback_to_model` across the empty-retry and every continuation round |
+| `backend/bot/handlers/ai_unified.py` | Failure notice states `backup model tried` for a model backup and `backup tried` for a provider failover |
+| `tests/test_dynamic_model_fallback.py` | 38 regression tests driving the real `ProviderManager.chat()` plus one real `Dispatcher` tool-continuation run |
 | `INVESTIGATION.md`, `ROADMAP.md`, `IMPLEMENTATION_REPORT.md` | Replaced for this task |
 
 No other file was modified. No Supabase/SQL change, no `DATABASE_ARCHITECTURE.md`
@@ -83,7 +87,8 @@ deliberately NOT serialised.
 | 3 DISTINCT models of one provider failing inside 60 s | provider | `_escalate_if_provider_wide` opens the existing circuit breaker |
 | `auth` (401/403) | provider | disabled until configuration changes (unchanged) |
 | 429 with provider/account evidence (`insufficient_quota`, billing/credit markers) | provider | cooldown honoring Retry-After (unchanged) |
-| 429 the body does not explain | provider (conservative) | cooldown; sibling models are NOT fired at a possibly shared quota |
+| 429 the body does not explain, first occurrence with an eligible sibling | `(provider, model)` + one probe | tentative pair cooldown; exactly ONE distinct sibling model is probed; provider stays healthy |
+| 429 the body does not explain, second 429 (or no eligible sibling) | provider | provider-wide cooldown; the provider's remaining models are not contacted |
 | 429 naming THIS model with a model-level limit phrase | `(provider, model)` | pair cooled down; sibling models remain eligible |
 | `request` (4xx invalid request) | none | unchanged: no cooldown, deterministic advance |
 
@@ -113,13 +118,40 @@ cooled down the WRONG `(provider, model_id)` pair — leaving the failing backup
 eligible and disabling the healthy primary. A configured-default attempt still
 carries no `requested_model`, so an override never silently relabels it.
 
+**Ambiguous-429 probe and backup reuse.** The probe budget is a
+`_AmbiguityProbe` created INSIDE one `chat()` invocation — never a manager
+field, global counter or sticky session flag — so each call starts with a fresh
+budget while every cooldown already recorded stays effective. On an unknown-scope
+429 the manager cools the attempted pair tentatively and lets the candidate loop
+continue to the next eligible model of that provider. If that sibling also
+answers 429 the budget is already spent and the normal provider-wide cooldown
+applies, so the rest of that provider's models are skipped by the in-loop
+eligibility check. A non-429 sibling failure is classified normally (model
+cooldown, with the existing escalation only when distinct models keep failing).
+A successful sibling clears only its own model state and keeps the provider
+healthy, so later independent calls — including the Dispatcher's continuation
+rounds after tool execution — build their candidate pool from that same,
+still-eligible model. `_MAX_RETRIES` now drives the retry loop itself: at most
+that many SAME-MODEL retries (one today); candidate fallback never spends it,
+and `MAX_TOOL_ROUNDS` remains a separate execution bound.
+
+**Fallback telemetry.** A success whose model differs from the first attempted
+candidate carries `fallback`, `fallback_from_model`, `fallback_to_model` and
+`model_fallback` even when the provider name did not change, `model` names the
+serving model, and `candidates_attempted` counts distinct attempted candidates.
+`ai_retry_count` still reports only same-model retries, so a model fallback
+never inflates the visible retry count. The Dispatcher OR-merges
+`fallback_used` / `model_fallback_used` and keeps `fallback_to_model` across the
+initial request, its bounded empty retry and every tool continuation.
+
 ## 6. Exact tests executed and results
 
 | Command | Result |
 |---|---|
-| `.venv/bin/python -m pytest tests/test_dynamic_model_fallback.py -q` | **29 passed** |
-| focused group: `test_dynamic_model_fallback.py`, `test_23_provider_mesh.py`, `test_24_execution_reliability.py`, `test_17_providers.py`, `test_provider_structured_output.py`, `test_provider_tool_boundary.py`, `test_provider_system_instruction_contract.py`, `test_task_fallback_classification.py`, `test_task_fallback_cooldown.py`, `test_13_model_selection.py` | **158 passed** in 10.52 s |
-| full suite: `.venv/bin/python -m pytest tests -q --tb=line -p no:cacheprovider` | **6980 passed, 27 skipped, 2 failed** in 135.04 s |
+| `.venv/bin/python -m pytest tests/test_dynamic_model_fallback.py -q` | **38 passed** in 0.82 s |
+| focused group: `test_dynamic_model_fallback.py`, `test_23_provider_mesh.py`, `test_24_execution_reliability.py`, `test_17_providers.py`, `test_provider_structured_output.py`, `test_provider_tool_boundary.py`, `test_provider_system_instruction_contract.py`, `test_task_fallback_classification.py`, `test_task_fallback_cooldown.py`, `test_13_model_selection.py` | **167 passed** in 10.64 s |
+| retry UX + media AI: `test_35_ai_retry_ux.py`, `test_media_ai_integration.py` | **60 passed** in 0.96 s |
+| full suite: `.venv/bin/python -m pytest tests -q --tb=line -p no:cacheprovider` | **6990 passed, 27 skipped, 1 failed** in 135.42 s |
 | `.venv/bin/python -m py_compile` on every changed Python file + the new test | exit 0 |
 | `git diff --check` | exit 0 (no whitespace errors) |
 
@@ -127,9 +159,16 @@ The two full-suite failures are unrelated to this change:
 
 1. `tests/test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`
    — pre-existing failure, reproduced on the untouched baseline.
-2. `tests/test_private_message_scope.py::test_concurrent_messages_from_one_person_cannot_exceed_the_limit`
-   — load-dependent timing flake in an untouched module; it passes 3/3 when run
-   in isolation.
+
+The previously observed load-dependent
+`tests/test_private_message_scope.py::test_concurrent_messages_from_one_person_cannot_exceed_the_limit`
+flake did not recur in this run.
+
+A 12-file variant of the focused group that also includes
+`test_11_runtime_wiring.py` reports one further failure
+(`test_ai_test_models_action_launches_streaming_run`). That test passes alone
+and the same order-dependent failure reproduces on an untouched `git archive`
+copy of HEAD, so it is pre-existing test-order pollution, not a regression.
 
 New coverage (all asserting real calls, call order, requested model ids and
 maximum concurrent candidate calls):
@@ -174,6 +213,27 @@ failures):
 29. A sibling model stays eligible after a backup cooldown, and the next
     request is served by the primary rather than by a globally cooled provider.
 
+Added for the ambiguous-429 probe, backup reuse and telemetry:
+
+30. An opaque 429 cools only the attempted pair, probes ONE sibling, and keeps
+    the provider healthy; the serving model and fallback metadata are exact.
+31. A second 429 during the probe cools the provider and the third sibling is
+    never contacted; a later call does not contact the cooling provider at all.
+32. A probe sibling failing with a non-429 (real timeout) gets ordinary
+    classification: provider healthy, both failed pairs cooling, next sibling used.
+33. An opaque 429 with no eligible sibling keeps the provider-wide penalty.
+34. Each `chat()` invocation gets a fresh probe budget; a cleared pair cooldown
+    is probed again, so the budget is not a sticky provider flag.
+35. Model-scoped 429s on five models do not cap the pool: the sixth model serves.
+36. Two attempted models with one transient retry report `ai_retry_count == 1`
+    and `candidates_attempted == 2` — fallback does not inflate retries.
+37. The visible failure notice says `backup model tried` for a model backup and
+    never leaks the provider body, status code or an opaque error string.
+38. A real `Dispatcher` run: the primary gets an opaque 429, the healthy backup
+    serves the initial request AND two tool continuations, calls never overlap,
+    each tool round executes exactly once (distinct ids), and the result carries
+    `fallback_used`, `model_fallback_used`, `fallback_to_model` and retry_count 0.
+
 ## 7. Untested behaviour
 
 - No live provider call was made from this environment; every provider in the
@@ -209,6 +269,8 @@ availability, and this change does not attempt to make it one.
 4. The pool is only as fresh as the last diagnostic run; because cached results
    never arm it, a long-idle deployment keeps only the pool from its last live
    run (plus the configured model).
+5. An ambiguous 429 costs one extra probe request when a sibling is eligible —
+   the price of not disabling healthy models on unproven scope evidence.
 
 ## 10. Remaining work
 

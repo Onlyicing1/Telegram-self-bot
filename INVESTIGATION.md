@@ -112,9 +112,11 @@ pre-loop `_skip_reason()` had checked health.
 2. **Scope follows evidence, never assumption.** `classify_rate_limit_scope()`
    in `manager/health.py` returns `model` only when the body names THIS model
    and describes a model-level limit, `provider` for quota/billing/account
-   markers, and `unknown` otherwise. `unknown` is treated as provider-wide —
-   the conservative direction: one possibly shared exhausted quota is not fired
-   at every sibling model.
+   markers, and `unknown` otherwise. An ambiguous 429 gets the bounded middle
+   ground: the attempted pair is cooled tentatively and ONE distinct sibling
+   model of the same provider is probed per `chat()` invocation. A second 429
+   (or the absence of an eligible sibling) is the evidence that opens the
+   provider circuit.
 3. **Transient failures are model-scoped only when there is a sibling to
    protect.** With a single candidate model, the pre-existing provider-wide
    penalty is kept (nothing else could be spared).
@@ -128,29 +130,49 @@ pre-loop `_skip_reason()` had checked health.
    records it in the failure matrix (`outcome: skipped`).
 6. **`model_not_found` keeps its 3600 s pair TTL** (`_unavailable_models`) — a
    permanent configuration error for that id, never a provider penalty.
+7. **A model fallback is telemetry, not a provider change.** A success whose
+   model differs from the FIRST attempted candidate carries `fallback`,
+   `fallback_from_model`, `fallback_to_model` and `model_fallback` even when the
+   provider name is unchanged; `model` names the serving model and
+   `candidates_attempted` counts the pool work. `ai_retry_count` stays the
+   SAME-MODEL retry count, so candidate fallback never inflates it.
+8. **`_MAX_RETRIES` is the same-model retry budget.** The attempt loop spends
+   it (one retry today); candidate fallback never consumes it, so reaching a
+   20-model pool does not require retrying one model 20 times.
+9. **The ambiguity probe budget is invocation-local.** `_AmbiguityProbe` is
+   created inside `chat()` and never stored on the manager: a new call starts
+   fresh, bounded only by the cooldowns previous calls recorded.
 
 ## 5. What is NOT established
 
 - No live provider was contacted in this environment. The scope classifier is
   verified against the documented/observed error shapes listed in §3.3, not
   against a fresh 429 from each vendor.
-- Cloudflare's 429 body is not parsed for a model field; it therefore lands in
-  the `unknown` → provider-wide branch by construction.
+- Cloudflare's 429 body is not parsed for a model field; it therefore starts in
+  the `unknown` branch and, when a sibling is eligible, costs one extra probe
+  request before the provider is treated as limited.
 - Model and provider health state is in-memory (process lifetime), exactly like
   the pre-existing provider state; a restart clears every cooldown.
+- The ambiguous-429 probe is one EXTRA provider request; it is bounded per
+  invocation and by the candidate pool, never by a global counter.
 - The escalation threshold (3 distinct models / 60 s) is a policy choice, not a
   measurement of any provider's failure correlation.
 - No UI surface shows model-level cooldowns; only the router and its logs do.
 
 ## 6. Current test coverage of this area
 
-`tests/test_dynamic_model_fallback.py` (new, 22 tests) drives the real
+`tests/test_dynamic_model_fallback.py` (38 tests) drives the real
 `ProviderManager.chat()` with scripted providers that record `(provider, model,
 messages)` and concurrent overlap: 20-model pool completeness, primary-first
 order, deterministic candidate order, request identity across candidates,
 first-usable-wins, no fan-out, model-vs-provider health, the three rate-limit
-scopes, cached/untested exclusion, bounded retry, cross-provider fallback,
-tool-call/structured-output preservation and honest exhaustion.
+scopes, the bounded ambiguous-429 probe (sibling success, second 429, non-429
+probe failure, no sibling, fresh per-invocation budget, cooldown respect),
+cached/untested exclusion, bounded retry, same-model-retry vs model-fallback
+telemetry, cross-provider fallback, tool-call/structured-output preservation,
+honest exhaustion, and a real `Dispatcher` run where the healthy backup serves
+the initial fallback plus two tool continuations with no overlapping calls and
+no replayed tool.
 
 Existing suites that also cover this path and still pass: `test_23_provider_mesh.py`,
 `test_24_execution_reliability.py`, `test_17_providers.py`,

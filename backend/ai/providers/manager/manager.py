@@ -78,6 +78,29 @@ _PROVIDER_OUTAGE_WINDOW = 60.0
 _PROVIDER_OUTAGE_MODELS = 3
 
 
+class _AmbiguityProbe:
+    """Per-``chat()`` budget: ONE ambiguous-429 sibling probe per provider.
+
+    Created at the top of a single ``chat()`` invocation and never stored on
+    the manager, so it can never become a global counter, a permanent provider
+    flag or a sticky session restriction. A new invocation starts with an
+    empty budget and is still bounded by the cooldowns previous invocations
+    established.
+    """
+
+    __slots__ = ("_used",)
+
+    def __init__(self) -> None:
+        self._used: set[str] = set()
+
+    def consume(self, provider: str) -> bool:
+        """Claim the provider's ONE probe; False when it was already spent."""
+        if provider in self._used:
+            return False
+        self._used.add(provider)
+        return True
+
+
 class ProviderManager:
     """Manages provider lifecycle, routing, fallback, and metrics.
 
@@ -196,6 +219,11 @@ class ProviderManager:
         )
 
         total = len(eligible)
+        # An ambiguous 429 may spend ONE sibling probe per provider for THIS
+        # invocation. The budget is local: a new chat() starts fresh, bounded
+        # by whatever health state earlier calls established.
+        probe = _AmbiguityProbe()
+        attempted: list[tuple[str, str]] = []
         for idx, (score, name, model, provider) in enumerate(eligible):
             # A candidate that stopped being eligible WHILE this request ran
             # (its provider was disabled/cooled down by an earlier candidate,
@@ -225,7 +253,21 @@ class ProviderManager:
                 attempt=idx + 1, pool_size=total,
                 selection_reason="active_first_then_score_model_pool",
             )
-            response = await self._attempt_with_retry(provider, messages, kwargs, model)
+            attempted.append((name, model or ""))
+            # A probe only means something when a DISTINCT sibling model of
+            # the same provider is still ahead in the pool and eligible now.
+            sibling_ahead = any(
+                peer == name
+                and bool(peer_model)
+                and peer_model != (model or "")
+                and self._health.is_available(peer)
+                and not self._model_unavailable(peer, peer_model)
+                for _, peer, peer_model, _ in eligible[idx + 1:]
+            )
+            response = await self._attempt_with_retry(
+                provider, messages, kwargs, model,
+                probe=probe, sibling_ahead=sibling_ahead,
+            )
             if response.success:
                 # A semantically-empty or all-malformed "success" is not a
                 # usable execution answer. When another eligible provider is
@@ -292,22 +334,45 @@ class ProviderManager:
                     "provider": name, "model": model or "-",
                     "outcome": "success", "score": round(score, 3),
                 })
-                if name != first:
+                provider_fallback = name != first
+                # A same-provider MODEL fallback is a fallback too. Detecting
+                # one only by a provider-name change loses it completely, so
+                # the serving model is compared with the FIRST attempted one.
+                model_fallback = bool(
+                    not provider_fallback
+                    and attempted
+                    and attempted[0][0] == name
+                    and attempted[0][1] != (model or "")
+                )
+                if provider_fallback or model_fallback:
                     meta = dict(response.metadata or {})
                     meta["fallback"] = True
-                    meta["fallback_from"] = first or None
                     meta["fallback_to"] = name
                     meta["fallback_to_model"] = model or None
-                    from_provider = self._registry.get(first) if first else None
-                    from_model = (
-                        self._effective_model(from_provider) if from_provider is not None else "-"
-                    )
+                    if provider_fallback:
+                        meta["fallback_from"] = first or None
+                        meta["fallback_from_model"] = (
+                            attempted[0][1]
+                            if attempted and attempted[0][0] == first
+                            else None
+                        )
+                    else:
+                        meta["fallback_from"] = name
+                        meta["fallback_from_model"] = attempted[0][1] or None
+                        meta["model_fallback"] = True
                     logger.info(
-                        "AI_PROVIDER_FAILOVER from=%s/%s to=%s/%s",
-                        first or "-", from_model, name, model or "-",
+                        "AI_PROVIDER_FAILOVER from=%s/%s to=%s/%s model_fallback=%s",
+                        meta.get("fallback_from") or "-",
+                        meta.get("fallback_from_model") or "-",
+                        name, model or "-", model_fallback,
                     )
                     response = replace(response, metadata=meta)
                 meta = dict(response.metadata or {})
+                # The model that actually served this request, when a candidate
+                # list supplied one — the dispatcher reports this as the model.
+                if model and not meta.get("model"):
+                    meta["model"] = model
+                meta["candidates_attempted"] = len(attempted)
                 if total_retries:
                     meta["ai_retry_count"] = int(meta.get("ai_retry_count", 0) or 0) + total_retries
                 meta["provider_matrix"] = matrix
@@ -949,8 +1014,11 @@ class ProviderManager:
         messages: list[dict[str, Any]],
         kwargs: dict[str, Any],
         model: str = "",
+        *,
+        probe: "_AmbiguityProbe | None" = None,
+        sibling_ahead: bool = False,
     ) -> ProviderResponse:
-        """Attempt one (provider, model) with at most ONE immediate retry.
+        """Attempt one (provider, model) with at most ``_MAX_RETRIES`` retries.
 
         Applies the per-provider concurrency semaphore for the whole
         attempt. On success the provider is marked healthy. On failure the
@@ -958,6 +1026,13 @@ class ProviderManager:
         advances to the next candidate. A non-empty ``model`` override is
         passed through to the provider adapter; the provider's configured
         default model is used otherwise.
+
+        ``_MAX_RETRIES`` is the SAME-MODEL retry budget: a retryable transient
+        failure retries after a short backoff, and a rate limit retries only
+        when its Retry-After is short enough to wait out. A model CANDIDATE
+        fallback is driven by ``chat()``'s candidate loop instead and never
+        consumes this budget, so one model is never hammered to make the rest
+        of the pool reachable.
         """
         name = self._safe_provider_name(provider)
         # The model this attempt actually asks for — carried explicitly through
@@ -968,65 +1043,53 @@ class ProviderManager:
         async with self._health.acquire(name):
             logger.info("AI_PROVIDER_ATTEMPT provider=%s model=%s attempt=1", name, label)
             response = await self._call_once(provider, messages, kwargs, model)
+            retries_used = 0
+            while not response.success and retries_used < _MAX_RETRIES:
+                ftype = self._failure_type(response)
+                wait = self._retry_after_seconds(response)
+                if ftype in RETRYABLE_FAILURES:
+                    # After a short backoff, so a burst cannot hammer upstream.
+                    await asyncio.sleep(_RETRY_BACKOFF_SECONDS)
+                    reason = "transient"
+                elif ftype == "rate_limited" and 0 < wait <= _RATE_LIMIT_MAX_WAIT_SECONDS:
+                    # A brief Retry-After is worth waiting out; a long one would
+                    # stall the request, so the caller fails over instead.
+                    await asyncio.sleep(wait)
+                    reason = "rate_limit_window"
+                else:
+                    break
+                retries_used += 1
+                logger.info(
+                    "AI_PROVIDER_ATTEMPT provider=%s model=%s attempt=%d reason=%s",
+                    name, label, retries_used + 1, reason,
+                )
+                response = await self._call_once(provider, messages, kwargs, model)
+
             if response.success:
                 self._record_model_success(name, current_model)
                 self._note_response_quality(name, response, kwargs)
+                if retries_used:
+                    logger.info(
+                        "AI_PROVIDER_FAILURE provider=%s model=%s category=RETRY_RECOVERED",
+                        name, label,
+                    )
+                    return self._with_retry_metadata(response, retries_used)
                 return response
 
             ftype = self._failure_type(response)
             logger.warning(
                 "AI_PROVIDER_FAILURE provider=%s model=%s category=%s retryable=%s",
-                name, model, ftype, ftype in RETRYABLE_FAILURES,
+                name, label, ftype, ftype in RETRYABLE_FAILURES,
             )
-            if ftype not in RETRYABLE_FAILURES:
-                if ftype == "rate_limited":
-                    # Honor a SHORT Retry-After with exactly one retry — a
-                    # brief window is worth waiting out; a long one would
-                    # stall the request, so the caller fails over instead.
-                    wait = self._retry_after_seconds(response)
-                    if 0 < wait <= _RATE_LIMIT_MAX_WAIT_SECONDS:
-                        await asyncio.sleep(wait)
-                        logger.info(
-                            "AI_PROVIDER_ATTEMPT provider=%s model=%s attempt=2 reason=rate_limit_window",
-                            name, model,
-                        )
-                        retry_response = await self._call_once(provider, messages, kwargs, model)
-                        if retry_response.success:
-                            self._record_model_success(name, current_model)
-                            self._note_response_quality(name, retry_response, kwargs)
-                            logger.info(
-                                "AI_PROVIDER_FAILURE provider=%s model=%s category=RATE_LIMIT_RECOVERED",
-                                name, model,
-                            )
-                            return self._with_retry_metadata(retry_response, 1)
-                        self._apply_failure(
-                            name, self._failure_type(retry_response), retry_response,
-                            current_model,
-                        )
-                        return self._with_retry_metadata(retry_response, 1)
-                self._apply_failure(name, ftype, response, current_model)
-                return response
-
-            # ONE bounded retry for transient/network/server errors, after a
-            # short backoff so a burst cannot hammer the upstream API.
-            await asyncio.sleep(_RETRY_BACKOFF_SECONDS)
-            logger.info("AI_PROVIDER_ATTEMPT provider=%s model=%s attempt=2", name, model)
-            retry_response = await self._call_once(provider, messages, kwargs, model)
-            if retry_response.success:
-                self._record_model_success(name, current_model)
-                self._note_response_quality(name, retry_response, kwargs)
-                logger.info(
-                    "AI_PROVIDER_FAILURE provider=%s model=%s category=TRANSIENT_RECOVERED",
-                    name, model,
-                )
-                return self._with_retry_metadata(retry_response, 1)
-
             self._apply_failure(
-                name, self._failure_type(retry_response), retry_response, current_model
+                name, ftype, response, current_model,
+                probe=probe, sibling_ahead=sibling_ahead,
             )
-            # The retry DID happen — stamp it so a later fallback success
-            # (or the terminal failure) can report the true retry count.
-            return self._with_retry_metadata(retry_response, 1)
+            # A retry DID happen — stamp it so a later fallback success (or
+            # the terminal failure) reports the true same-model retry count.
+            if retries_used:
+                return self._with_retry_metadata(response, retries_used)
+            return response
 
     def _record_model_success(self, name: str, model: str) -> None:
         """A served request proves BOTH the provider and that model healthy."""
@@ -1078,15 +1141,21 @@ class ProviderManager:
 
     def _apply_failure(
         self, name: str, ftype: str, response: ProviderResponse, model: str = "",
+        *, probe: "_AmbiguityProbe | None" = None, sibling_ahead: bool = False,
     ) -> None:
         """Apply a failure at the SCOPE its own evidence supports.
 
         A dead, slow or model-throttled single model cools down that
         ``(provider, model)`` pair only. Provider/account-level evidence
-        (auth, an account quota, or an opaque 429 whose scope the response
-        does not establish) keeps the existing provider-wide circuit
-        breaker — and deliberately does NOT fire the same possibly-exhausted
-        quota at every sibling model.
+        (auth or an account/billing quota) keeps the existing provider-wide
+        circuit breaker — and never fires the same possibly-exhausted quota at
+        every sibling model.
+
+        An HTTP 429 whose scope the response does not establish gets the
+        bounded middle ground: ONE tentative model cooldown plus ONE sibling
+        probe per ``chat()`` invocation (``probe``/``sibling_ahead``). If that
+        sibling also answers 429, the budget is already spent and the normal
+        provider-wide cooldown applies from that second piece of evidence.
         """
         meta = response.metadata or {}
         provider = self._registry.get(name)
@@ -1127,6 +1196,23 @@ class ProviderManager:
             )
             if scope == "model" and effective_model:
                 self._mark_model_cooling(name, effective_model, retry_after, ftype)
+                return
+            if (
+                scope == "unknown"
+                and effective_model
+                and sibling_ahead
+                and probe is not None
+                and probe.consume(name)
+            ):
+                # The 429 proves nothing about its scope. Cooling the WHOLE
+                # provider would disable healthy siblings; firing the same
+                # possibly-exhausted quota at every sibling is equally wrong.
+                # Cool only this pair and let ONE sibling settle the question.
+                self._mark_model_cooling(name, effective_model, retry_after, ftype)
+                logger.info(
+                    "PROVIDER_AMBIGUOUS_429_PROBE provider=%s model=%s",
+                    name, effective_model,
+                )
                 return
             self._health.record_failure(name, ftype, retry_after)
             return

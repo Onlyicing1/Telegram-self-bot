@@ -519,6 +519,8 @@ class Dispatcher:
             )
             retry_count = int(response.metadata.get("ai_retry_count", 0) or 0)
             fallback_used = bool(response.metadata.get("fallback"))
+            model_fallback_used = bool(response.metadata.get("model_fallback"))
+            fallback_to_model = str(response.metadata.get("fallback_to_model") or "")
             failure_type = _provider_failure_type(response)
 
             def _reject_disabled_tool_calls(candidate: ProviderResponse) -> ProviderResponse:
@@ -593,6 +595,13 @@ class Dispatcher:
                     retry_count, int(retry_response.metadata.get("ai_retry_count", 0) or 0)
                 )
                 fallback_used = fallback_used or bool(retry_response.metadata.get("fallback"))
+                model_fallback_used = model_fallback_used or bool(
+                    retry_response.metadata.get("model_fallback")
+                )
+                fallback_to_model = (
+                    str(retry_response.metadata.get("fallback_to_model") or "")
+                    or fallback_to_model
+                )
                 if not retry_response.success:
                     failure_type = _provider_failure_type(retry_response)
                 if retry_response.success and (retry_response.text or retry_response.tool_calls):
@@ -911,6 +920,13 @@ class Dispatcher:
                 retry_count, int(cont_response.metadata.get("ai_retry_count", 0) or 0)
             )
             fallback_used = fallback_used or bool(cont_response.metadata.get("fallback"))
+            model_fallback_used = model_fallback_used or bool(
+                cont_response.metadata.get("model_fallback")
+            )
+            fallback_to_model = (
+                str(cont_response.metadata.get("fallback_to_model") or "")
+                or fallback_to_model
+            )
             if not cont_response.success:
                 failure_type = _provider_failure_type(cont_response)
 
@@ -1147,6 +1163,9 @@ class Dispatcher:
             metadata["token_source"] = "unavailable"
         metadata["retry_count"] = retry_count
         metadata["fallback_used"] = fallback_used
+        metadata["model_fallback_used"] = model_fallback_used
+        if fallback_to_model:
+            metadata["fallback_to_model"] = fallback_to_model
         metadata["provider_call_count"] = provider_call_count
         metadata["provider_elapsed_s"] = round(provider_total_elapsed, 3)
         metadata["provider_failure_type"] = failure_type
