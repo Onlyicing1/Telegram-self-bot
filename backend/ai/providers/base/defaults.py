@@ -339,29 +339,10 @@ def list_provider_names() -> list[str]:
     return list(_PROVIDER_DEFAULTS.keys())
 
 
-# ── Model resolution / deprecation ──
-
-# Known-retired models → current replacement. Kept as data (not code) so a
-# stale value in env/Supabase config never poisons the provider: it is
-# substituted before the request is built. Add entries here when a provider
-# retires a model — no execution logic needs to change.
-DEPRECATED_MODELS: dict[str, str] = {
-    "gemini-2.0-flash": "gemini-2.5-flash",
-}
-
-
-def resolve_model(provider_name: str, model: str) -> str:
-    """Resolve a configured model, substituting known-deprecated models.
-
-    Returns ``model`` unchanged when it is not in the deprecation map. This is
-    a pure, provider-agnostic data lookup — no network, no provider coupling.
-    """
-    resolved = DEPRECATED_MODELS.get((model or "").strip())
-    if resolved and resolved != model:
-        import logging
-        logging.getLogger(__name__).warning(
-            "provider-model: '%s' model '%s' is deprecated — using '%s'",
-            provider_name, model, resolved,
-        )
-        return resolved
-    return model
+# ── Model identity ──
+#
+# A configured model id is used VERBATIM everywhere: discovery, testing, the
+# runtime selection and the outbound request. This module deliberately holds no
+# per-model substitution table — a retired or unknown id must fail AS THAT ID
+# (the provider's own error, attributed to the model the owner selected) instead
+# of being silently rewritten into a model the owner never chose.

@@ -394,7 +394,14 @@ def _failure_notice(result) -> str:
     if retries > 0:
         recovery.append(f"{retries} retr{'y' if retries == 1 else 'ies'}")
     if metadata.get("fallback_used"):
-        recovery.append("backup tried")
+        # A same-provider model backup is a different recovery step from a
+        # provider failover; state which one actually ran when the dispatcher
+        # preserved that detail.
+        recovery.append(
+            "backup model tried"
+            if metadata.get("model_fallback_used")
+            else "backup tried"
+        )
     lines = [f"{sym.STATE_FAILED} Couldn't get a response", reason]
     if ftype == "auth":
         lines.append("Check your API key configuration.")
@@ -1035,6 +1042,10 @@ def register(client, owner_id: int, tz_str: str):
                 reply_message = _REPLY_UNFETCHED
 
         if not trigger_matched and not reply_to_ai:
+            # DEBUG only: every outgoing message reaches this handler, so an
+            # INFO line here would drown the Render stream. With LOG_LEVEL=DEBUG
+            # it answers "did the AI path even run for this message?".
+            logger.debug("AI_ACTIVATION_SKIPPED reason=no_trigger_match")
             return
 
         # Determine the actual user message and trigger label
@@ -1070,6 +1081,10 @@ def register(client, owner_id: int, tz_str: str):
 
         # ── Trigger Mode: no reply, must have remaining text ──
         if not user_text:
+            logger.debug(
+                "AI_ACTIVATION_SKIPPED reason=no_prompt_text trigger=%s",
+                trigger_label,
+            )
             return
 
         trace("AI_TRIGGER_MATCHED", trigger=trigger_label, mode="trigger")

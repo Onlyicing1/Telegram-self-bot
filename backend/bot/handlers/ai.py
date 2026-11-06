@@ -1188,7 +1188,7 @@ async def _ai_pick_model_action(event, extra: str, chat_id: int) -> tuple[str, s
 
     builder = InlinePanelBuilder()
     builder.add_row(sym.label(sym.OP_NEXT, "Start Chat"), "action:ai_start_chat")
-    builder.add_row(sym.label(sym.OP_REFRESH, "Re-run Tests"), "action:ai_test_models")
+    builder.add_row(sym.label(sym.OP_REFRESH, "Refresh All Models"), "action:ai_test_refresh")
     builder.add_row("Overview", "panel:ai")
     _nav_buttons(builder)
     return (
@@ -1266,6 +1266,12 @@ async def _ai_start_chat_action(event, extra: str, chat_id: int) -> tuple[str, s
 _TEST_STATUS_ICONS: dict[str, str] = {
     "AVAILABLE": sym.OP_SAVE,
     "NOT_CONFIGURED": "·",
+    # A catalog model with no stored result (cached reconciliation only): an
+    # untested mark, never a failure mark.
+    "NOT_TESTED": "·",
+    # A target the run never reached: pending mark, never a failure mark, so
+    # an unattempted model is not shown as a broken one.
+    "NOT_ATTEMPTED": "…",
     "AUTH_ERROR": sym.STATE_FAILED,
     "RATE_LIMITED": sym.STATE_FAILED,
     "TIMEOUT": "…",
@@ -1298,6 +1304,10 @@ def _short_model_name(model_id: str) -> str:
 # that does not fit.
 _TEST_GRID_2COL_MAX = 12
 _TEST_GRID_ROWS_PER_PAGE = 6
+
+# Historical (removed-model) diagnostics are a bounded appendix; the current
+# catalog is paged in full by the All Results view.
+_TEST_HISTORICAL_LIMIT = 20
 
 
 def _test_grid_columns(usable_count: int) -> int:
@@ -1358,6 +1368,41 @@ def _usable_results(results: list[dict]) -> list[dict]:
     )
 
 
+def _status_label(status: str, cached: bool) -> str:
+    """A cached status is labelled as such — never as a fresh live test."""
+    return f"{status} (CACHED)" if cached else status
+
+
+def _snapshot_line(payload: dict) -> str:
+    """One honest provenance line: cached, saved, partial or unsaved."""
+    from backend.ai.test_snapshot import format_timestamp
+
+    if payload.get("cached"):
+        stamp = format_timestamp(payload.get("snapshot_last_completed_at"))
+        state = "complete" if payload.get("snapshot_complete") else "partial"
+        line = (
+            f"_Cached snapshot · last full test {stamp} · "
+            f"{payload.get('result_count', 0)} results · "
+            f"catalog {payload.get('catalog_count', 0)} · {state}_"
+        )
+        if payload.get("refresh_running"):
+            line += f"\n_{sym.MEDIA_UNKNOWN} Refresh in progress — these are the last saved results._"
+        return line
+    if payload.get("snapshot_saved"):
+        stamp = format_timestamp(payload.get("snapshot_last_completed_at"))
+        return f"_{sym.OP_SAVE} Saved as the persistent snapshot · {stamp}_"
+    if payload.get("snapshot_skipped_partial"):
+        return (
+            f"_{sym.STATE_WARNING} Partial run — the previous saved snapshot is unchanged._"
+        )
+    if payload.get("snapshot_saved") is False:
+        return (
+            f"_{sym.STATE_WARNING} Results were not saved (storage write failed) — "
+            f"they exist only in this panel._"
+        )
+    return ""
+
+
 def _render_test_results(
     results_payload: dict,
     page: int = 0,
@@ -1391,6 +1436,11 @@ def _render_test_results(
     lines.append(_current_model_line(active_provider, active_model))
     lines.append("")
 
+    snapshot_line = _snapshot_line(results_payload)
+    if snapshot_line:
+        lines.append(snapshot_line)
+        lines.append("")
+
     # Compact layout: usable models are the focus (provider-grouped, model
     # name dominant, one line each). Failure details stay out of the main
     # message — one compact line per model, capped, full detail one tap away.
@@ -1407,7 +1457,10 @@ def _render_test_results(
             is_active = bool(active_model) and provider == active_provider and r.get("model") == active_model
             mark = sym.MEDIA_VOICE if is_active else sym.BULLET
             free_tag = " ·free" if r.get("is_free") else ""
-            lines.append(f"{mark} `{_short_model_name(r.get('model', '?'))}`{free_tag}")
+            cached_tag = " ·cached" if r.get("cached") else ""
+            lines.append(
+                f"{mark} `{_short_model_name(r.get('model', '?'))}`{free_tag}{cached_tag}"
+            )
         lines.append("")
     else:
         lines.append("_No usable chat models right now._")
@@ -1419,7 +1472,10 @@ def _render_test_results(
         for r in failed[:8]:
             status = r.get("status", "UNKNOWN_ERROR")
             icon = _TEST_STATUS_ICONS.get(status, "×")
-            lines.append(f"{icon} `{_short_model_name(r.get('model', '?'))}` — {status}")
+            lines.append(
+                f"{icon} `{_short_model_name(r.get('model', '?'))}` — "
+                f"{_status_label(status, bool(r.get('cached')))}"
+            )
         if len(failed) > 8:
             lines.append(f"_…and {len(failed) - 8} more_")
         lines.append("")
@@ -1449,6 +1505,8 @@ def _render_test_results(
             label = f"{mark} {r.get('display_name', provider)} — {_short_model_name(r.get('model', '?'))}"
             if r.get("is_free"):
                 label += " ·free"
+            if r.get("cached"):
+                label += " ·cached"
             latency = r.get("latency_s")
             if latency is not None:
                 label += f" ({latency}s)"
@@ -1462,7 +1520,8 @@ def _render_test_results(
         if page < total_pages - 1:
             nav.append((sym.label(sym.OP_NEXT, "Next"), f"action:ai_test_page:{page + 1}"))
         builder.add_buttons(*nav)
-    builder.add_row(sym.label(sym.OP_REFRESH, "Re-run Tests"), "action:ai_test_models")
+    builder.add_row(sym.label(sym.OP_REFRESH, "Refresh All Models"), "action:ai_test_refresh")
+    builder.add_row(sym.label(sym.CONTENT_STATIC, "Saved Results"), "action:ai_test_models")
     if results:
         builder.add_row("⌕ All Results", "action:ai_test_details")
     builder.add_row(sym.label(sym.CONTENT_STATIC, "Pick Model"), "panel:ai_model")
@@ -1474,8 +1533,19 @@ def _render_test_results(
 _test_running = False
 
 
-async def _ai_test_models_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
-    """Launch the model availability diagnostics without blocking the panel.
+def _test_running_view() -> tuple[str, str, list]:
+    """One run at a time: a tap during a run never starts a second pass."""
+    builder = InlinePanelBuilder()
+    builder.add_row(sym.label(sym.OP_HOME, "Home"), "panel:_nav:home")
+    return (
+        "Test Modules",
+        f"◌ Already running — this panel will update when done.\n\n{_runtime_pair_line()}",
+        builder.build(),
+    )
+
+
+async def _launch_test_run(event) -> tuple[str, str, list]:
+    """Start the existing complete diagnostic without blocking the panel.
 
     The run executes in a guarded background task against the SAME isolated
     tester the web dashboard uses (never conversation history, active config,
@@ -1487,19 +1557,6 @@ async def _ai_test_models_action(event, extra: str, chat_id: int) -> tuple[str, 
     from backend.bot.handlers import ai_test_progress
 
     owner_id = await _get_owner_id()
-
-    # One run at a time: the flag spans the whole background run (the handler
-    # returns long before it finishes), so a second tap re-renders the notice
-    # instead of racing a second tester pass.
-    if _test_running:
-        builder = InlinePanelBuilder()
-        builder.add_row(sym.label(sym.OP_HOME, "Home"), "panel:_nav:home")
-        return (
-            "Test Modules",
-            f"◌ Already running — this panel will update when done.\n\n{_runtime_pair_line()}",
-            builder.build(),
-        )
-
     _test_running = True
     guarded_create_task(
         ai_test_progress.run_streaming_test(owner_id, event),
@@ -1514,6 +1571,70 @@ async def _ai_test_models_action(event, extra: str, chat_id: int) -> tuple[str, 
         f"_This panel will update with progress and results — no spam._",
         builder.build(),
     )
+
+
+def _snapshot_problem_view(state: str, detail: str) -> tuple[str, str, list]:
+    """A storage problem never becomes a full diagnostic by itself."""
+    from backend.ai import test_snapshot
+
+    if state == test_snapshot.STATE_UNAVAILABLE:
+        headline = f"{sym.STATE_WARNING} Saved results are unavailable right now."
+        note = (
+            "_The snapshot store could not be read — this is not the same as "
+            "having no saved results._"
+        )
+    elif state == test_snapshot.STATE_UNSUPPORTED:
+        headline = f"{sym.STATE_WARNING} Saved results use an unsupported format."
+        note = f"_{detail or 'schema version not supported'}_"
+    else:
+        headline = f"{sym.STATE_WARNING} Saved results could not be read."
+        note = f"_{detail or 'the stored snapshot is malformed'}_"
+
+    builder = InlinePanelBuilder()
+    builder.add_row(sym.label(sym.OP_REFRESH, "Refresh All Models"), "action:ai_test_refresh")
+    builder.add_row("Overview", "panel:ai")
+    _nav_buttons(builder)
+    body = (
+        "**Test Modules**\n\n"
+        f"{headline}\n\n"
+        f"{note}\n\n"
+        f"{_runtime_pair_line()}\n\n"
+        "_Refresh All Models tests every eligible model again and replaces the saved snapshot._"
+    )
+    return "Test Modules", body, builder.build()
+
+
+async def _ai_test_models_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    """Open Test Modules — the persisted snapshot, never a fresh live run.
+
+    Only a visit with NO saved results performs the initial complete
+    diagnostic. A refresh is always the explicit, separate action below, so
+    opening this panel or paging through its results can never re-test models.
+    """
+    global _last_test_payload
+    from backend.ai import test_snapshot
+
+    if _test_running:
+        return _test_running_view()
+
+    loaded = await test_snapshot.load_snapshot()
+    snapshot = loaded.snapshot or {}
+    if loaded.ok and snapshot.get("results"):
+        _last_test_payload = test_snapshot.snapshot_to_payload(snapshot)
+        body, buttons = _render_test_results(_last_test_payload)
+        return "Test Modules", body, buttons
+    if loaded.missing or loaded.ok:
+        # No saved result to show: the first visit runs the initial full test
+        # exactly as it always did, and persists what it finds.
+        return await _launch_test_run(event)
+    return _snapshot_problem_view(loaded.state, loaded.detail)
+
+
+async def _ai_test_refresh_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    """The ONLY path that spends provider calls: a complete explicit refresh."""
+    if _test_running:
+        return _test_running_view()
+    return await _launch_test_run(event)
 
 
 async def _test_modules_page_dispatch(event, extra: str, chat_id: int):
@@ -1532,45 +1653,174 @@ if get_action("ai_test_page") is None:
     register_action("ai_test_page", _test_modules_page_dispatch)
 
 
-async def _ai_test_details_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
-    """Show the full per-model diagnostics from the last Test Models run.
+def _diag_text(value, limit: int = 160) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
 
-    Keeps the main model-selection message compact while preserving full
-    failure details (HTTP status, retry-after, sanitized errors) one tap
-    away. Uses the cached payload — never re-runs the tests.
+
+def _failure_diagnostic_lines(r: dict) -> list[str]:
+    """'Why it failed' lines for one model in the All Results view.
+
+    Renders only facts the result actually carries — HTTP status, the
+    provider's own code/status, the failure origin, the exact operation and
+    endpoint, retry-after, and one bounded sanitized message. Missing
+    metadata renders nothing (no empty placeholders), and a code/type equal
+    to the HTTP status is not repeated.
     """
-    results = (_last_test_payload or {}).get("results", [])
-    if not results:
-        builder = InlinePanelBuilder()
-        builder.add_row("Run Tests", "action:ai_test_models")
-        _nav_buttons(builder)
-        return "Test Modules", "**All Results**\n\n_◌ No results yet. Tap **Run Tests** first._", builder.build()
+    lines: list[str] = []
+    http_status = r.get("http_status")
+    provider_code = r.get("provider_code")
+    provider_type = r.get("provider_error_type")
+    origin = r.get("failure_origin")
 
-    lines = ["**All Results**\n"]
+    facts: list[str] = []
+    if http_status:
+        facts.append(f"HTTP {http_status}")
+    if provider_code and str(provider_code) != str(http_status):
+        facts.append(f"code {provider_code}")
+    if provider_type and str(provider_type) != str(http_status):
+        facts.append(str(provider_type))
+    if origin:
+        facts.append(str(origin))
+    if facts:
+        lines.append("      " + " · ".join(facts))
+
+    target = r.get("endpoint") or r.get("operation")
+    if target:
+        version = r.get("api_version")
+        suffix = f" ({version})" if version else ""
+        lines.append(f"      _{_diag_text(target, 120)}{suffix}_")
+
+    if r.get("retry_after"):
+        lines.append(f"      _retry-after: {r['retry_after']}s_")
+
+    reasons = r.get("provider_error_reasons") or []
+    if reasons:
+        joined = ", ".join(str(reason) for reason in reasons)
+        lines.append(f"      _reason: {_diag_text(joined, 120)}_")
+
+    message = r.get("provider_error_message") or r.get("error")
+    if message:
+        lines.append(f"      _{_diag_text(message)}_")
+    return lines
+
+
+# Telegram rejects any single message text longer than 4096 characters. The
+# All Results view is built from the LAST run's COMPLETE result list — every
+# model of every provider, each failing model with up to six diagnostic lines —
+# and a run has no per-provider cap, so one body is routinely far longer than a
+# message. Rendering it as one body made the edit fail with "Message is too
+# long"; the click had already been acknowledged, so the tap ended with no
+# change on screen, which is exactly the dead "All Results" button. The view
+# therefore pages itself under this budget: complete diagnostics, every field
+# preserved, and never a message the API rejects.
+_TEST_DETAILS_BODY_BUDGET = 3500
+
+
+def _test_detail_blocks(results: list[dict]) -> list[str]:
+    """One diagnostic block per model, provider-grouped, deterministic.
+
+    A block carries its provider header whenever the provider changes, so a
+    page can never split an entry or lose a model's provider attribution.
+    """
+    blocks: list[str] = []
     current_provider = None
     for r in sorted(results, key=lambda x: (x.get("provider", ""), x.get("model", ""))):
         provider = r.get("provider", "?")
+        lines: list[str] = []
         if provider != current_provider:
             current_provider = provider
             lines.append(f"**{r.get('display_name', provider)}**")
         status = r.get("status", "UNKNOWN_ERROR")
         icon = _TEST_STATUS_ICONS.get(status, "×")
-        model = r.get("model", "?")
-        line = f"  {icon} `{model}` — {status}"
+        model = str(r.get("model", "?"))[:80]
+        line = f"  {icon} `{model}` — {_status_label(status, bool(r.get('cached')))}"
         latency = r.get("latency_s")
         if latency is not None:
             line += f" · {latency}s"
         lines.append(line)
-        if r.get("http_status"):
-            lines.append(f"      _HTTP {r['http_status']}_")
-        if r.get("retry_after"):
-            lines.append(f"      _retry-after: {r['retry_after']}s_")
-        if r.get("error"):
-            lines.append(f"      _{r['error'][:160]}_")
+        if status != "AVAILABLE":
+            lines.extend(_failure_diagnostic_lines(r))
+        blocks.append("\n".join(lines))
+    return blocks
+
+
+def _detail_pages(
+    blocks: list[str], budget: int = _TEST_DETAILS_BODY_BUDGET,
+) -> list[list[str]]:
+    """Greedily pack diagnostic blocks into pages that fit one message."""
+    pages: list[list[str]] = []
+    page: list[str] = []
+    size = 0
+    for block in blocks:
+        cost = len(block) + 2
+        if page and size + cost > budget:
+            pages.append(page)
+            page, size = [], 0
+        page.append(block)
+        size += cost
+    if page:
+        pages.append(page)
+    return pages or [[]]
+
+
+async def _ai_test_details_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    """Show the full per-model diagnostics from the last Test Models run.
+
+    Keeps the main model-selection message compact while preserving the full
+    failure evidence one tap away: HTTP status, the provider's own code and
+    status, the attributed failure origin, the exact operation/endpoint, a
+    bounded sanitized provider message and retry-after. Uses the cached
+    payload — never re-runs the tests. ``extra`` is the page index: the body
+    pages itself so a complete run's diagnostics always fit one Telegram
+    message and the tap always produces a visible edit.
+    """
+    results = (_last_test_payload or {}).get("results", [])
+    historical = (_last_test_payload or {}).get("historical_results", []) or []
+    if not results and not historical:
+        builder = InlinePanelBuilder()
+        builder.add_row("Run Tests", "action:ai_test_models")
+        _nav_buttons(builder)
+        return "Test Modules", "**All Results**\n\n_◌ No results yet. Tap **Run Tests** first._", builder.build()
+
+    pages = _detail_pages(_test_detail_blocks(results))
+    try:
+        page = max(0, int((extra or "0").strip()))
+    except ValueError:
+        page = 0
+    page = min(page, len(pages) - 1)
+
+    lines = ["**All Results**\n"]
+    lines.extend(pages[page])
+    if len(pages) > 1:
+        lines.append(f"_Page {page + 1}/{len(pages)} · full diagnostics, nothing omitted_")
+
+    if historical:
+        lines.append(f"**Historical (not in the latest catalog): {len(historical)}**")
+        for r in historical[:_TEST_HISTORICAL_LIMIT]:
+            status = r.get("status", "UNKNOWN_ERROR")
+            icon = _TEST_STATUS_ICONS.get(status, "×")
+            lines.append(
+                f"  {icon} `{r.get('model', '?')}` — "
+                f"{_status_label(status, bool(r.get('cached')))} · historical"
+            )
+        if len(historical) > _TEST_HISTORICAL_LIMIT:
+            lines.append(f"_…and {len(historical) - _TEST_HISTORICAL_LIMIT} more historical results_")
         lines.append("")
 
     builder = InlinePanelBuilder()
-    builder.add_row(sym.label(sym.OP_REFRESH, "Re-run Tests"), "action:ai_test_models")
+    builder.add_row(sym.label(sym.OP_REFRESH, "Refresh All Models"), "action:ai_test_refresh")
+    builder.add_row(sym.label(sym.CONTENT_STATIC, "Saved Results"), "action:ai_test_models")
+    if len(pages) > 1:
+        nav: list[tuple[str, str]] = []
+        if page > 0:
+            nav.append((sym.label(sym.OP_PREV, "Prev"), f"action:ai_test_details:{page - 1}"))
+        nav.append((f"{page + 1}/{len(pages)}", "panel:_nav:noop"))
+        if page < len(pages) - 1:
+            nav.append((sym.label(sym.OP_NEXT, "Next"), f"action:ai_test_details:{page + 1}"))
+        builder.add_buttons(*nav)
     builder.add_row(sym.label(sym.CONTENT_STATIC, "Pick Model"), "panel:ai_model")
     _nav_buttons(builder)
     return "Test Modules", "\n".join(lines).rstrip(), builder.build()
@@ -1797,6 +2047,7 @@ def register(client, owner_id: int) -> None:
         register_action("ai_refresh_models", _ai_refresh_models_action)
         register_action("ai_start_chat", _ai_start_chat_action)
         register_action("ai_test_models", _ai_test_models_action)
+        register_action("ai_test_refresh", _ai_test_refresh_action)
         register_action("ai_test_details", _ai_test_details_action)
         register_action("ai_diagnostics_refresh", _ai_diagnostics_refresh_action)
         register_action("ai_health_refresh", _ai_health_refresh_action)

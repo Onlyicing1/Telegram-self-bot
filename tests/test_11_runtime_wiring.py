@@ -820,11 +820,15 @@ async def test_ai_test_models_action_launches_streaming_run():
         assert "panel:_nav:home" in datas
 
         # Flush the background run INSIDE the patch context: the guarded
-        # task runs to completion (stubbed tester + terminal results edit
-        # through the guardian), so no real network call can leak past the
-        # patches and the running flag is proven cleared.
-        for _ in range(30):
-            await asyncio.sleep(0)
+        # task runs to completion (stubbed tester + snapshot persist + terminal
+        # results edit through the guardian), so no real network call can leak
+        # past the patches and the running flag is proven cleared. The persist
+        # step does a real bounded DB round trip, so wait for it instead of
+        # assuming it fits in a fixed number of event-loop turns.
+        for _ in range(600):
+            if ai_module._test_running is False:
+                break
+            await asyncio.sleep(0.01)
 
     assert ai_module._test_running is False
     assert ai_module._last_test_payload.get("success") is True

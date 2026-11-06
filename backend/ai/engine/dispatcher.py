@@ -530,6 +530,8 @@ class Dispatcher:
             )
             retry_count = int(response.metadata.get("ai_retry_count", 0) or 0)
             fallback_used = bool(response.metadata.get("fallback"))
+            model_fallback_used = bool(response.metadata.get("model_fallback"))
+            fallback_to_model = str(response.metadata.get("fallback_to_model") or "")
             failure_type = _provider_failure_type(response)
 
             def _reject_disabled_tool_calls(candidate: ProviderResponse) -> ProviderResponse:
@@ -604,6 +606,13 @@ class Dispatcher:
                     retry_count, int(retry_response.metadata.get("ai_retry_count", 0) or 0)
                 )
                 fallback_used = fallback_used or bool(retry_response.metadata.get("fallback"))
+                model_fallback_used = model_fallback_used or bool(
+                    retry_response.metadata.get("model_fallback")
+                )
+                fallback_to_model = (
+                    str(retry_response.metadata.get("fallback_to_model") or "")
+                    or fallback_to_model
+                )
                 if not retry_response.success:
                     failure_type = _provider_failure_type(retry_response)
                 if retry_response.success and (retry_response.text or retry_response.tool_calls):
@@ -982,6 +991,26 @@ class Dispatcher:
                 retry_count, int(cont_response.metadata.get("ai_retry_count", 0) or 0)
             )
             fallback_used = fallback_used or bool(cont_response.metadata.get("fallback"))
+            model_fallback_used = model_fallback_used or bool(
+                cont_response.metadata.get("model_fallback")
+            )
+            fallback_to_model = (
+                str(cont_response.metadata.get("fallback_to_model") or "")
+                or fallback_to_model
+            )
+            cont_metadata = cont_response.metadata or {}
+            if cont_metadata.get("model_fallback") or cont_metadata.get("fallback"):
+                logger.info(
+                    "AI_CONTINUATION_FALLBACK id=%s round=%d kind=%s from=%s/%s "
+                    "to=%s/%s",
+                    rid or "-", round_num + 2,
+                    "model" if cont_metadata.get("model_fallback") else "provider",
+                    cont_metadata.get("fallback_from") or "-",
+                    cont_metadata.get("fallback_from_model") or "-",
+                    cont_metadata.get("fallback_to")
+                    or cont_response.provider_name or "-",
+                    fallback_to_model or "-",
+                )
             if not cont_response.success:
                 failure_type = _provider_failure_type(cont_response)
 
@@ -1232,6 +1261,9 @@ class Dispatcher:
             metadata["token_source"] = "unavailable"
         metadata["retry_count"] = retry_count
         metadata["fallback_used"] = fallback_used
+        metadata["model_fallback_used"] = model_fallback_used
+        if fallback_to_model:
+            metadata["fallback_to_model"] = fallback_to_model
         metadata["provider_call_count"] = provider_call_count
         metadata["provider_elapsed_s"] = round(provider_total_elapsed, 3)
         metadata["provider_failure_type"] = failure_type
@@ -1272,6 +1304,26 @@ class Dispatcher:
             warnings=warnings,
             errors=errors,
             metadata=metadata,
+        )
+
+        # The final serving (provider, model) is reported ONLY for a served
+        # response: a failed candidate is itemized by AI_FALLBACK_START /
+        # AI_PROVIDER_FAILURE and is never presented as the answer's model.
+        logger.info(
+            "AI_RESULT id=%s success=%s provider=%s model=%s finish_state=%s "
+            "model_fallback=%s provider_fallback=%s fallback_to_model=%s "
+            "candidates_attempted=%s failure_type=%s latency_s=%.3f",
+            rid or "-",
+            result.success,
+            (result.provider or "-") if result.success else "-",
+            (result.model or "-") if result.success else "-",
+            finish_state,
+            model_fallback_used,
+            fallback_used,
+            fallback_to_model or "-",
+            (result.metadata or {}).get("candidates_attempted", "-"),
+            failure_type or "-",
+            latency,
         )
 
         safe_call(self._hooks, "after_response", result)

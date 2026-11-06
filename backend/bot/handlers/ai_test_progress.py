@@ -153,6 +153,36 @@ class _PanelEditGuardian:
             self._chain = None
 
 
+async def _persist_test_snapshot(payload: dict) -> dict:
+    """Persist a COMPLETED run; never let a partial run replace a good one.
+
+    The returned payload carries its own provenance (``cached=False``,
+    ``snapshot_saved`` and the stored ``last_completed_at``) so the shared
+    results renderer reports a failed write honestly instead of claiming a
+    save that did not happen.
+    """
+    from backend.ai import test_snapshot
+
+    payload = dict(payload)
+    payload["cached"] = False
+    if payload.get("partial"):
+        payload["snapshot_saved"] = False
+        payload["snapshot_skipped_partial"] = True
+        return payload
+    snapshot: dict = {}
+    try:
+        snapshot = test_snapshot.build_snapshot(payload)
+        saved = await test_snapshot.save_snapshot(snapshot)
+    except Exception as exc:
+        logger.warning("Test Modules snapshot persist failed: %s", exc)
+        saved = False
+    payload["snapshot_saved"] = bool(saved)
+    payload["snapshot_last_completed_at"] = (
+        snapshot.get("last_completed_at") if saved else None
+    )
+    return payload
+
+
 async def run_streaming_test(owner_id: int, event) -> None:
     """Run the streaming test and edit the launching panel via the guardian.
 
@@ -210,6 +240,7 @@ async def run_streaming_test(owner_id: int, event) -> None:
             await guardian.wait()
             return
 
+        payload = await _persist_test_snapshot(payload)
         _ai_mod._last_test_payload = payload
 
         from backend.bot.handlers.ai import _render_test_results

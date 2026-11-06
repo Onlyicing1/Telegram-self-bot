@@ -2,7 +2,7 @@
 Focused tests for the execution-reliability fixes:
 
 - Groq/OpenAI-compatible requests never send a contradictory tool_choice.
-- Stale Gemini model is resolved to a current one (data-driven deprecation).
+- A selected model is never substituted: the request names the exact id.
 - model_not_found is classified correctly (Gemini 404 → model_not_found).
 - A dead model is marked unavailable and skipped on later requests.
 - Account identity tool reads the authenticated self account via get_me.
@@ -79,15 +79,61 @@ async def test_openai_compat_no_tools_omits_tool_choice():
     assert "tools" not in payload
 
 
-# ── Stale model resolution ──
+# ── The selected model is the requested model ──
 
 
-def test_deprecated_gemini_model_is_substituted():
-    from backend.ai.providers.base.defaults import resolve_model
+@pytest.mark.asyncio
+async def test_gemini_requests_the_exactly_selected_model():
+    """The configured selection reaches the URL verbatim, with no rewrite.
 
-    assert resolve_model("gemini", "gemini-2.0-flash") == "gemini-2.5-flash"
-    assert resolve_model("gemini", "gemini-2.5-flash") == "gemini-2.5-flash"
-    assert resolve_model("openai", "gpt-4o") == "gpt-4o"
+    A hardcoded deprecation table used to turn ``gemini-2.0-flash`` into
+    ``gemini-2.5-flash`` before the request was built, so the outbound request
+    named a model the owner never chose. A retired id must fail AS that id.
+    """
+    from backend.ai.providers.gemini import GeminiProvider
+
+    provider = GeminiProvider(ProviderConfig(
+        api_key="k", enabled=True, default_model="gemini-2.0-flash",
+    ))
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {
+        "candidates": [{"content": {"parts": [{"text": "ok"}]}, "finishReason": "STOP"}],
+        "usageMetadata": {},
+    }
+    provider._http_client = MagicMock()
+    provider._http_client.post = AsyncMock(return_value=mock_resp)
+
+    await provider.chat([{"role": "user", "content": "hi"}])
+
+    url = provider._http_client.post.call_args.args[0]
+    assert "models/gemini-2.0-flash:generateContent" in url
+    assert "gemini-2.5-flash" not in url
+
+
+@pytest.mark.asyncio
+async def test_an_explicit_model_argument_is_not_reinterpreted():
+    """A model the provider catalogue did not know at build time works as-is."""
+    from backend.ai.providers.gemini import GeminiProvider
+
+    provider = GeminiProvider(ProviderConfig(
+        api_key="k", enabled=True, default_model="gemini-2.5-flash",
+    ))
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {
+        "candidates": [{"content": {"parts": [{"text": "ok"}]}, "finishReason": "STOP"}],
+        "usageMetadata": {},
+    }
+    provider._http_client = MagicMock()
+    provider._http_client.post = AsyncMock(return_value=mock_resp)
+
+    await provider.chat(
+        [{"role": "user", "content": "hi"}], model="gemini-future-model-xyz",
+    )
+
+    url = provider._http_client.post.call_args.args[0]
+    assert "models/gemini-future-model-xyz:generateContent" in url
 
 
 def test_gemini_default_model_is_current():
@@ -116,7 +162,8 @@ async def test_gemini_404_is_model_not_found():
 
     assert result.success is False
     assert result.metadata["failure_type"] == "model_not_found"
-    assert result.metadata["model"] == "gemini-2.5-flash"  # deprecated model was resolved
+    # The failure is attributed to the model that was actually requested.
+    assert result.metadata["model"] == "gemini-2.0-flash"
 
 
 # ── Dead model is skipped on later requests ──
