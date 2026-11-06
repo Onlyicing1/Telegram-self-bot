@@ -59,6 +59,7 @@ from backend.ai.providers.manager.manager import ProviderManager
 from backend.ai.providers.registry.registry import ProviderRegistry
 from backend.ai.runtime.manager import ConversationManager
 from backend.ai.session.request import AIRequest
+from backend.ai.tools import lifecycle as tool_events
 from backend.ai.tools.executor import ToolExecutor, ToolExecutionResult
 from backend.ai.tools.registry import ToolRegistry, create_default_registry
 from backend.ai.tools.context import ToolContext
@@ -378,6 +379,16 @@ class Dispatcher:
             tools_allowed,
             len(tool_definitions),
             [d["function"]["name"] for d in tool_definitions],
+        )
+        tool_events.emit(
+            "AI_TOOL_REQUEST_RECEIVED",
+            request_id=rid,
+            round_no=0,
+            status="received",
+            detail=(
+                f"tools_enabled={tools_allowed} "
+                f"tool_defs={len(tool_definitions)} owner={request.owner_id}"
+            ),
         )
 
         # ── Stage 1: Conversation Runtime ──
@@ -738,9 +749,34 @@ class Dispatcher:
         round_execution_failed = False
 
         for round_num in range(MAX_TOOL_ROUNDS):
-            if not response.success or not response.tool_calls:
+            round_no = round_num + 1
+            if not response.success:
+                break
+            if not response.tool_calls:
+                # A successful response with no tool call is a distinct outcome
+                # from a rejected or unexecuted tool call: name it explicitly.
+                tool_events.emit(
+                    "AI_TOOL_CALLS_EMPTY",
+                    request_id=rid,
+                    round_no=round_no,
+                    provider=response.provider_name or provider_name,
+                    model=self._response_model(response, request),
+                    status="no_tool_calls",
+                    detail=f"text_chars={len(response.text or '')}",
+                )
                 break
             if not self._tool_executor:
+                tool_events.emit(
+                    "AI_TOOL_EXECUTION_SKIPPED",
+                    request_id=rid,
+                    round_no=round_no,
+                    provider=response.provider_name or provider_name,
+                    model=self._response_model(response, request),
+                    status="not_executed",
+                    error="no_tool_executor",
+                    detail=f"calls={len(response.tool_calls)}",
+                    level=logging.WARNING,
+                )
                 warnings.append(
                     "tool_execution_unavailable: no ToolExecutor attached — "
                     "pending tool calls were not executed"
@@ -750,43 +786,53 @@ class Dispatcher:
 
             try:
                 _stage("TOOL_PARSE")
-                logger.info(
-                    "AI_TOOL_PARSE id=%s tools=%s",
-                    rid or "-", [tc.get("name", "") for tc in response.tool_calls],
+                provider_label = response.provider_name or provider_name
+                model_label = self._response_model(response, request)
+                call_names = [str(tc.get("name", "") or "") for tc in response.tool_calls]
+                tool_events.emit(
+                    "AI_TOOL_CALLS_RECEIVED",
+                    request_id=rid,
+                    round_no=round_no,
+                    provider=provider_label,
+                    model=model_label,
+                    status="received",
+                    detail=(
+                        f"count={len(response.tool_calls)} "
+                        f"tools={','.join(tool_events.bounded(n, 40) for n in call_names[:8])}"
+                    ),
                 )
-                for tc in response.tool_calls:
-                    args = tc.get("arguments") or {}
-                    keys = sorted(args.keys()) if isinstance(args, dict) else []
-                    logger.info(
-                        "AI_TOOL_ARGS id=%s tool=%s args=%s",
-                        rid or "-", tc.get("name", ""), keys,
-                    )
                 _stage("TOOL_EXECUTION")
-                logger.info("AI_TOOL_EXECUTION_START id=%s", rid or "-")
-                logger.info(
-                    "AI_EXECUTION_START id=%s tools=%s",
-                    rid or "-", [tc.get("name", "") for tc in response.tool_calls],
+                per_request_ctx = self._build_tool_context(
+                    request, provider=provider_label, model=model_label,
                 )
-                per_request_ctx = self._build_tool_context(request)
                 exec_results = await self._tool_executor.execute_calls(
                     response.tool_calls,
                     owner_id=request.owner_id,
                     session_id=request.session_id,
                     status_callback=status_callback,
                     context_override=per_request_ctx,
+                    round_no=round_no,
                 )
-                logger.info("AI_TOOL_EXECUTION_END id=%s results=%d", rid or "-", len(exec_results))
-                for er in exec_results:
-                    if er.success:
-                        logger.info(
-                            "AI_EXECUTION_RESULT id=%s action=%s success=True",
-                            rid or "-", er.tool_name,
-                        )
-                    else:
-                        logger.info(
-                            "AI_EXECUTION_ERROR id=%s action=%s error=%s",
-                            rid or "-", er.tool_name, er.error or er.message,
-                        )
+                for index, er in enumerate(exec_results):
+                    tool_events.emit(
+                        "AI_TOOL_RESULT_RETURNED",
+                        request_id=rid,
+                        round_no=round_no,
+                        tool_call_id=(
+                            tool_events.call_id(response.tool_calls[index], round_no, index)
+                            if index < len(response.tool_calls) else ""
+                        ),
+                        tool=er.tool_name,
+                        provider=provider_label,
+                        model=model_label,
+                        status=(
+                            "confirmation_required" if er.needs_confirmation
+                            else ("success" if er.success else "failed")
+                        ),
+                        elapsed_ms=er.latency_ms,
+                        error=tool_events.error_class(er.error),
+                        detail=f"index={index + 1} message_chars={len(er.message or '')}",
+                    )
                     result_dict = er.as_dict()
                     if er.tool_name == "web_search" and isinstance(er.data, dict):
                         result_dict["query"] = er.data.get("query", "")
@@ -880,9 +926,19 @@ class Dispatcher:
             )
 
             continuation_messages = self._build_continuation_messages(messages, response, exec_results)
+            continuation_round = round_num + 2
             try:
                 _stage("PROVIDER_REQUEST")
-                logger.info("AI_PROVIDER_REQUEST_START id=%s round=%d", rid or "-", round_num + 2)
+                logger.info("AI_PROVIDER_REQUEST_START id=%s round=%d", rid or "-", continuation_round)
+                tool_events.emit(
+                    "AI_TOOL_CONTINUATION_STARTED",
+                    request_id=rid,
+                    round_no=continuation_round,
+                    provider=provider_label,
+                    model=model_label,
+                    status="started",
+                    detail=f"tools_executed={len(exec_results)}",
+                )
                 cont_response: ProviderResponse = await _provider_chat(
                     continuation_messages,
                     call_label=f"continuation_{round_num + 1}",
@@ -891,7 +947,22 @@ class Dispatcher:
                 _mark_success("PROVIDER_REQUEST")
                 logger.info(
                     "AI_PROVIDER_RESPONSE id=%s round=%d success=%s",
-                    rid or "-", round_num + 2, cont_response.success,
+                    rid or "-", continuation_round, cont_response.success,
+                )
+                tool_events.emit(
+                    "AI_TOOL_CONTINUATION_COMPLETED",
+                    request_id=rid,
+                    round_no=continuation_round,
+                    provider=cont_response.provider_name or provider_label,
+                    model=self._response_model(cont_response, request),
+                    status="success" if cont_response.success else "provider_failure",
+                    error=(
+                        "" if cont_response.success else tool_events.bounded(
+                            str((cont_response.metadata or {}).get("failure_type") or "provider_failure"),
+                            48,
+                        )
+                    ),
+                    detail=f"tool_calls={len(cont_response.tool_calls or [])}",
                 )
                 safe_call(self._hooks, "after_provider", cont_response)
                 metadata["stages"].append(f"provider_continuation_{round_num + 1}")
@@ -985,13 +1056,18 @@ class Dispatcher:
                         "AI_TOOL_PENDING_EXEC_START id=%s tools=%s rounds_executed=%d limit=%d",
                         rid or "-", pending_names, tool_rounds_executed, MAX_TOOL_ROUNDS,
                     )
-                    per_request_ctx = self._build_tool_context(request)
+                    per_request_ctx = self._build_tool_context(
+                        request,
+                        provider=response.provider_name or provider_name,
+                        model=self._response_model(response, request),
+                    )
                     salvage_results = await self._tool_executor.execute_calls(
                         salvage_calls,
                         owner_id=request.owner_id,
                         session_id=request.session_id,
                         status_callback=status_callback,
                         context_override=per_request_ctx,
+                        round_no=tool_rounds_executed + 1,
                     )
                     for er in salvage_results:
                         all_tool_results.append(er.as_dict())
@@ -1004,9 +1080,18 @@ class Dispatcher:
                             tool_name=er.tool_name,
                             result=f"{marker} {detail}",
                         )
-                        logger.info(
-                            "AI_TOOL_PENDING_RESULT id=%s tool=%s success=%s",
-                            rid or "-", er.tool_name, er.success,
+                        tool_events.emit(
+                            "AI_TOOL_RESULT_RETURNED",
+                            request_id=rid,
+                            round_no=tool_rounds_executed + 1,
+                            tool=er.tool_name,
+                            status=(
+                                "confirmation_required" if er.needs_confirmation
+                                else ("success" if er.success else "failed")
+                            ),
+                            elapsed_ms=er.latency_ms,
+                            error=tool_events.error_class(er.error),
+                            detail="at_round_limit=True",
                         )
                     metadata["tool_results"] = all_tool_results
                     metadata["stages"].append("pending_tool_execution_at_limit")
@@ -1241,12 +1326,26 @@ class Dispatcher:
         except Exception as exc:  # noqa: BLE001
             logger.warning("AI usage persistence schedule failed: %r", exc)
 
-    def _build_tool_context(self, request: AIRequest) -> ToolContext:
+    @staticmethod
+    def _response_model(response: ProviderResponse, request: AIRequest) -> str:
+        """The model that produced this response (correlation only)."""
+        metadata = response.metadata or {}
+        return str(metadata.get("model") or getattr(request, "model", "") or "")
+
+    def _build_tool_context(
+        self,
+        request: AIRequest,
+        *,
+        provider: str = "",
+        model: str = "",
+    ) -> ToolContext:
         """Build a per-request ToolContext from the executor's base context.
 
         Enriches the base context's ``extra`` dict with ``chat_id`` and
         ``reply_msg`` from the current AIRequest so tools (save, delete,
-        etc.) can operate on the correct chat and replied-to message.
+        etc.) can operate on the correct chat and replied-to message. The
+        provider/model labels ride along so every tool-lifecycle event can
+        name them without the executor knowing about providers.
         """
         base = self._tool_executor._context
         extra: dict[str, Any] = dict(base.extra) if base.extra else {}
@@ -1259,6 +1358,8 @@ class Dispatcher:
         # than from model output — see task_contract's provenance rule.
         extra["request_text"] = request.user_message
         extra["request_id"] = request.request_id
+        extra["provider_name"] = provider
+        extra["model_name"] = model
         # Per-request proactive consent, proved from the OWNER'S message by the
         # ONE shared detector. Tools (create_task) read this instead of
         # re-deciding authorization — never stored, never a global mode.
@@ -1339,6 +1440,17 @@ class Dispatcher:
             getattr(request, "request_id", "") or "-",
             request.owner_id, request.chat_id, tool_name,
             pending is not None, extra_blocked,
+        )
+        tool_events.emit(
+            "AI_TOOL_CONFIRMATION_REQUIRED",
+            request_id=getattr(request, "request_id", "") or "",
+            round_no=1,
+            tool=tool_name,
+            status="pending_owner_approval" if pending is not None else "already_pending",
+            detail=(
+                f"stored={pending is not None} extra_blocked={extra_blocked} "
+                f"args={tool_events.arg_shape(arguments)}"
+            ),
         )
         return text
 
@@ -1726,16 +1838,25 @@ class Dispatcher:
             return replace(response, text=message, metadata=meta)
 
         if result.kind == "invalid":
-            logger.info(
-                "AI_ACTION_VALIDATION id=%s result=rejected error=%s",
-                rid or "-", result.error,
+            tool_events.emit(
+                "AI_TOOL_CALL_VALIDATION_FAILED",
+                request_id=rid,
+                round_no=1,
+                tool=str(result.action or ""),
+                status="rejected",
+                error=tool_events.error_class(result.error),
+                detail="structured action rejected by local validation",
             )
             return replace(response, text=f"{sym.STATE_FAILED} {result.error}", metadata=meta)
 
         if result.kind == "unsupported":
-            logger.info(
-                "AI_ACTION_VALIDATION id=%s result=unsupported action=%s",
-                rid or "-", result.action,
+            tool_events.emit(
+                "AI_TOOL_CALL_VALIDATION_FAILED",
+                request_id=rid,
+                round_no=1,
+                tool=str(result.action or ""),
+                status="unsupported",
+                error="unsupported_action",
             )
             return replace(response, text=f"{sym.STATE_FAILED} Unsupported action: {result.action}", metadata=meta)
 
