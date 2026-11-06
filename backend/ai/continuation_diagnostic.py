@@ -56,6 +56,9 @@ PROBE_TIMEOUT_SECONDS = 12.0
 #: acknowledgement or one function call and keeps the diagnostic cheap; the
 #: production generation budget is never spent on it.
 PROBE_MAX_TOKENS = 64
+#: Probe sampling temperature: 0 keeps the diagnostic deterministic, so the
+#: same pair answers the same way instead of varying with sampling.
+PROBE_TEMPERATURE = 0.0
 
 #: Only these continuation failure categories get a probe. ``auth``,
 #: ``rate_limited``, ``model_not_found``, ``timeout``, ``network`` and
@@ -63,9 +66,20 @@ PROBE_MAX_TOKENS = 64
 #: to re-learn the same classification.
 QUALIFYING_CATEGORIES = frozenset({"request", "tool_call"})
 
+#: Provider-reported finish reasons that mean generation stopped at the
+#: output-token limit. Only an explicit reason from the adapter qualifies:
+#: ``length`` for the OpenAI-compatible envelope, ``MAX_TOKENS`` for Gemini.
+#: Content-filter reasons (``content_filter``, ``SAFETY``, ``RECITATION``)
+#: are deliberately absent, and response length or empty text is never used
+#: to infer truncation.
+TRUNCATION_FINISH_REASONS = frozenset({"length", "MAX_TOKENS"})
+
 #: Classification vocabulary — the only values this module ever emits.
 CONTINUATION_ACCEPTED = "CONTINUATION_ACCEPTED"
 CONTINUATION_REJECTED = "CONTINUATION_REJECTED"
+#: The probe could not settle the question: it stopped at its output budget,
+#: so the answer says nothing about whether the continuation was accepted.
+CONTINUATION_INCONCLUSIVE = "CONTINUATION_INCONCLUSIVE"
 AUTH_ERROR = "AUTH_ERROR"
 RATE_LIMITED = "RATE_LIMITED"
 MODEL_NOT_FOUND = "MODEL_NOT_FOUND"
@@ -166,6 +180,11 @@ def classify_probe_response(response: ProviderResponse) -> tuple[str, str]:
     category = str(metadata.get("failure_type") or "").strip().lower()
     status = metadata.get("http_status")
     if response.success:
+        # A capped answer proves nothing either way, so it must not be read as
+        # a rejection — nor as acceptance of a contract the model never
+        # finished. Only the adapter's own finish reason can say this.
+        if str(metadata.get("finish_reason") or "").strip() in TRUNCATION_FINISH_REASONS:
+            return CONTINUATION_INCONCLUSIVE, "output_truncated"
         if (response.text or "").strip() == NOT_IMPLEMENTED:
             return UNSUPPORTED, "not_implemented"
         if response.text or response.tool_calls:
@@ -237,9 +256,11 @@ def _log_event(
     logger.log(
         level,
         "PROVIDER_CONTINUATION_DIAGNOSTIC id=%s provider=%s model=%s result=%s "
-        "category=%s latency_s=%.3f cooldown_s=%d skipped=%s",
+        "category=%s latency_s=%.3f max_tokens=%d temperature=%.1f "
+        "cooldown_s=%d skipped=%s",
         request_id or "-", provider or "-", model or "-", result,
-        category or "-", latency, int(PROBE_COOLDOWN_SECONDS), skipped or "-",
+        category or "-", latency, PROBE_MAX_TOKENS, PROBE_TEMPERATURE,
+        int(PROBE_COOLDOWN_SECONDS), skipped or "-",
     )
 
 
@@ -334,7 +355,7 @@ def _probe_instance(
     # be the production instance's, and nothing here mutates the live config.
     probe_config = replace(config, extra=dict(config.extra or {}))
     probe_config.max_tokens = PROBE_MAX_TOKENS
-    probe_config.temperature = 0.0
+    probe_config.temperature = PROBE_TEMPERATURE
     if model and not probe_config.default_model:
         probe_config.default_model = model
     return ProviderFactory.create_provider(provider_name, probe_config)

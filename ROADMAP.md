@@ -85,3 +85,21 @@ merged, so the probe is now the live way to confirm the repair holds for each
    evidence that pair's serialization or capability is the defect.
 5. Optionally surface the latest per-pair diagnostic result in the AI
    diagnostics panel so it does not require reading Render logs.
+
+## Continuation diagnostic — generation budget and truncation
+
+The probe is explicitly cheap and deterministic: `PROBE_MAX_TOKENS = 64` and
+`PROBE_TEMPERATURE = 0.0` are applied to the COPIED config only — credential,
+endpoint, requested model and the live config object are untouched — and both
+values are reported on every `PROVIDER_CONTINUATION_DIAGNOSTIC` line
+(`max_tokens=64 temperature=0.0`), including the DEBUG `result=SKIPPED` lines.
+
+A capped answer is `CONTINUATION_INCONCLUSIVE category=output_truncated`, not a
+rejection: it says the probe's own output budget ended the turn, so it can
+neither confirm nor refute the continuation contract. Only an adapter's own
+finish reason can produce it — OpenAI-compatible `finish_reason="length"` and
+Gemini `finishReason="MAX_TOKENS"` (one shared `TRUNCATION_FINISH_REASONS` set).
+Content-filter reasons (`content_filter`, `SAFETY`, `RECITATION`), empty text
+and short responses never imply truncation. A provider that exposes no finish
+reason keeps its previous classification: `CONTINUATION_ACCEPTED` when text or
+tool calls came back, `CONTINUATION_REJECTED (empty_response)` when nothing did.

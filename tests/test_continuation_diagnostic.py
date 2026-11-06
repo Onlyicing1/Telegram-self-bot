@@ -247,6 +247,148 @@ async def test_probe_config_is_cheap_and_leaves_live_config_untouched(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_event_reports_probe_generation_settings(monkeypatch, caplog):
+    diag.reset_state()
+    manager, _ = _manager()
+    _patch_factory(monkeypatch, _FakeFactory())
+    caplog.set_level(logging.INFO, logger=diag.logger.name)
+
+    await diag.run_continuation_probe(manager, "gemini", "gemini-2.5-pro", request_id="rid")
+
+    assert diag.PROBE_MAX_TOKENS == 64
+    assert diag.PROBE_TEMPERATURE == 0.0
+    events = [
+        record.getMessage() for record in caplog.records
+        if record.getMessage().startswith("PROVIDER_CONTINUATION_DIAGNOSTIC")
+    ]
+    assert events
+    assert "max_tokens=64" in events[-1]
+    assert "temperature=0.0" in events[-1]
+
+
+@pytest.mark.asyncio
+async def test_skipped_event_reports_probe_generation_settings(monkeypatch, caplog):
+    diag.reset_state()
+    manager, _ = _manager()
+    _patch_factory(monkeypatch, _FakeFactory())
+    caplog.set_level(logging.DEBUG, logger=diag.logger.name)
+
+    first = diag.schedule_continuation_diagnostic(manager, _failure(), request_id="rid-1")
+    assert first is not None
+    await first
+    assert diag.schedule_continuation_diagnostic(manager, _failure(), request_id="rid-2") is None
+
+    skipped = [
+        record.getMessage() for record in caplog.records
+        if "result=SKIPPED" in record.getMessage()
+    ]
+    assert skipped
+    assert "max_tokens=64" in skipped[-1]
+    assert "temperature=0.0" in skipped[-1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("finish_reason", ["length", "MAX_TOKENS"])
+async def test_output_token_truncation_is_inconclusive(monkeypatch, caplog, finish_reason):
+    diag.reset_state()
+    manager, _ = _manager()
+    _patch_factory(
+        monkeypatch,
+        _FakeFactory([ProviderResponse(
+            # Exactly what each adapter returns for a capped answer: the
+            # synthesized sentence plus the provider's own finish reason.
+            text="Response truncated due to token limit.",
+            provider_name="gemini",
+            success=True,
+            metadata={"finish_reason": finish_reason},
+        )]),
+    )
+    caplog.set_level(logging.INFO, logger=diag.logger.name)
+
+    result = await diag.run_continuation_probe(
+        manager, "gemini", "gemini-2.5-pro", request_id="rid",
+    )
+
+    assert result == diag.CONTINUATION_INCONCLUSIVE
+    assert "category=output_truncated" in caplog.text
+    assert "CONTINUATION_REJECTED" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_empty_success_without_finish_reason_stays_rejected(monkeypatch):
+    diag.reset_state()
+    manager, _ = _manager()
+    _patch_factory(
+        monkeypatch,
+        _FakeFactory([ProviderResponse(text="", provider_name="gemini", success=True, metadata={})]),
+    )
+
+    assert await diag.run_continuation_probe(
+        manager, "gemini", "gemini-2.5-pro", request_id="rid",
+    ) == diag.CONTINUATION_REJECTED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("finish_reason", "text"),
+    [
+        ("content_filter", "Response blocked by content filter."),
+        ("SAFETY", "Response blocked by content filter."),
+        ("RECITATION", "Response blocked due to recitation."),
+    ],
+)
+async def test_content_filter_is_not_token_truncation(monkeypatch, finish_reason, text):
+    diag.reset_state()
+    manager, _ = _manager()
+    _patch_factory(
+        monkeypatch,
+        _FakeFactory([ProviderResponse(
+            text=text, provider_name="gemini", success=True,
+            metadata={"finish_reason": finish_reason},
+        )]),
+    )
+
+    result = await diag.run_continuation_probe(
+        manager, "gemini", "gemini-2.5-pro", request_id="rid",
+    )
+
+    assert result == diag.CONTINUATION_ACCEPTED
+    assert result != diag.CONTINUATION_INCONCLUSIVE
+
+
+@pytest.mark.asyncio
+async def test_truncation_sentence_without_finish_reason_is_not_inferred(monkeypatch):
+    """Text alone never proves truncation: only the adapter's reason does."""
+    diag.reset_state()
+    manager, _ = _manager()
+    _patch_factory(
+        monkeypatch,
+        _FakeFactory([ProviderResponse(
+            text="Response truncated due to token limit.",
+            provider_name="gemini", success=True, metadata={},
+        )]),
+    )
+
+    assert await diag.run_continuation_probe(
+        manager, "gemini", "gemini-2.5-pro", request_id="rid",
+    ) == diag.CONTINUATION_ACCEPTED
+
+
+@pytest.mark.asyncio
+async def test_provider_without_finish_reason_keeps_existing_classification(monkeypatch):
+    diag.reset_state()
+    manager, _ = _manager()
+    _patch_factory(
+        monkeypatch,
+        _FakeFactory([ProviderResponse(text="ok", provider_name="gemini", success=True, metadata={})]),
+    )
+
+    assert await diag.run_continuation_probe(
+        manager, "gemini", "gemini-2.5-pro", request_id="rid",
+    ) == diag.CONTINUATION_ACCEPTED
+
+
+@pytest.mark.asyncio
 async def test_repeated_failure_inside_cooldown_skips_the_probe(monkeypatch, caplog):
     diag.reset_state()
     manager, _ = _manager()

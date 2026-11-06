@@ -479,3 +479,19 @@ continuation contract, which is the new evidence to act on). A repeated
 failure within 30 minutes emits only
 `result=SKIPPED skipped=cooldown` at DEBUG. No provider cooldown, health
 snapshot or candidate pool entry changes as a result.
+
+### 11.10 Generation budget visibility and truncation (follow-up)
+
+Every `PROVIDER_CONTINUATION_DIAGNOSTIC` line now also carries
+`max_tokens=64 temperature=0.0` (from `PROBE_MAX_TOKENS` / `PROBE_TEMPERATURE`,
+which are also the values the copied probe config uses), including the DEBUG
+`result=SKIPPED` lines, so a capped probe is readable from the log alone.
+
+A successful response whose adapter reports an output-token finish reason
+(`length` from the OpenAI-compatible envelope, `MAX_TOKENS` from Gemini) is now
+`CONTINUATION_INCONCLUSIVE category=output_truncated` instead of an acceptance
+or a rejection: the probe's own budget ended the turn, so it cannot settle the
+contract question. Everything else is unchanged — content-filter reasons, empty
+text and providers that expose no finish reason classify exactly as before, and
+truncation is never inferred from response length or from the adapters'
+synthesized "Response truncated due to token limit." sentence.
