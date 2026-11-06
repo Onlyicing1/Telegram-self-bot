@@ -47,6 +47,7 @@ from backend.ai.confirmation import (
     confirmation_request_text,
     is_explicit_confirmation,
 )
+from backend.ai.continuation_diagnostic import schedule_continuation_diagnostic
 from backend.ai.engine.hooks import NOOP_HOOKS, EngineHooks, safe_call
 from backend.ai.engine.metrics import EngineMetrics
 from backend.ai.engine.result import EngineResult
@@ -940,6 +941,15 @@ class Dispatcher:
                     or cont_response.provider_name or "-",
                     fallback_to_model or "-",
                 )
+            # A continuation-only defect (a provider that served the first
+            # round but refuses the assistant-tool-call / tool-result turn)
+            # is invisible to ordinary model availability. The probe is
+            # bounded, single-flight, off the response path, and its result
+            # never feeds routing — this request's outcome is already decided
+            # by cont_response.
+            schedule_continuation_diagnostic(
+                self._provider_manager, cont_response, request_id=rid,
+            )
             if not cont_response.success:
                 failure_type = _provider_failure_type(cont_response)
 

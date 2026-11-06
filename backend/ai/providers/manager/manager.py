@@ -387,9 +387,14 @@ class ProviderManager:
                 meta["provider_matrix"] = matrix
                 return replace(response, metadata=meta)
             total_retries += int((response.metadata or {}).get("ai_retry_count", 0) or 0)
+            failed_category = self._failure_type(response)
+            # The matrix entry carries the normalized category so a consumer
+            # (e.g. the continuation diagnostic) can act on the EXACT pair and
+            # failure kind this routing decision already classified.
             matrix.append({
                 "provider": name, "model": model or "-",
-                "outcome": "failed", "reason": (response.text or "")[:200],
+                "outcome": "failed", "category": failed_category,
+                "reason": (response.text or "")[:200],
             })
             failures.append(
                 f"{name}/{model or '-'}: success=False ({(response.text or '')[:200]})"
@@ -398,7 +403,7 @@ class ProviderManager:
                 self._log_fallback_start(
                     failed_provider=name,
                     failed_model=model or "",
-                    failure_category=self._failure_type(response),
+                    failure_category=failed_category,
                     next_provider=eligible[idx + 1][1],
                     next_model=eligible[idx + 1][2],
                     attempt=idx + 1,

@@ -27,6 +27,47 @@ exercised; **LIMITATION** = deliberately not done / not provable here.
 | Persisted model health across restarts | LIMITATION | in-memory, same as provider health |
 | Model-level health in the Glass/Web UI | LIMITATION (not requested) | — |
 | Live provider reliability of the 600+ model catalog | LIMITATION (untestable here) | — |
+| **Continuation diagnostic**: a continuation failure classified `request`/`tool_call` probes that exact `(provider, model)` with a synthetic assistant-tool-call + tool-response conversation | IMPLEMENTED + TESTED | `continuation_diagnostic.py`, hook in `dispatcher.py` continuation round |
+| Probe uses the same provider config/credential path as production (a separate provider instance from the live config) | IMPLEMENTED + TESTED | `_probe_instance` → `ProviderFactory.create_provider` |
+| Probe never runs a tool, reads owner/Telegram content, or writes history | IMPLEMENTED + TESTED | fixed synthetic messages, `ToolExecutor` untouched |
+| Probe cannot alter provider health, cooldown, quarantine, metrics or candidate eligibility | IMPLEMENTED + TESTED | separate instance, no manager call |
+| ONE probe per `(provider, model)` per 30 min, single-flight, 12 s timeout, never on the response path | IMPLEMENTED + TESTED | monotonic cooldown, `guarded_create_task` |
+| Classification: `CONTINUATION_ACCEPTED` / `CONTINUATION_REJECTED` / `AUTH_ERROR` / `RATE_LIMITED` / `MODEL_NOT_FOUND` / `TIMEOUT` / `UNSUPPORTED` / `UNKNOWN` | IMPLEMENTED + TESTED | `classify_probe_response` |
+| `PROVIDER_CONTINUATION_DIAGNOSTIC` event (id, provider, model, result, category, latency, cooldown/skipped reason) | IMPLEMENTED + TESTED | `continuation_diagnostic._log_event` |
+| Probe result influences routing / auto-repair | LIMITATION (deliberately not done) | diagnostic only |
+| Live confirmation against real Gemini/OpenAI/Groq continuation endpoints | LIMITATION (no live provider here) | — |
+
+## Continuation diagnostic — trigger, safety, tests
+
+**Trigger.** Only a multi-turn continuation round that the router itself
+recorded as `failed` with category `request` or `tool_call` (the pair and
+category come from the manager's own failure matrix). `auth`, `rate_limited`,
+`quota`, `model_not_found`, `timeout`, `network` and `server` never probe — the
+classification is already meaningful and an extra call would only spend quota.
+
+**Safety.** Synthetic fixed conversation only (no owner text, tool arguments,
+tool results, Telegram ids or history); no registered tool and never the
+`ToolExecutor`; a separate provider instance built from the live provider's own
+config (same credential/endpoint, never the production HTTP client); no write
+to health, cooldowns, quarantine, metrics or the candidate pool; one probe per
+pair per 30 min, single-flight, 12 s strict timeout, scheduled with the
+existing `guarded_create_task` — no new scheduler, worker or loop, and the
+user's response path never awaits it.
+
+**Tests.** `tests/test_continuation_diagnostic.py` — 26 focused tests covering
+the trigger, cooldown, independent pairs, in-flight suppression, the
+no-probe categories, accepted/rejected/classification matrix, timeout,
+multiple tool responses preserving the adapter contract, no tool execution, no
+private content, probe-failure isolation, unchanged health/metrics, and
+secret-free logging.
+
+**Status.** IMPLEMENTED + TESTED in this tree; NOT LIVE-VERIFIED (no deployed
+run and no real provider request). Source inspection additionally found that
+`gemini.py` serializes `role: "tool"` messages as `role: "model"` Contents
+(Google requires the `functionResponse` turn to be `user`, and parallel
+responses in ONE Content) — the strongest source-backed candidate for the
+observed Gemini continuation `request` failure. It is NOT changed in this
+diagnostic phase.
 
 ## Remaining work
 
@@ -37,3 +78,9 @@ exercised; **LIMITATION** = deliberately not done / not provable here.
 3. Re-run the Model Tester on a schedule if the AVAILABLE pool is expected to
    track provider catalog changes — the pool is only as fresh as the last run
    (a cached snapshot never arms it).
+4. Read `PROVIDER_CONTINUATION_DIAGNOSTIC` on the next real continuation
+   failure; if it reports `CONTINUATION_REJECTED` for `gemini`, fix the
+   adapter's function-response serialization (role `user`, all responses in
+   ONE Content) in a separate, behaviour-scoped change.
+5. Optionally surface the latest per-pair diagnostic result in the AI
+   diagnostics panel so it does not require reading Render logs.

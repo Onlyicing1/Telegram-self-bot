@@ -1,5 +1,9 @@
 # Implementation Report — Dynamic Test-Verified Model Fallback
 
+> Sections 1–11 record the fallback delivery; §12 records the logging/observability
+> follow-up. **§13 is the current delivered state** (automatic continuation
+> diagnostics).
+
 ## 1. Summary
 
 Production fallback is now driven entirely by live Model Tester evidence: every
@@ -421,3 +425,196 @@ format argument, or the level resolution in `main.py`.
    is reused).
 4. Reading these events still requires the Render log view; no panel or endpoint
    renders them.
+
+---
+
+## 13. Automatic provider continuation diagnostics
+
+### 13.1 What the evidence supported before any change
+
+The Model Tester answers "is this model reachable" with one request:
+`provider_inst.chat([{"role": "user", "content": "ping"}], model=model_id)`
+(`model_tester.py`, its own `ProviderConfig`, `max_tokens=5`). It never sends an
+assistant tool-call turn or a tool result, so it cannot observe the shape the
+dispatcher sends after a tool runs. The five requests in the Render capture all
+started successfully on Gemini and failed **in the continuation**, which is
+exactly the blind spot: an initial round and a continuation round differ only in
+that assistant/tool-result structure.
+
+Source read for this phase: `model_tester.py`, `manager.py`, `health.py`,
+`metrics.py`, `base/contract.py`, `base/exceptions.py`, `gemini.py`,
+`openai_compat.py`, `dispatcher.py`, `factory.py`, and the provider/fallback
+provider tool-boundary and tool-calling tests.
+
+**Verified serialization asymmetry (source + vendor contract).** The dispatcher's
+continuation messages are OpenAI-shaped: assistant `tool_calls`
+(`id`/`type: function`/`function.arguments` as a JSON string) followed by one
+`role: "tool"` message per call carrying `tool_call_id`, `name` and a JSON result
+body (`Dispatcher._build_continuation_messages`). `openai_compat.py` posts that
+array unchanged, which is the documented OpenAI shape. `gemini.py` translates it
+into `contents`: the assistant turn becomes `role: "model"` with
+`functionCall` parts, and **each tool message becomes a separate
+`role: "model"` Content with a `functionResponse` part**. Google's contract
+requires the `functionResponse` turn to be a *client* turn (`role: "user"`, or
+the legacy `"function"`), and requires the responses for parallel calls to be
+returned together in ONE Content, in call order. The adapter therefore emits a
+malformed continuation for any tool-using round on Gemini. That is a
+source-backed, reproducible candidate for "Gemini continuation failure
+classified as `request`" (HTTP 400 request validation) while initial Gemini
+requests succeed — it is NOT proven live from this environment, and it is
+deliberately not changed in this diagnostic phase.
+
+Other observed failures already carry meaningful classifications and are not
+continuation-specific: OpenAI/NaraRouter `rate_limited`, Groq `auth`,
+SambaNova/Cohere/NaraRouter `model_not_found`. The production evidence does not
+establish one single provider defect, and this phase does not claim one.
+
+**Credential/config parity.** Production providers are built by
+`ProviderFactory.create_registry()` from `AI_*`/vendor env keys and handed
+`ProviderConfig` instances; the Model Tester reads the same env source
+(`_get_env`) and builds its own config — same key, different request profile
+(`max_tokens=5`, 8 s timeout, no tools). The diagnostic below reuses the LIVE
+registered provider's own `ProviderConfig`, so it uses the exact credential,
+endpoint and model resolution of the failing request.
+
+**Configured model cannot bypass the pool.** `_candidate_models()` puts the
+provider's configured model first, then every discovery-fed candidate
+(deduplicated, free-first). A configured default is candidate #1, never a
+shortcut around the proven pool.
+
+### 13.2 Exact implementation
+
+New module `backend/ai/continuation_diagnostic.py`:
+
+- `schedule_continuation_diagnostic(manager, response, request_id=…)` reads the
+  manager's own `provider_matrix`, takes the FIRST `failed` entry whose
+  normalized `category` is `request` or `tool_call`, and schedules at most one
+  probe for that exact `(provider, model)`. Nothing qualifies for `auth`,
+  `rate_limited`, `quota`, `model_not_found`, `timeout`, `network`, `server`, or
+  a response with no failed matrix entry.
+- `run_continuation_probe()` builds a **separate** provider instance from
+  `replace(live_provider.config, extra=dict(...))` via the same
+  `ProviderFactory.create_provider()` path and sends the fixed synthetic
+  conversation: one user turn, one assistant turn with TWO OpenAI-format
+  `tool_calls`, two `tool` turns with matching `tool_call_id`/`name` and JSON
+  bodies, plus the same single synthetic tool declaration production sends with
+  a continuation round. Model is passed verbatim as the request's `model`
+  kwarg.
+- `classify_probe_response()` emits exactly one of `CONTINUATION_ACCEPTED`,
+  `CONTINUATION_REJECTED`, `AUTH_ERROR`, `RATE_LIMITED`, `MODEL_NOT_FOUND`,
+  `TIMEOUT`, `UNSUPPORTED`, `UNKNOWN`. A transport success with no text and no
+  tool call is `CONTINUATION_REJECTED` (`empty_response`), never "accepted".
+- Bounds: 30-minute monotonic cooldown per pair (`PROBE_COOLDOWN_SECONDS`),
+  single-flight via a closed set, 12 s strict `asyncio.wait_for`, one existing
+  `guarded_create_task` per probe (no scheduler/worker/loop), and the caller
+  never awaits it.
+- No production side effects: the probe never calls `ProviderManager`, so
+  health, cooldowns, quarantine, metrics and candidate eligibility are
+  untouched; `ToolExecutor`/`ToolRegistry` are never imported or called; no
+  history write; no user/Telegram content.
+
+`ProviderManager` change (one line of metadata): the `failed` matrix entry now
+carries `"category": <normalized failure type>`. This makes the exact failed
+pair and its category available to a consumer without re-deriving either. No
+routing, ordering, cooldown, retry, probe-policy or ownership change.
+
+`Dispatcher` change (one call): after a continuation round's response is
+classified, `schedule_continuation_diagnostic(self._provider_manager,
+cont_response, request_id=rid)` is invoked. It cannot alter the round's result
+and cannot delay the reply.
+
+### 13.3 Exact files changed
+
+| File | Change |
+|---|---|
+| `backend/ai/continuation_diagnostic.py` | NEW — synthetic continuation probe, cooldown/single-flight, classification, `PROVIDER_CONTINUATION_DIAGNOSTIC` |
+| `backend/ai/engine/dispatcher.py` | ONE import + ONE scheduling call in the continuation round |
+| `backend/ai/providers/manager/manager.py` | Failure-matrix entries carry the normalized `category` (+ reuse it for the existing log/trace) |
+| `tests/test_continuation_diagnostic.py` | NEW — 26 focused tests |
+| `ROADMAP.md` | Capability, trigger, safety bounds, tests, status, limitations |
+| `IMPLEMENTATION_REPORT.md` | This section |
+
+No provider adapter, selection/fallback policy, Model Tester, ToolExecutor,
+RuntimeSupervisor, Supabase schema or `DATABASE_ARCHITECTURE.md` change.
+
+### 13.4 Observability
+
+One event per probe, exactly the required fields:
+
+```
+PROVIDER_CONTINUATION_DIAGNOSTIC id=<request id> provider=<name> model=<id> \
+  result=<CLASSIFICATION> category=<normalized category> latency_s=<float> \
+  cooldown_s=1800 skipped=<->
+```
+
+A suppressed probe logs the same event at DEBUG with
+`result=SKIPPED skipped=cooldown|in_flight`. The line carries no key, header,
+tool argument, tool result, owner message or Telegram identifier; the category
+is the provider's own normalized taxonomy value, never an error body. The event
+name is unique to this probe, so it cannot be confused with a production
+provider call (the adapter's own per-request warning may also appear — that is
+the real request the probe made).
+
+### 13.5 Focused test results
+
+`tests/test_continuation_diagnostic.py` → **26 passed** in 0.83 s, covering:
+qualifying failure schedules exactly one probe; repeated failure inside the
+cooldown does not probe again; different `(provider, model)` pairs have
+independent state and each probes for its own model; an in-flight probe is not
+duplicated; `auth`/`rate_limited`/`quota`/`model_not_found` never probe; a
+matrix with no failed entry never probes; accepted and rejected synthetic
+continuations classify correctly; the timeout path; an unregistered provider is
+`UNSUPPORTED`; two tool responses preserve the adapter contract (ids, order,
+JSON-string arguments, tool definitions, verbatim model); no `ToolExecutor` call
+is possible; no user/Telegram content is present; a crashing probe cannot raise
+into the caller; health and metrics snapshots are byte-identical before/after;
+the log carries neither the API key nor an echoed `Bearer` value nor the
+synthetic prompt; and the manager's matrix really carries the category the
+trigger reads.
+
+Focused provider/continuation group (`test_continuation_diagnostic`,
+`test_dynamic_model_fallback`, `test_23_provider_mesh`,
+`test_provider_tool_boundary`, `test_10_tool_calls`, `test_17_providers`,
+`test_ai_fallback_logging`, `test_24_execution_reliability`,
+`test_13_model_selection`, `test_41_reset_cooldown`) → **190 passed**, 19.06 s,
+exit 0. `tests/test_tool_calling_root_cause_fixes.py` named in the brief does
+not exist in this tree (no file by that name; `tests/test_10_tool_calls.py`,
+`tests/test_provider_tool_boundary.py` and `tests/test_tool_schema_contract.py`
+are the tool-contract suites) — it was not created.
+
+### 13.6 Full suite
+
+`.venv/bin/python -m pytest -q` → **7029 passed, 27 skipped, 1 failed** in
+138.60 s. The single failure is
+`tests/test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`,
+which is pre-existing and unrelated (it fails identically on the untouched
+baseline `fa2dfd0`); it was not touched.
+
+### 13.7 Compilation and diff checks
+
+`py_compile` on the new module, `dispatcher.py`, `manager.py` and the new test
+module → exit 0. `git diff --check` → exit 0 (no whitespace errors).
+
+### 13.8 Live verification not performed
+
+- No deployed Render run and no real provider request: whether Gemini actually
+  rejects this continuation shape, and whether the probe reports
+  `CONTINUATION_REJECTED` for it, is NOT verified here.
+- The five-request capture does not record which round each provider failure
+  came from beyond "continuation", nor the response body of Gemini's `request`
+  failure; the serialization defect is source + vendor-contract evidence, not a
+  captured rejection.
+- The probe's own quota cost is real (one small request per pair per 30 min) and
+  is not observable from here.
+
+### 13.9 What the next production request should show
+
+On the next continuation failure, expect one
+`PROVIDER_CONTINUATION_DIAGNOSTIC` line per failing pair naming
+`provider=gemini model=<id>` with either `result=CONTINUATION_REJECTED
+category=request` (serialization/capability defect confirmed for that pair) or
+`result=CONTINUATION_ACCEPTED` (the production failure was request-specific —
+e.g. tool arguments/result size — not the continuation contract). A repeated
+failure within 30 minutes emits only
+`result=SKIPPED skipped=cooldown` at DEBUG. No provider cooldown, health
+snapshot or candidate pool entry changes as a result.
