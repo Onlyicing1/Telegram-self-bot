@@ -316,6 +316,15 @@ class ProviderManager:
                         "AI_PROVIDER_FAILURE provider=%s model=%s category=%s failover=1",
                         name, model or "-", category,
                     )
+                    self._log_fallback_start(
+                        failed_provider=name,
+                        failed_model=model or "",
+                        failure_category=category.lower(),
+                        next_provider=eligible[idx + 1][1],
+                        next_model=eligible[idx + 1][2],
+                        attempt=idx + 1,
+                        pool_size=total,
+                    )
                     task_trace(
                         "provider_fallback", failed_provider=name,
                         failed_model=model or "-", failure_category=category.lower(),
@@ -385,6 +394,16 @@ class ProviderManager:
             failures.append(
                 f"{name}/{model or '-'}: success=False ({(response.text or '')[:200]})"
             )
+            if idx + 1 < len(eligible):
+                self._log_fallback_start(
+                    failed_provider=name,
+                    failed_model=model or "",
+                    failure_category=self._failure_type(response),
+                    next_provider=eligible[idx + 1][1],
+                    next_model=eligible[idx + 1][2],
+                    attempt=idx + 1,
+                    pool_size=total,
+                )
             task_trace(
                 "provider_fallback", failed_provider=name, failed_model=model or "-",
                 failure_category=self._failure_type(response),
@@ -829,6 +848,32 @@ class ProviderManager:
         """Cool down ONE (provider, model) pair, never the provider."""
         self._health.record_model_failure(name, model, category, seconds)
 
+    @staticmethod
+    def _log_fallback_start(
+        *,
+        failed_provider: str,
+        failed_model: str,
+        failure_category: str,
+        next_provider: str,
+        next_model: str,
+        attempt: int,
+        pool_size: int,
+    ) -> None:
+        """Log a fallback transition BEFORE the replacement is attempted.
+
+        A model fallback (same provider, different model) and a provider
+        fallback (different provider) share this ONE event so the two are
+        always distinguishable by ``kind``. A same-model retry never emits it:
+        it happens inside ONE candidate attempt.
+        """
+        logger.info(
+            "AI_FALLBACK_START kind=%s from=%s/%s to=%s/%s reason=%s attempt=%d pool=%d",
+            "model" if next_provider == failed_provider else "provider",
+            failed_provider, failed_model or "-",
+            next_provider, next_model or "-",
+            failure_category or "unknown", attempt, pool_size,
+        )
+
     def _escalate_if_provider_wide(
         self, name: str, model: str, ftype: str, retry_after: float | None = None,
     ) -> None:
@@ -1194,6 +1239,14 @@ class ProviderManager:
             scope = classify_rate_limit_scope(
                 {**meta, "text": response.text or ""}, effective_model
             )
+            # The scope the evidence supports, logged BEFORE the cooldown is
+            # applied: the line that follows (PROVIDER_MODEL_COOLDOWN,
+            # PROVIDER_AMBIGUOUS_429_PROBE or PROVIDER_COOLDOWN) states which
+            # scope was actually used.
+            logger.info(
+                "AI_RATE_LIMIT_CLASSIFIED provider=%s model=%s scope=%s retry_after=%.1fs",
+                name, effective_model or "-", scope, retry_after,
+            )
             if scope == "model" and effective_model:
                 self._mark_model_cooling(name, effective_model, retry_after, ftype)
                 return
@@ -1307,6 +1360,13 @@ class ProviderManager:
         """
         errors = list(failures or [])
         detail = "; ".join(errors) if errors else "no additional provider error information"
+        matrix = list(matrix or [])
+        logger.warning(
+            "AI_CANDIDATES_EXHAUSTED failed=%d skipped=%d error_entries=%d category=all_providers_failed",
+            sum(1 for entry in matrix if entry.get("outcome") == "failed"),
+            sum(1 for entry in matrix if entry.get("outcome") == "skipped"),
+            len(errors),
+        )
         task_trace(
             "provider_fallback_exhausted", providers_tried=len(errors),
             final_category="all_providers_failed", final_error=bound_text(detail, 240),

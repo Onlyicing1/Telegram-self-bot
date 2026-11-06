@@ -927,6 +927,19 @@ class Dispatcher:
                 str(cont_response.metadata.get("fallback_to_model") or "")
                 or fallback_to_model
             )
+            cont_metadata = cont_response.metadata or {}
+            if cont_metadata.get("model_fallback") or cont_metadata.get("fallback"):
+                logger.info(
+                    "AI_CONTINUATION_FALLBACK id=%s round=%d kind=%s from=%s/%s "
+                    "to=%s/%s",
+                    rid or "-", round_num + 2,
+                    "model" if cont_metadata.get("model_fallback") else "provider",
+                    cont_metadata.get("fallback_from") or "-",
+                    cont_metadata.get("fallback_from_model") or "-",
+                    cont_metadata.get("fallback_to")
+                    or cont_response.provider_name or "-",
+                    fallback_to_model or "-",
+                )
             if not cont_response.success:
                 failure_type = _provider_failure_type(cont_response)
 
@@ -1206,6 +1219,26 @@ class Dispatcher:
             warnings=warnings,
             errors=errors,
             metadata=metadata,
+        )
+
+        # The final serving (provider, model) is reported ONLY for a served
+        # response: a failed candidate is itemized by AI_FALLBACK_START /
+        # AI_PROVIDER_FAILURE and is never presented as the answer's model.
+        logger.info(
+            "AI_RESULT id=%s success=%s provider=%s model=%s finish_state=%s "
+            "model_fallback=%s provider_fallback=%s fallback_to_model=%s "
+            "candidates_attempted=%s failure_type=%s latency_s=%.3f",
+            rid or "-",
+            result.success,
+            (result.provider or "-") if result.success else "-",
+            (result.model or "-") if result.success else "-",
+            finish_state,
+            model_fallback_used,
+            fallback_used,
+            fallback_to_model or "-",
+            (result.metadata or {}).get("candidates_attempted", "-"),
+            failure_type or "-",
+            latency,
         )
 
         safe_call(self._hooks, "after_response", result)

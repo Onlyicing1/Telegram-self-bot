@@ -29,6 +29,7 @@ the crash diagnostics module dumps the full crash snapshot.
 import asyncio
 import atexit
 import logging
+import os
 import signal
 import sys
 import traceback
@@ -48,13 +49,46 @@ from backend.runtime.crash_diagnostics import (
     uptime_s,
 )
 
-logging.basicConfig(
-    level=logging.WARNING,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    stream=sys.stdout,
-)
-logging.getLogger("backend").setLevel(logging.INFO)
-logging.getLogger("telethon").setLevel(logging.WARNING)
+_LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+_DEFAULT_APP_LEVEL = logging.INFO
+
+
+def _resolve_level(raw: str, default: int) -> int:
+    """Map a LOG_LEVEL value to a level, returning ``default`` when unusable.
+
+    ``logging.getLevelName`` is the only public name→level lookup; it returns
+    the input unchanged for a name it does not know.
+    """
+    name = (raw or "").strip().upper()
+    if not name:
+        return default
+    level = logging.getLevelName(name)
+    return level if isinstance(level, int) else default
+
+
+def _configure_logging() -> None:
+    """Configure process logging once: application events on stdout.
+
+    ``LOG_LEVEL`` (documented in render.yaml and AGENTS.md) sets the
+    ``backend`` namespace — the one an operator configures — and defaults to
+    INFO. The root logger stays at WARNING so third-party libraries cannot
+    drown the application's own events in the Render stream.
+
+    ``basicConfig`` installs the root handler a single time, so calling this
+    again can never add a second handler or duplicate a record.
+    """
+    logging.basicConfig(
+        level=logging.WARNING,
+        format=_LOG_FORMAT,
+        stream=sys.stdout,
+    )
+    logging.getLogger("backend").setLevel(
+        _resolve_level(os.getenv("LOG_LEVEL", ""), _DEFAULT_APP_LEVEL)
+    )
+    logging.getLogger("telethon").setLevel(logging.WARNING)
+
+
+_configure_logging()
 
 logger = logging.getLogger(__name__)
 

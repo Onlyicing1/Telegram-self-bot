@@ -285,3 +285,139 @@ Committed as one scoped commit on top of the previous feature commit, pushed to
 the connected repository's `main`, then verified with `git fetch`,
 `git rev-parse` and `git merge-base --is-ancestor` against the remote head; the
 working tree was confirmed clean afterwards.
+
+---
+
+## 12. Follow-up — AI model-fallback logging / observability
+
+This section describes a **separate, logging-only follow-up** to §§1–11. It
+changes no fallback behaviour; §§1–11 remain the record of the fallback feature.
+
+### 12.1 Confirmed root cause
+
+The AI and fallback events were **not filtered — they were never generated on
+the path that ran**. `logging.basicConfig(level=WARNING, stream=stdout)` plus
+`getLogger("backend").setLevel(INFO)` puts every `backend.*` logger at INFO with
+propagation on and exactly one root handler, and INFO records emitted from the
+real `manager`, `dispatcher`, `ai_unified` and `tracer` loggers all reach stdout
+(measured, §12.2). The AED records in the capture came through that same path.
+
+What was missing, by source:
+
+1. `task_trace("provider_fallback" | "provider_selection" |
+   "provider_fallback_exhausted", …)` is a **no-op unless a `create_task`
+   request is bound** (`backend/ai/task_trace.py`: `if binding is None: return`),
+   so for ordinary chat traffic the fallback and exhaustion transitions were
+   discarded by design.
+2. `AI_PROVIDER_FAILOVER` was emitted only **after a fallback succeeded**, so a
+   fallback that started and then failed produced no "from → to" record.
+3. The chat activation handler returned silently at every non-match gate at any
+   level, and the Model Tester path
+   (`model_tester._test_one_model` → `provider_inst.chat(...)`) bypasses
+   ProviderManager/Dispatcher entirely with no per-model record of its own.
+4. `LOG_LEVEL` was documented and set in `render.yaml` but read by no code.
+
+### 12.2 Evidence supporting the diagnosis
+
+- Reproduced `main.py`'s exact logging configuration and emitted INFO from
+  `backend.ai.providers.manager.manager`, `backend.ai.engine.dispatcher`,
+  `backend.bot.handlers.ai_unified`, `backend.tracer` and
+  `backend.bot.handlers.anti_edit_delete`: all reached stdout, effective level
+  INFO, `propagate=True`, one root handler.
+- `grep` over `backend/` finds **no** `dictConfig`, `addFilter`, `addHandler`,
+  `logging.disable`, `StreamHandler` or stdout redirection; `backend/main.py` is
+  the only logging configuration in the project.
+- The 2026-11-06 capture contains no `[TRACE]` line, while
+  `[TRACE] AI_TRIGGER_MATCHED` is WARNING-level and emitted before any AI work.
+
+### 12.3 Files changed (logging only)
+
+| File | Change |
+|---|---|
+| `backend/main.py` | `_configure_logging()` + `_resolve_level()`: `LOG_LEVEL` now configures the `backend` namespace (default INFO); root stays WARNING; idempotent, no second handler |
+| `backend/ai/providers/manager/manager.py` | `AI_RATE_LIMIT_CLASSIFIED`, `AI_FALLBACK_START` (model vs provider, before the replacement is attempted), `AI_CANDIDATES_EXHAUSTED` |
+| `backend/ai/providers/manager/health.py` | Cooldown lines now carry the sanitized `category` (`PROVIDER_COOLDOWN`, `PROVIDER_MODEL_COOLDOWN`) |
+| `backend/ai/engine/dispatcher.py` | `AI_RESULT` (final serving provider/model, success only) and `AI_CONTINUATION_FALLBACK` (round + transition) |
+| `backend/bot/handlers/ai_unified.py` | DEBUG `AI_ACTIVATION_SKIPPED reason=…` at the silent activation gates |
+| `backend/ai/model_tester.py` | DEBUG per-model result + one INFO `MODEL_TEST_COMPLETE` summary |
+| `tests/test_ai_fallback_logging.py` | New: 13 observability regression tests |
+| `INVESTIGATION.md`, `IMPLEMENTATION_REPORT.md` | This follow-up section |
+
+No fallback ordering, 429 classification, cooldown value, retry limit, sibling
+probe policy, `MAX_TOOL_ROUNDS`, ToolRegistry/ToolExecutor behaviour, provider
+selection or provider/dispatcher ownership was modified. No new scheduler,
+executor, listener or logging framework; no Supabase, SQL, Render or env change.
+
+### 12.4 Events now observable
+
+| Transition | Record | Level |
+|---|---|---|
+| Request started | `AI_REQUEST_START id= owner=` (pre-existing) | INFO |
+| Candidate selected | `ROUTER_SELECTED provider= model= score=` (pre-existing) | INFO |
+| Attempt started | `AI_PROVIDER_ATTEMPT provider= model= attempt=1` (pre-existing) | INFO |
+| Same-model retry | `AI_PROVIDER_ATTEMPT … attempt=2 reason=transient\|rate_limit_window` (pre-existing, unchanged semantics) | INFO |
+| 429 classified + scope | `AI_RATE_LIMIT_CLASSIFIED provider= model= scope= retry_after=` | INFO |
+| Model cooldown | `PROVIDER_MODEL_COOLDOWN provider= model= category= seconds=` | INFO |
+| Provider-wide cooldown | `PROVIDER_COOLDOWN provider= category= seconds=` | INFO |
+| Model fallback started | `AI_FALLBACK_START kind=model from= to= reason=` | INFO |
+| Provider fallback started | `AI_FALLBACK_START kind=provider from= to= reason=` | INFO |
+| Fallback served | `AI_PROVIDER_FAILOVER … model_fallback=` (pre-existing, success-only) | INFO |
+| Candidate exhausted | `AI_CANDIDATES_EXHAUSTED failed= skipped= error_entries= category=` | WARNING |
+| Final AI result | `AI_RESULT id= success= provider= model= finish_state= model_fallback= provider_fallback= fallback_to_model= candidates_attempted= failure_type=` | INFO |
+| Continuation fallback | `AI_CONTINUATION_FALLBACK id= round= kind= from= to=` | INFO |
+| Model test (diagnostic) | `MODEL_TEST_RESULT …` / `MODEL_TEST_COMPLETE tested= available= …` | DEBUG / INFO |
+| Activation declined | `AI_ACTIVATION_SKIPPED reason=no_trigger_match\|no_prompt_text` | DEBUG |
+
+`AI_RESULT` prints `provider=- model=-` when the request failed, so a failed
+candidate is never readable as the answer's model. Only one record per real
+transition: one `AI_FALLBACK_START` per advance, one `AI_CONTINUATION_FALLBACK`
+only for a round that actually fell back, one `AI_RESULT` per request.
+
+### 12.5 Tests executed and exact results
+
+| Command | Result |
+|---|---|
+| `.venv/bin/python -m pytest tests/test_ai_fallback_logging.py -q` | **13 passed** in 0.72 s |
+| focused: `test_dynamic_model_fallback.py test_17_providers.py test_23_provider_mesh.py test_24_execution_reliability.py test_41_reset_cooldown.py test_13_model_selection.py test_ai_fallback_logging.py` | **144 passed, 3 warnings** in 13.59 s (exit 0) |
+| full suite: `.venv/bin/python -m pytest -q` | **7003 passed, 27 skipped, 1 failed** in 137.07 s |
+| `.venv/bin/python -m compileall -q backend tests` | exit 0 |
+| `git diff --check` | exit 0 (no whitespace errors) |
+
+The single failure is
+`tests/test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`.
+It is **pre-existing**: it fails alone in this tree and fails identically in a
+clean `git worktree` at the untouched baseline `fa2dfd0` (`1 failed, 10 passed`).
+It is unrelated to logging and was not touched.
+
+### 12.6 Fallback behaviour unchanged
+
+The 144-test focused run above is the same provider/fallback suite recorded in
+§6 and §12.5 and passes with no assertion changes: ordering, same-model retry,
+429 scope, model cooldowns, the one-sibling probe, exhaustion and continuation
+behaviour are all identical. Every change in §12.3 is a logging call, a log
+format argument, or the level resolution in `main.py`.
+
+### 12.7 Live verification not performed
+
+- **No deployed Render run and no live provider request.** This environment has
+  no Render shell access and no service log stream, so whether these lines
+  appear in the Render view cannot be claimed — only the next deployed test can
+  answer it.
+- A viewer-side log filter cannot be excluded from source; if the earlier capture
+  was filtered by the reader, that is a viewing artifact this change does not
+  alter.
+- Which AI path the operator's fallback test used (chat activation vs panel
+  Model Tester) is not recorded anywhere; both are now observable.
+
+### 12.8 Remaining limitations
+
+1. `AI_ACTIVATION_SKIPPED` and `MODEL_TEST_RESULT` are DEBUG: at the deployed
+   `LOG_LEVEL=INFO` they stay invisible unless the level is raised, which is
+   deliberate (one line per outgoing message / per tested model).
+2. The root logger deliberately stays at WARNING, so third-party records below
+   WARNING remain invisible even at `LOG_LEVEL=DEBUG`.
+3. Log lines state transitions; they do not add a request-correlation id where
+   one does not already exist (`AI_REQUEST_START`'s `id` is the existing one and
+   is reused).
+4. Reading these events still requires the Render log view; no panel or endpoint
+   renders them.

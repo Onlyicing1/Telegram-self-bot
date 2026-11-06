@@ -714,11 +714,28 @@ async def test_all_models(
         if isinstance(item, dict):
             item.setdefault("tested_at", tested_at)
             results.append(item)
+            # DEBUG keeps a per-model trail without flooding the stream: this
+            # diagnostic path calls the provider DIRECTLY (no ProviderManager),
+            # so its own attempt outcome is the only evidence it produces.
+            logger.debug(
+                "MODEL_TEST_RESULT provider=%s model=%s status=%s "
+                "http_status=%s latency_s=%s error_type=%s",
+                item.get("provider"), item.get("model"), item.get("status"),
+                item.get("http_status"), item.get("latency_s"),
+                item.get("error_type"),
+            )
 
     annotate_is_free(results, complete_models, providers_status)
     _feed_production_candidates(results, complete_models, providers_status)
 
     summary = _build_summary(results, len(discovered_models))
+    logger.info(
+        "MODEL_TEST_COMPLETE tested=%d available=%d unavailable=%d "
+        "not_configured=%d rate_limited=%d timeout=%d",
+        summary.get("tested", 0), summary.get("available", 0),
+        summary.get("unavailable", 0), summary.get("not_configured", 0),
+        summary.get("rate_limited", 0), summary.get("timeout", 0),
+    )
 
     return {
         "success": True,

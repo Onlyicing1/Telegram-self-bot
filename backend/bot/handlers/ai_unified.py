@@ -1042,6 +1042,10 @@ def register(client, owner_id: int, tz_str: str):
                 reply_message = _REPLY_UNFETCHED
 
         if not trigger_matched and not reply_to_ai:
+            # DEBUG only: every outgoing message reaches this handler, so an
+            # INFO line here would drown the Render stream. With LOG_LEVEL=DEBUG
+            # it answers "did the AI path even run for this message?".
+            logger.debug("AI_ACTIVATION_SKIPPED reason=no_trigger_match")
             return
 
         # Determine the actual user message and trigger label
@@ -1077,6 +1081,10 @@ def register(client, owner_id: int, tz_str: str):
 
         # ── Trigger Mode: no reply, must have remaining text ──
         if not user_text:
+            logger.debug(
+                "AI_ACTIVATION_SKIPPED reason=no_prompt_text trigger=%s",
+                trigger_label,
+            )
             return
 
         trace("AI_TRIGGER_MATCHED", trigger=trigger_label, mode="trigger")
