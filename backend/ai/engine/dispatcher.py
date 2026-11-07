@@ -2198,8 +2198,9 @@ class Dispatcher:
         assistant_content = response.text or ""
         assistant_msg: dict[str, Any] = {"role": "assistant", "content": assistant_content}
         if response.tool_calls:
-            assistant_msg["tool_calls"] = [
-                {
+            calls: list[dict[str, Any]] = []
+            for tc in response.tool_calls:
+                call: dict[str, Any] = {
                     "id": tc.get("id", ""),
                     "type": "function",
                     "function": {
@@ -2207,8 +2208,13 @@ class Dispatcher:
                         "arguments": json.dumps(tc.get("arguments", {})),
                     },
                 }
-                for tc in response.tool_calls
-            ]
+                signature = tc.get("thought_signature")
+                if isinstance(signature, str) and signature:
+                    # Provider-owned opaque state travels with the call that
+                    # produced it; adapters that do not understand it drop it.
+                    call["thought_signature"] = signature
+                calls.append(call)
+            assistant_msg["tool_calls"] = calls
         messages.append(assistant_msg)
 
         # EVERY assistant tool call gets exactly one tool response, in order:

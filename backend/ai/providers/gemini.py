@@ -139,6 +139,11 @@ def _to_gemini_schema(value: Any) -> Any:
 class GeminiProvider(BaseProvider):
     PROVIDER_NAME = "gemini"
     PROVIDER_VERSION = "1.0.0"
+    #: Gemini validates the current tool turn: the model's own opaque thought
+    #: signature must come back in the exact functionCall part. A synthetic
+    #: conversation can never carry one, so callers that build their own calls
+    #: (the continuation diagnostic) must not send them here.
+    REQUIRES_NATIVE_TOOL_SIGNATURE = True
 
     def __init__(self, config: ProviderConfig | None = None) -> None:
         if config is None:
@@ -229,7 +234,7 @@ class GeminiProvider(BaseProvider):
                 parts: list[dict[str, Any]] = []
                 if content:
                     parts.append({"text": content})
-                for tc in msg["tool_calls"]:
+                for index, tc in enumerate(msg["tool_calls"]):
                     fn = tc.get("function", {})
                     args_raw = fn.get("arguments", "{}")
                     try:
@@ -244,7 +249,20 @@ class GeminiProvider(BaseProvider):
                         # Gemini echoes this id back on the function call, so
                         # the response can be matched to the exact call.
                         function_call["id"] = call_id
-                    parts.append({"functionCall": function_call})
+                    part: dict[str, Any] = {"functionCall": function_call}
+                    signature = tc.get("thought_signature")
+                    if isinstance(signature, str) and signature:
+                        part["thoughtSignature"] = signature
+                    elif index == 0:
+                        # Never invent one. Only the FIRST call of a turn must
+                        # carry a signature (parallel calls legitimately have
+                        # none), so a first part without one is the real defect.
+                        logger.warning(
+                            "GEMINI_THOUGHT_SIGNATURE_MISSING calls=%d "
+                            "reason=provider_returned_no_signature",
+                            len(msg["tool_calls"]),
+                        )
+                    parts.append(part)
                 contents.append({"role": "model", "parts": parts})
             else:
                 gemini_role = "user" if role == "user" else "model"
@@ -349,7 +367,17 @@ class GeminiProvider(BaseProvider):
                         text_parts.append(p["text"])
                     elif "functionCall" in p:
                         fc = p["functionCall"]
-                        tool_calls.append({"id": fc.get("id", ""), "name": fc.get("name", ""), "arguments": fc.get("args", {})})
+                        call: dict[str, Any] = {
+                            "id": fc.get("id", ""),
+                            "name": fc.get("name", ""),
+                            "arguments": fc.get("args", {}),
+                        }
+                        signature = p.get("thoughtSignature")
+                        if isinstance(signature, str) and signature:
+                            # Opaque reasoning state; Google requires it back in
+                            # THIS part, so it rides with its own call.
+                            call["thought_signature"] = signature
+                        tool_calls.append(call)
                 text = " ".join(text_parts)
                 finish_reason = candidates[0].get("finishReason", "")
             usage = data.get("usageMetadata", {})

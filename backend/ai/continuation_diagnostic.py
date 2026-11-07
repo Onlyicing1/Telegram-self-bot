@@ -179,6 +179,10 @@ def classify_probe_response(response: ProviderResponse) -> tuple[str, str]:
     metadata = response.metadata or {}
     category = str(metadata.get("failure_type") or "").strip().lower()
     status = metadata.get("http_status")
+    if "thought_signature" in str(metadata.get("provider_error_message") or "").lower():
+        # Google rejected the probe's own synthetic call, not the real
+        # continuation: a signature can only come from the model itself.
+        return UNSUPPORTED, "native_thought_signature_required"
     if response.success:
         # A capped answer proves nothing either way, so it must not be read as
         # a rejection — nor as acceptance of a contract the model never
@@ -290,11 +294,17 @@ async def run_continuation_probe(
             category = "provider_unavailable"
         else:
             try:
-                response = await asyncio.wait_for(
-                    _chat(instance, model),
-                    timeout=PROBE_TIMEOUT_SECONDS,
-                )
-                result, category = classify_probe_response(response)
+                if getattr(instance, "REQUIRES_NATIVE_TOOL_SIGNATURE", False):
+                    # The probe's calls are synthetic and carry no model-issued
+                    # signature, so sending them would test the probe, not the
+                    # pair. Report the honest reason instead of a rejection.
+                    result, category = UNSUPPORTED, "native_thought_signature_required"
+                else:
+                    response = await asyncio.wait_for(
+                        _chat(instance, model),
+                        timeout=PROBE_TIMEOUT_SECONDS,
+                    )
+                    result, category = classify_probe_response(response)
             except asyncio.TimeoutError:
                 result, category = TIMEOUT, "timeout"
             except Exception as exc:  # noqa: BLE001
