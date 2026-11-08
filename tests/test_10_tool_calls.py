@@ -617,10 +617,12 @@ async def test_delete_tool_fails_safely_on_out_of_range_count():
     class FakeTelegram:
         client = None
 
+    from backend.services.delete_service import MAX_DELETE_COUNT
+
     ctx = ToolContext(telegram=FakeTelegram(), owner_id=1, tz_str="UTC", extra={"chat_id": -100})
-    result = await DeleteTool(ctx).execute(ctx, {"count": 9999})
+    result = await DeleteTool(ctx).execute(ctx, {"count": MAX_DELETE_COUNT + 1})
     assert result.success is False
-    assert "1 and 500" in result.message
+    assert f"1 and {MAX_DELETE_COUNT}" in result.message
 
 
 def test_default_trigger_word_is_nova():

@@ -510,7 +510,7 @@ async def test_delete_rejects_unscoped_and_oversized_counts():
     assert "explicit count" in results[0].message
 
     results2 = await executor.execute_calls(
-        [{"name": "delete", "arguments": {"count": 501}}],
+        [{"name": "delete", "arguments": {"count": 10**9}}],
         owner_id=OWNER,
         session_id="s",
         context_override=ctx,

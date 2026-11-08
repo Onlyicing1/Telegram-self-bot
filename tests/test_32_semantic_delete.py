@@ -382,8 +382,12 @@ async def test_semantic_delete_history_iteration_is_bounded():
         context(client), {"mode": "filtered", "semantic": {"english_word_count": 2}}
     )
     assert result.success is True
-    # The selector never asks for an unbounded history.
-    assert all(kwargs.get("limit") == 1000 for kwargs in client.iter_kwargs)
+    # The selector never asks for an unbounded history: every scan carries the
+    # operation's documented bound, not a fixed 1000-message ceiling.
+    assert all(
+        kwargs.get("limit") == delete_service._MAX_DELETE_SCAN_MESSAGES
+        for kwargs in client.iter_kwargs
+    )
 
 
 @pytest.mark.asyncio

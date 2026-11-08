@@ -270,22 +270,30 @@ class TestSubmenuStyles:
     @pytest.mark.asyncio
     async def test_delete_submenu_is_primary(self):
         from backend.bot.handlers import delete
+        from backend.helper import symbols as sym
+
         _, _, rows = await delete._del_panel_handler(None, "")
         buttons = self._by_text(rows)
-        # Delete is an ordinary action → blue, never red.
-        assert _bg(buttons["⌫ Delete last N messages"], "primary") is True
-        assert _bg(buttons["⌫ Delete From..."], "primary") is True
+        # Every scope choice is an ordinary action → blue, never green/red; the
+        # destructive confirmation lives on the next step, not here.
+        assert _bg(buttons[sym.label(sym.OP_DELETE, "Last 10")], "primary") is True
+        assert _bg(buttons[sym.label(sym.OP_DELETE, "All my messages")], "primary") is True
+        assert _bg(
+            buttons[sym.label(sym.OP_DELETE, "Delete from a message...")], "primary"
+        ) is True
         assert all(_bg(b, "success") in (None, False) for b in buttons.values())
         assert all(_bg(b, "danger") in (None, False) for b in buttons.values())
 
     @pytest.mark.asyncio
     async def test_delete_confirm_is_green_and_back_is_blue(self):
         from backend.bot.handlers import delete
-        _, _, rows = await delete._delfrom_confirm(123)
+        from backend.helper import symbols as sym
+
+        _, _, rows = await delete._delfrom_confirm(None, 123, forward=False)
         buttons = self._by_text(rows)
         # The explicit confirmation step is green; its Back is blue.
-        assert _bg(buttons["⌫ Confirm Delete"], "success") is True
-        assert _bg(buttons["❮ Back to methods"], "primary") is True
+        assert _bg(buttons[sym.label(sym.OP_DELETE, "Confirm delete")], "success") is True
+        assert _bg(buttons[sym.label(sym.OP_BACK, "Back")], "primary") is True
 
     @pytest.mark.asyncio
     async def test_settings_submenu_is_primary(self):

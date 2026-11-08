@@ -91,7 +91,10 @@ def test_unknown_field_rejected():
 
 def test_invalid_count_rejected():
     import json
-    for bad in (-5, 0, 501, "abc"):
+
+    from backend.services.delete_service import MAX_DELETE_COUNT
+
+    for bad in (-5, 0, MAX_DELETE_COUNT + 1, "abc"):
         text = json.dumps({"action": "delete_messages", "target": "recent_messages", "count": bad})
         r = parse_action_text(text)
         assert r.kind == KIND_INVALID, bad

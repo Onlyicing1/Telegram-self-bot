@@ -28,9 +28,13 @@ from backend.ai.tools.context import ToolContext
 
 logger = logging.getLogger(__name__)
 
-_MAX_CANDIDATES = 100
+#: Bounded windows for the semantic path. The history tool lists at most
+#: _MAX_CANDIDATES real messages per call, and one deletion call re-verifies
+#: at most _MAX_DELETE_IDS of them; both stay bounded, so the model can never
+#: turn one vague request into an unbounded scan or delete.
+_MAX_CANDIDATES = 200
 _DEFAULT_CANDIDATES = 50
-_MAX_DELETE_IDS = 100
+_MAX_DELETE_IDS = 500
 _PREVIEW_LEN = 200
 
 
@@ -118,8 +122,11 @@ class ListRecentMessagesTool(Tool):
             "limit": {
                 "type": "integer",
                 "minimum": 1,
-                "maximum": 100,
-                "description": "Number of recent Telegram messages to list (default 50).",
+                "maximum": _MAX_CANDIDATES,
+                "description": (
+                    f"Number of recent Telegram messages to list "
+                    f"(default {_DEFAULT_CANDIDATES})."
+                ),
             },
         }
 
@@ -255,11 +262,20 @@ class DeleteMessagesByIdsTool(Tool):
         return "ToolResult with deleted/rejected message IDs in data"
 
     async def execute(self, context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
-        ids = _coerce_id_list(arguments.get("message_ids"))
+        raw_ids = arguments.get("message_ids")
+        ids = _coerce_id_list(raw_ids)
+        # Every value the coercion dropped is reported back as REJECTED, so the
+        # model sees malformed or non-positive ids instead of believing they
+        # were deleted.
+        invalid = [
+            value for value in (raw_ids if isinstance(raw_ids, list) else [])
+            if not isinstance(coerce_int(value), int) or coerce_int(value) <= 0
+        ]
         if not ids:
             return ToolResult(
                 success=False,
                 message="No valid message IDs provided. No messages were deleted.",
+                data={"deleted": [], "rejected": invalid},
             )
 
         chat_id = context.extra.get("chat_id") if context.extra else None
@@ -272,19 +288,27 @@ class DeleteMessagesByIdsTool(Tool):
         if client is None:
             return ToolResult(success=False, message="No Telegram client available.")
 
+        valid = ids[:_MAX_DELETE_IDS]
+        # Ids beyond the verified window are reported as rejected, never silently
+        # dropped: the model must see exactly what was NOT acted on.
+        overflow = ids[_MAX_DELETE_IDS:]
         try:
             deleted, rejected = await delete_service.delete_verified_self_messages(
                 client,
                 chat_id,
-                ids[:_MAX_DELETE_IDS],
+                valid,
                 exclude_message_id=None,
             )
         except Exception as exc:
+            partial = getattr(exc, "deleted_ids", []) or []
             return ToolResult(
                 success=False,
-                message=f"Delete failed: {exc}",
-                data={"deleted": [], "rejected": ids},
+                message=(
+                    f"Delete failed after deleting {len(partial)} message(s): {exc}"
+                ),
+                data={"deleted": partial, "rejected": ids},
             )
+        rejected = list(rejected) + invalid + overflow
 
         if not deleted:
             return ToolResult(
