@@ -280,7 +280,8 @@ class ToolExecutor:
             tool_events.emit(
                 "AI_TOOL_CALL_VALIDATION_FAILED",
                 status="rejected", error="missing_name",
-                detail="the tool call carried no name", **trace,
+                detail="the tool call carried no name",
+                level=logging.WARNING, **trace,
             )
             return ToolExecutionResult(
                 tool_name="(unknown)",
@@ -295,7 +296,8 @@ class ToolExecutor:
             detail = call.get("arguments_error") or "arguments could not be parsed"
             tool_events.emit(
                 "AI_TOOL_CALL_VALIDATION_FAILED",
-                status="rejected", error="malformed_arguments", **trace,
+                status="rejected", error="malformed_arguments",
+                level=logging.WARNING, **trace,
             )
             return ToolExecutionResult(
                 tool_name=tool_name,
@@ -308,7 +310,8 @@ class ToolExecutor:
             tool_events.emit(
                 "AI_TOOL_CALL_VALIDATION_FAILED",
                 status="rejected", error="malformed_arguments",
-                detail=f"args_type={type(arguments).__name__}", **trace,
+                detail=f"args_type={type(arguments).__name__}",
+                level=logging.WARNING, **trace,
             )
             return ToolExecutionResult(
                 tool_name=tool_name,
@@ -321,7 +324,8 @@ class ToolExecutor:
         if tool is None:
             tool_events.emit(
                 "AI_TOOL_LOOKUP_FAILED",
-                status="not_registered", error="not_found", **trace,
+                status="not_registered", error="not_found",
+                level=logging.WARNING, **trace,
             )
             return ToolExecutionResult(
                 tool_name=tool_name,
@@ -352,7 +356,9 @@ class ToolExecutor:
         tool_events.emit(
             "AI_TOOL_EXECUTION_STARTED",
             status="started",
-            detail=tool_events.arg_shape(arguments), **trace,
+            detail=tool_events.arg_shape(arguments),
+            level=logging.DEBUG,
+            **trace,
         )
         start = time.perf_counter()
         try:
@@ -392,6 +398,7 @@ class ToolExecutor:
                         f"message_chars={len(tool_result.message or '')} "
                         f"data_keys={len(tool_result.data or {})}"
                     ),
+                    level=logging.DEBUG,
                     **trace,
                 )
             else:
@@ -404,6 +411,7 @@ class ToolExecutor:
                         f"result_type=failure "
                         f"message_chars={len(tool_result.message or '')}"
                     ),
+                    level=logging.WARNING,
                     **trace,
                 )
             return ToolExecutionResult(

@@ -293,7 +293,7 @@ class Dispatcher:
                 )
             except Exception:
                 pass
-            logger.info(
+            logger.debug(
                 "AI_PROVIDER_CALL_START id=%s call=%s attempt=%d",
                 rid or "-", call_label, provider_call_count,
             )
@@ -370,7 +370,9 @@ class Dispatcher:
                 )
             except Exception:
                 pass
-            logger.info(
+            # A failed call is reported by AI_PROVIDER_CALL_FAILURE at WARNING;
+            # this per-call completion is success-path detail.
+            logger.debug(
                 "AI_PROVIDER_CALL_COMPLETE id=%s call=%s provider=%s success=%s elapsed_s=%.3f failure_type=%s fallback=%s",
                 rid or "-",
                 call_label,
@@ -391,12 +393,11 @@ class Dispatcher:
         tools_allowed = bool(getattr(request, "allow_tools", True))
         tool_definitions = self._build_tool_definitions() if tools_allowed else []
         chat_kwargs: dict[str, Any] = {"tools": tool_definitions} if tool_definitions else {}
-        logger.info(
-            "AI_TOOL_AVAILABILITY id=%s enabled=%s tools=%d names=%s",
+        logger.debug(
+            "AI_TOOL_AVAILABILITY id=%s enabled=%s tools=%d",
             rid or "-",
             tools_allowed,
             len(tool_definitions),
-            [d["function"]["name"] for d in tool_definitions],
         )
         tool_events.emit(
             "AI_TOOL_REQUEST_RECEIVED",
@@ -407,6 +408,7 @@ class Dispatcher:
                 f"tools_enabled={tools_allowed} "
                 f"tool_defs={len(tool_definitions)} owner={request.owner_id}"
             ),
+            level=logging.DEBUG,
         )
 
         # ── Stage 1: Conversation Runtime ──
@@ -461,7 +463,7 @@ class Dispatcher:
         # ── Stage 2: Prompt Builder ──
         try:
             _stage("PROMPT_BUILD")
-            logger.info("AI_PROMPT_BUILD id=%s", rid or "-")
+            logger.debug("AI_PROMPT_BUILD id=%s", rid or "-")
             # Tool schemas belong to the prompt's tool section, so they are
             # rendered before the build and handed to the Prompt Builder. The
             # full registry renders ~1.9k tokens; adding them after the build
@@ -491,7 +493,7 @@ class Dispatcher:
         try:
             provider_name = self._provider_manager.get_active_name()
             metadata["stages"].append("provider_manager")
-            logger.info(
+            logger.debug(
                 "AI_EXEC_TRACE request_id=%s stage=provider_selected provider=%s",
                 rid or "-", provider_name,
             )
@@ -526,13 +528,13 @@ class Dispatcher:
                     insert_at,
                     {"role": "system", "content": PROACTIVE_AUTHORIZED_RULES},
                 )
-                logger.info(
+                logger.debug(
                     "AI_EXEC_TRACE id=%s stage=proactive_authorized max_tools=%s",
                     rid or "-", 5,
                 )
             _stage("PROVIDER_REQUEST")
-            logger.info("AI_PROVIDER_REQUEST_START id=%s provider=%s", rid or "-", provider_name)
-            logger.info(
+            logger.debug("AI_PROVIDER_REQUEST_START id=%s provider=%s", rid or "-", provider_name)
+            logger.debug(
                 "AI_EXEC_TRACE request_id=%s stage=provider_request provider=%s",
                 rid or "-", provider_name,
             )
@@ -577,11 +579,11 @@ class Dispatcher:
 
             response = _reject_disabled_tool_calls(response)
             _mark_success("PROVIDER_REQUEST")
-            logger.info(
+            logger.debug(
                 "AI_PROVIDER_RESPONSE id=%s provider=%s success=%s",
                 rid or "-", response.provider_name or provider_name, response.success,
             )
-            logger.info(
+            logger.debug(
                 "AI_EXEC_TRACE request_id=%s stage=provider_response success=%s "
                 "structured=%s tool_calls=%d",
                 rid or "-", response.success, bool(response.tool_calls),
@@ -645,7 +647,7 @@ class Dispatcher:
                         retry_count, int(retry_meta["ai_retry_count"])
                     )
                     response = _reject_disabled_tool_calls(retry_response)
-                    logger.info("AI_PROVIDER_EMPTY_RESPONSE_RETRY_RECOVERED id=%s", rid or "-")
+                    logger.debug("AI_PROVIDER_EMPTY_RESPONSE_RETRY_RECOVERED id=%s", rid or "-")
 
             safe_call(self._hooks, "after_provider", response)
             metadata["stages"].append("provider")
@@ -724,7 +726,7 @@ class Dispatcher:
                     # directly (the nudge produced the structured output).
                     response = recovery_response
                     structured_action = True
-                    logger.info("AI_ACTION_RECOVERY_RETRY_RECOVERED id=%s", rid or "-")
+                    logger.debug("AI_ACTION_RECOVERY_RETRY_RECOVERED id=%s", rid or "-")
                 elif recovery_response.success and recovery_response.text:
                     candidate = self._apply_structured_action(recovery_response, request, rid)
                     if candidate.tool_calls:
@@ -732,7 +734,7 @@ class Dispatcher:
                         provider_usage_reported = provider_usage_reported or recovery_usage_reported
                         response = candidate
                         structured_action = True
-                        logger.info("AI_ACTION_RECOVERY_RETRY_RECOVERED id=%s", rid or "-")
+                        logger.debug("AI_ACTION_RECOVERY_RETRY_RECOVERED id=%s", rid or "-")
                     elif candidate.metadata.get("ai_action"):
                         # A clarify/invalid/unsupported action is a real
                         # deterministic outcome — prefer it over raw prose.
@@ -793,6 +795,7 @@ class Dispatcher:
                     model=self._response_model(response, request),
                     status="no_tool_calls",
                     detail=f"text_chars={len(response.text or '')}",
+                    level=logging.DEBUG,
                 )
                 break
             if not self._tool_executor:
@@ -830,6 +833,7 @@ class Dispatcher:
                         f"count={len(response.tool_calls)} "
                         f"tools={','.join(tool_events.bounded(n, 40) for n in call_names[:8])}"
                     ),
+                    level=logging.DEBUG,
                 )
                 _stage("TOOL_EXECUTION")
                 per_request_ctx = self._build_tool_context(
@@ -867,6 +871,10 @@ class Dispatcher:
                         elapsed_ms=er.latency_ms,
                         error=tool_events.error_class(er.error),
                         detail=f"index={index + 1} message_chars={len(er.message or '')}",
+                        level=(
+                            logging.DEBUG if er.success and not er.needs_confirmation
+                            else logging.WARNING
+                        ),
                     )
                     result_dict = er.as_dict()
                     if er.tool_name == "web_search" and isinstance(er.data, dict):
@@ -937,7 +945,7 @@ class Dispatcher:
                     # a hard-coded task-only subset.
                     verbatim_read_pending = self._summarize_tool_results(all_tool_results)
                     response = replace(response, tool_calls=[], text="")
-                    logger.info(
+                    logger.debug(
                         "AI_EXEC_TRACE id=%s stage=verbatim_tool_result_deferred tools=%s",
                         rid or "-", [er.tool_name for er in exec_results],
                     )
@@ -963,7 +971,7 @@ class Dispatcher:
             continuation_round = round_num + 2
             try:
                 _stage("PROVIDER_REQUEST")
-                logger.info("AI_PROVIDER_REQUEST_START id=%s round=%d", rid or "-", continuation_round)
+                logger.debug("AI_PROVIDER_REQUEST_START id=%s round=%d", rid or "-", continuation_round)
                 tool_events.emit(
                     "AI_TOOL_CONTINUATION_STARTED",
                     request_id=rid,
@@ -972,6 +980,7 @@ class Dispatcher:
                     model=model_label,
                     status="started",
                     detail=f"tools_executed={len(exec_results)}",
+                    level=logging.DEBUG,
                 )
                 cont_response: ProviderResponse = await _provider_chat(
                     continuation_messages,
@@ -979,7 +988,7 @@ class Dispatcher:
                     **chat_kwargs,
                 )
                 _mark_success("PROVIDER_REQUEST")
-                logger.info(
+                logger.debug(
                     "AI_PROVIDER_RESPONSE id=%s round=%d success=%s",
                     rid or "-", continuation_round, cont_response.success,
                 )
@@ -997,6 +1006,9 @@ class Dispatcher:
                         )
                     ),
                     detail=f"tool_calls={len(cont_response.tool_calls or [])}",
+                    level=(
+                        logging.DEBUG if cont_response.success else logging.WARNING
+                    ),
                 )
                 safe_call(self._hooks, "after_provider", cont_response)
                 metadata["stages"].append(f"provider_continuation_{round_num + 1}")
@@ -1064,7 +1076,7 @@ class Dispatcher:
                     response = replace(
                         cont_response, tool_calls=[], text=verbatim_read_pending
                     )
-                    logger.info(
+                    logger.debug(
                         "AI_EXEC_TRACE id=%s stage=verbatim_tool_result_delivered",
                         rid or "-",
                     )
@@ -1165,6 +1177,9 @@ class Dispatcher:
                             elapsed_ms=er.latency_ms,
                             error=tool_events.error_class(er.error),
                             detail="at_round_limit=True",
+                            level=(
+                                logging.DEBUG if er.success else logging.WARNING
+                            ),
                         )
                     metadata["tool_results"] = all_tool_results
                     metadata["stages"].append("pending_tool_execution_at_limit")
@@ -1222,7 +1237,7 @@ class Dispatcher:
                         rid or "-", salvage_executed, exc,
                     )
 
-        logger.info(
+        logger.debug(
             "AI_TOOL_LOOP_END id=%s rounds_executed=%d limit=%d disposition=%s",
             rid or "-", tool_rounds_executed, MAX_TOOL_ROUNDS,
             (
@@ -1719,7 +1734,7 @@ class Dispatcher:
             # "This request never entered the media path" must be a POSITIVE
             # trace — an absent trace is not evidence. Only classifier labels
             # travel here: never a chat id, a message id or any content.
-            logger.info(
+            logger.debug(
                 "AI_EXEC_TRACE request_id=%s stage=media_route_skipped "
                 "replied_media=%s request_media=%s",
                 rid or "-", replied_media, request_media,
@@ -1752,7 +1767,7 @@ class Dispatcher:
                 await status_callback(f"{sym.MEDIA_DOCUMENT} Reading media...")
             except Exception as exc:
                 logger.debug("Dispatcher: media status callback failed: %s", exc)
-        logger.info(
+        logger.debug(
             "AI_EXEC_TRACE request_id=%s stage=media_request target=%s "
             "replied_media=%s request_media=%s",
             rid or "-",
@@ -1820,7 +1835,7 @@ class Dispatcher:
         except Exception:  # noqa: BLE001
             pass
         metadata["media_status"] = answer.status
-        logger.info(
+        logger.debug(
             "AI_EXEC_TRACE request_id=%s stage=media_completed status=%s chars=%d",
             rid or "-", answer.status or "-", len(answer.text or ""),
         )
@@ -1860,7 +1875,7 @@ class Dispatcher:
         # Same shape as the provider structured-action path so diagnostics
         # and tests read a consistent ai_action object.
         meta["ai_action"] = {"action": action, "kind": kind, "target": target}
-        logger.info(
+        logger.debug(
             "AI_EXEC_TRACE request_id=%s stage=telegram_response success=%s",
             rid or "-", success,
         )
@@ -1915,7 +1930,7 @@ class Dispatcher:
         if not text:
             return response
 
-        logger.info("AI_ACTION_PARSE_START id=%s", rid or "-")
+        logger.debug("AI_ACTION_PARSE_START id=%s", rid or "-")
 
         # The MODEL's structured output is the only input here. There is no
         # deterministic pre-pass over the owner's message: local code validates
@@ -1923,13 +1938,13 @@ class Dispatcher:
         result = parse_action_text(text)
 
         if result.kind == "conversational":
-            logger.info(
+            logger.debug(
                 "AI_ACTION_PARSE_RESULT id=%s action=none reason=no_action "
                 "text_len=%d has_json=%s",
                 rid or "-", len(text), "{" in text,
             )
             return response
-        logger.info(
+        logger.debug(
             "AI_ACTION_PARSE_RESULT id=%s action=%s count=%s",
             rid or "-",
             result.action or result.kind,
@@ -1942,7 +1957,7 @@ class Dispatcher:
         meta["ai_action_target"] = result.target
 
         if result.kind == "clarify":
-            logger.info("AI_ACTION_VALIDATION id=%s result=clarify", rid or "-")
+            logger.debug("AI_ACTION_VALIDATION id=%s result=clarify", rid or "-")
             message = result.reason or "Could you clarify what you'd like me to do?"
             return replace(response, text=message, metadata=meta)
 
@@ -1955,6 +1970,7 @@ class Dispatcher:
                 status="rejected",
                 error=tool_events.error_class(result.error),
                 detail="structured action rejected by local validation",
+                level=logging.WARNING,
             )
             return replace(response, text=f"{sym.STATE_FAILED} {result.error}", metadata=meta)
 
@@ -1966,11 +1982,12 @@ class Dispatcher:
                 tool=str(result.action or ""),
                 status="unsupported",
                 error="unsupported_action",
+                level=logging.WARNING,
             )
             return replace(response, text=f"{sym.STATE_FAILED} Unsupported action: {result.action}", metadata=meta)
 
-        logger.info("AI_ACTION_VALIDATION id=%s result=ok action=%s", rid or "-", result.action)
-        logger.info(
+        logger.debug("AI_ACTION_VALIDATION id=%s result=ok action=%s", rid or "-", result.action)
+        logger.debug(
             "AI_TARGET_RESOLUTION id=%s action=%s target=%s tools=%s",
             rid or "-", result.action, result.target,
             [tc.get("name") for tc in result.tool_calls],

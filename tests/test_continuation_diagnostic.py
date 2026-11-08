@@ -251,7 +251,8 @@ async def test_event_reports_probe_generation_settings(monkeypatch, caplog):
     diag.reset_state()
     manager, _ = _manager()
     _patch_factory(monkeypatch, _FakeFactory())
-    caplog.set_level(logging.INFO, logger=diag.logger.name)
+    # An accepted probe is routine detail now: DEBUG carries it.
+    caplog.set_level(logging.DEBUG, logger=diag.logger.name)
 
     await diag.run_continuation_probe(manager, "gemini", "gemini-2.5-pro", request_id="rid")
 
@@ -303,7 +304,8 @@ async def test_output_token_truncation_is_inconclusive(monkeypatch, caplog, fini
             metadata={"finish_reason": finish_reason},
         )]),
     )
-    caplog.set_level(logging.INFO, logger=diag.logger.name)
+    # An inconclusive probe is not an actionable failure: DEBUG carries it.
+    caplog.set_level(logging.DEBUG, logger=diag.logger.name)
 
     result = await diag.run_continuation_probe(
         manager, "gemini", "gemini-2.5-pro", request_id="rid",

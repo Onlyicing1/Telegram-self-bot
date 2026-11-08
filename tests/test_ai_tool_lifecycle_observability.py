@@ -104,7 +104,7 @@ def _records(caplog, event: str) -> list[logging.LogRecord]:
 
 @pytest.mark.asyncio
 async def test_successful_execution_emits_correlated_start_and_success(caplog):
-    caplog.set_level(logging.DEBUG)
+    caplog.set_level(logging.DEBUG, logger="backend")
     tool = StubTool()
     executor = _executor(tool)
 
@@ -129,13 +129,16 @@ async def test_successful_execution_emits_correlated_start_and_success(caplog):
         assert "model=stub-model" in line
     assert "status=started" in started[0]
     assert "status=success" in succeeded[0]
+    # Routine success-path lifecycle detail is DEBUG-only.
+    assert _records(caplog, "AI_TOOL_EXECUTION_STARTED")[0].levelno == logging.DEBUG
+    assert _records(caplog, "AI_TOOL_EXECUTION_SUCCEEDED")[0].levelno == logging.DEBUG
     assert "elapsed_ms=" in succeeded[0]
     assert "result_type=success" in succeeded[0]
 
 
 @pytest.mark.asyncio
 async def test_unsuccessful_tool_result_emits_failure_event(caplog):
-    caplog.set_level(logging.DEBUG)
+    caplog.set_level(logging.DEBUG, logger="backend")
     tool = StubTool(result=ToolResult(success=False, message="nothing matched"))
     executor = _executor(tool)
 
@@ -153,7 +156,7 @@ async def test_unsuccessful_tool_result_emits_failure_event(caplog):
 
 @pytest.mark.asyncio
 async def test_timeout_emits_warning_timeout_event(caplog):
-    caplog.set_level(logging.DEBUG)
+    caplog.set_level(logging.DEBUG, logger="backend")
     tool = StubTool(delay=0.2, timeout_seconds=0.01)
     executor = _executor(tool)
 
@@ -171,7 +174,7 @@ async def test_timeout_emits_warning_timeout_event(caplog):
 
 @pytest.mark.asyncio
 async def test_unexpected_exception_emits_sanitized_failure(caplog):
-    caplog.set_level(logging.DEBUG)
+    caplog.set_level(logging.DEBUG, logger="backend")
     tool = StubTool(raises=ValueError(SECRET_RESULT))
     executor = _executor(tool)
 
@@ -190,7 +193,7 @@ async def test_unexpected_exception_emits_sanitized_failure(caplog):
 
 @pytest.mark.asyncio
 async def test_unknown_tool_emits_lookup_failure_and_never_executes(caplog):
-    caplog.set_level(logging.DEBUG)
+    caplog.set_level(logging.DEBUG, logger="backend")
     tool = StubTool()
     executor = _executor(tool)
 
@@ -209,7 +212,7 @@ async def test_unknown_tool_emits_lookup_failure_and_never_executes(caplog):
 
 @pytest.mark.asyncio
 async def test_malformed_arguments_emit_validation_failure(caplog):
-    caplog.set_level(logging.DEBUG)
+    caplog.set_level(logging.DEBUG, logger="backend")
     tool = StubTool()
     executor = _executor(tool)
 
@@ -237,7 +240,7 @@ async def test_malformed_arguments_emit_validation_failure(caplog):
 
 @pytest.mark.asyncio
 async def test_confirmation_required_is_distinguishable_from_execution(caplog):
-    caplog.set_level(logging.DEBUG)
+    caplog.set_level(logging.DEBUG, logger="backend")
     tool = StubTool(level=PermissionLevel.ADMIN_ONLY)
     executor = _executor(tool)
 
@@ -267,7 +270,7 @@ async def test_confirmation_required_is_distinguishable_from_execution(caplog):
 
 @pytest.mark.asyncio
 async def test_argument_values_and_result_content_never_reach_the_log(caplog):
-    caplog.set_level(logging.DEBUG)
+    caplog.set_level(logging.DEBUG, logger="backend")
     tool = StubTool(
         result=ToolResult(success=True, message=SECRET_RESULT, data={"blob": SECRET_RESULT})
     )
@@ -298,7 +301,7 @@ async def test_argument_values_and_result_content_never_reach_the_log(caplog):
 
 @pytest.mark.asyncio
 async def test_multiple_tool_calls_are_correlated_individually(caplog):
-    caplog.set_level(logging.DEBUG)
+    caplog.set_level(logging.DEBUG, logger="backend")
     tool = StubTool()
     executor = _executor(tool)
 
@@ -369,7 +372,7 @@ def _request() -> AIRequest:
 
 @pytest.mark.asyncio
 async def test_provider_response_without_tool_calls_emits_empty_event(caplog):
-    caplog.set_level(logging.DEBUG)
+    caplog.set_level(logging.DEBUG, logger="backend")
     response = ProviderResponse(
         text="plain answer",
         provider_name="stubprov",
@@ -390,8 +393,86 @@ async def test_provider_response_without_tool_calls_emits_empty_event(caplog):
 
 
 @pytest.mark.asyncio
+async def test_routine_success_path_is_debug_while_ai_result_stays_info(caplog):
+    """The request-level summary is the ONLY INFO record of a normal request."""
+    caplog.set_level(logging.INFO)
+    first = ProviderResponse(
+        text="",
+        provider_name="stubprov",
+        success=True,
+        tool_calls=[{"id": "c1", "name": "probe", "arguments": {"secret": SECRET_ARG}}],
+        metadata={"finish_reason": "tool_calls", "model": "stub-model"},
+    )
+    final = ProviderResponse(
+        text="done",
+        provider_name="stubprov",
+        success=True,
+        metadata={"finish_reason": "stop", "model": "stub-model"},
+    )
+    dispatcher = _dispatcher([first, final], _executor(StubTool()))
+
+    result = await dispatcher.dispatch(_request())
+
+    assert result.success is True
+    for event in (
+        "AI_TOOL_REQUEST_RECEIVED",
+        "AI_TOOL_AVAILABILITY",
+        "AI_PROMPT_BUILD",
+        "AI_PROVIDER_CALL_START",
+        "AI_PROVIDER_CALL_COMPLETE",
+        "AI_PROVIDER_REQUEST_START",
+        "AI_PROVIDER_RESPONSE",
+        "AI_TOOL_CALLS_RECEIVED",
+        "AI_TOOL_EXECUTION_STARTED",
+        "AI_TOOL_EXECUTION_SUCCEEDED",
+        "AI_TOOL_RESULT_RETURNED",
+        "AI_TOOL_CONTINUATION_STARTED",
+        "AI_TOOL_CONTINUATION_COMPLETED",
+        "AI_TOOL_LOOP_END",
+    ):
+        assert _lines(caplog, event) == [], event
+    summary = _lines(caplog, "AI_RESULT")
+    assert len(summary) == 1 and "success=True" in summary[0]
+    assert SECRET_ARG not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_tool_and_provider_failures_stay_visible_at_info(caplog):
+    """Downgrading success-path detail must not hide a real failure."""
+    caplog.set_level(logging.INFO)
+    failed_tool = StubTool(result=ToolResult(success=False, message="nothing matched"))
+    executor = _executor(failed_tool)
+
+    await executor.execute_calls(
+        [{"id": "c1", "name": "probe", "arguments": {}}], owner_id=1, session_id="s"
+    )
+
+    failures = _records(caplog, "AI_TOOL_EXECUTION_FAILED")
+    assert len(failures) == 1
+    assert failures[0].levelno == logging.WARNING
+    assert "status=failed" in failures[0].getMessage()
+
+    caplog.clear()
+    provider_failure = ProviderResponse(
+        text="",
+        provider_name="stubprov",
+        success=False,
+        metadata={"failure_type": "request", "finish_reason": ""},
+    )
+    dispatcher = _dispatcher([provider_failure], _executor(StubTool()))
+
+    result = await dispatcher.dispatch(_request())
+
+    assert result.success is False
+    summary = _lines(caplog, "AI_RESULT")
+    assert len(summary) == 1 and "success=False" in summary[0]
+    category = _records(caplog, "AI_PROVIDER_FAILURE_CATEGORY")
+    assert category and category[0].levelno == logging.WARNING
+
+
+@pytest.mark.asyncio
 async def test_tool_lifecycle_and_continuation_share_one_request_id(caplog):
-    caplog.set_level(logging.DEBUG)
+    caplog.set_level(logging.DEBUG, logger="backend")
     first = ProviderResponse(
         text="",
         provider_name="stubprov",
@@ -429,5 +510,13 @@ async def test_tool_lifecycle_and_continuation_share_one_request_id(caplog):
     assert "round=2" in cont_started[0]
     assert "tool_calls=0" in cont_done[0]
     assert SECRET_ARG not in caplog.text
+    for record in (
+        _records(caplog, "AI_TOOL_CALLS_RECEIVED")
+        + _records(caplog, "AI_TOOL_EXECUTION_STARTED")
+        + _records(caplog, "AI_TOOL_RESULT_RETURNED")
+        + _records(caplog, "AI_TOOL_CONTINUATION_STARTED")
+        + _records(caplog, "AI_TOOL_CONTINUATION_COMPLETED")
+    ):
+        assert record.levelno == logging.DEBUG, record.getMessage()
     # The request-received event of the same request is correlated too.
     assert f"id={RID}" in _lines(caplog, "AI_TOOL_REQUEST_RECEIVED")[0]

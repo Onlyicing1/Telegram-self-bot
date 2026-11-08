@@ -326,6 +326,8 @@ async def run_continuation_probe(
         result, category = UNKNOWN, "probe_unavailable"
     finally:
         _in_flight.discard(key)
+        # An accepted / unanswerable / expected classification is routine
+        # detail; only an actionable failure belongs at WARNING.
         _log_event(
             request_id=request_id,
             provider=provider_name,
@@ -333,6 +335,14 @@ async def run_continuation_probe(
             result=result,
             category=category,
             latency=round(time.perf_counter() - started, 3),
+            level=(
+                logging.DEBUG
+                if result in {
+                    CONTINUATION_ACCEPTED, CONTINUATION_INCONCLUSIVE,
+                    UNSUPPORTED, SKIPPED,
+                }
+                else logging.WARNING
+            ),
         )
     return result
 

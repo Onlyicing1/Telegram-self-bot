@@ -1101,7 +1101,8 @@ async def test_a_successful_transcription_traces_its_own_completion(caplog):
     client = _voice_client()
     dispatcher, _ = _dispatcher(_manager(provider), client, fail_prompt_build=True)
 
-    with caplog.at_level(logging.INFO):
+    # Routine media success traces are DEBUG; a media FAILURE stays WARNING.
+    with caplog.at_level(logging.DEBUG, logger="backend"):
         result = await dispatcher.dispatch(
             _request(reply_context=_reply_context(media_type="Voice"))
         )
@@ -1121,7 +1122,8 @@ async def test_a_request_that_never_enters_the_media_path_says_so(caplog):
     provider = _ScriptedProvider("normal answer")
     dispatcher, _ = _dispatcher(_manager(provider), _TrapClient())
 
-    with caplog.at_level(logging.INFO):
+    # "This request never entered the media path" is routine detail at DEBUG.
+    with caplog.at_level(logging.DEBUG, logger="backend"):
         result = await dispatcher.dispatch(_request())
 
     assert result.success is True

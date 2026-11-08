@@ -100,6 +100,19 @@ def _no_retry_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(manager_module, "_RETRY_BACKOFF_SECONDS", 0.0)
 
 
+@pytest.fixture(autouse=True)
+def _restore_backend_log_level():
+    """``_configure_logging()`` deliberately sets the namespace level.
+
+    That is process-wide state, so leaving it behind would silently drop
+    DEBUG records asserted by later tests in the same run.
+    """
+    namespace = logging.getLogger("backend")
+    saved = namespace.level
+    yield
+    namespace.setLevel(saved)
+
+
 # ── ProviderManager events ──
 
 

@@ -446,7 +446,8 @@ async def test_gemini_probe_is_unsupported_not_rejected(monkeypatch, caplog):
     diag.reset_state()
     factory = _ProbeFactory()
     monkeypatch.setattr(diag, "ProviderFactory", factory)
-    caplog.set_level(logging.INFO, logger=diag.logger.name)
+    # An UNSUPPORTED probe is routine detail now: DEBUG carries it.
+    caplog.set_level(logging.DEBUG, logger="backend")
 
     result = await diag.run_continuation_probe(
         _gemini_manager(), "gemini", "gemini-2.5-pro", request_id="rid",
