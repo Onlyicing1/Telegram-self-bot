@@ -55,6 +55,12 @@ class FakeClient:
         self.iter_error_at = iter_error_at
         self.batch_delay = batch_delay
         self.fail_on_batch = fail_on_batch
+        self.edit_delay = 0.0
+        self.fail_edits = False
+        self.edits_in_flight = 0
+        self.max_concurrent_edits = 0
+        self.fetch_sizes: list[int] = []
+        self.missing_on_fetch: set[int] = set()
 
     async def iter_messages(self, chat_id, **kwargs):
         limit = kwargs.get("limit")
@@ -78,7 +84,11 @@ class FakeClient:
 
     async def get_messages(self, chat_id, ids):
         if isinstance(ids, (list, tuple)):
-            return [self.messages.get(mid) for mid in ids]
+            self.fetch_sizes.append(len(ids))
+            return [
+                None if mid in self.missing_on_fetch else self.messages.get(mid)
+                for mid in ids
+            ]
         return self.messages.get(ids)
 
     async def delete_messages(self, chat_id, ids):
@@ -93,7 +103,16 @@ class FakeClient:
         self.deleted.extend(batch)
 
     async def edit_message(self, chat_id, message_id, text, **kwargs):
-        self.edits.append((chat_id, message_id, text))
+        self.edits_in_flight += 1
+        self.max_concurrent_edits = max(self.max_concurrent_edits, self.edits_in_flight)
+        try:
+            if self.edit_delay:
+                await asyncio.sleep(self.edit_delay)
+            if self.fail_edits:
+                raise RuntimeError("panel edit refused")
+            self.edits.append((chat_id, message_id, text))
+        finally:
+            self.edits_in_flight -= 1
 
 
 class FakeEvent:
@@ -184,7 +203,8 @@ async def test_history_failure_after_valid_ids_still_deletes_them(monkeypatch):
     assert sorted(client.deleted, reverse=True) == list(range(40, 15, -1))
     assert len(client.deleted) == 25
     assert "did not finish" in body
-    assert "deleted 25" in body
+    assert "Deleted: 25" in body
+    assert "Rejected: 0" in body
     assert "Partial result" in body
 
 
@@ -199,7 +219,7 @@ async def test_failure_before_any_valid_id_deletes_nothing(monkeypatch):
     assert client.batches == []
     assert client.deleted == []
     assert "did not finish" in body
-    assert "deleted 0" in body
+    assert "Deleted: 0" in body
 
 
 # ── 5/6. the documented bounds are enforced and reported ────────────────────
@@ -245,7 +265,7 @@ async def test_deadline_mid_deletion_keeps_completed_batch_counts(monkeypatch):
     assert 0 < len(client.deleted) < 900
     assert len(client.batches) < 9
     assert "Partial result" in body
-    assert f"deleted {len(client.deleted)}" in body
+    assert f"Deleted: {len(client.deleted):,}" in body
 
 
 @pytest.mark.asyncio
@@ -305,10 +325,237 @@ async def test_long_operation_paints_progress_and_an_accurate_result(monkeypatch
         monkeypatch, [Message(i) for i in range(1, 121)], batch_delay=0.01,
     )
 
-    _title, body, _buttons = await delete_ui._del_panel_handler(FakeEvent(), "allexec")
+    title, body, _buttons = await delete_ui._del_panel_handler(FakeEvent(), "allexec")
 
     progress_texts = [text for _chat, _msg, text in client.edits]
-    assert any("Working" in text and "scanned" in text for text in progress_texts)
-    assert any("of yours verified" in text for text in progress_texts)
-    assert "Deleted 120" in body
-    assert "Completed" in body
+    assert any("Scanning chat" in text and "Scanned: 5 messages" in text
+               for text in progress_texts)
+    assert any("Processing 0%" in text and "Deleted: 0 / 120" in text
+               for text in progress_texts)
+    assert "Deleted: 120" in body
+    assert title == "Delete — Completed"
+
+
+# ── 12+. large chat: capped counters, a real bar, and no edit spam ─────────
+
+
+def _scan_counts(texts: list[str]) -> list[int]:
+    return [
+        int(text.split("Scanned: ")[1].split(" messages")[0].replace(",", ""))
+        for text in texts
+        if "Scanned: " in text
+    ]
+
+
+@pytest.mark.asyncio
+async def test_ten_thousand_message_chat_paints_real_scan_counters(monkeypatch):
+    monkeypatch.setattr(delete_ui, "_PROGRESS_PAINT_INTERVAL", 0.0)
+    monkeypatch.setattr(delete_service, "_DELETE_PROGRESS_EVERY", 1000)
+    client = install(monkeypatch, [Message(i) for i in range(1, 10001)])
+
+    title, body, _buttons = await delete_ui._del_panel_handler(FakeEvent(), "allexec")
+
+    scanning = [text for _c, _m, text in client.edits if "Scanning chat" in text]
+    counts = _scan_counts(scanning)
+    assert len(counts) >= 5          # painted WHILE scanning, not only at the end
+    assert counts[0] == 0
+    assert counts == sorted(counts)
+    assert counts[-1] == 10000
+    assert "%" not in "".join(scanning)  # never a fabricated scan percentage
+    assert "Delete — All My Messages" in scanning[0]
+    assert "Scanned: 10,000" in body
+    assert "Found: 10,000" in body
+    assert "Deleted: 10,000" in body
+    assert "Rejected: 0" in body
+    assert title == "Delete — Completed"
+    assert "All selected messages were processed." in body
+
+
+@pytest.mark.asyncio
+async def test_progress_bar_starts_empty_and_fills_only_on_resolved_work(monkeypatch):
+    monkeypatch.setattr(delete_ui, "_PROGRESS_PAINT_INTERVAL", 0.0)
+    client = install(monkeypatch, [Message(i) for i in range(1, 1001)])
+
+    _title, body, _buttons = await delete_ui._del_panel_handler(FakeEvent(), "allexec")
+
+    deleting = [text for _c, _m, text in client.edits if "Processing " in text]
+    percentages = [int(t.split("Processing ")[1].split("%")[0]) for t in deleting]
+    assert percentages[0] == 0
+    assert percentages == sorted(percentages)
+    assert percentages[-1] == 100
+    assert "▱▱▱▱▱" in deleting[0]
+    assert "Deleted: 0 / 1,000" in deleting[0]
+    assert "▰▰▰▰▰" in body
+
+
+@pytest.mark.asyncio
+async def test_ownership_rejections_are_counted_exactly_once(monkeypatch):
+    monkeypatch.setattr(delete_ui, "_PROGRESS_PAINT_INTERVAL", 60.0)
+    client = install(monkeypatch, [Message(i) for i in range(1, 301)])
+    # Messages that vanish between selection and the ownership fetch are
+    # rejections the chokepoint discovers — counted once, never twice.
+    client.missing_on_fetch = set(range(251, 301))
+
+    title, body, _buttons = await delete_ui._del_panel_handler(FakeEvent(), "allexec")
+
+    assert "Found: 300" in body
+    assert "Deleted: 250" in body
+    assert "Rejected: 50" in body
+    assert "Rejected: 100" not in body
+    assert title == "Delete — Completed"
+    assert "All selected messages were processed." in body
+
+
+@pytest.mark.asyncio
+async def test_telegram_delete_failure_is_counted_once(monkeypatch):
+    monkeypatch.setattr(delete_ui, "_PROGRESS_PAINT_INTERVAL", 60.0)
+    client = install(monkeypatch, [Message(i) for i in range(1, 301)])
+    client.fail_on_batch = 2
+
+    title, body, _buttons = await delete_ui._del_panel_handler(FakeEvent(), "allexec")
+
+    assert "Deleted: 200" in body
+    assert "Rejected: 100" in body
+    assert "Rejected: 200" not in body
+    assert title == "Delete — Stopped"
+    assert "Delete did not finish" in body
+    assert "All selected messages were processed." not in body
+
+
+@pytest.mark.asyncio
+async def test_unprocessed_candidates_are_not_reported_as_rejected(monkeypatch):
+    monkeypatch.setattr(delete_service, "_DELETE_OPERATION_DEADLINE_SECONDS", 0.25)
+    monkeypatch.setattr(delete_ui, "_PROGRESS_PAINT_INTERVAL", 60.0)
+    client = install(
+        monkeypatch, [Message(i) for i in range(1, 3001)], batch_delay=0.03,
+    )
+
+    title, body, _buttons = await delete_ui._del_panel_handler(FakeEvent(), "allexec")
+
+    assert 0 < len(client.deleted) < 3000
+    assert f"Deleted: {len(client.deleted):,}" in body
+    assert "Rejected: 0" in body
+    assert "Remaining: " in body
+    assert "Partial result" in body
+    assert title == "Delete — Stopped"
+
+
+@pytest.mark.asyncio
+async def test_repeated_paints_inside_the_interval_edit_once(monkeypatch):
+    monkeypatch.setattr(delete_ui, "_PROGRESS_PAINT_INTERVAL", 60.0)
+    client = install(monkeypatch, [Message(1)])
+    paint = delete_ui._progress_painter(FakeEvent())
+
+    await paint({"scanned": 1, "considered": 1})
+    for n in range(2, 20):
+        await paint({"scanned": n, "considered": n})
+
+    assert len(client.edits) == 1
+    assert "Scanned: 1 messages" in client.edits[0][2]
+
+
+@pytest.mark.asyncio
+async def test_unchanged_counters_never_repaint(monkeypatch):
+    monkeypatch.setattr(delete_ui, "_PROGRESS_PAINT_INTERVAL", 0.0)
+    client = install(monkeypatch, [Message(1)])
+    paint = delete_ui._progress_painter(FakeEvent())
+    snapshot = {"total": 100, "deleted": 10, "rejected": 0, "resolved": 10,
+                "remaining": 90}
+
+    await paint(snapshot)
+    await paint(dict(snapshot))
+    await paint(dict(snapshot))
+
+    assert len(client.edits) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_slow_panel_edit_never_stacks_pending_edits(monkeypatch):
+    monkeypatch.setattr(delete_ui, "_PROGRESS_PAINT_INTERVAL", 0.0)
+    client = install(monkeypatch, [Message(1)])
+    client.edit_delay = 0.05
+    paint = delete_ui._progress_painter(FakeEvent())
+
+    await asyncio.gather(*(
+        paint({"total": 100, "deleted": n, "rejected": 0, "resolved": n,
+               "remaining": 100 - n})
+        for n in range(1, 21)
+    ))
+
+    assert client.max_concurrent_edits == 1
+    assert len(client.edits) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_failed_panel_edit_never_aborts_the_deletion(monkeypatch):
+    monkeypatch.setattr(delete_ui, "_PROGRESS_PAINT_INTERVAL", 0.0)
+    client = install(monkeypatch, [Message(i) for i in range(1, 401)])
+    client.fail_edits = True
+
+    title, body, _buttons = await delete_ui._del_panel_handler(FakeEvent(), "allexec")
+
+    assert len(client.deleted) == 400
+    assert client.edits == []
+    assert "Deleted: 400" in body
+    assert title == "Delete — Completed"
+
+
+@pytest.mark.asyncio
+async def test_large_deletion_never_exceeds_the_chunk_size(monkeypatch):
+    monkeypatch.setattr(delete_ui, "_PROGRESS_PAINT_INTERVAL", 60.0)
+    client = install(monkeypatch, [Message(i) for i in range(1, 1001)])
+
+    await delete_ui._del_panel_handler(FakeEvent(), "allexec")
+
+    assert len(client.deleted) == 1000
+    assert len(client.deleted) == len(set(client.deleted))
+    assert all(
+        len(batch) <= delete_service._DELETE_VERIFY_CHUNK for batch in client.batches
+    )
+    assert all(
+        size <= delete_service._DELETE_VERIFY_CHUNK for size in client.fetch_sizes
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_large_deletion_yields_control_to_the_event_loop(monkeypatch):
+    monkeypatch.setattr(delete_ui, "_PROGRESS_PAINT_INTERVAL", 60.0)
+    client = install(monkeypatch, [Message(i) for i in range(1, 2001)])
+    client.iter_delay = 0.0005
+    client.batch_delay = 0.0005
+    ticks = 0
+    stop = False
+
+    async def ticker():
+        nonlocal ticks
+        while not stop:
+            ticks += 1
+            await asyncio.sleep(0.001)
+
+    task = asyncio.create_task(ticker())
+    try:
+        await delete_ui._del_panel_handler(FakeEvent(), "allexec")
+    finally:
+        stop = True
+        await task
+
+    assert len(client.deleted) == 2000
+    assert ticks > 5
+
+
+@pytest.mark.asyncio
+async def test_foreign_messages_stay_untouched_in_a_large_chat(monkeypatch):
+    monkeypatch.setattr(delete_ui, "_PROGRESS_PAINT_INTERVAL", 60.0)
+    messages = [
+        Message(i, out=(i % 10 != 0), sender_id=(OWNER if i % 10 != 0 else 222))
+        for i in range(1, 2001)
+    ]
+    client = install(monkeypatch, messages)
+
+    _title, body, _buttons = await delete_ui._del_panel_handler(FakeEvent(), "allexec")
+
+    expected = {m.id for m in messages if m.out}
+    assert set(client.deleted) == expected
+    assert len(expected) == 1800
+    assert "Found: 1,800" in body
+    assert "Deleted: 1,800" in body

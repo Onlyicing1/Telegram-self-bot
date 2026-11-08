@@ -33,6 +33,7 @@ from backend.helper import (
     render,
 )
 from backend.helper.client import get_client
+from backend.helper.progress import render_progress_bar
 from backend.helper.styles import PRIMARY, SUCCESS
 from backend.helper import symbols as sym
 
@@ -43,7 +44,10 @@ _QUICK_COUNTS = (10, 25, 50, 100, 250, 500)
 #: Progress is advisory: a long deletion costs a few panel edits, never one per
 #: message, and one slow edit can never hold up the operation.
 _PROGRESS_PAINT_INTERVAL = 3.0
-_PROGRESS_EDIT_TIMEOUT = 5.0
+#: A progress edit is bounded BELOW the paint interval: an edit that takes as
+#: long as the interval would make every repaint wait for the previous one, so
+#: the panel would fall behind the deletion it is reporting.
+_PROGRESS_EDIT_TIMEOUT = 3.0
 #: The confirmation panel must render even when the preview cannot be read.
 _ALL_PREVIEW_TIMEOUT = 5.0
 
@@ -165,36 +169,98 @@ def _report_text(report: DeleteReport, *, error: Exception | None = None) -> str
     return "\n".join(lines)
 
 
-def _progress_painter(event):
-    """A throttled progress painter for the panel this click came from.
+_ALL_TITLE = "Delete — All My Messages"
+_DELETING_TITLE = "Delete — Deleting"
+_COMPLETED_TITLE = "Delete — Completed"
+_STOPPED_TITLE = "Delete — Stopped"
 
-    The snapshot carries only measured figures (``scanned`` while the history is
-    read, ``considered``/``deleted`` afterwards), so the panel never renders a
-    number nobody counted. Painting is throttled and individually bounded:
-    progress must not slow the deletion down, and must not fail it.
+
+def _render_scan_progress(snapshot: dict) -> str:
+    """Stage A — the history scan, with measured counters and no percentage.
+
+    The size of the chat is not known before the scan ends, so there is no
+    honest denominator: any percentage here (including one derived from the
+    50,000-message safety bound) would be invented.
+    """
+    scanned = int(snapshot.get("scanned") or 0)
+    found = int(snapshot.get("considered") or 0)
+    return (
+        "Scanning chat...\n\n"
+        f"Scanned: {scanned:,} messages\n"
+        f"Your messages found: {found:,}"
+    )
+
+
+def _resolved_fraction(snapshot: dict) -> tuple[int, int, int, int, int]:
+    total = int(snapshot.get("total") or 0)
+    deleted = int(snapshot.get("deleted") or 0)
+    rejected = int(snapshot.get("rejected") or 0)
+    resolved = int(snapshot.get("resolved") if snapshot.get("resolved") is not None
+                   else deleted + rejected)
+    remaining = int(snapshot.get("remaining") if snapshot.get("remaining") is not None
+                    else max(total - resolved, 0))
+    return total, deleted, rejected, resolved, remaining
+
+
+def _render_delete_progress(snapshot: dict) -> str:
+    """Stage B — the determinate bar over RESOLVED candidates.
+
+    A candidate is resolved once it is deleted or rejected after a completed
+    attempt, so the percentage can never move for work that has not happened.
+    """
+    total, deleted, rejected, resolved, remaining = _resolved_fraction(snapshot)
+    percent = _percent(resolved, total)
+    return (
+        f"Processing {percent}%\n\n"
+        f"{render_progress_bar(percent / 100)}\n\n"
+        f"Deleted: {deleted:,} / {total:,}\n"
+        f"Rejected: {rejected:,}\n"
+        f"Remaining: {remaining:,}"
+    )
+
+
+def _percent(resolved: int, total: int) -> int:
+    if total <= 0:
+        return 0
+    return min(100, int(resolved * 100 / total))
+
+
+def _progress_message(snapshot: dict) -> str:
+    """The whole progress panel text for one measured snapshot."""
+    if "total" in snapshot:
+        return f"**{_DELETING_TITLE}**\n\n{_render_delete_progress(snapshot)}"
+    return f"**{_ALL_TITLE}**\n\n{_render_scan_progress(snapshot)}"
+
+
+def _progress_painter(event):
+    """A throttled, single-flight progress painter for the panel this click came from.
+
+    The snapshot carries only measured figures (``scanned``/``considered``
+    while the history is read, ``total``/``deleted``/``rejected`` afterwards),
+    so the panel never renders a number nobody counted. Three cheap guards
+    keep Telegram out of the deletion's way: an unchanged panel is not
+    repainted, a repaint waits for the interval, and at most ONE edit is ever
+    in flight. A slow or failed edit is swallowed — progress must not slow the
+    deletion down, and must not fail it.
     """
     chat_id = _chat_for(event)
     msg_id = getattr(event, "message_id", None)
     inline_id = getattr(event, "inline_message_id", None)
-    state = {"last": 0.0}
+    state = {"last": 0.0, "text": "", "busy": False}
 
     async def paint(snapshot: dict) -> None:
+        text = _progress_message(snapshot)
+        if text == state["text"]:
+            return
         now = time.monotonic()
         if state["last"] and now - state["last"] < _PROGRESS_PAINT_INTERVAL:
             return
+        if state["busy"]:
+            # Never queue a second edit behind one that has not returned.
+            return
+        state["text"] = text
         state["last"] = now
-        parts: list[str] = []
-        if "scanned" in snapshot:
-            parts.append(f"scanned {snapshot['scanned']} message(s)")
-        if "considered" in snapshot:
-            parts.append(f"{snapshot['considered']} of yours verified")
-        if "deleted" in snapshot:
-            parts.append(f"{snapshot['deleted']} deleted")
-        detail = " · ".join(parts) or "starting the history scan"
-        text = (
-            f"{sym.OP_DELETE} Working — {detail}.\n\n"
-            "Only messages sent by your account are ever deleted."
-        )
+        state["busy"] = True
         try:
             await asyncio.wait_for(
                 _edit_panel(
@@ -207,8 +273,46 @@ def _progress_painter(event):
             )
         except Exception as exc:  # noqa: BLE001 — progress never aborts a deletion
             logger.debug("DELETE_UI progress paint failed: %s", exc)
+        finally:
+            state["busy"] = False
 
     return paint
+
+
+def _all_result_text(
+    report: DeleteReport, *, error: Exception | None = None,
+) -> tuple[str, str]:
+    """Stage C — the real account of the operation, never an inferred one.
+
+    Completion is claimed only when every candidate was resolved (deleted or
+    rejected) and nothing stopped the run; otherwise the panel keeps its
+    stopped title, the unprocessed candidates and the documented reason.
+    """
+    found = report.considered
+    resolved = report.deleted + report.rejected
+    complete = error is None and report.complete and resolved >= found
+    percent = 100 if complete and found else _percent(resolved, found)
+
+    lines: list[str] = []
+    if error is not None:
+        lines += [f"{sym.STATE_FAILED} Delete did not finish: {error}", ""]
+    lines += [
+        render_progress_bar(percent / 100),
+        "",
+        f"Scanned: {report.scanned:,}",
+        f"Found: {found:,}",
+        f"Deleted: {report.deleted:,}",
+        f"Rejected: {report.rejected:,}",
+    ]
+    if complete:
+        lines += ["", "All selected messages were processed."]
+        return _COMPLETED_TITLE, "\n".join(lines)
+
+    lines += ["", f"Remaining: {max(found - resolved, 0):,}"]
+    reason = report.reason or (str(error) if error is not None else
+                              "the operation stopped early")
+    lines += ["", f"{sym.STATE_WARNING} Partial result: {reason}."]
+    return _STOPPED_TITLE, "\n".join(lines)
 
 
 def _back_row(target: str = "panel:del") -> list:
@@ -339,15 +443,16 @@ async def _del_view(event, extra: str) -> tuple[str, str, list]:
             return _no_chat()
         if client is None:
             return _unavailable()
-        report = DeleteReport()
+        report = DeleteReport(requested="all of your messages in this chat")
         progress = _progress_painter(event)
-        # Say that work started BEFORE the scan: a large chat must never look
-        # frozen while the history is being read.
+        # Say that the scan started BEFORE it starts: a large chat must never
+        # look frozen while the history is being read.
         await progress({})
         _considered, _deleted, error = await delete_service.do_del_self_filtered(
             client, chat_id, report=report, progress=progress,
         )
-        return "Delete", _report_text(report, error=error), _back_row()
+        title, body = _all_result_text(report, error=error)
+        return title, body, _back_row()
 
     return "Delete", "Choose a deletion scope:", _home_buttons().build()
 

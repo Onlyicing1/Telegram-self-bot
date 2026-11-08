@@ -316,12 +316,13 @@ async def test_all_mode_scans_beyond_1000_messages(monkeypatch):
     ]
     client = install(monkeypatch, messages)
 
-    _title, body, _buttons = await delete_ui._del_panel_handler(FakeEvent(), "allexec")
+    title, body, _buttons = await delete_ui._del_panel_handler(FakeEvent(), "allexec")
 
     expected = {m.id for m in messages if m.out}
     assert len(expected) == 1188
     assert set(client.deleted) == expected
-    assert "Completed" in body
+    assert "Completed" in title
+    assert "All selected messages were processed." in body
 
 
 @pytest.mark.asyncio
@@ -359,7 +360,7 @@ async def test_partial_batch_failure_is_reported_honestly(monkeypatch):
     _title, body, _buttons = await delete_ui._del_panel_handler(FakeEvent(), "allexec")
 
     assert "did not finish" in body
-    assert "deleted 150" in body
+    assert "Deleted: 150" in body
     assert "Completed" not in body
     # Every verified batch was attempted; the failing one was not retried.
     assert len(client.batches) == 3

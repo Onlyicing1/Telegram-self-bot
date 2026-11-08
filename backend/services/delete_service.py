@@ -61,6 +61,7 @@ class DeleteReport:
 
     requested: str = ""
     considered: int = 0
+    scanned: int = 0
     deleted: int = 0
     rejected: int = 0
     complete: bool = True
@@ -76,6 +77,9 @@ class Selection:
     complete: bool = True
     reason: str = ""
     error: Exception | None = None
+    #: Messages the scan actually walked — the one honest "how far did it get"
+    #: figure, since the size of the chat is not known in advance.
+    scanned: int = 0
 
 
 def _describe_scope(
@@ -242,6 +246,7 @@ async def delete_verified_self_messages(
     exclude_message_id: int | None = None,
     request_id: str = "",
     on_batch: Callable[[list[int], list[int]], object] | None = None,
+    on_rejected: Callable[[list[int]], object] | None = None,
     deadline: float | None = None,
     stopped: dict[str, str] | None = None,
 ) -> tuple[list[int], list[int]]:
@@ -273,6 +278,20 @@ async def delete_verified_self_messages(
     me_id = await _resolve_me_id(client)
     verified: list[int] = []
     chunk = _DELETE_VERIFY_CHUNK
+
+    async def _report_rejected(part: list[int]) -> None:
+        """Hand ownership rejections to the caller ONCE per chunk.
+
+        ``on_batch`` carries the outcome of a DELETION batch, so a caller that
+        adds this to it counts ownership rejections and delete failures
+        separately instead of double-counting the same id twice.
+        """
+        if not part or on_rejected is None:
+            return
+        outcome = on_rejected(list(part))
+        if inspect.isawaitable(outcome):
+            await outcome
+
     for start in range(0, len(ids), chunk):
         if deadline is not None and time.monotonic() >= deadline:
             # The remaining candidates were neither verified nor deleted, so
@@ -293,6 +312,7 @@ async def delete_verified_self_messages(
                 chat_id, part, exc,
             )
             rejected.extend(part)
+            await _report_rejected(part)
             continue
         if fetched is None:
             logger.warning(
@@ -300,6 +320,7 @@ async def delete_verified_self_messages(
                 chat_id, part,
             )
             rejected.extend(part)
+            await _report_rejected(part)
             continue
         if not isinstance(fetched, list):
             fetched = [fetched]
@@ -312,13 +333,16 @@ async def delete_verified_self_messages(
                 by_id[mid] = msg
         chunk_verified = 0
         chunk_rejected = 0
+        chunk_rejected_ids: list[int] = []
         for mid in part:
             if _is_self_owned(by_id.get(mid), me_id):
                 verified.append(mid)
                 chunk_verified += 1
             else:
                 rejected.append(mid)
+                chunk_rejected_ids.append(mid)
                 chunk_rejected += 1
+        await _report_rejected(chunk_rejected_ids)
         logger.info(
             "DELETE_OWNERSHIP_CHECK chat_id=%s ids=%s verified=%d rejected=%d "
             "me_id_resolved=%s",
@@ -583,25 +607,26 @@ async def select_self_owned_message_ids(
             considered += 1
             selected.append(mid)
             if count is not None and len(selected) >= count:
-                return Selection(selected, considered, True, "")
+                return Selection(selected, considered, True, "", scanned=scanned)
             if len(selected) >= MAX_DELETE_COUNT:
                 # All mode is bounded by the same per-operation candidate limit
                 # as an explicit count; reaching it is a PARTIAL result.
                 return Selection(
                     selected, considered, False,
                     f"candidate limit ({MAX_DELETE_COUNT}) reached",
+                    scanned=scanned,
                 )
     except Exception as exc:
-        return Selection(selected, considered, False, str(exc), exc)
+        return Selection(selected, considered, False, str(exc), exc, scanned=scanned)
 
     if boundary_id is not None and not boundary_seen:
         # A missing/foreign boundary is a safe empty result, not permission
         # to expand the range to the whole chat.
-        return Selection([], considered, False, "boundary message not found")
+        return Selection([], considered, False, "boundary message not found", scanned=scanned)
     stopped = stats.get("stopped", "")
     if stopped:
-        return Selection(selected, considered, False, f"{stopped} reached")
-    return Selection(selected, considered, True, "")
+        return Selection(selected, considered, False, f"{stopped} reached", scanned=scanned)
+    return Selection(selected, considered, True, "", scanned=scanned)
 
 
 async def do_del_self_filtered(
@@ -653,6 +678,7 @@ async def do_del_self_filtered(
     )
     if report is not None:
         report.considered = considered
+        report.scanned = selection.scanned
         report.complete = selection.complete
         report.reason = selection.reason
     scan_error = selection.error
@@ -662,23 +688,44 @@ async def do_del_self_filtered(
         # the owner's messages. None of those may attempt a deletion.
         return considered, 0, scan_error
 
+    total = len(ids)
+
+    def _on_rejected(chunk: list[int]) -> None:
+        # Ownership rejections arrive HERE and only here. A failed Telegram
+        # batch arrives through ``on_batch`` instead, so an id that failed to
+        # delete is never added to the ownership counter as well.
+        if report is not None:
+            report.rejected += len(chunk)
+
     async def _on_batch(done: list[int], failed: list[int]) -> None:
         if report is not None:
             report.deleted += len(done)
             report.rejected += len(failed)
+        resolved = (report.deleted + report.rejected) if report is not None else 0
         await _emit_progress(
             progress,
-            considered=considered,
+            total=total,
             deleted=report.deleted if report is not None else 0,
+            rejected=report.rejected if report is not None else 0,
+            resolved=resolved,
+            remaining=max(total - resolved, 0),
         )
+
+    # The deletion stage starts at a real 0% now that the candidate count is
+    # known, instead of leaving the panel on its last scan figure.
+    await _emit_progress(
+        progress, total=total, deleted=0, rejected=0, resolved=0, remaining=total,
+    )
 
     stopped: dict[str, str] = {}
     try:
         # Even a failed scan keeps its verified candidates: they still pass
         # through the same ownership chokepoint inside the remaining budget.
+        # ``on_rejected`` + ``on_batch`` are the ONLY accounting: adding the
+        # returned ``_rejected`` on top would count both kinds twice.
         deleted, _rejected = await delete_verified_self_messages(
             client, chat_id, ids, exclude_message_id=exclude_message_id,
-            request_id=request_id, on_batch=_on_batch,
+            request_id=request_id, on_batch=_on_batch, on_rejected=_on_rejected,
             deadline=deadline, stopped=stopped,
         )
     except Exception as exc:

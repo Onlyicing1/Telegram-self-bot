@@ -119,3 +119,35 @@ The ownership chokepoint itself was NOT the defect: every path already went
 through `delete_verified_self_messages()`, which re-fetches and checks `out` +
 `sender_id` per id in 100-id batches. The fix adds a deadline and partial-result
 reporting around it without bypassing or weakening it.
+
+## 5. Progress reporting: text-only, and rejections that could be double-counted
+
+Traced at `c8e5e905`, where the All path already had a deadline, partial
+reporting and a throttled text painter.
+
+1. **The painter carried no model of the operation.** It printed
+   `Working — scanned N · M of yours verified · K deleted` from whatever keys a
+   snapshot happened to carry, so it had no candidate total, no percentage, no
+   bar and no stage: the owner could not tell 12% from 90%, and the scan showed
+   no honest "found" counter. Nothing compared the rendered text with the last
+   painted text either, so a snapshot that had not changed still cost an edit
+   once the 3s interval elapsed.
+2. **`5s` edit timeout inside a `3s` interval.** A single slow edit could take
+   longer than the cadence it was reporting on, and because there was no
+   single-flight guard, overlapping paints were possible.
+3. **Two overlapping rejection sources.** `do_del_self_filtered()` ignored
+   `delete_verified_self_messages()`'s returned rejected ids while `_on_batch()`
+   already added failed deletion batches to `report.rejected`. The returned list
+   is exactly `ownership rejections + failed-delete ids`, so the obvious fix
+   (`report.rejected += len(_rejected)`) would have counted every failed batch
+   twice. The chokepoint therefore reports the two kinds separately
+   (`on_rejected` for ownership, `on_batch` for deletion outcomes) and each id
+   reaches exactly one of them.
+4. **The report had no scan figure.** `DeleteReport` carried `considered` but not
+   how much history was walked, so "Scanned / Found / Deleted / Rejected" could
+   not be shown honestly; `Selection` now carries `scanned` and the report takes
+   it from there.
+
+Chunking was NOT a defect: verification and deletion already ran in 100-id
+awaited batches with bounded memory, and every awaited RPC yields the loop. No
+batch size, bound or deadline was changed by this task.

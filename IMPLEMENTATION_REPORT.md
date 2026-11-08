@@ -196,11 +196,11 @@ test hung and deleted nothing.
   at all still attempts no deletion (unresolved identity, missing boundary, etc.).
 * `do_del_id_counts`: passes its existing deadline/stop record into the chokepoint.
 * `preview_self_owned_count`: its own 3s wall clock (`_DELETE_PREVIEW_SECONDS`).
-* `backend/bot/handlers/delete.py`: `_progress_painter(event)` paints a throttled
-  (3s), individually bounded (5s) `Working — scanned N · M of yours verified ·
-  K deleted` status on the same panel, starting before the scan and never able to
-  fail the operation. The All confirmation wraps its preview in a 5s `wait_for`
-  and renders anyway ("preview unavailable") when it cannot be read.
+* `backend/bot/handlers/delete.py`: `_progress_painter(event)` renders the staged
+  progress panel described in §9 — measured scan counters, then the five-segment
+  bar over resolved candidates — throttled to one edit per 3s, single-flight, and
+  never able to fail the operation. The All confirmation wraps its preview in a
+  5s `wait_for` and renders anyway ("preview unavailable") when it cannot be read.
 
 ### Tests added
 
@@ -236,8 +236,10 @@ not touched by this diff.
 * The deadline bounds one operation to 240s of wall clock. A chat with more than
   `MAX_DELETE_COUNT` (20,000) of the owner's messages needs more than one run, and
   each run says so honestly instead of pretending it finished.
-* Progress is a same-panel text edit every ≥3s; a refused edit is swallowed and
-  Telegram flood limits are not modelled beyond the per-edit timeout.
+* Progress is a same-panel edit every ≥3s, at most one in flight; a refused edit
+  is swallowed and Telegram flood limits are not modelled beyond the per-edit
+  timeout. The bar measures processed candidates, so a run stopped by the deadline
+  shows its real percentage under the `Stopped` title, never completion.
 * Only the All path gained the new deadline/partial/progress coverage; the
   quick-count, Delete From, message-ID, date-range and AI paths keep their existing
   suites, which still pass.
@@ -253,3 +255,205 @@ A live smoke test is still required after deploy: run All on a chat with more th
 1000 owner messages and confirm the panel shows the Working line, ends with real
 deleted/rejected counts, a second run continues from what remains, and no message
 from another participant is ever deleted.
+
+---
+
+## 9. Low-noise staged progress bar and honest rejected accounting (2026-11-08)
+
+Baseline `c8e5e905`. Scope: the manual **All my messages** path only — the one
+scope whose workload (≈10,000 messages) makes both the missing progress surface
+and the ignored rejection count observable.
+
+### 9.1 What the panel shows
+
+Stage A — history scan. No percentage at all: the size of the chat is not known
+until the scan ends, so any figure (including one derived from the 50,000-
+message scan bound) would be invented.
+
+```
+Delete — All My Messages
+
+Scanning chat...
+
+Scanned: 4,000 messages
+Your messages found: 2,850
+```
+
+Stage B — deletion, once the candidate count is known. Determinate, using the
+existing five-segment renderer (`backend/helper/progress.py`, the same bar Save
+and the model tester use):
+
+```
+Delete — Deleting
+
+Processing 50%
+
+▰▰▱▱▱
+
+Deleted: 1,425 / 2,850
+Rejected: 0
+Remaining: 1,425
+```
+
+Stage C — the final report replaces the bar, through the panel's normal return
+path (so it is painted even when every progress edit failed):
+
+```
+Delete — Completed
+
+▰▰▰▰▰
+
+Scanned: 10,000
+Found: 2,850
+Deleted: 2,850
+Rejected: 0
+
+All selected messages were processed.
+```
+
+A partial run gets the `Delete — Stopped` title, the same real counters, a
+`Remaining:` line for the candidates that were never processed, the
+`Delete did not finish: …` line when an exception ended it, and
+`Partial result: <reason>.` The completion line appears only when every
+candidate was resolved (deleted or rejected) AND nothing stopped the run. Titles
+are plain Latin text: the panel renderer applies the persisted Glass UI font, so
+no display-font glyph is hard-coded in the handler.
+
+### 9.2 How the two progresses are computed
+
+* Scan: `scanned` is the number of history messages the streaming iterator
+  actually yielded; `found` (`report.considered`) is the number that passed
+  ownership + range + content selection. Both are reported every
+  `_DELETE_PROGRESS_EVERY` (200) messages, and `Selection.scanned` /
+  `DeleteReport.scanned` carry the final figure to the report.
+* Deletion: `percent = floor(100 × (deleted + rejected) / total)`, capped at 100,
+  where `total` is the number of selected candidates. A candidate counts as
+  **resolved** once it is deleted or rejected after a completed attempt, so the
+  bar cannot advance for work that has not happened. `Remaining` is
+  `total − resolved`; it is 0 only when everything was attempted.
+* Deleted and rejected stay separate real counters the whole way through; the
+  final `Deleted` figure is Telegram's own count, never the requested count.
+
+### 9.3 Throttling (no edit spam)
+
+`_progress_painter` keeps four cheap guards, all in the existing callback/panel
+architecture — no scheduler, worker, task or second loop:
+
+1. **Interval** — at most one paint per `_PROGRESS_PAINT_INTERVAL` (3s).
+2. **Change required** — the rendered text is compared with the last painted
+   text, so unchanged counters never produce an edit.
+3. **Single flight** — a `busy` flag drops a paint while an earlier edit is in
+   flight instead of queueing it; a slow Telegram edit therefore cannot build a
+   backlog.
+4. **Bounded, isolated edit** — each edit is wrapped in
+   `asyncio.wait_for(..., _PROGRESS_EDIT_TIMEOUT)`, reduced from 5s to 3s so an
+   edit cannot take longer than the interval it is reporting on. Any failure or
+   timeout is logged at debug level and swallowed.
+
+The terminal report is not a progress edit: it is the panel handler's return
+value, so it is always attempted, even after a failed or timed-out progress edit.
+Each candidate batch costs at most one paint attempt, and one paint attempt per
+3s actually reaches Telegram.
+
+### 9.4 Chunking and responsiveness: audit result
+
+No batch size was changed. The audit found the pipeline already bounded and
+cooperative:
+
+* history is streamed (`_iter_messages_bounded`) and only selected integer ids
+  are retained — no message objects accumulate;
+* verification and deletion both run in `_DELETE_VERIFY_CHUNK` (100) batches,
+  each awaited through `rpc_await` (which is a real `await`, so the event loop
+  runs between batches); there is no `asyncio.gather` over deletion and no
+  thread;
+* the 20,000-candidate bound, the 50,000-message scan bound and the 240s
+  operation deadline are unchanged.
+
+The one measurable gap was presentation, not throughput: before this change the
+panel showed nothing between the click and the final result. A new test runs a
+2,000-message deletion beside a 1ms ticker and asserts the ticker advanced
+(>5 turns), and another asserts every verification fetch and deletion batch is
+≤100 ids with no id attempted twice. `MAX_DELETE_COUNT` and the batch size were
+deliberately NOT raised: 100 is Telegram's practical batch size and larger
+batches would lengthen each awaited RPC.
+
+### 9.5 Rejected-count accounting
+
+`do_del_self_filtered()` discarded `delete_verified_self_messages(...)`'s
+rejected ids while `_on_batch()` already counted failed deletion batches. Adding
+`len(_rejected)` on top would have counted every failed-delete id twice, because
+that list is exactly (ownership rejections + failed-delete ids).
+
+Fix: the chokepoint now reports the two kinds through two distinct callbacks.
+
+* `on_rejected(chunk)` — fired once per verification chunk with the ids that
+  failed ownership/verification (missing message, foreign or unresolvable
+  sender, failed ownership fetch). `_on_rejected` adds `len(chunk)` to
+  `report.rejected`.
+* `on_batch(done, failed)` — fired per completed DELETION batch;
+  `_on_batch` adds successes to `report.deleted` and failures to
+  `report.rejected`.
+
+Because an id can reach only one of the two, every rejection is counted exactly
+once and the returned `_rejected` list is intentionally unused by this caller
+(commented as such). Candidates that were never attempted — the deadline
+stopped the operation — are counted nowhere and surface as `Remaining`, so they
+are never reported as rejected. A partial exception still returns the ids that
+were really deleted (the chokepoint's `deleted_ids`), and the panel reports that
+exact figure with `Partial result`.
+
+### 9.6 Tests
+
+`tests/test_34_delete_all_execution.py` grew from 11 to 23 tests. Added:
+
+| Property | Test |
+| --- | --- |
+| 10,000-message chat, streamed scan, real counters | `test_ten_thousand_message_chat_paints_real_scan_counters` |
+| no fabricated scan percentage | same test (`"%" not in` every scan paint) |
+| bar starts empty, advances only on resolved work, ends full | `test_progress_bar_starts_empty_and_fills_only_on_resolved_work` |
+| ownership rejections counted once | `test_ownership_rejections_are_counted_exactly_once` |
+| Telegram delete failures counted once | `test_telegram_delete_failure_is_counted_once` |
+| unprocessed candidates are not rejections | `test_unprocessed_candidates_are_not_reported_as_rejected` |
+| throttling: repeated paints inside the interval | `test_repeated_paints_inside_the_interval_edit_once` |
+| unchanged counters never repaint | `test_unchanged_counters_never_repaint` |
+| slow edit never stacks pending edits | `test_a_slow_panel_edit_never_stacks_pending_edits` |
+| failed panel edit never aborts deletion | `test_a_failed_panel_edit_never_aborts_the_deletion` |
+| batches never exceed 100 ids | `test_large_deletion_never_exceeds_the_chunk_size` |
+| large deletion yields the event loop | `test_a_large_deletion_yields_control_to_the_event_loop` |
+| foreign messages untouched in a large chat | `test_foreign_messages_stay_untouched_in_a_large_chat` |
+
+The one pre-existing progress test was updated to the staged text
+(`Scanning chat` / `Processing 0%` / `Deleted: n / total`) and
+`tests/test_33_delete_manual_ui.py` now asserts the `Completed` title plus the
+completion line. Every earlier ownership-isolation test is retained unchanged.
+
+### 9.7 Results
+
+```
+delete suites (test_26 … test_34, test_task_durable_delete,
+               test_10_tool_calls, test_19_ai_actions,
+               test_colored_buttons, test_tool_health_audit) ... 299 passed
+full suite .................................. 7197 passed, 27 skipped, 1 failed
+py_compile (2 modules + 2 test files) ........ COMPILE_OK
+git diff --check ............................ clean
+```
+
+The single failure is
+`tests/test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`
+(`interval advancement exceeded bound`), which fails on the untouched baseline
+`c8e5e905` as well; the scheduler is not touched by this diff.
+
+### 9.8 Limitations / not live-verified
+
+* No real 10,000-message Telegram deletion was performed. The fake client proves
+  code behaviour (counters, throttling, batching, yields), not live Telegram
+  throughput, FloodWait behaviour or edit latency.
+* `_PROGRESS_EDIT_TIMEOUT = 3.0` is a judgement call: it is below the paint
+  interval so an edit cannot outlive its own cadence, but a real FloodWait on
+  edits (not modelled) is still swallowed rather than retried.
+* The bar's granularity is one candidate, not one message: rejection detection
+  and progress both advance per verification/deletion batch, so the displayed
+  percentage can jump by up to 100 candidates at a time (the printed numbers are
+  always exact).
+* A run that hits the 20,000-candidate bound or the 240s deadline still needs
+  another run; it reports the real counters and `Remaining`, never completion.
