@@ -13,6 +13,7 @@
 | New dependency | none |
 | Architecture | unchanged: `TaskScheduler → TaskExecutionCoordinator → AIActionPreparator → PreparationPolicy → ToolExecutor → bio_set_text → bio_service` |
 | Execution authority | unchanged: `ToolExecutor` is still the only caller of `tool.execute()` |
+| Follow-up base | **`19594dd`** — precise content-policy violation codes appended in §10 |
 
 ## 0. Intervening delivered work (unchanged by this task)
 
@@ -295,3 +296,115 @@ deterministic content policy (language/length/attribution; nothing truncated or
 fabricated), the fixed action name `bio_set_text`, `ToolExecutor` as sole
 execution authority, result delivery, runtime supervision/heartbeat/recovery,
 and the database schema.
+
+---
+
+## 10. Follow-up: the exact content-policy rule is now recorded
+
+> Appended on top of `19594dd` (the deployed classification commit). Nothing in
+> §1–§9 is changed or restated; this section covers only the violation-code
+> diagnostics.
+
+### 10.1 The remaining gap
+
+Post-deployment occurrences `22074` and `22078` now correctly say
+`error_class=content_policy_rejected`, `failure_stage=content_policy`, three
+preparation attempts, zero successful actions. That is the right *category*
+but not the right *rule*: `PreparationPolicyError` carried only an English
+message, and `TaskPreparationError` kept `category`/`stage` only, so the
+persisted record could not distinguish a missed 70-character limit from a
+language violation, a missing Shikamaru attribution, an empty output or a
+non-string argument. The messages were also deliberately not persisted (they
+are human text, not a stable contract), so the specific rule was lost.
+
+### 10.2 Implemented
+
+* `backend/ai/preparation_policy.py` — new closed vocabulary
+  `POLICY_VIOLATION_CODES` (+ `DEFAULT_VIOLATION_CODE =
+  "other_policy_violation"`). `PreparationPolicyError` now requires a bounded
+  `code`; every deterministic raise site supplies one, so the rejection knows
+  its rule while the message stays human-readable and content-free.
+* `backend/ai/task_execution.py` — `TaskPreparationError` accepts
+  `policy_violation` (only a vocabulary member survives; anything else is
+  dropped, never persisted). Every wrapping site (`AIActionPreparator.prepare`,
+  `prepare_validated`, the coordinator's `_prepare_calls` and
+  `_enforce_content_policy`) forwards the code, and the aggregate
+  "failed after N attempts" error re-raises the last specific code.
+* `handle_failure` persists it as `error_metadata["policy_violation"]` and adds
+  `violation=<code>` to the existing `TASK_PREPARATION_FAILED` warning;
+  `TASK_PREPARE_AHEAD_FAILED` gets the same field. The broad
+  `error_class=content_policy_rejected` and `failure_stage=content_policy`
+  remain unchanged for compatibility.
+
+| Code | Meaning |
+|---|---|
+| `attribution_missing` | no speaker label / no separator after the requested source (e.g. a bare line) |
+| `attribution_mismatch` | a speaker label exists but names another character, or a short form of the source |
+| `language_mismatch` | the visible letters do not satisfy the instruction's named language (including "no letters") |
+| `visible_length_exceeded` | an "at most N" contract was exceeded (71 visible chars for `N=70`) |
+| `visible_length_mismatch` | an "exactly N" contract was missed in either direction |
+| `empty_content` | empty/whitespace-only content, or a label with no dialogue line |
+| `invalid_content_type` | a non-string value, a JSON payload, or a provider failure payload |
+| `unverifiable_exact_quote` | an explicit exact-canonical-quote request (no trusted corpus/verifier) |
+| `other_policy_violation` | fallback for an unknown/missing code — never an arbitrary message |
+
+Attribution is the only place with two codes, and it is decided
+deterministically: text that opens with a `Name:`-style label is
+`attribution_mismatch` when the name is not the full requested source;
+text that never attempts a label is `attribution_missing`.
+
+### 10.3 Privacy guarantee
+
+The code is a member of a closed `frozenset`. Generated dialogue, the Bio text,
+the attributed line, prompts, conversation messages, provider payloads,
+credentials and destinations never enter it; the existing content-free
+messages (lengths, language names, the instruction-derived source name) are
+unchanged, and no new field carries text. `policy_violation` is omitted
+entirely for non-policy failures.
+
+### 10.4 Tests
+
+New `tests/test_preparation_policy_codes.py` pins the vocabulary and every
+mapping (compliant Shikamaru line passes; 70 passes / 71 exceeds; exact-N
+mismatch; missing vs. wrong vs. short attribution; language, empty, non-string,
+JSON/failure payload, exact-quote, source-without-content-field; unknown-code
+fallback; the message never contains the generated text).
+
+`tests/test_preparation_failure_diagnosis.py` gained five end-to-end tests
+through the real coordinator/preparator/policy/ToolExecutor proving the codes
+reach `error_metadata` for `visible_length_exceeded`, `attribution_missing`,
+`attribution_mismatch`, `language_mismatch`, `visible_length_mismatch` and
+`empty_content`, that the warning log carries the code and no generated text,
+and its safety allow-list was extended with the one new field. Existing
+retry/failure-persistence, exactly-once `bio_set_text` and no-execution-on-
+rejection assertions are unchanged.
+
+| Check | Command | Result |
+|---|---|---|
+| Focused new + diagnosis suites | `pytest tests/test_preparation_policy_codes.py tests/test_preparation_failure_diagnosis.py -q` | **37 passed** |
+| Affected suites (policy, source policy, preparation, execution, prepare-ahead, contract) | `pytest <7 files> -q` | **103 passed** |
+| Full suite | `pytest tests -q` | **7147 passed, 27 skipped, 1 failed** (137.69 s) |
+| Compilation | `py_compile` on both modules + both test files | exit `0` |
+| Whitespace | `git diff --check` | clean |
+
+The single failure is the same pre-existing
+`tests/test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`
+("interval advancement exceeded bound"); no scheduler file is touched.
+
+### 10.5 What did not change
+
+`PreparationPolicy` rules, the 70-character limit, the English requirement, the
+Shikamaru attribution requirement, the task definition/instruction/schedule/
+Bio template, `present_calls`, `ToolExecutor`, retry/attempt budget, the
+scheduler and every Supabase table. No second scheduler, executor or AI entry
+point was added; no dependency was added.
+
+### 10.6 Not verified
+
+* **No production access.** Occurrences `22074`/`22078` were not re-read, no
+  Render log or deployment was inspected, no SQL was run, and no Bio update was
+  triggered.
+* **Which rule rejected those two occurrences remains unknown** — the codes
+  above are what the *next* occurrence will record; they cannot classify the
+  past. The issue is **not** claimed fixed by these tests.
+* No live Telegram Bio change was performed or observed.

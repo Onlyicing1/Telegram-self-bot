@@ -47,6 +47,22 @@ from typing import Any
 CONTENT_FIELDS = frozenset({"text", "message", "content", "body"})
 MAX_PREPARATION_ATTEMPTS = 3
 
+# Bounded, stable vocabulary for a deterministic policy rejection. A code is
+# persisted as an occurrence's diagnostic, so it must stay stable across
+# releases and must NEVER carry generated content, a prompt, or provider data.
+POLICY_VIOLATION_CODES = frozenset({
+    "attribution_missing",
+    "attribution_mismatch",
+    "language_mismatch",
+    "visible_length_exceeded",
+    "visible_length_mismatch",
+    "empty_content",
+    "invalid_content_type",
+    "unverifiable_exact_quote",
+    "other_policy_violation",
+})
+DEFAULT_VIOLATION_CODE = "other_policy_violation"
+
 _PERSIAN_WORDS = ("فارسی", "پارسی", "persian", "farsi")
 _CHINESE_WORDS = ("چینی", "chinese", "中文", "汉语", "mandarin")
 _ARABIC_WORDS = ("عربی", "arabic")
@@ -176,7 +192,17 @@ _FAILURE_MARKERS = ("error", "failed", "exception", "traceback", "api key", "una
 
 
 class PreparationPolicyError(ValueError):
-    """Prepared content violates the task's deterministic content policy."""
+    """Prepared content violates the task's deterministic content policy.
+
+    ``code`` is the bounded, stable identifier of the violated rule — never
+    the message and never any generated content — so the rejection can be
+    diagnosed precisely without persisting what the model produced. An
+    unknown or missing code degrades to ``other_policy_violation``.
+    """
+
+    def __init__(self, message: str, *, code: str = "") -> None:
+        super().__init__(message)
+        self.code = code if code in POLICY_VIOLATION_CODES else DEFAULT_VIOLATION_CODE
 
 
 @dataclass(frozen=True)
@@ -390,27 +416,54 @@ def _check_language(text: str, language: str) -> None:
     if not letters:
         # Punctuation-only output is rejected by the garbage check; here a
         # language constraint with no letters at all cannot prove compliance.
-        raise PreparationPolicyError(f"content contains no letters to satisfy the {language} language requirement")
+        raise PreparationPolicyError(
+            f"content contains no letters to satisfy the {language} language requirement",
+            code="language_mismatch",
+        )
     if language == "persian":
         if _LatinLetter.search(letters):
-            raise PreparationPolicyError("content must be Persian-only but contains Latin letters")
+            raise PreparationPolicyError(
+                "content must be Persian-only but contains Latin letters",
+                code="language_mismatch",
+            )
         if not _ArabicLetter.search(letters):
-            raise PreparationPolicyError("content must be Persian but contains no Persian/Arabic script")
+            raise PreparationPolicyError(
+                "content must be Persian but contains no Persian/Arabic script",
+                code="language_mismatch",
+            )
     elif language == "arabic":
         if _LatinLetter.search(letters):
-            raise PreparationPolicyError("content must be Arabic-only but contains Latin letters")
+            raise PreparationPolicyError(
+                "content must be Arabic-only but contains Latin letters",
+                code="language_mismatch",
+            )
         if not _ArabicLetter.search(letters):
-            raise PreparationPolicyError("content must be Arabic but contains no Arabic script")
+            raise PreparationPolicyError(
+                "content must be Arabic but contains no Arabic script",
+                code="language_mismatch",
+            )
     elif language == "chinese":
         if _ArabicLetter.search(letters) or _LatinLetter.search(letters):
-            raise PreparationPolicyError("content must be Chinese-only but contains Persian/Arabic or Latin letters")
+            raise PreparationPolicyError(
+                "content must be Chinese-only but contains Persian/Arabic or Latin letters",
+                code="language_mismatch",
+            )
         if not _HanLetter.search(letters):
-            raise PreparationPolicyError("content must be Chinese but contains no Han characters")
+            raise PreparationPolicyError(
+                "content must be Chinese but contains no Han characters",
+                code="language_mismatch",
+            )
     elif language == "english":
         if _ArabicLetter.search(letters) or _HanLetter.search(letters):
-            raise PreparationPolicyError("content must be English but contains Persian/Arabic or Han letters")
+            raise PreparationPolicyError(
+                "content must be English but contains Persian/Arabic or Han letters",
+                code="language_mismatch",
+            )
         if not _LatinLetter.search(letters):
-            raise PreparationPolicyError("content must be English but contains no Latin letters")
+            raise PreparationPolicyError(
+                "content must be English but contains no Latin letters",
+                code="language_mismatch",
+            )
 
 
 def _check_length(text: str, policy: PreparationPolicy) -> None:
@@ -419,27 +472,45 @@ def _check_length(text: str, policy: PreparationPolicy) -> None:
     count = len(text)
     if policy.exact_length is not None and count != policy.exact_length:
         raise PreparationPolicyError(
-            f"content must be exactly {policy.exact_length} characters but is {count} (rejected, not truncated)"
+            f"content must be exactly {policy.exact_length} characters but is {count} (rejected, not truncated)",
+            code="visible_length_mismatch",
         )
     if policy.max_length is not None and count > policy.max_length:
         raise PreparationPolicyError(
-            f"content must be at most {policy.max_length} characters but is {count} (rejected, not truncated)"
+            f"content must be at most {policy.max_length} characters but is {count} (rejected, not truncated)",
+            code="visible_length_exceeded",
         )
 
 
 def _check_garbage(text: str) -> None:
     stripped = text.strip()
     if not stripped:
-        raise PreparationPolicyError("content is empty")
+        raise PreparationPolicyError("content is empty", code="empty_content")
     lowered = stripped.lower()
     if stripped.startswith(_JSON_OPENERS) or stripped.startswith("```"):
         try:
             json.loads(stripped.strip("` \n").replace("json\n", "", 1)) if not stripped.startswith("{") else json.loads(stripped)
-            raise PreparationPolicyError("content is a JSON payload, not the requested content")
+            raise PreparationPolicyError(
+                "content is a JSON payload, not the requested content",
+                code="invalid_content_type",
+            )
         except json.JSONDecodeError:
             pass
     if any(marker in lowered for marker in _FAILURE_MARKERS) and len(stripped) < 200:
-        raise PreparationPolicyError("content looks like a provider failure payload, not the requested content")
+        raise PreparationPolicyError(
+            "content looks like a provider failure payload, not the requested content",
+            code="invalid_content_type",
+        )
+
+
+def _opens_with_speaker_label(tokens: list[str]) -> bool:
+    """Whether the opening tokens attempt a ``Name:``-style speaker label.
+
+    Used only to DISTINGUISH the two attribution failures: a line that never
+    tried to label a speaker is ``attribution_missing``; a label naming
+    someone else (or a short form) is ``attribution_mismatch``.
+    """
+    return any(token and token[-1] in _ATTRIBUTION_NAME_SUFFIX for token in tokens)
 
 
 def _attributed_line(text: str, source: str) -> str:
@@ -447,7 +518,8 @@ def _attributed_line(text: str, source: str) -> str:
 
     Runs the same deterministic attribution parse as ``_check_attribution``
     and may therefore only be called on text that already passed it (the
-    execution-boundary presentation step). Raises on any mismatch.
+    execution-boundary presentation step). Raises on any mismatch, carrying
+    the bounded violation code.
     """
     source_tokens = source.split()
     if not source_tokens:
@@ -456,10 +528,17 @@ def _attributed_line(text: str, source: str) -> str:
     while stripped and stripped[0] in _ATTRIBUTION_OPENERS:
         stripped = stripped[1:].lstrip()
     parts = stripped.split(maxsplit=len(source_tokens))
+    opening = parts[: len(source_tokens)]
+    attribution_code = (
+        "attribution_mismatch"
+        if _opens_with_speaker_label(opening)
+        else "attribution_missing"
+    )
     if len(parts) < len(source_tokens):
         raise PreparationPolicyError(
             f"content must be a dialogue attributed to {source!r}: open with "
-            f"'{source}:' followed by the line"
+            f"'{source}:' followed by the line",
+            code=attribution_code,
         )
     name_tokens = parts[: len(source_tokens)]
     last = name_tokens[-1]
@@ -470,14 +549,16 @@ def _attributed_line(text: str, source: str) -> str:
         if core.lower() != source_tokens[-1].lower():
             raise PreparationPolicyError(
                 f"content is attributed to a different speaker; expected the "
-                f"requested source {source!r} as the opening speaker"
+                f"requested source {source!r} as the opening speaker",
+                code=attribution_code,
             )
         separator_attached = True
     for expected, actual in zip(source_tokens[:-1], name_tokens[:-1], strict=True):
         if expected.lower() != actual.lower():
             raise PreparationPolicyError(
                 f"content is attributed to a different speaker; expected the "
-                f"requested source {source!r} as the opening speaker"
+                f"requested source {source!r} as the opening speaker",
+                code="attribution_mismatch",
             )
     rest = " ".join(parts[len(source_tokens):]).strip()
     if separator_attached:
@@ -486,12 +567,14 @@ def _attributed_line(text: str, source: str) -> str:
         if not rest or rest[0] not in _ATTRIBUTION_SEPARATORS:
             raise PreparationPolicyError(
                 f"content must open with {source!r} followed by a separator "
-                f"and the dialogue line"
+                f"and the dialogue line",
+                code="attribution_missing",
             )
         line = rest[1:].strip()
     if not line:
         raise PreparationPolicyError(
-            f"content must include the dialogue line after the {source!r} attribution"
+            f"content must include the dialogue line after the {source!r} attribution",
+            code="empty_content",
         )
     return line
 
@@ -528,7 +611,7 @@ def validate_content(text: Any, policy: PreparationPolicy) -> str:
     never modified, truncated, or repaired.
     """
     if not isinstance(text, str):
-        raise PreparationPolicyError("content must be a string")
+        raise PreparationPolicyError("content must be a string", code="invalid_content_type")
     _check_garbage(text)
     visible = text
     if policy.source:
@@ -539,7 +622,8 @@ def validate_content(text: Any, policy: PreparationPolicy) -> str:
             raise PreparationPolicyError(
                 f"exact canonical quote from {policy.source!r} cannot be "
                 "independently verified: no trusted source corpus or verifier "
-                "is configured"
+                "is configured",
+                code="unverifiable_exact_quote",
             )
         # Generated in-character dialogue: deterministic self-attribution is
         # enforced (a provider label is never treated as canon, only as the
@@ -572,5 +656,6 @@ def validate_prepared_arguments(arguments: dict[str, Any], policy: PreparationPo
             validate_content(value, policy)
     if policy.source and not found_content:
         raise PreparationPolicyError(
-            f"source-specific content for {policy.source!r} has no verifiable content field"
+            f"source-specific content for {policy.source!r} has no verifiable content field",
+            code="attribution_missing",
         )

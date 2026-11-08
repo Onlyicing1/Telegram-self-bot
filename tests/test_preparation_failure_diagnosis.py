@@ -90,7 +90,7 @@ def _json_body(text: str, *, name: str = "bio_set_text", key: str = "text") -> s
     return json.dumps({"actions": [{"name": name, "arguments": {key: text}}]})
 
 
-def _task_data(actions=None) -> dict:
+def _task_data(actions=None, instruction: str = BIO_INSTRUCTION) -> dict:
     return {
         "label": "Update Bio",
         "schedule_type": "once",
@@ -98,13 +98,13 @@ def _task_data(actions=None) -> dict:
         "timezone": "Asia/Tehran",
         "actions": actions if actions is not None else [{"name": "bio_set_text", "arguments": {"text": ""}}],
         "notification_destination": {},
-        "ai_instruction": BIO_INSTRUCTION,
+        "ai_instruction": instruction,
     }
 
 
-async def _run(providers, *, actions=None):
+async def _run(providers, *, actions=None, instruction: str = BIO_INSTRUCTION):
     repo = InMemoryTaskRepository()
-    task = await repo.create_task(OWNER, _task_data(actions))
+    task = await repo.create_task(OWNER, _task_data(actions, instruction))
     calls: list = []
     registry = ToolRegistry()
     registry.register(RecordingBioTool(calls))
@@ -188,6 +188,76 @@ async def test_attribution_to_the_requested_source_is_required(generated):
     assert calls == []
     assert stored.error_metadata["error_class"] == "content_policy_rejected"
     assert stored.error_metadata["failure_stage"] == "content_policy"
+
+
+# ── Precise violation codes through the real coordinator ──────────────────
+
+
+@pytest.mark.asyncio
+async def test_visible_length_code_is_persisted():
+    providers = _ScriptedProviders(_response(_json_body(LABEL + "a" * 71)))
+    result, stored, calls = await _run(providers)
+
+    assert calls == []
+    assert stored.error_metadata["error_class"] == "content_policy_rejected"
+    assert stored.error_metadata["failure_stage"] == "content_policy"
+    assert stored.error_metadata["policy_violation"] == "visible_length_exceeded"
+    assert stored.error_metadata["preparation_attempts"] == MAX_PREPARATION_ATTEMPTS
+
+
+@pytest.mark.asyncio
+async def test_missing_and_wrong_attribution_persist_distinct_codes():
+    missing = _ScriptedProviders(_response(_json_body(DIALOGUE)))
+    _, stored, calls = await _run(missing)
+    assert calls == []
+    assert stored.error_metadata["policy_violation"] == "attribution_missing"
+
+    wrong = _ScriptedProviders(_response(_json_body("Shikamaru: " + DIALOGUE)))
+    _, stored, calls = await _run(wrong)
+    assert calls == []
+    assert stored.error_metadata["policy_violation"] == "attribution_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_language_code_is_persisted():
+    providers = _ScriptedProviders(_response(_json_body(LABEL + "چه دردسر...")))
+    _, stored, calls = await _run(providers)
+
+    assert calls == []
+    assert stored.error_metadata["policy_violation"] == "language_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_exact_length_and_empty_content_codes_are_persisted():
+    exact = _ScriptedProviders(_response(_json_body(LABEL + "abc")))
+    _, stored, _ = await _run(
+        exact,
+        instruction=(
+            "update my bio, with a randomly generated dialogue, in English, "
+            "exactly 10 characters, from Shikamaru Nara"
+        ),
+    )
+    assert stored.error_metadata["policy_violation"] == "visible_length_mismatch"
+
+    empty = _ScriptedProviders(_response(_json_body("")))
+    _, stored, _ = await _run(empty)
+    assert stored.error_metadata["policy_violation"] == "empty_content"
+
+
+@pytest.mark.asyncio
+async def test_policy_diagnostic_log_is_precise_and_content_free(caplog):
+    import logging
+
+    providers = _ScriptedProviders(_response(_json_body(LABEL + "a" * 71)))
+    with caplog.at_level(logging.WARNING, logger="backend.ai.task_execution"):
+        _, stored, calls = await _run(providers)
+
+    assert calls == []
+    messages = "\n".join(record.getMessage() for record in caplog.records)
+    assert "violation=visible_length_exceeded" in messages
+    assert DIALOGUE not in messages
+    assert "a" * 71 not in messages
+    assert BIO_INSTRUCTION not in messages
 
 
 # ── Parse / structure stages ────────────────────────────────────────────────
@@ -281,7 +351,7 @@ async def test_failure_record_is_safe_and_never_carries_generated_content():
     assert set(stored.error_metadata) <= {
         "error_class", "attempt", "action_count", "successful_action_count",
         "failure_stage", "preparation_attempts", "provider_failure_origin",
-        "provider_finish_reason", "actions",
+        "provider_finish_reason", "policy_violation", "actions",
     }
     assert stored.error_metadata["action_count"] == 1
     assert stored.error_metadata["successful_action_count"] == 0

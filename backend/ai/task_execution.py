@@ -52,6 +52,7 @@ from backend.ai.tools.executor import ToolExecutionResult, ToolExecutor
 from backend.ai.tools.registry import ToolRegistry
 from backend.ai.preparation_policy import (
     CONTENT_FIELDS,
+    POLICY_VIOLATION_CODES,
     PreparationPolicy,
     PreparationPolicyError,
     derive_policy,
@@ -111,6 +112,8 @@ class TaskPreparationError(ValueError):
     occurrence persists. ``provider_origin``/``provider_finish_reason`` carry
     the provider's OWN classification (rate limit, model lookup, safety block,
     token truncation) — never its message and never any generated text.
+    ``policy_violation`` is the deterministic rule that rejected the content
+    (bounded vocabulary), or empty when this failure is not a policy one.
     """
 
     DEFAULT_CATEGORY = "preparation_failed"
@@ -123,6 +126,7 @@ class TaskPreparationError(ValueError):
         stage: str = "preparation",
         provider_origin: str = "",
         provider_finish_reason: str = "",
+        policy_violation: str = "",
         attempts: int = 1,
     ) -> None:
         super().__init__(message)
@@ -132,6 +136,11 @@ class TaskPreparationError(ValueError):
             provider_origin, _PROVIDER_FAILURE_ORIGINS
         )
         self.provider_finish_reason = _bounded_provider_diagnostic(provider_finish_reason)
+        # Only the bounded vocabulary is persisted; anything else is dropped
+        # rather than becoming an arbitrary diagnostic string.
+        self.policy_violation = (
+            policy_violation if policy_violation in POLICY_VIOLATION_CODES else ""
+        )
         self.attempts = max(1, int(attempts)) if isinstance(attempts, int) else 1
 
 
@@ -363,6 +372,7 @@ class AIActionPreparator:
                     f"prepared content violates the task policy: {exc}",
                     category="content_policy_rejected",
                     stage="content_policy",
+                    policy_violation=exc.code,
                 ) from exc
             prepared.append({"name": template["name"], "arguments": dict(arguments)})
         return prepared
@@ -411,6 +421,7 @@ class AIActionPreparator:
             stage=getattr(last_error, "stage", "preparation"),
             provider_origin=getattr(last_error, "provider_origin", ""),
             provider_finish_reason=getattr(last_error, "provider_finish_reason", ""),
+            policy_violation=getattr(last_error, "policy_violation", ""),
             attempts=attempt,
         )
 
@@ -1394,10 +1405,11 @@ class TaskExecutionCoordinator:
         except Exception as exc:
             logger.warning(
                 "TASK_PREPARE_AHEAD_FAILED task_id=%s occurrence_key=%s exception=%s "
-                "category=%s stage=%s attempts=%s detail=%s",
+                "category=%s stage=%s attempts=%s violation=%s detail=%s",
                 occurrence.task_id, occurrence.occurrence_key, type(exc).__name__,
                 getattr(exc, "category", ""), getattr(exc, "stage", ""),
-                getattr(exc, "attempts", ""), str(exc)[:200],
+                getattr(exc, "attempts", ""), getattr(exc, "policy_violation", "") or "-",
+                str(exc)[:200],
             )
             return None
         prepared_at = datetime.now(timezone.utc).isoformat()
@@ -1520,7 +1532,10 @@ class TaskExecutionCoordinator:
                     validate_prepared_arguments(call.get("arguments", {}), policy)
             except PreparationPolicyError as exc:
                 last_error = TaskPreparationError(
-                    f"prepared content violates the task policy: {exc}"
+                    f"prepared content violates the task policy: {exc}",
+                    category="content_policy_rejected",
+                    stage="content_policy",
+                    policy_violation=exc.code,
                 )
                 continue
             return prepared
@@ -1530,6 +1545,7 @@ class TaskExecutionCoordinator:
             stage=getattr(last_error, "stage", "preparation"),
             provider_origin=getattr(last_error, "provider_origin", ""),
             provider_finish_reason=getattr(last_error, "provider_finish_reason", ""),
+            policy_violation=getattr(last_error, "policy_violation", ""),
             attempts=attempt,
         )
 
@@ -1548,7 +1564,12 @@ class TaskExecutionCoordinator:
             try:
                 validate_prepared_arguments(call.get("arguments", {}), policy)
             except PreparationPolicyError as exc:
-                raise TaskPreparationError(f"prepared content violates the task policy: {exc}") from exc
+                raise TaskPreparationError(
+                    f"prepared content violates the task policy: {exc}",
+                    category="content_policy_rejected",
+                    stage="content_policy",
+                    policy_violation=exc.code,
+                ) from exc
 
     @staticmethod
     def _validate_prepared_calls(
@@ -1676,11 +1697,14 @@ class TaskExecutionCoordinator:
                 diagnostics["provider_failure_origin"] = error.provider_origin
             if error.provider_finish_reason:
                 diagnostics["provider_finish_reason"] = error.provider_finish_reason
+            if error.policy_violation:
+                diagnostics["policy_violation"] = error.policy_violation
             logger.warning(
                 "TASK_PREPARATION_FAILED task_id=%s occurrence_key=%s category=%s "
-                "stage=%s attempts=%s origin=%s",
+                "stage=%s attempts=%s origin=%s violation=%s",
                 occurrence.task_id, occurrence.occurrence_key, error.category,
                 error.stage, error.attempts, error.provider_origin or "-",
+                error.policy_violation or "-",
             )
         error_metadata = _bounded_metadata({
             "error_class": failure_class,
