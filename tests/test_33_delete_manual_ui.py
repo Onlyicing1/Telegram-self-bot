@@ -23,6 +23,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
+from telethon.tl.types import InputBotInlineMessageID
 
 from backend.ai.tools.context import ToolContext
 from backend.ai.tools.delete import DeleteRepliedTool, DeleteTool
@@ -36,6 +37,7 @@ OWNER = 111
 CHAT = -100
 PANEL_MSG = 500
 COMMAND_MSG = 900
+INLINE_ID = InputBotInlineMessageID(dc_id=2, id=1, access_hash=2)
 
 delete_ui.register(None, OWNER)
 
@@ -62,6 +64,9 @@ class FakeClient:
         self.deleted: list[int] = []
         self.batches: list[list[int]] = []
         self.edits: list[tuple[int, int, str]] = []
+        #: Panel edits attempted with the owner's OWN account. The Glass panel
+        #: belongs to the Helper Bot, so tests assert this stays empty.
+        self.self_edits: list[tuple] = []
         self.handlers: list = []
         self.fail_on_batch: int | None = None
         self.delete_delay = 0.0
@@ -106,12 +111,28 @@ class FakeClient:
         self.deleted.extend(batch)
 
     async def edit_message(self, chat_id, message_id, text, **kwargs):
-        self.edits.append((chat_id, message_id, text))
+        self.self_edits.append((chat_id, message_id, text))
+
+
+class FakeHelper:
+    """The Helper Bot: the ONLY principal allowed to edit the Glass panel."""
+
+    def __init__(self, client: FakeClient) -> None:
+        self._client = client
+        self.inline_ids: list = []
+        self.edits: list[tuple] = []
+
+    async def edit_message(self, inline_id, text=None, buttons=None, **kwargs):
+        self.inline_ids.append(inline_id)
+        if self._client.fail_edits:
+            raise RuntimeError("panel edit refused")
+        self.edits.append((inline_id, text))
+        self._client.edits.append((None, None, text))
 
 
 class FakeEvent:
     def __init__(self, *, chat_id=CHAT, message_id=PANEL_MSG, text="", sender_id=OWNER,
-                 msg_id=None):
+                 msg_id=None, inline_identifier=INLINE_ID):
         self.chat_id = chat_id
         self.message_id = message_id
         self.raw_text = text
@@ -121,6 +142,8 @@ class FakeEvent:
         self.id = msg_id if msg_id is not None else message_id
         self.message = SimpleNamespace(id=self.id)
         self.inline_message_id = None
+        # A callback on an inline panel carries Telegram's identifier here.
+        self.query = SimpleNamespace(msg_id=inline_identifier)
         self.edits: list[str] = []
 
     async def edit(self, text, buttons=None, **kwargs):
@@ -129,8 +152,10 @@ class FakeEvent:
 
 def install(monkeypatch, messages) -> FakeClient:
     client = FakeClient(messages)
+    client.fail_edits = False
+    client.helper = FakeHelper(client)
     monkeypatch.setattr(inline_engine, "_self_client", client)
-    monkeypatch.setattr(delete_ui, "get_client", lambda: None)
+    monkeypatch.setattr(delete_ui, "get_client", lambda: client.helper)
     return client
 
 
@@ -286,7 +311,7 @@ async def test_manual_message_id_input_works_without_reply_context(monkeypatch):
     target_context.clear_all()
 
     await delete_ui._del_id_input_handler(
-        "42", CHAT, COMMAND_MSG, CHAT, PANEL_MSG,
+        "42", CHAT, COMMAND_MSG, CHAT, PANEL_MSG, inline_id=INLINE_ID,
     )
 
     assert [mid for mid in client.deleted if mid != COMMAND_MSG] == [42]
@@ -297,8 +322,12 @@ async def test_manual_message_id_input_works_without_reply_context(monkeypatch):
 async def test_manual_message_id_input_rejects_foreign_and_malformed_ids(monkeypatch):
     client = install(monkeypatch, [Message(42, out=False, sender_id=222)])
 
-    await delete_ui._del_id_input_handler("42", CHAT, COMMAND_MSG, CHAT, PANEL_MSG)
-    await delete_ui._del_id_input_handler("abc", CHAT, COMMAND_MSG, CHAT, PANEL_MSG)
+    await delete_ui._del_id_input_handler(
+        "42", CHAT, COMMAND_MSG, CHAT, PANEL_MSG, inline_id=INLINE_ID,
+    )
+    await delete_ui._del_id_input_handler(
+        "abc", CHAT, COMMAND_MSG, CHAT, PANEL_MSG, inline_id=INLINE_ID,
+    )
 
     assert [mid for mid in client.deleted if mid != COMMAND_MSG] == []
     assert "Nothing was deleted" in client.edits[0][2]
@@ -427,7 +456,7 @@ async def test_date_range_respects_the_configured_timezone(monkeypatch):
     client = install(monkeypatch, [in_range, too_early, foreign])
 
     await delete_ui._del_range_input_handler(
-        "08:00 .. 10:00", CHAT, COMMAND_MSG, CHAT, PANEL_MSG,
+        "08:00 .. 10:00", CHAT, COMMAND_MSG, CHAT, PANEL_MSG, inline_id=INLINE_ID,
     )
 
     assert [mid for mid in client.deleted if mid != COMMAND_MSG] == [3]
@@ -520,11 +549,18 @@ async def test_every_manual_path_reaches_the_ownership_chokepoint(monkeypatch):
     await delete_ui._del_panel_handler(FakeEvent(), "allexec")
     await delete_ui._delfrom_panel_handler(FakeEvent(), "oneexec:3")
     await delete_ui._delfrom_panel_handler(FakeEvent(), "fromexec:3")
-    await delete_ui._del_id_input_handler("4", CHAT, COMMAND_MSG, CHAT, PANEL_MSG)
-    await delete_ui._del_from_input_handler("5", CHAT, COMMAND_MSG, CHAT, PANEL_MSG)
-    await delete_ui._del_n_input_handler("6", CHAT, COMMAND_MSG, CHAT, PANEL_MSG)
+    await delete_ui._del_id_input_handler(
+        "4", CHAT, COMMAND_MSG, CHAT, PANEL_MSG, inline_id=INLINE_ID,
+    )
+    await delete_ui._del_from_input_handler(
+        "5", CHAT, COMMAND_MSG, CHAT, PANEL_MSG, inline_id=INLINE_ID,
+    )
+    await delete_ui._del_n_input_handler(
+        "6", CHAT, COMMAND_MSG, CHAT, PANEL_MSG, inline_id=INLINE_ID,
+    )
     await delete_ui._del_range_input_handler(
         "2026-08-01 .. 2026-08-20", CHAT, COMMAND_MSG, CHAT, PANEL_MSG,
+        inline_id=INLINE_ID,
     )
 
     assert len(calls) == 8

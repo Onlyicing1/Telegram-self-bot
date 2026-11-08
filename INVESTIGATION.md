@@ -151,3 +151,29 @@ reporting and a throttled text painter.
 Chunking was NOT a defect: verification and deletion already ran in 100-id
 awaited batches with bounded memory, and every awaited RPC yields the loop. No
 batch size, bound or deadline was changed by this task.
+
+## 6. Panel ownership: the account was editing the Helper Bot's message
+
+Traced while adding the staged progress bar.
+
+1. **The inline identifier was never read.** `_progress_painter` used
+   `getattr(event, "inline_message_id", None)`. A `CallbackQuery` has no such
+   attribute — Telegram's inline handle lives at `query.msg_id` — so the value
+   was always `None` and callers fell into the next branch.
+2. **The editor was built with a self-client fallback.**
+   `_edit_panel()` passed `self_client=_self_client()`, and
+   `ExistingPanelEditor` retries a refused (or absent) inline edit through
+   `self_client.edit_message(chat, msg)`. For an inline panel that means the
+   account re-edits a message the Helper Bot owns — a silent ownership switch,
+   which is exactly what Deep Save's `_save_reply_wait_handler` avoids by
+   passing only the inline identifier and the bot.
+3. **No generation token.** Deep Save calls `begin_panel_operation` before its
+   first edit and `finish_panel_operation` after its terminal one, which is what
+   makes the newest operation the panel's only writer; the Delete painter took
+   no token, so a second click could not supersede a running run's paints.
+
+Fix: Delete now follows Deep Save exactly — `inline_message_id_from_event`,
+`begin_panel_operation`/`finish_panel_operation`, one `ExistingPanelEditor` with
+`self_client=None` reused for the whole operation, and a bounded
+`[DELETE_UI] panel edit path unavailable` warning (deletion unaffected) when the
+identifier or the bot is missing.

@@ -14,6 +14,7 @@ import time
 from types import SimpleNamespace
 
 import pytest
+from telethon.tl.types import InputBotInlineMessageID
 
 from backend.bot.handlers import delete as delete_ui
 from backend.helper import callback_gate, inline_engine, input_state, target_context
@@ -22,6 +23,7 @@ from backend.services import delete_service
 OWNER = 111
 CHAT = -100
 PANEL_MSG = 500
+INLINE_ID = InputBotInlineMessageID(dc_id=2, id=1, access_hash=2)
 
 
 class Message:
@@ -61,6 +63,9 @@ class FakeClient:
         self.max_concurrent_edits = 0
         self.fetch_sizes: list[int] = []
         self.missing_on_fetch: set[int] = set()
+        #: Any panel edit attempted with the owner's OWN account. The Glass
+        #: panel belongs to the Helper Bot, so tests assert this stays empty.
+        self.self_edits: list[tuple] = []
 
     async def iter_messages(self, chat_id, **kwargs):
         limit = kwargs.get("limit")
@@ -103,31 +108,52 @@ class FakeClient:
         self.deleted.extend(batch)
 
     async def edit_message(self, chat_id, message_id, text, **kwargs):
-        self.edits_in_flight += 1
-        self.max_concurrent_edits = max(self.max_concurrent_edits, self.edits_in_flight)
+        self.self_edits.append((chat_id, message_id, text))
+
+
+class FakeHelper:
+    """The Helper Bot: the ONLY principal allowed to edit the Glass panel."""
+
+    def __init__(self, client: FakeClient) -> None:
+        self._client = client
+        self.inline_ids: list = []
+        self.edits: list[tuple] = []
+
+    async def edit_message(self, inline_id, text=None, buttons=None, **kwargs):
+        client = self._client
+        client.edits_in_flight += 1
+        client.max_concurrent_edits = max(client.max_concurrent_edits, client.edits_in_flight)
+        self.inline_ids.append(inline_id)
         try:
-            if self.edit_delay:
-                await asyncio.sleep(self.edit_delay)
-            if self.fail_edits:
+            if client.edit_delay:
+                await asyncio.sleep(client.edit_delay)
+            if client.fail_edits:
                 raise RuntimeError("panel edit refused")
-            self.edits.append((chat_id, message_id, text))
+            self.edits.append((inline_id, text))
+            client.edits.append((None, None, text))
         finally:
-            self.edits_in_flight -= 1
+            client.edits_in_flight -= 1
 
 
 class FakeEvent:
-    def __init__(self, *, chat_id=CHAT, message_id=PANEL_MSG):
+    def __init__(
+        self, *, chat_id=CHAT, message_id=PANEL_MSG, inline_identifier=INLINE_ID,
+    ):
         self.chat_id = chat_id
         self.message_id = message_id
         self.inline_message_id = None
         self.id = message_id
         self.out = True
+        # A callback on an inline panel carries Telegram's identifier in
+        # ``query.msg_id`` — that is what ``inline_message_id_from_event`` reads.
+        self.query = SimpleNamespace(msg_id=inline_identifier)
 
 
 def install(monkeypatch, messages, **kwargs) -> FakeClient:
     client = FakeClient(messages, **kwargs)
+    client.helper = FakeHelper(client)
     monkeypatch.setattr(inline_engine, "_self_client", client)
-    monkeypatch.setattr(delete_ui, "get_client", lambda: None)
+    monkeypatch.setattr(delete_ui, "get_client", lambda: client.helper)
     return client
 
 

@@ -457,3 +457,97 @@ The single failure is
   always exact).
 * A run that hits the 20,000-candidate bound or the 240s deadline still needs
   another run; it reports the real counters and `Remaining`, never completion.
+
+---
+
+## 10. The Helper Bot owns the Delete panel (2026-11-08)
+
+### 10.1 What was wrong
+
+The Delete panel is an inline message the Helper Bot sent, but the progress and
+result painter edited it through the owner's own account:
+
+* `_edit_panel()` built `ExistingPanelEditor` with BOTH the inline identifier and
+  `self_client=...`, and `ExistingPanelEditor` falls back to
+  `self_client.edit_message(chat, msg)` whenever the inline edit is refused or
+  absent — so the account re-edited a message it does not own;
+* the painter read `event.inline_message_id`, a field a real `CallbackQuery`
+  never sets (Telegram puts the identifier in `query.msg_id`), so it was always
+  `None` and the self-client path was the one that actually ran;
+* no panel operation token was taken, so a newer click on the same panel could
+  not supersede a running deletion's writer.
+
+### 10.2 The fix — Deep Save's exact convention
+
+`_ProgressPainter` and `_edit_panel()` now do what
+`_save_reply_wait_handler()` does:
+
+1. `inline_message_id_from_event(event)` extracts Telegram's
+   `InputBotInlineMessageID` from the callback (`query.msg_id`);
+2. `begin_panel_operation(chat_id, msg_id)` claims the panel and returns the
+   generation token that `ExistingPanelEditor` re-checks before every edit, so a
+   newer interaction supersedes this writer instead of being overwritten;
+3. ONE
+   `ExistingPanelEditor(chat_id=…, msg_id=…, inline_id=…, helper=get_client(),
+   self_client=None, generation=…)` is created per operation and reused for the
+   scan, every deletion update and the terminal hand-over;
+4. `finish_panel_operation(...)` releases the token in a `finally` when the run
+   ends.
+
+`self_client=None` is the enforcement point: the editor has no principal to fall
+back to, so a refused inline edit simply stops painting — `self_client.
+edit_message()` is never called, no replacement message is created, nothing is
+sent into the chat, and no second editing mechanism exists. When the identifier
+or the Helper Bot is missing the painter logs one bounded
+`[DELETE_UI] panel edit path unavailable (inline_id=… helper=… chat=… msg=…)`
+warning and the deletion keeps its own semantics (same chokepoint, bounds,
+partial reporting). Input handlers receive the identifier from the pending entry
+(`panels._handle_input` stores it) and skip the same way.
+
+The terminal status is the callback's own paint of the SAME message: the handler
+returns `(title, body, buttons)` and the router edits this panel through the
+Helper Bot's event. No message is ever replaced or re-owned.
+
+### 10.3 Tests (`tests/test_delete_panel_ownership.py`, 8 tests)
+
+| Property | Test |
+| --- | --- |
+| every progress edit uses the Helper Bot | `test_every_progress_edit_uses_the_helper_and_the_callback_identifier` |
+| the identifier passed is the callback's exact inline id | same test (`all(inline is INLINE_ID …)`) |
+| the Self Client never edits the panel | same test (`client.self_edits == []`) |
+| scanning, deleting and final status share one message | `test_scanning_deleting_and_final_status_share_one_panel_message` |
+| a refused inline edit never falls back | `test_a_refused_inline_edit_never_falls_back_to_the_self_client` |
+| no identifier ⇒ unavailable, deletion intact | `test_a_missing_inline_identifier_reports_unavailable_and_still_deletes` |
+| no Helper Bot ⇒ unavailable, deletion intact | `test_a_missing_helper_reports_unavailable_and_still_deletes` |
+| the panel token is released | `test_the_panel_token_is_released_when_the_operation_ends` |
+| input results use the Helper Bot too | `test_input_result_edits_use_the_helper_too` |
+| the chokepoint stays the only deletion path | `test_the_chokepoint_stays_the_only_deletion_path` |
+
+`tests/test_33_delete_manual_ui.py` and `tests/test_34_delete_all_execution.py`
+now install a fake Helper Bot and a real `InputBotInlineMessageID` on the fake
+callback, record helper edits as panel edits, and record any self-client edit
+separately so the forbidden path is observable — it stays empty.
+
+### 10.4 Results
+
+```
+focused delete suites (test_26 … test_34, ownership, durable delete) ... 158 passed, 1 warning in 6.02s
+full suite ........................................................... 1 failed, 7205 passed, 27 skipped, 3 warnings in 141.05s (0:02:21)
+py_compile / compileall (2 modules + 3 test files) ................... exit 0
+git diff --check ..................................................... clean
+```
+
+The single full-suite failure is still
+`tests/test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`,
+which also fails on the untouched baseline `c8e5e905`; the scheduler is not
+touched by this diff. These totals include §9's 23 All-path tests plus the 8
+new ownership tests.
+
+### 10.5 Not live-verified
+
+No real Helper Bot, no real inline callback and no real `editInlineBotMessage`
+call was exercised: the tests use a fake bot and a constructed
+`InputBotInlineMessageID`, so they prove which principal the code addresses and
+that the self-client path is never taken, not that Telegram accepts the inline
+edit for a real panel. A live run must confirm the panel updates in place with
+no second message and no "message can't be edited" error.

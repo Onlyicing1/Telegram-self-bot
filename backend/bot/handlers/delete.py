@@ -95,6 +95,28 @@ def _chat_for(event) -> int:
     return 0
 
 
+def _panel_editor(*, chat_id: int, msg_id: int, inline_id, generation: int = 0):
+    """The Helper Bot's editor for ONE Glass panel — the panel's only writer.
+
+    The Delete panel is an inline message the Helper Bot sent, so the bot is its
+    owner and must stay its only editor, exactly as Deep Save does it. There is
+    deliberately **no** ``self_client`` here: an inline panel can only be
+    rewritten by the principal Telegram gave the inline identifier to, and
+    switching to the account's own ``edit_message`` would change the message's
+    ownership instead of reporting the panel as unavailable.
+    """
+    from backend.helper.panel_edit import ExistingPanelEditor
+
+    return ExistingPanelEditor(
+        chat_id=chat_id,
+        msg_id=msg_id,
+        inline_id=inline_id,
+        helper=get_client(),
+        self_client=None,
+        generation=generation,
+    )
+
+
 async def _edit_panel(
     text: str,
     *,
@@ -104,28 +126,26 @@ async def _edit_panel(
     inline_msg_id: int | None,
     inline_id=None,
 ) -> bool:
-    """Report on the panel the owner is looking at, through the real edit paths.
+    """Report on the panel the owner is looking at, through the Helper Bot.
 
-    The Helper Bot's inline edit is tried first (it is the only principal that
-    can replace an inline panel's keyboard), and the owner's own account edits
-    the same message when the inline path is unavailable — so a helper-less
-    runtime still shows the result instead of nothing.
+    ``inline_id`` is Telegram's ``InputBotInlineMessageID`` for that message,
+    carried on the pending input entry by ``panels._handle_input``. Without it
+    (or without the bot) the panel is simply not painted: the edit is skipped
+    and logged once, and the deletion keeps its own result — the message is
+    never re-owned and no replacement message is sent.
     """
-    from backend.helper.panel_edit import ExistingPanelEditor
-
-    editor = ExistingPanelEditor(
-        chat_id=int(inline_chat_id or chat_id or 0),
-        msg_id=int(inline_msg_id or msg_id or 0),
-        inline_id=inline_id,
-        helper=get_client(),
-        self_client=_self_client(),
-    )
-    if not editor.available:
+    panel_chat = int(inline_chat_id or chat_id or 0)
+    panel_msg = int(inline_msg_id or msg_id or 0)
+    if inline_id is None or get_client() is None:
         logger.warning(
-            "DELETE_UI no panel surface for the result (chat=%s msg=%s)",
-            chat_id, msg_id,
+            "[DELETE_UI] panel edit path unavailable (inline_id=%s helper=%s) — "
+            "no status was painted",
+            inline_id is not None, get_client() is not None,
         )
         return False
+    editor = _panel_editor(
+        chat_id=panel_chat, msg_id=panel_msg, inline_id=inline_id,
+    )
     return await editor.edit(text)
 
 
@@ -232,8 +252,15 @@ def _progress_message(snapshot: dict) -> str:
     return f"**{_ALL_TITLE}**\n\n{_render_scan_progress(snapshot)}"
 
 
-def _progress_painter(event):
-    """A throttled, single-flight progress painter for the panel this click came from.
+class _ProgressPainter:
+    """The All operation's single writer for the panel the click came from.
+
+    One ``ExistingPanelEditor`` bound to the Helper Bot and Telegram's inline
+    identifier is created ONCE and reused for scanning, deletion progress and
+    the terminal hand-over, so the same Glass message is rewritten in place and
+    nothing else ever edits it. A panel operation token (``begin_panel_operation``
+    / ``finish_panel_operation``) makes this run the panel's newest writer; a
+    newer click supersedes it and its paints stop instead of overwriting it.
 
     The snapshot carries only measured figures (``scanned``/``considered``
     while the history is read, ``total``/``deleted``/``rejected`` afterwards),
@@ -243,40 +270,77 @@ def _progress_painter(event):
     in flight. A slow or failed edit is swallowed — progress must not slow the
     deletion down, and must not fail it.
     """
-    chat_id = _chat_for(event)
-    msg_id = getattr(event, "message_id", None)
-    inline_id = getattr(event, "inline_message_id", None)
-    state = {"last": 0.0, "text": "", "busy": False}
 
-    async def paint(snapshot: dict) -> None:
+    def __init__(self, event) -> None:
+        from backend.helper.panel_edit import (
+            begin_panel_operation,
+            inline_message_id_from_event,
+        )
+
+        self._chat_id = _chat_for(event)
+        self._msg_id = int(getattr(event, "message_id", None) or 0)
+        inline_id = inline_message_id_from_event(event)
+        helper = get_client()
+        self._generation = 0
+        self._editor = None
+        if inline_id is not None and helper is not None and self._chat_id and self._msg_id:
+            self._generation = begin_panel_operation(self._chat_id, self._msg_id)
+            self._editor = _panel_editor(
+                chat_id=self._chat_id, msg_id=self._msg_id,
+                inline_id=inline_id, generation=self._generation,
+            )
+            logger.info(
+                "[DELETE_UI] progress panel edit path=%s chat=%s msg=%s",
+                self._editor.path, self._chat_id, self._msg_id,
+            )
+        else:
+            logger.warning(
+                "[DELETE_UI] panel edit path unavailable (inline_id=%s helper=%s "
+                "chat=%s msg=%s) — the deletion runs without progress updates",
+                inline_id is not None, helper is not None,
+                bool(self._chat_id), bool(self._msg_id),
+            )
+        self._last = 0.0
+        self._text = ""
+        self._busy = False
+
+    @property
+    def available(self) -> bool:
+        return self._editor is not None
+
+    async def __call__(self, snapshot: dict) -> None:
+        if self._editor is None:
+            return
         text = _progress_message(snapshot)
-        if text == state["text"]:
+        if text == self._text:
             return
         now = time.monotonic()
-        if state["last"] and now - state["last"] < _PROGRESS_PAINT_INTERVAL:
+        if self._last and now - self._last < _PROGRESS_PAINT_INTERVAL:
             return
-        if state["busy"]:
+        if self._busy:
             # Never queue a second edit behind one that has not returned.
             return
-        state["text"] = text
-        state["last"] = now
-        state["busy"] = True
+        self._text = text
+        self._last = now
+        self._busy = True
         try:
-            await asyncio.wait_for(
-                _edit_panel(
-                    text,
-                    chat_id=chat_id, msg_id=msg_id,
-                    inline_chat_id=chat_id, inline_msg_id=msg_id,
-                    inline_id=inline_id,
-                ),
-                timeout=_PROGRESS_EDIT_TIMEOUT,
-            )
+            await asyncio.wait_for(self._editor(text), timeout=_PROGRESS_EDIT_TIMEOUT)
         except Exception as exc:  # noqa: BLE001 — progress never aborts a deletion
             logger.debug("DELETE_UI progress paint failed: %s", exc)
         finally:
-            state["busy"] = False
+            self._busy = False
 
-    return paint
+    def close(self) -> None:
+        """Release the panel token so a later Delete can become its writer."""
+        from backend.helper.panel_edit import finish_panel_operation
+
+        if self._generation:
+            finish_panel_operation(self._chat_id, self._msg_id, self._generation)
+            self._generation = 0
+
+
+def _progress_painter(event) -> _ProgressPainter:
+    return _ProgressPainter(event)
 
 
 def _all_result_text(
@@ -445,12 +509,19 @@ async def _del_view(event, extra: str) -> tuple[str, str, list]:
             return _unavailable()
         report = DeleteReport(requested="all of your messages in this chat")
         progress = _progress_painter(event)
-        # Say that the scan started BEFORE it starts: a large chat must never
-        # look frozen while the history is being read.
-        await progress({})
-        _considered, _deleted, error = await delete_service.do_del_self_filtered(
-            client, chat_id, report=report, progress=progress,
-        )
+        error: Exception | None = None
+        try:
+            # Say that the scan started BEFORE it starts: a large chat must
+            # never look frozen while the history is being read.
+            await progress({})
+            _considered, _deleted, error = await delete_service.do_del_self_filtered(
+                client, chat_id, report=report, progress=progress,
+            )
+        finally:
+            # The panel token is released here; the terminal view below is the
+            # callback's own paint of this SAME message through the router, so
+            # the panel is never replaced and never re-owned.
+            progress.close()
         title, body = _all_result_text(report, error=error)
         return title, body, _back_row()
 
