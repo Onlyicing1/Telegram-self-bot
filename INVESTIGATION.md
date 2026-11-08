@@ -88,3 +88,34 @@ to skip it for speed.
 * Timezone: `TZ` (default `Asia/Tehran`), the same source `backend/config.py` uses;
   no second parser was added (`split_range()` splits, `parse_time_range` parses).
 * No scheduler, worker, extra client, or second deletion mechanism.
+
+## 4. Follow-up: why manual "All my messages" hung and deleted nothing
+
+The owner's live test overrode the first report, so the All path was traced again
+at `15bc401`.
+
+1. **No total deadline.** `_del_view("allexec")` called
+   `do_del_self_filtered()` without `deadline`, and the service only honoured a
+   caller-supplied one. The scan bound (50,000) and the 5s per-RPC timeout bound
+   individual calls, not the operation: 20,000 candidates mean ~200 ownership
+   RPCs plus ~200 delete batches, which can run for a very long time while the
+   panel handler — and therefore the visible panel — waits.
+2. **Verified candidates were thrown away.** `do_del_self_filtered()` returned
+   immediately when `selection.error` was set. `select_self_owned_message_ids()`
+   returns the ids it already collected together with that error, so one history
+   RPC failure produced zero deletions instead of a partial, honest result.
+3. **The candidate bound was not enforced in All mode.** `MAX_DELETE_COUNT` was
+   checked only in the `count is not None` branch, so `count=None` could select
+   the full 50,000-scan-bound worth of ids.
+4. **The preview could stall the confirmation panel.**
+   `preview_self_owned_count()` was awaited inside the panel handler with only the
+   per-message 5s RPC timeout, so 200 sampled messages could delay the panel by
+   minutes.
+5. **No sign of life.** The callback query was acknowledged, then nothing edited
+   the panel until the whole operation returned. Even a bounded operation looked
+   frozen.
+
+The ownership chokepoint itself was NOT the defect: every path already went
+through `delete_verified_self_messages()`, which re-fetches and checks `out` +
+`sender_id` per id in 100-id batches. The fix adds a deadline and partial-result
+reporting around it without bypassing or weakening it.

@@ -148,11 +148,108 @@ which was already failing on the untouched base commit before any edit here
 (`interval advancement exceeded bound` in `task_scheduler`). It is unrelated to
 Delete and was left untouched per scope control.
 
-## 7. Not verified against live Telegram
+## 7. Follow-up fix (live failure): manual "All my messages"
 
-Nothing here was exercised against a real account: no real self-client, no real
-`messages.deleteMessages` permission check, no real large-chat history. The chat
-resolution and the streaming path are verified only by the fake-client tests above.
-A live smoke test is still required: verify Recent Messages / Delete From without a
-reply, a 501+ count, All on a chat with more than 1000 owner messages, and the date
-range in the configured timezone.
+The first implementation made All reachable but not safe to run: the owner's live
+test hung and deleted nothing.
+
+### Confirmed root causes
+
+1. `_del_view("allexec")` called `do_del_self_filtered()` with no deadline, and the
+   service only honoured a caller-supplied one, so the 50,000-message scan and
+   every verification/deletion batch ran with no total bound. A 5s per-RPC
+   timeout is not an operation deadline: ~200 verification RPCs plus ~200 delete
+   RPCs could occupy the better part of an hour while the panel sat on the click.
+2. `do_del_self_filtered()` returned as soon as `selection.error` was set,
+   discarding the ids the scan had already verified — zero deletions after any
+   history error.
+3. `MAX_DELETE_COUNT` was documented as the per-operation candidate bound but
+   enforced only when `count` was passed; All mode could collect the whole scan
+   bound (50,000 ids) before deleting.
+4. `preview_self_owned_count()` was awaited inside the panel handler with only the
+   per-RPC 5s timeout per sampled message, so the confirmation panel could take
+   minutes to appear (200 × 5s worst case).
+5. Nothing told the owner work had started: the callback was acked, then the panel
+   stayed unchanged for the whole operation.
+
+### Exact code changes
+
+* `delete_service.do_del_self_filtered`: establishes
+  `deadline = time.monotonic() + _DELETE_OPERATION_DEADLINE_SECONDS` when the caller
+  passes none (a shorter AI deadline still wins) and applies it to BOTH selection
+  and the ownership chokepoint.
+* `delete_service.delete_verified_self_messages`: keyword-only `deadline` and
+  `stopped` dict. Every verification chunk and delete batch is preceded by a
+  monotonic check; on expiry the remaining ids are left untouched (never reported
+  as ownership rejections) and `stopped["reason"]` records why. An awaitable
+  `on_batch` result is awaited, so batch-boundary progress works without a second
+  task or loop.
+* `delete_service._iter_messages_bounded`: the per-page RPC timeout is clamped to
+  the operation's remaining budget.
+* `delete_service.select_self_owned_message_ids`: enforces `MAX_DELETE_COUNT` when
+  `count is None`, returning `complete=False` with `candidate limit (N) reached`,
+  and reports `scanned`/`considered` through a new `progress` callback every
+  `_DELETE_PROGRESS_EVERY` messages.
+* `do_del_self_filtered`: a failed scan no longer discards verified ids — they are
+  processed through the chokepoint inside the remaining budget and the scan error
+  is returned so the panel reports a partial result. A scan that produced no ids
+  at all still attempts no deletion (unresolved identity, missing boundary, etc.).
+* `do_del_id_counts`: passes its existing deadline/stop record into the chokepoint.
+* `preview_self_owned_count`: its own 3s wall clock (`_DELETE_PREVIEW_SECONDS`).
+* `backend/bot/handlers/delete.py`: `_progress_painter(event)` paints a throttled
+  (3s), individually bounded (5s) `Working — scanned N · M of yours verified ·
+  K deleted` status on the same panel, starting before the scan and never able to
+  fail the operation. The All confirmation wraps its preview in a 5s `wait_for`
+  and renders anyway ("preview unavailable") when it cannot be read.
+
+### Tests added
+
+`tests/test_34_delete_all_execution.py` — 11 tests using the real panel handler and
+real service against a deterministic fake client: self-applied total deadline; slow
+history returns a partial result; a mid-scan error still deletes the verified ids;
+a failure before any candidate deletes nothing; the candidate bound; the history
+scan bound; a deadline mid-deletion keeps real counts; no id is deleted twice;
+foreign messages stay untouched on the error path; the preview is bounded and still
+confirms; progress is painted and the final result is exact.
+
+`tests/test_33_delete_manual_ui.py::test_every_manual_path_reaches_the_ownership_chokepoint`
+now dates its messages into the range, because a scope with zero candidates
+legitimately performs no deletion and therefore calls no chokepoint.
+
+### Results
+
+```
+tests/test_34_delete_all_execution.py ................. 11 passed in 1.90s
+focused batch (test_27–test_34, tool/AI/colored/saved) ... 309 passed in 8.36s
+full suite ..................... 7185 passed, 27 skipped, 1 failed in 137.01s
+py_compile (both changed modules) ...................... COMPILE_OK
+git diff --check ...................................... clean
+```
+
+The one failure is
+`tests/test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`,
+which failed on the untouched base commit before any Delete edit; the scheduler is
+not touched by this diff.
+
+### Remaining limitations
+
+* The deadline bounds one operation to 240s of wall clock. A chat with more than
+  `MAX_DELETE_COUNT` (20,000) of the owner's messages needs more than one run, and
+  each run says so honestly instead of pretending it finished.
+* Progress is a same-panel text edit every ≥3s; a refused edit is swallowed and
+  Telegram flood limits are not modelled beyond the per-edit timeout.
+* Only the All path gained the new deadline/partial/progress coverage; the
+  quick-count, Delete From, message-ID, date-range and AI paths keep their existing
+  suites, which still pass.
+
+## 8. Not verified against live Telegram
+
+Nothing here has been exercised against a real account: no real self-client, no real
+`messages.deleteMessages` permission check, no real large-chat history, and no real
+callback timing. Chat resolution, the deadline, partial handling and progress are
+verified only by the fake-client tests above.
+
+A live smoke test is still required after deploy: run All on a chat with more than
+1000 owner messages and confirm the panel shows the Working line, ends with real
+deleted/rejected counts, a second run continues from what remains, and no message
+from another participant is ever deleted.

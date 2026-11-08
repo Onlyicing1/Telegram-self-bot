@@ -500,7 +500,13 @@ async def test_foreign_missing_and_malformed_ids_remain_rejected(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_every_manual_path_reaches_the_ownership_chokepoint(monkeypatch):
-    client = install(monkeypatch, [Message(i) for i in range(1, 31)])
+    # Dates inside the range below, so the time-filter path has real
+    # candidates too: a scope with zero candidates legitimately attempts no
+    # deletion, and only then may it skip the chokepoint.
+    in_range = datetime(2026, 8, 10, 12, tzinfo=timezone.utc)
+    client = install(
+        monkeypatch, [Message(i, date=in_range) for i in range(1, 31)],
+    )
     calls: list[list[int]] = []
 
     async def _spy(chosen_client, chat_id, ids, **kwargs):

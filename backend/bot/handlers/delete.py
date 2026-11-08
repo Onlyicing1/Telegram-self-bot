@@ -17,8 +17,10 @@ having to reply to something first. Ownership is NOT decided here: every chat
 deletion goes through ``backend.services.delete_service`` and its single
 ``delete_verified_self_messages`` chokepoint.
 """
+import asyncio
 import logging
 import os
+import time
 
 from backend.services import delete_service
 from backend.services.delete_service import MAX_DELETE_COUNT, DeleteReport
@@ -38,6 +40,12 @@ logger = logging.getLogger(__name__)
 
 _RECENT_PAGE_SIZE = 8
 _QUICK_COUNTS = (10, 25, 50, 100, 250, 500)
+#: Progress is advisory: a long deletion costs a few panel edits, never one per
+#: message, and one slow edit can never hold up the operation.
+_PROGRESS_PAINT_INTERVAL = 3.0
+_PROGRESS_EDIT_TIMEOUT = 5.0
+#: The confirmation panel must render even when the preview cannot be read.
+_ALL_PREVIEW_TIMEOUT = 5.0
 
 
 # ── shared plumbing ─────────────────────────────────────────────────────────
@@ -157,6 +165,52 @@ def _report_text(report: DeleteReport, *, error: Exception | None = None) -> str
     return "\n".join(lines)
 
 
+def _progress_painter(event):
+    """A throttled progress painter for the panel this click came from.
+
+    The snapshot carries only measured figures (``scanned`` while the history is
+    read, ``considered``/``deleted`` afterwards), so the panel never renders a
+    number nobody counted. Painting is throttled and individually bounded:
+    progress must not slow the deletion down, and must not fail it.
+    """
+    chat_id = _chat_for(event)
+    msg_id = getattr(event, "message_id", None)
+    inline_id = getattr(event, "inline_message_id", None)
+    state = {"last": 0.0}
+
+    async def paint(snapshot: dict) -> None:
+        now = time.monotonic()
+        if state["last"] and now - state["last"] < _PROGRESS_PAINT_INTERVAL:
+            return
+        state["last"] = now
+        parts: list[str] = []
+        if "scanned" in snapshot:
+            parts.append(f"scanned {snapshot['scanned']} message(s)")
+        if "considered" in snapshot:
+            parts.append(f"{snapshot['considered']} of yours verified")
+        if "deleted" in snapshot:
+            parts.append(f"{snapshot['deleted']} deleted")
+        detail = " · ".join(parts) or "starting the history scan"
+        text = (
+            f"{sym.OP_DELETE} Working — {detail}.\n\n"
+            "Only messages sent by your account are ever deleted."
+        )
+        try:
+            await asyncio.wait_for(
+                _edit_panel(
+                    text,
+                    chat_id=chat_id, msg_id=msg_id,
+                    inline_chat_id=chat_id, inline_msg_id=msg_id,
+                    inline_id=inline_id,
+                ),
+                timeout=_PROGRESS_EDIT_TIMEOUT,
+            )
+        except Exception as exc:  # noqa: BLE001 — progress never aborts a deletion
+            logger.debug("DELETE_UI progress paint failed: %s", exc)
+
+    return paint
+
+
 def _back_row(target: str = "panel:del") -> list:
     builder = InlinePanelBuilder()
     builder.add_row(sym.label(sym.OP_BACK, "Back"), target)
@@ -249,7 +303,14 @@ async def _del_view(event, extra: str) -> tuple[str, str, list]:
             return _no_chat()
         if client is None:
             return _unavailable()
-        owned, scanned = await delete_service.preview_self_owned_count(client, chat_id)
+        try:
+            owned, scanned = await asyncio.wait_for(
+                delete_service.preview_self_owned_count(client, chat_id),
+                timeout=_ALL_PREVIEW_TIMEOUT,
+            )
+        except Exception as exc:  # noqa: BLE001 — the preview is only advisory
+            logger.warning("DELETE_UI all preview failed: %s", exc)
+            owned, scanned = 0, 0
         builder = InlinePanelBuilder()
         builder.add_row(
             sym.label(sym.OP_DELETE, "Confirm: delete all mine"),
@@ -257,12 +318,17 @@ async def _del_view(event, extra: str) -> tuple[str, str, list]:
             SUCCESS,
         )
         builder.add_row(sym.label(sym.OP_BACK, "Back"), "panel:del")
+        preview_line = (
+            f"Preview: {owned} of the newest {scanned} message(s) here are yours; "
+            "the scan continues to the start of the chat."
+            if scanned
+            else "Preview unavailable right now, so the preview was skipped."
+        )
         return (
             "Delete",
             "Delete ALL of your messages in this chat.\n\n"
-            f"Preview: {owned} of the newest {scanned} message(s) here are yours; "
-            "the scan continues to the start of the chat. Messages sent by other "
-            "participants are never deleted.\n\n"
+            f"{preview_line} Messages sent by other participants are never "
+            "deleted.\n\n"
             f"The operation stops at {MAX_DELETE_COUNT} of your messages or its "
             "deadline, and reports exactly how far it got.",
             builder.build(),
@@ -274,8 +340,12 @@ async def _del_view(event, extra: str) -> tuple[str, str, list]:
         if client is None:
             return _unavailable()
         report = DeleteReport()
+        progress = _progress_painter(event)
+        # Say that work started BEFORE the scan: a large chat must never look
+        # frozen while the history is being read.
+        await progress({})
         _considered, _deleted, error = await delete_service.do_del_self_filtered(
-            client, chat_id, report=report,
+            client, chat_id, report=report, progress=progress,
         )
         return "Delete", _report_text(report, error=error), _back_row()
 

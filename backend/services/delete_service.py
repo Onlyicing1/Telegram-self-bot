@@ -6,9 +6,10 @@ Both text commands and inline panels call these exact functions.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, time as datetime_time, timedelta, timezone, tzinfo
 from typing import Any
@@ -40,6 +41,11 @@ _DELETE_VERIFY_CHUNK = 100
 _DELETE_RPC_TIMEOUT_SECONDS = 5.0
 _DELETE_OPERATION_DEADLINE_SECONDS = 240.0
 _DELETE_PREVIEW_SAMPLE = 200
+#: A confirmation panel must never wait on a history scan, so the preview gets
+#: its own short wall clock instead of the operation's deadline.
+_DELETE_PREVIEW_SECONDS = 3.0
+#: How many scanned messages may pass between two progress reports.
+_DELETE_PROGRESS_EVERY = 200
 
 
 @dataclass
@@ -123,14 +129,19 @@ async def _iter_messages_bounded(client, chat_id, *, deadline: float | None = No
     kwargs["limit"] = limit
     iterator = client.iter_messages(chat_id, **kwargs)
     for _ in range(limit):
-        if deadline is not None and time.monotonic() >= deadline:
-            if stats is not None:
-                stats["stopped"] = "operation deadline"
-            return
+        timeout = _DELETE_RPC_TIMEOUT_SECONDS
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                if stats is not None:
+                    stats["stopped"] = "operation deadline"
+                return
+            # One page fetch must not outlive the operation's remaining budget.
+            timeout = min(timeout, remaining)
         try:
             yield await rpc_await(
                 iterator.__anext__(),
-                timeout=_DELETE_RPC_TIMEOUT_SECONDS,
+                timeout=timeout,
                 label="delete.iter_messages",
             )
         except StopAsyncIteration:
@@ -182,6 +193,31 @@ def _is_self_owned(msg, me_id: int | None) -> bool:
     return True
 
 
+def _note_stopped(stopped: dict[str, str] | None, reason: str) -> None:
+    """Record, once, why an operation stopped before it finished."""
+    if stopped is not None:
+        stopped.setdefault("reason", reason)
+
+
+async def _emit_progress(
+    progress: Callable[[dict[str, int]], Awaitable[None]] | None,
+    **fields: int,
+) -> None:
+    """Report progress through a caller-supplied painter.
+
+    ``fields`` carries only the figures that are actually known at that point
+    (``scanned`` while the history is read, ``considered``/``deleted``
+    afterwards), so a painter can never render a number nobody measured. A
+    painter failure is logged and never aborts the deletion.
+    """
+    if progress is None:
+        return
+    try:
+        await progress(dict(fields))
+    except Exception as exc:  # noqa: BLE001 — progress is never load-bearing
+        logger.debug("DELETE_PROGRESS painter failed: %s", exc)
+
+
 def _batch_progress(report: "DeleteReport | None"):
     """A per-batch observer for :func:`delete_verified_self_messages`.
 
@@ -205,7 +241,9 @@ async def delete_verified_self_messages(
     *,
     exclude_message_id: int | None = None,
     request_id: str = "",
-    on_batch: Callable[[list[int], list[int]], None] | None = None,
+    on_batch: Callable[[list[int], list[int]], object] | None = None,
+    deadline: float | None = None,
+    stopped: dict[str, str] | None = None,
 ) -> tuple[list[int], list[int]]:
     """Delete ONLY messages verified as belonging to the authenticated account.
 
@@ -236,6 +274,11 @@ async def delete_verified_self_messages(
     verified: list[int] = []
     chunk = _DELETE_VERIFY_CHUNK
     for start in range(0, len(ids), chunk):
+        if deadline is not None and time.monotonic() >= deadline:
+            # The remaining candidates were neither verified nor deleted, so
+            # they are NOT reported as ownership rejections.
+            _note_stopped(stopped, "operation deadline reached")
+            break
         part = ids[start:start + chunk]
         try:
             fetched = await _telegram_rpc(
@@ -286,6 +329,9 @@ async def delete_verified_self_messages(
     deleted: list[int] = []
     delete_errors: list[str] = []
     for start in range(0, len(verified), chunk):
+        if deadline is not None and time.monotonic() >= deadline:
+            _note_stopped(stopped, "operation deadline reached")
+            break
         batch = verified[start:start + chunk]
         logger.info(
             "DELETE_EXECUTION_START chat_id=%s batch_size=%d ids=%s",
@@ -298,7 +344,9 @@ async def delete_verified_self_messages(
             )
             deleted.extend(batch)
             if on_batch is not None:
-                on_batch(list(batch), [])
+                outcome = on_batch(list(batch), [])
+                if inspect.isawaitable(outcome):
+                    await outcome
         except Exception as exc:
             delete_errors.append(str(exc))
             logger.error(
@@ -307,7 +355,9 @@ async def delete_verified_self_messages(
             )
             rejected.extend(batch)
             if on_batch is not None:
-                on_batch([], list(batch))
+                outcome = on_batch([], list(batch))
+                if inspect.isawaitable(outcome):
+                    await outcome
     logger.info(
         "DELETE_EXECUTION_END request_id=%s chat_id=%s deleted=%d rejected=%d",
         request_id or "-", chat_id, len(deleted), len(rejected),
@@ -415,6 +465,7 @@ async def select_self_owned_message_ids(
     tz_name: str = "UTC",
     request_id: str = "",
     deadline: float | None = None,
+    progress: Callable[[dict[str, int]], Awaitable[None]] | None = None,
 ) -> Selection:
     """Select recent self-owned IDs before the final ownership chokepoint.
 
@@ -447,6 +498,7 @@ async def select_self_owned_message_ids(
 
     selected: list[int] = []
     considered = 0
+    scanned = 0
     stats: dict[str, str] = {}
     # Topic queries are matched on the deterministic normalized form so
     # Persian/Arabic script variants, digits, and zero-width characters do
@@ -464,6 +516,11 @@ async def select_self_owned_message_ids(
             deadline=deadline, stats=stats,
         )
         async for msg in iterator:
+            scanned += 1
+            if progress is not None and scanned % _DELETE_PROGRESS_EVERY == 0:
+                await _emit_progress(
+                    progress, scanned=scanned, considered=considered,
+                )
             mid = getattr(msg, "id", None)
             if not isinstance(mid, int) or mid <= 0:
                 continue
@@ -527,6 +584,13 @@ async def select_self_owned_message_ids(
             selected.append(mid)
             if count is not None and len(selected) >= count:
                 return Selection(selected, considered, True, "")
+            if len(selected) >= MAX_DELETE_COUNT:
+                # All mode is bounded by the same per-operation candidate limit
+                # as an explicit count; reaching it is a PARTIAL result.
+                return Selection(
+                    selected, considered, False,
+                    f"candidate limit ({MAX_DELETE_COUNT}) reached",
+                )
     except Exception as exc:
         return Selection(selected, considered, False, str(exc), exc)
 
@@ -555,12 +619,18 @@ async def do_del_self_filtered(
     request_id: str = "",
     report: DeleteReport | None = None,
     deadline: float | None = None,
+    progress: Callable[[dict[str, int]], Awaitable[None]] | None = None,
 ) -> tuple[int, int, Exception | None]:
     """Delete a self-owned range after deterministic candidate selection.
 
     ``report`` (optional) is filled with the real numbers, including a partial
     result when the scan or the Telegram batches did not complete.
     """
+    if deadline is None:
+        # Every caller — the panel included — gets a real total deadline that
+        # covers BOTH the history scan and the verification/deletion batches.
+        # A shorter caller-supplied deadline (the AI tool's) still wins.
+        deadline = time.monotonic() + _DELETE_OPERATION_DEADLINE_SECONDS
     if report is not None and not report.requested:
         report.requested = _describe_scope(
             count=count, boundary_id=boundary_id, until_time=until_time,
@@ -571,6 +641,7 @@ async def do_del_self_filtered(
         boundary_id=boundary_id, query=query, match=match,
         exclude_message_id=exclude_message_id,
         tz_name=tz_name, request_id=request_id, deadline=deadline,
+        progress=progress,
     )
     ids, considered = selection.ids, selection.considered
     logger.info(
@@ -584,12 +655,31 @@ async def do_del_self_filtered(
         report.considered = considered
         report.complete = selection.complete
         report.reason = selection.reason
-    if selection.error is not None:
-        return considered, 0, selection.error
+    scan_error = selection.error
+    if not ids:
+        # Nothing was safely verified: identity unresolved, a missing boundary,
+        # a scan that failed before its first candidate, or a chat with none of
+        # the owner's messages. None of those may attempt a deletion.
+        return considered, 0, scan_error
+
+    async def _on_batch(done: list[int], failed: list[int]) -> None:
+        if report is not None:
+            report.deleted += len(done)
+            report.rejected += len(failed)
+        await _emit_progress(
+            progress,
+            considered=considered,
+            deleted=report.deleted if report is not None else 0,
+        )
+
+    stopped: dict[str, str] = {}
     try:
-        deleted, rejected = await delete_verified_self_messages(
+        # Even a failed scan keeps its verified candidates: they still pass
+        # through the same ownership chokepoint inside the remaining budget.
+        deleted, _rejected = await delete_verified_self_messages(
             client, chat_id, ids, exclude_message_id=exclude_message_id,
-            request_id=request_id, on_batch=_batch_progress(report),
+            request_id=request_id, on_batch=_on_batch,
+            deadline=deadline, stopped=stopped,
         )
     except Exception as exc:
         partial = getattr(exc, "deleted_ids", []) or []
@@ -597,7 +687,10 @@ async def do_del_self_filtered(
             report.complete = False
             report.reason = str(exc)
         return considered, len(partial), exc
-    return considered, len(deleted), None
+    if report is not None and stopped:
+        report.complete = False
+        report.reason = stopped.get("reason", "operation stopped early")
+    return considered, len(deleted), scan_error
 
 
 async def do_del_self_last_n(
@@ -747,6 +840,7 @@ async def do_del_id_counts(
     rejected_total = 0
     deadline = time.monotonic() + _DELETE_OPERATION_DEADLINE_SECONDS
     stats: dict[str, str] = {}
+    stopped: dict[str, str] = {}
     try:
         batch: list[int] = []
         async for msg in _iter_messages_bounded(
@@ -765,14 +859,16 @@ async def do_del_id_counts(
             if len(batch) >= settings_service.delete_batch_size():
                 deleted_ids, _rejected = await delete_verified_self_messages(
                     client, chat_id, batch, exclude_message_id=exclude_message_id,
-                    on_batch=_batch_progress(report),
+                    on_batch=_batch_progress(report), deadline=deadline,
+                    stopped=stopped,
                 )
                 total += len(deleted_ids)
                 batch = []
         if batch:
             deleted_ids, _rejected = await delete_verified_self_messages(
                 client, chat_id, batch, exclude_message_id=exclude_message_id,
-                on_batch=_batch_progress(report),
+                on_batch=_batch_progress(report), deadline=deadline,
+                stopped=stopped,
             )
             total += len(deleted_ids)
         record_event("delete", "del id", (asyncio.get_event_loop().time() - t0) * 1000, "SUCCESS")
@@ -781,6 +877,9 @@ async def do_del_id_counts(
             if stats.get("stopped"):
                 report.complete = False
                 report.reason = f"{stats['stopped']} reached"
+            if stopped.get("reason"):
+                report.complete = False
+                report.reason = stopped["reason"]
         return total, None
     except Exception as exc:
         logger.error("del id failed: %s", exc)
@@ -825,8 +924,11 @@ async def preview_self_owned_count(
     if me_id is None:
         return 0, 0
     owned = scanned = 0
+    deadline = time.monotonic() + _DELETE_PREVIEW_SECONDS
     try:
-        async for msg in _iter_messages_bounded(client, chat_id, limit=sample):
+        async for msg in _iter_messages_bounded(
+            client, chat_id, limit=sample, deadline=deadline,
+        ):
             scanned += 1
             if _is_self_owned(msg, me_id):
                 owned += 1
