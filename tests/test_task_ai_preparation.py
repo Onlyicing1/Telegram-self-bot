@@ -198,13 +198,15 @@ async def test_provider_failure_fails_closed_without_execution():
     ).execute(claimed)
 
     assert not result.success
-    # Pre-existing handle_failure semantics: UNKNOWN failures persist the
-    # classifier reason (the raw detail is a log concern, not the contract).
-    assert result.error == "unclassified"
+    # A preparation failure persists its own bounded category: the generic
+    # classifier would collapse it into ``unclassified`` (the raw detail stays
+    # a log concern, never part of the persisted contract).
+    assert result.error == "preparation_failed"
     assert calls == []  # nothing executed on a failed preparation
     stored = await repo.get_occurrence(OWNER, task.id, "k")
     assert stored.status == "failed"
-    assert stored.error_metadata.get("error_class") == "unclassified"
+    assert stored.error_metadata.get("error_class") == "preparation_failed"
+    assert stored.error_metadata.get("failure_stage") == "preparation"
 
 
 @pytest.mark.asyncio
