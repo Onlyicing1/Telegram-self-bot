@@ -7,6 +7,7 @@ handlers' real home-view text (asserted against them here).
 from __future__ import annotations
 
 import asyncio
+import io
 import os
 import struct
 import tempfile
@@ -65,6 +66,7 @@ class _Bucket:
     def __init__(self, objects, calls):
         self.objects = objects
         self.calls = calls
+        self.list_error: Exception | None = None
 
     def upload(self, path, file, options=None):
         self.objects[path] = bytes(file)
@@ -77,6 +79,26 @@ class _Bucket:
 
     def download(self, path):
         return self.objects[path]
+
+    def list(self, path=None, options=None):
+        self.calls.append(("list", path, options))
+        if self.list_error is not None:
+            raise self.list_error
+        prefix = f"{path.rstrip('/')}/" if path else ""
+        entries = []
+        for key in sorted(self.objects):
+            if not key.startswith(prefix):
+                continue
+            name = key[len(prefix):]
+            if "/" in name:
+                continue
+            entries.append({
+                "name": name,
+                "id": f"id-{name}",
+                "created_at": "2026-01-01T00:00:00Z",
+                "metadata": {"size": len(self.objects[key])},
+            })
+        return entries
 
 
 class _Storage:
@@ -101,7 +123,7 @@ def storage(monkeypatch):
     objects: dict = {}
     calls: list = []
     monkeypatch.setattr(db_client, "get_db", lambda: _DB(objects, calls))
-    monkeypatch.setenv("APPEARANCE_MEDIA_BUCKET", "lifeos-appearance")
+    monkeypatch.setenv("APPEARANCE_MEDIA_BUCKET", "appearance-assets")
     return objects, calls
 
 
@@ -117,7 +139,7 @@ def png_bytes(width: int, height: int) -> bytes:
         )
 
     ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
-    raw = b"".join(b"\x00" + b"\x00\x00\x00" * width for _ in range(min(height, 4)))
+    raw = b"".join(b"\x00" + b"\x00\x00\x00" * width for _ in range(height))
     return (
         b"\x89PNG\r\n\x1a\n"
         + chunk(b"IHDR", ihdr)
@@ -127,17 +149,12 @@ def png_bytes(width: int, height: int) -> bytes:
 
 
 def jpeg_bytes(width: int, height: int) -> bytes:
-    app0 = b"\xff\xe0" + (16).to_bytes(2, "big") + b"JFIF\x00" + b"\x00" * 9
-    sof0 = (
-        b"\xff\xc0"
-        + (17).to_bytes(2, "big")
-        + b"\x08"
-        + height.to_bytes(2, "big")
-        + width.to_bytes(2, "big")
-        + b"\x03"
-        + b"\x00" * 9
-    )
-    return b"\xff\xd8" + app0 + sof0 + b"\xff\xd9"
+    """A JPEG the installed decoder can actually open (upload is verified)."""
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (width, height), (5, 6, 7)).save(buffer, "JPEG")
+    return buffer.getvalue()
 
 
 def _buttons_of(row):
@@ -451,11 +468,11 @@ async def test_upload_stores_object_and_only_a_key(persisted, storage):
     assert key.startswith("appearance/preview/") and key.endswith(".png")
     assert not key.startswith("http")
     assert key in objects
-    assert ("upload", key, {"content-type": "image/png", "upsert": "true"}) in calls
+    assert ("upload", key, {"content-type": "image/png", "upsert": "false"}) in calls
 
 
 @pytest.mark.asyncio
-async def test_replacement_swaps_key_and_removes_the_old_object(persisted, storage):
+async def test_upload_retains_every_previous_image(persisted, storage):
     objects, _calls = storage
     await appearance_service.install_image(png_bytes(2, 2))
     first = settings_service.appearance_preview_image_key()
@@ -463,8 +480,9 @@ async def test_replacement_swaps_key_and_removes_the_old_object(persisted, stora
     second = settings_service.appearance_preview_image_key()
 
     assert second != first
-    assert first not in objects and second in objects
+    assert first in objects and second in objects
     assert second.endswith(".jpg")
+    assert len(objects) == 2
 
 
 @pytest.mark.asyncio
@@ -480,12 +498,14 @@ async def test_failed_upload_keeps_the_previous_image(persisted, storage):
 
 
 @pytest.mark.asyncio
-async def test_remove_clears_reference_and_object(persisted, storage):
+async def test_deleting_the_selected_image_clears_reference_and_object(persisted, storage):
     objects, _calls = storage
     await appearance_service.install_image(png_bytes(2, 2))
     key = settings_service.appearance_preview_image_key()
 
-    ok, _notice = await appearance_service.clear_image()
+    ok, _notice = await appearance_service.delete_image(
+        appearance_service.token_from_key(key)
+    )
     assert ok is True
     assert settings_service.appearance_preview_image_key() == ""
     assert key not in objects
@@ -512,7 +532,7 @@ async def test_enabling_without_an_image_offers_upload(persisted):
     assert status["enabled"] is True and status["stored"] is False
     assert status["active"] is False
     _t, body, _b = appearance._preview_view()
-    assert "No image is stored" in body
+    assert "without a selected image" in body
 
 
 # ── preview URL and metadata ────────────────────────────────────────────────
@@ -699,21 +719,40 @@ class _File:
         self.size = size
 
 
+class _Downloader:
+    def __init__(self, data, chunk=7):
+        self._data = data
+        self._chunk = chunk
+
+    async def __aiter__(self):
+        for start in range(0, len(self._data), self._chunk):
+            yield self._data[start:start + self._chunk]
+
+    async def aclose(self):
+        return None
+
+
 class _Event:
-    def __init__(self, data=b"", media=True, size=None):
+    def __init__(self, data=b"", media=True, size=None, mime="image/png"):
         self.media = object() if media else None
         self.file = _File(size if size is not None else len(data))
+        self.message = type("M", (), {
+            "id": 1,
+            "media": self.media,
+            "photo": None,
+            "document": type("D", (), {"mime_type": mime})() if media else None,
+        })()
+        self.client = type("C", (), {
+            "iter_download": lambda _self, media, chunk_size=None: _Downloader(data),
+        })()
         self._data = data
-
-    async def download_media(self, file=None):
-        path = os.path.join(file, "upload.bin")
-        with open(path, "wb") as handle:
-            handle.write(self._data)
-        return path
+        self._mime = mime
 
 
 @pytest.mark.asyncio
-async def test_image_input_stores_and_cleans_up(persisted, storage, monkeypatch):
+async def test_image_input_stores_original_bytes_without_a_temp_file(
+    persisted, storage, monkeypatch
+):
     monkeypatch.setattr("backend.helper.client.get_client", lambda: object())
     objects, _calls = storage
     painted: list = []
@@ -723,23 +762,20 @@ async def test_image_input_stores_and_cleans_up(persisted, storage, monkeypatch)
         return True
 
     monkeypatch.setattr(appearance, "_paint_input", _paint)
-    created: list = []
-    real_mkdtemp = tempfile.mkdtemp
-
-    def _mkdtemp(**kwargs):
-        path = real_mkdtemp(**kwargs)
-        created.append(path)
-        return path
-
-    monkeypatch.setattr(appearance.tempfile, "mkdtemp", _mkdtemp)
-
-    await appearance._image_input(
-        "", CHAT, 1, CHAT, PANEL_MSG, event=_Event(png_bytes(2, 2)),
+    # An upload must never need a temporary file (the old download_media +
+    # read_bytes path); creating one here would fail the test.
+    monkeypatch.setattr(
+        tempfile, "mkdtemp", lambda **kwargs: (_ for _ in ()).throw(AssertionError("no temp dir"))
     )
 
-    assert settings_service.appearance_preview_image_key() in objects
-    assert painted and "stored" in painted[-1][1]
-    assert created and not os.path.isdir(created[0])
+    original = png_bytes(2, 2)
+    await appearance._image_input(
+        "", CHAT, 1, CHAT, PANEL_MSG, event=_Event(original),
+    )
+
+    key = settings_service.appearance_preview_image_key()
+    assert key in objects and objects[key] == original
+    assert painted and "uploaded" in painted[-1][1]
 
 
 @pytest.mark.asyncio

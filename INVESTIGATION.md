@@ -1,136 +1,152 @@
-# Investigation — Appearance personalization for the Glass UI
+# INVESTIGATION — Appearance Preview Image (current state)
 
-Snapshot inspected: `5f8437d1` (`origin/main` at the start of the task, also the
-local HEAD, clean working tree). Everything below was verified against that
-source; no claim here comes from an earlier report.
+_Investigated and implemented at `a301e6422e4211e435b77a3b33224e10fce7c758`
+(`main`, "Add Glass UI Appearance personalization with header, page text and
+preview image"). Everything below was verified against the source at that
+commit and against the installed dependencies, not against the previous report's
+wording._
 
-## 1. How a Glass UI panel is built, rendered and edited
+## 1. What existed before this change
 
-```
-Menu (self-client, exact text)                 backend/bot/handlers/misc.py
-  → helper inline panel  (inline_engine)        backend/helper/inline_engine.py
-      build results via the registered builder  backend/helper/panel_registry.py
-      send via the Helper Bot                   backend/helper/inline_sender.py
-  → callback  panel:* / action:* / input:*      backend/helper/panels.py
-      _callback_router → callback_gate (ack, FIFO turn, painter)
-      _handle_panel  → registered panel fn      backend/helper/panel_registry.py
-                     → ExistingPanelEditor      backend/helper/panel_edit.py
-                     → Helper Bot edit by inline_message_id
-  → typed input   input:*                       backend/helper/input_state.py
-      ONE pending-input listener (register_input_listener) → handler
-```
+`backend/services/appearance_service.py` stored ONE preview image:
 
-Facts that constrained the design:
+- `bucket()` read `APPEARANCE_MEDIA_BUCKET` **or fell back to
+  `ARCHIVE_MEDIA_BUCKET`**, so an unset Appearance bucket silently reused the
+  Saved-Messages archive bucket.
+- `install_image()` uploaded a new key and then **deleted the previous object**,
+  so every "Replace" destroyed the only other image.
+- `MAX_IMAGE_MB = 5` and `MAX_IMAGE_SIDE = 4096` — far below Telegram's own
+  photo limits and the 25 MiB object ceiling already configured on the bucket.
+- Validation was header-only (`sniff_image`): a truncated, mislabelled or
+  decompression-bomb file with a plausible header was accepted.
+- `backend/bot/handlers/appearance.py` called `event.download_media(file=tmpdir)`
+  and then `Path(path).read_bytes()`, i.e. an **unbounded** download bounded only
+  by the file size Telegram *reported* afterwards.
+- The panel offered only Enable/Disable, Upload/Replace and Remove; there was no
+  gallery, no per-image selection and no way to keep more than one image.
 
-* The **initial** panel is an inline result built by
-  `panel_registry`/`inline_engine`; it never passes through
-  `panels._handle_panel`. Any composition done only in `_handle_panel` would
-  therefore miss the first render and appear only after the first click.
-* `panels._handle_panel(client, event, panel_id, extra)` is the single funnel for
-  every callback navigation that returns `(title, body, buttons)`. `extra` is
-  the sub-view marker (`""` = the page's own home view; anything else = a
-  confirmation, picker, pagination page, input prompt or dynamic result).
-* `ExistingPanelEditor(inline_id, helper)` is the only editor used for the
-  inline panel; `panel_edit.py` retries a refused inline edit through the
-  self-client **only when one is passed in**. The inline identifier lives on a
-  `CallbackQuery` as `query.msg_id` (`inline_message_id_from_event`).
-* `register_input(...)` registers state on the ONE owner pending-input listener;
-  `input_state` deletes the owner's trigger message and dispatches to the
-  handler. No handler may create another listener, client or update loop.
+The image itself is served by `backend/web/app.py`:
 
-## 2. The settings architecture that already exists
+- `/appearance/preview/<version>` — Open Graph HTML whose tap target is the
+  existing `/guide/` site;
+- `/appearance/image/<version>` — the stored bytes with an immutable one-year
+  cache header.
 
-`settings_service` → `panel_settings_repository` → `panel_settings` (one
-singleton row, `key = 'global'`).
+Both routes derive everything from `preview_version()`, which is the selected
+object key's stem. That contract is correct and was kept.
 
-* `settings_service` owns a `_DEFAULTS` map, per-key validators, a
-  cache-first read and a write-through setter; a rejected DB write is logged
-  and the cache keeps the value (the documented no-database behaviour).
-* `panel_settings_repository` writes **real columns** (`SET <column> = …`) and
-  refuses unknown keys, so adding a setting without a migration means the write
-  is rejected and the value survives only in the process cache — the exact
-  defect fixed for Auto-Reaction in `20261020160000_…` and re-checked here.
-* `db_client.get_db()` returns `None` when Supabase is not configured, so in
-  tests (and on a bare local run) every write is cache-only and honest.
+## 2. Installed dependency surface (verified, not assumed)
 
-## 3. The actual `panel_settings` schema and its history
+| Package | Version | Relevant API |
+|---|---|---|
+| `storage3` (via `supabase==2.4.2`) | 0.8.x | `storage.from_(bucket).list(path, {"limit", "offset", "sortBy"})` → `list[dict]` with `name`/`created_at`/`metadata.size`; `.upload(path, bytes, {"content-type", "upsert"})`; `.download(path)`; `.remove([path])` |
+| `telethon` | 1.43.0 | `client.iter_download(file, *, offset, stride, limit, chunk_size, request_size, …)` — `limit` is a count of **chunks**, so a byte ceiling must be enforced by counting yielded bytes |
+| `pillow` | 11.3.0 (added) | `Image.open`, `img.size`, `img.format`, `img.verify()`, `img.draft()`, `img.load()`; no image-decoding library was previously installed |
 
-The createdAt column set is defined by the canonical reconciliation snapshot
-(`20260920000001_reconcile_canonical_schema.sql`, part 1 of §31.3) and extended
-by four later additive migrations (Auto-Reaction was the last one before this
-task). Seven settings columns already existed at `5f8437d1`
-(`auto_delete_config`, `custom_emoji_enabled`, `auto_reaction_enabled`,
-`auto_reaction_emoji`, …), each added by its own migration — the established
-pattern was therefore "one additive migration per setting group", not "adding a
-column to an old file".
+`storage3`'s `list()` merges caller options over its defaults and sets
+`prefix` from `path`, so the gallery is discovered with a single call.
 
-Two doc-audit suites pin the shape of `DATABASE_ARCHITECTURE.md` itself:
-`tests/test_database_setup_order.py` (statement-identity of the embedded parts,
-counts, §30.11 list) and `tests/test_private_message_db_security.py`
-(part numbering, migration/file counts). **Any new migration must be added as a
-new `PART n of N` inside the ONE §31.3 setup block, and both suites' constants
-must move with it.** They hard-coded 36 migrations / 14 parts.
+## 3. What was wrong, precisely
 
-## 4. Durable object storage that already exists
+1. **No gallery inventory existed.** The bucket was write-only in practice: the
+   application never listed objects, so it could not display, select, count or
+   delete an individual image.
+2. **Replacement destroyed images.** `install_image()` deleted the previous
+   object after persisting the new key, which makes "keep up to 10" impossible.
+3. **The archive bucket could receive Appearance images.** The fallback violated
+   the "Appearance images never go to the archive bucket" boundary.
+4. **The quality contract was too small.** 5 MiB / 4096 px discarded legitimate
+   high-resolution uploads while the bucket itself accepts 25 MiB.
+5. **Validation could not detect corruption.** Magic-byte parsing proves the
+   header, not the image: truncated IDAT/entropy data and decompression bombs
+   passed.
+6. **The download had no transfer-time bound.** Telegram's reported size was
+   trusted before the transfer, and the file was then read into memory whole.
+7. **The failure mode of a missing selected object was silence.** A stale key
+   still produced "stored: yes" with no way to see it or clear it.
 
-`backend/services/archive_media.py` (and the Anti-Edit archive) already store
-BLOBs in **Supabase Storage** through the service-role client:
-`create_bucket`/`upload`/`download`/`remove` on a configurable bucket name
-(`ARCHIVE_MEDIA_BUCKET`), with a stable object key persisted in the database and
-**never** the bytes or a signed URL. That is exactly the required model, so the
-Appearance preview reuses the same mechanism and the same bucket by default
-(`APPEARANCE_MEDIA_BUCKET`, falling back to `ARCHIVE_MEDIA_BUCKET`); Render's
-local filesystem is never involved. The bucket's access model is the one the
-repository already relies on: private bucket, service-role writes/reads, and the
-image is re-served by the app from `/appearance/image/<version>`.
+## 4. What the new implementation does
 
-## 5. Web routing and the Guide
+- **Bucket** — `bucket()` returns `APPEARANCE_MEDIA_BUCKET` only; the archive
+  fallback is gone. `storage_available()` still requires a configured DB.
+- **Inventory** — `gallery()` lists `appearance/preview/` through the Storage
+  API and returns `{items, known, count, error, selected, missing_selected}`.
+  A listing failure returns `known=False` plus an error and is never rendered as
+  "empty". Objects whose name is not a generated `appearance/preview/<32 hex>.<ext>`
+  key (folder placeholders, nested paths, hand-uploaded files) are not gallery
+  members.
+- **Selection** — `select_image(token)` resolves the short token against the
+  listing and writes only `appearance_preview_image_key`; an arbitrary
+  callback-supplied key is never trusted.
+- **Deletion** — `delete_image(token)` clears the selected key FIRST when the
+  target is active (and aborts if that write fails), then removes exactly that
+  one object. A refused Storage deletion is reported as a failure, with the
+  cleared/kept state stated explicitly.
+- **Clearing a stale reference** — `clear_selection()` drops the key without
+  touching objects; the panel offers it whenever a stored key is not in the
+  listing.
+- **Upload** — serialized by one `asyncio.Lock` (single-instance runtime), so a
+  count check cannot be raced past 10. Order: list → capacity check → validate
+  (in a worker thread) → new unique object → re-list to confirm the write →
+  persist the key → only on failure remove the new object. Existing objects are
+  never deleted or evicted.
+- **Validation** — Pillow identifies the real format; side, pixel and byte
+  bounds are read before any decode; PNG is proved by walking its chunks and
+  streaming IDAT through zlib in bounded pieces (CRC + exact decompressed
+  length); JPEG is decoded at a reduced draft size; WebP is fully decoded only
+  under the 12 Mpx budget, above which its RIFF container is checked.
+- **Bounded transfer** — the handler streams `client.iter_download(media,
+  chunk_size=256 KiB)` into a bytearray, stopping before a chunk would exceed
+  25 MiB. No temporary file exists at all, so nothing can leak; the stream is
+  closed on success, rejection and cancellation.
+- **UI** — the Preview panel lists `N / 10`, marks the selected image with the
+  registry glyph, gives every image a select and a delete button, hides the
+  upload row at 10 and explains that nothing was evicted. Callback payloads stay
+  ≤ 64 bytes (`action:appearance_select:<32 hex>`).
+- **Routes** — unchanged contract: only the selected version is served, the
+  bytes are the original upload, the content type comes from the bytes, the
+  cache header stays immutable, and a superseded version 404s.
 
-`backend/web/app.py` mounts the SPA/static assets **last**; explicit routes are
-declared before it and already include `/guide`-style pages and API routes. New
-routes therefore must be declared before the SPA fallback or they are swallowed
-by it. `guide/index.html` is the existing public Guide page, which is the
-natural tap target for the preview.
+## 5. Supabase live state and the migration discrepancy
 
-## 6. Telethon capability check (installed version, not assumed)
+- Live project `telegram-self-bot` (`burfebhahuowywyfgcsc`), storage bucket
+  **`appearance-assets`**: private, 25 MiB object ceiling, MIME allow-list
+  `image/jpeg`, `image/png`, `image/webp`. Empty when created. **No SQL, bucket
+  or migration action was performed by this change.**
+- The five `panel_settings` columns already exist live:
+  `appearance_header_title`, `appearance_header_body`,
+  `appearance_page_overrides`, `appearance_preview_enabled`,
+  `appearance_preview_image_key`.
+- Remote migration history records `20261109164548` with name
+  `20261109000000_add_panel_settings_appearance`.
+- The repository file is `supabase/migrations/20261109000000_add_panel_settings_appearance.sql`.
+  Its constraints contain `position(chr(0) in <column>) = 0`; PostgreSQL rejects
+  `chr(0)` in text, and those predicates were omitted from the SQL that was
+  applied live. The file's other statements (columns, defaults, backfill,
+  NOT NULL, other constraints, singleton insert, `NOTIFY pgrst`) match the live
+  schema.
+- **This discrepancy remains open and was deliberately not touched**: renaming
+  or rewriting `20261109000000_…` would desynchronise the recorded remote
+  version, and "repair"/push/apply are out of scope for a code change. The
+  gallery needs no new schema, so nothing is blocked by it. A future, separate
+  migration task should reconcile the filename/version and the invalid `chr(0)`
+  predicates; `DATABASE_ARCHITECTURE.md` was not modified.
 
-Installed Telethon 1.43 provides `InputBotInlineMessageMediaWebPage` and
-`InputMediaWebPage`, and `client.edit_message(..., link_preview=…)` accepts a
-`bool`/media for the outgoing-edit path. The inline **edit** path used here
-(`messages.editInlineBotMessage` via the Helper Bot) cannot carry
-`force_small_media` for an already-sent message through this code, so the
-implemented preview uses Telegram's ordinary **web-page preview** of a public
-HTTPS URL (`no_webpage=False` + URL appended). Telegram decides the layout; the
-panel never claims a forced small preview.
+## 6. Render
 
-## 7. The symbol registry
+`APPEARANCE_MEDIA_BUCKET=appearance-assets` was already set on the `Self_bot`
+service and its deployment was triggered before this task. **No Render
+environment change was made here**, and the variable is read exactly as before
+(`bucket()`), only without the archive fallback.
 
-`backend/helper/symbols.py` is the single source of truth: functional,
-non-emoji glyphs, no `U+FE0F`, grouped into categories with a documented-reuse
-set, and `tests/test_symbols.py` enforces uniqueness. The Appearance UI needed
-no new symbol: it reuses `OP_EDIT`, `PANEL_HEADING`, `MEDIA_PHOTO`, `OP_SAVE`,
-`OP_STOP`, `OP_REFRESH`, `OP_DELETE`, `OP_CREATE`, `STATE_COMPLETED`,
-`STATE_WARNING`, `STATE_FAILED` and `SEPARATOR` through `sym.label(...)`, so the
-font pipeline never sees a new glyph and callback data is untouched.
+## 7. Residual risks
 
-## 8. Discovered defects and gaps this task had to handle
-
-1. **No central text layer existed.** Every handler returned its own
-   `(title, body, buttons)`; nothing could prepend a header or override one
-   page's text without editing eleven handlers. The narrowest correct boundary
-   is `panels._handle_panel` (callback navigation) plus
-   `inline_engine._inline_router` (first render).
-2. **`settings_service` could not report a rejected write.** A strict setter was
-   missing, so a "saved" value could be cache-only without the caller knowing.
-   `set_setting_strict` was added for the Appearance writes (the cache-only
-   path stays the documented fallback when no database is configured).
-3. **`_safe_edit` did not pass `link_preview`.** Test doubles and older shims
-   without that keyword raised `TypeError`; a bounded fallback was added so the
-   preview is best-effort and an edit still happens.
-4. **`with_preview` initially appended the URL even when preview was OFF**,
-   producing a preview on a "disabled" panel. Caught by the new tests; the URL
-   is now appended only when `preview_active()`.
-5. **Menu size.** The menu had nine entries; Appearance is the tenth. A test
-   pins that the menu's `panel:*` destinations equal
-   `appearance_service.MAIN_PAGE_IDS`, so eligibility can never drift from the
-   real navigation.
+- 10 concurrent owners do not exist in a single-owner self-bot, so an
+  `asyncio.Lock` is the correct scope; a multi-instance deployment would need an
+  external lock and is out of scope.
+- Supabase Storage `list()` is strongly consistent after `upload()`; the
+  post-upload re-list is the verification step. A pathological eventual-
+  consistency window would reject a valid upload (the object is removed) rather
+  than keep an unverified one.
+- Telegram decides its own preview rendering/zoom; only the original bytes and
+  correct metadata are guaranteed here.

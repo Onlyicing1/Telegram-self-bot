@@ -7,8 +7,9 @@ Three independent areas, all stored on the EXISTING singleton settings row
   customizable main pages;
 * **per-main-page text** — title/body overrides for the pages reachable as
   top-level categories from the main menu;
-* **preview image** — an independent enable flag plus a durable Storage object
-  key (never image bytes, never a signed/expiring URL).
+* **preview image gallery** — an independent enable flag plus at most
+  ``MAX_GALLERY_IMAGES`` original images in one private Supabase Storage
+  bucket, and the durable key of the ONE selected image.
 
 Composition happens at the panel render boundary: ``panels._handle_panel``
 for callback navigation and ``inline_engine._inline_router`` for the initial
@@ -16,22 +17,32 @@ inline result. Dynamic operational content (action results, confirmations,
 paginated pickers) is never rewritten — only the home view of an eligible
 main page is customizable.
 
-The preview image lives in a Supabase Storage bucket
-(``APPEARANCE_MEDIA_BUCKET``, falling back to the existing
-``ARCHIVE_MEDIA_BUCKET``); Render's local filesystem is never used. The
-rendered preview is Telegram's web-page preview of a public HTTPS page
-(``/appearance/preview/<version>``) served by ``backend/web/app.py``, whose
-Open Graph tags point at ``/appearance/image/<version>`` and whose tap target
-is the existing Guide site.
+Gallery inventory is the Storage bucket itself, under ONE prefix
+(``appearance/preview/``): the objects ARE the gallery, so no table, no extra
+column and no second settings system exists. The settings row only ever holds
+the selected object's key — never image bytes, a signed/expiring URL, a
+Telegram file/message id or a filename. The rendered preview is Telegram's
+web-page preview of a public HTTPS page (``/appearance/preview/<version>``)
+served by ``backend/web/app.py``, whose Open Graph tags point at
+``/appearance/image/<version>`` and whose tap target is the existing Guide
+site.
+
+Uploads preserve the owner's original bytes exactly: no resize, no
+recompression, no format conversion, no metadata stripping. Validation reads
+the file's real content (Pillow) inside a worker thread under hard size, side
+and pixel bounds, so a mislabelled, truncated or decompression-bomb file is
+refused before it can be decoded without limit.
 """
 from __future__ import annotations
 
 import asyncio
 import html
+import io
 import logging
 import os
 import re
 import uuid
+import zlib
 from typing import Any
 
 from backend.helper import symbols as sym
@@ -83,16 +94,39 @@ PAGE_DEFAULTS: dict[str, tuple[str, str]] = {
 TITLE_LIMIT = 120
 BODY_LIMIT = 800
 
-MAX_IMAGE_MB = 5
-MAX_IMAGE_BYTES = MAX_IMAGE_MB * 1024 * 1024
-MAX_IMAGE_SIDE = 4096
+# ── Image gallery bounds ─────────────────────────────────────────────────────
+#
+# These are the OWNER's quality contract as much as safety bounds: the original
+# bytes are stored and served untouched up to 25 MiB (the bucket's own object
+# ceiling), 8192 pixels per side and 50 decoded megapixels.
+IMAGES_PREFIX = "appearance/preview"
+MAX_GALLERY_IMAGES = 10
+MAX_IMAGE_MB = 25
+MAX_IMAGE_BYTES = 26_214_400
+MAX_IMAGE_SIDE = 8192
+MAX_IMAGE_PIXELS = 50_000_000
 
-_VERSION_RE = re.compile(r"^[A-Za-z0-9_-]{8,80}$")
+#: A full pixel decode proves an image is genuinely decodable, but its memory
+#: cost grows with area. Above this budget the structural proof (container
+#: trailer + Pillow's own header/CRC verification) is used instead, so a 50 MP
+#: PNG is validated without materialising a 150 MB bitmap.
+_DECODE_PIXEL_BUDGET = 12_000_000
+
+#: One upload at a time inside this single-instance runtime: the count check and
+#: the object write must not interleave, or two concurrent uploads could both
+#: observe 9/10 and end at 11.
+_UPLOAD_LOCK = asyncio.Lock()
+
+_FORMAT_MIME = {"PNG": "image/png", "JPEG": "image/jpeg", "WEBP": "image/webp"}
 _MIME_EXT = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp"}
+_EXT_MIME = {"png": "image/png", "jpg": "image/jpeg", "webp": "image/webp"}
+_KEY_RE = re.compile(r"^appearance/preview/([0-9a-f]{32})\.(png|jpg|webp)$")
+_TOKEN_RE = re.compile(r"^[0-9a-f]{32}$")
+_VERSION_RE = re.compile(r"^[A-Za-z0-9_-]{8,80}$")
 
 
 class ImageRejected(Exception):
-    """Uploaded media is not a supported, bounded image."""
+    """Uploaded media is not a supported, bounded, decodable image."""
 
 
 # ── Page identity ────────────────────────────────────────────────────────────
@@ -276,12 +310,12 @@ def with_preview(panel_id: str, extra: str, title: str, body: str) -> tuple[str,
 
     The URL is what makes Telegram render its web-page preview above the text
     and buttons. It is appended (not substituted) so the page's own text is
-    kept, and it carries the object's unique version so a replaced image is
-    refetched instead of served from Telegram's preview cache.
+    kept, and it carries the selected object's unique version so a different
+    image is refetched instead of served from Telegram's preview cache.
     """
     title, body = compose_text(panel_id, extra, title, body)
     # Disabled preview must produce a GENUINELY text-only panel: no URL at all,
-    # even when an image is still stored (turning preview OFF keeps the image).
+    # even when images are still stored (turning preview OFF keeps the gallery).
     url = preview_url() if preview_active() else ""
     if url:
         body = f"{body}\n\n{url}" if body else url
@@ -350,12 +384,14 @@ def public_base_url() -> str:
     return ""
 
 
+def token_from_key(key: str) -> str:
+    """The short identifier/version of one gallery object key ("" if invalid)."""
+    match = _KEY_RE.match(str(key or ""))
+    return match.group(1) if match else ""
+
+
 def preview_version() -> str:
-    key = settings_service.appearance_preview_image_key()
-    if not key:
-        return ""
-    stem = key.rsplit("/", 1)[-1].split(".")[0]
-    return stem if _VERSION_RE.match(stem) else ""
+    return token_from_key(settings_service.appearance_preview_image_key())
 
 
 def preview_url() -> str:
@@ -384,20 +420,23 @@ def preview_active() -> bool:
 
 
 def preview_status() -> dict[str, Any]:
+    """The selected-image view; the gallery itself is read by :func:`gallery`."""
     enabled = settings_service.appearance_preview_enabled()
-    stored = bool(settings_service.appearance_preview_image_key())
+    key = settings_service.appearance_preview_image_key()
     return {
         "enabled": enabled,
-        "stored": stored,
+        "stored": bool(key),
+        "selected": token_from_key(key),
         "active": preview_active(),
         "public_base": bool(public_base_url()),
         "storage": storage_available(),
         "mode": "image" if preview_active() else "text",
+        "max_images": MAX_GALLERY_IMAGES,
     }
 
 
 def preview_meta(version: str) -> dict[str, str] | None:
-    """Open Graph metadata for one stored preview version, or ``None``."""
+    """Open Graph metadata for the SELECTED preview version, or ``None``."""
     current = preview_version()
     base = public_base_url()
     if not version or not current or version != current or not base:
@@ -453,11 +492,8 @@ def preview_html(meta: dict[str, str]) -> str:
 # ── Durable image storage (Supabase Storage; never the local filesystem) ─────
 
 def bucket() -> str:
-    """The Storage bucket: a dedicated one, or the existing archive bucket."""
-    return (
-        (os.getenv("APPEARANCE_MEDIA_BUCKET") or "").strip()
-        or (os.getenv("ARCHIVE_MEDIA_BUCKET") or "").strip()
-    )
+    """The Appearance bucket: the dedicated one only, never the archive bucket."""
+    return (os.getenv("APPEARANCE_MEDIA_BUCKET") or "").strip()
 
 
 def storage_available() -> bool:
@@ -466,11 +502,22 @@ def storage_available() -> bool:
     return bool(bucket()) and db_client.get_db() is not None
 
 
+def storage_help() -> str:
+    return (
+        "Durable image storage is not configured. Set APPEARANCE_MEDIA_BUCKET to "
+        "the private Appearance Storage bucket and keep SUPABASE_URL / "
+        "SUPABASE_SERVICE_ROLE_KEY set."
+    )
+
+
+# ── Content validation (real bytes, bounded, off the event loop) ─────────────
+
 def sniff_image(data: bytes) -> tuple[str, int, int] | None:
     """Return ``(mime, width, height)`` from the bytes themselves.
 
-    The declared MIME type is never trusted: only real PNG/JPEG/WebP headers
-    with a readable size are accepted.
+    A cheap header probe used for the image response's content type; it never
+    decides whether an upload is accepted (``validate_image`` does, by
+    decoding).
     """
     if not data:
         return None
@@ -489,23 +536,178 @@ def sniff_image(data: bytes) -> tuple[str, int, int] | None:
     return None
 
 
-def validate_image(data: bytes) -> tuple[str, int, int]:
-    """Validate size, real content and dimensions; raise :class:`ImageRejected`."""
-    if len(data) > MAX_IMAGE_BYTES:
-        raise ImageRejected(f"the image is larger than {MAX_IMAGE_MB} MB")
+def validate_image(data: bytes, declared_mime: str = "") -> tuple[str, int, int]:
+    """Validate real content, bounds and decodability; raise :class:`ImageRejected`.
+
+    Runs synchronously (callers offload it with ``asyncio.to_thread``) so no
+    decoding ever happens on the event loop. The bytes are never modified: this
+    function only reads them.
+    """
     if not data:
         raise ImageRejected("the file is empty")
-    sniffed = sniff_image(data)
-    if sniffed is None:
-        raise ImageRejected("that file is not a readable PNG, JPEG or WebP image")
-    mime, width, height = sniffed
-    if width < 1 or height < 1:
-        raise ImageRejected("the image has no usable dimensions")
-    if width > MAX_IMAGE_SIDE or height > MAX_IMAGE_SIDE:
+    if len(data) > MAX_IMAGE_BYTES:
         raise ImageRejected(
-            f"the image is {width}x{height}; the limit is {MAX_IMAGE_SIDE}px per side"
+            f"the image is larger than {MAX_IMAGE_MB} MB "
+            f"({len(data)} bytes received, limit {MAX_IMAGE_BYTES})"
         )
+    try:
+        from PIL import Image, UnidentifiedImageError
+    except ImportError as exc:  # pragma: no cover - pinned dependency
+        raise ImageRejected("image validation is unavailable on this server") from exc
+
+    declared = (declared_mime or "").strip().lower()
+    if declared.split(";")[0] == "image/jpg":
+        declared = "image/jpeg"
+
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            fmt = (image.format or "").upper()
+            mime = _FORMAT_MIME.get(fmt)
+            if mime is None:
+                raise ImageRejected("that file is not a PNG, JPEG or WebP image")
+            width, height = image.size
+            if width < 1 or height < 1:
+                raise ImageRejected("the image has no usable dimensions")
+            if width > MAX_IMAGE_SIDE or height > MAX_IMAGE_SIDE:
+                raise ImageRejected(
+                    f"the image is {width}x{height}; the limit is "
+                    f"{MAX_IMAGE_SIDE}px per side"
+                )
+            if width * height > MAX_IMAGE_PIXELS:
+                raise ImageRejected(
+                    f"the image is {width}x{height} "
+                    f"({width * height / 1_000_000:.1f} megapixels); the limit is "
+                    f"{MAX_IMAGE_PIXELS // 1_000_000} megapixels"
+                )
+            image.verify()
+    except ImageRejected:
+        raise
+    except UnidentifiedImageError as exc:
+        raise ImageRejected("that file is not a readable PNG, JPEG or WebP image") from exc
+    except Image.DecompressionBombError as exc:
+        raise ImageRejected("the image is too large to be decoded safely") from exc
+    except (OSError, ValueError, SyntaxError, IndexError) as exc:
+        raise ImageRejected("that image file is damaged or truncated") from exc
+
+    if declared in _MIME_EXT and declared != mime:
+        raise ImageRejected(
+            f"the file's content is {mime} but it was sent as {declared}"
+        )
+    _prove_decodable(data, fmt, width, height)
     return mime, width, height
+
+
+def _prove_decodable(data: bytes, fmt: str, width: int, height: int) -> None:
+    """Confirm the container is complete and the pixel data really decodes.
+
+    PNG is proved by walking its own chunks and streaming the IDAT through
+    zlib in small bounded pieces: a truncated, corrupt or empty pixel stream is
+    detected without ever materialising the bitmap. JPEG is decoded at a
+    reduced draft size, which detects a truncated entropy stream cheaply.
+    WebP has no draft mode, so it is fully decoded only under
+    :data:`_DECODE_PIXEL_BUDGET`; above that its RIFF container is checked
+    instead of allocating a very large bitmap.
+    """
+    from PIL import Image
+
+    if fmt == "PNG":
+        _prove_png_stream(data)
+        return
+    _require_complete_container(data, fmt)
+    if fmt == "WEBP" and width * height > _DECODE_PIXEL_BUDGET:
+        return
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            if fmt == "JPEG":
+                image.draft("RGB", (1024, 1024))
+            image.load()
+    except Image.DecompressionBombError as exc:
+        raise ImageRejected("the image is too large to be decoded safely") from exc
+    except (OSError, ValueError, SyntaxError, IndexError) as exc:
+        raise ImageRejected("that image file is damaged or truncated") from exc
+
+
+def _prove_png_stream(data: bytes) -> None:
+    """Verify every PNG chunk CRC and that the IDAT stream is complete.
+
+    The decompressed length is checked against the size the header promises
+    (non-interlaced images), and decompression is fed in fixed-size pieces with
+    a bounded output so a compressed bomb can neither exhaust memory nor run
+    unbounded. A PNG with no IDAT, a short one, or one that ends mid-stream is
+    rejected here.
+    """
+    width = int.from_bytes(data[16:20], "big")
+    height = int.from_bytes(data[20:24], "big")
+    bit_depth = data[24]
+    color_type = data[25]
+    interlace = data[28]
+    channels = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}.get(color_type)
+    if channels is None:
+        raise ImageRejected("that image file is damaged or truncated")
+    expected = 0
+    if not interlace:
+        row = (width * channels * bit_depth + 7) // 8
+        expected = height * (row + 1)
+
+    index = 8
+    seen_idat = False
+    produced = 0
+    inflater = zlib.decompressobj()
+    while index + 8 <= len(data):
+        length = int.from_bytes(data[index:index + 4], "big")
+        kind = data[index + 4:index + 8]
+        start = index + 8
+        end = start + length
+        if end + 4 > len(data):
+            raise ImageRejected("that image file is damaged or truncated")
+        payload = data[start:end]
+        crc = int.from_bytes(data[end:end + 4], "big")
+        if (zlib.crc32(kind + payload) & 0xFFFFFFFF) != crc:
+            raise ImageRejected("that image file is damaged or truncated")
+        if kind == b"IDAT":
+            seen_idat = True
+            produced += _inflate_bounded(inflater, payload)
+            if expected and produced > expected:
+                raise ImageRejected("that image file is damaged or truncated")
+        elif kind == b"IEND":
+            break
+        index = end + 4
+
+    if not seen_idat:
+        raise ImageRejected("that image file is damaged or truncated")
+    try:
+        produced += len(inflater.flush())
+    except zlib.error as exc:
+        raise ImageRejected("that image file is damaged or truncated") from exc
+    if not inflater.eof or produced <= 0:
+        raise ImageRejected("that image file is damaged or truncated")
+    if expected and produced != expected:
+        raise ImageRejected("that image file is damaged or truncated")
+
+
+def _inflate_bounded(inflater, payload: bytes, step: int = 65_536, cap: int = 1 << 20) -> int:
+    """Decompress ``payload`` in bounded slices, returning the output length."""
+    produced = 0
+    try:
+        for offset in range(0, len(payload), step):
+            piece = payload[offset:offset + step]
+            while piece:
+                produced += len(inflater.decompress(piece, cap))
+                piece = inflater.unconsumed_tail
+    except zlib.error as exc:
+        raise ImageRejected("that image file is damaged or truncated") from exc
+    return produced
+
+
+def _require_complete_container(data: bytes, fmt: str) -> None:
+    """Reject a JPEG/WebP whose own container does not end where it should."""
+    if fmt == "JPEG":
+        if not data.rstrip(b"\x00").endswith(b"\xff\xd9"):
+            raise ImageRejected("that image file is damaged or truncated")
+        return
+    if fmt == "WEBP":
+        if len(data) < 12 or int.from_bytes(data[4:8], "little") + 8 > len(data):
+            raise ImageRejected("that image file is damaged or truncated")
 
 
 def _jpeg_size(data: bytes) -> tuple[int, int] | None:
@@ -552,108 +754,312 @@ def _webp_size(data: bytes) -> tuple[int, int] | None:
     return None
 
 
-def _upload_sync(key: str, data: bytes, mime: str) -> None:
+# ── Storage primitives ──────────────────────────────────────────────────────
+
+def _db():
     from backend.db import client as db_client
 
     db = db_client.get_db()
     if db is None:
         raise RuntimeError("database unavailable")
-    db.storage.from_(bucket()).upload(
-        key, data, {"content-type": mime, "upsert": "true"}
+    return db
+
+
+def _upload_sync(key: str, data: bytes, mime: str) -> None:
+    response = _db().storage.from_(bucket()).upload(
+        key, data, {"content-type": mime, "upsert": "false"}
     )
+    status = getattr(response, "status_code", None)
+    if isinstance(status, int) and status >= 400:
+        raise RuntimeError(f"storage upload refused ({status})")
 
 
 def _delete_sync(key: str) -> bool:
-    from backend.db import client as db_client
-
-    db = db_client.get_db()
-    if db is None:
-        return False
     try:
-        db.storage.from_(bucket()).remove([key])
+        _db().storage.from_(bucket()).remove([key])
         return True
-    except Exception as exc:  # noqa: BLE001 — a stale object is logged, never fatal
+    except Exception as exc:  # noqa: BLE001 — a failed deletion is reported, never fatal
         logger.warning("appearance: could not delete stored object: %s", exc)
         return False
 
 
 def _download_sync(key: str) -> bytes | None:
-    from backend.db import client as db_client
-
-    db = db_client.get_db()
-    if db is None:
-        return None
-    data = db.storage.from_(bucket()).download(key)
+    data = _db().storage.from_(bucket()).download(key)
     if isinstance(data, (bytes, bytearray)) and data:
         return bytes(data)
     return None
 
 
-# ── Owner-facing image operations ────────────────────────────────────────────
+def _entry_key(entry: Any) -> str | None:
+    """The validated object key of one listing entry, or ``None``.
 
-def storage_help() -> str:
-    return (
-        "Durable image storage is not configured. Set APPEARANCE_MEDIA_BUCKET "
-        "(or ARCHIVE_MEDIA_BUCKET) to a Supabase Storage bucket and keep "
-        "SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY set."
+    Only a direct child of :data:`IMAGES_PREFIX` whose name is exactly a
+    generated key is part of the gallery — folder placeholders, nested paths
+    and anything a human put in the bucket are ignored.
+    """
+    if not isinstance(entry, dict):
+        return None
+    name = str(entry.get("name") or "").strip()
+    if not name or "/" in name:
+        return None
+    key = f"{IMAGES_PREFIX}/{name}"
+    return key if _KEY_RE.match(key) else None
+
+
+def _list_sync() -> list[dict[str, Any]]:
+    """List the gallery objects (newest first) from the Storage API."""
+    raw = _db().storage.from_(bucket()).list(
+        IMAGES_PREFIX,
+        {"limit": 100, "sortBy": {"column": "created_at", "order": "desc"}},
+    )
+    items: list[dict[str, Any]] = []
+    for entry in raw or []:
+        key = _entry_key(entry)
+        if key is None:
+            continue
+        metadata = entry.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        try:
+            size = int(metadata.get("size") or 0)
+        except (TypeError, ValueError):
+            size = 0
+        extension = key.rsplit(".", 1)[-1]
+        items.append({
+            "key": key,
+            "token": token_from_key(key),
+            "mime": _EXT_MIME.get(extension, "application/octet-stream"),
+            "size": size,
+            "created_at": str(entry.get("created_at") or ""),
+        })
+    items.sort(key=lambda item: (item["created_at"], item["token"]), reverse=True)
+    return items
+
+
+async def gallery() -> dict[str, Any]:
+    """The stored gallery plus the selected image, read from Storage itself.
+
+    A listing failure is returned as ``error`` with an EMPTY ``items`` list and
+    ``known=False``: the caller must never present that as an empty gallery.
+    """
+    selected_key = settings_service.appearance_preview_image_key()
+    state: dict[str, Any] = {
+        "items": [],
+        "error": "",
+        "known": False,
+        "max": MAX_GALLERY_IMAGES,
+        "selected_key": selected_key,
+        "selected": token_from_key(selected_key),
+        "missing_selected": False,
+        "available": storage_available(),
+    }
+    if not storage_available():
+        state["error"] = storage_help()
+        return state
+    try:
+        entries = await asyncio.to_thread(_list_sync)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — an unreadable gallery is reported honestly
+        logger.warning("appearance: gallery listing failed: %s", exc)
+        state["error"] = (
+            f"{sym.STATE_FAILED} The image gallery could not be read from Storage."
+        )
+        return state
+
+    for entry in entries:
+        entry["active"] = bool(selected_key) and entry["key"] == selected_key
+    state["items"] = entries
+    state["known"] = True
+    state["count"] = len(entries)
+    state["missing_selected"] = bool(selected_key) and not any(
+        entry["active"] for entry in entries
+    )
+    return state
+
+
+def _find(state: dict[str, Any], token: str) -> dict[str, Any] | None:
+    for entry in state.get("items") or []:
+        if entry.get("token") == token:
+            return entry
+    return None
+
+
+def _normalize_token(token: str) -> str:
+    value = str(token or "").strip()
+    return value if _TOKEN_RE.match(value) else ""
+
+
+def _gallery_unreadable(state: dict[str, Any]) -> tuple[bool, str]:
+    return False, (
+        f"{sym.STATE_FAILED} The image gallery could not be read, so nothing was "
+        "changed. Try again in a moment."
     )
 
 
-async def install_image(data: bytes) -> tuple[bool, str]:
-    """Validate, upload, persist the new key, then remove the replaced object."""
+async def select_image(token: str) -> tuple[bool, str]:
+    """Make one STORED image the preview; never uploads, copies or deletes."""
     if not storage_available():
         return False, f"{sym.STATE_FAILED} {storage_help()}"
-    try:
-        mime, width, height = validate_image(data)
-    except ImageRejected as exc:
-        return False, f"{sym.STATE_FAILED} {exc}."
-
-    key = f"appearance/preview/{uuid.uuid4().hex}.{_MIME_EXT[mime]}"
-    try:
-        await asyncio.to_thread(_upload_sync, key, data, mime)
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:  # noqa: BLE001 — upload failure is reported, not raised
-        logger.warning("appearance: preview upload failed: %s", exc)
-        return False, f"{sym.STATE_FAILED} The upload failed, so nothing was changed."
-
-    previous = settings_service.appearance_preview_image_key()
-    if not settings_service.set_appearance_preview_image_key(key):
-        # The object must not outlive a reference we failed to persist.
-        await asyncio.to_thread(_delete_sync, key)
+    wanted = _normalize_token(token)
+    if not wanted:
         return False, (
-            f"{sym.STATE_FAILED} The image could not be saved to settings, so the "
-            "upload was discarded."
+            f"{sym.STATE_FAILED} That image reference is not valid, so nothing "
+            "was changed."
         )
-    if previous and previous != key:
-        await asyncio.to_thread(_delete_sync, previous)
-    return True, f"{sym.OP_SAVE} Preview image stored ({width}x{height})."
+    state = await gallery()
+    if not state["known"]:
+        return _gallery_unreadable(state)
+    entry = _find(state, wanted)
+    if entry is None:
+        return False, (
+            f"{sym.STATE_FAILED} That image is no longer in the gallery. The "
+            "selection was not changed."
+        )
+    if entry["key"] == state["selected_key"]:
+        return True, f"{sym.OP_SAVE} That image is already the preview."
+    if not settings_service.set_appearance_preview_image_key(entry["key"]):
+        return False, (
+            f"{sym.STATE_FAILED} The selection could not be saved, so nothing "
+            "was changed."
+        )
+    return True, f"{sym.OP_SAVE} Preview image selected. Existing images were kept."
 
 
-async def clear_image() -> tuple[bool, str]:
-    """Remove the stored object and clear the reference (settings first)."""
-    key = settings_service.appearance_preview_image_key()
-    if not key:
-        return True, f"{sym.OP_DELETE} No stored preview image."
-    if not settings_service.set_appearance_preview_image_key(""):
-        return False, f"{sym.STATE_FAILED} The reference could not be cleared; nothing was changed."
-    removed = False
-    if storage_available():
-        removed = await asyncio.to_thread(_delete_sync, key)
-    if removed:
-        return True, f"{sym.OP_DELETE} Preview image removed."
+async def delete_image(token: str) -> tuple[bool, str]:
+    """Delete exactly one gallery object; the active key is cleared first."""
+    if not storage_available():
+        return False, f"{sym.STATE_FAILED} {storage_help()}"
+    wanted = _normalize_token(token)
+    if not wanted:
+        return False, (
+            f"{sym.STATE_FAILED} That image reference is not valid, so nothing "
+            "was deleted."
+        )
+    state = await gallery()
+    if not state["known"]:
+        return _gallery_unreadable(state)
+    entry = _find(state, wanted)
+    if entry is None:
+        return False, (
+            f"{sym.STATE_FAILED} That image is no longer in the gallery, so "
+            "nothing was deleted."
+        )
+
+    was_active = entry["key"] == state["selected_key"]
+    if was_active and not settings_service.set_appearance_preview_image_key(""):
+        return False, (
+            f"{sym.STATE_FAILED} The selected image could not be cleared, so the "
+            "image was not deleted."
+        )
+
+    removed = await asyncio.to_thread(_delete_sync, entry["key"])
+    if not removed:
+        if was_active:
+            return False, (
+                f"{sym.STATE_FAILED} Storage refused the deletion. The image is "
+                "no longer selected, but it is still stored; try deleting it again."
+            )
+        return False, (
+            f"{sym.STATE_FAILED} Storage refused the deletion, so the image is "
+            "still there. Nothing else was changed."
+        )
+    if was_active:
+        return True, (
+            f"{sym.OP_DELETE} Preview image deleted. The preview is text-only "
+            "until another image is selected."
+        )
     return True, (
-        f"{sym.OP_DELETE} Image reference removed. The stored object could not be "
-        "deleted and no longer appears anywhere."
+        f"{sym.OP_DELETE} Image deleted. The selected preview was not changed."
+    )
+
+
+async def clear_selection() -> tuple[bool, str]:
+    """Drop the selected reference without touching any stored image."""
+    if not settings_service.appearance_preview_image_key():
+        return True, f"{sym.SEPARATOR} No image is selected."
+    if not settings_service.set_appearance_preview_image_key(""):
+        return False, (
+            f"{sym.STATE_FAILED} The selection could not be cleared, so nothing "
+            "was changed."
+        )
+    return True, (
+        f"{sym.OP_DELETE} Selection cleared. Every stored image is still in the "
+        "gallery; the panels stay text-only until another is selected."
+    )
+
+
+async def install_image(data: bytes, declared_mime: str = "") -> tuple[bool, str]:
+    """Validate, upload as a NEW object, then select it. Never evicts images."""
+    if not storage_available():
+        return False, f"{sym.STATE_FAILED} {storage_help()}"
+
+    async with _UPLOAD_LOCK:
+        state = await gallery()
+        if not state["known"]:
+            return False, (
+                f"{sym.STATE_FAILED} The image gallery could not be read, so the "
+                "upload was refused and nothing was changed."
+            )
+        if len(state["items"]) >= MAX_GALLERY_IMAGES:
+            return False, (
+                f"{sym.STATE_FAILED} The gallery already holds "
+                f"{len(state['items'])}/{MAX_GALLERY_IMAGES} images. Delete one "
+                "before uploading another."
+            )
+
+        try:
+            mime, width, height = await asyncio.to_thread(
+                validate_image, data, declared_mime
+            )
+        except ImageRejected as exc:
+            return False, f"{sym.STATE_FAILED} {exc}."
+
+        key = f"{IMAGES_PREFIX}/{uuid.uuid4().hex}.{_MIME_EXT[mime]}"
+        try:
+            await asyncio.to_thread(_upload_sync, key, data, mime)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — an upload failure is reported
+            logger.warning("appearance: preview upload failed: %s", exc)
+            return False, (
+                f"{sym.STATE_FAILED} The upload failed, so nothing was changed."
+            )
+
+        try:
+            stored = await asyncio.to_thread(_list_sync)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — verify what we just wrote, best effort
+            stored = []
+        if not any(entry["key"] == key for entry in stored):
+            await asyncio.to_thread(_delete_sync, key)
+            return False, (
+                f"{sym.STATE_FAILED} Storage did not confirm the upload, so the "
+                "copy was discarded."
+            )
+
+        if not settings_service.set_appearance_preview_image_key(key):
+            # The object must not outlive a reference we failed to persist.
+            await asyncio.to_thread(_delete_sync, key)
+            return False, (
+                f"{sym.STATE_FAILED} The image could not be selected in settings, "
+                "so the uploaded copy was discarded."
+            )
+
+    return True, (
+        f"{sym.OP_SAVE} Image uploaded and selected ({width}x{height}, "
+        f"{len(stored)}/{MAX_GALLERY_IMAGES} stored). Original bytes kept as sent."
     )
 
 
 async def image_payload(version: str) -> tuple[bytes, str] | None:
-    """The stored image for one live version, with its content type."""
+    """The stored image for the SELECTED version, with its content type."""
     if not version or version != preview_version() or not storage_available():
         return None
     try:
-        data = await asyncio.to_thread(_download_sync, settings_service.appearance_preview_image_key())
+        data = await asyncio.to_thread(
+            _download_sync, settings_service.appearance_preview_image_key()
+        )
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # noqa: BLE001 — a missing object is a 404, not a crash
