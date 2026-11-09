@@ -1,122 +1,309 @@
-# Implementation Report — Manual “All my messages” Frozen (2026-11-09)
+# Implementation Report — Glass UI Appearance Personalization (2026-11-09)
 
-**Scope.** Only the manual Delete Glass UI path that offered to delete ALL of
-the owner's messages in the current chat. Everything else is untouched.
+**Scope.** The Appearance category of the Glass UI: one new top-level menu entry,
+three sub-panels (Header, Page Text, Preview Image), five `panel_settings`
+columns, one additive migration, the preview web routes, and the tests/docs that
+pin them. No other panel, callback family, client, listener or scheduler was
+changed.
 
-**Status.** Implemented, tested, committed, pushed to `origin/main`.
+**Stage.** Stage 1 of the Appearance feature (owner-uploaded image, no gallery,
+no web upload UI). **Status:** implemented and tested in this tree, committed and
+pushed to `origin/main`; the database migration and the Storage bucket are
+**not** applied to the owner's live project (manual action, §8).
 
-## 1. What was frozen
+## 1. Implemented — architecture
 
-The Delete home panel's **“All my messages”** button (`panel:del:all`, which led
-to the preview/confirmation step `panel:del:allexec`) is no longer rendered,
-and both legacy callbacks are now inert:
-
-* `_home_buttons()` no longer adds the “All my messages” row. The other rows
-  render exactly as before: Last 10 / 25 / 50 / 100 / 250 / 500, **Custom
-  amount…**, **Delete from a message…**, **Delete by date range…**, plus the
-  existing Back and confirmation navigation for the remaining options.
-* `_del_view()` answers BOTH `all` and `allexec` with the same frozen view —
-  title `Delete`, body “Deleting all of your messages is temporarily
-  unavailable. Nothing was deleted.”, and a single **Back** button to
-  `panel:del`. A stale panel or a manually replayed callback therefore cannot
-  display a preview, cannot display a confirmation, cannot start the scan or
-  the deletion, and performs no deletion of any kind.
-* Nothing in the frozen path reads history, calls the deletion service, or
-  invokes `preview_self_owned_count()`.
-
-## 2. What remains, unchanged
-
-* The **general Delete service** (`backend/services/delete_service.py`), its
-  ownership-verification chokepoint (`delete_verified_self_messages`), and
-  the All-capability (`do_del_self_filtered`, `select_self_owned_message_ids`,
-  `preview_self_owned_count`) are byte-for-byte untouched.
-* The **AI Delete tool** and its existing capabilities (`mode: "all"` included)
-  are untouched. Its own timeout/partial-result behaviour never depended on
-  the Glass panel and still passes its tests unchanged.
-* Quick-count deletion (`panel:del:q:n` / `qexec`), custom-count input,
-  delete-from-message (recent/preview/single/forward/reply), message-ID input,
-  ID-forward, and date-range input behave exactly as before.
-* Shared Telegram clients, the Helper Bot architecture, panel ownership
-  (Helper Bot is still the only editor of the Delete panel), and all other UI
-  infrastructure are untouched.
-
-## 3. Freeze, not removal
-
-The implementation is kept in place for possible future reactivation:
-
-* `do_del_self_filtered` + its bounds/deadline/progress plumbing (service),
-* the staged progress machinery — `_ProgressPainter`, `_progress_painter`,
-  `_render_scan_progress` / `_render_delete_progress`, `_progress_message`,
-  `_all_result_text` and the `_ALL_TITLE` / `_DELETING_TITLE` /
-  `_COMPLETED_TITLE` / `_STOPPED_TITLE` titles (handler),
-* `_ALL_PREVIEW_TIMEOUT` and `preview_self_owned_count()` (preview step).
-
-Reactivation is limited to restoring the button in `_home_buttons()` and
-routing `panel:del:all` / `panel:del:allexec` to implementing code again;
-the whole backend + progress + rendering stack stays tested at the service
-and painter level (see §4), so nothing else needs to be rebuilt.
-
-## 4. Tests and validation
-
-Frozen-callback coverage (new/updated):
-
-| Test | Proves |
-| --- | --- |
-| `test_33…::test_frozen_all_callback_deletes_nothing_however_many_messages` | both callbacks delete nothing with 1,320 messages present; no `panel:del:allexec` button; Back offered |
-| `test_33…::test_frozen_all_callbacks_never_invoke_the_deletion_service` | spies on `do_del_self_filtered`, `do_del_n_counts`, `preview_self_owned_count` record **zero** calls |
-| `test_33…::test_frozen_all_callbacks_show_no_preview_or_confirmation` | no “Preview:”, no “Confirm”, no “Delete ALL” in the frozen body |
-| `test_34…::test_frozen_all_renders_no_preview_and_no_confirmation` | same, plus the preview service is never even called |
-| `test_34…::test_frozen_allexec_starts_no_operation` | replayed `allexec` deletes nothing, paints nothing |
-| `test_delete_panel_ownership…::test_the_frozen_all_callbacks_edit_nothing` | neither callback edits the panel (Helper Bot or Self Client) |
-| `test_33…::test_home_panel_offers_every_required_quick_action` (updated) | `panel:del:all` is absent from the home panel; every other button remains |
-| `test_33…::test_quick_still_requires_confirmation_and_all_is_gone` (updated) | quick-count still requires confirmation; `all` shows no confirmation |
-| `test_colored_buttons…::test_delete_submenu_is_primary` (updated) | frozen button absent; remaining buttons keep their styles |
-| `test_33…::test_every_manual_path_reaches_the_ownership_chokepoint` (updated) | `allexec` removed from the path list; the other seven paths still reach the chokepoint exactly once |
-
-Backend capability coverage kept (drives the implementation directly — the
-frozen UI no longer reaches it):
-
-* `tests/test_34_delete_all_execution.py` — the former handler tests now call
-  the service through a `run_all()` helper that mirrors the old `allexec`
-  handler (one progress painter → `do_del_self_filtered` →
-  `_all_result_text`): total deadline, slow-history partial results, scan
-  failure keeps verified candidates, candidate/scan bounds, mid-deletion
-  deadline accounting, no duplicates, foreign messages untouched, staged
-  progress (counters, bar, single-count rejection accounting), panel-edit
-  throttling/single-flight/failure tolerance, chunk ceilings, event-loop
-  yielding — plus the two new frozen tests above.
-* `tests/test_delete_panel_ownership.py` — helper-owned panel editing tests
-  now also drive the capability through the same helper (same
-  `run_all()`), plus a frozen test asserting no panel edit at all.
-* AI Delete tool / semantic-delete / silent-delete / durable-delete suites —
-  untouched, still green.
-
-Exact runs:
+Composition happens at the smallest boundary that covers every eligible render:
 
 ```
-focused Delete suites (test_26 … test_34, ownership, durable delete) ... 159 passed
-UI + ownership + coloured buttons .................................... 111 passed
-full suite ........................................................... 7206 passed, 27 skipped, 1 failed, 3 warnings in 211.07s
-py_compile / compileall (delete.py + 4 test files) ................... exit 0
-git diff --check ..................................................... clean
+settings_service (5 keys + strict setter)
+   ↓
+appearance_service   compose_text / with_preview / apply_to_inline_results
+   ↓                                  ↓
+panels._handle_panel            inline_engine._inline_router
+(callback navigation)           (the first inline result)
+   ↓                                  ↓
+ExistingPanelEditor(inline_id, helper) — Helper Bot only
 ```
 
-The single full-suite failure is the pre-existing
-`tests/test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`
-(“interval advancement exceeded bound”), which reproduces on the untouched
-baseline `c8e5e90`; neither the scheduler nor any of its files are touched by
-this diff. (One transient additional failure during this work,
-`test_colored_buttons …test_delete_submenu_is_primary`, asserted the frozen
-button's presence; it was updated to assert the freeze and is green.)
+* `backend/services/appearance_service.py` (new) owns page identity
+  (`MAIN_PAGE_IDS`), canonical defaults (`PAGE_DEFAULTS`), validation, text
+  composition, the preview URL/meta/HTML, image sniffing/limits and the Storage
+  upload/download/remove calls.
+* `backend/bot/handlers/appearance.py` (new) owns the fives panels, four
+  actions and five pending-input flows. It never builds a client, never
+  registers a listener and never edits through the self-client.
+* `settings_service` gained the five keys, their validators and typed
+  accessors, plus `set_setting_strict` (a rejected DB write is reported, never
+  silently cache-only, when a database is configured).
+* `panels._handle_panel` applies `appearance_service.with_preview(...)` and
+  threads `link_preview` through `_safe_edit`/`_present`;
+  `inline_engine._inline_router` applies `apply_to_inline_results(...)`.
+* `backend/web/app.py` serves `GET /appearance/preview/{version}` (HTML with
+  Open Graph tags) and `GET /appearance/image/{version}` (bytes, immutable
+  cache), both declared before the SPA fallback.
+* `backend/bot/handlers/misc.py` adds exactly one menu row;
+  `backend/bot/router.py` calls `appearance.register`.
 
-## 5. Limitations
+## 2. Appearance menu and Unicode compliance
 
-* No live Telegram behaviour was verified: the tests prove the panel no
-  longer renders the option, the callbacks are inert, and no service or panel
-  edit is reached — not the rendering of the frozen notice on a real client.
-* The frozen implementation is intentionally kept (dead from the UI's point
-  of view) for reactivation; it is covered by service/painter-level tests
-  rather than callback tests.
-* The AI delete tool in `mode: "all"` remains reachable through the assistant
-  (untouched by design). If it too is ever to be gated, that belongs to the
-  AI-tool governance, not to this UI freeze.
+* `Menu` → **Appearance** (`panel:appearance`) → **Header Customization**
+  (`panel:appearance:header`), **Page Text** (`panel:appearance:pages` → one
+  page each), **Preview Image** (`panel:appearance:preview`). Every sub-panel
+  uses the shared Back / Home / Close navigation.
+* The main menu gained exactly this one entry (10 rows, was 9).
+* No new symbol was introduced. Labels are composed with the existing registry
+  (`OP_EDIT`, `PANEL_HEADING`, `MEDIA_PHOTO`, `OP_SAVE`, `OP_STOP`,
+  `OP_REFRESH`, `OP_DELETE`, `OP_CREATE`, `STATE_COMPLETED`, `STATE_WARNING`,
+  `STATE_FAILED`, `SEPARATOR`) via `sym.label(...)`; no emoji, no `U+FE0F`, and
+  no font transformation is ever applied to callback data, page ids or URLs.
+
+## 3. Global header and per-page customization
+
+* `appearance_header_title` / `appearance_header_body` are shared static
+  values. `''` means "built-in default", so resetting stores the empty value,
+  never a copy of the current customization.
+* When a header title is set it becomes the panel title, with the page's own
+  title kept as one bold line beneath it (no duplicate title); the header body
+  sits above the page body / live content.
+* Eleven eligible pages (`menu, save, del, profile, db, general, settings,
+  cipher, todo, ai, appearance`) come from `MAIN_PAGE_IDS`; a test asserts that
+  set equals the menu's own `panel:*` destinations + `menu`, so it cannot drift.
+* Per-page `{title?, body?}` overrides live in `appearance_page_overrides`
+  (jsonb). An absent field keeps the page's default. A body override replaces a
+  body that is still its untouched default and is otherwise **prepended** above
+  live/dynamic content, so counters, provider state and lists stay live.
+* Composition runs only for `extra == ""` (the page's home view): action
+  results, confirmations, pickers, pagination and input prompts are untouched.
+* Reset is per field and per page, restoring the canonical default from
+  `PAGE_DEFAULTS`. Bounds: title 120, body 800 characters; blank/NUL and
+  oversized input is rejected without corrupting the previous value.
+
+## 4. Image upload, storage and toggle
+
+* Preview switch (`appearance_preview_enabled`) and storage
+  (`appearance_preview_image_key`) are independent:
+
+  | enabled | stored | behaviour |
+  |---|---|---|
+  | OFF | yes | text-only, key retained |
+  | OFF | no | text-only |
+  | ON | yes | web-page preview |
+  | ON | no | asks to upload or skip; the panel stays functional |
+
+* Upload reuses the ONE pending-input listener (`input:appearance:image`); the
+  self-client only receives the owner's media, the Helper Bot performs the
+  panel edit (`ExistingPanelEditor(inline_id, helper)`, `self_client=None`).
+  If the Helper Bot cannot edit, the failure is reported — there is no
+  self-client fallback and no second panel message.
+* Validation is content-based: PNG/JPEG/WebP magic bytes + dimension parsing,
+  ≤ 5 MB, ≤ 4096 px per side, malformed/unsupported media rejected with the
+  previous setting intact. The bytes are streamed from a bounded read, never
+  written to disk, so there is no temp file to leak.
+* The image is uploaded to Supabase Storage (`APPEARANCE_MEDIA_BUCKET`,
+  falling back to `ARCHIVE_MEDIA_BUCKET`) under a versioned key. Only that
+  stable object key is persisted — never bytes, never a signed URL. Replace
+  uploads first and removes the old object afterwards; Remove deletes the
+  object and clears the key; disabling preview deletes nothing.
+
+## 5. Telegram preview — implementation and verification status
+
+* Enabled preview appends the public HTTPS URL
+  `$PUBLIC_BASE_URL/appearance/preview/<version>` (fallback
+  `RENDER_EXTERNAL_URL`) to the composed body with `no_webpage=False`, so
+  Telegram renders its own web-page preview above the text; the inline keyboard
+  is untouched and no second message is created.
+* `/appearance/preview/<version>` returns HTML carrying `og:title`,
+  `og:description`, `og:image`, `og:image:width/height`, `og:image:type` and
+  `og:url`; the tap target is the existing Guide page. `/appearance/image/<version>`
+  serves the stored object with an immutable cache header. The version is part
+  of the key, so a replacement changes both URLs and Telegram's preview cache
+  cannot keep showing the old image.
+* Disabled preview produces a genuinely text-only panel: no URL is appended at
+  all, even when an image is still stored (this was a real bug the tests caught).
+* **Verified:** the built HTML/meta, the URL/version derivation, the
+  text-only/URL-present split, the keyboard preservation and the edit path are
+  covered by tests. **Not verified:** how Telegram actually renders the preview
+  card (size, crop, cache), because no live Telegram client is available here;
+  the small-preview request cannot be forced through this inline edit path and
+  is documented as a limitation, not claimed.
+
+## 6. Helper-Bot-only editing
+
+* Every repaint in the new flow goes through `_paint_input(inline_id, view)`
+  → `ExistingPanelEditor(inline_id=…, helper=…)` with **no** `self_client`
+  argument, so a refused inline edit surfaces as a failure instead of being
+  retried by the account.
+* The migration handler path uses the same editor; the account never calls
+  `edit_message` for this panel and never sends a replacement panel.
+* Tests assert the editor is constructed with `self_client=None`, that no
+  self-client edit occurs, and that no new listener/client/loop is registered.
+
+## 7. Files changed
+
+New:
+
+* `backend/services/appearance_service.py`
+* `backend/bot/handlers/appearance.py`
+* `supabase/migrations/20261109000000_add_panel_settings_appearance.sql`
+* `tests/test_appearance_ui.py` (42 tests)
+
+Modified:
+
+* `backend/services/settings_service.py` (5 keys, validators, strict setter)
+* `backend/helper/panels.py` (composition + `link_preview` plumbing, shim-safe)
+* `backend/helper/inline_engine.py` (first-render composition)
+* `backend/helper/inline_sender.py` (`event` kwarg for builders that accept it)
+* `backend/bot/handlers/misc.py` (menu entry)
+* `backend/bot/router.py` (registration)
+* `backend/web/app.py` (preview + image routes)
+* `DATABASE_ARCHITECTURE.md` (§6 columns, §30.11 list, §31.1 audit row + counts,
+  §31.2 prose, §31.3 part 15 of 15)
+* `tests/test_database_setup_order.py`, `tests/test_private_message_db_security.py`
+  (migration/part counts: 36 → 37, 14 → 15, "thirteen" → "fourteen")
+* `AGENTS.md`, `INVESTIGATION.md`, `IMPLEMENTATION_REPORT.md`, `ROADMAP.md`
+
+## 8. Exact database / storage setup and rollback (NOT applied)
+
+Nothing below was executed; the live Supabase project was not contacted.
+
+**Required:** the five columns do not exist on the owner's database until the
+new part is applied. Until then the repository rejects the writes and the
+customization survives only in the process cache (it is lost on restart).
+
+Apply, as `postgres` in the Supabase SQL editor — the single §31.3 block of
+`DATABASE_ARCHITECTURE.md` (now parts 1–15) **or** just this migration:
+
+```sql
+-- supabase/migrations/20261109000000_add_panel_settings_appearance.sql
+ALTER TABLE panel_settings ADD COLUMN IF NOT EXISTS appearance_header_title text;
+ALTER TABLE panel_settings ALTER COLUMN appearance_header_title SET DEFAULT '';
+UPDATE panel_settings SET appearance_header_title = '' WHERE appearance_header_title IS NULL;
+ALTER TABLE panel_settings ALTER COLUMN appearance_header_title SET NOT NULL;
+
+ALTER TABLE panel_settings ADD COLUMN IF NOT EXISTS appearance_header_body text;
+ALTER TABLE panel_settings ALTER COLUMN appearance_header_body SET DEFAULT '';
+UPDATE panel_settings SET appearance_header_body = '' WHERE appearance_header_body IS NULL;
+ALTER TABLE panel_settings ALTER COLUMN appearance_header_body SET NOT NULL;
+
+ALTER TABLE panel_settings ADD COLUMN IF NOT EXISTS appearance_page_overrides jsonb;
+ALTER TABLE panel_settings ALTER COLUMN appearance_page_overrides SET DEFAULT '{}'::jsonb;
+UPDATE panel_settings SET appearance_page_overrides = '{}'::jsonb WHERE appearance_page_overrides IS NULL;
+ALTER TABLE panel_settings ALTER COLUMN appearance_page_overrides SET NOT NULL;
+
+ALTER TABLE panel_settings ADD COLUMN IF NOT EXISTS appearance_preview_enabled boolean;
+ALTER TABLE panel_settings ALTER COLUMN appearance_preview_enabled SET DEFAULT false;
+UPDATE panel_settings SET appearance_preview_enabled = false WHERE appearance_preview_enabled IS NULL;
+ALTER TABLE panel_settings ALTER COLUMN appearance_preview_enabled SET NOT NULL;
+
+ALTER TABLE panel_settings ADD COLUMN IF NOT EXISTS appearance_preview_image_key text;
+ALTER TABLE panel_settings ALTER COLUMN appearance_preview_image_key SET DEFAULT '';
+UPDATE panel_settings SET appearance_preview_image_key = '' WHERE appearance_preview_image_key IS NULL;
+ALTER TABLE panel_settings ALTER COLUMN appearance_preview_image_key SET NOT NULL;
+
+INSERT INTO panel_settings (key) VALUES ('global') ON CONFLICT (key) DO NOTHING;
+
+ALTER TABLE panel_settings DROP CONSTRAINT IF EXISTS panel_settings_appearance_header_title_check;
+ALTER TABLE panel_settings ADD CONSTRAINT panel_settings_appearance_header_title_check
+    CHECK (length(appearance_header_title) <= 1024 AND position(chr(0) in appearance_header_title) = 0);
+ALTER TABLE panel_settings DROP CONSTRAINT IF EXISTS panel_settings_appearance_header_body_check;
+ALTER TABLE panel_settings ADD CONSTRAINT panel_settings_appearance_header_body_check
+    CHECK (length(appearance_header_body) <= 1024 AND position(chr(0) in appearance_header_body) = 0);
+ALTER TABLE panel_settings DROP CONSTRAINT IF EXISTS panel_settings_appearance_page_overrides_check;
+ALTER TABLE panel_settings ADD CONSTRAINT panel_settings_appearance_page_overrides_check
+    CHECK (jsonb_typeof(appearance_page_overrides) = 'object');
+ALTER TABLE panel_settings DROP CONSTRAINT IF EXISTS panel_settings_appearance_preview_image_key_check;
+ALTER TABLE panel_settings ADD CONSTRAINT panel_settings_appearance_preview_image_key_check
+    CHECK (appearance_preview_image_key = '' OR appearance_preview_image_key ~ '^[A-Za-z0-9][A-Za-z0-9/_.-]*$');
+
+NOTIFY pgrst, 'reload schema';
+```
+
+**Storage bucket (required for upload):**
+
+* Create a **private** bucket, name it in `APPEARANCE_MEDIA_BUCKET` (or let it
+  fall back to the existing `ARCHIVE_MEDIA_BUCKET`). If neither is set, upload
+  fails with an explicit "durable image storage is not configured" message and
+  everything else keeps working.
+* Allowed MIME types: `image/png`, `image/jpeg`, `image/webp`.
+* Max size 5 MB per object (the app also enforces ≤ 4096 px per side before
+  upload).
+* No public policy is needed: only the backend service-role key writes, reads
+  and deletes, and the image is served to Telegram by
+  `/appearance/image/<version>`. Do **not** make the bucket public.
+* Public HTTPS base URL: set `PUBLIC_BASE_URL` (https) — or rely on Render's
+  `RENDER_EXTERNAL_URL` — so the preview page is reachable by Telegram.
+
+**Rollback** (Appearance values then degrade to the process cache and reset on
+restart; the stored preview OBJECT is not deleted by this rollback):
+
+```sql
+ALTER TABLE panel_settings DROP CONSTRAINT IF EXISTS panel_settings_appearance_header_title_check;
+ALTER TABLE panel_settings DROP CONSTRAINT IF EXISTS panel_settings_appearance_header_body_check;
+ALTER TABLE panel_settings DROP CONSTRAINT IF EXISTS panel_settings_appearance_page_overrides_check;
+ALTER TABLE panel_settings DROP CONSTRAINT IF EXISTS panel_settings_appearance_preview_image_key_check;
+ALTER TABLE panel_settings DROP COLUMN IF EXISTS appearance_preview_image_key;
+ALTER TABLE panel_settings DROP COLUMN IF EXISTS appearance_preview_enabled;
+ALTER TABLE panel_settings DROP COLUMN IF EXISTS appearance_page_overrides;
+ALTER TABLE panel_settings DROP COLUMN IF EXISTS appearance_header_body;
+ALTER TABLE panel_settings DROP COLUMN IF EXISTS appearance_header_title;
+```
+
+## 9. Tests run and exact results
+
+Focused suites (Appearance + symbols + Taskloom input/editor UX + emoji stage 1
++ coloured buttons + guide):
+
+```
+226 passed
+```
+
+Appearance-specific file (`tests/test_appearance_ui.py`, 42 tests) and the two
+shim regressions that first failed on `link_preview`:
+
+```
+44 passed
+```
+
+Documentation audits after the migration was added as part 15
+(`test_database_setup_order`, `test_private_message_db_security`,
+`test_canonical_schema_reconciliation`):
+
+```
+103 passed
+```
+
+Full suite, compilation and diff hygiene are recorded in §11 with the delivery
+state; the numbers above are the exact pytest summaries from this tree.
+
+## 10. Tested and passed / not tested
+
+**Tested and passed** — menu registration and single-entry rule; eligibility
+equals the menu's destinations; header title/body edit, independent reset and
+full reset; bounds rejection (blank, NUL, oversized) with the old value intact;
+per-page title-only / body-only / both overrides; untouched pages keep defaults;
+dynamic bodies keep their live content under a prepended override; sub-views are
+never composed; reset restores the real default; callback data unchanged;
+strict-write honesty; reload/restart persistence through the settings service;
+image accept/reject (magic bytes, dimensions, size), replace, remove, OFF keeps
+the key, ON-without-image asks, failed upload leaves settings intact, temp-file
+avoidance; preview URL/version/OG metadata; text-only when disabled; keyboard
+preserved; edit-not-replace; Helper-Bot-only editor; no new listener/client/loop.
+
+**Not tested** — live Telegram rendering of the preview card (no client here);
+live Supabase Storage round-trip (no credentials here); the font pipeline's
+rendering of the new labels on a real device.
+
+**Requires manual owner action** — run the migration (§8); create/point the
+bucket and set `APPEARANCE_MEDIA_BUCKET`/`PUBLIC_BASE_URL`.
+
+**Deferred** — a curated gallery or generated default image; web-dashboard
+upload; per-user (multi-owner) appearances; forcing `force_small_media` on the
+inline edit path; live verification of Telegram's preview layout.
+
+## 11. Delivery
+
+One focused commit on `freebuff/dcc722156bb0a1a080890e10`, pushed to
+`origin/main`; the pushed SHA and the verified remote state are reported in the
+final response for this task (and, if the push is refused, the exact remaining
+step is reported instead of a claim).

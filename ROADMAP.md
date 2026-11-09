@@ -70,6 +70,35 @@ failure. That defect was repaired upstream in `0d07dc1` before this branch
 merged, so the probe is now the live way to confirm the repair holds for each
 `(provider, model)` pair.
 
+## Appearance personalization (Glass UI) — Stage 1
+
+Status legend as above. Everything in this stage is source-backed by
+`backend/services/appearance_service.py`, `backend/bot/handlers/appearance.py`
+and `tests/test_appearance_ui.py` (42 tests).
+
+| Capability | Status | Where |
+|---|---|---|
+| One new top-level `Appearance` category in the main menu (10th row) | IMPLEMENTED + TESTED | `misc._build_menu_buttons` |
+| Three sub-panels with the shared Back / Home / Close flow | IMPLEMENTED + TESTED | `appearance.register`, `panel_registry` |
+| Global header title + description, independently editable and resettable | IMPLEMENTED + TESTED | `appearance_service.set_header` / `reset_header` |
+| Per-main-page title/body overrides, validated against the real menu registry | IMPLEMENTED + TESTED | `appearance_service.MAIN_PAGE_IDS` / `set_page_text` |
+| Central composition (header + page override + live content + keyboard) | IMPLEMENTED + TESTED | `panels._handle_panel`, `inline_engine._inline_router` |
+| Dynamic/operational views, pickers, pagination and confirmations untouched | IMPLEMENTED + TESTED | `compose_text` (`extra == ""` only) |
+| Preview toggle independent of the stored image (OFF keeps the object) | IMPLEMENTED + TESTED | `settings_service.appearance_preview_enabled` |
+| Owner-uploaded image via the ONE pending-input listener, content-validated | IMPLEMENTED + TESTED | `appearance._image_input`, `validate_image` |
+| Durable Supabase Storage object key (never bytes / signed URL) | IMPLEMENTED + TESTED (unit), NOT LIVE-VERIFIED | `appearance_service.install_image` / `image_payload` |
+| Public HTTPS preview page with Open Graph metadata + versioned image URL | IMPLEMENTED + TESTED | `web.app` `/appearance/preview` + `/appearance/image` |
+| Genuinely text-only panel when preview is disabled | IMPLEMENTED + TESTED | `with_preview` |
+| Helper Bot is the only editor; no self-client fallback, no second message | IMPLEMENTED + TESTED | `appearance._paint_input`, `panel_edit.ExistingPanelEditor` |
+| `panel_settings` columns + additive migration + one-paste setup part 15 | IMPLEMENTED; MIGRATION NOT APPLIED | `20261109000000_add_panel_settings_appearance.sql`, `DATABASE_ARCHITECTURE.md` §31.3 |
+| Telegram's rendering of the preview card (size, crop, cache) | NOT LIVE-VERIFIED | requires a real client |
+| Forced small preview (`force_small_media`) on the inline edit path | LIMITATION | not expressible through this edit path |
+
+**Next stage (not started):** apply the migration and create/point the private
+Storage bucket, then live-verify the upload → preview → Guide tap flow on a real
+client; then consider an optional compact-preview path and a gallery only if the
+owner asks for it.
+
 ## Remaining work
 
 1. Live-verify the 429 scope classifier against real OpenAI/Groq/Gemini/Cloudflare
@@ -85,6 +114,9 @@ merged, so the probe is now the live way to confirm the repair holds for each
    evidence that pair's serialization or capability is the defect.
 5. Optionally surface the latest per-pair diagnostic result in the AI
    diagnostics panel so it does not require reading Render logs.
+6. Apply the Appearance migration (part 15), create/point the private Storage
+   bucket and set `APPEARANCE_MEDIA_BUCKET` / `PUBLIC_BASE_URL`, then
+   live-verify the upload → preview → Guide tap flow on a real client.
 
 ## Continuation diagnostic — generation budget and truncation
 

@@ -47,7 +47,17 @@ def _buttons_repr(buttons: list) -> tuple[tuple[str, ...], ...]:
     return tuple(result)
 
 
-async def _safe_edit(event, text: str, buttons: list, chat_id: int | None, msg_id: int | None) -> bool:
+async def _safe_edit(
+    event, text: str, buttons: list, chat_id: int | None, msg_id: int | None,
+    link_preview: bool | None = None,
+) -> bool:
+    """One edit of the panel message.
+
+    ``link_preview`` is left untouched (``None``) for every ordinary panel; the
+    Appearance layer passes it explicitly so a main page is either genuinely
+    text-only (disabled preview) or shows Telegram's web-page preview (enabled
+    preview with a stored image).
+    """
     lifecycle = get_lifecycle()
     key = (chat_id, msg_id)
     new_repr = (text, _buttons_repr(buttons))
@@ -57,7 +67,20 @@ async def _safe_edit(event, text: str, buttons: list, chat_id: int | None, msg_i
         return False
     started = time.monotonic()
     try:
-        await event.edit(text, buttons=buttons if buttons else [])
+        edit_kwargs: dict = {"buttons": buttons if buttons else []}
+        # Only a main page with an explicit preview policy carries the flag, so
+        # every other edit is byte-for-byte the call it has always been.
+        if link_preview is not None:
+            edit_kwargs["link_preview"] = link_preview
+        try:
+            await event.edit(text, **edit_kwargs)
+        except TypeError as exc:
+            # A client/event shim without the optional Telethon kwarg still gets
+            # the edit (text-only composition already removed any URL when the
+            # preview is disabled); never fail a panel paint over the flag.
+            if link_preview is None or "link_preview" not in str(exc):
+                raise
+            await event.edit(text, buttons=edit_kwargs["buttons"])
         lifecycle.set_render(chat_id or 0, msg_id or 0, text, new_repr)
         logger.info("[CALLBACK] edit OK (key=%s:%s)", chat_id, msg_id)
         return True
@@ -300,6 +323,32 @@ def _sync_timer(chat_id: int, msg_id: int, title: str, body: str, buttons: list)
         pass
 
 
+def _apply_appearance(panel_id: str, extra: str, result):
+    """Compose the Appearance layer onto one panel view.
+
+    This is the single callback-rendering boundary: the page's own handler has
+    already produced its title/body, and only an eligible main page's HOME view
+    (``extra == ""``) is rewritten. Action results and sub-views never pass
+    through here with an eligible empty ``extra``, so dynamic operational
+    content is never replaced.
+    """
+    if result is None:
+        return result
+    try:
+        from backend.services import appearance_service
+
+        if not appearance_service.is_eligible(panel_id):
+            return result
+        title, body, buttons = _extract_render_result(result)
+        new_title, new_body = appearance_service.with_preview(panel_id, extra, title, body)
+        if (new_title, new_body) == (title, body):
+            return result
+        return new_title, new_body, buttons
+    except Exception as exc:  # noqa: BLE001 — customization never breaks a panel
+        logger.warning("[APPEARANCE] composition skipped for panel '%s': %s", panel_id, exc)
+        return result
+
+
 def _extract_render_result(result) -> tuple[str, str, list]:
     if result is None:
         return "", "", []
@@ -322,7 +371,22 @@ async def _render_and_edit(event, result, panel_id: str, chat_id: int | None, ms
     from backend.helper.panel_render import render_edit
     text, built_buttons = render_edit(title, body, buttons)
     _sync_timer(chat_id or 0, msg_id or 0, title, body, buttons)
-    await _present(event, text, built_buttons, chat_id, msg_id)
+    await _present(
+        event, text, built_buttons, chat_id, msg_id,
+        link_preview=_appearance_link_preview(panel_id),
+    )
+
+
+def _appearance_link_preview(panel_id: str) -> bool | None:
+    """The explicit preview policy for a main page, or ``None`` elsewhere."""
+    try:
+        from backend.services import appearance_service
+
+        if not appearance_service.is_eligible(panel_id):
+            return None
+        return appearance_service.preview_active()
+    except Exception:
+        return None
 
 
 def _resolve_session(chat_id: int | None, msg_id: int | None, inline_message_id: str | None) -> tuple[Session | None, int, int]:
@@ -365,7 +429,10 @@ def _resolve_session(chat_id: int | None, msg_id: int | None, inline_message_id:
     return None, chat_id or 0, msg_id or 0
 
 
-async def _present(event, text: str, buttons: list, chat_id: int | None, msg_id: int | None) -> None:
+async def _present(
+    event, text: str, buttons: list, chat_id: int | None, msg_id: int | None,
+    link_preview: bool | None = None,
+) -> None:
     """Paint one view through the panel's single writer, outside the turn.
 
     The newest view wins: a view superseded while another paint is in flight is
@@ -379,7 +446,10 @@ async def _present(event, text: str, buttons: list, chat_id: int | None, msg_id:
         if painter.closed:
             return
         view_text, view_buttons = view
-        await _safe_edit(event, view_text, view_buttons, chat_id, msg_id)
+        paint_kwargs: dict = {}
+        if link_preview is not None:
+            paint_kwargs["link_preview"] = link_preview
+        await _safe_edit(event, view_text, view_buttons, chat_id, msg_id, **paint_kwargs)
 
     if painter.publish((text, buttons)):
         await painter.drain(_paint)
@@ -602,7 +672,7 @@ async def _handle_panel(event, remainder: str, chat_id: int, msg_id: int, owner_
 
     result = await handler(event, extra)
     logger.info("[CALLBACK] _handle_panel: handler returned (panel='%s')", panel_id)
-    return panel_id, result
+    return panel_id, _apply_appearance(panel_id, extra, result)
 
 
 async def dispatch_click(

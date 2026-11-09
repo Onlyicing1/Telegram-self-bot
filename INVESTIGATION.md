@@ -1,179 +1,136 @@
-# Investigation — Delete feature: manual reliability and the 500-message ceiling
+# Investigation — Appearance personalization for the Glass UI
 
-Snapshot inspected: `809d582` (`origin/main` at the start of the task).
-Everything below is verified against that source, not against a prompt description.
+Snapshot inspected: `5f8437d1` (`origin/main` at the start of the task, also the
+local HEAD, clean working tree). Everything below was verified against that
+source; no claim here comes from an earlier report.
 
-## 1. How a manual delete actually flows
+## 1. How a Glass UI panel is built, rendered and edited
 
-Panel button → callback router (`backend/bot/handlers/callback_gate.py`) →
-the *registered panel handler* (not the inline builder) →
-`panel:*` / `input:*` routing → `backend/bot/handlers/delete.py` →
-`backend/services/delete_service.py` → `delete_verified_self_messages()` →
-Telethon → panel repaint.
+```
+Menu (self-client, exact text)                 backend/bot/handlers/misc.py
+  → helper inline panel  (inline_engine)        backend/helper/inline_engine.py
+      build results via the registered builder  backend/helper/panel_registry.py
+      send via the Helper Bot                   backend/helper/inline_sender.py
+  → callback  panel:* / action:* / input:*      backend/helper/panels.py
+      _callback_router → callback_gate (ack, FIFO turn, painter)
+      _handle_panel  → registered panel fn      backend/helper/panel_registry.py
+                     → ExistingPanelEditor      backend/helper/panel_edit.py
+                     → Helper Bot edit by inline_message_id
+  → typed input   input:*                       backend/helper/input_state.py
+      ONE pending-input listener (register_input_listener) → handler
+```
 
-The old Delete panel had exactly two entries (`input:del:n`, `panel:delfrom`), so
-"Delete From" was the only scope picker, and it was the only place that touched
-Recent Messages.
+Facts that constrained the design:
 
-## 2. Confirmed root causes
+* The **initial** panel is an inline result built by
+  `panel_registry`/`inline_engine`; it never passes through
+  `panels._handle_panel`. Any composition done only in `_handle_panel` would
+  therefore miss the first render and appear only after the first click.
+* `panels._handle_panel(client, event, panel_id, extra)` is the single funnel for
+  every callback navigation that returns `(title, body, buttons)`. `extra` is
+  the sub-view marker (`""` = the page's own home view; anything else = a
+  confirmation, picker, pagination page, input prompt or dynamic result).
+* `ExistingPanelEditor(inline_id, helper)` is the only editor used for the
+  inline panel; `panel_edit.py` retries a refused inline edit through the
+  self-client **only when one is passed in**. The inline identifier lives on a
+  `CallbackQuery` as `query.msg_id` (`inline_message_id_from_event`).
+* `register_input(...)` registers state on the ONE owner pending-input listener;
+  `input_state` deletes the owner's trigger message and dispatches to the
+  handler. No handler may create another listener, client or update loop.
 
-### 2.1 Recent Messages / Delete From resolved the chat only from a reply target
+## 2. The settings architecture that already exists
 
-`_delfrom_recent_page()` and `_delfrom_panel_handler("exec:…")` both obtained the
-chat with `get_target(owner_id)` and bailed out unless `kind == "reply"`.
-Consequences:
+`settings_service` → `panel_settings_repository` → `panel_settings` (one
+singleton row, `key = 'global'`).
 
-* Opening the panel from the chat without replying to something produced
-  `No chat context` even though the callback itself carries the chat.
-* `TargetContext` expires after 300 seconds, so a panel left open stopped working.
-* When a stale target existed for a *different* chat, execution could aim at that
-  chat instead of the one the panel lives in.
-* The `exec:` path had no way to distinguish "chat unknown" from "0".
+* `settings_service` owns a `_DEFAULTS` map, per-key validators, a
+  cache-first read and a write-through setter; a rejected DB write is logged
+  and the cache keeps the value (the documented no-database behaviour).
+* `panel_settings_repository` writes **real columns** (`SET <column> = …`) and
+  refuses unknown keys, so adding a setting without a migration means the write
+  is rejected and the value survives only in the process cache — the exact
+  defect fixed for Auto-Reaction in `20261020160000_…` and re-checked here.
+* `db_client.get_db()` returns `None` when Supabase is not configured, so in
+  tests (and on a bare local run) every write is cache-only and honest.
 
-The panel session (`inline_chat_id`, or the message-id session for the
-personal-account panel) always knows the chat; it was simply never consulted.
+## 3. The actual `panel_settings` schema and its history
 
-### 2.2 Numeric input (`del:n`) reported nothing and left the command message behind
+The createdAt column set is defined by the canonical reconciliation snapshot
+(`20260920000001_reconcile_canonical_schema.sql`, part 1 of §31.3) and extended
+by four later additive migrations (Auto-Reaction was the last one before this
+task). Seven settings columns already existed at `5f8437d1`
+(`auto_delete_config`, `custom_emoji_enabled`, `auto_reaction_enabled`,
+`auto_reaction_emoji`, …), each added by its own migration — the established
+pattern was therefore "one additive migration per setting group", not "adding a
+column to an old file".
 
-`_del_n_input_handler()`:
+Two doc-audit suites pin the shape of `DATABASE_ARCHITECTURE.md` itself:
+`tests/test_database_setup_order.py` (statement-identity of the embedded parts,
+counts, §30.11 list) and `tests/test_private_message_db_security.py`
+(part numbering, migration/file counts). **Any new migration must be added as a
+new `PART n of N` inside the ONE §31.3 setup block, and both suites' constants
+must move with it.** They hard-coded 36 migrations / 14 parts.
 
-* ran `delete_service.do_del_n(...)` correctly, then painted the result **only**
-  if a helper client existed **and** `inline_chat_id`/`inline_msg_id` were set.
-  In the self-client Glass panel that condition is false, so the deletion happened
-  and the user saw nothing — which is exactly the reported "unreliable execution".
-* cleaned up the typed command message with a hard-coded helper assumption, so the
-  command message survived and the visible chat looked unchanged.
-* had no chat fallback at all: it used the `chat_id` captured when the input was
-  registered, and `0` was accepted silently.
+## 4. Durable object storage that already exists
 
-`_del_id_input_handler()` had the same three defects (plus `do_del_id`'s unbounded
-"from this id forward" semantics).
+`backend/services/archive_media.py` (and the Anti-Edit archive) already store
+BLOBs in **Supabase Storage** through the service-role client:
+`create_bucket`/`upload`/`download`/`remove` on a configurable bucket name
+(`ARCHIVE_MEDIA_BUCKET`), with a stable object key persisted in the database and
+**never** the bytes or a signed URL. That is exactly the required model, so the
+Appearance preview reuses the same mechanism and the same bucket by default
+(`APPEARANCE_MEDIA_BUCKET`, falling back to `ARCHIVE_MEDIA_BUCKET`); Render's
+local filesystem is never involved. The bucket's access model is the one the
+repository already relies on: private bucket, service-role writes/reads, and the
+image is re-served by the app from `/appearance/image/<version>`.
 
-### 2.3 Three independent ceilings
+## 5. Web routing and the Guide
 
-| Layer | Old value | Effect |
-| --- | --- | --- |
-| `backend/ai/actions.py::_MAX_DELETE_COUNT` | 500 | structured action rejected `count > 500` |
-| `DeleteTool.parameters()["count"]["maximum"]` | 500 | tool schema told the model 500 |
-| `delete_service.select_self_owned_message_ids()` | 500 | service raised for `count > 500` |
-| `do_del_n_counts()` / `do_del_last_n_real()` | 500 | direct callers rejected too |
-| `_MAX_DELETE_SCAN_MESSAGES` | 1000 | All mode and semantic selection stopped at 1000 |
-| `semantic._MAX_CANDIDATES` / `_MAX_DELETE_IDS` | 100 / 100 | history window and re-verify window |
+`backend/web/app.py` mounts the SPA/static assets **last**; explicit routes are
+declared before it and already include `/guide`-style pages and API routes. New
+routes therefore must be declared before the SPA fallback or they are swallowed
+by it. `guide/index.html` is the existing public Guide page, which is the
+natural tap target for the preview.
 
-### 2.4 Partial operations were reported as total failure or total success
+## 6. Telethon capability check (installed version, not assumed)
 
-* `delete_verified_self_messages()` raised `RuntimeError` on a batch error without
-  carrying what had already been deleted; callers reported `count: 0`.
-* The tool's timeout branch always said `count: 0` even when batches had succeeded.
-* `do_del_n()` / `do_del_id()` built their own strings, so the count shown to the
-  user could disagree with what Telegram actually deleted.
-* Nothing distinguished "scan stopped at the safety bound" from "history exhausted".
+Installed Telethon 1.43 provides `InputBotInlineMessageMediaWebPage` and
+`InputMediaWebPage`, and `client.edit_message(..., link_preview=…)` accepts a
+`bool`/media for the outgoing-edit path. The inline **edit** path used here
+(`messages.editInlineBotMessage` via the Helper Bot) cannot carry
+`force_small_media` for an already-sent message through this code, so the
+implemented preview uses Telegram's ordinary **web-page preview** of a public
+HTTPS URL (`no_webpage=False` + URL appended). Telegram decides the layout; the
+panel never claims a forced small preview.
 
-### 2.5 Ownership chokepoint is sound (unchanged)
+## 7. The symbol registry
 
-`delete_verified_self_messages()` re-fetches every id, compares `out` against
-`owner_id`, and deletes in `_DELETE_VERIFY_CHUNK = 100` batches. That is the only
-place that issues `delete_messages`, and it stays that way — no path was allowed
-to skip it for speed.
+`backend/helper/symbols.py` is the single source of truth: functional,
+non-emoji glyphs, no `U+FE0F`, grouped into categories with a documented-reuse
+set, and `tests/test_symbols.py` enforces uniqueness. The Appearance UI needed
+no new symbol: it reuses `OP_EDIT`, `PANEL_HEADING`, `MEDIA_PHOTO`, `OP_SAVE`,
+`OP_STOP`, `OP_REFRESH`, `OP_DELETE`, `OP_CREATE`, `STATE_COMPLETED`,
+`STATE_WARNING`, `STATE_FAILED` and `SEPARATOR` through `sym.label(...)`, so the
+font pipeline never sees a new glyph and callback data is untouched.
 
-## 3. Constraints that shaped the fix
+## 8. Discovered defects and gaps this task had to handle
 
-* The self client (`inline_engine._self_client`) is the only Telegram authority;
-  the helper bot may paint panels but must never delete.
-* Manual paths must not depend on `TargetContext`; the chat comes from the
-  callback message, then the inline session, then the message-id session, never a
-  guess.
-* The AI never gets raw RPC: it still goes `ToolRegistry` → `ToolExecutor` →
-  `delete_service`.
-* Timezone: `TZ` (default `Asia/Tehran`), the same source `backend/config.py` uses;
-  no second parser was added (`split_range()` splits, `parse_time_range` parses).
-* No scheduler, worker, extra client, or second deletion mechanism.
-
-## 4. Follow-up: why manual "All my messages" hung and deleted nothing
-
-The owner's live test overrode the first report, so the All path was traced again
-at `15bc401`.
-
-1. **No total deadline.** `_del_view("allexec")` called
-   `do_del_self_filtered()` without `deadline`, and the service only honoured a
-   caller-supplied one. The scan bound (50,000) and the 5s per-RPC timeout bound
-   individual calls, not the operation: 20,000 candidates mean ~200 ownership
-   RPCs plus ~200 delete batches, which can run for a very long time while the
-   panel handler — and therefore the visible panel — waits.
-2. **Verified candidates were thrown away.** `do_del_self_filtered()` returned
-   immediately when `selection.error` was set. `select_self_owned_message_ids()`
-   returns the ids it already collected together with that error, so one history
-   RPC failure produced zero deletions instead of a partial, honest result.
-3. **The candidate bound was not enforced in All mode.** `MAX_DELETE_COUNT` was
-   checked only in the `count is not None` branch, so `count=None` could select
-   the full 50,000-scan-bound worth of ids.
-4. **The preview could stall the confirmation panel.**
-   `preview_self_owned_count()` was awaited inside the panel handler with only the
-   per-message 5s RPC timeout, so 200 sampled messages could delay the panel by
-   minutes.
-5. **No sign of life.** The callback query was acknowledged, then nothing edited
-   the panel until the whole operation returned. Even a bounded operation looked
-   frozen.
-
-The ownership chokepoint itself was NOT the defect: every path already went
-through `delete_verified_self_messages()`, which re-fetches and checks `out` +
-`sender_id` per id in 100-id batches. The fix adds a deadline and partial-result
-reporting around it without bypassing or weakening it.
-
-## 5. Progress reporting: text-only, and rejections that could be double-counted
-
-Traced at `c8e5e905`, where the All path already had a deadline, partial
-reporting and a throttled text painter.
-
-1. **The painter carried no model of the operation.** It printed
-   `Working — scanned N · M of yours verified · K deleted` from whatever keys a
-   snapshot happened to carry, so it had no candidate total, no percentage, no
-   bar and no stage: the owner could not tell 12% from 90%, and the scan showed
-   no honest "found" counter. Nothing compared the rendered text with the last
-   painted text either, so a snapshot that had not changed still cost an edit
-   once the 3s interval elapsed.
-2. **`5s` edit timeout inside a `3s` interval.** A single slow edit could take
-   longer than the cadence it was reporting on, and because there was no
-   single-flight guard, overlapping paints were possible.
-3. **Two overlapping rejection sources.** `do_del_self_filtered()` ignored
-   `delete_verified_self_messages()`'s returned rejected ids while `_on_batch()`
-   already added failed deletion batches to `report.rejected`. The returned list
-   is exactly `ownership rejections + failed-delete ids`, so the obvious fix
-   (`report.rejected += len(_rejected)`) would have counted every failed batch
-   twice. The chokepoint therefore reports the two kinds separately
-   (`on_rejected` for ownership, `on_batch` for deletion outcomes) and each id
-   reaches exactly one of them.
-4. **The report had no scan figure.** `DeleteReport` carried `considered` but not
-   how much history was walked, so "Scanned / Found / Deleted / Rejected" could
-   not be shown honestly; `Selection` now carries `scanned` and the report takes
-   it from there.
-
-Chunking was NOT a defect: verification and deletion already ran in 100-id
-awaited batches with bounded memory, and every awaited RPC yields the loop. No
-batch size, bound or deadline was changed by this task.
-
-## 6. Panel ownership: the account was editing the Helper Bot's message
-
-Traced while adding the staged progress bar.
-
-1. **The inline identifier was never read.** `_progress_painter` used
-   `getattr(event, "inline_message_id", None)`. A `CallbackQuery` has no such
-   attribute — Telegram's inline handle lives at `query.msg_id` — so the value
-   was always `None` and callers fell into the next branch.
-2. **The editor was built with a self-client fallback.**
-   `_edit_panel()` passed `self_client=_self_client()`, and
-   `ExistingPanelEditor` retries a refused (or absent) inline edit through
-   `self_client.edit_message(chat, msg)`. For an inline panel that means the
-   account re-edits a message the Helper Bot owns — a silent ownership switch,
-   which is exactly what Deep Save's `_save_reply_wait_handler` avoids by
-   passing only the inline identifier and the bot.
-3. **No generation token.** Deep Save calls `begin_panel_operation` before its
-   first edit and `finish_panel_operation` after its terminal one, which is what
-   makes the newest operation the panel's only writer; the Delete painter took
-   no token, so a second click could not supersede a running run's paints.
-
-Fix: Delete now follows Deep Save exactly — `inline_message_id_from_event`,
-`begin_panel_operation`/`finish_panel_operation`, one `ExistingPanelEditor` with
-`self_client=None` reused for the whole operation, and a bounded
-`[DELETE_UI] panel edit path unavailable` warning (deletion unaffected) when the
-identifier or the bot is missing.
+1. **No central text layer existed.** Every handler returned its own
+   `(title, body, buttons)`; nothing could prepend a header or override one
+   page's text without editing eleven handlers. The narrowest correct boundary
+   is `panels._handle_panel` (callback navigation) plus
+   `inline_engine._inline_router` (first render).
+2. **`settings_service` could not report a rejected write.** A strict setter was
+   missing, so a "saved" value could be cache-only without the caller knowing.
+   `set_setting_strict` was added for the Appearance writes (the cache-only
+   path stays the documented fallback when no database is configured).
+3. **`_safe_edit` did not pass `link_preview`.** Test doubles and older shims
+   without that keyword raised `TypeError`; a bounded fallback was added so the
+   preview is best-effort and an edit still happens.
+4. **`with_preview` initially appended the URL even when preview was OFF**,
+   producing a preview on a "disabled" panel. Caught by the new tests; the URL
+   is now appended only when `preview_active()`.
+5. **Menu size.** The menu had nine entries; Appearance is the tenth. A test
+   pins that the menu's `panel:*` destinations equal
+   `appearance_service.MAIN_PAGE_IDS`, so eligibility can never drift from the
+   real navigation.

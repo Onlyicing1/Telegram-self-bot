@@ -245,6 +245,18 @@ layer — an execution interface, never just a text response.
   reached only through this category; the grouping is navigation only, so
   Anti-Edit / Anti-Delete keeps its existing private-chat capture scope.
 - **Settings / General**, **Context Panel**, **Health Dashboard**.
+- **Appearance** — the owner's personalization, kept out of Settings: a
+  shared static header, per-main-page title/body overrides for exactly the
+  top-level pages, and an optional preview image with its own switch. Values
+  are five `panel_settings` columns owned by `settings_service`
+  (`appearance_*`) and composed centrally by
+  `backend/services/appearance_service.py` at the panel render boundary, so
+  dynamic results, pickers and confirmations are never rewritten. The preview
+  is Telegram's web-page preview of a public Open Graph page
+  (`/appearance/preview/<version>`) whose tap target is the Guide; only a
+  durable Storage object key is stored, never bytes or a signed URL. The
+  Helper Bot is the only editor of this panel. See §31.3 part 15 of
+  `DATABASE_ARCHITECTURE.md` and `IMPLEMENTATION_REPORT.md`.
 
 Actions (`action:*`), panels (`panel:*`), and inputs (`input:*`) are registered
 through `backend/helper` registries and dispatched by `panels._callback_router`.

@@ -16,6 +16,7 @@ from telethon import events
 from backend.bot.handlers import misc, save, retrieve, delete, bio, discover, database, username, ai, ghost_seen_v2
 from backend.bot.handlers import (
     ai_unified,
+    appearance,
     ai_credentials,
     anti_edit_delete,
     ai_stt_settings,
@@ -90,6 +91,9 @@ def register_all(client, owner_id: int, tz_str: str):
 
     handlers = [
         ("misc", lambda: misc.register(client, owner_id)),
+        # Appearance registers panels/actions/inputs only — no listener, no
+        # client, no update loop; the main menu links its one new category.
+        ("appearance", lambda: appearance.register(client, owner_id)),
         ("save", lambda: save.register(client, owner_id, tz_str)),
         ("retrieve", lambda: retrieve.register(client, owner_id)),
         ("delete", lambda: delete.register(client, owner_id)),

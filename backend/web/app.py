@@ -8,7 +8,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 
 from backend.db import client as db_client
 from backend.health import snapshot as health_snapshot
@@ -307,6 +307,42 @@ def _apply_runtime_selection(provider: str, model: str) -> None:
         apply_runtime_selection(provider, model)
     except Exception as exc:
         logger.warning("api/ai: runtime selection apply failed: %s", exc)
+
+
+# ── Appearance preview ───────────────────────────────────────────────────────
+#
+# These two routes are registered BEFORE the SPA fallback (added in
+# mount_static below), so they are never shadowed by it and the existing
+# /guide mount is untouched.
+#
+#   /appearance/preview/<version> — the public page Telegram fetches for its
+#     web-page preview: Open Graph tags + an immediate continue to /guide/.
+#   /appearance/image/<version>   — the stored image itself, versioned per
+#     upload so a replacement is never served from Telegram's preview cache.
+
+@app.get("/appearance/preview/{version}")
+async def appearance_preview(version: str):
+    from backend.services import appearance_service
+
+    meta = appearance_service.preview_meta(version)
+    if meta is None:
+        raise HTTPException(status_code=404, detail="Not found")
+    return HTMLResponse(appearance_service.preview_html(meta))
+
+
+@app.get("/appearance/image/{version}")
+async def appearance_image(version: str):
+    from backend.services import appearance_service
+
+    payload = await appearance_service.image_payload(version)
+    if payload is None:
+        raise HTTPException(status_code=404, detail="Not found")
+    data, media_type = payload
+    return Response(
+        content=data,
+        media_type=media_type,
+        headers={"Cache-Control": "public, max-age=31536000, immutable"},
+    )
 
 
 def mount_static():

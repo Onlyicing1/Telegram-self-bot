@@ -319,6 +319,15 @@ def register_inline_handler(helper_client, owner_id: int) -> None:
         built: list = []
         try:
             built = await builder(event, extra)
+            # The initial panel is an inline result, so it never passes through
+            # the callback boundary: the Appearance layer is applied HERE, with
+            # the SAME composition later edits use.
+            try:
+                from backend.services import appearance_service
+
+                built = appearance_service.apply_to_inline_results(panel_id, extra, built)
+            except Exception as exc:  # noqa: BLE001 — never break a panel render
+                logger.warning("appearance: inline composition skipped: %s", exc)
             built = _sanitize_results(built)
             await event.answer(built)
             record_inline_answer(panel_id, built, ok=True)
