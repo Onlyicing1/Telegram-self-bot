@@ -252,11 +252,18 @@ layer — an execution interface, never just a text response.
   (`appearance_*`) and composed centrally by
   `backend/services/appearance_service.py` at the panel render boundary, so
   dynamic results, pickers and confirmations are never rewritten. The preview
-  is Telegram's web-page preview of a public Open Graph page
-  (`/appearance/preview/<version>`) whose tap target is the Guide; only a
-  durable Storage object key is stored, never bytes or a signed URL. The
-  Helper Bot is the only editor of this panel. See §31.3 part 15 of
-  `DATABASE_ARCHITECTURE.md` and `IMPLEMENTATION_REPORT.md`.
+  is delivered as the panel message's OWN PHOTO with the page text as its
+  caption: the initial inline result is rebuilt as a photo result
+  (`InputBotInlineResult` type `photo`, `InputWebDocument` content) whose URL is
+  the versioned `/appearance/image/<version>?fmt=jpeg` rendition of the selected
+  object, so no URL ever appears in the message and Telegram renders no web-page
+  card. Only a durable Storage object key is stored, never bytes or a signed
+  URL. A panel message is either media-with-caption or text; because Telegram
+  cannot convert one into the other (or exchange a photo without uploading it),
+  enabling, disabling or switching the selected image REPLACES the panel message
+  through `PanelLifecycleManager.replace_panel` (create first, delete the old
+  message after). The Helper Bot is the only editor of this panel. See §31.3
+  part 15 of `DATABASE_ARCHITECTURE.md` and `IMPLEMENTATION_REPORT.md`.
 
 Actions (`action:*`), panels (`panel:*`), and inputs (`input:*`) are registered
 through `backend/helper` registries and dispatched by `panels._callback_router`.

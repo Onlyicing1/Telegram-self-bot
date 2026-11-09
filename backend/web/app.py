@@ -331,8 +331,21 @@ async def appearance_preview(version: str):
 
 
 @app.get("/appearance/image/{version}")
-async def appearance_image(version: str):
+async def appearance_image(version: str, fmt: str = ""):
     from backend.services import appearance_service
+
+    # Telegram fetches an inline photo as a JPEG web document, so the panel's
+    # media points here with ``?fmt=jpeg``. The stored object is untouched: the
+    # rendition is encoded on demand from the same bytes (see ``telegram_photo``).
+    if (fmt or "").strip().lower() in ("jpeg", "jpg"):
+        encoded = await appearance_service.telegram_photo(version)
+        if encoded is None:
+            raise HTTPException(status_code=404, detail="Not found")
+        return Response(
+            content=encoded,
+            media_type="image/jpeg",
+            headers={"Cache-Control": "public, max-age=31536000, immutable"},
+        )
 
     payload = await appearance_service.image_payload(version)
     if payload is None:

@@ -36,6 +36,7 @@ def _fresh_settings(monkeypatch):
     settings_service._cache = dict(settings_service._DEFAULTS)
     settings_service._cache["appearance_page_overrides"] = {}
     settings_service._loaded = True
+    appearance_service.reset_delivery_state()
     for name in (
         "PUBLIC_BASE_URL",
         "RENDER_EXTERNAL_URL",
@@ -621,45 +622,67 @@ async def test_preview_web_routes(persisted, storage, monkeypatch):
 
 # ── inline rendering ────────────────────────────────────────────────────────
 
-def test_inline_result_is_text_only_by_default():
+@pytest.mark.asyncio
+async def test_inline_result_is_text_only_by_default():
     from backend.helper.panel_render import render
 
     result = render("LifeOS", "Choose a category:", [])
-    appearance_service.apply_to_inline_results("menu", "", [result])
+    built = await appearance_service.apply_to_inline_results("menu", "", [result])
+    assert built[0] is result
     assert result.send_message.no_webpage is True
     assert "appearance/preview" not in result.send_message.message
 
 
-def test_inline_result_carries_preview_and_keeps_the_keyboard(persisted, monkeypatch):
+@pytest.mark.asyncio
+async def test_inline_result_carries_the_photo_and_keeps_the_keyboard(
+    persisted, storage, monkeypatch
+):
+    from telethon.tl import types
+
     from backend.helper.panel_render import render
 
     monkeypatch.setenv("PUBLIC_BASE_URL", "https://lifeos.example")
-    settings_service.set_appearance_preview_image_key(_key())
-    settings_service.set_appearance_preview_enabled(True)
+    _objects, _calls = storage
+    await appearance_service.install_image(png_bytes(2, 2))
+    assert settings_service.set_appearance_preview_enabled(True) is True
+    appearance_service.reset_delivery_state()
 
     builder = panels.InlinePanelBuilder()
     builder.add_row("Save", "panel:save")
     result = render("LifeOS", "Choose a category:", builder.build())
-    before = [len(_buttons_of(row)) for row in result.send_message.reply_markup.rows]
+    before_rows = [len(_buttons_of(row)) for row in result.send_message.reply_markup.rows]
     before_data = _data(result.send_message.reply_markup.rows)
 
-    appearance_service.apply_to_inline_results("menu", "", [result])
+    built = await appearance_service.apply_to_inline_results("menu", "", [result])
 
-    assert result.send_message.no_webpage is False
-    assert appearance_service.preview_url() in result.send_message.message
-    assert [len(_buttons_of(row)) for row in result.send_message.reply_markup.rows] == before
-    assert _data(result.send_message.reply_markup.rows) == before_data
+    photo = built[0]
+    assert isinstance(photo.send_message, types.InputBotInlineMessageMediaAuto)
+    assert photo.type == "photo"
+    assert isinstance(photo.content, types.InputWebDocument)
+    assert photo.content.mime_type == "image/jpeg"
+    version = appearance_service.preview_version()
+    assert photo.content.url == (
+        f"https://lifeos.example/appearance/image/{version}?fmt=jpeg"
+    )
+    # The intent is preserved as the CAPTION; no link is part of the message.
+    assert "Choose a category:" in photo.send_message.message
+    assert "https://" not in photo.send_message.message
+    assert "/appearance/" not in photo.send_message.message
+    assert [len(_buttons_of(row)) for row in photo.send_message.reply_markup.rows] == before_rows
+    assert _data(photo.send_message.reply_markup.rows) == before_data
     assert "panel:save" in before_data
+    assert appearance_service.claim_built("menu") == ("media", version)
 
 
-def test_inline_composition_respects_page_override(persisted):
+@pytest.mark.asyncio
+async def test_inline_composition_respects_page_override(persisted):
     from backend.helper.panel_render import render
 
     appearance_service.set_page_text("menu", "title", "Owner home")
     result = render("LifeOS", "Choose a category:", [])
-    appearance_service.apply_to_inline_results("menu", "", [result])
-    assert result.send_message.message.startswith("**Owner home**")
-    assert "Choose a category:" in result.send_message.message
+    built = await appearance_service.apply_to_inline_results("menu", "", [result])
+    assert built[0].send_message.message.startswith("**Owner home**")
+    assert "Choose a category:" in built[0].send_message.message
 
 
 # ── Helper-Bot-only editing ────────────────────────────────────────────────

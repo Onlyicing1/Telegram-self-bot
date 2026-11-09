@@ -367,6 +367,8 @@ async def _render_and_edit(event, result, panel_id: str, chat_id: int | None, ms
     if not title and not body and not buttons:
         logger.warning("[CALLBACK] render_and_edit: empty result for panel='%s'", panel_id)
         return
+    if await _replace_for_delivery(panel_id, title, body, chat_id, msg_id):
+        return
     title, body, buttons = _finalize_panel(title, body, buttons, panel_id, chat_id, msg_id)
     from backend.helper.panel_render import render_edit
     text, built_buttons = render_edit(title, body, buttons)
@@ -378,15 +380,65 @@ async def _render_and_edit(event, result, panel_id: str, chat_id: int | None, ms
 
 
 def _appearance_link_preview(panel_id: str) -> bool | None:
-    """The explicit preview policy for a main page, or ``None`` elsewhere."""
+    """The explicit web-page-preview policy for a main page, or ``None``.
+
+    A customizable main page NEVER asks Telegram for a web-page preview: with a
+    preview image enabled the image is the message's PHOTO (so the text contains
+    no link to expand), and with it disabled the panel is genuinely text-only.
+    Returning ``False`` suppresses the card in both states, which is what stops
+    the Render/Guide card the owner reported.
+    """
     try:
         from backend.services import appearance_service
 
         if not appearance_service.is_eligible(panel_id):
             return None
-        return appearance_service.preview_active()
+        return False
     except Exception:
         return None
+
+
+async def _replace_for_delivery(
+    panel_id: str,
+    title: str,
+    body: str,
+    chat_id: int | None,
+    msg_id: int | None,
+) -> bool:
+    """Replace the panel message when its media/text state must change.
+
+    Only the HOME view of an eligible main page is affected, and only when the
+    message on screen cannot be edited into the desired state (a photo message
+    cannot lose its photo, and a different selected image needs a new inline
+    result). Returns ``True`` when a replacement was made, in which case the
+    caller must not paint the old message.
+    """
+    if not chat_id or not msg_id:
+        return False
+    try:
+        from backend.services import appearance_service
+
+        if not appearance_service.is_eligible(panel_id):
+            return False
+        nav = get_lifecycle().sessions.current_nav(chat_id, msg_id)
+        extra = nav[1] if nav else ""
+        if extra:
+            return False
+        if not appearance_service.needs_new_message(chat_id, msg_id, title, body):
+            return False
+        replaced = await get_lifecycle().replace_panel(chat_id, msg_id, panel_id, "")
+        if replaced:
+            logger.info(
+                "[APPEARANCE] panel '%s' replaced to change its delivery state "
+                "(chat=%s msg=%s)", panel_id, chat_id, msg_id,
+            )
+        return replaced
+    except Exception as exc:  # noqa: BLE001 — a failed replacement keeps the panel
+        logger.warning(
+            "[APPEARANCE] delivery replacement skipped for panel '%s': %s",
+            panel_id, exc,
+        )
+        return False
 
 
 def _resolve_session(chat_id: int | None, msg_id: int | None, inline_message_id: str | None) -> tuple[Session | None, int, int]:

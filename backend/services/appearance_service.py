@@ -41,6 +41,7 @@ import io
 import logging
 import os
 import re
+import time
 import uuid
 import zlib
 from typing import Any
@@ -123,6 +124,18 @@ _EXT_MIME = {"png": "image/png", "jpg": "image/jpeg", "webp": "image/webp"}
 _KEY_RE = re.compile(r"^appearance/preview/([0-9a-f]{32})\.(png|jpg|webp)$")
 _TOKEN_RE = re.compile(r"^[0-9a-f]{32}$")
 _VERSION_RE = re.compile(r"^[A-Za-z0-9_-]{8,80}$")
+
+#: Telegram's media-caption ceiling. A composed panel above it is delivered as
+#: TEXT instead, so the owner's full text is never truncated.
+MAX_CAPTION_CHARS = 1024
+
+#: The inline-photo fetch limit Telegram applies to a web document. The image
+#: is re-encoded for delivery only; the stored object is never touched.
+TELEGRAM_PHOTO_MAX_BYTES = 5 * 1024 * 1024
+
+#: How long a positive/negative readiness answer is reused before the gallery is
+#: listed again. Panel renders are frequent; the gallery changes rarely.
+_DELIVERY_READY_TTL = 30.0
 
 
 class ImageRejected(Exception):
@@ -306,45 +319,103 @@ def compose_text(panel_id: str, extra: str, title: str, body: str) -> tuple[str,
 
 
 def with_preview(panel_id: str, extra: str, title: str, body: str) -> tuple[str, str]:
-    """Compose the view and, when active, the versioned preview URL.
+    """Compose the view's TEXT only; the image travels as the message's media.
 
-    The URL is what makes Telegram render its web-page preview above the text
-    and buttons. It is appended (not substituted) so the page's own text is
-    kept, and it carries the selected object's unique version so a different
-    image is refetched instead of served from Telegram's preview cache.
+    This function used to append the versioned ``/appearance/preview/<version>``
+    URL to the body. Telegram then rendered its own web-page preview card of
+    that page (the Render hostname and the Guide site's title/description)
+    instead of the owner's image — the reported defect. No URL is composed
+    here any more: the selected image is sent as the inline result's PHOTO and
+    this text becomes its caption, so a panel is either genuine media with a
+    caption or genuine text, never a link.
     """
-    title, body = compose_text(panel_id, extra, title, body)
-    # Disabled preview must produce a GENUINELY text-only panel: no URL at all,
-    # even when images are still stored (turning preview OFF keeps the gallery).
-    url = preview_url() if preview_active() else ""
-    if url:
-        body = f"{body}\n\n{url}" if body else url
-    return title, body
+    return compose_text(panel_id, extra, title, body)
 
 
-def apply_to_inline_results(panel_id: str, extra: str, results: list) -> list:
+async def apply_to_inline_results(panel_id: str, extra: str, results: list) -> list:
     """Apply the appearance layer to freshly built inline results.
 
     The initial panel is an inline result, so it never passes through
     ``panels._handle_panel``. The title is recovered from the panel registry (or
     the canonical default) and the body is the remaining text, so the same
     composition is used for the first render and every later callback edit.
+
+    When a preview is genuinely deliverable, the result is REBUILT as a photo
+    result whose ``send_message`` is a media message: Telegram fetches the
+    selected image itself and shows it as the message's photo with this text as
+    its caption. The image URL is an API parameter, never message text, so no
+    link and no web-page card can appear.
+
+    Anything that makes media impossible (preview off, no selected image, the
+    selected object unreadable, or a caption above Telegram's limit) falls back
+    to the plain TEXT result with web-page previews suppressed — never to a URL
+    in the message.
     """
     if not is_eligible(panel_id) or extra or not results:
         return results
+
+    ready = await delivery_ready()
+    built_state: tuple[str, str] = ("text", "")
+    composed_any = False
+    output: list = []
     for result in results:
         message = getattr(result, "send_message", None)
         text = getattr(message, "message", None)
         if not isinstance(text, str):
+            output.append(result)
             continue
         split = _split_rendered_text(text, panel_id)
         if split is None:
+            output.append(result)
             continue
         title, body = with_preview(panel_id, extra, *split)
-        message.message = _compose_rendered(title, body)
+        composed = _compose_rendered(title, body)
+        composed_any = True
+        caption = caption_for(composed)
+        if preview_active() and ready and caption:
+            output.append(_as_photo_result(result, caption, telegram_photo_url()))
+            built_state = ("media", preview_version())
+            continue
+        message.message = composed
         if hasattr(message, "no_webpage"):
-            message.no_webpage = not preview_active()
-    return results
+            message.no_webpage = True
+        output.append(result)
+
+    # Only claim a state when a result was genuinely composed; a result whose
+    # text could not be recognised is left alone rather than mislabelled.
+    if composed_any:
+        note_built(panel_id, built_state)
+    return output
+
+
+def _as_photo_result(result, caption: str, image_url: str):
+    """Rebuild one inline result as a PHOTO result carrying ``caption``.
+
+    ``InputBotInlineResult`` with ``type="photo"`` and an
+    ``InputWebDocument`` content is Telegram's own shape for an inline photo
+    (the Bot API's ``InlineQueryResultPhoto``): the server downloads the image
+    from the document URL and sends it as the message media. The existing
+    inline keyboard is carried over untouched, so navigation is unchanged.
+    """
+    from telethon.tl import types
+
+    message = getattr(result, "send_message", None)
+    markup = getattr(message, "reply_markup", None)
+    return types.InputBotInlineResult(
+        id=str(getattr(result, "id", "0") or "0"),
+        type="photo",
+        title=str(getattr(result, "title", "") or "LifeOS")[:255],
+        content=types.InputWebDocument(
+            url=image_url,
+            size=0,
+            mime_type="image/jpeg",
+            attributes=[],
+        ),
+        send_message=types.InputBotInlineMessageMediaAuto(
+            message=caption,
+            reply_markup=markup,
+        ),
+    )
 
 
 def _split_rendered_text(text: str, panel_id: str) -> tuple[str, str] | None:
@@ -433,6 +504,142 @@ def preview_status() -> dict[str, Any]:
         "mode": "image" if preview_active() else "text",
         "max_images": MAX_GALLERY_IMAGES,
     }
+
+
+# ── Telegram media delivery ──────────────────────────────────────────────────
+#
+# The preview reaches Telegram as the panel message's PHOTO, with the panel's
+# own text as its caption. There are exactly two delivery states, and a panel
+# message can only be ONE of them:
+#
+#   ("media", <version>) — a photo message built from the selected object
+#   ("text", "")        — a text message with web-page previews suppressed
+#
+# Telegram cannot turn a photo message back into a text one, and cannot swap a
+# photo without an upload, so any change of state is delivered by REPLACING the
+# panel message through the existing lifecycle (create first, delete the old
+# one after) rather than by editing it in place.
+
+#: ``(mode, version)`` last known to be on screen, per panel message.
+_DELIVERED: dict[tuple[int, int], tuple[str, str]] = {}
+
+#: State the inline builder actually produced, per panel id. The builder runs in
+#: the Helper Bot's inline query; ``lifecycle.create_panel`` claims it once the
+#: message exists, so a fresh panel is recorded as what it really is.
+_BUILT: dict[str, tuple[str, str]] = {}
+
+_READY_AT: float = 0.0
+_READY_VALUE: bool = False
+
+
+def caption_for(text: str) -> str:
+    """The media caption for a composed panel text ("" when it cannot be one)."""
+    text = text or ""
+    if not text.strip() or len(text) > MAX_CAPTION_CHARS:
+        return ""
+    return text
+
+
+def telegram_photo_url() -> str:
+    """The public JPEG rendition of the selected image ("" when unavailable)."""
+    base = public_base_url()
+    version = preview_version()
+    if not base or not version:
+        return ""
+    return f"{base}/appearance/image/{version}?fmt=jpeg"
+
+
+async def delivery_ready(force: bool = False) -> bool:
+    """Whether the SELECTED object genuinely exists and can be delivered.
+
+    Listing the prefix is what tells a real image apart from a stale key, so a
+    missing object degrades to a text panel instead of Telegram failing to
+    fetch a 404 as the message's photo. The answer is cached briefly: panel
+    renders are frequent and the gallery changes rarely.
+    """
+    global _READY_AT, _READY_VALUE
+    now = time.monotonic()
+    if not force and _READY_AT and (now - _READY_AT) < _DELIVERY_READY_TTL:
+        return _READY_VALUE
+
+    ready = False
+    if preview_active() and storage_available():
+        key = settings_service.appearance_preview_image_key()
+        try:
+            entries = await asyncio.to_thread(_list_sync)
+            ready = any(entry["key"] == key for entry in entries)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — an unreadable gallery is not media
+            logger.warning("appearance: delivery readiness check failed: %s", exc)
+            ready = False
+    _READY_AT = now
+    _READY_VALUE = ready
+    return ready
+
+
+def note_built(panel_id: str, state: tuple[str, str]) -> None:
+    """Record what the inline builder produced for this panel query."""
+    _BUILT[str(panel_id)] = state
+
+
+def claim_built(panel_id: str) -> tuple[str, str] | None:
+    """Take (and clear) the state the inline builder produced for ``panel_id``."""
+    return _BUILT.pop(str(panel_id), None)
+
+
+def note_delivered(chat_id: int, msg_id: int, state: tuple[str, str]) -> None:
+    """Record the state that is actually on screen for one panel message."""
+    key = (int(chat_id or 0), int(msg_id or 0))
+    if not key[0] or not key[1]:
+        return
+    _DELIVERED[key] = state
+    if len(_DELIVERED) > 256:  # bounded: the oldest panel is dropped
+        _DELIVERED.pop(next(iter(_DELIVERED)))
+
+
+def forget_delivered(chat_id: int, msg_id: int) -> None:
+    _DELIVERED.pop((int(chat_id or 0), int(msg_id or 0)), None)
+
+
+def delivered_state(chat_id: int, msg_id: int) -> tuple[str, str] | None:
+    return _DELIVERED.get((int(chat_id or 0), int(msg_id or 0)))
+
+
+def desired_state(title: str = "", body: str = "") -> tuple[str, str]:
+    """The state the CURRENT settings should put on screen.
+
+    ``title``/``body`` are the composed view about to be painted; a caption
+    above Telegram's limit means text, so the full text is preserved.
+    """
+    caption = caption_for(_compose_rendered(title, body))
+    if preview_active() and _READY_VALUE and caption:
+        return ("media", preview_version())
+    return ("text", "")
+
+
+def needs_new_message(chat_id: int, msg_id: int, title: str, body: str) -> bool:
+    """Whether this panel message must be REPLACED to match the desired state.
+
+    Telegram cannot remove media from a message or exchange it without an
+    upload, so a text↔media switch, or a different selected image, needs a new
+    message. An unknown state (fresh process, panel created by an older build)
+    is replaced once when media is what should be shown.
+    """
+    desired = desired_state(title, body)
+    delivered = delivered_state(chat_id, msg_id)
+    if delivered is None:
+        return desired[0] == "media"
+    return delivered != desired
+
+
+def reset_delivery_state() -> None:
+    """Forget every recorded state (process start, and isolated tests)."""
+    global _READY_AT, _READY_VALUE
+    _DELIVERED.clear()
+    _BUILT.clear()
+    _READY_AT = 0.0
+    _READY_VALUE = False
 
 
 def preview_meta(version: str) -> dict[str, str] | None:
@@ -1069,3 +1276,73 @@ async def image_payload(version: str) -> tuple[bytes, str] | None:
         return None
     sniffed = sniff_image(data)
     return data, (sniffed[0] if sniffed else "application/octet-stream")
+
+
+def _encode_telegram_photo(data: bytes) -> bytes | None:
+    """A JPEG rendition Telegram will accept as an inline photo.
+
+    Delivery only: the stored object keeps the owner's original bytes exactly.
+    Telegram re-encodes photos for its own preview anyway, and an inline photo
+    fetch is limited to a JPEG document of a few megabytes. The image is
+    encoded at quality 90 and, only if that still exceeds the fetch limit,
+    progressively scaled down — never enlarged, never cropped.
+    """
+    try:
+        from PIL import Image
+    except ImportError:  # pragma: no cover - pinned dependency
+        return None
+
+    with Image.open(io.BytesIO(data)) as image:
+        image.load()
+        if image.mode not in ("RGB", "L"):
+            rgba = image.convert("RGBA")
+            canvas = Image.new("RGB", rgba.size, (255, 255, 255))
+            canvas.paste(rgba, mask=rgba.split()[-1])
+            frame = canvas
+        else:
+            frame = image if image.mode == "RGB" else image.convert("RGB")
+
+        scale = 1.0
+        for _attempt in range(4):
+            candidate = frame
+            if scale < 1.0:
+                size = (
+                    max(1, int(frame.width * scale)),
+                    max(1, int(frame.height * scale)),
+                )
+                candidate = frame.resize(size, Image.LANCZOS)
+            buffer = io.BytesIO()
+            candidate.save(buffer, "JPEG", quality=90, optimize=True)
+            encoded = buffer.getvalue()
+            if len(encoded) <= TELEGRAM_PHOTO_MAX_BYTES:
+                return encoded
+            scale *= 0.75
+        logger.warning(
+            "appearance: cannot fit the preview into Telegram's inline photo "
+            "limit (%d bytes)",
+            TELEGRAM_PHOTO_MAX_BYTES,
+        )
+        return None
+
+
+async def telegram_photo(version: str) -> bytes | None:
+    """The selected image encoded for Telegram's inline photo fetch.
+
+    ``None`` on a stale version, a missing object or an undecodable file: the
+    caller answers 404 rather than serving a wrong image, and the panel falls
+    back to text instead of showing a broken photo.
+    """
+    if not version or version != preview_version() or not storage_available():
+        return None
+    try:
+        data = await asyncio.to_thread(
+            _download_sync, settings_service.appearance_preview_image_key()
+        )
+        if not data:
+            return None
+        return await asyncio.to_thread(_encode_telegram_photo, data)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — a bad image is a 404, not a crash
+        logger.warning("appearance: telegram photo encoding failed: %s", exc)
+        return None

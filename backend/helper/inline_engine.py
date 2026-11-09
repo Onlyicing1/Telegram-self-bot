@@ -325,7 +325,7 @@ def register_inline_handler(helper_client, owner_id: int) -> None:
             try:
                 from backend.services import appearance_service
 
-                built = appearance_service.apply_to_inline_results(panel_id, extra, built)
+                built = await appearance_service.apply_to_inline_results(panel_id, extra, built)
             except Exception as exc:  # noqa: BLE001 — never break a panel render
                 logger.warning("appearance: inline composition skipped: %s", exc)
             built = _sanitize_results(built)

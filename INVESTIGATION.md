@@ -1,152 +1,130 @@
-# INVESTIGATION — Appearance Preview Image (current state)
+# INVESTIGATION — Appearance Preview Delivery (visible URL / "Onrender" card)
 
-_Investigated and implemented at `a301e6422e4211e435b77a3b33224e10fce7c758`
-(`main`, "Add Glass UI Appearance personalization with header, page text and
-preview image"). Everything below was verified against the source at that
-commit and against the installed dependencies, not against the previous report's
-wording._
+_Investigated and fixed at `9b66750d5330ef26742c995da5c42d30199c8351` (`main`,
+after the ten-image gallery change). Every claim below is derived from the
+source and the Telegram objects the code builds, not from the previous report._
 
-## 1. What existed before this change
+## 1. Symptom
 
-`backend/services/appearance_service.py` stored ONE preview image:
+With a gallery image selected and Preview ON, the LifeOS main panel showed:
 
-- `bucket()` read `APPEARANCE_MEDIA_BUCKET` **or fell back to
-  `ARCHIVE_MEDIA_BUCKET`**, so an unset Appearance bucket silently reused the
-  Saved-Messages archive bucket.
-- `install_image()` uploaded a new key and then **deleted the previous object**,
-  so every "Replace" destroyed the only other image.
-- `MAX_IMAGE_MB = 5` and `MAX_IMAGE_SIDE = 4096` — far below Telegram's own
-  photo limits and the 25 MiB object ceiling already configured on the bucket.
-- Validation was header-only (`sniff_image`): a truncated, mislabelled or
-  decompression-bomb file with a plausible header was accepted.
-- `backend/bot/handlers/appearance.py` called `event.download_media(file=tmpdir)`
-  and then `Path(path).read_bytes()`, i.e. an **unbounded** download bounded only
-  by the file size Telegram *reported* afterwards.
-- The panel offered only Enable/Disable, Upload/Replace and Remove; there was no
-  gallery, no per-image selection and no way to keep more than one image.
+- the Render URL (`https://<service>.onrender.com/appearance/preview/<version>`)
+  as part of the message body — visible text;
+- Telegram's own web-page preview card above it, titled **Onrender**;
+- the Guide page's title/description — i.e. the whole webpage, not the image.
 
-The image itself is served by `backend/web/app.py`:
+The Appearance panel itself was correct (`Preview: ON`, `Images: 1 / 10`,
+`Selected: image 1`), so the defect is in DELIVERY, not in the gallery.
 
-- `/appearance/preview/<version>` — Open Graph HTML whose tap target is the
-  existing `/guide/` site;
-- `/appearance/image/<version>` — the stored bytes with an immutable one-year
-  cache header.
+## 2. Verified root cause (exact code)
 
-Both routes derive everything from `preview_version()`, which is the selected
-object key's stem. That contract is correct and was kept.
+1. `backend/services/appearance_service.py::with_preview()` composed the panel
+   title/body and then did:
 
-## 2. Installed dependency surface (verified, not assumed)
+   ```python
+   url = preview_url() if preview_active() else ""
+   if url:
+       body = f"{body}\n\n{url}" if body else url
+   ```
 
-| Package | Version | Relevant API |
-|---|---|---|
-| `storage3` (via `supabase==2.4.2`) | 0.8.x | `storage.from_(bucket).list(path, {"limit", "offset", "sortBy"})` → `list[dict]` with `name`/`created_at`/`metadata.size`; `.upload(path, bytes, {"content-type", "upsert"})`; `.download(path)`; `.remove([path])` |
-| `telethon` | 1.43.0 | `client.iter_download(file, *, offset, stride, limit, chunk_size, request_size, …)` — `limit` is a count of **chunks**, so a byte ceiling must be enforced by counting yielded bytes |
-| `pillow` | 11.3.0 (added) | `Image.open`, `img.size`, `img.format`, `img.verify()`, `img.draft()`, `img.load()`; no image-decoding library was previously installed |
+   `preview_url()` returns `https://<PUBLIC_BASE_URL>/appearance/preview/<version>`,
+   i.e. the public HTML page — **not** the image route.
 
-`storage3`'s `list()` merges caller options over its defaults and sets
-`prefix` from `path`, so the gallery is discovered with a single call.
+2. `with_preview()` is the single composition function used by BOTH panel
+   render boundaries:
+   - `backend/helper/panels.py::_apply_appearance()` for every callback paint,
+   - `backend/services/appearance_service.py::apply_to_inline_results()` for the
+     initial inline panel result.
 
-## 3. What was wrong, precisely
+   So the URL was inserted into the message text on every path, including the
+   `send_message.message` of the inline result that becomes the panel message.
 
-1. **No gallery inventory existed.** The bucket was write-only in practice: the
-   application never listed objects, so it could not display, select, count or
-   delete an individual image.
-2. **Replacement destroyed images.** `install_image()` deleted the previous
-   object after persisting the new key, which makes "keep up to 10" impossible.
-3. **The archive bucket could receive Appearance images.** The fallback violated
-   the "Appearance images never go to the archive bucket" boundary.
-4. **The quality contract was too small.** 5 MiB / 4096 px discarded legitimate
-   high-resolution uploads while the bucket itself accepts 25 MiB.
-5. **Validation could not detect corruption.** Magic-byte parsing proves the
-   header, not the image: truncated IDAT/entropy data and decompression bombs
-   passed.
-6. **The download had no transfer-time bound.** Telegram's reported size was
-   trusted before the transfer, and the file was then read into memory whole.
-7. **The failure mode of a missing selected object was silence.** A stale key
-   still produced "stored: yes" with no way to see it or clear it.
+3. `backend/helper/panels.py::_appearance_link_preview()` returned
+   `preview_active()` for eligible main pages. `_safe_edit()` forwards that as
+   `link_preview=…`, and Telethon maps `link_preview=True` to
+   `no_webpage=False`. The code therefore **explicitly asked Telegram to expand
+   the URL**, guaranteeing the web-page card.
 
-## 4. What the new implementation does
+4. `/appearance/preview/<version>` (`backend/web/app.py::appearance_preview`)
+   serves an Open Graph HTML page whose `og:title`/`og:description` come from the
+   Appearance header text and whose tap target is `/guide/`. That is exactly the
+   card Telegram built — including the host name ("Onrender") when no header was
+   customised.
 
-- **Bucket** — `bucket()` returns `APPEARANCE_MEDIA_BUCKET` only; the archive
-  fallback is gone. `storage_available()` still requires a configured DB.
-- **Inventory** — `gallery()` lists `appearance/preview/` through the Storage
-  API and returns `{items, known, count, error, selected, missing_selected}`.
-  A listing failure returns `known=False` plus an error and is never rendered as
-  "empty". Objects whose name is not a generated `appearance/preview/<32 hex>.<ext>`
-  key (folder placeholders, nested paths, hand-uploaded files) are not gallery
-  members.
-- **Selection** — `select_image(token)` resolves the short token against the
-  listing and writes only `appearance_preview_image_key`; an arbitrary
-  callback-supplied key is never trusted.
-- **Deletion** — `delete_image(token)` clears the selected key FIRST when the
-  target is active (and aborts if that write fails), then removes exactly that
-  one object. A refused Storage deletion is reported as a failure, with the
-  cleared/kept state stated explicitly.
-- **Clearing a stale reference** — `clear_selection()` drops the key without
-  touching objects; the panel offers it whenever a stored key is not in the
-  listing.
-- **Upload** — serialized by one `asyncio.Lock` (single-instance runtime), so a
-  count check cannot be raced past 10. Order: list → capacity check → validate
-  (in a worker thread) → new unique object → re-list to confirm the write →
-  persist the key → only on failure remove the new object. Existing objects are
-  never deleted or evicted.
-- **Validation** — Pillow identifies the real format; side, pixel and byte
-  bounds are read before any decode; PNG is proved by walking its chunks and
-  streaming IDAT through zlib in bounded pieces (CRC + exact decompressed
-  length); JPEG is decoded at a reduced draft size; WebP is fully decoded only
-  under the 12 Mpx budget, above which its RIFF container is checked.
-- **Bounded transfer** — the handler streams `client.iter_download(media,
-  chunk_size=256 KiB)` into a bytearray, stopping before a chunk would exceed
-  25 MiB. No temporary file exists at all, so nothing can leak; the stream is
-  closed on success, rejection and cancellation.
-- **UI** — the Preview panel lists `N / 10`, marks the selected image with the
-  registry glyph, gives every image a select and a delete button, hides the
-  upload row at 10 and explains that nothing was evicted. Callback payloads stay
-  ≤ 64 bytes (`action:appearance_select:<32 hex>`).
-- **Routes** — unchanged contract: only the selected version is served, the
-  bytes are the original upload, the content type comes from the bytes, the
-  cache header stays immutable, and a superseded version 404s.
+Net effect: the owner's image was never part of the message; only a link to an
+HTML page was. The gallery, the bucket, the versioned image route and the
+selection semantics were all working.
 
-## 5. Supabase live state and the migration discrepancy
+## 3. Why "just remove the URL" is not enough
 
-- Live project `telegram-self-bot` (`burfebhahuowywyfgcsc`), storage bucket
-  **`appearance-assets`**: private, 25 MiB object ceiling, MIME allow-list
-  `image/jpeg`, `image/png`, `image/webp`. Empty when created. **No SQL, bucket
-  or migration action was performed by this change.**
-- The five `panel_settings` columns already exist live:
-  `appearance_header_title`, `appearance_header_body`,
-  `appearance_page_overrides`, `appearance_preview_enabled`,
-  `appearance_preview_image_key`.
-- Remote migration history records `20261109164548` with name
-  `20261109000000_add_panel_settings_appearance`.
-- The repository file is `supabase/migrations/20261109000000_add_panel_settings_appearance.sql`.
-  Its constraints contain `position(chr(0) in <column>) = 0`; PostgreSQL rejects
-  `chr(0)` in text, and those predicates were omitted from the SQL that was
-  applied live. The file's other statements (columns, defaults, backfill,
-  NOT NULL, other constraints, singleton insert, `NOTIFY pgrst`) match the live
-  schema.
-- **This discrepancy remains open and was deliberately not touched**: renaming
-  or rewriting `20261109000000_…` would desynchronise the recorded remote
-  version, and "repair"/push/apply are out of scope for a code change. The
-  gallery needs no new schema, so nothing is blocked by it. A future, separate
-  migration task should reconcile the filename/version and the invalid `chr(0)`
-  predicates; `DATABASE_ARCHITECTURE.md` was not modified.
+Removing the appended link alone yields a text-only panel — the requirement is
+that the selected image is visibly part of the message. Telegram has no API that
+turns a text message into a media message in place, so the delivery mechanism
+itself had to change.
 
-## 6. Render
+## 4. Delivery mechanism now used, and why
 
-`APPEARANCE_MEDIA_BUCKET=appearance-assets` was already set on the `Self_bot`
-service and its deployment was triggered before this task. **No Render
-environment change was made here**, and the variable is read exactly as before
-(`bucket()`), only without the archive fallback.
+The panel message is created by the owner's account from the **Helper Bot's
+inline result** (`inline_engine.trigger` → `result.click(chat_id)`), and every
+later paint edits that same inline message
+(`CallbackQuery.Event.edit` → `messages.editInlineBotMessage`). Telegram's own
+shape for "inline result that becomes a photo with a caption and buttons" is:
 
-## 7. Residual risks
+```
+InputBotInlineResult(
+    id=…, type="photo",
+    content=InputWebDocument(url=<image URL>, mime_type="image/jpeg"),
+    send_message=InputBotInlineMessageMediaAuto(message=<text>, reply_markup=<same rows>),
+)
+```
 
-- 10 concurrent owners do not exist in a single-owner self-bot, so an
-  `asyncio.Lock` is the correct scope; a multi-instance deployment would need an
-  external lock and is out of scope.
-- Supabase Storage `list()` is strongly consistent after `upload()`; the
-  post-upload re-list is the verification step. A pathological eventual-
-  consistency window would reject a valid upload (the object is removed) rather
-  than keep an unverified one.
-- Telegram decides its own preview rendering/zoom; only the original bytes and
-  correct metadata are guaranteed here.
+which is the raw-API equivalent of the Bot API's `InlineQueryResultPhoto`. The
+Telegram server fetches the photo URL itself and sends it as message media; the
+text becomes the caption; there is no textual link and no place for a web-page
+card. Verified against the installed Telethon constructors
+(`InputBotInlineResult`, `InputWebDocument`, `InputBotInlineMessageMediaAuto`
+all exist with those fields).
+
+Consequences that shaped the implementation:
+
+- **Photo URL must be a JPEG document.** `/appearance/image/<version>` still
+  serves the owner's ORIGINAL bytes (PNG/JPEG/WebP, up to 25 MiB). The panel's
+  media therefore points at the same route with `?fmt=jpeg`, which encodes a
+  delivery rendition on demand (`quality=90`, progressive downscale only if the
+  result exceeds Telegram's inline-photo fetch limit). Stored bytes are never
+  modified.
+- **A caption is capped (1024 characters).** A composed panel above that limit
+  is delivered as TEXT with `no_webpage=True`, so the full text is preserved and
+  no card appears; it never silently truncates and never inserts a URL.
+- **Media and text are mutually exclusive for one message.** Telegram cannot
+  remove a photo from a message and cannot exchange one without uploading it, so
+  enabling, disabling or switching the selected image requires a NEW inline
+  result. This is handled by `PanelLifecycleManager.replace_panel()`: the
+  replacement is created first and the old message is deleted only after the new
+  one exists (a failed replacement leaves the current panel intact).
+- **A missing object must not become a broken photo.** The builder lists the
+  gallery prefix before claiming media (`delivery_ready()`), so a stale key
+  degrades to a text panel instead of Telegram fetching a 404 as the photo.
+
+## 5. What was deliberately not changed
+
+- Gallery inventory, uploads, selection, deletion, bucket and prefix.
+- `/appearance/preview/<version>` and `/appearance/image/<version>` (still
+  versioned, still immutable-cached, still the Open Graph page for sharing).
+- Panel architecture: same inline engine, same lifecycle, same callback
+  registries, same Helper-Bot-only editing, same nav buttons.
+- No new Telegram client, listener, loop, table, column, migration or Render
+  variable.
+
+## 6. Residual risk (cannot be verified from this environment)
+
+- Telegram's server-side behaviour for a photo inline result whose
+  `InputWebDocument` URL serves `?fmt=jpeg` is documented and widely used, but
+  this sandbox has no live Helper Bot/owner chat, so the rendered result was not
+  observed. If Telegram refused that content, the panel would keep its previous
+  text form; the code logs the answer failure and never falls back to a URL.
+- Editing a photo inline message by sending only `message`/`reply_markup` (no
+  `media`) is Telegram's caption-edit path; a refusal is logged by `_safe_edit`
+  and cannot introduce a link, because the text no longer contains one anywhere.
+- The delivery-state registry (`_DELIVERED`) is process-local and bounded; after
+  a restart the first render of an existing media panel replaces it once.
