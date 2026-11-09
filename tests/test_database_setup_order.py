@@ -807,7 +807,7 @@ def test_the_waiting_answer_migration_is_absorbed_by_part_one():
     assert "waiting_answer" in snapshot, (
         "part 1 must re-add the status CHECK in its final form"
     )
-    status = _section("## 20. Migration Status")
+    status = _section("## 22. Migration Status")
     row = next(
         line
         for line in status.splitlines()
@@ -817,7 +817,7 @@ def test_the_waiting_answer_migration_is_absorbed_by_part_one():
         "the inventory must say the snapshot already establishes it"
     )
     assert "owner action required" not in row
-    assert "**36** files" in _flat(status), (
+    assert "**37** files" in _flat(status), (
         "the audited file count must be the current one (36)"
     )
 

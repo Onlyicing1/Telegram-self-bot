@@ -40,8 +40,8 @@
 20. [In-Memory Fallback](#20-in-memory-fallback)
 21. [Known Inconsistencies](#21-known-inconsistencies)
 22. [Migration Status](#22-migration-status)
-23. [Migration Generation Rules](#23-migration-generation-rules)
-24. [Ghost Seen / Ghost PV](#24-ghost-seen--ghost-pv)
+23. [Ghost Seen / Ghost PV](#23-ghost-seen--ghost-pv)
+24. [Migration Generation Rules](#24-migration-generation-rules)
 25. [Self Bot Persistent State Inventory](#25-self-bot-persistent-state-inventory)
 26. [Hermes Integration Boundary & Corrected Architecture](#26-hermes-integration-boundary--corrected-architecture)
 27. [Font System Persistence](#27-font-system-persistence)
@@ -52,6 +52,7 @@
 32. [Emoji & Reaction Persistence](#32-emoji--reaction-persistence-premiumcustom-emoji-replacement--reactions)
 33. [Private Message Management Persistence (human private messages only)](#33-private-message-management-persistence-human-private-messages-only)
 34. [Anti-Edit / Anti-Delete Persistence (private human conversations only)](#34-anti-edit--anti-delete-persistence-private-human-conversations-only)
+35. [Appearance Persistence (panel text + Storage gallery)](#35-appearance-persistence-panel-text--storage-gallery)
 
 ---
 
@@ -120,7 +121,7 @@ fifteen embedded parts) and `tests/test_canonical_schema_reconciliation.py
 | 12 | `20261017000001_create_anti_edit_delete_tables.sql` | The TWO persistence tables of Anti-Edit / Anti-Delete (§34), in their final shape: `aed_config` (ONE row per owner — the master `enabled` switch, the `categories text[]` content filter that is never empty, and `retention_days` 1..3650) and `aed_archive_entries` (one row per observed archive record — the deterministic `id` primary key/idempotency key, `owner_id`, the POSITIVE private `chat_id` (`CHECK > 0` — a group/supergroup/channel row is structurally impossible), `message_id`, `kind` (`snapshot`/`edit`/`delete`), the content `category`, `has_caption`, `captured_at`, `message_date`, `edited_at`, `sender_id`, `out`, `has_media`, the bounded `body`, the media metadata (`media_type`/`media_name`/`media_size`/`media_stored`/`media_object`), `recoverable`/`recovered_from` and the bounded peer identity `peer_id`/`peer_username`/`peer_name`). Plus one read index, RLS enabled with ZERO policies and a service-role-only posture — every privilege revoked from `PUBLIC`/`anon`/`authenticated` (table-level AND column-level) and only SELECT/INSERT/UPDATE/DELETE granted to `service_role`, with the legacy permissive read policies dropped by name — table/column `COMMENT`s, `NOTIFY pgrst`, table/column verification queries and a read-only legacy probe of the Phase-1 `bot_settings` documents that are read while the tables are absent. Additive: no existing table, column, index, policy, grant or row is touched, and NO foreign key is created (the peer reference is application-level, like every other identifier relationship in this database). The scope (genuine private human-to-human conversations only) is enforced in code; the `chat_id > 0` CHECK is its structural backstop | **§31.3, part 12 of 15** (the tables are documented in §34) |
 | 13 | `20261020144423_harden_private_message_table_access.sql` | The Private Message Management access hardening (§33.4): RLS re-asserted on both tables, the eight named policy drops — the two `anon_select_private_message_*` policies the creation migration actually created plus the `anon_insert_*` / `anon_update_*` / `anon_delete_*` names it already dropped defensively — so a database that still carries any of them converges to the restrictive posture; every privilege REVOKED from `PUBLIC`/`anon`/`authenticated` (table-level AND column-level, because a table `REVOKE` cannot clear a legacy per-column grant), and exactly SELECT/INSERT/UPDATE/DELETE GRANTed to `service_role` (the four verbs `backend/db/client.py` uses). It creates ZERO policies, so with RLS enabled every client role is denied at the table by construction while `service_role` bypasses RLS. Plus two table `COMMENT`s that state the posture, `NOTIFY pgrst` and five read-only verification queries (client table grants, client column grants, policy count, the two RLS flags, the four service-role grants). Grant/policy/comment change only: no table, column, index, constraint, row or stored value is created, dropped or rewritten, and no unrelated policy or grant is touched | **§31.3, part 13 of 15** (the model is documented in §33.4) |
 | 14 | `20261020160000_add_panel_settings_auto_reaction_settings.sql` | The Auto-Reaction setting's TWO `panel_settings` columns (§6), which `settings_service` writes and `auto_reaction_service` reads on every outgoing message: `auto_reaction_enabled boolean NOT NULL DEFAULT false` (OFF by default — applying it can never enable a reaction) and `auto_reaction_emoji text NOT NULL DEFAULT ''` (`''` = none selected). Each is added WITHOUT a default first so an existing column keeps its value, then the final default is bound, only `NULL`s are backfilled, and the `NOT NULL` binding is applied — so no valid stored value is ever replaced. Plus `NOTIFY pgrst` and one column-count verification query. Additive ALTER only: no table, index, constraint, policy, grant or row is created, and the existing RLS/SELECT-only boundary is unchanged | **§31.3, part 14 of 15** (§6 documents the columns) |
-| 15 | `20261109000000_add_panel_settings_appearance.sql` | The Appearance personalization's FIVE `panel_settings` columns (§6): `appearance_header_title text NOT NULL DEFAULT ''` and `appearance_header_body text NOT NULL DEFAULT ''` (the shared global header; `''` = built-in default, so a reset stores the empty value, never a copy of the current customization), `appearance_page_overrides jsonb NOT NULL DEFAULT '{}'` (page id → `{title?, body?}`, each text bounded), `appearance_preview_enabled boolean NOT NULL DEFAULT false` (the independent preview switch) and `appearance_preview_image_key text NOT NULL DEFAULT ''` (a Storage OBJECT KEY only — never image bytes and never a signed/expiring URL). Each is added WITHOUT a default first so an existing column keeps its value, then the final default is bound, only `NULL`s are backfilled, and the `NOT NULL` binding is applied. Adds length/NUL CHECKs on the two text columns, a `jsonb_typeof(...) = 'object'` CHECK and a Storage-path regex CHECK, re-seeds the `('global')` row idempotently, and ends with `NOTIFY pgrst`. Additive ALTER only: no table, index, policy, grant or row is created, and the existing RLS/SELECT-only boundary is unchanged | **§31.3, part 15 of 15** (§6 documents the columns; `IMPLEMENTATION_REPORT.md` documents the feature) |
+| 15 | `20261109000000_add_panel_settings_appearance.sql` | The Appearance personalization's FIVE `panel_settings` columns (§6): `appearance_header_title text NOT NULL DEFAULT ''` and `appearance_header_body text NOT NULL DEFAULT ''` (the shared global header; `''` = built-in default, so a reset stores the empty value, never a copy of the current customization), `appearance_page_overrides jsonb NOT NULL DEFAULT '{}'` (page id → `{title?, body?}`, each text bounded), `appearance_preview_enabled boolean NOT NULL DEFAULT false` (the independent preview switch) and `appearance_preview_image_key text NOT NULL DEFAULT ''` (a Storage OBJECT KEY only — never image bytes and never a signed/expiring URL). Each is added WITHOUT a default first so an existing column keeps its value, then the final default is bound, only `NULL`s are backfilled, and the `NOT NULL` binding is applied. Adds length/NUL CHECKs on the two text columns, a `jsonb_typeof(appearance_page_overrides) = 'object'` CHECK and a Storage-path regex CHECK, re-seeds the `('global')` row idempotently, and ends with `NOTIFY pgrst`. Additive ALTER only: no table, index, policy, grant or row is created, and the existing RLS/SELECT-only boundary is unchanged | **§31.3, part 15 of 15** (§6 documents the columns; `IMPLEMENTATION_REPORT.md` documents the feature) |
 
 **The other 22 migrations — the history the reconciliation snapshot already
 absorbs.** (The table below lists 21 of them; the twenty-second,
@@ -186,7 +187,10 @@ migration creates them.
    Message access-hardening phase and part 14
    (`20261020160000_add_panel_settings_auto_reaction_settings.sql`) by the
    persistence-audit phase — the two Auto-Reaction settings columns no earlier
-   migration created; all are embedded the same way.
+   migration created — and part 15
+   (`20261109000000_add_panel_settings_appearance.sql`) by the Appearance
+   audit — the five Appearance columns no earlier migration created; all are
+   embedded the same way.
 2. **What was missing, and when.** At the end of the Part 1 phase nothing was
    missing from the *block* relative to the migrations that existed then:
    parts 1–7 covered them. The gap opened afterwards, on two fronts. The
@@ -220,13 +224,13 @@ migration creates them.
    Anti-Delete tables (§34) —, part 13 — the Private Message access hardening
    (§33.4) — and part 14 — the two Auto-Reaction `panel_settings` columns (§6)
    — all embedded verbatim from their migration files.
-6. **What was corrected.** Documentation: the §31 intro, §31.1 and §20 state
-   the current count (36 migration files; 14 embedded parts; 16 canonical
+6. **What was corrected.** Documentation: the §31 intro, §31.1 and §22 state
+   the current count (37 migration files; 15 embedded parts; 16 canonical
    tables + `todo_steps` + the five Emoji & Reaction tables + the two Private
    Message tables + the two Anti-Edit / Anti-Delete tables), plus the
    counter-reset columns those two Private Message tables gain in part 11, the
-   two Auto-Reaction columns part 14 adds, and the reconciliation claim
-   explicitly.
+   two Auto-Reaction columns part 14 adds, the five Appearance columns part 15
+   adds, and the reconciliation claim explicitly.
 7. **Todo-specific database changes.** Part 7 of §31.3 carries
    `20260926000001_add_todo_schedule_type.sql` in full:
    `ai_tasks_schedule_type_check` re-added with `'todo'` in the enum, and
@@ -3529,16 +3533,16 @@ repository, which is exactly why every statement in the block is idempotent.
 
 ## 1. Overview
 
-The database contains **13 tables** in the `public` schema — 5 core
-LifeOS tables and 8 AI subsystem tables. Two additional tables exist in
-migrations (`bot_settings`, `ghost_chats`). `ai_usage` and
-`ai_provider_stats` are created by their migrations (`20260827000003` /
-`20260827000004`), which part 1 of the one-paste setup (§31.3) absorbs;
-`ai_preferences` is specified here and implemented in code but has **no
-migration at all**.
-The exact
-status of every table is in [§19](#19-known-inconsistencies),
-[§20](#20-migration-status), and [§23](#23-self-bot-persistent-state-inventory).
+The migrations in `supabase/migrations/` create **27 tables** in the
+`public` schema: 6 core LifeOS/configuration tables, 10 AI/automation tables
+and 11 feature tables. One further table name, `ai_preferences`, exists only as
+a repository interface (`backend/ai/database/preferences_repository.py`); it has
+**no migration and no producer**, so it is NOT part of the schema the migrations
+establish (§14, §19.17). `ai_usage`, `ai_provider_stats`, `ai_tasks` and
+`ai_task_occurrences` are created by their own `20260827…`/`20260829…`
+migrations, which part 1 of the one-paste setup (§31.3) absorbs.
+The exact status of every table is in [§19](#19-known-inconsistencies),
+[§22](#22-migration-status), and [§25](#25-self-bot-persistent-state-inventory).
 
 ### Core Tables
 
@@ -3548,30 +3552,34 @@ status of every table is in [§19](#19-known-inconsistencies),
 | `bio_state` | Bio cron engine state per owner | `id` (bigserial) | `db/client.py`, `bio_service`, `bio/engine`, `organize_service`, `web/app` |
 | `username_state` | Username cron engine state per owner | `id` (bigserial) | `db/client.py`, `username_service`, `username/engine` |
 | `bot_logs` | Structured activity log | `id` (bigserial) | `db/client.py` (via `log()`), nearly every service, `web/app` |
-| `panel_settings` | Glass Panel configuration (column-per-setting) | `key` (text) | `panel_settings_repository`, `settings_service`, `web/app` |
+| `panel_settings` | Glass Panel configuration (column-per-setting, singleton `key='global'`) | `key` (text) | `panel_settings_repository`, `settings_service`, `web/app` |
+| `bot_settings` | Key-value JSON documents that predate the column model; still live for `ghost_seen_allowed_chats`, the AED legacy shards, the Private Message Phase-1 document and the Test Modules snapshot | `key` (text) | `ghost_seen_v2`, `settings_document_state`/`settings_document_write` (`db/client.py`), `ai/test_snapshot.py`, AED + Private Message services |
 
 ### AI Tables
 
 | Table | Purpose | PK | Used by |
 |---|---|---|---|
 | `ai_config` | Per-owner AI configuration (provider, model, triggers, settings) | `id` (bigserial) | `ai/config_store.py`, `bot/handlers/ai_trigger.py`, `bot/handlers/ai.py`, `web/app` |
-| `ai_sessions` | AI conversation session metadata | `session_id` (text) | `ai/persistence.py`, `ai/database/session_repository.py` |
+| `ai_sessions` | AI conversation session metadata | `id` (bigserial); `session_id` UNIQUE (not the PK — §19.19) | `ai/persistence.py`, `ai/database/session_repository.py` |
 | `ai_messages` | Individual AI messages within a session | `id` (bigserial) | `ai/persistence.py`, `ai/database/message_repository.py` |
 | `ai_memories` | Three-tier memory (short, long, permanent) | `id` (bigserial) | `ai/persistence.py`, `ai/database/memory_repository.py` |
 | `ai_tool_history` | Log of every tool call the AI made | `id` (bigserial) | `ai/persistence.py`, `ai/database/tool_history_repository.py` |
 | `ai_provider_stats` | Per-provider aggregate statistics | `(provider_name, owner_id)` | `ai/database/provider_stats_repository.py` |
-| `ai_usage` | Per-request token usage log | `id` (bigserial) | `ai/database/usage_repository.py` |
-| `ai_preferences` | Per-owner AI personality and behavior preferences | `owner_id` (bigint) | `ai/database/preferences_repository.py` |
+| `ai_usage` | Per-request token usage log | `id` (bigserial) | `ai/database/usage_repository.py`, `usage_recorder` |
+| `ai_tasks` | Scheduled/event/todo task definitions and their actions | `id` (bigserial) | `ai/database/task_repository.py`, the scheduler |
+| `ai_task_occurrences` | Per-occurrence execution ledger (RUNNING/WAITING/etc.) | `id` (bigserial) | `ai/database/task_repository.py`, the scheduler |
+| `todo_steps` | Ordered steps of ONE `ai_tasks` todo row | `id` (bigserial) | `ai/database/task_repository.py` |
 
-### Additional Tables in Migrations / Specified But Unmigrated
+### Feature Tables (all created by their own additive migrations)
 
 | Table | Migration | Code usage | Status |
 |---|---|---|---|
-| `bot_settings` | `20260729213959` | `ghost_seen_v2` (key `ghost_seen_allowed_chats`) | **Live** — NOT orphaned. See §19.4. |
-| `ghost_chats` | `20260822090000` | none | **Orphaned** — no code reads or writes it. See §19.12. |
-| `ai_usage` | `20260827000003` | `SupabaseUsageRepository` + `usage_recorder` | Created by the canonical setup (§31.3, part 1); see §13. |
-| `ai_provider_stats` | `20260827000004` | `SupabaseProviderStatsRepository` + `usage_recorder` | Created by the canonical setup (§31.3, part 1); see §12. |
-| `ai_preferences` | none | interface + in-memory only | Specified (§14), **no producer, no migration**. |
+| `ghost_chats` | `20260822090000` | none | **Unused** — no code reads or writes it (§19.12). |
+| `emoji_library`, `emoji_categories`, `emoji_mappings`, `emoji_state`, `emoji_chat_overrides` | `20260928000001` | Emoji services + Glass UI | **MANUAL-ONLY** — §31.3 part 9; see §32. |
+| `private_message_config`, `private_message_senders` | `20260929000001` + `20261016000001` + `20261020144423` | `private_message_service`, `db/client.py` | **MANUAL-ONLY** — §31.3 parts 10/11/13; see §33. |
+| `aed_config`, `aed_archive_entries` | `20261017000001` | `anti_edit_delete_service`, `db/client.py` | **MANUAL-ONLY** — §31.3 part 12; see §34. |
+| `api_credentials` | `20260919000001` + `20260919000002` | credential-vault code (§29); secrets live in Supabase Vault, never in this table | **MANUAL-ONLY** — §31.3 parts 2/3; see §29. |
+| `ai_preferences` | none | repository interface + in-memory only | Specified (§14), **no producer, no migration**. |
 
 ### Emoji & Reaction Tables (MANUAL-ONLY migration)
 
@@ -3875,18 +3883,18 @@ RLS is enabled. Only SELECT is granted to `anon` + `authenticated`.
 `update_field`, `update_fields`, `reload`.
 
 **`backend/services/settings_service.py`** — cache-first reads,
-write-through cache, **14 typed getters + 14 typed setters**
-(`auto_close_enabled`, `auto_close_delay`, `max_deep_save_mb`,
+write-through cache, **19 typed getters + 19 typed setters**, per-setting
+validators (`auto_close_enabled`, `auto_close_delay`, `max_deep_save_mb`,
 `delete_batch_size`, `log_retention_days`, `panel_timeout_seconds`,
 `allow_multiple_panels`, `reuse_existing_panel`, `language`,
 `debug_callbacks`, `owner_only`, `dashboard_font`,
-`auto_reaction_enabled`, `auto_reaction_emoji`), per-setting
-validators. See [§17 Panel Database](#17-panel-database) for details.
-
-> **Note:** `ghost_seen_retention_seconds` and `update_stale_seconds`
-> are migrated columns with **no accessor in `settings_service` and no
-> production consumer** — configured-but-unconsumed until a consumer is
-> implemented (see §19.13, §19.14).
+`auto_reaction_enabled`, `auto_reaction_emoji`, and the five Appearance
+accessors `appearance_header_title`, `appearance_header_body`,
+`appearance_page_overrides`, `appearance_preview_enabled`,
+`appearance_preview_image_key`). `ghost_seen_retention_seconds` and
+`update_stale_seconds` are the only two of the 21 setting columns with **no
+accessor and no production consumer** (see §19.13, §19.14). See
+[§17 Panel Database](#17-panel-database) for the cache/validation model.
 
 ### Migration Status
 
@@ -3909,7 +3917,7 @@ verified by the project owner. The follow-up migration
 replaces the days column with `ghost_seen_retention_seconds`
 (backfilling `days × 86400`) to support sub-day retention windows; it is
 also embedded in part 1 of the one-paste setup (§31.3), which carries only the
-final `ghost_seen_retention_seconds` shape. See [§20](#20-migration-status) and
+final `ghost_seen_retention_seconds` shape. See [§22](#22-migration-status) and
 [§19](#19-known-inconsistencies).
 
 **Auto-Reaction (Emoji Stage 1 + 2) — migration `20261020160000_add_panel_settings_auto_reaction_settings.sql`:**
@@ -3926,6 +3934,23 @@ it is additive, idempotent and can never enable a reaction. It is embedded as
 **part 14 of the one-paste setup (§31.3)** — there is no separate snippet to
 apply. No CHECK is added on purpose: `settings_service` is the authority on the
 valid setting values, exactly as for every other `panel_settings` column.
+
+**Appearance — migration `20261109000000_add_panel_settings_appearance.sql`:**
+the five Appearance columns (`appearance_header_title text NOT NULL DEFAULT ''`,
+`appearance_header_body text NOT NULL DEFAULT ''`,
+`appearance_page_overrides jsonb NOT NULL DEFAULT '{}'`,
+`appearance_preview_enabled boolean NOT NULL DEFAULT false`,
+`appearance_preview_image_key text NOT NULL DEFAULT ''`) are added the same
+way (add without a default, bind the default, backfill only `NULL`s, then
+`NOT NULL`) and with the same idempotent `('global')` seed. Unlike the
+Auto-Reaction pair this migration DOES add CHECKs that mirror the service
+boundaries: `length(...) <= 1024` and no NUL on both text columns,
+`jsonb_typeof(appearance_page_overrides) = 'object'`, and
+`appearance_preview_image_key = '' OR appearance_preview_image_key ~
+'^[A-Za-z0-9][A-Za-z0-9/_.-]*$'`. It is **part 15 of §31.3** and adds no
+table, index, policy or grant. The gallery itself is not in the database: the
+image objects live in a dedicated private Supabase Storage bucket and the
+column stores only the selected object key (§35).
 
 ### Removed / phantom columns
 
@@ -4058,11 +4083,12 @@ AI conversation session metadata. One row per active AI conversation.
 
 | Column | SQL Type | Nullable | Default | Notes |
 |---|---|---|---|---|
-| `session_id` | `text` | NO | — | Primary key. Format: `owner-{owner_id}` |
+| `id` | `bigserial` | NO | `nextval(...)` | Primary key (the migration's actual PK) |
+| `session_id` | `text` | NO | — | UNIQUE, **not** the primary key (§19.19). Format: `owner-{owner_id}` |
 | `owner_id` | `bigint` | NO | — | Telegram user ID of the bot owner |
-| `provider` | `text` | YES | — | Active provider name |
-| `model` | `text` | YES | — | Active model name |
-| `status` | `text` | NO | `'active'` | Session status: `active`, `closed`, `error` |
+| `provider` | `text` | YES | `''` | Active provider name |
+| `model` | `text` | YES | `''` | Active model name |
+| `status` | `text` | NO | `'active'` | Session status: `active`, `completed`, `closed`, `error` |
 | `total_tokens` | `integer` | YES | `0` | Cumulative token count |
 | `message_count` | `integer` | YES | `0` | Number of messages in session |
 | `created_at` | `timestamptz` | YES | `now()` | When the session was created |
@@ -4072,8 +4098,10 @@ AI conversation session metadata. One row per active AI conversation.
 
 | Index | Columns | Type |
 |---|---|---|
-| `ai_sessions_pkey` | `session_id` | btree (PK) |
+| `ai_sessions_pkey` | `id` | btree (PK) |
+| `ai_sessions_session_id_key` | `session_id` | btree (UNIQUE) |
 | `idx_ai_sessions_owner` | `owner_id` | btree |
+| `idx_ai_sessions_session_id` | `session_id` | btree |
 
 ### RLS
 
@@ -5192,6 +5220,134 @@ pins the corrected grant/policy model against the migration text and against par
 
 ---
 
+## 35. Appearance Persistence (panel text + Storage gallery)
+
+Appearance (Glass UI → Appearance) customizes the shared header of the eleven
+eligible main pages and can render one selected preview image above a page's
+body. It persists in exactly two places and adds **no table**:
+
+1. five columns on the existing singleton `panel_settings` row
+   (`key = 'global'`), and
+2. image OBJECTS in a dedicated private Supabase Storage bucket, addressed by
+   the object key stored in `appearance_preview_image_key`.
+
+The database never stores image bytes, signed/expiring URLs, Telegram file IDs
+or original filenames, and there is **no gallery table**: the gallery IS the
+Storage listing under the feature's prefix. The migration is
+`20261109000000_add_panel_settings_appearance.sql` — part 15 of §31.3.
+
+### 35.1 The five `panel_settings` columns
+
+| Column | SQL type | Null | Default | Migration CHECK | Service validator |
+|---|---|---|---|---|---|
+| `appearance_header_title` | `text` | NO | `''` | `length(...) <= 1024` and no NUL (`position(chr(0) in …) = 0`) | `_validate_appearance_text`: string, ≤1024 chars, NUL-free |
+| `appearance_header_body` | `text` | NO | `''` | same | same |
+| `appearance_page_overrides` | `jsonb` | NO | `'{}'` | `jsonb_typeof(appearance_page_overrides) = 'object'` | `_validate_page_overrides`: dict ≤64 entries; page id non-empty ≤64 chars; only `title`/`body`; each a non-blank string ≤1024 chars |
+| `appearance_preview_enabled` | `boolean` | NO | `false` | — (boolean type) | `_validate_bool` |
+| `appearance_preview_image_key` | `text` | NO | `''` | `''` OR `~ '^[A-Za-z0-9][A-Za-z0-9/_.-]*$'` | `_validate_storage_key`: string ≤256 chars, NUL-free, empty or the same path regex |
+
+The ownership chain is one-directional:
+`backend/bot/handlers/appearance.py` (UI) → `appearance_service` (page ids,
+composition, Storage operations) → `settings_service` (typed accessors, cache,
+per-key validators, `_DEFAULTS`) →
+`panel_settings_repository` (the ONLY module that touches the table) →
+`panel_settings`. No handler writes the table directly.
+
+`''` / `'{}'` mean **use the built-in default**: resetting a header writes the
+empty value rather than a copy of the current customization, and resetting a
+page override removes that page's entry. Only the eleven `MAIN_PAGE_IDS`
+(`menu`, `save`, `del`, `profile`, `db`, `general`, `settings`, `cipher`,
+`todo`, `ai`, `appearance`) are eligible; sub-panels, inputs and pickers are not
+customizable. An absent page field keeps the page's own default, and because an
+empty default body means “render live content”, an override body for such a page
+is shown ABOVE that live content rather than replacing it.
+
+### 35.2 The gallery is Storage, not a table
+
+- **Bucket:** `appearance_service.bucket()` returns
+  `os.getenv("APPEARANCE_MEDIA_BUCKET", "").strip()` — the dedicated private
+  Appearance bucket only, never the AED/archive bucket. An empty value makes
+  `storage_available()` false (the function also requires the Supabase client,
+  i.e. `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY`), and every gallery action
+  reports the configuration help instead of pretending to work.
+- **Prefix and key:** objects live under `IMAGES_PREFIX = "appearance/preview"`,
+  named `appearance/preview/<32 lowercase hex>.<png|jpg|webp>`. The UI receives a
+  32-hex **token**; the durable key is derived from it and validated against
+  `^appearance/preview/([0-9a-f]{32})\.(png|jpg|webp)$`.
+- **Inventory:** `gallery()` calls Storage `list()` on that prefix, reads each
+  object's `size`/`created_at` metadata and maps the extension to a MIME type.
+  It issues no table query. A listing failure returns `known=False` plus an
+  error — never an “empty gallery”. `missing_selected` is reported when the
+  stored key no longer appears in the listing.
+- **Selection:** `panel_settings.appearance_preview_image_key` stores the
+  selected object's key. It is the only durable link between the database and
+  Storage; deleting the key clears the selection but never the bytes.
+
+### 35.3 Upload, selection, deletion and reset
+
+- **Validation (`validate_image`)** runs off the event loop and rejects, with a
+  message and no stored object: empty files; more than **25 MiB**
+  (`MAX_IMAGE_BYTES = 26_214_400`); anything that is not a decodable
+  **PNG, JPEG or WebP** (format is read from the decoded image, not the
+  filename); more than **8192 px per side**; more than **50 megapixels**; a
+  declared MIME that contradicts the real format; and truncated/corrupt pixel
+  data (full decode, or a bounded structural proof above 12 MP). The original
+  bytes are stored untouched — no re-encode on upload.
+- **Upload (`install_image`)** holds one in-process upload lock, re-reads the
+  gallery, refuses at **10 images** (`MAX_GALLERY_IMAGES`) instead of evicting,
+  validates, writes a NEW object, re-lists to confirm the object exists, and only
+  then persists the key. If confirmation or the key write fails, the just-written
+  object is deleted, so an unselected orphan is not left behind.
+- **Select (`select_image`)** accepts only a token currently present in the
+  listing, writes that key through `settings_service`, and never uploads, copies
+  or deletes an object. Re-selecting the active image is a no-op.
+- **Delete (`delete_image`)** resolves the token in the listing; if it is the
+  SELECTED image it clears the stored key FIRST, then deletes exactly that one
+  object. If Storage refuses, the owner is told the image is no longer selected
+  but still stored. No other object is touched.
+- **Clear selection (`clear_selection`)** writes `''` and deletes nothing; every
+  stored image remains in the gallery.
+- **Reset (`reset_header` / `reset_page_text`)** writes `''` or drops the page
+  entry; it does not touch the preview image or the gallery.
+
+### 35.4 What survives a restart, and what is process-local
+
+Durable and restart-surviving: the five columns (hence the header text, page
+overrides and the preview switch) and the selected object key; the image objects
+themselves live in the bucket independently of the process. The gallery is
+re-derived from Storage on demand.
+
+Process-local only (never a source of truth, lost on restart and rebuilt):
+`_DELIVERED` (panel/message id → composed text + rendition + version),
+`_BUILT` (per-panel composed state), the bounded image byte/rendition cache
+(`IMAGE_CACHE_BUDGET_BYTES`) and the ≤30 s delivery-readiness probe
+(`_READY_*`). Losing them loses no customization.
+
+`appearance_preview_enabled = false` renders a genuinely text-only panel while
+keeping the stored key; a key missing from Storage yields `missing_selected` and
+a text-only panel — no image is invented and the key is not silently replaced.
+
+### 35.5 RLS and the access model are unchanged
+
+`panel_settings` already has RLS enabled with SELECT-only grants for
+`anon`/`authenticated`; the Appearance migration creates **no policy and no
+grant**, so the boundary is identical. All writes go through the backend's
+service-role client (which bypasses RLS), the dashboard reads through the
+backend API, and the Storage bucket is private and reached only by the backend
+service-role client. Appearance adds no anonymous or browser read path.
+
+### 35.6 Migration status and rollback
+
+The migration is **not applied** by any coding agent; applying it is a manual
+owner action (the one-paste setup in §31.3, part 15, or the migration file).
+Its header carries the idempotent rollback: drop the four Appearance CHECKs,
+then the five columns. The rollback does **not** delete stored images, and after
+it the five values degrade to the process cache and reset on restart — exactly
+the state the migration fixes. Nothing in this section claims the live Supabase
+project has the migration applied.
+
+---
+
 ## 17. Relationships
 
 The task foundation and the Todo steps table are the two intentional enforced
@@ -5503,7 +5659,7 @@ never end on an out-of-order stale value). Regression coverage:
 The table still has no `owner_id` (single-tenant assumption) and stores
 a JSON blob where a relational representation is appropriate, but it
 cannot be dropped until the allow-list is migrated to `ghost_chats`
-(§22, §24, §20 item 8/9).
+(§23, §26, §22 item 8/9).
 
 ### 19.5 `ai_messages.tool_calls` — three-way mismatch
 
@@ -5567,7 +5723,7 @@ when Supabase is unavailable or the tables are missing. Migrations for
 `ai_provider_stats` (`20260827000004`) and `ai_usage` (`20260827000003`)
 have been generated and are created by part 1 of the one-paste setup (§31.3);
 `ai_preferences` ([§14](#14-ai_preferences)) still has no migration
-(see §20, item 6).
+(see §22, item 6).
 
 ### 19.9 AI configuration persistence is non-deterministic
 
@@ -5674,7 +5830,7 @@ key-value table without owner scoping.
 **Resolution [MIGRATION + CODE REQUIRED]:** Repurpose `ghost_chats` as
 the authoritative per-chat Ghost Seen state table (additive `owner_id`
 + `allowed` columns), migrate the `bot_settings` blob into it, then
-drop `bot_settings`. See §22 and §24.
+drop `bot_settings`. See §23 and §26.
 
 ### 19.13 `ghost_seen_retention_seconds` — configured but unconsumed
 
@@ -5794,7 +5950,7 @@ migration. No code change needed.
 
 ---
 
-## 20. Migration Status
+## 22. Migration Status
 
 ### Applied Migration Files (in `supabase/migrations/`)
 
@@ -5827,6 +5983,7 @@ migration. No code change needed.
 | 24 | `20261016000001_add_private_message_counter_reset.sql` | The Private Message Management automatic per-person counter reset (§33.2): adds `private_message_config.ai_counter_reset_enabled boolean NOT NULL DEFAULT false` (the switch — OFF by default), `private_message_config.ai_counter_reset_seconds integer NOT NULL DEFAULT 86400` with the CHECK constraint `private_message_config_reset_interval_range` (`BETWEEN 60 AND 31536000`) and `private_message_senders.window_started_at timestamptz` (nullable, no default, no backfill — NULL is "no window recorded yet"); plus three column `COMMENT`s, `NOTIFY pgrst` and three verification queries (both config columns, the window column, the constraint). Additive ALTER only: no table, no index, no policy, no grant, no row, and no existing value is rewritten. It alters the two tables of row 22, so it must run AFTER them | **NOT APPLIED — owner action required** (§31.3, part 11 of 15; the columns are documented in §33.1/§33.2). Until BOTH Private Message parts (10 and 11 of §31.3) run, saving ANY Private Message setting fails honestly: the configuration write names the new columns, so a database without them rejects the statement, the service keeps its previous in-memory state and the panel reports the failed save instead of pretending the setting was stored |
 | 25 | `20261020144423_harden_private_message_table_access.sql` | The Private Message Management access hardening (§33.4): RLS re-asserted on both tables, the eight named policy drops (the two permissive `anon_select_private_message_*` policies the creation migration made, plus the `anon_insert_*` / `anon_update_*` / `anon_delete_*` names it already dropped defensively), `REVOKE ALL` from `PUBLIC`/`anon`/`authenticated` at table AND column level, and exactly `SELECT, INSERT, UPDATE, DELETE` granted to `service_role`; ZERO policies created, two table `COMMENT`s restating the posture, `NOTIFY pgrst` and five read-only verification queries. Grant/policy/comment change only — no table, column, index, constraint, row or stored value is created, dropped or rewritten. It removes what row 22 created, so it must run AFTER it | **NOT APPLIED — owner action required** (§31.3, part 13 of 15; the model is documented in §33.4). Until it runs the live posture is unchanged and the exposure is still open: `anon`/`authenticated` keep SELECT with a `USING (true)` policy on both tables, so any holder of the project's anon key can read the configuration, the allow/exception lists, the schedule, the fixed response text and every per-person counter |
 | 26 | `20261020160000_add_panel_settings_auto_reaction_settings.sql` | The Auto-Reaction setting's two `panel_settings` columns (§6): `auto_reaction_enabled boolean NOT NULL DEFAULT false` (OFF by default) and `auto_reaction_emoji text NOT NULL DEFAULT ''` (`''` = none selected), added WITHOUT a default first so an existing column keeps its value, with only `NULL`s backfilled and the `NOT NULL` binding re-applied; one column-count verification query. Additive ALTER only — no table, index, constraint, policy, grant or row; the RLS/SELECT-only boundary is unchanged. Before it existed, `settings_service`'s write was rejected and the setting reset on every restart | **NOT APPLIED — owner action required** (§31.3, part 14 of 15; the columns are documented in §6). Until it runs, the Auto-Reaction toggle and emoji live in the process cache only |
+| 27 | `20261109000000_add_panel_settings_appearance.sql` | The Appearance settings' FIVE `panel_settings` columns (§6, §35): `appearance_header_title` / `appearance_header_body` (`text NOT NULL DEFAULT ''`, ≤1024 chars, NUL-free), `appearance_page_overrides` (`jsonb NOT NULL DEFAULT '{}'`, must be a JSON object), `appearance_preview_enabled` (`boolean NOT NULL DEFAULT false`) and `appearance_preview_image_key` (`text NOT NULL DEFAULT ''`, empty or a bounded Storage path — never an image body or a signed URL). Additive, idempotent, re-seeds `('global')`; no table, index, policy or grant | **NOT APPLIED — owner action required** (§31.3, part 15 of 15; documented in §6 and §35). Until it runs, the five writes are rejected and Appearance values live only in the process cache |
 
 > This table is not exhaustive: the `20260827…`–`20260917…` migration files
 > (`ai_config` trigger / `show_question` / STT columns, `ai_usage`,
@@ -5837,7 +5994,7 @@ migration. No code change needed.
 > next to row 9; rows 21 and 22 carry their timestamp-order numbers but were
 > typed in the opposite order; and the `20261016…` counter-reset row is
 > numbered 24 although its file predates the `20261017…` row numbered 23); the
-> authoritative, timestamp-ordered classification of all **36** files is §31.1,
+> authoritative, timestamp-ordered classification of all **37** files is §31.1,
 > and every embedded part's statement identity is pinned by
 > `tests/test_database_setup_order.py`.
 
@@ -5883,9 +6040,9 @@ reconciliation script. Items 3 and 6 remain genuinely open.
 8. **Correct `ghost_chats`** — the table already exists (applied,
    migration #10). The required migration adds `owner_id` and `allowed`
    and backfills from `bot_settings.ghost_seen_allowed_chats`. See
-   [§22](#22-ghost-seen--ghost-pv) and §24.
+   [§23](#23-ghost-seen--ghost-pv) and §26.
 
-9. **Drop `bot_settings`** — only after the §20 item 8 backfill is
+9. **Drop `bot_settings`** — only after the §22 item 8 backfill is
    applied and Ghost Seen v2 reads/writes `ghost_chats` (code change
    paired with the migration). No code may reference `bot_settings`
    afterwards.
@@ -5895,9 +6052,9 @@ reconciliation script. Items 3 and 6 remain genuinely open.
 
 ---
 
-## 22. Ghost Seen / Ghost PV (ghost_chats + bot_settings)
+## 23. Ghost Seen / Ghost PV (ghost_chats + bot_settings)
 
-### 22.1 Current runtime state (source-verified)
+### 23.1 Current runtime state (source-verified)
 
 Ghost Seen v2 (`backend/services/ghost_seen_v2.py` +
 `backend/bot/handlers/ghost_seen_v2.py`) keeps the following state:
@@ -5910,7 +6067,7 @@ Ghost Seen v2 (`backend/services/ghost_seen_v2.py` +
 | AI Reply candidate state (`_ai_states` / `_ai_locks`, handler) | in-memory `dict` | No | No — transient |
 | Manage directory cache (`_manage_directory`) | in-memory list + 60s TTL | No | No — cache |
 | Browser/viewer page & query | lifecycle session nav stack | No | No — transient |
-| `ghost_chats` registry rows | **unused table** | — | Designed for the corrected per-chat model (§24) |
+| `ghost_chats` registry rows | **unused table** | — | Designed for the corrected per-chat model (§26) |
 
 The only durable Ghost Seen state is the allow-list. The `ghost_chats`
 table exists in the live database but nothing writes it (§19.12). The
@@ -5918,7 +6075,7 @@ former `GHOST_ROOM_ID` output-routing env no longer exists anywhere in
 the code; `GHOST_SEEN_DESTINATION_CHAT_ID/_NAME` are defined but unused
 (§19.15).
 
-### 22.2 Corrected table: `ghost_chats` — authoritative per-chat Ghost PV state
+### 23.2 Corrected table: `ghost_chats` — authoritative per-chat Ghost PV state
 
 `ghost_chats` becomes the single authoritative table for per-chat Ghost
 Seen state. The change is **additive-only** (no column is dropped):
@@ -5926,7 +6083,7 @@ Seen state. The change is **additive-only** (no column is dropped):
 | Column | Type | Nullable | Default | Purpose | Source requirement |
 |---|---|---|---|---|---|
 | `chat_id` | `bigint` | NO | — | Telegram chat ID (PK) | existing column |
-| `owner_id` | `bigint` | NO | `0` | Owner scoping (single-tenant) | new — every other table carries `owner_id`; required for ownership consistency (§24) |
+| `owner_id` | `bigint` | NO | `0` | Owner scoping (single-tenant) | new — every other table carries `owner_id`; required for ownership consistency (§26) |
 | `allowed` | `boolean` | NO | `false` | Ghost Seen opt-in permission for this chat | new — replaces the `bot_settings.ghost_seen_allowed_chats` JSON blob |
 | `display_name` | `text` | NO | `''` | Last known display name | existing column |
 | `last_preview` | `text` | NO | `''` | Last message preview (≤160 chars, PII-minimized) | existing column (write path optional — v2 currently renders live previews) |
@@ -5940,7 +6097,7 @@ Seen state. The change is **additive-only** (no column is dropped):
 **RLS:** unchanged — single SELECT policy for `anon`, `authenticated`
 USING `(true)`; all writes go through the service-role key.
 
-**Migration path (one additive migration, see §20 items 8–9):**
+**Migration path (one additive migration, see §22 items 8–9):**
 `ADD COLUMN owner_id bigint NOT NULL DEFAULT 0`;
 `ADD COLUMN allowed boolean NOT NULL DEFAULT false`; backfill from
 `bot_settings.ghost_seen_allowed_chats`; index; afterwards drop
@@ -5956,7 +6113,7 @@ USING `(true)`; all writes go through the service-role key.
 
 ---
 
-## 21. Migration Generation Rules
+## 24. Migration Generation Rules
 
 When generating new Supabase migrations from this document:
 
@@ -5968,7 +6125,7 @@ When generating new Supabase migrations from this document:
 2. **One migration per logical change.** Do not combine unrelated
    schema changes in a single migration. Each migration should address
    one item from the "Migrations That Must Be Generated" list in
-   [§20](#20-migration-status).
+   [§22](#22-migration-status).
 
 3. **Always use `IF NOT EXISTS` / `IF EXISTS`.** Migrations must be
    idempotent — safe to re-run. Use `ADD COLUMN IF NOT EXISTS` (inside
@@ -6000,13 +6157,13 @@ When generating new Supabase migrations from this document:
    migration from the updated spec. Never generate a migration that
    contradicts this document.
 
-10. **Document the migration in §20.** After generating a migration,
+10. **Document the migration in §22.** After generating a migration,
     add it to the "Applied Migration Files" table with its file name,
     date, and a one-line description.
 
 ---
 
-## 23. Self Bot Persistent State Inventory
+## 25. Self Bot Persistent State Inventory
 
 Source-verified restart-survival matrix for every feature. "Storage"
 is where the state lives today; "Must survive restart?" answers what
@@ -6019,28 +6176,45 @@ the actual source requires (not what would be nice).
 | Bio automation | template, mood, custom_text, `is_active`, `last_bio` | `bio_state` | **Yes** — `ProfileEngine.updater` reads `is_active`/tokens from DB each minute | none |
 | Username automation | template, mood, custom_text, `is_active`, `last_name` | `username_state` | **Yes** — same engine path | none |
 | Profile scheduler runtime | active-engine flags, running task | in-memory (`profile/scheduler.py`) | No — restarted on boot from `BIO_UPDATE_ENABLED` / `USERNAME_UPDATE_ENABLED` + DB `is_active` rows | none |
-| Panel / global settings | 12 typed settings | `panel_settings` (4 applied columns + `dashboard_font`; 10 columns missing §19.3) | **Yes** — settings must survive restart | §19.3 |
+| Panel / global settings | 19 typed settings (21 setting columns; `update_stale_seconds` and `ghost_seen_retention_seconds` have no accessor) | `panel_settings` (every column migrated; part 1 + parts 14/15) | **Yes** — settings must survive restart | no consumer for two columns (§19.13, §19.14) |
+| Auto-Reaction | enabled flag + selected reaction emoji | `panel_settings` (part 14) | **Yes** | none |
+| Appearance header | global title + body + per-page overrides | `panel_settings` (part 15) | **Yes** — composed at the render boundary | none |
+| Appearance preview switch | independent boolean; OFF renders text-only but keeps the stored image | `panel_settings` (part 15) | **Yes** | none |
+| Appearance image gallery | 0–10 original images (PNG/JPEG/WebP) | Supabase Storage, dedicated private bucket named by `APPEARANCE_MEDIA_BUCKET`, prefix `appearance/preview/` | **Yes** (intended) — objects persist independently of the process | `APPEARANCE_MEDIA_BUCKET` must be configured; there is no gallery table by design (§35) |
+| Appearance selected preview | the selected object's Storage KEY only | `panel_settings.appearance_preview_image_key` (part 15) | **Yes** | none — never bytes, signed URLs, file IDs or filenames (§35) |
+| Appearance delivery state | composed panel text, built-page cache, image rendition/bytes, readiness probe (≤30 s) | in-memory (`appearance_service`) | **No** — cache/delivery only, rebuilt from the columns + Storage | none |
 | Glass UI / dashboard font | selected font key | `panel_settings.dashboard_font` (CHECK on 23 keys) | **Yes** — persisted; key-surface mismatch §19.16 | §19.16 |
-| Ghost Seen retention window | `ghost_seen_retention_seconds` | `panel_settings` column (migration pending) | **Yes** (intended) — but no consumer exists | §19.13 |
-| Heartbeat stall threshold | `update_stale_seconds` | `panel_settings` column (applied) | No consumer | §19.14 |
+| Ghost Seen retention window | `ghost_seen_retention_seconds` | `panel_settings` column (migrated; part 1) | **Yes** (intended) — but no consumer exists | §19.13 |
+| Heartbeat stall threshold | `update_stale_seconds` | `panel_settings` column (migrated; part 1) | No consumer | §19.14 |
 | Ghost Seen allow-list | per-chat opt-in | `bot_settings.ghost_seen_allowed_chats` (JSON) | **Yes** — privacy permissions must survive restart | §19.4, §19.12 |
 | Ghost Seen transient state | selections, reply input, AI candidate, page/query | in-memory | **No** — transient by design; never persisted | none |
-| Ghost Seen registry rows | per-chat last-preview/unread metadata | `ghost_chats` (unused) | Only if the registry feature is built (retention setting implies intent) | §19.12, §24 |
-| AI configuration | provider, model, temperature, max_tokens, system_prompt, history_budget, is_configured, triggers, last-request stats | `ai_config` | **Yes** — restored on boot | §19.1 (trigger columns missing) |
-| AI sessions / messages / tool history | conversation history + audit | `ai_sessions`, `ai_messages`, `ai_tool_history` | **Yes** (per design) — written by `ai/persistence.py` | §19.5 (tool_calls col), §19.6 (result_data) |
+| Ghost Seen registry rows | per-chat last-preview/unread metadata | `ghost_chats` (unused) | Only if the registry feature is built (retention setting implies intent) | §19.12, §26 |
+| AI configuration | provider, model, temperature, max_tokens, system_prompt, history_budget, is_configured, triggers, show_question, STT, last-request stats | `ai_config` | **Yes** — restored on boot | none (trigger/show_question/STT columns delivered) |
+| AI sessions / messages / tool history | conversation history + audit | `ai_sessions`, `ai_messages`, `ai_tool_history` | **Yes** (per design) — written by `ai/persistence.py` | §19.5 (`ai_messages.tool_calls` has no column), §19.6 (`result_data`) |
 | AI memories | short/long/permanent tiers | `ai_memories` (Supabase repo wired; no automatic writer) | **Yes** (per design) — opt-in writes only | none |
-| AI usage + provider stats | per-request usage, per-provider aggregates | `ai_usage`, `ai_provider_stats` (repos wired) | **Yes** (per design) — tables not migrated | §19.8 |
+| AI task scheduler | task definitions, schedules, actions, occurrence ledger | `ai_tasks`, `ai_task_occurrences` (part 1) | **Yes** — the scheduler resumes from them | none |
+| Todo steps | ordered steps of ONE todo | `todo_steps` (part 8; manual) | **Yes** (when applied) | migration manual-only |
+| AI usage + provider stats | per-request usage, per-provider aggregates | `ai_usage`, `ai_provider_stats` (own migrations, absorbed by part 1) | **Yes** (per design) | only that part 1 is applied |
 | AI preferences | personality / behavior | in-memory only | **Yes** (per design) — no producer, no migration | §19.17 |
 | AI reply context map | Telegram msg-id → full AI content | in-memory LRU (`reply_resolver.py`) | Optional enhancement (cross-restart reply resolution) | §19.10 |
+| Emoji & Reaction | library, categories, mappings, global state, per-chat overrides | five dedicated tables (part 9; manual) | **Yes** (when applied) | migration manual-only; chat overrides implemented-not-approved (§32.6) |
+| Private Message management | master config, access lists, action flags, per-sender counters | `private_message_config`, `private_message_senders` (parts 10/11/13; manual) | **Yes** | manual-only; the legacy `bot_settings` document is read once for import (§33) |
+| Anti-Edit / Anti-Delete | config + bounded private-message archive | `aed_config`, `aed_archive_entries` (part 12; manual) | **Yes** (when applied) | manual-only; legacy `bot_settings` shards are the store until then (§34) |
+| Test Modules snapshot | last validated provider/model results | `bot_settings` document `ai_test_snapshot:v1` (`settings_document_write`) | **Yes** — the panel restores it | none |
+| API credential vault | credential METADATA only; secrets in Supabase Vault | `api_credentials` + `vault.secrets` (parts 2/3; manual) | **Yes** (when applied) | manual-only; deployment env keys remain the fallback (§29) |
 | Structured logs | activity log | `bot_logs` | **Yes** (bounded by `log_retention_days`) | none |
 | Runtime health telemetry | heartbeat/stats/diagnostics | in-memory (`health.py`, `diagnostics.py`) | No — by design | none |
 
 Every "Yes" row is backed by a concrete source requirement; every
-"No" row is transient UI/runtime state that must NOT be persisted.
+"No" row is transient UI/runtime state — or, for the Appearance delivery
+state, a cache — that must NOT be persisted. A manual-only migration means the
+SQL exists in `supabase/migrations/` but no setup has been applied to any
+project by the coding agent; the feature then reports durable-store failures
+honestly instead of claiming persistence.
 
 ---
 
-## 24. Hermes Integration Boundary & Corrected Architecture
+## 26. Hermes Integration Boundary & Corrected Architecture
 
 > **Scope note:** The supplied Hermes Runtime architecture document is
 > NOT present in this repository (zero references to "hermes" exist in
@@ -6051,39 +6225,46 @@ Every "Yes" row is backed by a concrete source requirement; every
 
 ### A. Existing database architecture
 
-See §1–§21. Summary: 13 live/specified tables (`saved_items`,
-`bio_state`, `username_state`, `bot_logs`, `panel_settings`,
-`ai_config`, `ai_sessions`, `ai_messages`, `ai_memories`,
-`ai_tool_history`, `ai_provider_stats`, `ai_usage`, `ai_preferences`)
-plus `bot_settings` (live, §19.4) and `ghost_chats` (orphaned,
-§19.12). All access via the Supabase service-role key; SELECT-only RLS;
-in-memory fallback everywhere.
+See §1–§22. Summary: the migrations create **27 tables** — 6 core
+(`saved_items`, `bio_state`, `username_state`, `bot_logs`, `panel_settings`,
+`bot_settings`), 10 AI/automation (`ai_config`, `ai_sessions`, `ai_messages`,
+`ai_memories`, `ai_tool_history`, `ai_usage`, `ai_provider_stats`, `ai_tasks`,
+`ai_task_occurrences`, `todo_steps`) and 11 feature tables (`ghost_chats`,
+five Emoji & Reaction tables, two Private Message tables, two Anti-Edit /
+Anti-Delete tables, `api_credentials`). `ai_preferences` has **no migration and
+no producer** (§14, §19.17). `bot_settings` is live (§19.4); `ghost_chats` has
+no writer (§19.12). All access goes through the Supabase service-role key; the
+generic tables keep SELECT-only RLS, while the Private Message and AED tables
+use the restrictive service-role-only posture (§33.4, §34.7); in-memory
+fallback applies wherever a repository finds no database.
 
 ### B. Existing Self Bot persistent state NOT correctly in the database
 
 1. **Ghost Seen allow-list** — persisted, but in a legacy key-value
    table (`bot_settings`) with no owner scoping and a JSON blob
    (§19.4). Corrected representation: `ghost_chats` rows with
-   `owner_id` + `allowed` (§22.2).
+   `owner_id` + `allowed` (§23.2).
 2. **Ghost Seen registry metadata** (`display_name`, `last_preview`,
    `last_message_at`, `unread_count`) — table exists, never written.
    Either write it (registry/retention feature) or keep it dormant;
    the retention setting (§19.13) implies the feature is intended.
-3. **AI usage / provider stats / preferences** — implemented in code,
-   no applied migrations (§19.8, §19.17).
+3. **AI usage / provider stats / preferences** — usage and stats have
+   repository code AND migrations (absorbed by part 1), but no setup has been
+   applied to a live project; `ai_preferences` also has no migration and no
+   producer (§19.8, §19.17).
 4. **Settings columns without consumers** — `ghost_seen_retention_seconds`
    (§19.13), `update_stale_seconds` (§19.14).
 
-### C. Proposed new persistent state (all additive; each justified by source)
+### C. Proposed new persistent state (not yet delivered; each justified by source)
 
 | Proposal | Source requirement | Table / column |
 |---|---|---|
 | `ghost_chats.owner_id` | owner scoping — every other table carries `owner_id` | new column |
 | `ghost_chats.allowed` | replaces `bot_settings.ghost_seen_allowed_chats` JSON blob; the allow-list is per-chat relational state | new column |
 | `ai_messages.tool_calls` | `MessageRecord` defines it; migration missing | new column (§19.5) |
-| `ai_config.trigger_en/fa` | `config_store` reads/writes them; migration missing | new columns (§19.1) |
-| `ai_usage`, `ai_provider_stats`, `ai_preferences` tables | Supabase repositories are wired; tables missing | create (§19.8) |
-| `panel_settings` 10 missing columns | `settings_service` reads/writes them | add columns (§19.3) |
+| `ai_preferences` table | repository interface exists; no producer | create + producer (§19.17) |
+| Verify `ai_config.trigger_en/fa` | Migration `20260827000002` exists and part 1 re-asserts them | no DDL proposed — confirm the applied schema (§19.1) |
+| Verify the Appearance columns | Migration part 15 exists in this repository | no DDL proposed — apply part 15 (§6, §35) |
 
 Nothing else is proposed. Specifically NOT proposed: per-message Ghost
 PV storage, Telegram message content storage, execution/action logs
@@ -6143,20 +6324,20 @@ Telegram (send/deliver results, message IDs, timestamps).
   for `anon, authenticated` USING `(true)`; all writes go through the
   service-role key (bypasses RLS).
 - `owner_id` must exist on every table that holds owner-scoped data.
-  `ghost_chats` gains it (§22.2); `bot_settings` is migrated away from;
+  `ghost_chats` gains it (§23.2); `bot_settings` is migrated away from;
   `panel_settings` is a global singleton (no `owner_id`, by design).
 - No anon/authenticated write policies anywhere.
 
 ### I. Migration strategy
 
-Follow §21 rules: doc-first, one logical change per migration,
-idempotent (`IF NOT EXISTS`), RLS SELECT-only, log in §20. Priority
+Follow §24 rules: doc-first, one logical change per migration,
+idempotent (`IF NOT EXISTS`), RLS SELECT-only, log in §22. Priority
 order: (1) §19.1 trigger columns + §19.3 panel_settings columns;
 (2) `ai_usage` + `ai_provider_stats` (+ decide `ai_preferences`);
-(3) `ghost_chats` correction + `bot_settings` drop (§20 items 8–9);
+(3) `ghost_chats` correction + `bot_settings` drop (§22 items 8–9);
 (4) §19.5/§19.6 column additions; (5) §19.7 dead-column cleanup.
 Every migration is additive or explicitly documented destructive
-(§19.7, §20 item 9) — never a surprise drop.
+(§19.7, §22 item 9) — never a surprise drop.
 
 ### J. Open decisions / unknowns
 
@@ -6179,7 +6360,7 @@ Every migration is additive or explicitly documented destructive
 
 ### Per-table rationale for the corrected/proposed objects
 
-Every column in §22.2 and §C answers "what actual source-code
+Every column in §23.2 and §C answers "what actual source-code
 requirement caused this field to exist?"; anything without a source
 requirement is marked **REQUIRES SOURCE VERIFICATION** rather than
 invented. The only schema object in this revision that is not yet
@@ -6189,9 +6370,9 @@ under decision J.2.
 
 ---
 
-## 25. Font System Persistence (current, verified)
+## 27. Font System Persistence (current, verified)
 
-### 25.1 What the font system actually is
+### 27.1 What the font system actually is
 
 The Glass UI font system is a **code-defined enumerated transform
 registry**, not a database of font definitions:
@@ -6217,7 +6398,7 @@ registry**, not a database of font definitions:
 - **Metadata / versioning:** none. No version field, no custom fonts, no
   per-owner groupings.
 
-### 25.2 What persists
+### 27.2 What persists
 
 Only ONE value is user-selected durable state: the active font key.
 
@@ -6246,7 +6427,7 @@ so a restart cannot overwrite the persisted value. Caveat (pre-existing,
 `tests/test_42_dashboard_font.py` (write-reaches-DB + restart restore +
 startup-hydration guard).
 
-### 25.3 Gaps / decisions
+### 27.3 Gaps / decisions
 
 - **Frontend key-surface mismatch** — §19.16 (dashboard hardcodes 4
   keys; `system`/`serif` are rejected by backend validation).
@@ -6257,7 +6438,7 @@ startup-hydration guard).
 
 ---
 
-## 26. Current vs Proposed Status Matrix
+## 28. Current vs Proposed Status Matrix
 
 Legend: **CURRENT (verified)** = read/written by live code today.
 **PROPOSED** = specified here; no migration applied and/or no live
@@ -6276,11 +6457,11 @@ producer yet.
 | `ai_memories` | CURRENT (repo wired; no auto writer) | `SupabaseMemoryRepository` via Engine | Yes |
 | `ai_tool_history` | CURRENT | `ai/persistence.py`, `ai/tools/executor.py` | Yes |
 | `bot_settings` | CURRENT (allow-list) | `ghost_seen_v2` | Yes |
-| `ghost_chats` | **PROPOSED (corrected)** | no live writer today | Table exists; §22.2 correction not applied |
+| `ghost_chats` | **PROPOSED (corrected)** | no live writer today | Table exists; §23.2 correction not applied |
 | `ai_usage` | **PROPOSED** | `SupabaseUsageRepository` + `usage_recorder` (wired; fails silently without table) | No |
 | `ai_provider_stats` | **PROPOSED** | `SupabaseProviderStatsRepository` (wired) | No |
 | `ai_preferences` | **PROPOSED** | interface + in-memory only; no producer | No |
-| Ghost Seen allow-list | CURRENT (via `bot_settings`) → PROPOSED migration to `ghost_chats.allowed` | `ghost_seen_v2` | Backfill = §20 item 8 |
+| Ghost Seen allow-list | CURRENT (via `bot_settings`) → PROPOSED migration to `ghost_chats.allowed` | `ghost_seen_v2` | Backfill = §22 item 8 |
 | Ghost Seen transient state | Intentionally NOT persisted (CURRENT design decision) | in-memory | n/a |
 | Ghost Seen watermark / exclusions / delays | Do NOT exist in source; deliberately NOT added (would be REQUIRES SOURCE VERIFICATION) | — | n/a |
 | Font definitions | CURRENT, code-only (`font_style.py`) | — | n/a |
@@ -7797,9 +7978,9 @@ alone.
 `saved_items.display_name` is deliberately **not** in this inventory: the
 column did not exist when the reconciliation snapshot was written and it is
 added afterwards by the additive migration
-`20260921000001_add_saved_items_display_name.sql` (§2, §20 row 16), together
+`20260921000001_add_saved_items_display_name.sql` (§2, §22 row 16), together
 with the resolver's two search indexes
-(`20260922000001_add_saved_items_search_indexes.sql`, §20 row 17). The
+(`20260922000001_add_saved_items_search_indexes.sql`, §22 row 17). The
 current contract for `saved_items` is therefore this snapshot **plus** those
 additive successors — the snapshot itself is never regenerated to contain
 them.
@@ -8016,7 +8197,7 @@ occurrence table has an `ON DELETE RESTRICT` foreign key — a plain
 
 ### 30.10 Optional cleanup — separate from the reconciliation path
 
-The following are the §20 removal proposals. They are **NOT part of the
+The following are the §22 removal proposals. They are **NOT part of the
 canonical script**, they are **destructive**, and they remain owner-gated on a
 live-data check. They are listed here so that "the canonical script" and
 "proposed cleanup" cannot be confused with each other.
@@ -8030,7 +8211,7 @@ SELECT count(*) AS legacy_ghost_chats_rows FROM ghost_chats;
 SELECT count(*) AS rows_with_short_code FROM saved_items WHERE short_code IS NOT NULL;
 SELECT count(*) AS rows_with_file_name  FROM saved_items WHERE file_name  IS NOT NULL;
 
--- §20 item 7 — dead saved_items columns and their indexes (no live writer).
+-- §22 item 7 — dead saved_items columns and their indexes (no live writer).
 DROP INDEX IF EXISTS idx_saved_items_short_code;
 DROP INDEX IF EXISTS idx_saved_items_short_code_trgm;
 DROP INDEX IF EXISTS idx_saved_items_file_name_trgm;

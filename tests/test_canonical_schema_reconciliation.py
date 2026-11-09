@@ -1192,7 +1192,7 @@ def test_the_documentation_separates_the_optional_destructive_cleanup():
     section = section_30()
     assert "OPTIONAL" in section.upper()
     assert "DESTRUCTIVE" in section.upper()
-    assert "§20" in section, "the cleanup must point at the recorded §20 proposals"
+    assert "§22" in section, "the cleanup must point at the recorded §22 proposals"
 
 
 def test_no_migration_creates_a_table_that_the_documentation_does_not_classify():
