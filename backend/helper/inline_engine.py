@@ -97,6 +97,61 @@ def _sanitize_results(results: list) -> list:
     return results
 
 
+#: The Telegram errors that mean the PHOTO RESULT ITSELF was refused (an empty
+#: or unusable thumbnail/content document, invalid media or a caption Telegram
+#: will not attach). Only these may fall back to the preserved text panel; any
+#: other RPC failure keeps its existing honest failure path.
+_MEDIA_RESULT_ERRORS = frozenset({
+    "PhotoThumbUrlEmptyError",
+    "PhotoContentUrlEmptyError",
+    "PhotoContentTypeInvalidError",
+    "PhotoExtInvalidError",
+    "PhotoInvalidDimensionsError",
+    "PhotoSaveFileInvalidError",
+    "PhotoFileMissingError",
+    "PhotoInvalidError",
+    "MediaEmptyError",
+    "MediaInvalidError",
+    "WebpageMediaEmptyError",
+    "MediaCaptionTooLongError",
+})
+
+
+def is_media_result_rejection(exc: BaseException) -> bool:
+    """Whether ``exc`` is Telegram refusing the composed MEDIA result itself.
+
+    Deliberately narrow: a known photo/media RPC error, or an ``RPCError`` whose
+    own text names a photo/thumbnail. A network, auth, flood-wait or unrelated
+    server error is NOT a media rejection and must never be presented as one.
+    """
+    if type(exc).__name__ in _MEDIA_RESULT_ERRORS:
+        return True
+    try:
+        from telethon.errors import RPCError
+    except Exception:  # pragma: no cover - telethon is a pinned dependency
+        return False
+    if not isinstance(exc, RPCError):
+        return False
+    text = (str(exc) or "").upper()
+    return "THUMB" in text or "PHOTO" in text
+
+
+def text_fallback_results(results: list) -> list:
+    """The preserved TEXT results, with web-page previews suppressed.
+
+    Used only when Telegram refused the composed photo result: the panel text
+    and its inline keyboard are handed over unchanged, no Appearance URL can be
+    present (none is ever composed into text), and no card is requested.
+    """
+    fallback: list = []
+    for result in results or []:
+        message = getattr(result, "send_message", None)
+        if message is not None and hasattr(message, "no_webpage"):
+            message.no_webpage = True
+        fallback.append(result)
+    return fallback
+
+
 def register_inline_builder(query_key: str, builder: InlineResultBuilder) -> None:
     _builders[query_key] = builder
 
@@ -317,20 +372,58 @@ def register_inline_handler(helper_client, owner_id: int) -> None:
             return
 
         built: list = []
+        text_results: list = []
+        media_attempted = False
         try:
             built = await builder(event, extra)
+            built = _sanitize_results(built)
+            # Preserve the panel's own TEXT results BEFORE the optional media
+            # composition, so a photo Telegram refuses can still be delivered
+            # as the ordinary text panel instead of an empty answer.
+            text_results = list(built)
             # The initial panel is an inline result, so it never passes through
             # the callback boundary: the Appearance layer is applied HERE, with
             # the SAME composition later edits use.
             try:
                 from backend.services import appearance_service
 
-                built = await appearance_service.apply_to_inline_results(panel_id, extra, built)
+                composed = await appearance_service.apply_to_inline_results(
+                    panel_id, extra, built
+                )
+                media_attempted = appearance_service.contains_photo_result(composed)
+                built = composed
             except Exception as exc:  # noqa: BLE001 — never break a panel render
                 logger.warning("appearance: inline composition skipped: %s", exc)
+                media_attempted = False
+                built = text_results
             built = _sanitize_results(built)
-            await event.answer(built)
-            record_inline_answer(panel_id, built, ok=True)
+            try:
+                await event.answer(built)
+            except Exception as exc:
+                if not media_attempted or not is_media_result_rejection(exc):
+                    raise
+                # A failed SetInlineBotResults stored nothing for this query, so
+                # answering the SAME query again with the preserved text results
+                # is safe — and it is the only thing that keeps the menu
+                # available when Telegram refuses the optional photo.
+                logger.warning(
+                    "[INLINE] media result rejected for panel '%s' (%s) — "
+                    "answering with the preserved text panel",
+                    panel_id, type(exc).__name__,
+                )
+                fallback = text_fallback_results(text_results)
+                await event.answer(fallback)
+                record_inline_answer(
+                    panel_id,
+                    fallback,
+                    ok=False,
+                    error=(
+                        f"media delivery failed ({type(exc).__name__}); "
+                        "the panel was delivered as text"
+                    ),
+                )
+            else:
+                record_inline_answer(panel_id, built, ok=True)
         except Exception as exc:
             logger.exception("Inline router error for panel '%s'", panel_id)
             record_inline_answer(

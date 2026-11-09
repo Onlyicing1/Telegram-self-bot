@@ -1,130 +1,141 @@
-# INVESTIGATION — Appearance Preview Delivery (visible URL / "Onrender" card)
+# INVESTIGATION — LifeOS menu stops opening after Appearance media delivery
 
-_Investigated and fixed at `9b66750d5330ef26742c995da5c42d30199c8351` (`main`,
-after the ten-image gallery change). Every claim below is derived from the
-source and the Telegram objects the code builds, not from the previous report._
+_Investigated at production commit `98c8f368409a4ecce00a83eea18acb063fe88197`
+(`main`, Render service **Self_bot**, deploy `dep-dbp0g6utlv9c73dto2m0`, live).
+Every claim below comes from the deployed source, the installed Telethon TL
+schema, and the recorded production exception — not from an earlier report._
 
-## 1. Symptom
+## 1. Symptom (confirmed production evidence)
 
-With a gallery image selected and Preview ON, the LifeOS main panel showed:
+After the Appearance media-delivery deploy, repeated real `menu` inline requests
+were logged as:
 
-- the Render URL (`https://<service>.onrender.com/appearance/preview/<version>`)
-  as part of the message body — visible text;
-- Telegram's own web-page preview card above it, titled **Onrender**;
-- the Guide page's title/description — i.e. the whole webpage, not the image.
+- `Inline router error for panel 'menu'`
+- `telethon.errors.rpcerrorlist.PhotoThumbUrlEmptyError: The URL used as a
+  thumbnail appears to be empty or has caused another HTTP error (caused by
+  SetInlineBotResultsRequest)`
+- the stack ending at `backend/helper/inline_engine.py::_inline_router` →
+  `await event.answer(built)` → Telethon `events/inlinequery.py::answer`
+- `trigger: helper returned zero results for query 'menu'`
+- `create_panel: trigger returned success=False msg_id=0`
+- `send_inline_panel ... success=False`
 
-The Appearance panel itself was correct (`Preview: ON`, `Images: 1 / 10`,
-`Selected: image 1`), so the defect is in DELIVERY, not in the gallery.
+So the Helper Bot received the query and built a result, but Telegram refused
+the `SetInlineBotResults` submission, the router answered with an EMPTY list, and
+the self-bot saw zero inline results. The root menu became unavailable.
 
-## 2. Verified root cause (exact code)
+## 2. Confirmed root cause (exact field)
 
-1. `backend/services/appearance_service.py::with_preview()` composed the panel
-   title/body and then did:
+`backend/services/appearance_service.py::_as_photo_result()` built:
 
-   ```python
-   url = preview_url() if preview_active() else ""
-   if url:
-       body = f"{body}\n\n{url}" if body else url
-   ```
-
-   `preview_url()` returns `https://<PUBLIC_BASE_URL>/appearance/preview/<version>`,
-   i.e. the public HTML page — **not** the image route.
-
-2. `with_preview()` is the single composition function used by BOTH panel
-   render boundaries:
-   - `backend/helper/panels.py::_apply_appearance()` for every callback paint,
-   - `backend/services/appearance_service.py::apply_to_inline_results()` for the
-     initial inline panel result.
-
-   So the URL was inserted into the message text on every path, including the
-   `send_message.message` of the inline result that becomes the panel message.
-
-3. `backend/helper/panels.py::_appearance_link_preview()` returned
-   `preview_active()` for eligible main pages. `_safe_edit()` forwards that as
-   `link_preview=…`, and Telethon maps `link_preview=True` to
-   `no_webpage=False`. The code therefore **explicitly asked Telegram to expand
-   the URL**, guaranteeing the web-page card.
-
-4. `/appearance/preview/<version>` (`backend/web/app.py::appearance_preview`)
-   serves an Open Graph HTML page whose `og:title`/`og:description` come from the
-   Appearance header text and whose tap target is `/guide/`. That is exactly the
-   card Telegram built — including the host name ("Onrender") when no header was
-   customised.
-
-Net effect: the owner's image was never part of the message; only a link to an
-HTML page was. The gallery, the bucket, the versioned image route and the
-selection semantics were all working.
-
-## 3. Why "just remove the URL" is not enough
-
-Removing the appended link alone yields a text-only panel — the requirement is
-that the selected image is visibly part of the message. Telegram has no API that
-turns a text message into a media message in place, so the delivery mechanism
-itself had to change.
-
-## 4. Delivery mechanism now used, and why
-
-The panel message is created by the owner's account from the **Helper Bot's
-inline result** (`inline_engine.trigger` → `result.click(chat_id)`), and every
-later paint edits that same inline message
-(`CallbackQuery.Event.edit` → `messages.editInlineBotMessage`). Telegram's own
-shape for "inline result that becomes a photo with a caption and buttons" is:
-
-```
-InputBotInlineResult(
-    id=…, type="photo",
-    content=InputWebDocument(url=<image URL>, mime_type="image/jpeg"),
-    send_message=InputBotInlineMessageMediaAuto(message=<text>, reply_markup=<same rows>),
+```python
+types.InputBotInlineResult(
+    id=..., type="photo", title=...,
+    content=types.InputWebDocument(url=<jpeg url>, size=0,
+                                   mime_type="image/jpeg", attributes=[]),
+    send_message=types.InputBotInlineMessageMediaAuto(message=caption,
+                                                      reply_markup=markup),
 )
 ```
 
-which is the raw-API equivalent of the Bot API's `InlineQueryResultPhoto`. The
-Telegram server fetches the photo URL itself and sends it as message media; the
-text becomes the caption; there is no textual link and no place for a web-page
-card. Verified against the installed Telethon constructors
-(`InputBotInlineResult`, `InputWebDocument`, `InputBotInlineMessageMediaAuto`
-all exist with those fields).
+The installed Telethon schema (`telethon.tl.types.InputBotInlineResult`,
+`telethon==1.43.0`) is:
 
-Consequences that shaped the implementation:
+```
+inputBotInlineResult#88bf9319 flags:#
+    id:string type:string
+    title:flags.1?string description:flags.2?string url:flags.3?string
+    thumb:flags.4?InputWebDocument
+    content:flags.5?InputWebDocument
+    send_message:InputBotInlineMessage = InputBotInlineResult;
+```
 
-- **Photo URL must be a JPEG document.** `/appearance/image/<version>` still
-  serves the owner's ORIGINAL bytes (PNG/JPEG/WebP, up to 25 MiB). The panel's
-  media therefore points at the same route with `?fmt=jpeg`, which encodes a
-  delivery rendition on demand (`quality=90`, progressive downscale only if the
-  result exceeds Telegram's inline-photo fetch limit). Stored bytes are never
-  modified.
-- **A caption is capped (1024 characters).** A composed panel above that limit
-  is delivered as TEXT with `no_webpage=True`, so the full text is preserved and
-  no card appears; it never silently truncates and never inserts a URL.
-- **Media and text are mutually exclusive for one message.** Telegram cannot
-  remove a photo from a message and cannot exchange one without uploading it, so
-  enabling, disabling or switching the selected image requires a NEW inline
-  result. This is handled by `PanelLifecycleManager.replace_panel()`: the
-  replacement is created first and the old message is deleted only after the new
-  one exists (a failed replacement leaves the current panel intact).
-- **A missing object must not become a broken photo.** The builder lists the
-  gallery prefix before claiming media (`delivery_ready()`), so a stale key
-  degrades to a text panel instead of Telegram fetching a 404 as the photo.
+`content` and `thumb` are **two separate web documents**. The Bot API's
+equivalent (`InlineQueryResultPhoto`) likewise requires both `photo_url` and
+`thumb_url`. `_as_photo_result()` supplied only `content`, so `thumb` was
+absent — an empty thumbnail URL — and Telegram rejected the entire
+`SetInlineBotResults` call with `PhotoThumbUrlEmptyError` before it ever fetched
+the photo. The failure is in the TL result composition, not in the storage, the
+image route, the gallery or the caption.
 
-## 5. What was deliberately not changed
+## 3. Why an Appearance failure emptied the whole menu
 
-- Gallery inventory, uploads, selection, deletion, bucket and prefix.
-- `/appearance/preview/<version>` and `/appearance/image/<version>` (still
-  versioned, still immutable-cached, still the Open Graph page for sharing).
-- Panel architecture: same inline engine, same lifecycle, same callback
-  registries, same Helper-Bot-only editing, same nav buttons.
-- No new Telegram client, listener, loop, table, column, migration or Render
-  variable.
+`_inline_router` treated any `event.answer()` exception as fatal for that query:
 
-## 6. Residual risk (cannot be verified from this environment)
+```python
+except Exception as exc:
+    logger.exception("Inline router error for panel '%s'", panel_id)
+    record_inline_answer(panel_id, built, ok=False, ...)
+    await event.answer([])          # zero results
+```
 
-- Telegram's server-side behaviour for a photo inline result whose
-  `InputWebDocument` URL serves `?fmt=jpeg` is documented and widely used, but
-  this sandbox has no live Helper Bot/owner chat, so the rendered result was not
-  observed. If Telegram refused that content, the panel would keep its previous
-  text form; the code logs the answer failure and never falls back to a URL.
-- Editing a photo inline message by sending only `message`/`reply_markup` (no
-  `media`) is Telegram's caption-edit path; a refusal is logged by `_safe_edit`
-  and cannot introduce a link, because the text no longer contains one anywhere.
-- The delivery-state registry (`_DELIVERED`) is process-local and bounded; after
-  a restart the first render of an existing media panel replaces it once.
+`event.answer([])` is a VALID submission (the bot answered "nothing"), so the
+self-bot's `getInlineBotResults` then returned zero results, `trigger()` failed,
+and `create_panel` reported `success=False`. An optional presentation
+enhancement therefore made the entire LifeOS menu unavailable — the actual
+production regression, separate from the thumbnail bug that triggered it.
+
+## 4. Corrective shape (what the code now does)
+
+1. **Both documents.** `_as_photo_result()` now sets `content` and a separate
+   `thumb`, each an `InputWebDocument` with `mime_type="image/jpeg"`. The photo
+   keeps the existing `?fmt=jpeg` URL; the thumbnail points at the SAME
+   versioned image route with `?fmt=jpeg&thumb=1`, which returns a bounded JPEG
+   rendition (longest side ≤ 320 px, quality 80, never enlarged). No new storage
+   object, bucket, route family or public surface was added, and the stored
+   original bytes are never modified.
+2. **Only attempt media that can be described completely.** The photo result is
+   built only when preview is active, the selected object provably exists, the
+   caption fits, and BOTH URLs are non-empty. Otherwise the panel is the normal
+   text result.
+3. **Narrow fallback, at the right boundary.** `_inline_router` preserves the
+   panel's own text results BEFORE the optional media composition. If
+   `event.answer(media)` is refused by a photo/media-specific RPC error, the
+   router answers the SAME query again with those preserved text results
+   (`no_webpage=True`, same inline keyboard, no Appearance URL) and records the
+   answer as `ok=False` with `media delivery failed (<Type>)`. That is the only
+   supported place to recover: a failed `SetInlineBotResults` stored nothing for
+   the query, so the retry is simply the first successful answer, not a second
+   answer to an already-answered query.
+4. **Everything else keeps failing honestly.** Network timeouts, flood waits,
+   auth errors and every other RPC error are NOT media rejections; the existing
+   path (log, record `ok=False`, empty answer) is unchanged. No arbitrary
+   exception is converted into a success.
+
+## 5. Verified behaviour boundaries
+
+- Normal text-only panels: unchanged (`no_webpage=True`, one answer).
+- Preview OFF / no selected image / missing object / caption too long: unchanged
+  text result, one answer, no URL.
+- A successful photo answer never invokes the fallback.
+- A media rejection produces exactly two `answer()` calls: the refused photo and
+  then the text panel.
+- The fallback caption/message text contains no `https://` and no
+  `/appearance/`; both URLs exist only as API parameters of the web documents.
+- The inline keyboard (Back/Home/Close, `panel:save`, callback data and styles)
+  is the same object the panel builder produced, carried through unchanged.
+
+## 6. Deliberately not changed
+
+Gallery inventory, selection/deletion, the ten-image limit, private Supabase
+Storage, upload semantics, the versioned image route's default original-bytes
+response, the Open Graph page, preview enable/disable semantics, panel lifecycle
+replacement, callback routing, owner guards, Helper-Bot-only editing, and the
+single-persistent-panel architecture. No second Telegram client, scheduler,
+panel registry, table or Render variable was added. No SQL was executed and
+nothing in Supabase was modified.
+
+## 7. Residual risk (not observable in this environment)
+
+- This workspace has no Telegram session, no owner chat and no Render/Supabase
+  credentials, so the fixed result was NOT submitted to Telegram here. The
+  correction is verified against the installed TL constructor and by tests that
+  drive the real router with the real `PhotoThumbUrlEmptyError`, not by a live
+  inline query.
+- Telegram must accept the `thumb` web document from the versioned image route;
+  the route is tested to return a decodable JPEG for both `?fmt=jpeg` and
+  `?fmt=jpeg&thumb=1`, but server-side fetching is only provable in production.
+- If Telegram rejects the photo for a reason outside the recognised media-error
+  set, the menu still fails through the existing (unchanged) failure path; that
+  would be visible as the same `Inline router error` log without a
+  `media result rejected ... answering with the preserved text panel` line.

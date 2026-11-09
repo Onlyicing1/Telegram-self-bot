@@ -133,6 +133,13 @@ MAX_CAPTION_CHARS = 1024
 #: is re-encoded for delivery only; the stored object is never touched.
 TELEGRAM_PHOTO_MAX_BYTES = 5 * 1024 * 1024
 
+#: Inline results carry a SEPARATE thumbnail document (``thumb``) as well as the
+#: photo ``content``. Telegram rejects the whole answer with
+#: ``PhotoThumbUrlEmptyError`` when that URL is absent, so the thumbnail is a
+#: bounded JPEG rendition of the same selected object (never a second upload).
+TELEGRAM_THUMB_MAX_SIDE = 320
+TELEGRAM_THUMB_QUALITY = 80
+
 #: How long a positive/negative readiness answer is reused before the gallery is
 #: listed again. Panel renders are frequent; the gallery changes rarely.
 _DELIVERY_READY_TTL = 30.0
@@ -372,8 +379,12 @@ async def apply_to_inline_results(panel_id: str, extra: str, results: list) -> l
         composed = _compose_rendered(title, body)
         composed_any = True
         caption = caption_for(composed)
-        if preview_active() and ready and caption:
-            output.append(_as_photo_result(result, caption, telegram_photo_url()))
+        photo_url = telegram_photo_url()
+        thumb_url = telegram_thumb_url()
+        if preview_active() and ready and caption and photo_url and thumb_url:
+            output.append(
+                _as_photo_result(result, caption, photo_url, thumb_url)
+            )
             built_state = ("media", preview_version())
             continue
         message.message = composed
@@ -388,14 +399,20 @@ async def apply_to_inline_results(panel_id: str, extra: str, results: list) -> l
     return output
 
 
-def _as_photo_result(result, caption: str, image_url: str):
+def _as_photo_result(result, caption: str, image_url: str, thumb_url: str):
     """Rebuild one inline result as a PHOTO result carrying ``caption``.
 
-    ``InputBotInlineResult`` with ``type="photo"`` and an
-    ``InputWebDocument`` content is Telegram's own shape for an inline photo
-    (the Bot API's ``InlineQueryResultPhoto``): the server downloads the image
-    from the document URL and sends it as the message media. The existing
-    inline keyboard is carried over untouched, so navigation is unchanged.
+    ``InputBotInlineResult`` with ``type="photo"``, an ``InputWebDocument``
+    content AND a separate ``InputWebDocument`` thumbnail is Telegram's own
+    shape for an inline photo (the Bot API's ``InlineQueryResultPhoto``, whose
+    ``thumb_url`` is required). The raw TL constructor carries the thumbnail in
+    its OWN ``thumb`` field (``flags.4``); putting the document only in
+    ``content`` left ``thumb`` absent and Telegram answered the whole query with
+    ``PhotoThumbUrlEmptyError``. Both documents point at the existing versioned
+    image route, as JPEG renditions of the same stored object.
+
+    The existing inline keyboard is carried over untouched, so navigation is
+    unchanged, and neither URL is ever part of the caption or any message text.
     """
     from telethon.tl import types
 
@@ -411,11 +428,22 @@ def _as_photo_result(result, caption: str, image_url: str):
             mime_type="image/jpeg",
             attributes=[],
         ),
+        thumb=types.InputWebDocument(
+            url=thumb_url,
+            size=0,
+            mime_type="image/jpeg",
+            attributes=[],
+        ),
         send_message=types.InputBotInlineMessageMediaAuto(
             message=caption,
             reply_markup=markup,
         ),
     )
+
+
+def contains_photo_result(results: list) -> bool:
+    """Whether an answer actually attempts Appearance photo delivery."""
+    return any(getattr(result, "type", "") == "photo" for result in results or [])
 
 
 def _split_rendered_text(text: str, panel_id: str) -> tuple[str, str] | None:
@@ -547,6 +575,20 @@ def telegram_photo_url() -> str:
     if not base or not version:
         return ""
     return f"{base}/appearance/image/{version}?fmt=jpeg"
+
+
+def telegram_thumb_url() -> str:
+    """The public JPEG THUMBNAIL rendition of the selected image ("" if none).
+
+    This is the ``thumb`` web document the inline photo result must carry; it is
+    a bounded rendition served by the same existing image route, never a second
+    storage object and never part of any message text.
+    """
+    base = public_base_url()
+    version = preview_version()
+    if not base or not version:
+        return ""
+    return f"{base}/appearance/image/{version}?fmt=jpeg&thumb=1"
 
 
 async def delivery_ready(force: bool = False) -> bool:
@@ -1322,6 +1364,58 @@ def _encode_telegram_photo(data: bytes) -> bytes | None:
             "limit (%d bytes)",
             TELEGRAM_PHOTO_MAX_BYTES,
         )
+        return None
+
+
+def _encode_telegram_thumb(data: bytes) -> bytes | None:
+    """A small JPEG thumbnail Telegram will accept for an inline photo result.
+
+    Delivery only, exactly like the photo rendition: the stored object keeps the
+    owner's original bytes. The longest side is capped at
+    :data:`TELEGRAM_THUMB_MAX_SIDE` and the image is never enlarged.
+    """
+    try:
+        from PIL import Image
+    except ImportError:  # pragma: no cover - pinned dependency
+        return None
+
+    with Image.open(io.BytesIO(data)) as image:
+        image.load()
+        if image.mode not in ("RGB", "L"):
+            rgba = image.convert("RGBA")
+            canvas = Image.new("RGB", rgba.size, (255, 255, 255))
+            canvas.paste(rgba, mask=rgba.split()[-1])
+            frame = canvas
+        else:
+            frame = image if image.mode == "RGB" else image.convert("RGB")
+        frame.thumbnail(
+            (TELEGRAM_THUMB_MAX_SIDE, TELEGRAM_THUMB_MAX_SIDE), Image.LANCZOS
+        )
+        buffer = io.BytesIO()
+        frame.save(buffer, "JPEG", quality=TELEGRAM_THUMB_QUALITY, optimize=True)
+        return buffer.getvalue()
+
+
+async def telegram_thumb(version: str) -> bytes | None:
+    """The selected image encoded as the inline result's thumbnail document.
+
+    ``None`` on a stale version, a missing object or an undecodable file, so the
+    route answers 404 and the caller degrades to a text result instead of
+    handing Telegram an empty or broken thumbnail URL.
+    """
+    if not version or version != preview_version() or not storage_available():
+        return None
+    try:
+        data = await asyncio.to_thread(
+            _download_sync, settings_service.appearance_preview_image_key()
+        )
+        if not data:
+            return None
+        return await asyncio.to_thread(_encode_telegram_thumb, data)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — a bad image is a 404, not a crash
+        logger.warning("appearance: telegram thumbnail encoding failed: %s", exc)
         return None
 
 

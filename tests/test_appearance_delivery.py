@@ -13,12 +13,14 @@ media message), never on a formatter's string alone.
 from __future__ import annotations
 
 import io
+import logging
 import struct
 import zlib
 
 import pytest
 
 from backend.bot.handlers import appearance
+from backend.helper import inline_engine
 from backend.helper import panels
 from backend.helper import lifecycle as lifecycle_mod
 from backend.helper import symbols as sym
@@ -519,3 +521,250 @@ async def test_the_gallery_panel_never_shows_the_preview_url(store):
     assert "https://" not in body
     assert "/appearance/preview/" not in body
     assert f"input:{appearance._PANEL}:image" in _data(buttons)
+
+
+# ── the required thumbnail document (the production regression) ────────────
+#
+# Production evidence: after the media-delivery change, every root `menu`
+# query failed with `PhotoThumbUrlEmptyError` from `SetInlineBotResultsRequest`
+# and the Helper Bot answered nothing. The raw TL constructor carries the photo
+# document in `content` and the thumbnail in a SEPARATE `thumb` field; the old
+# `_as_photo_result()` supplied only `content`.
+
+@pytest.mark.asyncio
+async def test_photo_result_carries_the_required_thumbnail_document(store):
+    from telethon.tl import types
+
+    from backend.helper.panel_render import render
+
+    version = await _installed_with_preview(store)
+    built = await appearance_service.apply_to_inline_results(
+        "menu", "", [render("LifeOS", "Choose a category:", [])]
+    )
+
+    photo = built[0]
+    assert photo.type == "photo"
+    assert isinstance(photo.content, types.InputWebDocument)
+    assert isinstance(photo.thumb, types.InputWebDocument)
+    assert photo.content.url == (
+        f"https://lifeos.example/appearance/image/{version}?fmt=jpeg"
+    )
+    assert photo.thumb.url == (
+        f"https://lifeos.example/appearance/image/{version}?fmt=jpeg&thumb=1"
+    )
+    assert photo.thumb.url != photo.content.url
+    assert photo.thumb.mime_type == "image/jpeg"
+    assert photo.content.mime_type == "image/jpeg"
+    assert photo.thumb.attributes == []
+    assert appearance_service.contains_photo_result(built) is True
+
+
+@pytest.mark.asyncio
+async def test_both_media_urls_resolve_to_valid_jpeg_images(store):
+    from PIL import Image
+
+    from fastapi.testclient import TestClient
+
+    from backend.web.app import app
+
+    version = await _installed_with_preview(store, 800, 600)
+    client = TestClient(app)
+
+    photo = client.get(f"/appearance/image/{version}?fmt=jpeg")
+    thumb = client.get(f"/appearance/image/{version}?fmt=jpeg&thumb=1")
+    for response in (photo, thumb):
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("image/jpeg")
+        with Image.open(io.BytesIO(response.content)) as decoded:
+            assert decoded.format == "JPEG"
+
+    with Image.open(io.BytesIO(thumb.content)) as decoded:
+        assert max(decoded.size) <= appearance_service.TELEGRAM_THUMB_MAX_SIDE
+        assert decoded.size == (320, 240)  # bounded, aspect ratio kept
+
+    # Delivery renditions never modify the stored original for either URL.
+    original = store.objects[f"appearance/preview/{version}.png"]
+    assert client.get(f"/appearance/image/{version}").content == original
+
+
+@pytest.mark.asyncio
+async def test_the_thumbnail_url_is_never_in_the_caption(store):
+    from backend.helper.panel_render import render
+
+    await _installed_with_preview(store)
+    built = await appearance_service.apply_to_inline_results(
+        "menu", "", [render("LifeOS", "Choose a category:", [])]
+    )
+    caption = built[0].send_message.message
+    assert "https://" not in caption
+    assert "/appearance/" not in caption
+    assert "thumb" not in caption
+
+
+# ── the root menu must survive a rejected photo result ─────────────────────
+
+OWNER = 4242
+
+
+def _panel_result():
+    from backend.helper.panel_render import render
+
+    builder = panels.InlinePanelBuilder()
+    builder.add_row("Save", "panel:save")
+    return render("LifeOS", "Choose a category:", builder.build())
+
+
+class _InlineEvent:
+    def __init__(self, text: str = "menu"):
+        self.text = text
+        self.sender_id = OWNER
+        self.answers: list = []
+
+    async def answer(self, results=None, **kwargs):
+        self.answers.append(results)
+
+
+def _inline_handler(monkeypatch, builder):
+    """Register the REAL router on a fake helper client and return its handler."""
+
+    class _Helper:
+        def __init__(self):
+            self.handlers: list = []
+
+        def on(self, _event):
+            def _decorator(fn):
+                self.handlers.append(fn)
+                return fn
+
+            return _decorator
+
+    helper = _Helper()
+    monkeypatch.setattr(inline_engine, "is_owner", lambda event, owner: True)
+    monkeypatch.setitem(inline_engine._builders, "menu", builder)
+    monkeypatch.setattr(inline_engine, "_last_answers", {})
+    inline_engine.register_inline_handler(helper, OWNER)
+    assert len(helper.handlers) == 1
+    return helper.handlers[0]
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_photo_result_opens_the_text_panel(store, monkeypatch, caplog):
+    """The production regression: PhotoThumbUrlEmptyError must not empty the menu."""
+    from telethon.errors.rpcerrorlist import PhotoThumbUrlEmptyError
+    from telethon.tl import types
+
+    await _installed_with_preview(store)
+
+    async def builder(event, extra):
+        return [_panel_result()]
+
+    handler = _inline_handler(monkeypatch, builder)
+
+    class _RejectingEvent(_InlineEvent):
+        async def answer(self, results=None, **kwargs):
+            self.answers.append(results)
+            if len(self.answers) == 1:
+                raise PhotoThumbUrlEmptyError(request=None)
+
+    event = _RejectingEvent()
+    with caplog.at_level(logging.WARNING, logger="backend.helper.inline_engine"):
+        await handler(event)
+
+    # The photo was attempted, Telegram refused it, and the SAME query was then
+    # answered with the preserved text panel.
+    assert len(event.answers) == 2
+    assert event.answers[0][0].type == "photo"
+    fallback = event.answers[1]
+    assert isinstance(fallback, list) and len(fallback) == 1
+    message = fallback[0].send_message
+    assert isinstance(message, types.InputBotInlineMessageText)
+    assert message.no_webpage is True
+    assert "LifeOS" in message.message
+    assert "Choose a category:" in message.message
+    assert "https://" not in message.message
+    assert "/appearance/" not in message.message
+    # The fallback keeps exactly the keyboard the photo result carried.
+    photo_rows = event.answers[0][0].send_message.reply_markup.rows
+    assert _data(message.reply_markup.rows) == _data(photo_rows)
+    assert "panel:save" in _data(message.reply_markup.rows)
+
+    record = inline_engine.last_inline_answer("menu")
+    assert record["ok"] is False
+    assert "PhotoThumbUrlEmptyError" in record["error"]
+    assert "text" in record["error"]
+
+    logs = "\n".join(record_.getMessage() for record_ in caplog.records)
+    assert "media result rejected" in logs
+    assert "PhotoThumbUrlEmptyError" in logs
+    assert "Choose a category:" not in logs  # the caption itself is never logged
+
+
+@pytest.mark.asyncio
+async def test_an_accepted_photo_result_never_uses_the_fallback(store, monkeypatch):
+    from telethon.tl import types
+
+    await _installed_with_preview(store)
+
+    async def builder(event, extra):
+        return [_panel_result()]
+
+    handler = _inline_handler(monkeypatch, builder)
+    event = _InlineEvent()
+    await handler(event)
+
+    assert len(event.answers) == 1
+    photo = event.answers[0][0]
+    assert photo.type == "photo"
+    assert isinstance(photo.send_message, types.InputBotInlineMessageMediaAuto)
+    assert isinstance(photo.thumb, types.InputWebDocument)
+    assert inline_engine.last_inline_answer("menu")["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_unrelated_answer_failures_are_not_a_media_fallback(store, monkeypatch):
+    await _installed_with_preview(store)
+
+    async def builder(event, extra):
+        return [_panel_result()]
+
+    handler = _inline_handler(monkeypatch, builder)
+
+    class _FloodingEvent(_InlineEvent):
+        async def answer(self, results=None, **kwargs):
+            self.answers.append(results)
+            raise TimeoutError("transport died")
+
+    event = _FloodingEvent()
+    await handler(event)
+
+    # The failure stays a failure: the last answer is the existing empty answer,
+    # and no text fallback is claimed.
+    assert event.answers[-1] == []
+    assert len(event.answers) == 2
+    record = inline_engine.last_inline_answer("menu")
+    assert record["ok"] is False
+    assert "text" not in record["error"]
+    assert inline_engine.is_media_result_rejection(TimeoutError("x")) is False
+
+
+@pytest.mark.asyncio
+async def test_preview_disabled_still_answers_one_text_panel(store, monkeypatch):
+    from telethon.tl import types
+
+    await _installed_with_preview(store)
+    assert settings_service.set_appearance_preview_enabled(False) is True
+    appearance_service.reset_delivery_state()
+
+    async def builder(event, extra):
+        return [_panel_result()]
+
+    handler = _inline_handler(monkeypatch, builder)
+    event = _InlineEvent()
+    await handler(event)
+
+    assert len(event.answers) == 1
+    message = event.answers[0][0].send_message
+    assert isinstance(message, types.InputBotInlineMessageText)
+    assert message.no_webpage is True
+    assert "panel:save" in _data(message.reply_markup.rows)
+    assert inline_engine.last_inline_answer("menu")["ok"] is True
