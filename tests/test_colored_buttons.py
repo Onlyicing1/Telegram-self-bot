@@ -277,7 +277,8 @@ class TestSubmenuStyles:
         # Every scope choice is an ordinary action → blue, never green/red; the
         # destructive confirmation lives on the next step, not here.
         assert _bg(buttons[sym.label(sym.OP_DELETE, "Last 10")], "primary") is True
-        assert _bg(buttons[sym.label(sym.OP_DELETE, "All my messages")], "primary") is True
+        # The manual "All my messages" option is frozen: not rendered anymore.
+        assert sym.label(sym.OP_DELETE, "All my messages") not in buttons
         assert _bg(
             buttons[sym.label(sym.OP_DELETE, "Delete from a message...")], "primary"
         ) is True

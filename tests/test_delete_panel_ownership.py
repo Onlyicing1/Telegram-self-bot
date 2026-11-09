@@ -130,12 +130,31 @@ def _isolated():
     panel_edit.reset_panel_operations()
 
 
+async def run_all(client, report=None):
+    """Drive the frozen capability directly, through the same helper-owned
+    painter the old ``allexec`` handler used. Returns ``(title, body, error)``."""
+    report = report or delete_service.DeleteReport(
+        requested="all of your messages in this chat",
+    )
+    paint = delete_ui._progress_painter(FakeEvent())
+    error = None
+    try:
+        await paint({})
+        _considered, _deleted, error = await delete_service.do_del_self_filtered(
+            client, CHAT, report=report, progress=paint,
+        )
+    finally:
+        paint.close()
+    title, body = delete_ui._all_result_text(report, error=error)
+    return title, body, error
+
+
 @pytest.mark.asyncio
 async def test_every_progress_edit_uses_the_helper_and_the_callback_identifier(monkeypatch):
     monkeypatch.setattr(delete_ui, "_PROGRESS_PAINT_INTERVAL", 0.0)
     client = install(monkeypatch, [Message(i) for i in range(1, 601)])
 
-    await delete_ui._del_panel_handler(FakeEvent(), "allexec")
+    await run_all(client)
 
     assert client.helper.edits, "the panel must be painted"
     assert all(inline is INLINE_ID for inline in client.helper.inline_ids)
@@ -149,7 +168,7 @@ async def test_scanning_deleting_and_final_status_share_one_panel_message(monkey
     monkeypatch.setattr(delete_ui, "_PROGRESS_PAINT_INTERVAL", 0.0)
     client = install(monkeypatch, [Message(i) for i in range(1, 601)])
 
-    title, body, _buttons = await delete_ui._del_panel_handler(FakeEvent(), "allexec")
+    title, body, _error = await run_all(client)
 
     # Every stage was written to the SAME inline message the callback named:
     # one identifier, no replacement message, nothing sent to the chat.
@@ -167,7 +186,7 @@ async def test_a_refused_inline_edit_never_falls_back_to_the_self_client(monkeyp
     client = install(monkeypatch, [Message(i) for i in range(1, 401)])
     client.fail_edits = True
 
-    title, body, _buttons = await delete_ui._del_panel_handler(FakeEvent(), "allexec")
+    title, body, _error = await run_all(client)
 
     assert client.helper.inline_ids, "the Helper Bot was attempted"
     assert client.helper.edits == []
@@ -185,9 +204,18 @@ async def test_a_missing_inline_identifier_reports_unavailable_and_still_deletes
     client = install(monkeypatch, [Message(i) for i in range(1, 301)])
 
     with caplog.at_level(logging.WARNING, logger="backend.bot.handlers.delete"):
-        title, body, _buttons = await delete_ui._del_panel_handler(
-            FakeEvent(inline_identifier=None), "allexec",
+        report = delete_service.DeleteReport(
+            requested="all of your messages in this chat",
         )
+        paint = delete_ui._progress_painter(FakeEvent(inline_identifier=None))
+        try:
+            await delete_service.do_del_self_filtered(
+                client, CHAT, report=report, progress=paint,
+            )
+        finally:
+            paint.close()
+        title, body = delete_ui._all_result_text(report)
+        _buttons = None
 
     assert client.helper.inline_ids == []
     assert client.helper.edits == []
@@ -204,7 +232,17 @@ async def test_a_missing_helper_reports_unavailable_and_still_deletes(monkeypatc
     monkeypatch.setattr(delete_ui, "get_client", lambda: None)
 
     with caplog.at_level(logging.WARNING, logger="backend.bot.handlers.delete"):
-        title, body, _buttons = await delete_ui._del_panel_handler(FakeEvent(), "allexec")
+        report = delete_service.DeleteReport(
+            requested="all of your messages in this chat",
+        )
+        paint = delete_ui._progress_painter(FakeEvent())
+        try:
+            await delete_service.do_del_self_filtered(
+                client, CHAT, report=report, progress=paint,
+            )
+        finally:
+            paint.close()
+        title, body = delete_ui._all_result_text(report)
 
     assert client.self_edits == []
     assert len(client.deleted) == 300
@@ -215,9 +253,9 @@ async def test_a_missing_helper_reports_unavailable_and_still_deletes(monkeypatc
 @pytest.mark.asyncio
 async def test_the_panel_token_is_released_when_the_operation_ends(monkeypatch):
     monkeypatch.setattr(delete_ui, "_PROGRESS_PAINT_INTERVAL", 60.0)
-    install(monkeypatch, [Message(i) for i in range(1, 31)])
+    client = install(monkeypatch, [Message(i) for i in range(1, 31)])
 
-    await delete_ui._del_panel_handler(FakeEvent(), "allexec")
+    await run_all(client)
 
     assert (CHAT, PANEL_MSG) not in panel_edit._generations
 
@@ -248,7 +286,23 @@ async def test_the_chokepoint_stays_the_only_deletion_path(monkeypatch):
 
     monkeypatch.setattr(delete_service, "delete_verified_self_messages", _spy)
 
-    await delete_ui._del_panel_handler(FakeEvent(), "allexec")
+    await run_all(client)
 
     assert calls and all(isinstance(ids, list) for ids in calls)
     assert client.deleted == []
+
+
+@pytest.mark.asyncio
+async def test_the_frozen_all_callbacks_edit_nothing(monkeypatch):
+    # The freeze: neither legacy callback touches the panel nor any message.
+    client = install(monkeypatch, [Message(i) for i in range(1, 51)])
+
+    for extra in ("all", "allexec"):
+        title, body, buttons = await delete_ui._del_panel_handler(FakeEvent(), extra)
+
+        assert client.helper.inline_ids == []
+        assert client.helper.edits == []
+        assert client.self_edits == []
+        assert client.deleted == []
+        assert title == "Delete"
+        assert "Nothing was deleted" in body

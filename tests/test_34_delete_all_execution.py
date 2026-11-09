@@ -1,11 +1,13 @@
-"""Manual "All my messages": total deadline, partial scan, caps and progress.
+"""The manual "All my messages" option is FROZEN — the backend stays tested.
 
-These tests drive the real panel handler and the real ``delete_service``
-against a deterministic fake Telethon client. They lock in the live failure
-that motivated this fix: All mode scanned an unbounded history with no total
-deadline (so the panel simply hung), discarded candidates it had already
-verified when the scan raised, and never enforced its documented candidate
-bound.
+The Glass UI can no longer render the option, show its preview, or start it
+from a panel callback. These tests lock in the live failure that motivated
+keeping the capability safe — All mode scanned an unbounded history with no
+total deadline (so the panel simply hung), discarded candidates it had
+already verified when the scan raised, and never enforced its documented
+candidate bound — and they keep exercising the backend implementation
+(``do_del_self_filtered`` + the staged progress painter) directly, which the
+frozen UI no longer reaches.
 """
 from __future__ import annotations
 
@@ -177,7 +179,27 @@ def _isolated():
     target_context.clear_all()
 
 
-# ── 1/2. the panel's All path carries its own total deadline ────────────────
+async def run_all(client, report=None):
+    """Drive the frozen capability directly, exactly as the old ``allexec``
+    handler did: one progress painter, the service's ``do_del_self_filtered``,
+    then the terminal result text. Returns ``(title, body, error)``."""
+    report = report or delete_service.DeleteReport(
+        requested="all of your messages in this chat",
+    )
+    paint = delete_ui._progress_painter(FakeEvent())
+    error = None
+    try:
+        await paint({})
+        _considered, _deleted, error = await delete_service.do_del_self_filtered(
+            client, CHAT, report=report, progress=paint,
+        )
+    finally:
+        paint.close()
+    title, body = delete_ui._all_result_text(report, error=error)
+    return title, body, error
+
+
+# ── 1/2. the frozen capability keeps its own total deadline ────────────────
 
 
 @pytest.mark.asyncio
@@ -188,7 +210,7 @@ async def test_manual_all_applies_its_own_total_deadline(monkeypatch):
     )
 
     started = time.monotonic()
-    _title, body, _buttons = await delete_ui._del_panel_handler(FakeEvent(), "allexec")
+    _title, body, _error = await run_all(client)
     elapsed = time.monotonic() - started
 
     assert elapsed < 5.0
@@ -205,7 +227,7 @@ async def test_slow_history_returns_a_partial_result_instead_of_hanging(monkeypa
     )
 
     started = time.monotonic()
-    _title, body, _buttons = await delete_ui._del_panel_handler(FakeEvent(), "allexec")
+    _title, body, _error = await run_all(client)
     elapsed = time.monotonic() - started
 
     assert elapsed < 5.0
@@ -222,7 +244,7 @@ async def test_history_failure_after_valid_ids_still_deletes_them(monkeypatch):
         monkeypatch, [Message(i) for i in range(1, 41)], iter_error_at=25,
     )
 
-    _title, body, _buttons = await delete_ui._del_panel_handler(FakeEvent(), "allexec")
+    _title, body, _error = await run_all(client)
 
     # The scan raised after 25 verified candidates; those must still be
     # processed through the ownership chokepoint.
@@ -240,7 +262,7 @@ async def test_failure_before_any_valid_id_deletes_nothing(monkeypatch):
         monkeypatch, [Message(i) for i in range(1, 21)], iter_error_at=0,
     )
 
-    _title, body, _buttons = await delete_ui._del_panel_handler(FakeEvent(), "allexec")
+    _title, body, _error = await run_all(client)
 
     assert client.batches == []
     assert client.deleted == []
@@ -286,7 +308,7 @@ async def test_deadline_mid_deletion_keeps_completed_batch_counts(monkeypatch):
         monkeypatch, [Message(i) for i in range(1, 901)], batch_delay=0.05,
     )
 
-    _title, body, _buttons = await delete_ui._del_panel_handler(FakeEvent(), "allexec")
+    _title, body, _error = await run_all(client)
 
     assert 0 < len(client.deleted) < 900
     assert len(client.batches) < 9
@@ -301,7 +323,7 @@ async def test_no_id_is_deleted_twice_after_a_deadline_stop(monkeypatch):
         monkeypatch, [Message(i) for i in range(1, 1201)], batch_delay=0.04,
     )
 
-    await delete_ui._del_panel_handler(FakeEvent(), "allexec")
+    await run_all(client)
 
     assert len(client.deleted) == len(set(client.deleted))
     attempted = [mid for batch in client.batches for mid in batch]
@@ -319,7 +341,7 @@ async def test_foreign_messages_are_never_deleted_when_the_scan_fails(monkeypatc
     ]
     client = install(monkeypatch, messages, iter_error_at=40)
 
-    await delete_ui._del_panel_handler(FakeEvent(), "allexec")
+    await run_all(client)
 
     assert client.deleted, "the verified candidates should still be deleted"
     assert all(mid % 2 == 0 for mid in client.deleted)
@@ -330,17 +352,41 @@ async def test_foreign_messages_are_never_deleted_when_the_scan_fails(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_all_preview_is_bounded_and_still_renders_confirmation(monkeypatch):
-    monkeypatch.setattr(delete_service, "_DELETE_PREVIEW_SECONDS", 0.05)
-    install(monkeypatch, [Message(i) for i in range(1, 501)], iter_delay=0.01)
+async def test_frozen_all_renders_no_preview_and_no_confirmation(monkeypatch):
+    # The freeze: a stale panel answers with the notice and a way back — no
+    # preview, no confirmation button, and nothing deleted or even scanned.
+    client = install(
+        monkeypatch, [Message(i) for i in range(1, 501)], iter_delay=0.01,
+    )
+    calls: list = []
 
-    started = time.monotonic()
+    async def _spy(*args, **kwargs):
+        calls.append(args)
+        raise AssertionError("the frozen callback must not read history")
+
+    monkeypatch.setattr(delete_service, "preview_self_owned_count", _spy)
+
     _title, body, buttons = await delete_ui._del_panel_handler(FakeEvent(), "all")
-    elapsed = time.monotonic() - started
 
-    assert elapsed < 5.0
-    assert "Preview" in body
-    assert "panel:del:allexec" in button_data(buttons)
+    assert "Preview" not in body
+    assert "Confirm" not in body
+    assert "panel:del:allexec" not in button_data(buttons)
+    assert "panel:del" in button_data(buttons)
+    assert client.deleted == []
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_frozen_allexec_starts_no_operation(monkeypatch):
+    client = install(monkeypatch, [Message(i) for i in range(1, 501)])
+
+    _title, body, buttons = await delete_ui._del_panel_handler(FakeEvent(), "allexec")
+
+    assert client.deleted == []
+    assert client.edits == []
+    assert "temporarily unavailable" in body
+    assert "Nothing was deleted" in body
+    assert "panel:del" in button_data(buttons)
 
 
 @pytest.mark.asyncio
@@ -351,7 +397,7 @@ async def test_long_operation_paints_progress_and_an_accurate_result(monkeypatch
         monkeypatch, [Message(i) for i in range(1, 121)], batch_delay=0.01,
     )
 
-    title, body, _buttons = await delete_ui._del_panel_handler(FakeEvent(), "allexec")
+    title, body, _error = await run_all(client)
 
     progress_texts = [text for _chat, _msg, text in client.edits]
     assert any("Scanning chat" in text and "Scanned: 5 messages" in text
@@ -379,7 +425,7 @@ async def test_ten_thousand_message_chat_paints_real_scan_counters(monkeypatch):
     monkeypatch.setattr(delete_service, "_DELETE_PROGRESS_EVERY", 1000)
     client = install(monkeypatch, [Message(i) for i in range(1, 10001)])
 
-    title, body, _buttons = await delete_ui._del_panel_handler(FakeEvent(), "allexec")
+    title, body, _error = await run_all(client)
 
     scanning = [text for _c, _m, text in client.edits if "Scanning chat" in text]
     counts = _scan_counts(scanning)
@@ -402,7 +448,7 @@ async def test_progress_bar_starts_empty_and_fills_only_on_resolved_work(monkeyp
     monkeypatch.setattr(delete_ui, "_PROGRESS_PAINT_INTERVAL", 0.0)
     client = install(monkeypatch, [Message(i) for i in range(1, 1001)])
 
-    _title, body, _buttons = await delete_ui._del_panel_handler(FakeEvent(), "allexec")
+    _title, body, _error = await run_all(client)
 
     deleting = [text for _c, _m, text in client.edits if "Processing " in text]
     percentages = [int(t.split("Processing ")[1].split("%")[0]) for t in deleting]
@@ -422,7 +468,7 @@ async def test_ownership_rejections_are_counted_exactly_once(monkeypatch):
     # rejections the chokepoint discovers — counted once, never twice.
     client.missing_on_fetch = set(range(251, 301))
 
-    title, body, _buttons = await delete_ui._del_panel_handler(FakeEvent(), "allexec")
+    title, body, _error = await run_all(client)
 
     assert "Found: 300" in body
     assert "Deleted: 250" in body
@@ -438,7 +484,7 @@ async def test_telegram_delete_failure_is_counted_once(monkeypatch):
     client = install(monkeypatch, [Message(i) for i in range(1, 301)])
     client.fail_on_batch = 2
 
-    title, body, _buttons = await delete_ui._del_panel_handler(FakeEvent(), "allexec")
+    title, body, _error = await run_all(client)
 
     assert "Deleted: 200" in body
     assert "Rejected: 100" in body
@@ -456,7 +502,7 @@ async def test_unprocessed_candidates_are_not_reported_as_rejected(monkeypatch):
         monkeypatch, [Message(i) for i in range(1, 3001)], batch_delay=0.03,
     )
 
-    title, body, _buttons = await delete_ui._del_panel_handler(FakeEvent(), "allexec")
+    title, body, _error = await run_all(client)
 
     assert 0 < len(client.deleted) < 3000
     assert f"Deleted: {len(client.deleted):,}" in body
@@ -518,7 +564,7 @@ async def test_a_failed_panel_edit_never_aborts_the_deletion(monkeypatch):
     client = install(monkeypatch, [Message(i) for i in range(1, 401)])
     client.fail_edits = True
 
-    title, body, _buttons = await delete_ui._del_panel_handler(FakeEvent(), "allexec")
+    title, body, _error = await run_all(client)
 
     assert len(client.deleted) == 400
     assert client.edits == []
@@ -531,7 +577,7 @@ async def test_large_deletion_never_exceeds_the_chunk_size(monkeypatch):
     monkeypatch.setattr(delete_ui, "_PROGRESS_PAINT_INTERVAL", 60.0)
     client = install(monkeypatch, [Message(i) for i in range(1, 1001)])
 
-    await delete_ui._del_panel_handler(FakeEvent(), "allexec")
+    await run_all(client)
 
     assert len(client.deleted) == 1000
     assert len(client.deleted) == len(set(client.deleted))
@@ -560,7 +606,7 @@ async def test_a_large_deletion_yields_control_to_the_event_loop(monkeypatch):
 
     task = asyncio.create_task(ticker())
     try:
-        await delete_ui._del_panel_handler(FakeEvent(), "allexec")
+        await run_all(client)
     finally:
         stop = True
         await task
@@ -578,7 +624,7 @@ async def test_foreign_messages_stay_untouched_in_a_large_chat(monkeypatch):
     ]
     client = install(monkeypatch, messages)
 
-    _title, body, _buttons = await delete_ui._del_panel_handler(FakeEvent(), "allexec")
+    _title, body, _error = await run_all(client)
 
     expected = {m.id for m in messages if m.out}
     assert set(client.deleted) == expected

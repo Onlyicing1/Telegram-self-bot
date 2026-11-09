@@ -5,7 +5,9 @@ Deletion scopes offered by the panel:
 
   - quick counts (last 10/25/50/100/250/500 of the owner's messages)
   - a custom count above those
-  - all of the owner's messages in this chat
+  - FROZEN: the "all of the owner's messages" option is no longer rendered
+    or executable from this UI; its legacy callbacks render a notice and do
+    nothing (the backend capability stays wired for reactivation)
   - one selected message from a paginated preview of the owner's messages
   - the owner's messages from a selected message forward
   - one message by ID, or every owner message from an ID forward
@@ -403,6 +405,23 @@ def _unavailable() -> tuple[str, str, list]:
     )
 
 
+#: The manual "All my messages" option is frozen: it must not be visible or
+#: executable through this UI. A stale panel (or a replayed callback) landing
+#: here gets an honest notice with a way back — never a preview, never a
+#: confirmation, never a deletion. The implementation behind it (service
+#: ``do_del_self_filtered``, the staged progress painter and its result text)
+#: stays in place so the option can be reactivated by restoring the button
+#: and routing ``panel:del:all`` / ``panel:del:allexec`` to it again.
+_FROZEN_ALL_BODY = (
+    "Deleting all of your messages is temporarily unavailable. "
+    "Nothing was deleted."
+)
+
+
+def _frozen_all() -> tuple[str, str, list]:
+    return "Delete", _FROZEN_ALL_BODY, _back_row()
+
+
 def _home_buttons() -> InlinePanelBuilder:
     builder = InlinePanelBuilder()
     row: list[tuple[str, str]] = []
@@ -414,7 +433,6 @@ def _home_buttons() -> InlinePanelBuilder:
     if row:
         builder.add_buttons(*row)
     builder.add_row(sym.label(sym.OP_DELETE, "Custom amount..."), "input:del:n")
-    builder.add_row(sym.label(sym.OP_DELETE, "All my messages"), "panel:del:all")
     builder.add_row(sym.label(sym.OP_DELETE, "Delete from a message..."), "panel:delfrom")
     builder.add_row(sym.label(sym.OP_DELETE, "Delete by date range..."), "input:del:range")
     return builder
@@ -467,63 +485,12 @@ async def _del_view(event, extra: str) -> tuple[str, str, list]:
         return "Delete", _report_text(report, error=error), _back_row()
 
     if head == "all":
-        if not chat_id:
-            return _no_chat()
-        if client is None:
-            return _unavailable()
-        try:
-            owned, scanned = await asyncio.wait_for(
-                delete_service.preview_self_owned_count(client, chat_id),
-                timeout=_ALL_PREVIEW_TIMEOUT,
-            )
-        except Exception as exc:  # noqa: BLE001 — the preview is only advisory
-            logger.warning("DELETE_UI all preview failed: %s", exc)
-            owned, scanned = 0, 0
-        builder = InlinePanelBuilder()
-        builder.add_row(
-            sym.label(sym.OP_DELETE, "Confirm: delete all mine"),
-            "panel:del:allexec",
-            SUCCESS,
-        )
-        builder.add_row(sym.label(sym.OP_BACK, "Back"), "panel:del")
-        preview_line = (
-            f"Preview: {owned} of the newest {scanned} message(s) here are yours; "
-            "the scan continues to the start of the chat."
-            if scanned
-            else "Preview unavailable right now, so the preview was skipped."
-        )
-        return (
-            "Delete",
-            "Delete ALL of your messages in this chat.\n\n"
-            f"{preview_line} Messages sent by other participants are never "
-            "deleted.\n\n"
-            f"The operation stops at {MAX_DELETE_COUNT} of your messages or its "
-            "deadline, and reports exactly how far it got.",
-            builder.build(),
-        )
+        # Frozen: a stale panel can never show the preview or confirmation.
+        return _frozen_all()
 
     if head == "allexec":
-        if not chat_id:
-            return _no_chat()
-        if client is None:
-            return _unavailable()
-        report = DeleteReport(requested="all of your messages in this chat")
-        progress = _progress_painter(event)
-        error: Exception | None = None
-        try:
-            # Say that the scan started BEFORE it starts: a large chat must
-            # never look frozen while the history is being read.
-            await progress({})
-            _considered, _deleted, error = await delete_service.do_del_self_filtered(
-                client, chat_id, report=report, progress=progress,
-            )
-        finally:
-            # The panel token is released here; the terminal view below is the
-            # callback's own paint of this SAME message through the router, so
-            # the panel is never replaced and never re-owned.
-            progress.close()
-        title, body = _all_result_text(report, error=error)
-        return title, body, _back_row()
+        # Frozen: a replayed callback can never start the operation.
+        return _frozen_all()
 
     return "Delete", "Choose a deletion scope:", _home_buttons().build()
 

@@ -12,8 +12,10 @@ The properties locked in here are the reported defects:
   - the numeric input executes the requested deletion, above 500 too;
   - Recent Messages paginates, previews, and distinguishes deleting ONE
     selected message from deleting from it FORWARD;
-  - "all" scans past 1000 messages, deletes only the owner's messages, and
-    reports a partial run honestly;
+  - the manual "All my messages" option is FROZEN: the button is gone, a
+    stale panel can show neither the preview nor the confirmation, and a
+    replayed "allexec" callback can never start the deletion (the backend
+    capability is untouched — the AI delete tool still covers it);
   - every manual path still reaches the single ownership chokepoint.
 """
 from __future__ import annotations
@@ -334,66 +336,61 @@ async def test_manual_message_id_input_rejects_foreign_and_malformed_ids(monkeyp
     assert "valid message ID" in client.edits[1][2]
 
 
-# ── 8/9/10. all mode ───────────────────────────────────────────────────────
+# ── 8/9/10/11. the manual All option is frozen ────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_all_mode_scans_beyond_1000_messages(monkeypatch):
-    messages = [
-        Message(i, out=(i % 10 != 0), sender_id=(OWNER if i % 10 != 0 else 222))
-        for i in range(1, 1321)
-    ]
-    client = install(monkeypatch, messages)
-
-    title, body, _buttons = await delete_ui._del_panel_handler(FakeEvent(), "allexec")
-
-    expected = {m.id for m in messages if m.out}
-    assert len(expected) == 1188
-    assert set(client.deleted) == expected
-    assert "Completed" in title
-    assert "All selected messages were processed." in body
-
-
-@pytest.mark.asyncio
-async def test_all_mode_deletes_only_authenticated_owner_messages(monkeypatch):
-    messages = [
-        Message(1), Message(2, out=False, sender_id=222), Message(3),
-        Message(4, out=True, sender_id=333),  # inconsistent metadata
-    ]
-    client = install(monkeypatch, messages)
-
-    await delete_ui._del_panel_handler(FakeEvent(), "allexec")
-
-    assert sorted(client.deleted) == [1, 3]
-
-
-@pytest.mark.asyncio
-async def test_more_than_500_messages_are_processed_in_bounded_batches(monkeypatch):
-    client = install(monkeypatch, [Message(i) for i in range(1, 751)])
-
-    await delete_ui._del_panel_handler(FakeEvent(), "allexec")
-
-    assert len(client.deleted) == 750
-    assert client.batches
-    assert all(len(batch) <= 100 for batch in client.batches)
-
-
-# ── 11. honest partial failure ─────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_partial_batch_failure_is_reported_honestly(monkeypatch):
-    client = install(monkeypatch, [Message(i) for i in range(1, 251)])
+async def test_frozen_all_callback_deletes_nothing_however_many_messages(monkeypatch):
+    # Even a 1,320-message chat deletes nothing: the manual All option is
+    # frozen, so an old panel can neither scan, confirm nor delete.
+    client = install(monkeypatch, [Message(i) for i in range(1, 1321)])
     client.fail_on_batch = 2
 
-    _title, body, _buttons = await delete_ui._del_panel_handler(FakeEvent(), "allexec")
+    for extra in ("all", "allexec"):
+        title, body, buttons = await delete_ui._del_panel_handler(FakeEvent(), extra)
 
-    assert "did not finish" in body
-    assert "Deleted: 150" in body
-    assert "Completed" not in body
-    # Every verified batch was attempted; the failing one was not retried.
-    assert len(client.batches) == 3
-    assert len(client.deleted) == 150
+        assert client.deleted == []
+        assert "temporarily unavailable" in body
+        assert "Nothing was deleted" in body
+        assert "Completed" not in body
+        assert "panel:del:allexec" not in button_data(buttons)
+        assert "panel:del" in button_data(buttons)  # a way back, no confirmation
+        assert title == "Delete"
+
+
+@pytest.mark.asyncio
+async def test_frozen_all_callbacks_never_invoke_the_deletion_service(monkeypatch):
+    client = install(monkeypatch, [Message(i) for i in range(1, 51)])
+    calls: list[str] = []
+
+    async def _recorder(name):
+        async def _inner(*args, **kwargs):
+            calls.append(name)
+            raise AssertionError(f"{name} must never run from a frozen callback")
+        return _inner
+
+    for name in ("do_del_self_filtered", "do_del_n_counts", "preview_self_owned_count"):
+        monkeypatch.setattr(delete_service, name, await _recorder(name))
+
+    for extra in ("all", "allexec"):
+        await delete_ui._del_panel_handler(FakeEvent(), extra)
+
+    assert calls == []
+    assert client.deleted == []
+
+
+@pytest.mark.asyncio
+async def test_frozen_all_callbacks_show_no_preview_or_confirmation(monkeypatch):
+    install(monkeypatch, [Message(i) for i in range(1, 31)])
+
+    _title, body, buttons = await delete_ui._del_panel_handler(FakeEvent(), "all")
+
+    assert "Preview:" not in body
+    assert "Confirm" not in body
+    assert "Delete ALL" not in body
+    data = button_data(buttons)
+    assert "panel:del:allexec" not in data
+    assert "panel:del" in data
 
 
 # ── 12/13. timeouts: no duplicates, no false completion ────────────────────
@@ -546,7 +543,6 @@ async def test_every_manual_path_reaches_the_ownership_chokepoint(monkeypatch):
     monkeypatch.setattr(delete_service, "delete_verified_self_messages", _spy)
 
     await delete_ui._del_panel_handler(FakeEvent(), "qexec:2")
-    await delete_ui._del_panel_handler(FakeEvent(), "allexec")
     await delete_ui._delfrom_panel_handler(FakeEvent(), "oneexec:3")
     await delete_ui._delfrom_panel_handler(FakeEvent(), "fromexec:3")
     await delete_ui._del_id_input_handler(
@@ -563,7 +559,7 @@ async def test_every_manual_path_reaches_the_ownership_chokepoint(monkeypatch):
         inline_id=INLINE_ID,
     )
 
-    assert len(calls) == 8
+    assert len(calls) == 7
     assert all(isinstance(ids, list) for ids in calls)
 
 
@@ -630,13 +626,13 @@ async def test_home_panel_offers_every_required_quick_action(monkeypatch):
     for count in (10, 25, 50, 100, 250, 500):
         assert f"panel:del:q:{count}" in data
     assert "input:del:n" in data
-    assert "panel:del:all" in data
+    assert "panel:del:all" not in data  # frozen: not rendered anymore
     assert "panel:delfrom" in data
     assert "input:del:range" in data
 
 
 @pytest.mark.asyncio
-async def test_quick_and_all_require_explicit_confirmation(monkeypatch):
+async def test_quick_still_requires_confirmation_and_all_is_gone(monkeypatch):
     client = install(monkeypatch, [Message(i) for i in range(1, 31)])
 
     _title, _body, quick = await delete_ui._del_panel_handler(FakeEvent(), "q:25")
@@ -645,8 +641,9 @@ async def test_quick_and_all_require_explicit_confirmation(monkeypatch):
 
     _title, body, all_view = await delete_ui._del_panel_handler(FakeEvent(), "all")
     assert client.deleted == []
-    assert "panel:del:allexec" in button_data(all_view)
-    assert "Preview:" in body
+    assert "panel:del:allexec" not in button_data(all_view)
+    assert "Preview:" not in body
+    assert "temporarily unavailable" in body
 
 
 @pytest.mark.asyncio
