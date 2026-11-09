@@ -338,14 +338,14 @@ async def test_switching_the_image_marks_the_panel_message_stale(store):
     assert await appearance_service.delivery_ready() is True
     appearance_service.note_delivered(CHAT, MSG, ("media", first))
 
-    assert appearance_service.needs_new_message(CHAT, MSG, "LifeOS", "Choose a category:") is False
+    assert appearance_service.needs_new_message(CHAT, MSG) is False
 
     ok, _notice = await appearance_service.install_image(png_bytes(6, 6))
     assert ok is True
     second = appearance_service.preview_version()
     assert second != first
 
-    assert appearance_service.needs_new_message(CHAT, MSG, "LifeOS", "Choose a category:") is True
+    assert appearance_service.needs_new_message(CHAT, MSG) is True
 
 
 @pytest.mark.asyncio
@@ -355,13 +355,9 @@ async def test_disabling_preview_returns_the_panel_to_text(store):
     appearance_service.note_delivered(CHAT, MSG, ("media", version))
 
     assert settings_service.set_appearance_preview_enabled(False) is True
-    assert appearance_service.needs_new_message(
-        CHAT, MSG, "LifeOS", "Choose a category:"
-    ) is True
+    assert appearance_service.needs_new_message(CHAT, MSG) is True
     appearance_service.note_delivered(CHAT, MSG, ("text", ""))
-    assert appearance_service.needs_new_message(
-        CHAT, MSG, "LifeOS", "Choose a category:"
-    ) is False
+    assert appearance_service.needs_new_message(CHAT, MSG) is False
 
 
 @pytest.mark.asyncio
@@ -369,9 +365,7 @@ async def test_an_unknown_old_panel_is_replaced_once_for_media(store):
     await _installed_with_preview(store)
     assert await appearance_service.delivery_ready() is True
     # No recorded state: a text panel left by an older build must become media.
-    assert appearance_service.needs_new_message(
-        CHAT, MSG, "LifeOS", "Choose a category:"
-    ) is True
+    assert appearance_service.needs_new_message(CHAT, MSG) is True
 
 
 @pytest.mark.asyncio
@@ -423,7 +417,8 @@ async def test_the_paint_path_replaces_instead_of_editing_the_old_message(store,
             edited.append((args, kwargs))
 
     await panels._render_and_edit(
-        _Event(), ("LifeOS", "Choose a category:", []), "menu", CHAT, MSG
+        _Event(), ("LifeOS", "Choose a category:", []), "menu", CHAT, MSG,
+        home_view=True,
     )
 
     assert fake.calls == [(CHAT, MSG, "menu", "")]

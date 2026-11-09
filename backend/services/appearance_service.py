@@ -558,6 +558,8 @@ _BUILT: dict[str, tuple[str, str]] = {}
 
 _READY_AT: float = 0.0
 _READY_VALUE: bool = False
+#: The last readiness probe FAILED (no verdict) instead of answering "no".
+_READY_ERROR: bool = False
 
 
 def caption_for(text: str) -> str:
@@ -599,12 +601,13 @@ async def delivery_ready(force: bool = False) -> bool:
     fetch a 404 as the message's photo. The answer is cached briefly: panel
     renders are frequent and the gallery changes rarely.
     """
-    global _READY_AT, _READY_VALUE
+    global _READY_AT, _READY_VALUE, _READY_ERROR
     now = time.monotonic()
     if not force and _READY_AT and (now - _READY_AT) < _DELIVERY_READY_TTL:
         return _READY_VALUE
 
     ready = False
+    error = False
     if preview_active() and storage_available():
         key = settings_service.appearance_preview_image_key()
         try:
@@ -615,9 +618,20 @@ async def delivery_ready(force: bool = False) -> bool:
         except Exception as exc:  # noqa: BLE001 — an unreadable gallery is not media
             logger.warning("appearance: delivery readiness check failed: %s", exc)
             ready = False
+            error = True
     _READY_AT = now
     _READY_VALUE = ready
+    _READY_ERROR = error
     return ready
+
+
+def delivery_unknown() -> bool:
+    """Whether the last readiness probe FAILED — no verdict, not "unavailable".
+
+    A transiently unreadable gallery must never be read as "this panel should
+    be text": nothing changes on an unknown answer.
+    """
+    return _READY_ERROR
 
 
 def note_built(panel_id: str, state: tuple[str, str]) -> None:
@@ -648,19 +662,33 @@ def delivered_state(chat_id: int, msg_id: int) -> tuple[str, str] | None:
     return _DELIVERED.get((int(chat_id or 0), int(msg_id or 0)))
 
 
-def desired_state(title: str = "", body: str = "") -> tuple[str, str]:
-    """The state the CURRENT settings should put on screen.
+def fits_as_caption(title: str = "", body: str = "") -> bool:
+    """Whether this composed MAIN-PAGE view can be delivered as a caption.
 
-    ``title``/``body`` are the composed view about to be painted; a caption
-    above Telegram's limit means text, so the full text is preserved.
+    Telegram caps a media caption; a view above that limit cannot be shown on a
+    photo message at all. That is a genuine delivery limitation of the message
+    (the view is delivered as text in full), not a change of content identity.
     """
-    caption = caption_for(_compose_rendered(title, body))
-    if preview_active() and _READY_VALUE and caption:
-        return ("media", preview_version())
+    return bool(caption_for(_compose_rendered(title, body)))
+
+
+def desired_state(*, caption_fits: bool = True) -> tuple[str, str]:
+    """The delivery state the CURRENT settings should put on screen.
+
+    Deliberately independent of ordinary panel CONTENT: whether a save result,
+    a model-test progress line or a status message changed never changes the
+    state a panel message is supposed to have. ``caption_fits`` is a capability
+    of the view (can a photo message carry this text at all), not a text diff.
+    """
+    version = preview_version()
+    if caption_fits and preview_active() and _READY_VALUE and version:
+        return ("media", version)
     return ("text", "")
 
 
-def needs_new_message(chat_id: int, msg_id: int, title: str, body: str) -> bool:
+def needs_new_message(
+    chat_id: int, msg_id: int, *, caption_fits: bool = True
+) -> bool:
     """Whether this panel message must be REPLACED to match the desired state.
 
     Telegram cannot remove media from a message or exchange it without an
@@ -668,7 +696,7 @@ def needs_new_message(chat_id: int, msg_id: int, title: str, body: str) -> bool:
     message. An unknown state (fresh process, panel created by an older build)
     is replaced once when media is what should be shown.
     """
-    desired = desired_state(title, body)
+    desired = desired_state(caption_fits=caption_fits)
     delivered = delivered_state(chat_id, msg_id)
     if delivered is None:
         return desired[0] == "media"
@@ -677,11 +705,13 @@ def needs_new_message(chat_id: int, msg_id: int, title: str, body: str) -> bool:
 
 def reset_delivery_state() -> None:
     """Forget every recorded state (process start, and isolated tests)."""
-    global _READY_AT, _READY_VALUE
+    global _READY_AT, _READY_VALUE, _READY_ERROR
     _DELIVERED.clear()
     _BUILT.clear()
     _READY_AT = 0.0
     _READY_VALUE = False
+    _READY_ERROR = False
+    forget_image_cache()
 
 
 def preview_meta(version: str) -> dict[str, str] | None:
@@ -1171,6 +1201,7 @@ async def select_image(token: str) -> tuple[bool, str]:
             f"{sym.STATE_FAILED} The selection could not be saved, so nothing "
             "was changed."
         )
+    forget_image_cache()
     return True, f"{sym.OP_SAVE} Preview image selected. Existing images were kept."
 
 
@@ -1195,13 +1226,17 @@ async def delete_image(token: str) -> tuple[bool, str]:
         )
 
     was_active = entry["key"] == state["selected_key"]
-    if was_active and not settings_service.set_appearance_preview_image_key(""):
-        return False, (
-            f"{sym.STATE_FAILED} The selected image could not be cleared, so the "
-            "image was not deleted."
-        )
+    if was_active:
+        if not settings_service.set_appearance_preview_image_key(""):
+            return False, (
+                f"{sym.STATE_FAILED} The selected image could not be cleared, so "
+                "the image was not deleted."
+            )
+        forget_image_cache()
 
     removed = await asyncio.to_thread(_delete_sync, entry["key"])
+    # Deleted bytes are neither served nor retained in RAM.
+    forget_image_cache(wanted)
     if not removed:
         if was_active:
             return False, (
@@ -1231,6 +1266,7 @@ async def clear_selection() -> tuple[bool, str]:
             f"{sym.STATE_FAILED} The selection could not be cleared, so nothing "
             "was changed."
         )
+    forget_image_cache()
     return True, (
         f"{sym.OP_DELETE} Selection cleared. Every stored image is still in the "
         "gallery; the panels stay text-only until another is selected."
@@ -1294,6 +1330,9 @@ async def install_image(data: bytes, declared_mime: str = "") -> tuple[bool, str
                 f"{sym.STATE_FAILED} The image could not be selected in settings, "
                 "so the uploaded copy was discarded."
             )
+        # A new selection is a new delivery identity: the previous image's
+        # bytes and renditions must not survive in RAM.
+        forget_image_cache()
 
     return True, (
         f"{sym.OP_SAVE} Image uploaded and selected ({width}x{height}, "
@@ -1301,10 +1340,104 @@ async def install_image(data: bytes, declared_mime: str = "") -> tuple[bool, str
     )
 
 
-async def image_payload(version: str) -> tuple[bytes, str] | None:
-    """The stored image for the SELECTED version, with its content type."""
-    if not version or version != preview_version() or not storage_available():
+# ── Selected-image memory cache (process-local, bounded) ─────────────────────
+#
+# The panel only ever delivers the SELECTED image, so that is the only one worth
+# holding in RAM: the stored original plus the two Telegram renditions encoded
+# from it. The gallery objects are never prefetched. The cache is keyed by the
+# selected version, so a selection change can never serve stale bytes, and its
+# budget is the 25 MiB original ceiling plus the 5 MiB inline-photo ceiling plus
+# a thumbnail — the most ONE selected image can legitimately need. A process
+# restart simply empties it; the durable copy stays in the private bucket.
+
+IMAGE_CACHE_BUDGET_BYTES = MAX_IMAGE_BYTES + TELEGRAM_PHOTO_MAX_BYTES + (256 * 1024)
+
+_CACHE_KINDS: tuple[str, ...] = ("original", "photo", "thumb")
+
+_CACHE: dict[str, dict[str, Any]] = {}
+_CACHE_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def _cache_lock(version: str) -> asyncio.Lock:
+    """The single-flight lock for one version's download + encoding work."""
+    lock = _CACHE_LOCKS.get(version)
+    if lock is None:
+        lock = asyncio.Lock()
+        _CACHE_LOCKS[version] = lock
+    return lock
+
+
+def _cached_piece(version: str, kind: str) -> bytes | None:
+    entry = _CACHE.get(version)
+    if not entry:
         return None
+    data = entry.get(kind)
+    if not data:
+        return None
+    entry["used"] = time.monotonic()
+    return data
+
+
+def cached_image_bytes() -> int:
+    """Bytes currently held by the selected-image cache."""
+    return sum(
+        len(entry.get(kind) or b"")
+        for entry in _CACHE.values()
+        for kind in _CACHE_KINDS
+    )
+
+
+def forget_image_cache(version: str = "") -> None:
+    """Drop one version's cached bytes, or every version (selection changed)."""
+    if version:
+        _CACHE.pop(version, None)
+        _CACHE_LOCKS.pop(version, None)
+        return
+    _CACHE.clear()
+    _CACHE_LOCKS.clear()
+
+
+def _retain_only(version: str) -> None:
+    for key in [key for key in _CACHE if key != version]:
+        forget_image_cache(key)
+
+
+def _remember(version: str, kind: str, data: bytes, mime: str = "") -> None:
+    """Cache one piece of the SELECTED version, inside the explicit budget."""
+    _retain_only(version)
+    entry = _CACHE.setdefault(
+        version, {"used": time.monotonic(), "mime": ""}
+    )
+    previous = entry.get(kind)
+    entry[kind] = data
+    if mime:
+        entry["mime"] = mime
+    entry["used"] = time.monotonic()
+    if cached_image_bytes() > IMAGE_CACHE_BUDGET_BYTES:
+        # Never grow past the budget: this piece is delivered uncached instead.
+        entry[kind] = previous
+        if mime:
+            entry["mime"] = ""
+        if not any(entry.get(piece) for piece in _CACHE_KINDS):
+            _CACHE.pop(version, None)
+        logger.info(
+            "appearance: selected image rendition exceeds the in-memory cache "
+            "budget; delivering it uncached"
+        )
+
+
+def _sniffed_mime(data: bytes) -> str:
+    sniffed = sniff_image(data)
+    return sniffed[0] if sniffed else "application/octet-stream"
+
+
+async def _original_locked(version: str) -> tuple[bytes, str] | None:
+    """Download the selected object ONCE per version; the caller holds the lock."""
+    if version != preview_version() or not storage_available():
+        return None
+    cached = _cached_piece(version, "original")
+    if cached is not None:
+        return cached, _CACHE.get(version, {}).get("mime") or _sniffed_mime(cached)
     try:
         data = await asyncio.to_thread(
             _download_sync, settings_service.appearance_preview_image_key()
@@ -1316,8 +1449,52 @@ async def image_payload(version: str) -> tuple[bytes, str] | None:
         return None
     if not data:
         return None
-    sniffed = sniff_image(data)
-    return data, (sniffed[0] if sniffed else "application/octet-stream")
+    if version != preview_version():
+        # The selection changed while the download was in flight: never cache or
+        # serve bytes that are no longer the selected image.
+        return None
+    mime = _sniffed_mime(data)
+    _remember(version, "original", data, mime)
+    return data, mime
+
+
+async def _rendition_locked(version: str, kind: str) -> bytes | None:
+    """Encode one Telegram rendition from the SAME cached original bytes."""
+    cached = _cached_piece(version, kind)
+    if cached is not None:
+        return cached
+    original = await _original_locked(version)
+    if original is None:
+        return None
+    encoder = _encode_telegram_photo if kind == "photo" else _encode_telegram_thumb
+    try:
+        encoded = await asyncio.to_thread(encoder, original[0])
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — a bad image is a 404, not a crash
+        logger.warning("appearance: telegram %s encoding failed: %s", kind, exc)
+        return None
+    if not encoded:
+        return None
+    if version != preview_version():
+        return None
+    _remember(version, kind, encoded)
+    return encoded
+
+
+async def image_payload(version: str) -> tuple[bytes, str] | None:
+    """The stored image for the SELECTED version, with its content type.
+
+    The first request downloads it; every later request for the same selected
+    version is served from RAM, and concurrent requests share ONE download.
+    """
+    if not version or version != preview_version() or not storage_available():
+        return None
+    cached = _cached_piece(version, "original")
+    if cached is not None:
+        return cached, _CACHE.get(version, {}).get("mime") or _sniffed_mime(cached)
+    async with _cache_lock(version):
+        return await _original_locked(version)
 
 
 def _encode_telegram_photo(data: bytes) -> bytes | None:
@@ -1401,22 +1578,18 @@ async def telegram_thumb(version: str) -> bytes | None:
 
     ``None`` on a stale version, a missing object or an undecodable file, so the
     route answers 404 and the caller degrades to a text result instead of
-    handing Telegram an empty or broken thumbnail URL.
+    handing Telegram an empty or broken thumbnail URL. Encoded once per selected
+    version from the same cached original the photo rendition uses.
     """
     if not version or version != preview_version() or not storage_available():
         return None
-    try:
-        data = await asyncio.to_thread(
-            _download_sync, settings_service.appearance_preview_image_key()
-        )
-        if not data:
+    cached = _cached_piece(version, "thumb")
+    if cached is not None:
+        return cached
+    async with _cache_lock(version):
+        if version != preview_version():
             return None
-        return await asyncio.to_thread(_encode_telegram_thumb, data)
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:  # noqa: BLE001 — a bad image is a 404, not a crash
-        logger.warning("appearance: telegram thumbnail encoding failed: %s", exc)
-        return None
+        return await _rendition_locked(version, "thumb")
 
 
 async def telegram_photo(version: str) -> bytes | None:
@@ -1428,15 +1601,10 @@ async def telegram_photo(version: str) -> bytes | None:
     """
     if not version or version != preview_version() or not storage_available():
         return None
-    try:
-        data = await asyncio.to_thread(
-            _download_sync, settings_service.appearance_preview_image_key()
-        )
-        if not data:
+    cached = _cached_piece(version, "photo")
+    if cached is not None:
+        return cached
+    async with _cache_lock(version):
+        if version != preview_version():
             return None
-        return await asyncio.to_thread(_encode_telegram_photo, data)
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:  # noqa: BLE001 — a bad image is a 404, not a crash
-        logger.warning("appearance: telegram photo encoding failed: %s", exc)
-        return None
+        return await _rendition_locked(version, "photo")

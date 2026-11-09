@@ -310,7 +310,7 @@ async def test_main_search_callback_reaches_registered_open_action(search_state,
 
     captured = {}
 
-    async def capture_render(event, result, panel_id, chat_id, msg_id):
+    async def capture_render(event, result, panel_id, chat_id, msg_id, **_kwargs):
         captured.update(result=result, panel_id=panel_id, chat_id=chat_id, msg_id=msg_id)
 
     monkeypatch.setattr(panels, "_render_and_edit", capture_render)
