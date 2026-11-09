@@ -455,10 +455,11 @@ def test_test_modules_renders_gemini_models_and_their_statuses():
         for row in buttons for btn in row
     ]
 
-    assert "Usable Models" in body
-    assert "gemini-2.5-flash" in body and "gemini-2.5-flash-lite" in body
-    assert "Not usable: 1" in body
-    assert "`gemini-2.5-pro` — INVALID_MODEL" in body
+    assert "Usable Models: 2" in body
+    # Only the CURRENT pair may name a model in the bounded body.
+    assert "gemini-2.5-flash-lite" not in body
+    assert "gemini-2.5-pro" not in body
+    assert "invalid 1" in body
     assert "action:ai_pick_model:gemini:gemini-2.5-flash" in datas
     assert "action:ai_pick_model:gemini:gemini-2.5-flash-lite" in datas
     assert "action:ai_pick_model:gemini:gemini-2.5-pro" not in datas

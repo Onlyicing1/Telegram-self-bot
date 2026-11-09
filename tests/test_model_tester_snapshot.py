@@ -352,10 +352,15 @@ async def test_cached_statuses_and_models_are_visibly_cached(store):
     with patch.object(ai_module, "_runtime_pair", return_value=("groq", "m1")):
         _, body, buttons = await ai_module._ai_test_models_action(MagicMock(), "", 0)
 
-    assert f"{sym.MEDIA_VOICE} `m1` ·cached" in body
-    assert f"{sym.BULLET} `m3` ·cached" in body
-    assert "RATE_LIMITED (CACHED)" in body
-    assert any("·cached" in label for label in _labels(buttons))
+    assert "Cached snapshot" in body
+    assert "Usable Models: 2" in body
+    # Bounded body: model names are only reachable through the buttons.
+    assert "`m1`" not in body and "`m3`" not in body
+    cached_labels = [label for label in _labels(buttons) if "·cached" in label]
+    assert len(cached_labels) == 2
+    # Full per-model diagnostics (with cached labelling) stay one tap away.
+    _title, details, _details_buttons = await ai_module._ai_test_details_action(None, "", 0)
+    assert "RATE_LIMITED (CACHED)" in details
     assert json.loads(store.docs[ts.SNAPSHOT_KEY])["results"][0]["status"] == "AVAILABLE"
 
 
@@ -368,14 +373,16 @@ async def test_cached_snapshot_preserves_summary_grouping_and_pagination(store):
         _, body, buttons = await ai_module._ai_test_models_action(MagicMock(), "", 0)
 
     assert f"{sym.OP_SAVE} 20" in body
-    assert f"{sym.ICON_MODEL} **Groq**" in body
+    # Bounded body: the usable total replaces the per-model provider listing.
+    assert f"**{sym.OP_SAVE} Usable Models: 20**" in body
+    assert f"{sym.ICON_MODEL} **Groq**" not in body
     assert len([d for d in _flatten(buttons) if d.startswith(_PICK)]) == 18
     assert "action:ai_test_page:1" in _flatten(buttons)
 
     cached_payload = ai_module._last_test_payload
     _, page_body, page_buttons = await ai_module._ai_test_page_action(None, "1", 0)
     assert ai_module._last_test_payload is cached_payload
-    assert "cached" in page_body
+    assert "Cached snapshot" in page_body
     assert len([d for d in _flatten(page_buttons) if d.startswith(_PICK)]) == 2
 
 

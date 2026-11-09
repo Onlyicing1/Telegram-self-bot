@@ -1,138 +1,120 @@
-# INVESTIGATION — Panel updates rebuilt the menu, and every image request re-downloaded
+# INVESTIGATION — Model Tester results overflowed Telegram's media caption
 
-_Base commit: `f687e601e9f91e9cca0a88e70166614358732997` (`main`). Every claim
+_Base commit: `1d0ed3afe8e2cac93f65073de62211713cf932a6` (`main`). Every claim
 below comes from this tree's source and from deterministic tests that drive the
-real dispatch, lifecycle, render and delivery paths._
+real renderer, paging action, snapshot opening and streaming completion paths._
 
 ## 1. Symptom
 
-After the Appearance preview became the panel's **media**, the image correctly
-appeared and stayed attached while navigating categories. But operations that
-repaint the current panel several times — Save, the Model Tester, progress and
-status updates — sometimes produced a **new panel message** instead of updating
-the existing one. The section or operation then failed to continue: it kept
-editing the message that had just been replaced/deleted, while the owner saw the
-panel's home view (the root category) instead of the result or progress.
+After tapping **Test Modules**, the panel appeared unchanged and the runtime
+reported:
 
-## 2. Confirmed root cause — the replacement decision took the paint's TEXT
-
-`backend/helper/panels.py::_render_and_edit` called `_replace_for_delivery(...)`
-for **every** paint, before editing. `_replace_for_delivery` gated on two
-things only:
-
-1. `appearance_service.is_eligible(panel_id)` — the current panel id;
-2. the session's current nav `extra == ""`.
-
-An **action** result satisfies both: `_handle_action` returns
-`(current_panel, result)` from the session's nav (a main page with empty extra),
-so a Save result, a Model Tester progress view or a status line was evaluated as
-if it were the customizable home view.
-
-The decision itself came from `appearance_service.needs_new_message(chat, msg,
-title, body)`, whose desired state was derived from the **paint's text**:
-
-```python
-caption = caption_for(_compose_rendered(title, body))   # "" when empty or > 1024
-if preview_active() and _READY_VALUE and caption:
-    return ("media", preview_version())
-return ("text", "")
+```
+The caption is too long (caused by EditInlineBotMessageRequest)
 ```
 
-So for a panel message already delivered as `("media", <version>)`:
+Telegram rejects media captions longer than **1024 characters**. The results
+view put every usable model name into the message body, so a sufficiently large
+run exceeded that limit and the final edit was refused.
 
-- a paint whose text was **empty or longer than Telegram's 1024-character
-  caption limit** (a Save metadata block, a terminal test-results view, a
-  combined header + live body) computed `("text", "")`;
-- `delivered != desired` → `replace_panel(panel_id, "")`;
-- `replace_panel` creates a **new inline panel** (the panel's home view) and
-  then deletes the old message.
+## 2. Why a normal panel edit is a CAPTION edit
 
-Two further facts made it worse:
+The Appearance feature can deliver a panel message as a **photo** whose caption
+is the panel's composed text (`backend/services/appearance_service.py`:
+`MAX_CAPTION_CHARS = 1024`, `caption_for`, `_compose_rendered`,
+`_as_photo_result`). For such a message Telegram interprets an `edit` text as a
+**caption** edit, so the composed text must fit 1024 characters.
 
-- `_READY_VALUE` (readiness of the selected object) was only ever computed by
-  the inline build; the edit path never probed it, so a panel repaint in a fresh
-  process could compute `("text","")` while the message was genuinely media.
-- "content changed" and "delivery changed" were therefore the **same input**:
-  any ordinary content change whose text could not be a caption was read as a
-  media transition.
+The composed text is `render_edit(title, body)` — for this panel:
 
-## 3. What was ruled out
+```
+**Test Modules**
 
-- **Not** a Save/Model Tester defect: both edit `(chat_id, msg_id)` through
-  `_safe_edit` / `_edit_panel_message`; neither asks for a replacement.
-- **Not** a lifecycle defect: `replace_panel` already creates first and deletes
-  the old message only after the new one exists, and a failed replacement leaves
-  the old panel intact.
-- **Not** a keyboard/nav defect: Back/Home/Close and callback data are carried
-  through unchanged.
-- **Not** the Appearance composition path: `_handle_action` never applies page
-  overrides/header to a result (that boundary was already correct).
+<body>
+```
 
-## 4. The second defect — repeated Storage work per request
+`fits_as_caption(title, body)` is the repository's existing capability check for
+exactly this ("can a photo message carry this view at all?"), built on the same
+`caption_for`/`MAX_CAPTION_CHARS` boundary. Nothing in the Model Tester path
+consulted it.
 
-`backend/services/appearance_service.py` downloaded and encoded independently on
-every call:
+## 3. Why the body grew without bound
 
-| Call | Storage download | Encoding |
-|---|---|---|
-| `image_payload(version)` | yes | — |
-| `telegram_photo(version)` | yes | JPEG photo |
-| `telegram_thumb(version)` | yes | JPEG thumbnail |
+`backend/bot/handlers/ai.py::_render_test_results()` is the ONE canonical results
+view shared by the batch action result, the paging action, opening a saved
+snapshot and the streaming completion terminal render. It built the body as:
 
-The photo and thumbnail paths each downloaded the same stored object, and a
-panel open (photo + thumbnail URLs) therefore cost two downloads plus two
-encodes every time. Nothing was cached between requests.
+- counts line,
+- `Current:` runtime pair,
+- snapshot provenance line,
+- **`✓ Usable Models` followed by one line per AVAILABLE model**, provider-grouped,
+- **`Not usable: N`** followed by up to 8 failed-model lines.
 
-## 5. Corrective shape
+The usable listing is proportional to the discovered catalog (hundreds of
+models). With long model ids and multiple providers the body alone passed 1024
+characters, so the composed caption did too.
 
-1. **Delivery identity only.** `desired_state()` no longer accepts the view's
-   text. It is `("media", <selected version>)` when the preview is active, the
-   selected version exists and the object is genuinely deliverable, and
-   `("text", "")` otherwise. `needs_new_message()` compares that identity with
-   the state recorded for the message. Ordinary content can never move it.
-2. **Operational paints are not eligible.** `_render_and_edit` takes
-   `home_view`; the router derives it from the paint (`_handle_panel`:
-   `not extra`; `_handle_navigation` home/back; `_handle_action`: `False`). Only
-   a main page's own home view may transition.
-3. **Readiness is proven, and an unknown answer changes nothing.** The
-   replacement path awaits `delivery_ready()`; a probe that FAILED sets
-   `delivery_unknown()` and the existing panel is kept.
-4. **Caption capability, not caption diff.** `fits_as_caption(title, body)`
-   answers whether a photo message can hold this view at all; only then may the
-   home view transition to text (the full text is preserved, and the
-   replacement renders the intended page, never the root menu).
-5. **Bounded, version-keyed, single-flight cache** for the selected image's
-   original bytes and both renditions, with invalidation on every selection
-   change.
+## 4. Why the owner saw no change
 
-## 6. Verified boundaries (tests)
+`backend/helper/panels.py::_safe_edit` catches the Telegram error, logs
+`[CALLBACK] edit FAILED: The caption is too long …` and returns `False`.
+`_PanelEditGuardian` retries a **terminal** render a bounded number of times and
+then records `AI_TEST_PROGRESS terminal render failed after N retries`. The
+message therefore stayed on its previous (progress/launch) content: the run had
+completed, but its results could never be painted into a photo panel.
 
-- Action paints on a photo panel: no inline panel created, no message deleted,
-  session stays on the same message.
-- Save result on the Save panel: same message, Back/Home/Close intact, and the
-  result text contains no menu body.
-- Model Tester launch + three progress edits: one message, no replacement.
-- Category navigation and Back/Home: no replacement when only the view changed.
-- Version change / preview off / preview on: exactly one replacement, old
-  message deleted only after the new one exists.
-- Failed replacement: attempted once, old message kept and painted.
-- Cache: first request 1 download; photo+thumb+payload 1 download and one encode
-  each; six concurrent photo requests 1 download and 1 encode; no uploads during
-  delivery; selection/upload/delete/clear all drop the previous bytes.
+## 5. What was ruled out
 
-## 7. Deliberately not changed
+- **Not** the Test Modules workflow: opening a saved snapshot still issues zero
+  provider calls; only an explicit refresh starts the diagnostic.
+- **Not** a second runner or scheduler: the streaming tester and the batch tester
+  both feed the same renderer.
+- **Not** panel replacement: action results are painted with `home_view=False`,
+  so they edit the existing message and never replace it.
+- **Not** the pager: `_ai_test_page_action` is presentation-only over the cached
+  payload and never tests or mutates anything.
+- **Not** snapshot persistence: the snapshot write path and cached payload are
+  unchanged; the failing edit was purely the size of the rendered body.
+- **Not** a missing caption-limit implementation: the capability helper already
+  existed; the renderer simply ignored it.
 
-Panel lifecycle and callback routing, the single-writer painter, keyboards and
-callback data, gallery capacity and validation, upload bytes/quality, the
-Storage key format, the versioned image routes and their cache headers,
-`DATABASE_ARCHITECTURE.md`, environment variables, and every AI/runtime path.
-No new Telegram client, scheduler, executor, listener, table, bucket or service
-was added; no SQL was executed and nothing in Supabase was modified.
+## 6. Corrective shape
 
-## 8. Not observable here
+1. **Bounded body.** The canonical renderer now emits only: the heading, the
+   result counts (available, failed, rate-limited, not configured, invalid, no
+   credits), the current runtime pair, the snapshot provenance line, the usable
+   total (`✓ Usable Models: N`) and one line stating that every usable model is
+   on the buttons below. No content grows with the number of discovered models.
+2. **Validation through the existing helper.** The composed view is checked with
+   `appearance_service.fits_as_caption("Test Modules", body)`. If it ever failed
+   (not reachable with realistic identifiers), the renderer falls back to the
+   same summary without the optional hint — the summary is designed, never
+   truncated.
+3. **Access preserved through pagination.** The adaptive 2/3-column grid,
+   page size, Prev/Next navigation, page counter, active-model marker,
+   `·free`/`·cached` indicators, latency labels and exact
+   `action:ai_pick_model:<provider>:<model>` callback data are unchanged. Every
+   usable `(provider, model)` pair remains reachable exactly once across pages.
 
-No Telegram session, owner chat, Supabase credentials or Render deployment is
-available in this workspace, so no live panel was driven and no real Storage
-object was fetched. The correction is verified by tests that drive the real
-dispatch/lifecycle/render/delivery code and count the real Storage calls, and by
-source inspection of the installed Telethon behaviour — not by a live client.
+## 7. Evidence
+
+- `tests/test_model_tester_results_caption.py` — 11 regression tests: a 61-model,
+  3-provider snapshot composes under the caption limit with a 100-character
+  margin (every page), the summary keeps counts/current pair/usable total/
+  snapshot state, paging reaches all 61 pairs exactly once with exact callbacks,
+  active/cached/free indicators stay on the buttons, paging starts no test and
+  mutates nothing, opening a saved snapshot makes zero provider requests, the
+  streaming completion uses the same renderer and fits, the initial/refresh
+  workflow is unchanged, and All Results diagnostics stay complete and paginated.
+- Updated UI tests that had pinned the old unbounded listing
+  (`test_test_modules_grid.py`, `test_13_model_selection.py`,
+  `test_14_tool_honesty_glass.py`, `test_gemini_model_discovery.py`,
+  `test_symbols.py`, `test_model_tester_snapshot.py`).
+
+## 8. Not observed live
+
+No Telegram session, owner chat or Render deployment is available in this
+workspace, so no real photo panel was edited and the `EditInlineBotMessageRequest`
+error was not reproduced against Telegram. The correction is proven by composing
+the real view through the real caption capability helper in tests, not by a live
+client.

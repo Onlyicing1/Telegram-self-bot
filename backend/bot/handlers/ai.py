@@ -1403,6 +1403,23 @@ def _snapshot_line(payload: dict) -> str:
     return ""
 
 
+#: Title composed by the panel callback around the results body. The panel
+#: message may be a PHOTO (Appearance preview), so this exact composition is
+#: what Telegram accepts or rejects as a media caption.
+_TEST_RESULTS_TITLE = "Test Modules"
+
+
+def _results_body_fits_caption(body: str) -> bool:
+    """Whether the composed results view fits a Telegram media caption.
+
+    Reuses the ONE caption capability helper (``caption_for`` via
+    ``fits_as_caption``) instead of defining a second limit here.
+    """
+    from backend.services import appearance_service
+
+    return appearance_service.fits_as_caption(_TEST_RESULTS_TITLE, body)
+
+
 def _render_test_results(
     results_payload: dict,
     page: int = 0,
@@ -1413,11 +1430,18 @@ def _render_test_results(
     Single render path shared by the batch action result and the streaming
     completion view — the two entry points can never drift apart.
 
-    Shows the CURRENT runtime pair first (from the authoritative
-    ProviderManager state, never the persisted config), then an ADAPTIVE
-    usable-model grid: two columns for a normal usable set, three once it
-    exceeds one full two-column page. The active runtime model keeps its
-    normal position and is marked in place (``◉``) rather than duplicated.
+    The body is a BOUNDED summary (result counts, the CURRENT runtime pair
+    from the authoritative ProviderManager state, snapshot provenance and the
+    usable-model total); model names live in their buttons, never in the body.
+    The panel message can be a PHOTO, so the body is guaranteed to compose
+    with the title into a valid Telegram media caption; a pathological
+    identifier set falls back to the same summary without the optional hint.
+
+    Buttons are an ADAPTIVE usable-model grid: two columns for a normal
+    usable set, three once it exceeds one full two-column page. The active
+    runtime model keeps its normal position and is marked in place (``◉``)
+    rather than duplicated, and paging exposes every usable model exactly
+    once.
     """
     results = results_payload.get("results", [])
     summary = results_payload.get("summary", {})
@@ -1427,12 +1451,13 @@ def _render_test_results(
 
     active_provider, active_model = current if current is not None else _runtime_pair()
 
-    lines = ["**Model Tests**\n"]
-    lines.append(
-        f"_{sym.OP_SAVE} {s('available')} · {sym.STATE_FAILED} {s('failed')} · {sym.STATE_FAILED} rate {s('rate_limited')} · · not configured {s('not_configured')} · "
-        f"{sym.STATE_FAILED} invalid {s('invalid')} · {sym.STATE_FAILED} no credits {s('insufficient_credits')}_"
+    counts = (
+        f"_{sym.OP_SAVE} {s('available')} · {sym.STATE_FAILED} {s('failed')} · "
+        f"{sym.STATE_FAILED} rate {s('rate_limited')} · · not configured {s('not_configured')} · "
+        f"{sym.STATE_FAILED} invalid {s('invalid')} · {sym.STATE_FAILED} no credits "
+        f"{s('insufficient_credits')}_"
     )
-    lines.append("")
+    lines = ["**Model Tests**\n", counts, ""]
     lines.append(_current_model_line(active_provider, active_model))
     lines.append("")
 
@@ -1441,44 +1466,35 @@ def _render_test_results(
         lines.append(snapshot_line)
         lines.append("")
 
-    # Compact layout: usable models are the focus (provider-grouped, model
-    # name dominant, one line each). Failure details stay out of the main
-    # message — one compact line per model, capped, full detail one tap away.
+    # Bounded summary: only the CURRENT pair may name a model here. Every
+    # usable model is listed exactly once by the paginated buttons, so no
+    # content grows with the discovered-model count.
     usable_sorted = _usable_results(results)
-
     if usable_sorted:
-        lines.append(f"**{sym.OP_SAVE} Usable Models**")
-        current_provider = None
-        for r in usable_sorted:
-            provider = r.get("provider", "?")
-            if provider != current_provider:
-                current_provider = provider
-                lines.append(f"{sym.ICON_MODEL} **{r.get('display_name', provider)}**")
-            is_active = bool(active_model) and provider == active_provider and r.get("model") == active_model
-            mark = sym.MEDIA_VOICE if is_active else sym.BULLET
-            free_tag = " ·free" if r.get("is_free") else ""
-            cached_tag = " ·cached" if r.get("cached") else ""
-            lines.append(
-                f"{mark} `{_short_model_name(r.get('model', '?'))}`{free_tag}{cached_tag}"
-            )
+        lines.append(f"**{sym.OP_SAVE} Usable Models: {len(usable_sorted)}**")
         lines.append("")
+        lines.append(f"_{sym.BULLET} Every usable model is on the buttons below._")
     else:
         lines.append("_No usable chat models right now._")
-        lines.append("")
 
-    failed = [r for r in results if r.get("status") != "AVAILABLE"]
-    if failed:
-        lines.append(f"**{sym.STATE_FAILED} Not usable: {len(failed)}**")
-        for r in failed[:8]:
-            status = r.get("status", "UNKNOWN_ERROR")
-            icon = _TEST_STATUS_ICONS.get(status, "×")
-            lines.append(
-                f"{icon} `{_short_model_name(r.get('model', '?'))}` — "
-                f"{_status_label(status, bool(r.get('cached')))}"
-            )
-        if len(failed) > 8:
-            lines.append(f"_…and {len(failed) - 8} more_")
-        lines.append("")
+    body = "\n".join(lines).rstrip()
+    if not _results_body_fits_caption(body):
+        # Unreachable with realistic identifiers; still bounded, never truncated.
+        usable_total = (
+            f"**{sym.OP_SAVE} Usable Models: {len(usable_sorted)}**"
+            if usable_sorted else "_No usable chat models right now._"
+        )
+        body = "\n".join(
+            [
+                "**Model Tests**",
+                "",
+                counts,
+                "",
+                _current_model_line(active_provider, active_model),
+                "",
+                usable_total,
+            ]
+        ).rstrip()
 
     # Buttons: usable models select provider+model together in a grid whose
     # column count follows the usable set size; everything else is
@@ -1527,7 +1543,7 @@ def _render_test_results(
     builder.add_row(sym.label(sym.CONTENT_STATIC, "Pick Model"), "panel:ai_model")
     builder.add_row("Overview", "panel:ai")
     _nav_buttons(builder)
-    return "\n".join(lines).rstrip(), builder.build()
+    return body, builder.build()
 
 
 _test_running = False

@@ -388,18 +388,16 @@ async def test_glass_test_models_message_is_compact_and_preserves_buttons():
 
     assert mock_edit.await_count == 1
     body = mock_edit.await_args.args[1]
-    # Compact: provider-grouped usable list, model name dominant.
-    assert f"**{sym.OP_SAVE} Usable Models**" in body
-    assert f"{sym.ICON_MODEL} **Groq**" in body
-    assert f"{sym.BULLET} `gpt-oss-120b`" in body
-    assert f"{sym.BULLET} `gpt-oss-20b`" in body
+    # Bounded summary: model names live in their buttons, not the body.
+    assert f"**{sym.OP_SAVE} Usable Models: 3**" in body
+    assert f"{sym.ICON_MODEL} **Groq**" not in body
+    assert "gpt-oss-120b" not in body
+    assert "Every usable model is on the buttons below" in body
     # Summary chips still present.
     assert f"{sym.OP_SAVE} 3 · {sym.STATE_FAILED} 3" in body
     # No diagnostic paragraphs in the main message.
     assert "HTTP" not in body
     assert "retry-after" not in body
-    # Failed models: one compact line each, capped.
-    assert f"**{sym.STATE_FAILED} Not usable: 3**" in body
     # Buttons preserved: pick-model rows + re-run + details.
     datas = _flatten_button_datas(mock_edit.await_args.args[2])
     assert any(d.startswith("action:ai_pick_model:groq:openai/gpt-oss-120b") for d in datas)
