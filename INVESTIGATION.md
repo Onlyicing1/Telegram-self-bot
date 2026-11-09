@@ -1,183 +1,172 @@
-# Investigation — Dynamic Test-Verified Production Model Fallback
+# INVESTIGATION — Glass UI Appearance Personalization
 
-Scope: how a user request travels from the AI Engine into `ProviderManager`, what
-decides a model's production eligibility, and how failures are attributed to a
-model vs. a provider. Everything below is source-verified in this tree; nothing
-is inferred from intent or documentation alone.
+> Source-verified against the repository at `main` / local HEAD
+> `fa2dfd04c3cacbb78221a512576769fd6473ddb8` (branch
+> `freebuff/99799eefb106784388e20bc8`, clean tree before this change).
+> Code is authoritative; this document records what the code actually does.
 
----
+## 1. Repository and delivery state at the start
 
-## 1. The routing path (unchanged boundaries)
+- Branch: `freebuff/99799eefb106784388e20bc8`.
+- HEAD: `fa2dfd04c3cacbb78221a512576769fd6473ddb8`
+  (`fix(ai): probe one sibling model on an ambiguous rate limit`).
+- Working tree: clean; no pre-existing modified/untracked files in the project
+  root (only the ignored virtualenv and caches).
+- `origin/main` is not represented by a local remote-tracking ref in this
+  environment; delivery is verified after pushing with a fresh fetch.
+- `AGENTS.md` is the project's single source of truth; it was read in full
+  before source inspection.
 
-```
-ai_unified / task_execution
-        │
-        ▼
-Engine → Dispatcher._call_provider()          backend/ai/engine/dispatcher.py:282
-        │        await self._provider_manager.chat(provider_messages, **kwargs)
-        ▼
-ProviderManager.chat()                        backend/ai/providers/manager/manager.py
-        │  1. enumerate providers (active first, then AI_PROVIDER_FALLBACK,
-        │     then every other registered non-dummy provider)
-        │  2. _skip_reason() per provider, _score() per provider
-        │  3. _candidate_models() per provider → the MODEL-level pool
-        │  4. sort (JSON capability, active first, score)
-        │  5. sequential loop → _attempt_with_retry() per (provider, model)
-        ▼
-provider.chat(messages, model=…)             backend/ai/providers/openai_compat.py
-                                                                  gemini.py, cloudflare.py
-```
+## 2. The actual Glass UI path
 
-`ProviderManager.chat()` is the only production caller of `provider.chat()`. The
-loop is a plain `for … await …` — there is no `asyncio.gather`, no task creation,
-no speculative request. One user request therefore reaches exactly one model at a
-time and stops at the first usable response.
+1. `Menu` is the only text command (`backend/bot/handlers/misc.py`), matched by
+   exact equality on the raw outgoing text.
+2. `send_inline_panel` (`backend/helper/inline_sender.py`) delegates to
+   `PanelLifecycleManager.create_panel` (`backend/helper/lifecycle.py`).
+3. `inline_engine.trigger` issues `client.inline_query(helper_username, query)`
+   from the **self client**; the Helper Bot answers through
+   `inline_engine.register_inline_handler`, and the self client sends
+   `results[0]` with `result.click(chat_id)`.
+4. The sent message therefore belongs to the owner's account and carries the
+   Helper Bot as `via_bot`; its buttons belong to the Helper Bot.
+5. `register_callback_handlers(helper, owner_id)` is wired in
+   `backend/runtime/supervisor.py` **on the Helper Bot**, so every callback
+   `event.edit(...)` is a Helper Bot edit of its own inline message.
+6. There are two render boundaries:
+   - initial inline result: `panel_render.render(...)`, called by the
+     registered inline builders;
+   - callback edits: `panels._render_and_edit(...)` → `render_edit(...)`.
+   `lifecycle.try_reuse_panel(...)` is a third, rarely used path that also
+   renders a panel.
+7. `panels._finalize_panel` injects the standard Back/Home/Close row; root
+   render adds Close only. Sub-panel navigation is registry-driven
+   (`panel_registry.py`).
 
-## 2. What already fed the pool (and what did not)
+## 3. Main-menu categories (the eligible pages)
 
-- `backend/ai/model_tester.py::test_all_models()` runs the complete diagnostic
-  (every chat model of every chat provider, bounded concurrency, no budget) and
-  then calls `_feed_production_candidates(results, …)`.
-- `proven_usable_candidates()` keeps ONLY `status == "AVAILABLE"` results, skips
-  every result carrying `cached: True`, drops the provider's configured model
-  (the router already tries it first), and orders the remainder with the same
-  deterministic free-first selector used by the UI.
-- `_feed_production_candidates()` publishes that map through the existing
-  `ProviderManager.set_model_candidates(provider, models)` contract.
-- `_candidate_models()` returns configured model first, then EVERY fed model,
-  de-duplicated and empty-free — deliberately no per-provider cap.
+`misc._build_menu_buttons` is the authoritative menu. It contains:
 
-So the dynamic, all-AVAILABLE pool was already wired. This task did **not** add a
-second feed: it hardened eligibility and failure attribution around that pool.
+`save`, `del`, `profile`, `db`, `general`, `settings`, `cipher`, `todo`, `ai`.
 
-## 3. Defects this task corrects
+`list`, `find`, `emoji`, `context` and `health` are registered with
+`parent="menu"` but are **not** in the menu buttons, so they are not
+top-level categories and are not eligible. The new `appearance` category is the
+only menu addition.
 
-### 3.1 A model failure disabled the whole provider
+Default title/description pairs were read from the real handlers:
 
-`_apply_failure()` recorded every `timeout` / `network` / `server` /
-`rate_limited` failure through `ProviderHealthTracker.record_failure(name, …)`,
-i.e. at PROVIDER scope. One slow model therefore put a provider with dozens of
-tested-available models into cooldown, and `_skip_reason()` then skipped the
-provider entirely.
-
-`_skip_reason()` also skipped the whole provider when its CONFIGURED model was
-marked unavailable:
-
-```python
-model = self._effective_model(provider)
-if model and self._model_unavailable(name, model):
-    return f"model={model}:unavailable"
-```
-
-That turned a single dead model id into a provider outage.
-
-### 3.2 Unavailable pairs were not removed from the pool
-
-`_candidate_models()` never consulted `_unavailable_models`, so a model already
-proved dead by a 404 stayed in the candidate list on subsequent requests (it was
-only skipped when it happened to be the configured model).
-
-### 3.3 Rate-limit scope was not established
-
-Both `openai_compat.py` and `gemini.py` returned `failure_type="rate_limited"`
-with `http_status=429` and `retry_after`. Neither adapter reported what the 429
-was about. `openai_compat` discarded the error body for 429 entirely (it only
-kept `request_id`), so no consumer could distinguish
-
-| Provider evidence | Actual scope | Source |
+| Page | Title | Static description |
 |---|---|---|
-| OpenAI `code: insufficient_quota` / "exceeded your current quota … billing" | account/project | `openai_compat._error_fields` |
-| Groq "Rate limit reached for model \`<id>\` … requests per min (RPM)" | that model | Groq error message |
-| Gemini 429 "You exceeded your current quota …" (free-tier per-project metric) | project/account | `gemini._error_fields` |
-| Cloudflare Workers AI 429 (account-scoped endpoint, no model field) | account (not established in body) | `cloudflare.py` |
-| Any 429 with no recognizable body | **unknown** | — |
+| save | Save | Deep Save downloads the message and re-uploads it as a new Saved Messages message. |
+| del | Delete | Choose a deletion mode: |
+| profile | Profile | Choose a section: |
+| db | Database | Choose an action: |
+| general | General | Tap a button to execute instantly. |
+| settings | Settings | — (body is live status) |
+| cipher | Cipher | Private Communications / Choose a section: |
+| todo | Todo | — (body is live counts/list) |
+| ai | AI | — (body is live provider/model state) |
+| appearance | Appearance | Personalize the Glass UI header, page text, and preview image. |
 
-Before this task all five were handled identically at provider scope. That is
-safe for account quotas but wrong for per-model limits, and it is also the reason
-sibling models were never tried after a model-specific 429.
+Several bodies repeat their title as a leading heading (`**General**`,
+`**AI**`, `▣ **Todo**`). Composition removes that duplicate when an override
+is active, so the rendered panel never shows the title twice.
 
-### 3.4 Mid-request eligibility was never re-proved
+## 4. Settings architecture and the real schema
 
-The candidate list is built ONCE before the loop. A provider disabled or cooled
-down by candidate #1 was still asked for candidates #2..#N, because only the
-pre-loop `_skip_reason()` had checked health.
+`settings_service` → `panel_settings_repository` → `panel_settings` is the only
+settings path. `panel_settings` is a singleton row (`key = 'global'`) with one
+typed column per setting; the repository is the only module that touches the
+table.
 
-## 4. Decisions
+- `settings_service._DEFAULTS` and `_VALIDATORS` are the application contract.
+- `settings_service.load_all()` is cache-first; `set_setting()` writes through
+  the repository and refreshes the cache.
+- **Known defect:** `set_setting()` returns `True` and caches the value even
+  when `repo.update_field` returns `False` (a rejected write / missing column).
+  That is a phantom success. The Appearance feature therefore uses new strict
+  setters (`set_setting_strict`, `set_many_strict`) that return `False` and do
+  not cache when the repository rejects the write.
+- Migrations: `20260726143924_create_panel_settings_table.sql`,
+  `20260827000001_add_missing_panel_settings_columns.sql`,
+  `20261020160000_add_panel_settings_auto_reaction_settings.sql`.
+- `supabase/canonical_bootstrap.sql` §6 is the consolidated schema.
+- `sql/panel_settings.sql` is an older standalone snippet and does not describe
+  the current column set; it was not used as authority.
 
-1. **Model-level state belongs to the existing health tracker.** `ProviderHealthState`
-   / `ProviderHealthTracker` gained a parallel model clock
-   (`_model_until`, `_model_failures`, `is_model_available`,
-   `record_model_failure`, `record_model_success`). No new manager, router or
-   executor; `ProviderManager` still owns the decision and calls it.
-2. **Scope follows evidence, never assumption.** `classify_rate_limit_scope()`
-   in `manager/health.py` returns `model` only when the body names THIS model
-   and describes a model-level limit, `provider` for quota/billing/account
-   markers, and `unknown` otherwise. An ambiguous 429 gets the bounded middle
-   ground: the attempted pair is cooled tentatively and ONE distinct sibling
-   model of the same provider is probed per `chat()` invocation. A second 429
-   (or the absence of an eligible sibling) is the evidence that opens the
-   provider circuit.
-3. **Transient failures are model-scoped only when there is a sibling to
-   protect.** With a single candidate model, the pre-existing provider-wide
-   penalty is kept (nothing else could be spared).
-4. **Provider-wide evidence still opens the existing circuit breaker.** Auth
-   disables the provider; provider-scope/unknown 429 cools it down; three
-   DISTINCT models of one provider failing inside 60 s escalates the transient
-   failure to the provider circuit (`PROVIDER_OUTAGE_MODELS`,
-   `PROVIDER_OUTAGE_WINDOW`).
-5. **Eligibility is re-proved per attempt.** The in-loop check skips a candidate
-   whose provider stopped being available, or whose pair became unavailable, and
-   records it in the failure matrix (`outcome: skipped`).
-6. **`model_not_found` keeps its 3600 s pair TTL** (`_unavailable_models`) — a
-   permanent configuration error for that id, never a provider penalty.
-7. **A model fallback is telemetry, not a provider change.** A success whose
-   model differs from the FIRST attempted candidate carries `fallback`,
-   `fallback_from_model`, `fallback_to_model` and `model_fallback` even when the
-   provider name is unchanged; `model` names the serving model and
-   `candidates_attempted` counts the pool work. `ai_retry_count` stays the
-   SAME-MODEL retry count, so candidate fallback never inflates it.
-8. **`_MAX_RETRIES` is the same-model retry budget.** The attempt loop spends
-   it (one retry today); candidate fallback never consumes it, so reaching a
-   20-model pool does not require retrying one model 20 times.
-9. **The ambiguity probe budget is invocation-local.** `_AmbiguityProbe` is
-   created inside `chat()` and never stored on the manager: a new call starts
-   fresh, bounded only by the cooldowns previous calls recorded.
+The per-page map is stored as JSONB (`appearance_page_texts`) because the
+number of eligible pages is a registry concern, not a schema concern; the
+service validates every key against `appearance_service.MAIN_PAGES` and rejects
+unknown ids.
 
-## 5. What is NOT established
+## 5. Durable object storage
 
-- No live provider was contacted in this environment. The scope classifier is
-  verified against the documented/observed error shapes listed in §3.3, not
-  against a fresh 429 from each vendor.
-- Cloudflare's 429 body is not parsed for a model field; it therefore starts in
-  the `unknown` branch and, when a sibling is eligible, costs one extra probe
-  request before the provider is treated as limited.
-- Model and provider health state is in-memory (process lifetime), exactly like
-  the pre-existing provider state; a restart clears every cooldown.
-- The ambiguous-429 probe is one EXTRA provider request; it is bounded per
-  invocation and by the candidate pool, never by a global counter.
-- The escalation threshold (3 distinct models / 60 s) is a policy choice, not a
-  measurement of any provider's failure correlation.
-- No UI surface shows model-level cooldowns; only the router and its logs do.
+- The only existing object-storage use is
+  `backend/services/anti_edit_delete_service.py`: optional Supabase Storage via
+  `ARCHIVE_MEDIA_BUCKET`, gated by `media_storage_available()`.
+- There is no preview bucket and no other durable media store.
+- Render's local filesystem is ephemeral; it is not used for persistence.
+- The project has **no image-processing dependency** (Pillow is absent), so
+  image validation is implemented with a dependency-free header parser for
+  PNG/JPEG/WebP (`backend/services/image_probe.py`).
+- `preview_storage.py` reuses the same Supabase client with a separate bucket
+  (`PANEL_PREVIEW_BUCKET`, default `panel-previews`). Only an object key plus
+  probed metadata is persisted; the bucket may remain private because the
+  backend serves the bytes through a public route.
 
-## 6. Current test coverage of this area
+## 6. Link preview requirements vs. the installed Telethon
 
-`tests/test_dynamic_model_fallback.py` (38 tests) drives the real
-`ProviderManager.chat()` with scripted providers that record `(provider, model,
-messages)` and concurrent overlap: 20-model pool completeness, primary-first
-order, deterministic candidate order, request identity across candidates,
-first-usable-wins, no fan-out, model-vs-provider health, the three rate-limit
-scopes, the bounded ambiguous-429 probe (sibling success, second 429, non-429
-probe failure, no sibling, fresh per-invocation budget, cooldown respect),
-cached/untested exclusion, bounded retry, same-model-retry vs model-fallback
-telemetry, cross-provider fallback, tool-call/structured-output preservation,
-honest exhaustion, and a real `Dispatcher` run where the healthy backup serves
-the initial fallback plus two tool continuations with no overlapping calls and
-no replayed tool.
+Verified against the installed Telethon **1.43.0** (not assumed):
 
-Existing suites that also cover this path and still pass: `test_23_provider_mesh.py`,
-`test_24_execution_reliability.py`, `test_17_providers.py`,
-`test_provider_structured_output.py`, `test_provider_tool_boundary.py`,
-`test_provider_system_instruction_contract.py`,
-`test_task_fallback_classification.py`, `test_task_fallback_cooldown.py`,
-`test_13_model_selection.py`, `test_model_tester.py`,
-`test_model_tester_snapshot.py`.
+- `InputBotInlineMessageMediaWebPage(message, url, invert_media=None,
+  force_large_media=None, force_small_media=None, optional=None, entities=None,
+  reply_markup=None)` exists and accepts a keyboard.
+- `InputBotInlineMessageText(message, no_webpage=None, invert_media=None,
+  entities=None, reply_markup=None)` is the current text-only constructor.
+- `messages.EditInlineBotMessageRequest(id, no_webpage=None, invert_media=None,
+  message=None, media=None, reply_markup=None, entities=None)` accepts
+  `InputMediaWebPage(url, force_large_media, force_small_media, optional)` and
+  `InputMediaEmpty()`.
+- `force_small_media` is a request flag; Telegram is not guaranteed to honour
+  it on every client.
+
+The Guide is a static mount at `/guide`
+(`StaticFiles(html=True)`), so a metadata route cannot live beneath it. The
+preview document is therefore `/preview/<version>/<panel>`; Telegram crawlers
+receive Open Graph tags, while a normal browser is redirected to `/guide`.
+The version is derived from the stored object key, so replacing the image
+changes the URL and defeats Telegram's per-URL cache.
+
+## 7. Unicode symbol system
+
+`backend/helper/symbols.py` is the single registry; glyphs must be non-emoji
+Unicode marks with no variation selector, unique within their category, and
+labels are composed with `sym.label`. Two glyphs were added:
+`ICON_APPEARANCE = ◑` and `OP_UPLOAD = ⇧`, both unused and non-emoji.
+Callback data, identifiers and URLs are never font-transformed.
+
+## 8. Design decisions
+
+1. **One central composition layer** (`appearance_service.compose`) applied at
+   the three existing render boundaries; no per-handler string replacement.
+2. **Static description replacement, dynamic body preserved.** A page override
+   replaces the registered static description; everything after it is kept
+   verbatim. A page with no override is returned byte-identical.
+3. **Global header overrides are opt-in.** Empty means each page keeps its own
+   default; resetting clears the override rather than freezing the current
+   value.
+4. **Strict persistence.** Appearance writes never report a cache-only success.
+5. **Helper Bot is the only editor.** Repaints use the inline identifier with
+   `EditInlineBotMessageRequest`; the self client only downloads the upload and
+   deletes the upload message.
+6. **Single pending-input listener.** Media support is an extra keyword passed
+   to handlers that declare `message`; no new listener, client or loop.
+
+## 9. Known limits
+
+- Live Telegram rendering (small preview, tap-through, keyboard retention) is
+  not exercised by unit tests and remains owner-verified.
+- The bucket and migration are manual owner actions; the application reports
+  honest failures until they are applied.
+- `panel_settings`'s legacy phantom-success behaviour still exists for other
+  settings; only the Appearance surface uses the strict path in this phase.

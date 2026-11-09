@@ -152,14 +152,26 @@ def render(
     title: str,
     body: str = "",
     buttons: list | None = None,
+    panel_id: str = "",
 ) -> types.InputBotInlineResult:
     """Build a single inline result. Accepts tuples OR Button objects.
 
     Initial render always adds only Close (root menu).  Subsequent callback
     edits add Back+Home+Close via _finalize_panel when the view is a submenu.
+
+    Appearance customization is composed centrally here (the inline builder
+    path) and in ``panels._render_and_edit`` (the callback path); a caller that
+    passes no panel id and renders outside an inline builder gets the exact
+    previous behaviour.
     """
     if buttons is None:
         buttons = []
+
+    from backend.services import appearance_service
+
+    active_panel = panel_id or appearance_service.current_panel()
+    if active_panel:
+        title, body = appearance_service.compose(active_panel, title, body)
 
     from backend.helper.panels import _has_nav_buttons, InlinePanelBuilder, _add_close_button
     if not _has_nav_buttons(buttons):
@@ -180,11 +192,23 @@ def render(
         message = _style(body) or ""
 
     markup_rows = _to_inline_rows(buttons) if buttons else None
+    markup = types.ReplyInlineMarkup(rows=markup_rows) if markup_rows else None
 
-    msg = types.InputBotInlineMessageText(
-        message=message,
-        reply_markup=types.ReplyInlineMarkup(rows=markup_rows) if markup_rows else None,
-    )
+    preview_url = appearance_service.preview_page_url(active_panel) if active_panel else ""
+    if preview_url:
+        try:
+            msg = types.InputBotInlineMessageMediaWebPage(
+                message=message,
+                url=preview_url,
+                force_small_media=True,
+                optional=False,
+                reply_markup=markup,
+            )
+        except Exception as exc:  # noqa: BLE001 — a preview can never break a panel
+            logger.warning("Preview media unavailable (%s); rendering text-only", type(exc).__name__)
+            msg = types.InputBotInlineMessageText(message=message, reply_markup=markup)
+    else:
+        msg = types.InputBotInlineMessageText(message=message, reply_markup=markup)
 
     return types.InputBotInlineResult(
         id="0",

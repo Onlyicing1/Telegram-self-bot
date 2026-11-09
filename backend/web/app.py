@@ -6,9 +6,15 @@ import asyncio
 import logging
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    RedirectResponse,
+    Response,
+)
 
 from backend.db import client as db_client
 from backend.health import snapshot as health_snapshot
@@ -307,6 +313,67 @@ def _apply_runtime_selection(provider: str, model: str) -> None:
         apply_runtime_selection(provider, model)
     except Exception as exc:
         logger.warning("api/ai: runtime selection apply failed: %s", exc)
+
+
+def _public_base(request: Request) -> str:
+    """Absolute public origin for OG tags (env wins behind a proxy)."""
+    import os
+
+    configured = os.getenv("PUBLIC_BASE_URL") or os.getenv("RENDER_EXTERNAL_URL") or ""
+    if configured:
+        return configured.rstrip("/")
+    return str(request.base_url).rstrip("/")
+
+
+@app.get("/preview/{version}/{panel_id}")
+async def panel_preview_page(version: str, panel_id: str, request: Request):
+    """The versioned document Telegram reads for the panel's link preview.
+
+    A crawler receives the Open Graph document; a human tap is redirected to
+    the existing Guide. The version is derived from the stored object key, so
+    replacing the image changes the URL and defeats Telegram's cache.
+    """
+    from backend.services import appearance_service
+
+    key = appearance_service.preview_image_key()
+    if (
+        not key
+        or not appearance_service.preview_enabled()
+        or version != appearance_service.preview_version()
+        or not appearance_service.PAGE_ID_RE.match(panel_id or "")
+        or not appearance_service.public_base_url()
+    ):
+        raise HTTPException(status_code=404, detail="Not found")
+
+    user_agent = request.headers.get("user-agent", "")
+    if "telegram" not in user_agent.lower():
+        return RedirectResponse(url="/guide", status_code=302)
+    return HTMLResponse(appearance_service.og_html(panel_id))
+
+
+@app.get("/preview/{version}/{panel_id}/image")
+async def panel_preview_image(version: str, panel_id: str):
+    """Serve the owner's stored image publicly, without exposing a signed URL."""
+    from backend.services import appearance_service, preview_storage
+
+    key = appearance_service.preview_image_key()
+    if (
+        not key
+        or not appearance_service.preview_enabled()
+        or version != appearance_service.preview_version()
+    ):
+        raise HTTPException(status_code=404, detail="Not found")
+
+    payload = await asyncio.to_thread(preview_storage.download, key)
+    if not payload:
+        raise HTTPException(status_code=404, detail="Not found")
+    meta = appearance_service.preview_image_meta()
+    media_type = str(meta.get("mime") or "application/octet-stream")
+    return Response(
+        content=payload,
+        media_type=media_type,
+        headers={"Cache-Control": "public, max-age=31536000, immutable"},
+    )
 
 
 def mount_static():

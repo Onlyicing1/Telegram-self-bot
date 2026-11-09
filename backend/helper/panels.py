@@ -318,6 +318,11 @@ async def _render_and_edit(event, result, panel_id: str, chat_id: int | None, ms
     if not title and not body and not buttons:
         logger.warning("[CALLBACK] render_and_edit: empty result for panel='%s'", panel_id)
         return
+    # ONE central composition point for callback renders. Pages without a
+    # customization are returned untouched by the service.
+    from backend.services import appearance_service
+
+    title, body = appearance_service.compose(panel_id, title, body)
     title, body, buttons = _finalize_panel(title, body, buttons, panel_id, chat_id, msg_id)
     from backend.helper.panel_render import render_edit
     text, built_buttons = render_edit(title, body, buttons)
@@ -755,6 +760,7 @@ async def _handle_input(event, remainder: str, owner_id: int, chat_id: int, msg_
         inline_chat_id=chat_id or 0, inline_msg_id=msg_id or 0,
         inline_id=inline_message_id_from_event(event),
         extra=extra,
+        timeout=input_cfg.get("timeout", 60.0),
     )
 
     # The prompt is a SUB-VIEW of the panel. Its first row re-opens the panel

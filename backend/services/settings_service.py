@@ -48,6 +48,16 @@ Architecture:
 | dashboard_font          | str     | "default" | one of DASHBOARD_FONTS  |
 | auto_reaction_enabled   | bool    | false   | must be boolean         |
 | auto_reaction_emoji     | str     | ""      | non-empty string (a Telegram reaction emoji) |
+| appearance_header_title | str     | ""      | ≤64 chars; "" = no override |
+| appearance_header_body  | str     | ""      | ≤500 chars; "" = no override |
+| appearance_page_texts   | dict    | {}      | validated main-page ids/title/body map |
+| appearance_preview_enabled | bool | false   | must be boolean         |
+| appearance_preview_image | str    | ""      | "" or previews/<32 hex>.<png|jpg|webp> |
+| appearance_preview_meta | dict     | {}      | probed mime/width/height |
+
+The six appearance_* keys are written through set_setting_strict /
+set_many_strict (a rejected repository write is reported as failure and
+is never cached as if it had been saved).
 """
 import logging
 from typing import Any, Callable
@@ -80,6 +90,13 @@ _DEFAULTS: dict[str, Any] = {
     "dashboard_font": "default",
     "auto_reaction_enabled": False,
     "auto_reaction_emoji": "",
+    # Glass UI Appearance (see backend/services/appearance_service.py).
+    "appearance_header_title": "",
+    "appearance_header_body": "",
+    "appearance_page_texts": {},
+    "appearance_preview_enabled": False,
+    "appearance_preview_image": "",
+    "appearance_preview_meta": {},
 }
 
 _cache: dict[str, Any] = {}
@@ -110,6 +127,20 @@ def _validate_dashboard_font(value: Any) -> bool:
     return isinstance(value, str) and value in DASHBOARD_FONTS
 
 
+def _validate_appearance(key: str):
+    """Delegate to the Appearance module's own bounded validators.
+
+    Imported lazily: appearance_service reads this module at import time, so a
+    module-level import here would be circular.
+    """
+    from backend.services import appearance_service
+
+    def validator(value: Any) -> bool:
+        return appearance_service.validate_for_key(key, value)
+
+    return validator
+
+
 
 _VALIDATORS: dict[str, ValidatorFn] = {
     "auto_close_enabled": _validate_bool,
@@ -126,6 +157,12 @@ _VALIDATORS: dict[str, ValidatorFn] = {
     "dashboard_font": _validate_dashboard_font,
     "auto_reaction_enabled": _validate_bool,
     "auto_reaction_emoji": _validate_nonempty_str,
+    "appearance_header_title": _validate_appearance("appearance_header_title"),
+    "appearance_header_body": _validate_appearance("appearance_header_body"),
+    "appearance_page_texts": _validate_appearance("appearance_page_texts"),
+    "appearance_preview_enabled": _validate_appearance("appearance_preview_enabled"),
+    "appearance_preview_image": _validate_appearance("appearance_preview_image"),
+    "appearance_preview_meta": _validate_appearance("appearance_preview_meta"),
 }
 
 
@@ -217,6 +254,46 @@ def set_setting(key: str, value: Any) -> bool:
         return True
 
     _cache[key] = value
+    return True
+
+
+def _validate_entry(key: str, value: Any) -> bool:
+    if not is_valid_key(key):
+        logger.warning("settings_service: unknown setting key '%s' rejected", key)
+        return False
+    validator = _VALIDATORS.get(key)
+    if validator and not validator(value):
+        logger.warning("settings_service: validation failed for '%s' = %r", key, value)
+        return False
+    return True
+
+
+def set_setting_strict(key: str, value: Any) -> bool:
+    """Persist a setting and report ONLY a real DB write as success.
+
+    Used by the Appearance surface: a rejected repository write must never be
+    reported (or cached) as if the owner's choice was saved.
+    """
+    if not _validate_entry(key, value):
+        return False
+    if not repo.update_field(key, value):
+        logger.warning("settings_service: strict write rejected for '%s'", key)
+        return False
+    _refresh_from_db()
+    return True
+
+
+def set_many_strict(fields: dict[str, Any]) -> bool:
+    """Persist several settings atomically (one repository UPDATE)."""
+    if not isinstance(fields, dict) or not fields:
+        return False
+    for key, value in fields.items():
+        if not _validate_entry(key, value):
+            return False
+    if not repo.update_fields(fields):
+        logger.warning("settings_service: strict multi-write rejected for %s", list(fields))
+        return False
+    _refresh_from_db()
     return True
 
 

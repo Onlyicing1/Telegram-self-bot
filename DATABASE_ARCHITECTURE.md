@@ -3801,6 +3801,12 @@ a key-value store.
 | `dashboard_font` | `text` | NO | `'default'` | Glass UI / dashboard font key — one of `FONT_KEYS` in `backend/helper/font_style.py` (`DASHBOARD_FONTS` == `FONT_KEYS`); never free-text CSS |
 | `auto_reaction_enabled` | `boolean` | NO | `false` | Auto-Reaction setting (Emoji Stage 1) — whether the owner has enabled automatic reactions to their own outgoing messages. The setting is stored/read through `settings_service` and consumed by `auto_reaction_service.process_outgoing_message`. Created by `20261020160000_add_panel_settings_auto_reaction_settings.sql` — part 14 of the one-paste setup (§31.3). FALSE is the OFF default: applying the schema can never enable a reaction |
 | `auto_reaction_emoji` | `text` | NO | `''` | Auto-Reaction setting (Emoji Stage 2) — the exact Telegram reaction emoji the owner selected through the General panel selector, stored/read through `settings_service` and consumed by `auto_reaction_service.process_outgoing_message`. Created by the same migration — part 14 of the one-paste setup (§31.3). `''` is "none selected"; any other value is the exact Telegram reaction emoji |
+| `appearance_header_title` | `text` | NO | `''` | Glass UI Appearance: global header title override. Empty = no override (each page keeps its own default). Bounded to 64 chars by `appearance_service`. MANUAL setup — see `sql/panel_settings_appearance.sql`; deliberately not part of the audited 36-file migration history |
+| `appearance_header_body` | `text` | NO | `''` | Glass UI Appearance: global header description override. Empty = no override. Bounded to 500 chars |
+| `appearance_page_texts` | `jsonb` | NO | `'{}'::jsonb` | Glass UI Appearance: per-main-page overrides `{"<panel_id>": {"title": "…", "body": "…"}}`. Keys are validated against the actual top-level menu categories; no image bytes here |
+| `appearance_preview_enabled` | `boolean` | NO | `false` | Glass UI Appearance: independent preview-image switch. OFF never deletes the stored image |
+| `appearance_preview_image` | `text` | NO | `''` | Glass UI Appearance: durable Supabase Storage OBJECT KEY (`previews/<32 hex>.<png|jpg|webp>`). Never image bytes and never a signed URL |
+| `appearance_preview_meta` | `jsonb` | NO | `'{}'::jsonb` | Glass UI Appearance: probed image metadata `{"mime", "width", "height"}` used for the Open Graph tags |
 | `ghost_seen_retention_seconds` | `bigint` | NO | `2592000` | Ghost Seen registry retention window in seconds (30 min–365 days); presets include sub-day durations |
 | `update_stale_seconds` | `integer` | NO | `300` | Update staleness threshold (seconds) |
 | `updated_at` | `timestamptz` | YES | `now()` | Last update timestamp |
@@ -3821,13 +3827,19 @@ RLS is enabled. Only SELECT is granted to `anon` + `authenticated`.
 `update_field`, `update_fields`, `reload`.
 
 **`backend/services/settings_service.py`** — cache-first reads,
-write-through cache, **14 typed getters + 14 typed setters**
+write-through cache, **20 configured keys** — the 14 typed legacy accessors plus the six Appearance keys written through the STRICT path (`set_setting_strict` / `set_many_strict`: a rejected database write is never reported as saved) and read/composed by `backend/services/appearance_service.py`. The legacy accessors
 (`auto_close_enabled`, `auto_close_delay`, `max_deep_save_mb`,
 `delete_batch_size`, `log_retention_days`, `panel_timeout_seconds`,
 `allow_multiple_panels`, `reuse_existing_panel`, `language`,
 `debug_callbacks`, `owner_only`, `dashboard_font`,
 `auto_reaction_enabled`, `auto_reaction_emoji`), per-setting
 validators. See [§17 Panel Database](#17-panel-database) for details.
+
+> **Manual setup:** the six `appearance_*` columns are installed by
+> `sql/panel_settings_appearance.sql` (idempotent, with rollback and the
+> storage-bucket instructions in its header). It is intentionally NOT an
+> entry in the audited `supabase/migrations/` history, so the §31 one-paste
+> setup and its 36-file inventory are unchanged.
 
 > **Note:** `ghost_seen_retention_seconds` and `update_stale_seconds`
 > are migrated columns with **no accessor in `settings_service` and no

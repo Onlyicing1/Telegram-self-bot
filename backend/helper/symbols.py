@@ -66,6 +66,7 @@ OP_SEARCH = "⌕"           # U+2315 TELEPHONE RECORDER (magnifier-like)
 OP_MANAGE = "☰"           # U+2630 TRIGRAM FOR HEAVEN (settings/list-like)
 OP_CHAT = "▭"             # U+25AD WHITE RECTANGLE
 OP_STOP = "■"             # U+25A0 BLACK SQUARE (stop / disable)
+OP_UPLOAD = "⇧"           # U+21E7 UPWARDS WHITE ARROW (upload / send a file)
 
 # ── panel structure + wizard navigation (Category E) ────────────────────────
 PANEL_HEADING = "▣"       # U+25A3 WHITE SQUARE CONTAINING BLACK SMALL SQUARE
@@ -117,6 +118,7 @@ ICON_SELECT = "◒"         # U+25D2 CIRCLE WITH LOWER HALF BLACK
 ICON_PIN = "⦿"            # U+29BF CIRCLED BULLET
 ICON_MODEL = "◇"        # U+25C7 WHITE DIAMOND (AI model — same glyph as CONTENT_AI)
 ICON_CREDENTIAL = "⚿"   # U+26BF SQUARED KEY
+ICON_APPEARANCE = "◑"   # U+25D1 CIRCLE WITH RIGHT HALF BLACK
 
 # ── AI provider icons (Category I) ──────────────────────────────────────────
 # One abstract mark per provider (never a coloured emoji), so the provider
@@ -208,6 +210,7 @@ OPERATION_SYMBOLS: dict[str, SymbolSpec] = {
     "search": SymbolSpec("op_search", OP_SEARCH, "search / filter"),
     "manage": SymbolSpec("op_manage", OP_MANAGE, "manage / settings list"),
     "chat": SymbolSpec("op_chat", OP_CHAT, "chat / conversation"),
+    "upload": SymbolSpec("op_upload", OP_UPLOAD, "upload a file / image"),
 }
 
 #: Category E — panel structure and wizard/navigation glyphs.
@@ -279,6 +282,7 @@ DOMAIN_SYMBOLS: dict[str, SymbolSpec] = {
     "pin": SymbolSpec("icon_pin", ICON_PIN, "target chat / pin"),
     "model": SymbolSpec("icon_model", ICON_MODEL, "AI model", "same glyph as CONTENT_AI"),
     "credential": SymbolSpec("icon_credential", ICON_CREDENTIAL, "API credential"),
+    "appearance": SymbolSpec("icon_appearance", ICON_APPEARANCE, "Glass UI appearance"),
 }
 
 #: The single merged view used for auditability and the collision test.

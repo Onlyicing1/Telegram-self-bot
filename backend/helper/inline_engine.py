@@ -318,7 +318,12 @@ def register_inline_handler(helper_client, owner_id: int) -> None:
 
         built: list = []
         try:
-            built = await builder(event, extra)
+            from backend.services import appearance_service
+
+            # The builder renders through the shared ``render`` helper, which
+            # composes the Appearance layer for THIS panel id.
+            with appearance_service.rendering(panel_id):
+                built = await builder(event, extra)
             built = _sanitize_results(built)
             await event.answer(built)
             record_inline_answer(panel_id, built, ok=True)

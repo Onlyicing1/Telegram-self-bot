@@ -113,6 +113,11 @@ def register_input_listener(self_client, owner_id: int) -> None:
             # after this callback is gone; handlers that can use it declare it.
             if "inline_id" in parameters:
                 handler_kwargs["inline_id"] = pending_entry.get("inline_id")
+            # Media inputs (the Appearance preview upload) need the message
+            # itself, not just its text: it is the same pending input, the same
+            # listener and the same owner gate — no second update loop.
+            if "message" in parameters:
+                handler_kwargs["message"] = event.message
         except (TypeError, ValueError):
             pass
         try:

@@ -213,6 +213,12 @@ class PanelLifecycleManager:
                 if not title and not body and not buttons:
                     return False
 
+                # Reuse is a second render boundary: compose the Appearance
+                # layer before the text is laid out, exactly as the callback
+                # and initial-inline paths do.
+                from backend.services import appearance_service
+
+                title, body = appearance_service.compose(panel_id, title, body)
                 title, body, buttons = _finalize_panel(
                     title, body, buttons, panel_id, old_chat, old_msg
                 )
