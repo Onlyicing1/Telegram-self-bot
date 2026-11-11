@@ -2,112 +2,152 @@
 
 ## Request
 
-Add a read-only outbound bandwidth usage page under the existing Settings panel:
-`Menu → Settings → Bandwidth Usage`. The task was a UI integration for the
-already-implemented governor; the governor itself was not redesigned or
-replaced.
+Audit the connected Supabase database against the current repository contract,
+identify missing or redundant schema/security objects, apply safe corrections,
+and record the result in the canonical database documentation.
 
-## What changed
+## Scope and evidence
 
-### `backend/services/outbound_bandwidth_service.py`
+- Repository: `Onlyicing1/Telegram-self-bot`, branch `main`.
+- Supabase project: `burfebhahuowywyfgcsc`.
+- Live catalog inspection: public tables, columns, constraints, policies,
+  grants, default privileges, sequences, functions and event triggers.
+- Repository inspection: `DATABASE_ARCHITECTURE.md`,
+  `supabase/canonical_bootstrap.sql`, `AGENTS.md`, current implementation
+  report/roadmap and schema/security tests.
+- Supabase security and performance advisors were rerun after the migration.
 
-The read API now distinguishes a real zero from unreadable durable state,
-without changing limits, reservation logic or persistence:
+## Live schema findings
 
-- `get_outbound_usage()` gained `available` (bool), `detail` (why it is
-  unavailable) and `state` (`normal` / `near_limit` / `exhausted` /
-  `unavailable`). The byte fields and all previous aliases are retained.
-- `available` is **False** when no database is configured, when the
-  `panel_settings` row is missing/malformed, or when the read raises. The zero
-  values remain in the payload for compatibility but must not be presented as
-  usage when `available` is False.
-- `available` is **True with zeros** only when the current-period state is
-  genuinely readable (fresh/empty state, or a rolled-over period).
-- `usage_state()` classifies with `NEAR_LIMIT_RATIO = 0.90`; the limits
-  (`DAILY_LIMIT_BYTES = 150_000_000`, `MONTHLY_LIMIT_BYTES = 4_000_000_000`)
-  are untouched.
-- No change to `reserve_outbound_bytes`, `_read_row_state`, the JSONB shape or
-  the repository.
+### Completeness
 
-### `backend/bot/handlers/misc.py`
+- 28 public application tables are present.
+- All 179 expected core columns from the canonical bootstrap are present.
+- The audited later feature columns are also present, including the
+  Appearance fields and `panel_settings.outbound_bandwidth_state`.
+- No missing expected core or audited feature column was found.
+- The singleton `panel_settings('global')` row has
+  `outbound_bandwidth_state = {}`; the column is NOT NULL JSONB with an
+  object-type CHECK.
+- The Vault extension, `api_credentials` table and credential-management
+  functions exist. `vault.secrets` has zero rows, which is normal until a
+  credential is saved. No secret was created.
 
-- Settings panel: new **Bandwidth Usage** row → `panel:bandwidth`.
-- Registered child panel `bandwidth` (`parent="settings"`, title
-  “Bandwidth Usage”) plus the `bandwidth_refresh` action, through the existing
-  registry.
-- The page reads usage **only** through `get_outbound_usage()`; the handler
-  never queries Supabase.
-- Renders daily/monthly used, limits, remaining, the UTC periods and the state
-  label; byte formatting is decimal (`0 B`, `1.5 KB`, `150.000 MB`, `4.000 GB`).
-- On an unavailable read it renders “Usage unavailable” and the reason, shows no
-  byte counts, and explicitly says an unreadable state is not a zero reading.
-- **Refresh** calls the service again and returns the panel view for the same
-  panel; the callback router paints it as an action result (`home_view=False`),
-  i.e. an edit of the existing message, never a new panel.
-- Navigation is the shared row: Back/Home/Close are injected by
-  `_finalize_panel` for a submenu, and Back resolves to `settings` through the
-  registry parent.
+### Non-canonical / legacy objects retained
 
-### Tests and documentation
+- `ai_preferences` is non-canonical, empty, has no foreign-key dependents,
+  no application repository and no current producer. It is retained for now;
+  it was not dropped.
+- `ai_messages.tool_calls` and `ai_messages.telegram_msg_id` are present
+  but empty and have no current persistence consumer. They were retained.
+- `saved_items.short_code` and `saved_items.file_name` are documented
+  compatibility columns and were retained.
+- No table, column, row or stored value was deleted or rewritten.
 
-- New `tests/test_bandwidth_panel.py` (26 tests).
-- `tests/test_12_save_engine.py`: Settings row count 11 → 12 (the new row).
-- `DATABASE_ARCHITECTURE.md`: migration inventory updated to **38 files / 16
-  embedded parts**; the bandwidth migration is part 16 with the column and
-  CHECK; §6 documents `outbound_bandwidth_state`; §22 records it as applied.
-- Documentation count guards updated accordingly
-  (`test_database_architecture_doc.py`, `test_database_setup_order.py`,
-  `test_private_message_db_security.py`, `test_private_message_scope.py`).
-- `ROADMAP.md` and this report replaced.
+## Migration history
 
-## Governor limits, coverage and limitations (preserved)
+- Repository now contains 39 migration files.
+- Supabase migration history contains 3 records, not 39. The live schema
+  reflects a mixture of canonical/manual setup and tracked migrations.
+  Missing history rows were not fabricated.
+- The Appearance migration history version (`20261109164548`) does not
+  match its repository filename prefix (`20261109000000`).
+- The outbound bandwidth migration is recorded as `20261112000000`.
+- The new security migration is recorded as `20261111143543` and is stored
+  as `supabase/migrations/20261111143543_harden_public_schema_privileges.sql`.
 
-- **Limits:** daily 150,000,000 bytes; monthly 4,000,000,000 bytes; UTC
-  calendar day/month.
-- **Covered:** Gemini OCR and STT payloads, Telegram outbound media (including
-  `send_voice`), Deep Save single-item and album re-uploads.
-- **Not counted:** Telegram downloads (inbound), cleanup delete requests,
-  text-only AI calls and other provider traffic.
-- **Failure posture:** a reservation is persisted before the transfer; a
-  persistence failure rejects instead of transmitting unaccounted bytes;
-  reservations are never refunded.
-- **State:** one JSONB column (`outbound_bandwidth_state`) on the singleton
-  `panel_settings` row, accessed only through `panel_settings_repository`.
-- **Category-level usage breakdown is not available.** The persisted state has
-  only daily and monthly aggregates, so the UI shows none and does not imply
-  per-category accounting.
+## Applied correction
 
-## Migration status
+Migration:
+`supabase/migrations/20261111143543_harden_public_schema_privileges.sql`
 
-`supabase/migrations/20261112000000_add_panel_settings_outbound_bandwidth.sql`
-is **already applied to the connected Supabase project** (owner-confirmed).
-This task did not execute SQL, create a migration or change the JSONB schema.
-The previously stale “migration unapplied / manual SQL required” statements have
-been corrected in the rewritten documents.
+Applied to the connected Supabase project successfully.
 
-## Tests executed and results
+It:
 
-- Focused suites (`test_bandwidth_panel`, `test_12_save_engine`,
-  `test_database_architecture_doc`, `test_database_setup_order`,
-  `test_private_message_db_security`, `test_colored_buttons`,
-  `test_settings_model_key_contract`, `test_panel_update_delivery`,
-  `test_callback_backlog`): **222 passed**.
-- New panel suite: **26 passed** (Settings entry, registration, rendering,
-  formatting, normal/near/exhausted, refresh same-panel behaviour, unavailable
-  vs real zero, shared navigation).
-- Full suite: **7,411 passed, 27 skipped, 1 failed**. The failure is
-  `tests/test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`
-  (`assert 0 == 1`, “interval advancement exceeded bound”), which is unrelated
-  to this change and pre-existing.
-- `py_compile` on the changed modules/tests: passed.
-- `git diff --check`: passed.
+1. Revokes `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`,
+   `REFERENCES` and `TRIGGER` privileges from `anon` and
+   `authenticated` on all public tables.
+2. Revokes their privileges on public sequences.
+3. Removes those client write privileges from the `postgres` role's
+   default ACLs for future public tables and sequences.
+4. Removes fourteen redundant/non-canonical policies, retaining the 22
+   canonical `anon_select_*` SELECT policies.
+5. Pins `search_path = pg_catalog` on
+   `panel_settings_updated_at()`, `set_updated_at()` and
+   `update_ghost_chats_updated_at()`.
+6. Revokes direct EXECUTE on `rls_auto_enable()` from `PUBLIC`,
+   `anon` and `authenticated`. The registered DDL event trigger remains
+   enabled.
 
-## Not live-verified or deferred
+An initial attempt to alter the Supabase-managed `supabase_admin` default
+ACL was rejected with permission denied. Those statements were removed from
+the migration; only the `postgres` role defaults were changed. The migration
+was then applied successfully. Do not claim the Supabase-managed defaults
+were changed.
 
-- No live Telegram/helper-bot rendering or interaction was performed; the
-  tests are offline and source-level.
-- The live `panel_settings.outbound_bandwidth_state` row was not read; the
-  applied-migration status is the owner's confirmation.
-- Render deployment behaviour and real media transfers were not exercised.
-- No category-level breakdown was added, because the persisted state cannot
-  support one honestly.
+## Post-migration verification
+
+The live verification query returned:
+
+| Check | Result |
+|---|---:|
+| Remaining client table write grants | 0 |
+| Remaining client sequence grants | 0 |
+| Remaining non-canonical policies | 0 |
+| Canonical SELECT policies retained | 22 |
+| Public tables with RLS enabled | 28 |
+| Trigger functions with pinned search_path | 3 |
+| anon can execute rls_auto_enable() | No |
+| authenticated can execute rls_auto_enable() | No |
+| PUBLIC can execute rls_auto_enable() | No |
+| ai_preferences rows | 0 |
+
+## Remaining security and performance findings
+
+### Public SELECT exposure — not changed
+
+The 22 canonical `anon_select_*` policies still use `USING (true)`.
+A holder of the project's anon key can read all rows in those tables,
+including sensitive data in `ai_messages`, `ai_sessions`,
+`ai_memories`, `ai_tool_history`, `saved_items` and `bot_logs`.
+
+The repository says the React dashboard does not use the anon key and reads
+through the backend API; the backend database client uses
+`SUPABASE_SERVICE_ROLE_KEY`. A service-role-only model is therefore
+consistent with the current source architecture. SELECT access was not
+revoked in this migration because that is a separate access-model change.
+It remains the most important unresolved security decision.
+
+### Supabase advisors after the migration
+
+- Security: six informational `RLS Enabled No Policy` findings. Five are
+  intentional service-role-only tables; the sixth is the non-canonical,
+  empty `ai_preferences` table.
+- Security: one warning for `pg_trgm` being installed in `public`. It
+  remains there because the canonical bootstrap expects it; moving it needs
+  a separate index/operator compatibility review.
+- Performance: 22 unused-index findings. Usage counters alone are not enough
+  evidence to delete indexes on a low/unknown-traffic project.
+- Performance: four duplicate-index pairs on `ai_sessions`, `bio_state`,
+  `bot_logs` and `saved_items`. They were not dropped without reviewing
+  definitions and query plans.
+
+## Validation limits
+
+- The migration was applied and verified against the live Supabase catalog.
+- Supabase security and performance advisors were rerun.
+- No Python test suite, application runtime test, Telegram interaction or
+  Render deployment test was executed as part of this database-only task.
+- No migration-history backfill was attempted.
+
+## Outcome
+
+The missing core columns were already present. The concrete live drift was
+excess client write privileges, redundant policies, mutable trigger-function
+search paths and unnecessary direct execution on the RLS event-trigger
+function. Those items were corrected and verified.
+
+The public SELECT exposure, unused/duplicate indexes, empty legacy table,
+legacy columns and migration-history drift remain explicitly documented
+rather than being changed destructively or silently.
