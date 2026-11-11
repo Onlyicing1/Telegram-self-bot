@@ -78,7 +78,7 @@ embedded in the schema snapshot. There is
 no "step 0", no second block to paste and no shell workflow. Open this section,
 copy §31.3, paste it into the Supabase SQL Editor as `postgres` and run it. §31.1 is the
 reconciliation audit that proves the block equals the effective final state of
-all 39 repository migration files (with the separate post-setup hardening migration tracked independently) — including the two Todo migrations
+the 38 schema migration files classified below — including the two Todo migrations
 `20260926000001_add_todo_schedule_type.sql`,
 `20260927000001_add_todo_steps.sql`, the Taskloom question-status widening
 `20260927020000_add_waiting_answer_status.sql` (classified additive: it only
@@ -94,10 +94,10 @@ were created with, and adds no table of its own) and the Auto-Reaction columns
 part 14: the two `panel_settings` columns `settings_service` writes, which no
 earlier migration created).
 
-### 31.1 Reconciliation audit — 39 repository migration files; 16 embedded schema parts
+### 31.1 Reconciliation audit — 38 schema migrations; 16 embedded schema parts
 
 The script in §31.3 was reconciled against **every file currently in
-`supabase/migrations/` (39 files)**, not against the list any earlier document
+`supabase/migrations/` (38 schema migration files; the 39th file is the separately applied privilege-hardening migration documented in §22)**, not against the list any earlier document
 carried. Each migration was classified by its **effective schema change** —
 what a fresh database must end up with after it runs — and the classification
 is pinned by `tests/test_database_setup_order.py` (statement-identity for the
@@ -227,7 +227,7 @@ migration creates them.
    (§33.4) — and part 14 — the two Auto-Reaction `panel_settings` columns (§6)
    — all embedded verbatim from their migration files.
 6. **What was corrected.** Documentation: the §31 intro, §31.1 and §22 state
-   the current count (38 migration files; 16 embedded parts; 16 canonical
+   the current count (39 migration files: 38 schema migrations plus the separately tracked post-setup privilege-hardening migration; 16 embedded parts; 16 canonical
    tables + `todo_steps` + the five Emoji & Reaction tables + the two Private
    Message tables + the two Anti-Edit / Anti-Delete tables), plus the
    counter-reset columns those two Private Message tables gain in part 11, the
