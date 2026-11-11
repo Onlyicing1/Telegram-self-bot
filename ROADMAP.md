@@ -1,42 +1,60 @@
-# ROADMAP — Database Architecture Documentation Audit
+# ROADMAP — Appearance Composition Deduplication
 
-## Current task (complete, pending owner-side delivery)
+## Current task
 
-**Comprehensive, source-driven audit of `DATABASE_ARCHITECTURE.md`** against the
-actual repository (`Onlyicing1/Telegram-self-bot`, branch `main`), with focused
-regression tests. Documentation-only: no SQL was executed, no Supabase project
-was contacted, no table, column, migration, policy, grant, service or runtime
-behaviour was changed.
+**Make every configured text fragment render exactly once on LifeOS Glass UI
+main pages.** The owner reported identical text repeated consecutively in one
+panel. `appearance_service.compose_text()` joined the global header body, the
+per-page body override and the page handler's own body without checking whether
+two composition layers carried the same text, so identical configuration
+produced the same paragraph two or three times.
+
+The fix is confined to composition at the render boundary: the same layers are
+still applied, the same order is kept, and handler/dynamic text is never
+line-filtered. Only whole fragments supplied by DIFFERENT composition layers are
+collapsed when identical.
 
 ## Verified execution state
 
 | Phase | State | Evidence |
 |---|---|---|
-| Read the whole architecture document and map its sections | Done | 8,305-line document re-read after editing; TOC and chapter numbering reconciled |
-| Enumerate and read `supabase/migrations/` | Done | 37 SQL files; all 37 classified in §31, none missing |
-| Verify table/schema claims against migrations | Done | 27 migrated tables; `ai_preferences` correctly documented as unmigrated |
-| Verify `panel_settings` / Appearance | Done | Five columns, four CHECKs, singleton seed, 19 settings accessors in §6 |
-| Verify Storage persistence model | Done | §35 documents `APPEARANCE_MEDIA_BUCKET`, `appearance/preview/`, 10-image gallery, 25 MiB / 8192 px / 50 MP bounds, key-only DB link |
-| Reconcile `§1`, `§6`, `§22`, `§25`, `§26`, `§31.1.1` | Done | Stale counts and inventories corrected; no new audit-only appendix |
-| Add regression tests | Done | `tests/test_database_architecture_doc.py` (12 tests) + two stale assertions updated |
-| Run focused architecture/migration tests | Done | `97 passed` (doc contract + setup order + schema reconciliation + auto-reaction) |
-| Run the full test suite | Done | See `IMPLEMENTATION_REPORT.md` for the recorded result |
-| Python compilation / whitespace checks | Done | `py_compile` for the changed test module; `git diff --check` clean |
-| Commit and fast-forward push | Done | See `IMPLEMENTATION_REPORT.md` |
+| Read `appearance_service` composition/rendering functions | Done | `PAGE_DEFAULTS`, `compose_text`, `with_preview`, `apply_to_inline_results`, `_split_rendered_text`, `_compose_rendered` |
+| Read both render boundaries and the Appearance handler | Done | `panels._apply_appearance`/`_handle_panel`/`_render_and_edit`, `inline_engine` inline router, `handlers/appearance.py` header/page persistence |
+| Trace duplication in initial inline rendering | Done | One composition per built result; builder output is raw, `apply_to_inline_results` composes once |
+| Trace duplication on callback navigation | Done | `_handle_panel` composes once; `_render_and_edit` and `_finalize_panel` do not compose again |
+| Implement fragment-aware composition | Done | `_distinct_fragments` + `page_fragments` in `compose_text` |
+| Add regression tests | Done | 10 new tests in `tests/test_appearance_ui.py` |
+| Run focused Appearance/panel tests | Done | `165 passed` across the six Appearance/panel-delivery modules |
+| Run the full test suite | Done | `7383 passed, 27 skipped, 1 failed` — the one failure is the pre-existing scheduler test |
+| Compilation / whitespace checks | Done | `py_compile` exit 0; `git diff --check` exit 0 |
+| Commit and push | Done | Single commit `fix(appearance): render composition-layer text once`, pushed to `origin/main` |
 
-## Owner action that remains (outside this repository task)
+## Behaviour contract pinned by this task
 
-Applying the migrations is a **manual Supabase owner action**. The canonical
-one-paste script is `DATABASE_ARCHITECTURE.md` §31.3 (parts 1–15); the Appearance
-migration is part 15 (`20261109000000_add_panel_settings_appearance.sql`), and
-the Private Message, Emoji, Anti-Edit/Delete and Vault objects are the other
-manual-only parts. No coding agent executed any of it.
+- Identical non-empty text configured as both the global header body and a page
+  body renders once.
+- Identical text arriving from the page override and the handler's live body
+  renders once.
+- Different fragments keep their order: page title, header description, page
+  override, live handler body.
+- Page overrides never leak to another page; identical overrides on two pages
+  stay isolated per page.
+- Pages with an empty default body and pages with a non-empty default body keep
+  their existing default output.
+- Live/dynamic content is never dropped, shortened or line-filtered; only a
+  duplicate whole fragment from another layer is collapsed.
+- Sub-views, confirmations, pickers, pagination, action results and progress
+  messages never pass through composition.
+- Repeated rendering starts from the handler's raw body each time and does not
+  accumulate text.
+- The initial inline result and the callback-rendered page produce the same
+  composed text.
 
 ## Explicitly out of scope
 
-- Creating/altering/dropping tables, columns, constraints, policies or grants.
-- Editing the live Supabase project or running SQL.
-- Changing application runtime behaviour, repositories or services.
-- Fixing the implementation gaps that are documented as findings (for example
-  `ai_messages.tool_calls` having no column, or `ai_preferences` having no
-  migration/producer).
+- Removing the global header or disabling Appearance customization.
+- Changing where Appearance settings are stored or how they are written.
+- Database schema, migrations, SQL or Supabase changes.
+- Deduplicating identical lines that are legitimately repeated inside one
+  handler's own dynamic output.
+- Any new rendering framework or parallel composition system.

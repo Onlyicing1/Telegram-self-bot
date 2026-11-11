@@ -292,20 +292,29 @@ def compose_text(panel_id: str, extra: str, title: str, body: str) -> tuple[str,
     Only the home view (``extra == ""``) of an eligible main page is touched,
     so a confirmation, picker, paginated list or dynamic result rendered under
     the same panel keeps its own text.
+
+    The three composition sources (global header, per-page override, the
+    handler's own body) are joined as DISTINCT fragments: identical text
+    configured in more than one place is rendered once, and order is preserved
+    (page title, header description, page override, live handler body). Text
+    WITHIN the handler's own body is never deduplicated — only whole fragments
+    supplied by different layers are compared.
     """
     if not is_eligible(panel_id) or extra:
         return title, body
 
     override = page_override(panel_id)
     page_title = override.get("title") or title
-    page_body = body
+
+    page_fragments: list[str] = []
     custom_body = override.get("body")
     if custom_body:
+        page_fragments.append(custom_body)
         canonical = default_body(panel_id)
-        if not page_body or (canonical and page_body.strip() == canonical.strip()):
-            page_body = custom_body
-        else:
-            page_body = f"{custom_body}\n\n{page_body}"
+        if body and not (canonical and body.strip() == canonical.strip()):
+            page_fragments.append(body)
+    elif body:
+        page_fragments.append(body)
 
     header_title = settings_service.appearance_header_title().strip()
     header_body = settings_service.appearance_header_body().strip()
@@ -314,15 +323,30 @@ def compose_text(panel_id: str, extra: str, title: str, body: str) -> tuple[str,
         parts: list[str] = []
         if page_title and page_title.strip() != header_title:
             parts.append(f"**{page_title}**")
-        if header_body:
-            parts.append(header_body)
-        if page_body:
-            parts.append(page_body)
+        parts.extend(_distinct_fragments([header_body, *page_fragments]))
         return header_title, "\n\n".join(parts)
 
-    if header_body:
-        page_body = f"{header_body}\n\n{page_body}" if page_body else header_body
-    return page_title, page_body
+    return page_title, "\n\n".join(
+        _distinct_fragments([header_body, *page_fragments])
+    )
+
+
+def _distinct_fragments(fragments: list[str]) -> list[str]:
+    """Join one view's composition fragments, each non-empty text exactly once.
+
+    Comparison is on the whole stripped fragment, so a header line that merely
+    occurs inside a longer live body is not removed — only the same fragment
+    arriving from two composition layers is collapsed.
+    """
+    seen: set[str] = set()
+    distinct: list[str] = []
+    for fragment in fragments:
+        text = (fragment or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        distinct.append(text)
+    return distinct
 
 
 def with_preview(panel_id: str, extra: str, title: str, body: str) -> tuple[str, str]:

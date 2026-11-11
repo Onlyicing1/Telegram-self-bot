@@ -373,6 +373,151 @@ def test_dynamic_body_keeps_live_content(persisted):
     assert "Auto-close" in body and "Delete batch" in body
 
 
+# ── composition-layer duplication ──────────────────────────────────────────
+
+def _count(text: str, fragment: str) -> int:
+    return text.count(fragment)
+
+
+def test_identical_header_and_page_body_are_rendered_once(persisted):
+    appearance_service.set_header("body", "One shared line.")
+    appearance_service.set_page_text("menu", "body", "One shared line.")
+
+    title, body = appearance_service.compose_text(
+        "menu", "", "LifeOS", "Choose a category:"
+    )
+    assert title == "LifeOS"
+    assert _count(body, "One shared line.") == 1
+    assert body.startswith("One shared line.")
+
+
+def test_identical_header_and_page_body_with_header_title_are_rendered_once(persisted):
+    appearance_service.set_header("title", "My LifeOS")
+    appearance_service.set_header("body", "One shared line.")
+    appearance_service.set_page_text("menu", "body", "One shared line.")
+
+    title, body = appearance_service.compose_text(
+        "menu", "", "LifeOS", "Choose a category:"
+    )
+    assert title == "My LifeOS"
+    assert _count(body, "One shared line.") == 1
+    # The page remains identifiable beneath the header title, exactly once.
+    assert _count(body, "**LifeOS**") == 1
+    assert body.index("**LifeOS**") < body.index("One shared line.")
+
+
+def test_identical_page_override_and_live_body_are_rendered_once(persisted):
+    live = "**Auto-close:** ON (120s)\n**Delete batch:** 100"
+    appearance_service.set_page_text("settings", "body", live)
+
+    title, body = appearance_service.compose_text("settings", "", "Settings", live)
+    assert title == "Settings"
+    assert _count(body, "Auto-close") == 1
+    assert _count(body, "Delete batch") == 1
+
+
+def test_header_body_matching_page_override_keeps_live_content_once(persisted):
+    appearance_service.set_header("body", "My own introduction.")
+    appearance_service.set_page_text("settings", "body", "My own introduction.")
+    live = "**Auto-close:** ON (120s)\n**Delete batch:** 100"
+
+    title, body = appearance_service.compose_text("settings", "", "Settings", live)
+    assert title == "Settings"
+    assert _count(body, "My own introduction.") == 1
+    assert "Auto-close" in body and "Delete batch" in body
+    assert body.index("My own introduction.") < body.index("Auto-close")
+
+
+def test_different_header_and_page_text_both_appear_once_in_order(persisted):
+    appearance_service.set_header("body", "Shared header line.")
+    appearance_service.set_page_text("menu", "body", "Home-specific line.")
+
+    _title, body = appearance_service.compose_text(
+        "menu", "", "LifeOS", "Choose a category:"
+    )
+    assert _count(body, "Shared header line.") == 1
+    assert _count(body, "Home-specific line.") == 1
+    assert "Choose a category:" not in body
+    assert body.index("Shared header line.") < body.index("Home-specific line.")
+
+
+def test_identical_text_on_two_pages_stays_isolated(persisted):
+    appearance_service.set_page_text("menu", "body", "Same text.")
+    appearance_service.set_page_text("del", "body", "Same text.")
+
+    assert appearance_service.compose_text(
+        "menu", "", "LifeOS", "Choose a category:"
+    ) == ("LifeOS", "Same text.")
+    assert appearance_service.compose_text(
+        "del", "", "Delete", "Choose a deletion scope:"
+    ) == ("Delete", "Same text.")
+    assert appearance_service.compose_text(
+        "save", "", "Save", appearance_service.default_body("save")
+    ) == ("Save", appearance_service.default_body("save"))
+
+
+def test_defaults_are_unchanged_for_every_eligible_page():
+    for page_id in appearance_service.MAIN_PAGE_IDS:
+        expected = (
+            appearance_service.default_title(page_id),
+            appearance_service.default_body(page_id),
+        )
+        assert appearance_service.compose_text(page_id, "", *expected) == expected
+
+
+def test_repeated_rendering_does_not_accumulate_text(persisted):
+    appearance_service.set_header("body", "One shared line.")
+    appearance_service.set_page_text("menu", "body", "One shared line.")
+    live = "Choose a category:"
+
+    rendered = [
+        appearance_service.compose_text("menu", "", "LifeOS", live)
+        for _ in range(5)
+    ]
+    assert all(item == rendered[0] for item in rendered)
+    assert _count(rendered[0][1], "One shared line.") == 1
+
+
+def test_inline_and_callback_composition_agree(persisted):
+    from backend.helper.panel_render import render
+
+    appearance_service.set_header("body", "One shared line.")
+    appearance_service.set_page_text("menu", "body", "One shared line.")
+
+    built = asyncio.run(
+        appearance_service.apply_to_inline_results(
+            "menu", "", [render("LifeOS", "Choose a category:", [])]
+        )
+    )
+    inline_text = built[0].send_message.message
+
+    callback = panels._apply_appearance(
+        "menu", "", ("LifeOS", "Choose a category:", [])
+    )
+    assert inline_text == appearance_service._compose_rendered(
+        callback[0], callback[1]
+    )
+    assert _count(inline_text, "One shared line.") == 1
+
+
+def test_operational_results_and_subviews_are_untouched_by_composition(persisted):
+    appearance_service.set_header("body", "One shared line.")
+    appearance_service.set_page_text("del", "body", "One shared line.")
+
+    confirmation = (
+        "Delete",
+        "Delete the last 25 of your messages?",
+        [],
+    )
+    assert panels._apply_appearance("del", "q:25", confirmation) == confirmation
+    assert appearance_service.compose_text(
+        "del", "q:25", confirmation[0], confirmation[1]
+    ) == confirmation[:2]
+
+    sub_panel = ("Delete From", "Pick a message", [])
+    assert panels._apply_appearance("delfrom", "", sub_panel) == sub_panel
+
+
 def test_subviews_and_results_are_never_customized(persisted):
     appearance_service.set_page_text("del", "title", "Erase")
     appearance_service.set_page_text("del", "body", "Pick one.")
