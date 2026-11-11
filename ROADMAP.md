@@ -74,6 +74,8 @@ its filename prefix (`20261109000000`).
 `pg_trgm` remains in `public` as required by the current canonical setup.
 Moving it is a separate compatibility task.
 
+The Supabase health advisor currently reports no findings.
+
 ## Next feature
 
 The next requested feature is not yet identified unambiguously. Clarify the
