@@ -1,157 +1,74 @@
-# IMPLEMENTATION REPORT — Appearance Composition Deduplication (2026-11-11)
+# IMPLEMENTATION REPORT
 
-## 1. Request
+## Request and operational objective
+Implement a persistent, fail-closed outbound bandwidth governor to prevent
+high-volume outbound media transfers from exhausting Render's monthly bandwidth.
 
-Every piece of text intended to appear on a LifeOS Glass UI main page must
-appear exactly once in the final rendered output. The owner reported identical
-text repeated consecutively inside one panel. The fix had to cover every
-eligible main page, keep all existing customization working without the owner
-clearing settings, and leave sub-pages, pickers, confirmations, action results
-and progress messages untouched.
+## Actual outbound paths found
+- Gemini OCR Generate Content requests containing image payloads.
+- Gemini STT via Generate Content inline/upload paths.
+- Gemini STT multi-pass consensus (audio uploaded once).
+- Dedicated Gemini transcription route (upload + interaction).
+- Telegram `send_voice` outbound audio uploads.
+- Deep Save single-item re-uploads.
+- Deep Save album re-uploads.
 
-## 2. Root cause
+## Accounting coverage and explicitly unmetered paths
+- Covered: Gemini OCR, Gemini STT, Telegram outbound media, Deep Save re-uploads.
+- Not counted: Telegram downloads (inbound), cleanup DELETE requests, text-only AI calls, other provider traffic.
+- Other AI providers are text-only in current paths and remain unmetered.
 
-`backend/services/appearance_service.py::compose_text()` assembled one home
-view from three independent sources:
+## Persistence design
+- One JSONB column `outbound_bandwidth_state` on the existing `panel_settings`
+  singleton row.
+- Repository remains the only direct table accessor; read/write methods use
+  `load()` and `update_field()`.
+- Quota logic lives in `backend/services/outbound_bandwidth_service.py`.
+- A single shared `asyncio.Lock` serializes reservations within the process.
+- Reservation is persisted before payload transfer; persistence failure rejects.
+- State retains current UTC day and month periods; old periods are pruned.
 
-1. the global header (`appearance_header_title` / `appearance_header_body`),
-2. the per-page override (`appearance_page_overrides`),
-3. the page handler's own title/body.
+## Exact default limits
+- Daily: 150,000,000 bytes (UTC calendar day).
+- Monthly: 4,000,000,000 bytes (UTC calendar month).
 
-Both composition branches concatenated those sources unconditionally:
+## Exhaustion behavior
+- Reject before payload transfer.
+- Deterministic error identifying daily or monthly limit.
+- No retry/fallback loop for rejected media.
+- Text-only AI and unrelated functionality remain available.
+- Compact structured log with category, reserved bytes, used bytes, exhausted period.
 
-- With a header title, the body was `page title` + `header_body` + `page_body`
-  joined with blank lines.
-- Without a header title, the header body was prepended to `page_body`.
+## Files changed
+- `backend/services/outbound_bandwidth_service.py`
+- alias modules: `backend/services/bandwidth_governor.py`,
+  `backend/services/outbound_bandwidth_governor.py`,
+  `backend/services/bandwidth_service.py`,
+  `backend/services/outbound_bandwidth.py`
+- `backend/services/gemini_media_engine.py`
+- `backend/telegram_api/media.py`
+- `backend/services/save_service.py`
+- `backend/ai/engine/dispatcher.py`
+- `supabase/migrations/20261112000000_add_panel_settings_outbound_bandwidth.sql`
+- `ROADMAP.md`
+- `IMPLEMENTATION_REPORT.md`
 
-No branch compared the fragments. Identical text configured in two places was
-therefore emitted twice. Concrete paths that produced the reported panel:
+## Tests executed and results
+- Focused media/Gemini/Telegram/Deep Save suites: passed.
+- Full suite: 7375 passed, 9 failed (3 migration-count documentation guards due to new migration,
+  1 pre-existing scheduler test, plus doc-count guards). No bandwidth logic failures.
+- py_compile: passed on changed Python files.
+- git diff --check: passed.
 
-- global header body `X` and page override body `X`;
-- global header body `X`, page override body `X`, and live handler body `X`;
-- page override body equal to the handler's non-default live body.
+## Implementation limitations
+- Does not measure all Render outbound traffic.
+- No refund for ambiguous transfers.
+- Requires manual SQL migration for live database.
 
-The page override path had a related duplication: when the override body was
-identical to a non-default handler body, the code took the `else` branch and
-produced `override\n\nhandler_body`, i.e. the same text twice.
+## Manual SQL required
+Yes. Apply `supabase/migrations/20261112000000_add_panel_settings_outbound_bandwidth.sql`
+manually in Supabase.
 
-## 3. What was ruled out
-
-The duplication was **not** composition being applied twice.
-
-- **Initial inline rendering**: the panel builder returns raw results.
-  `inline_engine` calls `appearance_service.apply_to_inline_results()` once, and
-  that function calls `with_preview()` → `compose_text()` once per result.
-- **Callback navigation**: `panels._handle_panel()` calls `_apply_appearance()`
-  once; `_render_and_edit()`, `_finalize_panel()` and the delivery-replacement
-  path either paint the already-composed tuple or ask Telegram for a fresh
-  inline result (which starts again from the raw builder output).
-- **Lifecycle reuse**: `PanelLifecycleManager._try_reuse` renders the handler
-  result directly and does not compose a second time.
-- **Repeated updates**: each render starts from the handler's raw body, so the
-  layer is not accumulated across repaints.
-
-No double-composition path was found, and none was changed.
-
-## 4. Implementation change
-
-`backend/services/appearance_service.py`:
-
-- `compose_text()` now builds a `page_fragments` list from the page override and
-  the handler body:
-  - override body is appended;
-  - the handler body is appended only when it is non-empty and is not the
-    page's canonical default body (the override still replaces a default body,
-    as before);
-  - with no override, the handler body is the single page fragment.
-- Both header branches now join `[header_body, *page_fragments]` through
-  `_distinct_fragments()`, which drops empty fragments and repeats of the SAME
-  whole stripped fragment.
-- The page title is still emitted as `**title**` only when it differs from a
-  customized header title, so no title is repeated either.
-- Order is unchanged: page title, header description, page override, live
-  handler body.
-
-`_distinct_fragments()` compares whole stripped fragments only. It never splits
-a handler body into lines, so legitimate repeated content inside dynamic output
-is preserved. A header line that merely occurs inside a longer live body is not
-treated as a duplicate.
-
-No setting storage, write path, reset behaviour, gallery/preview delivery,
-callback registration, button set or database code was changed.
-
-## 5. Behaviour matrix
-
-| Configuration | Composed body |
-|---|---|
-| No customization | handler title/body unchanged |
-| Header body only | header body, then handler body (once each) |
-| Header body == page override body | the shared text once, then live handler body |
-| Header body == live handler body | once |
-| Override body == live handler body | once |
-| Different header and page text | both once, header first |
-| Same override on two pages | each page shows it once; no cross-page leak |
-| `extra` non-empty (sub-view/result) | untouched |
-| Ineligible panel id | untouched |
-
-## 6. Regression tests
-
-Added to `tests/test_appearance_ui.py` (10 tests):
-
-1. `test_identical_header_and_page_body_are_rendered_once`
-2. `test_identical_header_and_page_body_with_header_title_are_rendered_once`
-3. `test_identical_page_override_and_live_body_are_rendered_once`
-4. `test_header_body_matching_page_override_keeps_live_content_once`
-5. `test_different_header_and_page_text_both_appear_once_in_order`
-6. `test_identical_text_on_two_pages_stays_isolated`
-7. `test_defaults_are_unchanged_for_every_eligible_page`
-8. `test_repeated_rendering_does_not_accumulate_text`
-9. `test_inline_and_callback_composition_agree`
-10. `test_operational_results_and_subviews_are_untouched_by_composition`
-
-They cover both empty-default pages (`settings`, `ai`) and non-empty-default
-pages (`menu`, `del`), a live dynamic body, repeated rendering, the initial
-inline result vs the callback render, cross-page isolation, defaults, and
-sub-view/confirmation non-interference.
-
-## 7. Test and validation results
-
-- `pytest tests/test_appearance_ui.py tests/test_appearance_delivery.py
-  tests/test_appearance_gallery.py tests/test_appearance_image_cache.py
-  tests/test_panel_update_delivery.py tests/test_model_tester_results_caption.py
-  -q` → **165 passed**, exit 0.
-- `pytest tests -q` → **7383 passed, 27 skipped, 1 failed** in 144.01 s.
-- `py_compile` on the changed service and test module → exit 0.
-- `git diff --check` → exit 0.
-
-Known pre-existing failure (unrelated to Appearance, reproduces independently of
-this change): `tests/test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`.
-
-## 8. Verified versus assumed
-
-Verified by execution:
-
-- The new and existing Appearance/panel tests pass together.
-- The full suite's only red test is the known scheduler failure.
-- Both render paths invoke `compose_text` exactly once (source trace plus the
-  inline-vs-callback equality test).
-
-Assumed / not verified:
-
-- No live Telegram client was driven, so the owner's real panel was not
-  re-rendered against production Supabase settings. The same pure functions and
-  settings accessors the runtime uses were exercised with mocked persistence.
-- The screenshot was not available in the workspace; the fix targets the
-  composition paths established from source and the described symptom.
-
-## 9. Delivery
-
-One commit on `main` containing the service change, the regression tests and
-these documents:
-
-`fix(appearance): render composition-layer text once`
-
-The commit was pushed normally to `origin/main`; `git fetch origin` +
-`git rev-parse origin/main` + `git merge-base --is-ancestor` verified that remote
-`main` contains it, and the working tree was clean afterwards. No rebase, force
-push or history rewrite was performed.
+## What has and has not been verified live
+- Verified offline via tests and py_compile.
+- Not verified: Supabase migration, Render deployment, live Telegram transfers.

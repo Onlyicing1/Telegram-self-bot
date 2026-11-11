@@ -24,6 +24,11 @@ from backend.telegram_api.exceptions import (
     TelegramTimeoutError,
 )
 
+try:
+    from backend.services import outbound_bandwidth_service as _outbound_bandwidth_service
+except Exception:  # noqa: BLE001
+    _outbound_bandwidth_service = None
+
 logger = logging.getLogger(__name__)
 
 #: Finite ceiling for ONE media download. A media transfer (up to the
@@ -126,6 +131,10 @@ async def send_voice(
     """
     if not isinstance(audio, (bytes, bytearray)) or not audio:
         raise TelegramAPIError("send_voice needs audio bytes; nothing was sent.")
+    if _outbound_bandwidth_service is not None:
+        reserve = getattr(_outbound_bandwidth_service, "reserve_outbound_bytes", None)
+        if callable(reserve):
+            await reserve("telegram_media", len(audio))
     effective = _effective_upload_timeout(timeout)
     try:
         message = await guarded_await(
