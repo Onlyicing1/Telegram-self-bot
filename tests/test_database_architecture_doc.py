@@ -64,25 +64,29 @@ def test_every_migration_file_is_classified_in_the_audit_section():
     """§31 is the authoritative inventory: no migration may be omitted."""
     audit = section("## 31. Canonical Database Setup")
     missing = [path.name for path in MIGRATIONS if path.name[:14] not in audit]
-    assert len(MIGRATIONS) == 37, "the repository's migration count changed"
+    assert len(MIGRATIONS) == 38, "the repository's migration count changed"
     assert missing == [], f"migrations absent from §31: {missing}"
-    assert "all 37 migrations" in audit
+    assert "all 38 migrations" in audit
 
 
 def test_migration_status_states_the_same_count():
     status = section("## 22. Migration Status")
     flat = " ".join(status.split())
-    assert "**37** files" in flat
+    assert "**38** files" in flat
     assert "all **36** files" not in flat
 
 
-def test_the_appearance_migration_is_the_last_embedded_part():
+def test_the_appearance_migration_is_part_fifteen():
     audit = section("## 31. Canonical Database Setup")
     assert (
-        "PART 15 of 15 — 20261109000000_add_panel_settings_appearance.sql"
+        "PART 15 of 16 — 20261109000000_add_panel_settings_appearance.sql"
         in audit
     )
-    part = audit[audit.index("PART 15 of 15"):]
+    assert (
+        "PART 16 of 16 — 20261112000000_add_panel_settings_outbound_bandwidth.sql"
+        in audit
+    )
+    part = audit[audit.index("PART 15 of 16"): audit.index("PART 16 of 16")]
     for column, _type, _default in APPEARANCE_COLUMNS:
         assert f"ADD COLUMN IF NOT EXISTS {column}" in part
 
@@ -204,3 +208,17 @@ def test_the_current_state_sections_do_not_call_migrated_tables_missing():
         assert "10 columns missing" not in body, marker
         assert "trigger columns missing" not in body, marker
         assert "tables not migrated" not in body, marker
+
+
+def test_the_outbound_bandwidth_migration_is_part_sixteen():
+    from pathlib import Path
+
+    doc = (Path(__file__).resolve().parent.parent / "DATABASE_ARCHITECTURE.md").read_text(
+        encoding="utf-8"
+    )
+    marker = "PART 16 of 16 — 20261112000000_add_panel_settings_outbound_bandwidth.sql"
+    assert marker in doc
+    part = doc[doc.index(marker):]
+    assert "outbound_bandwidth_state" in part
+    assert "jsonb_typeof(outbound_bandwidth_state) = 'object'" in part
+    assert part.count("ALTER TABLE panel_settings") >= 4

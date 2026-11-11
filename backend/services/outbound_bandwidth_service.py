@@ -272,15 +272,51 @@ def reserve_outbound_bytes_sync(
     return asyncio.run(reserve_outbound_bytes(category, byte_count, now=now))
 
 
+#: At or above this fraction of either budget the usage is "near limit".
+NEAR_LIMIT_RATIO = 0.90
+
+
+def usage_state(daily_used: int, monthly_used: int) -> str:
+    """Classify usage as ``normal``, ``near_limit`` or ``exhausted``."""
+    if daily_used >= DAILY_LIMIT_BYTES or monthly_used >= MONTHLY_LIMIT_BYTES:
+        return "exhausted"
+    if (
+        daily_used >= DAILY_LIMIT_BYTES * NEAR_LIMIT_RATIO
+        or monthly_used >= MONTHLY_LIMIT_BYTES * NEAR_LIMIT_RATIO
+    ):
+        return "near_limit"
+    return "normal"
+
+
 async def get_outbound_usage(now: Optional[datetime] = None) -> Dict[str, Any]:
-    """Return current usage without reserving anything."""
+    """Return current usage without reserving anything.
+
+    ``available`` is ``False`` when the durable accounting state could not be
+    read; callers must show that state rather than treating the zero-valued
+    byte fields as a real reading.  ``detail`` explains an unavailable read.
+    """
     now_dt = _utc_now(now)
     daily_period, monthly_period = _period_keys(now_dt)
+    available = True
+    detail = ""
+    raw_state: Any = {}
     try:
-        raw_state = _read_row_state()
-    except OutboundBandwidthUnavailableError:
+        if not _db_configured():
+            available = False
+            detail = "persistent accounting is not configured"
+        else:
+            raw_state = _read_row_state()
+            if not isinstance(raw_state, dict):
+                available = False
+                detail = "stored bandwidth state is malformed"
+                raw_state = {}
+    except OutboundBandwidthUnavailableError as exc:
+        available = False
+        detail = str(exc) or "accounting state is unavailable"
         raw_state = {}
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        available = False
+        detail = f"accounting read failed ({type(exc).__name__})"
         raw_state = {}
     daily_used, monthly_used = _normalize_state(raw_state, daily_period, monthly_period)
     daily_remaining = max(0, DAILY_LIMIT_BYTES - daily_used)
@@ -294,6 +330,9 @@ async def get_outbound_usage(now: Optional[datetime] = None) -> Dict[str, Any]:
         "monthly_limit_bytes": MONTHLY_LIMIT_BYTES,
         "daily_remaining_bytes": daily_remaining,
         "monthly_remaining_bytes": monthly_remaining,
+        "available": available,
+        "detail": detail,
+        "state": usage_state(daily_used, monthly_used) if available else "unavailable",
         # Aliases.
         "daily_used": daily_used,
         "monthly_used": monthly_used,

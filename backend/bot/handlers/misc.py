@@ -377,6 +377,7 @@ async def _settings_panel_handler(event, extra: str) -> tuple[str, str, list] | 
     builder.add_row("Set Delete Batch Size", "input:settings:delete_batch_size", PRIMARY)
     builder.add_row("Set Log Retention", "input:settings:log_retention_days", PRIMARY)
     builder.add_row("Set Panel Timeout", "input:settings:panel_timeout_seconds", PRIMARY)
+    builder.add_row("Bandwidth Usage", f"panel:{_BANDWIDTH_PANEL}", PRIMARY)
     builder.add_row("Font", "panel:font", PRIMARY)
     return "Settings", await _build_settings_body(), builder.build()
 
@@ -546,9 +547,110 @@ async def _settings_language_handler(text, chat_id, msg_id, inline_chat_id, inli
             pass
 
 
+# ── Outbound bandwidth usage (read-only governor view) ────────────────────
+#: Child panel of Settings. It reads ONLY through the governor's
+#: ``get_outbound_usage()``; the handler never queries Supabase directly.
+_BANDWIDTH_PANEL = "bandwidth"
+_BANDWIDTH_UTC_NOTE = (
+    "Accounting periods use UTC — the daily period resets at 00:00 UTC and "
+    "the monthly period at 00:00 UTC on the 1st."
+)
+
+_BANDWIDTH_STATE_LABELS = {
+    "normal": "Normal",
+    "near_limit": "Near limit",
+    "exhausted": "Exhausted",
+}
+
+
+def _format_bandwidth_bytes(value) -> str:
+    """Render a byte count in decimal MB/GB with useful precision."""
+    try:
+        count = max(0, int(value))
+    except (TypeError, ValueError):
+        return "—"
+    if count >= 1_000_000_000:
+        return f"{count / 1_000_000_000:.3f} GB"
+    if count >= 1_000_000:
+        return f"{count / 1_000_000:.3f} MB"
+    if count >= 1_000:
+        return f"{count / 1_000:.1f} KB"
+    return f"{count} B"
+
+
+def _bandwidth_unavailable_body(detail: str) -> str:
+    return "\n".join([
+        f"{sym.STATE_WARNING} **Usage unavailable**",
+        "",
+        detail or "The stored accounting state could not be read.",
+        "",
+        "No usage figures are shown because an unreadable state cannot be "
+        "distinguished from a real zero by showing numbers.",
+        "",
+        _BANDWIDTH_UTC_NOTE,
+    ])
+
+
+def _bandwidth_body(usage: dict) -> str:
+    state = str(usage.get("state") or "normal")
+    label = _BANDWIDTH_STATE_LABELS.get(state, state)
+    return "\n".join([
+        f"**Today (UTC)** · {usage.get('daily_period') or '—'}",
+        f"Used: {_format_bandwidth_bytes(usage.get('daily_used_bytes'))} "
+        f"of {_format_bandwidth_bytes(usage.get('daily_limit_bytes'))}",
+        f"Remaining: {_format_bandwidth_bytes(usage.get('daily_remaining_bytes'))}",
+        "",
+        f"**This month (UTC)** · {usage.get('monthly_period') or '—'}",
+        f"Used: {_format_bandwidth_bytes(usage.get('monthly_used_bytes'))} "
+        f"of {_format_bandwidth_bytes(usage.get('monthly_limit_bytes'))}",
+        f"Remaining: {_format_bandwidth_bytes(usage.get('monthly_remaining_bytes'))}",
+        "",
+        f"**State:** {label}",
+        "",
+        _BANDWIDTH_UTC_NOTE,
+    ])
+
+
+async def _bandwidth_render(*, notice: str = "") -> tuple[str, str, list]:
+    from backend.services import outbound_bandwidth_service
+
+    try:
+        usage = await outbound_bandwidth_service.get_outbound_usage()
+    except Exception as exc:  # noqa: BLE001 — never fabricate a reading
+        usage = {
+            "available": False,
+            "detail": f"accounting read failed ({type(exc).__name__})",
+        }
+
+    if usage.get("available", True) is False:
+        body = _bandwidth_unavailable_body(str(usage.get("detail") or ""))
+    else:
+        body = _bandwidth_body(usage)
+        if notice:
+            body = f"{body}\n\n{notice}"
+
+    builder = InlinePanelBuilder()
+    builder.add_row(sym.label(sym.OP_REFRESH, "Refresh"), "action:bandwidth_refresh", PRIMARY)
+    return "Bandwidth Usage", body, builder.build()
+
+
+async def _bandwidth_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
+    return await _bandwidth_render()
+
+
+async def _bandwidth_refresh_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    """Re-read usage and repaint the SAME panel message (never a second one)."""
+    return await _bandwidth_render(notice=f"{sym.OP_REFRESH} Refreshed from the accounting service.")
+
+
 def _register_panels() -> None:
     register_panel("settings", _settings_panel_handler, parent="menu", title="Settings")
     register_inline_builder("settings", _settings_inline_builder)
+    register_panel(
+        _BANDWIDTH_PANEL, _bandwidth_panel_handler, parent="settings",
+        title="Bandwidth Usage",
+    )
+    register_action("bandwidth_refresh", _bandwidth_refresh_action)
     register_panel("general", _general_panel_handler, parent="menu", title="General")
     register_inline_builder("general", _general_inline_builder)
     register_panel(
