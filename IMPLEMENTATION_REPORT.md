@@ -129,6 +129,7 @@ It remains the most important unresolved security decision.
   a separate index/operator compatibility review.
 - Performance: 22 unused-index findings. Usage counters alone are not enough
   evidence to delete indexes on a low/unknown-traffic project.
+- Health advisor: no findings.
 - Performance: four duplicate-index pairs on `ai_sessions`, `bio_state`,
   `bot_logs` and `saved_items`. They were not dropped without reviewing
   definitions and query plans.
