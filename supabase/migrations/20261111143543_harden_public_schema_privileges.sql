@@ -20,7 +20,7 @@ REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER
     FROM anon, authenticated;
 
 -- Prevent the broad table/sequence grants observed in the live default ACLs
--- from being reintroduced by future objects created by either migration owner.
+-- from being reintroduced by future objects created by the postgres migration owner.
 ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public
     REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER
     ON TABLES FROM anon, authenticated;
