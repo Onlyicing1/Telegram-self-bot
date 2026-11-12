@@ -67,6 +67,7 @@ def _build_general_buttons() -> list:
         "action:general_toggle_intelligent_reaction",
         PRIMARY,
     )
+    builder.add_row("Set Reaction Probability", "input:general:intelligent_reaction_probability", PRIMARY)
     builder.add_row("Select Reaction", f"panel:{_REACTION_PANEL}", PRIMARY)
     return builder.build()
 
@@ -76,6 +77,7 @@ async def _general_body() -> str:
 
     auto = settings_service.is_auto_reaction_enabled()
     intel = settings_service.is_intelligent_reaction_enabled()
+    probability = settings_service.intelligent_reaction_probability()
     emoji = settings_service.auto_reaction_emoji()
     selected = emoji if emoji else "— none —"
     return (
@@ -83,8 +85,11 @@ async def _general_body() -> str:
         "Tap a button to execute instantly.\n\n"
         f"Auto-Reaction: {sym.label(sym.OP_SAVE, 'ON') if auto else sym.label(sym.OP_CLOSE, 'OFF')}\n"
         f"Selected reaction: {selected}\n"
-        f"Intelligent Reaction: {sym.label(sym.OP_SAVE, 'ON') if intel else sym.label(sym.OP_CLOSE, 'OFF')}\n\n"
-        "_The two reaction modes are mutually exclusive: turning one ON turns the other OFF._"
+        f"Intelligent Reaction: {sym.label(sym.OP_SAVE, 'ON') if intel else sym.label(sym.OP_CLOSE, 'OFF')}\n"
+        f"Reaction Probability: {probability}%\n\n"
+        "_The two reaction modes are mutually exclusive: turning one ON turns the other OFF._\n\n"
+        "_Probability is the owner's fixed setting; the AI never changes it. "
+        "0% never reacts, 100% always reacts._"
     )
 
 
@@ -683,6 +688,14 @@ def _register_panels() -> None:
         "general_toggle_intelligent_reaction",
         _general_toggle_intelligent_reaction_action,
     )
+    register_input("general", "intelligent_reaction_probability", {
+        "handler": _general_intelligent_reaction_probability_handler,
+        "prompt": (
+            "**Reaction Probability**\n\n"
+            "Enter a whole number from 0 to 100 (0 never reacts, 100 always reacts):\n\n"
+            "_Reply below._"
+        ),
+    })
     register_input("settings", "auto_close_delay", {
         "handler": _settings_auto_close_delay_handler,
         "prompt": "**Auto-close Delay**\n\nEnter delay in seconds (5-3600):\n\n_Reply below._",
@@ -748,6 +761,40 @@ async def _general_toggle_intelligent_reaction_action(
     if enabled:
         notice += " Auto-Reaction was turned OFF."
     return "General", notice, _build_general_buttons()
+
+
+async def _general_intelligent_reaction_probability_handler(
+    text, chat_id, msg_id, inline_chat_id, inline_msg_id,
+):
+    """Store the owner's fixed reaction probability (0–100 inclusive).
+
+    Validated before the write; a rejected database write is reported honestly
+    and leaves the effective value untouched (strict setter).
+    """
+    from backend.services import settings_service
+    from backend.helper.inline_engine import _self_client
+
+    raw = (text or "").strip().rstrip("%").strip()
+    if raw.isdigit() and 0 <= int(raw) <= 100:
+        percent = int(raw)
+        if settings_service.set_intelligent_reaction_probability(percent):
+            body = f"Reaction probability set to {percent}%"
+        else:
+            body = "Could not save the reaction probability; it was left unchanged."
+    else:
+        body = "Please enter a whole number between 0 and 100. Nothing was changed."
+
+    helper = get_client()
+    if helper and inline_chat_id and inline_msg_id:
+        try:
+            await helper.edit_message(inline_chat_id, inline_msg_id, body)
+        except Exception as exc:
+            logger.warning("settings intelligent_reaction_probability inline edit failed: %s", exc)
+    if _self_client:
+        try:
+            await _self_client.delete_messages(chat_id, [msg_id])
+        except Exception:
+            pass
 
 
 async def _general_id_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:

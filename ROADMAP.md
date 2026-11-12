@@ -81,24 +81,31 @@ The Supabase health advisor currently reports no findings.
 AI-driven reactions on the owner's own outgoing messages, independent of the
 fixed Auto-Reaction setting:
 
-- The AI returns a per-message `probability` (0–100) and a reaction from
-  Telegram's available-reaction catalog, or no reaction. There is no fixed
-  ratio, global quota, rolling window or compensation for missed messages.
-- Each message then passes its own independent random draw
-  (`draw * 100 < probability`); 0% never reacts and 100% always does.
+- The probability is OWNER configuration, not an AI decision:
+  `panel_settings.intelligent_reaction_probability` (integer 0–100, default 25)
+  is set in the General panel and read for every eligible message, so a change
+  applies without a restart. The AI never returns or overrides a probability.
+- The AI answers only `{"reaction": <catalog emoji|null>}` — a legacy
+  `probability` field invalidates the whole answer. Deterministic application
+  code owns the probability: 0% never reacts, 100% always does, and every other
+  value performs exactly one independent draw per message (no quota, rolling
+  window, streak or compensation).
 - Execution reuses the existing path: `reaction_service.react_to_message` →
   `telegram_api.reactions.send_reaction`. The target is always the owner's
   own outgoing message; a replied-to message is context only.
 - Context is bounded: the message text plus at most ONE replied-to text. No
   ids, sender identity, usernames or chat history reach the model.
-- Fail closed: a provider failure, invalid output, an unsupported reaction or
-  a refused Telegram call sends nothing and never falls back to a fixed emoji.
+- Fail closed: an unavailable catalog, a provider failure, invalid or legacy
+  output, an unsupported reaction or a refused Telegram call sends nothing and
+  never falls back to a fixed emoji. One stable outcome status per evaluation.
 - The two reaction modes are mutually exclusive in `settings_service`:
   enabling one disables the other.
 
 Tests: `tests/test_intelligent_reaction.py` (offline, scripted provider and
-Telegram fakes). Migration
+Telegram fakes). Migrations:
 `supabase/migrations/20261112140000_add_panel_settings_intelligent_reaction.sql`
 adds the single `panel_settings.intelligent_reaction_enabled` column (part 17
-of the one-paste setup) and is **not yet applied** — that remains a manual
-owner action.
+of the one-paste setup), and
+`supabase/migrations/20261112160000_add_panel_settings_intelligent_reaction_probability.sql`
+adds the probability-only column (0–100 CHECK, default 25) without touching the
+enabled column. Neither is **applied** — that remains a manual owner action.
