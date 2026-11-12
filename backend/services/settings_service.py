@@ -48,6 +48,7 @@ Architecture:
 | dashboard_font          | str     | "default" | one of DASHBOARD_FONTS  |
 | auto_reaction_enabled   | bool    | false   | must be boolean         |
 | auto_reaction_emoji     | str     | ""      | non-empty string (a Telegram reaction emoji) |
+| intelligent_reaction_enabled | bool | false  | must be boolean         |
 | appearance_header_title | str     | ""      | bounded text ("" = default header) |
 | appearance_header_body  | str     | ""      | bounded text ("" = default header) |
 | appearance_page_overrides | jsonb | {}      | page id → {title?, body?}, each bounded |
@@ -86,6 +87,7 @@ _DEFAULTS: dict[str, Any] = {
     "dashboard_font": "default",
     "auto_reaction_enabled": False,
     "auto_reaction_emoji": "",
+    "intelligent_reaction_enabled": False,
     "appearance_header_title": "",
     "appearance_header_body": "",
     "appearance_page_overrides": {},
@@ -181,6 +183,7 @@ _VALIDATORS: dict[str, ValidatorFn] = {
     "dashboard_font": _validate_dashboard_font,
     "auto_reaction_enabled": _validate_bool,
     "auto_reaction_emoji": _validate_nonempty_str,
+    "intelligent_reaction_enabled": _validate_bool,
     "appearance_header_title": _validate_appearance_text,
     "appearance_header_body": _validate_appearance_text,
     "appearance_page_overrides": _validate_page_overrides,
@@ -451,7 +454,16 @@ def is_auto_reaction_enabled() -> bool:
 
 
 def set_auto_reaction_enabled(enabled: bool) -> bool:
-    return set_setting("auto_reaction_enabled", bool(enabled))
+    """Enable/disable the fixed Auto-Reaction mode.
+
+    The two reaction modes are mutually exclusive: enabling this one turns
+    Intelligent Reaction OFF in the same operation. Disabling writes nothing
+    else, so the ordinary off-switch stays a single-column write.
+    """
+    ok = set_setting("auto_reaction_enabled", bool(enabled))
+    if ok and enabled and is_intelligent_reaction_enabled():
+        set_setting("intelligent_reaction_enabled", False)
+    return ok
 
 
 def toggle_auto_reaction() -> bool:
@@ -474,6 +486,32 @@ def auto_reaction_emoji() -> str:
 
 def set_auto_reaction_emoji(emoji: str) -> bool:
     return set_setting("auto_reaction_emoji", emoji)
+
+
+def is_intelligent_reaction_enabled() -> bool:
+    """Whether the AI-driven Intelligent Reaction mode is enabled.
+
+    Independent of the fixed Auto-Reaction setting: this mode never reads
+    ``auto_reaction_emoji``. The two are mutually exclusive, and
+    ``set_intelligent_reaction_enabled(True)`` enforces that.
+    """
+    _ensure_loaded()
+    return bool(_cache.get("intelligent_reaction_enabled", False))
+
+
+def set_intelligent_reaction_enabled(enabled: bool) -> bool:
+    """Enable/disable Intelligent Reaction, turning Auto-Reaction OFF on enable."""
+    ok = set_setting("intelligent_reaction_enabled", bool(enabled))
+    if ok and enabled and is_auto_reaction_enabled():
+        set_setting("auto_reaction_enabled", False)
+    return ok
+
+
+def toggle_intelligent_reaction() -> bool:
+    """Flip Intelligent Reaction and return its NEW value."""
+    new_val = not is_intelligent_reaction_enabled()
+    set_intelligent_reaction_enabled(new_val)
+    return new_val
 
 
 # ── Typed accessors: Appearance personalization ──

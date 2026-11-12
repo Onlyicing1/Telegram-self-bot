@@ -76,8 +76,29 @@ Moving it is a separate compatibility task.
 
 The Supabase health advisor currently reports no findings.
 
-## Next feature
+## Implemented: Intelligent Reaction (backend)
 
-The next requested feature is not yet identified unambiguously. Clarify the
-user's earlier reference before starting implementation; do not infer a
-feature from the typo or create a speculative roadmap.
+AI-driven reactions on the owner's own outgoing messages, independent of the
+fixed Auto-Reaction setting:
+
+- The AI returns a per-message `probability` (0–100) and a reaction from
+  Telegram's available-reaction catalog, or no reaction. There is no fixed
+  ratio, global quota, rolling window or compensation for missed messages.
+- Each message then passes its own independent random draw
+  (`draw * 100 < probability`); 0% never reacts and 100% always does.
+- Execution reuses the existing path: `reaction_service.react_to_message` →
+  `telegram_api.reactions.send_reaction`. The target is always the owner's
+  own outgoing message; a replied-to message is context only.
+- Context is bounded: the message text plus at most ONE replied-to text. No
+  ids, sender identity, usernames or chat history reach the model.
+- Fail closed: a provider failure, invalid output, an unsupported reaction or
+  a refused Telegram call sends nothing and never falls back to a fixed emoji.
+- The two reaction modes are mutually exclusive in `settings_service`:
+  enabling one disables the other.
+
+Tests: `tests/test_intelligent_reaction.py` (offline, scripted provider and
+Telegram fakes). Migration
+`supabase/migrations/20261112140000_add_panel_settings_intelligent_reaction.sql`
+adds the single `panel_settings.intelligent_reaction_enabled` column (part 17
+of the one-paste setup) and is **not yet applied** — that remains a manual
+owner action.

@@ -61,6 +61,12 @@ def _build_general_buttons() -> list:
         "action:general_toggle_auto_reaction",
         PRIMARY,
     )
+    intel = settings_service.is_intelligent_reaction_enabled()
+    builder.add_row(
+        f"Intelligent Reaction: {sym.label(sym.OP_SAVE, 'ON') if intel else sym.label(sym.OP_CLOSE, 'OFF')}",
+        "action:general_toggle_intelligent_reaction",
+        PRIMARY,
+    )
     builder.add_row("Select Reaction", f"panel:{_REACTION_PANEL}", PRIMARY)
     return builder.build()
 
@@ -69,13 +75,16 @@ async def _general_body() -> str:
     from backend.services import settings_service
 
     auto = settings_service.is_auto_reaction_enabled()
+    intel = settings_service.is_intelligent_reaction_enabled()
     emoji = settings_service.auto_reaction_emoji()
     selected = emoji if emoji else "— none —"
     return (
         "**General**\n\n"
         "Tap a button to execute instantly.\n\n"
         f"Auto-Reaction: {sym.label(sym.OP_SAVE, 'ON') if auto else sym.label(sym.OP_CLOSE, 'OFF')}\n"
-        f"Selected reaction: {selected}"
+        f"Selected reaction: {selected}\n"
+        f"Intelligent Reaction: {sym.label(sym.OP_SAVE, 'ON') if intel else sym.label(sym.OP_CLOSE, 'OFF')}\n\n"
+        "_The two reaction modes are mutually exclusive: turning one ON turns the other OFF._"
     )
 
 
@@ -670,6 +679,10 @@ def _register_panels() -> None:
     register_action("general_id", _general_id_action)
     register_action("general_health", _general_health_action)
     register_action("general_toggle_auto_reaction", _general_toggle_auto_reaction_action)
+    register_action(
+        "general_toggle_intelligent_reaction",
+        _general_toggle_intelligent_reaction_action,
+    )
     register_input("settings", "auto_close_delay", {
         "handler": _settings_auto_close_delay_handler,
         "prompt": "**Auto-close Delay**\n\nEnter delay in seconds (5-3600):\n\n_Reply below._",
@@ -697,10 +710,10 @@ async def _general_ping_action(event, extra: str, chat_id: int) -> tuple[str, st
 
 
 async def _general_toggle_auto_reaction_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
-    """Toggle the Auto-Reaction SETTING and re-render the General panel.
+    """Toggle the fixed Auto-Reaction setting and re-render the General panel.
 
-    This flips the persisted setting only — no reaction engine exists yet, so
-    nothing reacts to any message as a side effect of this toggle.
+    Enabling it turns Intelligent Reaction OFF (the two modes are mutually
+    exclusive) — the label above the buttons reflects the resulting pair.
     """
     from backend.services import settings_service
 
@@ -710,6 +723,30 @@ async def _general_toggle_auto_reaction_action(event, extra: str, chat_id: int) 
         f"**General**\n\nAuto-Reaction is now "
         f"{sym.label(sym.OP_SAVE, 'ON') if enabled else sym.label(sym.OP_CLOSE, 'OFF')}."
     )
+    if enabled:
+        notice += " Intelligent Reaction was turned OFF."
+    return "General", notice, _build_general_buttons()
+
+
+async def _general_toggle_intelligent_reaction_action(
+    event, extra: str, chat_id: int,
+) -> tuple[str, str, list] | None:
+    """Toggle the AI-driven Intelligent Reaction setting.
+
+    Enabling it turns the fixed Auto-Reaction OFF (the two modes are mutually
+    exclusive). The AI evaluates each outgoing message only while this setting
+    is ON; nothing reacts as a side effect of the click itself.
+    """
+    from backend.services import settings_service
+
+    settings_service.toggle_intelligent_reaction()
+    enabled = settings_service.is_intelligent_reaction_enabled()
+    notice = (
+        f"**General**\n\nIntelligent Reaction is now "
+        f"{sym.label(sym.OP_SAVE, 'ON') if enabled else sym.label(sym.OP_CLOSE, 'OFF')}."
+    )
+    if enabled:
+        notice += " Auto-Reaction was turned OFF."
     return "General", notice, _build_general_buttons()
 
 

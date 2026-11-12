@@ -71,14 +71,14 @@
 
 This section answers one operational question: **what exactly does the owner
 paste?** The block in §31.3 remains the canonical schema setup: the reconciliation
-snapshot first, then the fifteen additive migrations (parts 2–16). The live
+snapshot first, then the sixteen additive migrations (parts 2–17). The live
 project additionally requires the separately tracked post-setup privilege
 hardening migration listed in §22; that operational hardening layer is not
 embedded in the schema snapshot. There is
 no "step 0", no second block to paste and no shell workflow. Open this section,
 copy §31.3, paste it into the Supabase SQL Editor as `postgres` and run it. §31.1 is the
 reconciliation audit that proves the block equals the effective final state of
-the 38 schema migration files classified below — including the two Todo migrations
+the 39 schema migration files classified below — including the two Todo migrations
 `20260926000001_add_todo_schedule_type.sql`,
 `20260927000001_add_todo_steps.sql`, the Taskloom question-status widening
 `20260927020000_add_waiting_answer_status.sql` (classified additive: it only
@@ -94,36 +94,36 @@ were created with, and adds no table of its own) and the Auto-Reaction columns
 part 14: the two `panel_settings` columns `settings_service` writes, which no
 earlier migration created).
 
-### 31.1 Reconciliation audit — 38 schema migrations; 16 embedded schema parts
+### 31.1 Reconciliation audit — 39 schema migrations; 17 embedded schema parts
 
 The script in §31.3 was reconciled against **every file currently in
-`supabase/migrations/` (38 schema migration files; the 39th file is the separately applied privilege-hardening migration documented in §22)**, not against the list any earlier document
+`supabase/migrations/` (40 files: 39 schema migrations — all 39 migrations are accounted for below — plus the separately applied privilege-hardening migration documented in §22)**, not against the list any earlier document
 carried. Each migration was classified by its **effective schema change** —
 what a fresh database must end up with after it runs — and the classification
 is pinned by `tests/test_database_setup_order.py` (statement-identity for the
-sixteen embedded parts) and `tests/test_canonical_schema_reconciliation.py
+seventeen embedded parts) and `tests/test_canonical_schema_reconciliation.py
 (column/constraint/seed equivalence for the snapshot).
 
-**The sixteen migrations whose SQL is embedded verbatim (parts 1–16 of §31.3):**
+**The seventeen migrations whose SQL is embedded verbatim (parts 1–17 of §31.3):**
 
 | Order | Migration | Objects it establishes | Its SQL in this document |
 |---|---|---|---|
-| 1 | `20260920000001_reconcile_canonical_schema.sql` | `pg_trgm`; all 16 canonical tables, every column re-asserted with `ADD COLUMN IF NOT EXISTS` + deterministic backfill + final default/NOT NULL binding; data-guarded constraints, indexes and identity constraints; RLS + SELECT-only `anon`/`authenticated` policies on all 16 tables; the `panel_settings('global')` and five `bot_settings` seeds; the post-`COMMIT` drift report | **§31.3, part 1 of 16** — the complete canonical reconciliation SQL, physically inside the one deployment block |
-| 2 | `20260919000001_create_api_credential_vault.sql` | `supabase_vault` extension (`WITH SCHEMA vault`); `api_credentials` metadata table (no secret column) + `idx_api_credentials_provider_order`, `idx_api_credentials_owner`, `uq_api_credentials_vault_secret`; RLS, `REVOKE`/`GRANT` and the column/table `COMMENT`s; `api_credential_pool(text, bigint)`; deprecated alias `stt_credential_pool(text, bigint)`; `NOTIFY pgrst` | **§31.3, part 2 of 16** (the object contract is also documented in §29.10) |
-| 3 | `20260919000002_credential_vault_management.sql` | `api_credential_list(bigint, text)`, `api_credential_create(bigint, text, text, text, integer, boolean)`, `api_credential_replace_secret(bigint, text, text)`, `api_credential_update(bigint, text, text, boolean, integer)`, `api_credential_delete(bigint, text)` — each `SECURITY DEFINER`, `SET search_path = ''`, `OWNER TO postgres`, `REVOKE`d from `PUBLIC`/`anon`/`authenticated`, `GRANT`ed to `service_role`, and carrying its own `COMMENT`; `NOTIFY pgrst` | **§31.3, part 3 of 16** (documented in §29.14) |
-| 4 | `20260921000001_add_saved_items_display_name.sql` | `saved_items.display_name text` (nullable, no default, no backfill); `NOTIFY pgrst`; a `SELECT`-based verification query | **§31.3, part 4 of 16** |
-| 5 | `20260922000001_add_saved_items_search_indexes.sql` | `pg_trgm` again (`IF NOT EXISTS`); `idx_saved_items_display_name_trgm` (GIN trigram on `display_name`); `idx_saved_items_tags` (GIN on `tags`); `NOTIFY pgrst`; a `SELECT`-based verification query | **§31.3, part 5 of 16** |
-| 6 | `20260923000001_add_ai_config_tts_settings.sql` | `ai_config.tts_provider text`, `ai_config.tts_model text`, `ai_config.tts_voice text` (all nullable, no default, no backfill, no CHECK — the capability registry is the authority on the tokens); `NOTIFY pgrst`; a `SELECT`-based verification query over `information_schema.columns` | **§31.3, part 6 of 16** |
-| 7 | `20260926000001_add_todo_schedule_type.sql` | `ai_tasks_schedule_type_check` re-added with `'todo'` in the enum (the basic Todo item — an unscheduled, owner-managed row); `ai_tasks_actions_count` re-added as a CONDITIONAL check so only a `'todo'` row may store 0 actions while every scheduled row keeps 1–5; `NOTIFY pgrst`. No table, no column, no index, no policy, no grant and no row change | **§31.3, part 7 of 16** (the row shape is documented in §15) |
-| 8 | `20260927000001_add_todo_steps.sql` | The ONE new object of the multi-step phase: the `todo_steps` table — the ordered steps of ONE todo (`task_id` → `ai_tasks(id)` `ON DELETE CASCADE`; denormalized `owner_id`; 1-based `position` with `UNIQUE (task_id, position)`; nonblank ≤256-char `title`; `status` CHECK `active`/`completed`; CAS `version`; `completed_at` bound to the status; timestamps) + `RLS` + SELECT-only `anon`/`authenticated` policy + `NOTIFY pgrst` + a `SELECT`-based verification query. Additive: no existing table, column, index, policy, grant or row is touched | **§31.3, part 8 of 16** (the table is documented in §15) |
-| 9 | `20260928000001_create_emoji_reaction_tables.sql` | The FIVE persistence tables of the Emoji & Reaction feature, in their final shape: `emoji_library` (owner-scoped premium-emoji definitions, `UNIQUE (owner_id, document_id)`, Telegram's own `alt_text`, `source`/`source_msg_id` provenance), `emoji_categories` (`UNIQUE (owner_id, name)`, the explicit `is_custom` flag and the ordered `source_category_ids` snapshot list of a Custom Category), `emoji_mappings` (`UNIQUE (owner_id, category_id, simple_emoji)` — references `document_id`, never duplicates a definition), `emoji_state` (ONE global row per owner: the `replacement_enabled` toggle defaulting to `false` — OFF on first boot — and the global default category) and `emoji_chat_overrides` (per-chat override state of the implemented-but-NOT-owner-approved override path; the approved Active Category scope is global-only, §32). Plus the three read indexes the repository actually uses, the Phase 5 columns re-asserted with `ADD COLUMN IF NOT EXISTS`, RLS + SELECT-only `anon`/`authenticated` policies on all five, table/column `COMMENT`s, `NOTIFY pgrst` and verification queries. Additive: no existing table, column, index, policy, grant or row is touched, and NO foreign key is created (the emoji references are application-level, like every other identifier relationship in this database) | **§31.3, part 9 of 16** (the tables are documented in §32) |
-| 10 | `20260929000001_create_private_message_tables.sql` | The TWO persistence tables of Private Message Management (§33), in their final shape: `private_message_config` (ONE row per owner — the master `enabled` switch, the access state the panel edits (`mode`, `allowlist`, `exceptions`, `temporary`, `schedule`), the THREE independent action flags `delete_incoming` / `fixed_response_enabled` / `ai_response_enabled`, the `fixed_response_text`, the finite per-person allowance `ai_max_replies_per_person` with its explicit `ai_unlimited_replies` option, and `ai_interval_seconds` where `0` is a supported no-delay value) and `private_message_senders` (durable per-person AI-reply counters — `PRIMARY KEY (owner_id, sender_id)`, `ai_replies_used`, `last_ai_reply_at` — claimed by ONE bounded conditional update and given back by the compensating CAS when nothing was delivered). Plus the one read index, RLS + SELECT-only `anon`/`authenticated` policies on both, table/column `COMMENT`s, `NOTIFY pgrst`, table/column verification queries and a read-only legacy probe of the Phase-1 `bot_settings` document that is imported once by the application. Additive: no existing table, column, index, policy, grant or row is touched, and NO foreign key is created (the sender reference is application-level, like every other identifier relationship in this database). The scope (genuine human users in direct private chats only) is enforced in code and is NOT a schema-level or configuration-level choice. The `SELECT`-only `anon`/`authenticated` boundary this file establishes is SUPERSEDED by part 13 | **§31.3, part 10 of 16** (the tables are documented in §33) |
-| 11 | `20261016000001_add_private_message_counter_reset.sql` | The automatic per-person counter reset of Private Message Management (§33.2): `private_message_config.ai_counter_reset_enabled boolean NOT NULL DEFAULT false` (the switch — OFF by default, so applying it can never start resetting anything), `private_message_config.ai_counter_reset_seconds integer NOT NULL DEFAULT 86400` with `private_message_config_reset_interval_range` CHECK `BETWEEN 60 AND 31536000` (the panel's own bounds), and `private_message_senders.window_started_at timestamptz` (NULLABLE on purpose — NULL is "no window recorded yet" and is started by the next counted reply; no default, no backfill). Plus the three column `COMMENT`s, `NOTIFY pgrst` and three verification queries (both config columns, the window column, the constraint). Additive ALTER only: it creates no table, no index, no policy, no grant and no row, rewrites nothing and changes no existing value | **§31.3, part 11 of 16** (the columns are documented in §33.1/§33.2) |
-| 12 | `20261017000001_create_anti_edit_delete_tables.sql` | The TWO persistence tables of Anti-Edit / Anti-Delete (§34), in their final shape: `aed_config` (ONE row per owner — the master `enabled` switch, the `categories text[]` content filter that is never empty, and `retention_days` 1..3650) and `aed_archive_entries` (one row per observed archive record — the deterministic `id` primary key/idempotency key, `owner_id`, the POSITIVE private `chat_id` (`CHECK > 0` — a group/supergroup/channel row is structurally impossible), `message_id`, `kind` (`snapshot`/`edit`/`delete`), the content `category`, `has_caption`, `captured_at`, `message_date`, `edited_at`, `sender_id`, `out`, `has_media`, the bounded `body`, the media metadata (`media_type`/`media_name`/`media_size`/`media_stored`/`media_object`), `recoverable`/`recovered_from` and the bounded peer identity `peer_id`/`peer_username`/`peer_name`). Plus one read index, RLS enabled with ZERO policies and a service-role-only posture — every privilege revoked from `PUBLIC`/`anon`/`authenticated` (table-level AND column-level) and only SELECT/INSERT/UPDATE/DELETE granted to `service_role`, with the legacy permissive read policies dropped by name — table/column `COMMENT`s, `NOTIFY pgrst`, table/column verification queries and a read-only legacy probe of the Phase-1 `bot_settings` documents that are read while the tables are absent. Additive: no existing table, column, index, policy, grant or row is touched, and NO foreign key is created (the peer reference is application-level, like every other identifier relationship in this database). The scope (genuine private human-to-human conversations only) is enforced in code; the `chat_id > 0` CHECK is its structural backstop | **§31.3, part 12 of 16** (the tables are documented in §34) |
-| 13 | `20261020144423_harden_private_message_table_access.sql` | The Private Message Management access hardening (§33.4): RLS re-asserted on both tables, the eight named policy drops — the two `anon_select_private_message_*` policies the creation migration actually created plus the `anon_insert_*` / `anon_update_*` / `anon_delete_*` names it already dropped defensively — so a database that still carries any of them converges to the restrictive posture; every privilege REVOKED from `PUBLIC`/`anon`/`authenticated` (table-level AND column-level, because a table `REVOKE` cannot clear a legacy per-column grant), and exactly SELECT/INSERT/UPDATE/DELETE GRANTed to `service_role` (the four verbs `backend/db/client.py` uses). It creates ZERO policies, so with RLS enabled every client role is denied at the table by construction while `service_role` bypasses RLS. Plus two table `COMMENT`s that state the posture, `NOTIFY pgrst` and five read-only verification queries (client table grants, client column grants, policy count, the two RLS flags, the four service-role grants). Grant/policy/comment change only: no table, column, index, constraint, row or stored value is created, dropped or rewritten, and no unrelated policy or grant is touched | **§31.3, part 13 of 16** (the model is documented in §33.4) |
-| 14 | `20261020160000_add_panel_settings_auto_reaction_settings.sql` | The Auto-Reaction setting's TWO `panel_settings` columns (§6), which `settings_service` writes and `auto_reaction_service` reads on every outgoing message: `auto_reaction_enabled boolean NOT NULL DEFAULT false` (OFF by default — applying it can never enable a reaction) and `auto_reaction_emoji text NOT NULL DEFAULT ''` (`''` = none selected). Each is added WITHOUT a default first so an existing column keeps its value, then the final default is bound, only `NULL`s are backfilled, and the `NOT NULL` binding is applied — so no valid stored value is ever replaced. Plus `NOTIFY pgrst` and one column-count verification query. Additive ALTER only: no table, index, constraint, policy, grant or row is created, and the existing RLS/SELECT-only boundary is unchanged | **§31.3, part 14 of 16** (§6 documents the columns) |
-| 15 | `20261109000000_add_panel_settings_appearance.sql` | The Appearance personalization's FIVE `panel_settings` columns (§6): `appearance_header_title text NOT NULL DEFAULT ''` and `appearance_header_body text NOT NULL DEFAULT ''` (the shared global header; `''` = built-in default, so a reset stores the empty value, never a copy of the current customization), `appearance_page_overrides jsonb NOT NULL DEFAULT '{}'` (page id → `{title?, body?}`, each text bounded), `appearance_preview_enabled boolean NOT NULL DEFAULT false` (the independent preview switch) and `appearance_preview_image_key text NOT NULL DEFAULT ''` (a Storage OBJECT KEY only — never image bytes and never a signed/expiring URL). Each is added WITHOUT a default first so an existing column keeps its value, then the final default is bound, only `NULL`s are backfilled, and the `NOT NULL` binding is applied. Adds length/NUL CHECKs on the two text columns, a `jsonb_typeof(appearance_page_overrides) = 'object'` CHECK and a Storage-path regex CHECK, re-seeds the `('global')` row idempotently, and ends with `NOTIFY pgrst`. Additive ALTER only: no table, index, policy, grant or row is created, and the existing RLS/SELECT-only boundary is unchanged | **§31.3, part 15 of 16** (§6 documents the columns; `IMPLEMENTATION_REPORT.md` documents the feature) |
-| 16 | `20261112000000_add_panel_settings_outbound_bandwidth.sql` | The outbound bandwidth governor's ONE `panel_settings` column: `outbound_bandwidth_state jsonb NOT NULL DEFAULT '{}'`, constrained to a JSON object, holding the persisted UTC daily/monthly periods and reserved byte aggregates (`{version, daily:{period,bytes}, monthly:{period,bytes}}`). Read/written only by `outbound_bandwidth_service` through `panel_settings_repository`. Additive ALTER only: no table, index, policy, grant or row is created; re-seeds `('global')` and ends with `NOTIFY pgrst` | **§31.3, part 16 of 16** (§6 documents the column; `ROADMAP.md` documents the read-only Settings view) |
+| 1 | `20260920000001_reconcile_canonical_schema.sql` | `pg_trgm`; all 16 canonical tables, every column re-asserted with `ADD COLUMN IF NOT EXISTS` + deterministic backfill + final default/NOT NULL binding; data-guarded constraints, indexes and identity constraints; RLS + SELECT-only `anon`/`authenticated` policies on all 16 tables; the `panel_settings('global')` and five `bot_settings` seeds; the post-`COMMIT` drift report | **§31.3, part 1 of 17** — the complete canonical reconciliation SQL, physically inside the one deployment block |
+| 2 | `20260919000001_create_api_credential_vault.sql` | `supabase_vault` extension (`WITH SCHEMA vault`); `api_credentials` metadata table (no secret column) + `idx_api_credentials_provider_order`, `idx_api_credentials_owner`, `uq_api_credentials_vault_secret`; RLS, `REVOKE`/`GRANT` and the column/table `COMMENT`s; `api_credential_pool(text, bigint)`; deprecated alias `stt_credential_pool(text, bigint)`; `NOTIFY pgrst` | **§31.3, part 2 of 17** (the object contract is also documented in §29.10) |
+| 3 | `20260919000002_credential_vault_management.sql` | `api_credential_list(bigint, text)`, `api_credential_create(bigint, text, text, text, integer, boolean)`, `api_credential_replace_secret(bigint, text, text)`, `api_credential_update(bigint, text, text, boolean, integer)`, `api_credential_delete(bigint, text)` — each `SECURITY DEFINER`, `SET search_path = ''`, `OWNER TO postgres`, `REVOKE`d from `PUBLIC`/`anon`/`authenticated`, `GRANT`ed to `service_role`, and carrying its own `COMMENT`; `NOTIFY pgrst` | **§31.3, part 3 of 17** (documented in §29.14) |
+| 4 | `20260921000001_add_saved_items_display_name.sql` | `saved_items.display_name text` (nullable, no default, no backfill); `NOTIFY pgrst`; a `SELECT`-based verification query | **§31.3, part 4 of 17** |
+| 5 | `20260922000001_add_saved_items_search_indexes.sql` | `pg_trgm` again (`IF NOT EXISTS`); `idx_saved_items_display_name_trgm` (GIN trigram on `display_name`); `idx_saved_items_tags` (GIN on `tags`); `NOTIFY pgrst`; a `SELECT`-based verification query | **§31.3, part 5 of 17** |
+| 6 | `20260923000001_add_ai_config_tts_settings.sql` | `ai_config.tts_provider text`, `ai_config.tts_model text`, `ai_config.tts_voice text` (all nullable, no default, no backfill, no CHECK — the capability registry is the authority on the tokens); `NOTIFY pgrst`; a `SELECT`-based verification query over `information_schema.columns` | **§31.3, part 6 of 17** |
+| 7 | `20260926000001_add_todo_schedule_type.sql` | `ai_tasks_schedule_type_check` re-added with `'todo'` in the enum (the basic Todo item — an unscheduled, owner-managed row); `ai_tasks_actions_count` re-added as a CONDITIONAL check so only a `'todo'` row may store 0 actions while every scheduled row keeps 1–5; `NOTIFY pgrst`. No table, no column, no index, no policy, no grant and no row change | **§31.3, part 7 of 17** (the row shape is documented in §15) |
+| 8 | `20260927000001_add_todo_steps.sql` | The ONE new object of the multi-step phase: the `todo_steps` table — the ordered steps of ONE todo (`task_id` → `ai_tasks(id)` `ON DELETE CASCADE`; denormalized `owner_id`; 1-based `position` with `UNIQUE (task_id, position)`; nonblank ≤256-char `title`; `status` CHECK `active`/`completed`; CAS `version`; `completed_at` bound to the status; timestamps) + `RLS` + SELECT-only `anon`/`authenticated` policy + `NOTIFY pgrst` + a `SELECT`-based verification query. Additive: no existing table, column, index, policy, grant or row is touched | **§31.3, part 8 of 17** (the table is documented in §15) |
+| 9 | `20260928000001_create_emoji_reaction_tables.sql` | The FIVE persistence tables of the Emoji & Reaction feature, in their final shape: `emoji_library` (owner-scoped premium-emoji definitions, `UNIQUE (owner_id, document_id)`, Telegram's own `alt_text`, `source`/`source_msg_id` provenance), `emoji_categories` (`UNIQUE (owner_id, name)`, the explicit `is_custom` flag and the ordered `source_category_ids` snapshot list of a Custom Category), `emoji_mappings` (`UNIQUE (owner_id, category_id, simple_emoji)` — references `document_id`, never duplicates a definition), `emoji_state` (ONE global row per owner: the `replacement_enabled` toggle defaulting to `false` — OFF on first boot — and the global default category) and `emoji_chat_overrides` (per-chat override state of the implemented-but-NOT-owner-approved override path; the approved Active Category scope is global-only, §32). Plus the three read indexes the repository actually uses, the Phase 5 columns re-asserted with `ADD COLUMN IF NOT EXISTS`, RLS + SELECT-only `anon`/`authenticated` policies on all five, table/column `COMMENT`s, `NOTIFY pgrst` and verification queries. Additive: no existing table, column, index, policy, grant or row is touched, and NO foreign key is created (the emoji references are application-level, like every other identifier relationship in this database) | **§31.3, part 9 of 17** (the tables are documented in §32) |
+| 10 | `20260929000001_create_private_message_tables.sql` | The TWO persistence tables of Private Message Management (§33), in their final shape: `private_message_config` (ONE row per owner — the master `enabled` switch, the access state the panel edits (`mode`, `allowlist`, `exceptions`, `temporary`, `schedule`), the THREE independent action flags `delete_incoming` / `fixed_response_enabled` / `ai_response_enabled`, the `fixed_response_text`, the finite per-person allowance `ai_max_replies_per_person` with its explicit `ai_unlimited_replies` option, and `ai_interval_seconds` where `0` is a supported no-delay value) and `private_message_senders` (durable per-person AI-reply counters — `PRIMARY KEY (owner_id, sender_id)`, `ai_replies_used`, `last_ai_reply_at` — claimed by ONE bounded conditional update and given back by the compensating CAS when nothing was delivered). Plus the one read index, RLS + SELECT-only `anon`/`authenticated` policies on both, table/column `COMMENT`s, `NOTIFY pgrst`, table/column verification queries and a read-only legacy probe of the Phase-1 `bot_settings` document that is imported once by the application. Additive: no existing table, column, index, policy, grant or row is touched, and NO foreign key is created (the sender reference is application-level, like every other identifier relationship in this database). The scope (genuine human users in direct private chats only) is enforced in code and is NOT a schema-level or configuration-level choice. The `SELECT`-only `anon`/`authenticated` boundary this file establishes is SUPERSEDED by part 13 | **§31.3, part 10 of 17** (the tables are documented in §33) |
+| 11 | `20261016000001_add_private_message_counter_reset.sql` | The automatic per-person counter reset of Private Message Management (§33.2): `private_message_config.ai_counter_reset_enabled boolean NOT NULL DEFAULT false` (the switch — OFF by default, so applying it can never start resetting anything), `private_message_config.ai_counter_reset_seconds integer NOT NULL DEFAULT 86400` with `private_message_config_reset_interval_range` CHECK `BETWEEN 60 AND 31536000` (the panel's own bounds), and `private_message_senders.window_started_at timestamptz` (NULLABLE on purpose — NULL is "no window recorded yet" and is started by the next counted reply; no default, no backfill). Plus the three column `COMMENT`s, `NOTIFY pgrst` and three verification queries (both config columns, the window column, the constraint). Additive ALTER only: it creates no table, no index, no policy, no grant and no row, rewrites nothing and changes no existing value | **§31.3, part 11 of 17** (the columns are documented in §33.1/§33.2) |
+| 12 | `20261017000001_create_anti_edit_delete_tables.sql` | The TWO persistence tables of Anti-Edit / Anti-Delete (§34), in their final shape: `aed_config` (ONE row per owner — the master `enabled` switch, the `categories text[]` content filter that is never empty, and `retention_days` 1..3650) and `aed_archive_entries` (one row per observed archive record — the deterministic `id` primary key/idempotency key, `owner_id`, the POSITIVE private `chat_id` (`CHECK > 0` — a group/supergroup/channel row is structurally impossible), `message_id`, `kind` (`snapshot`/`edit`/`delete`), the content `category`, `has_caption`, `captured_at`, `message_date`, `edited_at`, `sender_id`, `out`, `has_media`, the bounded `body`, the media metadata (`media_type`/`media_name`/`media_size`/`media_stored`/`media_object`), `recoverable`/`recovered_from` and the bounded peer identity `peer_id`/`peer_username`/`peer_name`). Plus one read index, RLS enabled with ZERO policies and a service-role-only posture — every privilege revoked from `PUBLIC`/`anon`/`authenticated` (table-level AND column-level) and only SELECT/INSERT/UPDATE/DELETE granted to `service_role`, with the legacy permissive read policies dropped by name — table/column `COMMENT`s, `NOTIFY pgrst`, table/column verification queries and a read-only legacy probe of the Phase-1 `bot_settings` documents that are read while the tables are absent. Additive: no existing table, column, index, policy, grant or row is touched, and NO foreign key is created (the peer reference is application-level, like every other identifier relationship in this database). The scope (genuine private human-to-human conversations only) is enforced in code; the `chat_id > 0` CHECK is its structural backstop | **§31.3, part 12 of 17** (the tables are documented in §34) |
+| 13 | `20261020144423_harden_private_message_table_access.sql` | The Private Message Management access hardening (§33.4): RLS re-asserted on both tables, the eight named policy drops — the two `anon_select_private_message_*` policies the creation migration actually created plus the `anon_insert_*` / `anon_update_*` / `anon_delete_*` names it already dropped defensively — so a database that still carries any of them converges to the restrictive posture; every privilege REVOKED from `PUBLIC`/`anon`/`authenticated` (table-level AND column-level, because a table `REVOKE` cannot clear a legacy per-column grant), and exactly SELECT/INSERT/UPDATE/DELETE GRANTed to `service_role` (the four verbs `backend/db/client.py` uses). It creates ZERO policies, so with RLS enabled every client role is denied at the table by construction while `service_role` bypasses RLS. Plus two table `COMMENT`s that state the posture, `NOTIFY pgrst` and five read-only verification queries (client table grants, client column grants, policy count, the two RLS flags, the four service-role grants). Grant/policy/comment change only: no table, column, index, constraint, row or stored value is created, dropped or rewritten, and no unrelated policy or grant is touched | **§31.3, part 13 of 17** (the model is documented in §33.4) |
+| 14 | `20261020160000_add_panel_settings_auto_reaction_settings.sql` | The Auto-Reaction setting's TWO `panel_settings` columns (§6), which `settings_service` writes and `auto_reaction_service` reads on every outgoing message: `auto_reaction_enabled boolean NOT NULL DEFAULT false` (OFF by default — applying it can never enable a reaction) and `auto_reaction_emoji text NOT NULL DEFAULT ''` (`''` = none selected). Each is added WITHOUT a default first so an existing column keeps its value, then the final default is bound, only `NULL`s are backfilled, and the `NOT NULL` binding is applied — so no valid stored value is ever replaced. Plus `NOTIFY pgrst` and one column-count verification query. Additive ALTER only: no table, index, constraint, policy, grant or row is created, and the existing RLS/SELECT-only boundary is unchanged | **§31.3, part 14 of 17** (§6 documents the columns) |
+| 15 | `20261109000000_add_panel_settings_appearance.sql` | The Appearance personalization's FIVE `panel_settings` columns (§6): `appearance_header_title text NOT NULL DEFAULT ''` and `appearance_header_body text NOT NULL DEFAULT ''` (the shared global header; `''` = built-in default, so a reset stores the empty value, never a copy of the current customization), `appearance_page_overrides jsonb NOT NULL DEFAULT '{}'` (page id → `{title?, body?}`, each text bounded), `appearance_preview_enabled boolean NOT NULL DEFAULT false` (the independent preview switch) and `appearance_preview_image_key text NOT NULL DEFAULT ''` (a Storage OBJECT KEY only — never image bytes and never a signed/expiring URL). Each is added WITHOUT a default first so an existing column keeps its value, then the final default is bound, only `NULL`s are backfilled, and the `NOT NULL` binding is applied. Adds length/NUL CHECKs on the two text columns, a `jsonb_typeof(appearance_page_overrides) = 'object'` CHECK and a Storage-path regex CHECK, re-seeds the `('global')` row idempotently, and ends with `NOTIFY pgrst`. Additive ALTER only: no table, index, policy, grant or row is created, and the existing RLS/SELECT-only boundary is unchanged | **§31.3, part 15 of 17** (§6 documents the columns; `IMPLEMENTATION_REPORT.md` documents the feature) |
+| 16 | `20261112000000_add_panel_settings_outbound_bandwidth.sql` | The outbound bandwidth governor's ONE `panel_settings` column: `outbound_bandwidth_state jsonb NOT NULL DEFAULT '{}'`, constrained to a JSON object, holding the persisted UTC daily/monthly periods and reserved byte aggregates (`{version, daily:{period,bytes}, monthly:{period,bytes}}`). Read/written only by `outbound_bandwidth_service` through `panel_settings_repository`. Additive ALTER only: no table, index, policy, grant or row is created; re-seeds `('global')` and ends with `NOTIFY pgrst` | **§31.3, part 16 of 17** (§6 documents the column; `ROADMAP.md` documents the read-only Settings view) |
 
 **The other 22 migrations — the history the reconciliation snapshot already
 absorbs.** (The table below lists 21 of them; the twenty-second,
@@ -225,9 +225,11 @@ migration creates them.
    counter-reset columns and CHECK —, part 12 — the two Anti-Edit /
    Anti-Delete tables (§34) —, part 13 — the Private Message access hardening
    (§33.4) — and part 14 — the two Auto-Reaction `panel_settings` columns (§6)
-   — all embedded verbatim from their migration files.
+   — and part 15 — the five Appearance columns (§6) —, part 16 — the
+   outbound-bandwidth accounting column (§6) — and part 17 — the Intelligent
+   Reaction column (§6) — all embedded verbatim from their migration files.
 6. **What was corrected.** Documentation: the §31 intro, §31.1 and §22 state
-   the current count (39 migration files: 38 schema migrations plus the separately tracked post-setup privilege-hardening migration; 16 embedded parts; 16 canonical
+   the current count (40 migration files: 39 schema migrations plus the separately tracked post-setup privilege-hardening migration; 17 embedded parts; 16 canonical
    tables + `todo_steps` + the five Emoji & Reaction tables + the two Private
    Message tables + the two Anti-Edit / Anti-Delete tables), plus the
    counter-reset columns those two Private Message tables gain in part 11, the
@@ -296,10 +298,11 @@ migration creates them.
    and the policies it removes; it is additive in the sense that matters here
    (no table, column, index, row or stored value changes), and it is the ONE
    part of this block whose purpose is to REDUCE access rather than add schema.
+| 17 | `20261112140000_add_panel_settings_intelligent_reaction.sql` | The Intelligent Reaction setting's ONE `panel_settings` column (§6): `intelligent_reaction_enabled boolean NOT NULL DEFAULT false` — the independent, OFF-by-default switch for the AI-driven per-message reaction mode (`intelligent_reaction_service`). Added WITHOUT a default first so an existing column keeps its value, then the final default is bound, only `NULL`s are backfilled, and the `NOT NULL` binding is applied. Deliberately separate from the fixed Auto-Reaction columns of part 14 (the two modes are mutually exclusive). Plus `NOTIFY pgrst` and one column verification query. Additive ALTER only: no table, index, constraint, policy, grant or row is created | **§31.3, part 17 of 17** (§6 documents the column) |
 
 ### 31.2 The order, and why it is this order (source-proven)
 
-1. **The reconciliation snapshot runs first (part 1 of 16).** It is the only thing
+1. **The reconciliation snapshot runs first (part 1 of 17).** It is the only thing
    that creates `saved_items`, `ai_config`, `panel_settings`, `bot_settings`, the
    AI tables and the two task tables, and it is where every canonical column, the
    four `ai_config` columns and the drifted `panel_settings`/`bot_settings`
@@ -416,15 +419,24 @@ migration creates them.
     still carries the permissive policies leaves the restrictive posture, which
     is exactly the convergence the repository wants.
 
-13. **The Auto-Reaction columns close the block (part 14).** Two `ALTER TABLE
+13. **The Auto-Reaction columns (part 14).** Two `ALTER TABLE
     panel_settings` column additions with their defaults, a `NULL`-only backfill
     and the `NOT NULL` binding; they depend only on `panel_settings` existing
     (part 1) and touch no other table, so any position after part 1 is valid.
-    They are appended last, newest last (§30.11), and they are the ONE part that
+    They were appended after part 13 (§30.11), and they are the ONE part that
     exists because an application-required column pair had no migration at all
     — the reason the block was previously unable to persist the Auto-Reaction
     setting. Running it twice is a no-op, and it can never enable a reaction:
     the default is FALSE and the emoji default is the empty string.
+
+14. **The Intelligent Reaction column closes the block (part 17).** One
+    `ALTER TABLE panel_settings` column addition with its default, a `NULL`-only
+    backfill and the `NOT NULL` binding; it depends only on `panel_settings`
+    existing (part 1) and touches no other table. It is the independent,
+    OFF-by-default switch for the AI-driven reaction mode, deliberately separate
+    from the fixed Auto-Reaction columns of part 14 (the two modes are mutually
+    exclusive), and it can never enable itself: the default is FALSE. Running it
+    twice is a no-op.
 
 > **The order is repository-proven, recorded honestly.** The requested set named
 > four files, with the canonical reconciliation first and the Save V2 search
@@ -463,7 +475,7 @@ Copy the entire SQL block below and paste it into the Supabase SQL Editor as
 `postgres`. This block contains the complete ordered setup. No other SQL block in
 this document needs to be executed manually.
 
-The block is the fifteen migrations' executable SQL concatenated in order, with a
+The block is the sixteen migrations' executable SQL concatenated in order, with a
 part banner before each and the migrations' prose comments removed so the whole
 artifact is pure, runnable SQL. Every statement is verbatim from its migration,
 and `tests/test_database_setup_order.py` pins each one back to the file it came
@@ -471,9 +483,11 @@ from. It is idempotent and additive: no row, column or existing value is rewritt
 and no Vault secret is created. On a FRESH Supabase database the block is the
 complete setup: part 1 creates every canonical table in its final shape (the
 shape the 22 pre-reconciliation migrations converge to — see §31.1) and parts
-2–14 add the Vault, Save V2, TTS, Todo, Emoji & Reaction, Private Message
+2–17 add the Vault, Save V2, TTS, Todo, Emoji & Reaction, Private Message
 (including its counter-reset columns and its service-role-only access posture),
-Anti-Edit / Anti-Delete objects and the Auto-Reaction columns. No
+Anti-Edit / Anti-Delete objects, the Auto-Reaction columns, the Appearance
+columns, the outbound-bandwidth accounting column and the Intelligent Reaction
+column. No
 placeholder, no omitted section and no comment form like "add the remaining
 tables here" appears in it.
 
@@ -483,7 +497,7 @@ tables here" appears in it.
 --
 -- Copy this whole block and paste it into the Supabase SQL Editor as `postgres`.
 -- It is the complete ordered setup: the canonical reconciliation snapshot first,
--- then the fifteen later additive migrations (parts 2-16).
+-- then the sixteen later additive migrations (parts 2-17).
 --
 -- Order (source-derived from supabase/migrations/):
 --   1. 20260920000001_reconcile_canonical_schema.sql     (canonical snapshot)
@@ -506,7 +520,7 @@ tables here" appears in it.
 -- migrations' prose comments are removed so the artifact is pure executable SQL.
 -- ============================================================================
 
--- ─── PART 1 of 16 — 20260920000001_reconcile_canonical_schema.sql (canonical snapshot) ───
+-- ─── PART 1 of 17 — 20260920000001_reconcile_canonical_schema.sql (canonical snapshot) ───
 
 BEGIN;
 
@@ -2082,7 +2096,7 @@ LEFT JOIN information_schema.columns c
 WHERE c.column_name IS NULL
 ORDER BY 1;
 
--- ─── PART 2 of 16 — 20260919000001_create_api_credential_vault.sql (Vault PART 1) ───
+-- ─── PART 2 of 17 — 20260919000001_create_api_credential_vault.sql (Vault PART 1) ───
 
 CREATE EXTENSION IF NOT EXISTS supabase_vault WITH SCHEMA vault;
 
@@ -2205,7 +2219,7 @@ COMMENT ON FUNCTION public.stt_credential_pool(text, bigint) IS
 
 NOTIFY pgrst, 'reload schema';
 
--- ─── PART 3 of 16 — 20260919000002_credential_vault_management.sql (Vault PART 2) ───
+-- ─── PART 3 of 17 — 20260919000002_credential_vault_management.sql (Vault PART 2) ───
 
 CREATE OR REPLACE FUNCTION public.api_credential_list(
     p_owner_id bigint,
@@ -2611,7 +2625,7 @@ COMMENT ON FUNCTION public.api_credential_delete(bigint, text) IS
 
 NOTIFY pgrst, 'reload schema';
 
--- ─── PART 4 of 16 — 20260921000001_add_saved_items_display_name.sql (Save V2 column) ───
+-- ─── PART 4 of 17 — 20260921000001_add_saved_items_display_name.sql (Save V2 column) ───
 
 ALTER TABLE saved_items
     ADD COLUMN IF NOT EXISTS display_name text;
@@ -2625,7 +2639,7 @@ LEFT JOIN information_schema.columns c
 WHERE c.column_name IS NULL
 ORDER BY 1;
 
--- ─── PART 5 of 16 — 20260922000001_add_saved_items_search_indexes.sql (Save V2 indexes) ───
+-- ─── PART 5 of 17 — 20260922000001_add_saved_items_search_indexes.sql (Save V2 indexes) ───
 
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
@@ -2644,7 +2658,7 @@ LEFT JOIN pg_indexes i
 WHERE i.indexname IS NULL
 ORDER BY 1;
 
--- ─── PART 6 of 16 — 20260923000001_add_ai_config_tts_settings.sql (TTS settings) ───
+-- ─── PART 6 of 17 — 20260923000001_add_ai_config_tts_settings.sql (TTS settings) ───
 
 ALTER TABLE ai_config
     ADD COLUMN IF NOT EXISTS tts_provider text;
@@ -2659,7 +2673,7 @@ WHERE table_schema = 'public'
   AND table_name   = 'ai_config'
   AND column_name IN ('tts_provider', 'tts_model', 'tts_voice');
 
--- ─── PART 7 of 16 — 20260926000001_add_todo_schedule_type.sql (basic Todo items) ───
+-- ─── PART 7 of 17 — 20260926000001_add_todo_schedule_type.sql (basic Todo items) ───
 
 ALTER TABLE ai_tasks DROP CONSTRAINT IF EXISTS ai_tasks_schedule_type_check;
 
@@ -2676,7 +2690,7 @@ ALTER TABLE ai_tasks ADD CONSTRAINT ai_tasks_actions_count CHECK (
 NOTIFY pgrst, 'reload schema';
 
 
--- ─── PART 8 of 16 — 20260927000001_add_todo_steps.sql (multi-step todo steps) ───
+-- ─── PART 8 of 17 — 20260927000001_add_todo_steps.sql (multi-step todo steps) ───
 
 CREATE TABLE IF NOT EXISTS todo_steps (
     id           bigserial   PRIMARY KEY,
@@ -2726,7 +2740,7 @@ FROM information_schema.tables
 WHERE table_schema = 'public'
   AND table_name   = 'todo_steps';
 
--- ─── PART 9 of 16 — 20260928000001_create_emoji_reaction_tables.sql (Emoji & Reaction tables) ───
+-- ─── PART 9 of 17 — 20260928000001_create_emoji_reaction_tables.sql (Emoji & Reaction tables) ───
 
 CREATE TABLE IF NOT EXISTS emoji_library (
     id            bigserial   PRIMARY KEY,
@@ -2872,7 +2886,7 @@ WHERE table_schema = 'public'
   AND table_name   = 'emoji_categories'
   AND column_name IN ('is_custom', 'source_category_ids');
 
--- ─── PART 10 of 16 — 20260929000001_create_private_message_tables.sql (Private Message tables) ───
+-- ─── PART 10 of 17 — 20260929000001_create_private_message_tables.sql (Private Message tables) ───
 
 CREATE TABLE IF NOT EXISTS private_message_config (
     owner_id                  bigint      PRIMARY KEY,
@@ -2985,7 +2999,7 @@ SELECT 'legacy private_message settings' AS check, key
 FROM bot_settings
 WHERE key LIKE 'private_message%';
 
--- ─── PART 11 of 16 — 20261016000001_add_private_message_counter_reset.sql (Private Message counter reset) ───
+-- ─── PART 11 of 17 — 20261016000001_add_private_message_counter_reset.sql (Private Message counter reset) ───
 
 -- ALTER only: this part adds the automatic per-person counter reset to the two
 -- tables part 10 created. It creates no table, no index, no policy and no grant,
@@ -3034,7 +3048,7 @@ WHERE table_schema    = 'public'
   AND constraint_name = 'private_message_config_reset_interval_range'
   AND constraint_type = 'CHECK';
 
--- ─── PART 12 of 16 — 20261017000001_create_anti_edit_delete_tables.sql (Anti-Edit / Anti-Delete tables) ───
+-- ─── PART 12 of 17 — 20261017000001_create_anti_edit_delete_tables.sql (Anti-Edit / Anti-Delete tables) ───
 
 CREATE TABLE IF NOT EXISTS aed_config (
     owner_id       bigint      PRIMARY KEY,
@@ -3182,7 +3196,7 @@ SELECT 'legacy anti edit delete settings' AS check, key
 FROM bot_settings
 WHERE key LIKE 'anti_edit_delete%';
 
--- ─── PART 13 of 16 — 20261020144423_harden_private_message_table_access.sql (Private Message service-role-only) ───
+-- ─── PART 13 of 17 — 20261020144423_harden_private_message_table_access.sql (Private Message service-role-only) ───
 
 ALTER TABLE private_message_config ENABLE ROW LEVEL SECURITY;
 ALTER TABLE private_message_senders ENABLE ROW LEVEL SECURITY;
@@ -3265,7 +3279,7 @@ WHERE table_schema = 'public'
   AND table_name   IN ('private_message_config', 'private_message_senders')
   AND grantee      = 'service_role';
 
--- ─── PART 14 of 16 — 20261020160000_add_panel_settings_auto_reaction_settings.sql (Auto-Reaction columns) ───
+-- ─── PART 14 of 17 — 20261020160000_add_panel_settings_auto_reaction_settings.sql (Auto-Reaction columns) ───
 
 -- The two Auto-Reaction settings columns. No earlier migration created them, so
 -- the Panel Settings write was rejected and the toggle survived only in the
@@ -3288,7 +3302,7 @@ FROM information_schema.columns
 WHERE table_schema = 'public'
   AND table_name   = 'panel_settings'
   AND column_name IN ('auto_reaction_enabled', 'auto_reaction_emoji');
--- ─── PART 15 of 16 — 20261109000000_add_panel_settings_appearance.sql (Appearance columns) ───
+-- ─── PART 15 of 17 — 20261109000000_add_panel_settings_appearance.sql (Appearance columns) ───
 
 -- The five Appearance settings columns. No earlier migration created them, so the writes
 -- would be rejected and the customization would survive only in the process cache.
@@ -3337,7 +3351,8 @@ ALTER TABLE panel_settings
 NOTIFY pgrst, 'reload schema';
 
 
--- ─── PART 16 of 16 — 20261112000000_add_panel_settings_outbound_bandwidth.sql (bandwidth governor state) ───
+-- ─── PART 16 of 17 — 20261112000000_add_panel_settings_outbound_bandwidth.sql (bandwidth governor state) ───
+-- 17. 20261112140000_add_panel_settings_intelligent_reaction.sql (Intelligent Reaction column)
 
 ALTER TABLE panel_settings ADD COLUMN IF NOT EXISTS outbound_bandwidth_state jsonb;
 ALTER TABLE panel_settings ALTER COLUMN outbound_bandwidth_state SET DEFAULT '{}'::jsonb;
@@ -3354,6 +3369,23 @@ VALUES ('global')
 ON CONFLICT (key) DO NOTHING;
 
 NOTIFY pgrst, 'reload schema';
+
+-- ─── PART 17 of 17 — 20261112140000_add_panel_settings_intelligent_reaction.sql (Intelligent Reaction column) ───
+
+ALTER TABLE panel_settings ADD COLUMN IF NOT EXISTS intelligent_reaction_enabled boolean;
+ALTER TABLE panel_settings ALTER COLUMN intelligent_reaction_enabled SET DEFAULT false;
+UPDATE panel_settings SET intelligent_reaction_enabled = false WHERE intelligent_reaction_enabled IS NULL;
+ALTER TABLE panel_settings ALTER COLUMN intelligent_reaction_enabled SET NOT NULL;
+
+NOTIFY pgrst, 'reload schema';
+
+SELECT 'panel_settings intelligent-reaction column' AS check, count(*) AS present
+FROM information_schema.columns
+WHERE table_schema = 'public'
+  AND table_name   = 'panel_settings'
+  AND column_name  = 'intelligent_reaction_enabled';
+
+
 ```
 
 ### 31.4 Verification after the run
@@ -3887,6 +3919,7 @@ a key-value store.
 | `appearance_preview_enabled` | `boolean` | NO | `false` | Appearance: the independent preview-image switch. OFF retains the stored image and renders a genuinely text-only panel. Part 15 of §31.3 |
 | `appearance_preview_image_key` | `text` | NO | `''` | Appearance: the durable Supabase Storage OBJECT KEY of the preview image (never bytes, never a signed/expiring URL). `''` = no image. Part 15 of §31.3 |
 | `outbound_bandwidth_state` | `jsonb` | NO | `'{}'` | Outbound bandwidth governor accounting: `{version, daily:{period,bytes}, monthly:{period,bytes}}` for the CURRENT UTC day/month; older periods read as zero and are pruned on the next reservation. Written only by `outbound_bandwidth_service.reserve_outbound_bytes` through `panel_settings_repository`; read by the governor and by the read-only Settings → Bandwidth Usage panel. Part 16 of §31.3 |
+| `intelligent_reaction_enabled` | `boolean` | NO | `false` | Intelligent Reaction: the independent, OFF-by-default switch for the AI-driven per-message reaction mode (AI probability + a Telegram-catalog reaction, then an independent random check). Never reads `auto_reaction_emoji`; mutually exclusive with `auto_reaction_enabled`. Written/read through `settings_service`, consumed by `intelligent_reaction_service.process_outgoing_message`. Created by `20261112140000_add_panel_settings_intelligent_reaction.sql` — part 17 of §31.3 |
 | `ghost_seen_retention_seconds` | `bigint` | NO | `2592000` | Ghost Seen registry retention window in seconds (30 min–365 days); presets include sub-day durations |
 | `update_stale_seconds` | `integer` | NO | `300` | Update staleness threshold (seconds) |
 | `updated_at` | `timestamptz` | YES | `now()` | Last update timestamp |
@@ -3907,16 +3940,17 @@ RLS is enabled. Only SELECT is granted to `anon` + `authenticated`.
 `update_field`, `update_fields`, `reload`.
 
 **`backend/services/settings_service.py`** — cache-first reads,
-write-through cache, **19 typed getters + 19 typed setters**, per-setting
+write-through cache, **20 typed getters + 20 typed setters**, per-setting
 validators (`auto_close_enabled`, `auto_close_delay`, `max_deep_save_mb`,
 `delete_batch_size`, `log_retention_days`, `panel_timeout_seconds`,
 `allow_multiple_panels`, `reuse_existing_panel`, `language`,
 `debug_callbacks`, `owner_only`, `dashboard_font`,
-`auto_reaction_enabled`, `auto_reaction_emoji`, and the five Appearance
+`auto_reaction_enabled`, `auto_reaction_emoji`, `intelligent_reaction_enabled`,
+and the five Appearance
 accessors `appearance_header_title`, `appearance_header_body`,
 `appearance_page_overrides`, `appearance_preview_enabled`,
 `appearance_preview_image_key`). `ghost_seen_retention_seconds` and
-`update_stale_seconds` are the only two of the 21 setting columns with **no
+`update_stale_seconds` are the only two of the 22 setting columns with **no
 accessor and no production consumer** (see §19.13, §19.14). See
 [§17 Panel Database](#17-panel-database) for the cache/validation model.
 
@@ -4588,7 +4622,7 @@ RLS is enabled. SELECT is granted to `anon` and `authenticated`; no public write
 
 > **Status: documented from the actual repository. The migration that creates
 > these tables is created but NOT APPLIED to Supabase — manual-only (§31.3,
-> part 9 of 16).
+> part 9 of 17).
 > Phase 2 (Private Message Management, §33) adds two more tables in part 10 of
 > the same block. No agent has ever executed SQL against Supabase.**
 
@@ -4783,7 +4817,7 @@ be smuggled into this schema contract.
 | Item | Value |
 |---|---|
 | Migration file | `supabase/migrations/20260928000001_create_emoji_reaction_tables.sql` |
-| Canonical location | `DATABASE_ARCHITECTURE.md` §31.3, **part 9 of 16** (verbatim; run the one block) |
+| Canonical location | `DATABASE_ARCHITECTURE.md` §31.3, **part 9 of 17** (verbatim; run the one block) |
 | Applied by | **The project owner, manually, in the Supabase SQL Editor** |
 | Applied by any agent | **NO — never.** No SQL was executed against Supabase; Supabase remains manual-only and its physical schema unmodified by this repository |
 | Until applied | Configured Supabase reports the missing tables; every emoji helper degrades to the in-memory fallback (§20) and the feature reports the durable-store failure honestly |
@@ -4971,7 +5005,7 @@ by applying it.
 ### 33.4 Security and access model
 
 Both tables are **service-role only**. The posture is established by
-`20261020144423_harden_private_message_table_access.sql` (§31.3 part 13 of 16),
+`20261020144423_harden_private_message_table_access.sql` (§31.3 part 13 of 17),
 which runs after the part that creates the tables and the policies it removes:
 
 | Property | Intended posture after part 13 is applied |
@@ -6001,8 +6035,10 @@ migration filenames.
 
 ### Repository and remote migration history
 
-- Repository contains **39 migration files**.
-- Supabase migration history contains **3 records**, not 39. The live schema
+- Repository contains **40 migration files** (**40** files: 39 schema migrations
+  plus the separately tracked post-setup privilege-hardening migration; the
+  Intelligent Reaction column migration is committed and not yet applied).
+- Supabase migration history contains **3 records**, not 40. The live schema
   was evidently established through a mixture of canonical/manual setup and
   later tracked migrations. Do not invent the missing history rows.
 - Live history records:
@@ -6213,8 +6249,9 @@ the actual source requires (not what would be nice).
 | Bio automation | template, mood, custom_text, `is_active`, `last_bio` | `bio_state` | **Yes** — `ProfileEngine.updater` reads `is_active`/tokens from DB each minute | none |
 | Username automation | template, mood, custom_text, `is_active`, `last_name` | `username_state` | **Yes** — same engine path | none |
 | Profile scheduler runtime | active-engine flags, running task | in-memory (`profile/scheduler.py`) | No — restarted on boot from `BIO_UPDATE_ENABLED` / `USERNAME_UPDATE_ENABLED` + DB `is_active` rows | none |
-| Panel / global settings | 19 typed settings (21 setting columns; `update_stale_seconds` and `ghost_seen_retention_seconds` have no accessor) | `panel_settings` (every column migrated; part 1 + parts 14/15) | **Yes** — settings must survive restart | no consumer for two columns (§19.13, §19.14) |
+| Panel / global settings | 20 typed settings (22 setting columns; `update_stale_seconds` and `ghost_seen_retention_seconds` have no accessor) | `panel_settings` (every column migrated; part 1 + parts 14/15/17) | **Yes** — settings must survive restart | no consumer for two columns (§19.13, §19.14) |
 | Auto-Reaction | enabled flag + selected reaction emoji | `panel_settings` (part 14) | **Yes** | none |
+| Intelligent Reaction | enabled flag for the AI-driven per-message reaction mode (AI probability + catalog reaction, independent random check) | `panel_settings` (part 17) | **Yes** | manual migration until applied; the fixed Auto-Reaction setting stays independent |
 | Appearance header | global title + body + per-page overrides | `panel_settings` (part 15) | **Yes** — composed at the render boundary | none |
 | Appearance preview switch | independent boolean; OFF renders text-only but keeps the stored image | `panel_settings` (part 15) | **Yes** | none |
 | Appearance image gallery | 0–10 original images (PNG/JPEG/WebP) | Supabase Storage, dedicated private bucket named by `APPEARANCE_MEDIA_BUCKET`, prefix `appearance/preview/` | **Yes** (intended) — objects persist independently of the process | `APPEARANCE_MEDIA_BUCKET` must be configured; there is no gallery table by design (§35) |
@@ -8273,8 +8310,8 @@ agent.
 
 1. Open the Supabase **SQL Editor** as `postgres` and run the ONE complete setup
    script in **§31.3** — a single fenced block that begins with the canonical
-   reconciliation snapshot (part 1) and continues, in order, with the fifteen
-   later additive migrations, parts 2–16:
+   reconciliation snapshot (part 1) and continues, in order, with the sixteen
+   later additive migrations, parts 2–17:
    `20260919000001_create_api_credential_vault.sql` (part 2, Vault PART 1),
    `20260919000002_credential_vault_management.sql` (part 3, Vault PART 2),
    `20260921000001_add_saved_items_display_name.sql` (part 4),
@@ -8288,8 +8325,9 @@ agent.
    `20261017000001_create_anti_edit_delete_tables.sql` (part 12),
    `20261020144423_harden_private_message_table_access.sql` (part 13) and
    `20261020160000_add_panel_settings_auto_reaction_settings.sql` (part 14),
-   `20261109000000_add_panel_settings_appearance.sql` (part 15) and
-   `20261112000000_add_panel_settings_outbound_bandwidth.sql` (part 16). It
+   `20261109000000_add_panel_settings_appearance.sql` (part 15),
+   `20261112000000_add_panel_settings_outbound_bandwidth.sql` (part 16) and
+   `20261112140000_add_panel_settings_intelligent_reaction.sql` (part 17). It
    is one transaction-safe, re-runnable statement batch.
    (`supabase/canonical_bootstrap.sql` and the migration file remain the
    byte-identical convenience copies of the snapshot part.)
@@ -8300,9 +8338,9 @@ agent.
      in it is a column the script could not create (see §30.12).
    * `NOTIFY pgrst, 'reload schema'` has already asked PostgREST to drop its
      stale schema cache, so the API sees the new columns immediately.
-3. Nothing else has to be applied by hand. Fifteen migrations are newer than
+3. Nothing else has to be applied by hand. Sixteen migrations are newer than
    the snapshot and every one of them is inside the block: parts 2–16 carry
-   fourteen of them verbatim (named in item 1), and the fifteenth,
+   fifteen of them verbatim (named in item 1), and the sixteenth,
    `20260927020000_add_waiting_answer_status.sql`, needs no part of its own
    because part 1 already re-adds `ai_task_occurrences_status_check` with
    `waiting_answer` in the enum. The snapshot is never regenerated to include
@@ -8310,8 +8348,9 @@ agent.
    byte-identical.
 4. Nothing else is required for the schema: no new table, column, index,
    function, policy or grant to create by hand, no env var, no Render setting, no
-   Supabase Vault secret. The Auto-Reaction columns are part 14 of the SAME
-   block, so they need no separate snippet any more (§6). Vault itself is the
+   Supabase Vault secret. The Auto-Reaction columns are part 14 and the
+   Intelligent Reaction column is part 17 of the SAME block, so they need no
+   separate snippet any more (§6). Vault itself is the
    only extension dependency — if the `postgres` role cannot create
    `supabase_vault` on the project, enable Vault from the dashboard once
    (§29.5).

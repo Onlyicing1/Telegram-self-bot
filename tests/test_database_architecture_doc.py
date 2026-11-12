@@ -64,29 +64,29 @@ def test_every_migration_file_is_classified_in_the_audit_section():
     """§31 is the authoritative inventory: no migration may be omitted."""
     audit = section("## 31. Canonical Database Setup")
     missing = [path.name for path in MIGRATIONS if path.name[:14] not in audit]
-    assert len(MIGRATIONS) == 38, "the repository's migration count changed"
+    assert len(MIGRATIONS) == 40, "the repository's migration count changed"
     assert missing == [], f"migrations absent from §31: {missing}"
-    assert "all 38 migrations" in audit
+    assert "all 39 migrations" in audit
 
 
 def test_migration_status_states_the_same_count():
     status = section("## 22. Migration Status")
     flat = " ".join(status.split())
-    assert "**38** files" in flat
+    assert "**40** files" in flat
     assert "all **36** files" not in flat
 
 
 def test_the_appearance_migration_is_part_fifteen():
     audit = section("## 31. Canonical Database Setup")
     assert (
-        "PART 15 of 16 — 20261109000000_add_panel_settings_appearance.sql"
+        "PART 15 of 17 — 20261109000000_add_panel_settings_appearance.sql"
         in audit
     )
     assert (
-        "PART 16 of 16 — 20261112000000_add_panel_settings_outbound_bandwidth.sql"
+        "PART 16 of 17 — 20261112000000_add_panel_settings_outbound_bandwidth.sql"
         in audit
     )
-    part = audit[audit.index("PART 15 of 16"): audit.index("PART 16 of 16")]
+    part = audit[audit.index("PART 15 of 17"): audit.index("PART 16 of 17")]
     for column, _type, _default in APPEARANCE_COLUMNS:
         assert f"ADD COLUMN IF NOT EXISTS {column}" in part
 
@@ -124,8 +124,8 @@ def test_section_6_accessor_count_matches_the_settings_service():
     from backend.services.settings_service import _DEFAULTS
 
     panel = section("## 6. panel_settings")
-    assert len(_DEFAULTS) == 19
-    assert "**19 typed getters + 19 typed setters**" in panel
+    assert len(_DEFAULTS) == 20
+    assert "**20 typed getters + 20 typed setters**" in panel
     assert "14 typed getters" not in panel
     for column, _type, _default in APPEARANCE_COLUMNS:
         assert column in _DEFAULTS, f"{column} is not a settings key"
@@ -216,7 +216,7 @@ def test_the_outbound_bandwidth_migration_is_part_sixteen():
     doc = (Path(__file__).resolve().parent.parent / "DATABASE_ARCHITECTURE.md").read_text(
         encoding="utf-8"
     )
-    marker = "PART 16 of 16 — 20261112000000_add_panel_settings_outbound_bandwidth.sql"
+    marker = "PART 16 of 17 — 20261112000000_add_panel_settings_outbound_bandwidth.sql"
     assert marker in doc
     part = doc[doc.index(marker):]
     assert "outbound_bandwidth_state" in part
