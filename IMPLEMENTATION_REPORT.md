@@ -244,3 +244,65 @@ No Render deployment was performed and no live Telegram action was exercised.
 Panel rendering, provider calls and Telegram sends are verified only by the
 offline test suite (scripted provider and Telegram fakes); runtime behaviour on
 the deployed bot and the applied database schema remain owner actions.
+
+## 14. Follow-up: the stuck-25% probability — live contract verified, one honesty fix
+
+Verified against the live commit `098d594b641da28b49d5309947fc8e161d906304`
+(local `main` fast-forwarded to it; tree clean).
+
+**Root cause (database contract).** The probability column exists only in the
+committed migration, and the repository's own records still say that migration
+is **committed but not applied**: `DATABASE_ARCHITECTURE.md` §31.1 (deliberately
+not embedded in §31.3), §22 ("committed, not applied") and §10 of this report.
+The application writes exactly one `panel_settings` column
+(`intelligent_reaction_probability`); with that column absent from the live
+table, PostgREST rejects the update (`PGRST204`, column not found in the schema
+cache), `panel_settings_repository.update_field()` catches it and returns
+`False`, `set_setting_strict()` refuses to cache the value, and the input
+handler truthfully reports "Could not save the reaction probability; it was left
+unchanged." The cache therefore keeps the documented default **25**, the
+General panel renders 25, and `intelligent_reaction_service.process_outgoing_message`
+reads 25 for every eligible message. The engine itself is correct: it reads the
+setting per message, 0% costs no catalog/AI work, 100% always passes, 1–99%
+performs one independent draw, and the AI can never supply a probability.
+
+The column's presence in the live database could **not** be queried from this
+workspace (no Supabase URL/service-role key, and SQL execution was out of
+scope), so the migration's application state is reported from the repository's
+own verified records rather than assumed.
+
+**One genuine code gap found and fixed.** `set_intelligent_reaction_probability()`
+returned `True` whenever the repository *accepted* the update, without checking
+that the value was actually persisted. An update that matched no row, or a
+refresh read that returned nothing, would be reported as a successful save while
+the effective value stayed at 25 — the exact false-success shape of this
+symptom. The setter now confirms the write against the persisted row (only when
+a database is configured): a missing/unreadable row or a mismatched stored value
+returns `False` and keeps the value the database actually holds. In-memory
+fallback behaviour (no database configured) is unchanged.
+
+**Tests.** `tests/test_intelligent_reaction.py` → **106 passed** (3 new:
+confirmed persisted write becomes effective; accepted-but-unpersisted write is a
+failure; unreadable row is a failure and leaves 25). Adjacent suites (settings,
+reaction, appearance, panel, database docs) → **1096 passed, 3 skipped**, with
+the same 3 pre-existing documentation-drift failures. Full suite →
+**7513 passed, 27 skipped, 6 failed**, all six pre-existing and unchanged
+(§9 items 1–6). `py_compile` and `git diff --check` → exit 0.
+
+**Owner action still required.** The setting cannot persist until the column is
+created in the live database. Run the migration's executable statements (or the
+identical block in §10) once in the Supabase SQL editor as `postgres`, then set
+the probability again in General:
+
+```sql
+ALTER TABLE panel_settings ADD COLUMN IF NOT EXISTS intelligent_reaction_probability integer;
+ALTER TABLE panel_settings ALTER COLUMN intelligent_reaction_probability SET DEFAULT 25;
+UPDATE panel_settings SET intelligent_reaction_probability = 25 WHERE intelligent_reaction_probability IS NULL;
+ALTER TABLE panel_settings ALTER COLUMN intelligent_reaction_probability SET NOT NULL;
+ALTER TABLE panel_settings DROP CONSTRAINT IF EXISTS panel_settings_intelligent_reaction_probability_check;
+ALTER TABLE panel_settings ADD CONSTRAINT panel_settings_intelligent_reaction_probability_check
+    CHECK (intelligent_reaction_probability >= 0 AND intelligent_reaction_probability <= 100);
+```
+
+Do **not** re-run the enabled-column migration; the enabled value is already
+stored and is preserved. No deployment was triggered by this pass.

@@ -619,8 +619,43 @@ def test_probability_setter_uses_the_strict_setter(monkeypatch):
         return True
 
     monkeypatch.setattr(settings_service, "set_setting_strict", strict)
+    monkeypatch.setattr(settings_service, "_db_configured", lambda: False)
     assert settings_service.set_intelligent_reaction_probability(75) is True
     assert seen == [("intelligent_reaction_probability", 75)]
+
+
+def _persisted_row(value):
+    return {"key": "global", "intelligent_reaction_probability": value}
+
+
+def test_a_persisted_probability_is_confirmed_and_becomes_effective(monkeypatch):
+    settings_service._cache["intelligent_reaction_probability"] = 25
+    monkeypatch.setattr(settings_service, "_db_configured", lambda: True)
+    monkeypatch.setattr(settings_service.repo, "update_field", lambda *a, **k: True)
+    monkeypatch.setattr(settings_service.repo, "load", lambda: _persisted_row(60))
+
+    assert settings_service.set_intelligent_reaction_probability(60) is True
+    assert settings_service.intelligent_reaction_probability() == 60
+
+
+def test_an_accepted_write_that_did_not_persist_is_not_a_success(monkeypatch):
+    settings_service._cache["intelligent_reaction_probability"] = 25
+    monkeypatch.setattr(settings_service, "_db_configured", lambda: True)
+    monkeypatch.setattr(settings_service.repo, "update_field", lambda *a, **k: True)
+    monkeypatch.setattr(settings_service.repo, "load", lambda: _persisted_row(25))
+
+    assert settings_service.set_intelligent_reaction_probability(60) is False
+    assert settings_service.intelligent_reaction_probability() == 25
+
+
+def test_an_unreadable_persisted_row_is_not_a_success(monkeypatch):
+    settings_service._cache["intelligent_reaction_probability"] = 25
+    monkeypatch.setattr(settings_service, "_db_configured", lambda: True)
+    monkeypatch.setattr(settings_service.repo, "update_field", lambda *a, **k: True)
+    monkeypatch.setattr(settings_service.repo, "load", lambda: None)
+
+    assert settings_service.set_intelligent_reaction_probability(60) is False
+    assert settings_service.intelligent_reaction_probability() == 25
 
 
 def test_probability_is_a_registered_key_with_a_zero_to_hundred_validator():

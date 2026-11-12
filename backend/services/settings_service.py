@@ -535,11 +535,25 @@ def set_intelligent_reaction_probability(value: Any) -> bool:
     """Persist the probability and report the truth about the write.
 
     The service validates the range BEFORE storing, and the strict setter never
-    leaves the effective cache claiming a value the database rejected.
+    leaves the effective cache claiming a value the database rejected. A write
+    the repository accepted is then confirmed against the persisted row: an
+    update that matched nothing, or a read that cannot return the stored value,
+    is reported as a failure and the effective value stays what the database
+    actually holds — never an optimistic success.
     """
     if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 100:
         return False
-    return set_setting_strict("intelligent_reaction_probability", value)
+    if not set_setting_strict("intelligent_reaction_probability", value):
+        return False
+    if _db_configured():
+        row = repo.load()
+        if row is None or row.get("intelligent_reaction_probability") != value:
+            logger.warning(
+                "settings_service: intelligent_reaction_probability write was not "
+                "confirmed by the persisted row; the stored value was kept"
+            )
+            return False
+    return True
 
 
 # ── Typed accessors: Appearance personalization ──
