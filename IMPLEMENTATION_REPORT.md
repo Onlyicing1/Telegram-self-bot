@@ -1,164 +1,230 @@
-# IMPLEMENTATION REPORT — History summary delivered by editing the original panel
+# IMPLEMENTATION REPORT — History & Intelligence paginated summaries
 
-_Base commit: `c18a2d5baeceefa66f064712bd36eba638b8faa5` (`main`, the
-test-workspace deployment carrying the failure). This document replaces all
-earlier reports; only the current verified state is described._
+_Base commit: `c18a2d5baeceefa66f064712bd36eba638b8faa5`. The Helper-Bot
+in-place delivery fix from `77b762b` is the starting point for this change.
+This document replaces all earlier reports and describes only the current
+state._
 
-## 1. Root cause (verified)
+## 1. Root cause of the truncation
 
-The History workflow completed retrieval and AI generation; delivery failed
-with `destination_not_owner_private` and then `no_safe_text_path`.
+Two independent cuts discarded generated text:
 
-`backend/bot/handlers/history.py::_deliver_result` never reached a supported
-edit when the panel was a photo message with a long summary:
+1. **Delivery cut.** The result was fitted to the panel's Telegram limit with a
+   visible truncation marker, so a long summary could not be read past the
+   first caption/message.
+2. **Generation cut.** `_summary_body` discarded everything after
+   `MAX_SUMMARY_CHARS = 2800` and appended `… (summary truncated for display)`.
+   This happened BEFORE delivery, so pagination alone would still have paged an
+   already-truncated string.
 
-- with Appearance preview active the panel is delivered as an **inline photo
-  result**, so its text is a caption (1024 characters) while the summary body
-  can reach 2800 plus metadata;
-- the code therefore called `_replace_with_text_result`, which creates a
-  **replacement panel** through `PanelLifecycleManager.replace_panel`;
-- that replacement was gated by `_owner_private_destination()` — allowed only
-  when the panel chat equals the owner's own private chat. The recorded panel
-  source chat `-1002750223875` is a group, so it was refused with
-  `destination_not_owner_private`, and the operation ended with
-  `no_safe_text_path`.
+Both cuts are gone. `_summary_body` now keeps the complete generated summary,
+and the delivery path splits that complete body into pages. There is no
+truncation marker for the summary any more.
 
-The same function's normal edit path built `ExistingPanelEditor` with BOTH the
-Helper Bot and the owner's self-bot client. For an inline-bot message the
-self-client edit is invalid (only the bot that sent the inline result may edit
-it), so that fallback could only hide the real failure. The failure text also
-instructed the owner to rerun from a Saved Messages panel, which is prohibited.
+## 2. Delivery ownership (unchanged)
 
-## 2. Helper Bot ownership and editing mechanism
+The panel is an inline result sent by the owner's account with the Helper Bot
+as its inline identity. The only editor remains the Helper Bot:
 
-The History panel is an inline result: `inline_engine.trigger` runs
-`self_client.inline_query(helper, query)` and sends `result.click(chat)`, so the
-message is sent by the owner's account with the Helper Bot as `via_bot` and its
-inline-bot identity belongs to the Helper Bot. The callback arrives at the
-Helper Bot with `query.msg_id` as an `InputBotInlineMessageID` /
-`InputBotInlineMessageID64`.
+- `history._editor` builds `ExistingPanelEditor` with `helper=get_client()` and
+  **`self_client=None`**;
+- the edit is Telethon's `edit_message(InputBotInlineMessageID, text=...,
+  buttons=...)` (`messages.editInlineBotMessage`) using the callback's own
+  inline handle;
+- page navigation uses the same editor and the same handle.
 
-`history._editor` now builds `ExistingPanelEditor` with `helper=get_client()`
-and **`self_client=None`**, and `_run_action`/input handlers pass the inline
-handle obtained from the callback (`inline_message_id_from_event`). The edit is
-`messages.editInlineBotMessage` via Telethon's
-`edit_message(InputBotInlineMessageID, text=..., buttons=...)` — the same
-mechanism already used by `backend/bot/handlers/appearance.py` and the Save
-progress path. The owner's self-bot client is never supplied as an editor, and
-no second client is created.
+No replacement panel, second message, Saved Messages message, redirect, new
+Telegram client, update loop or scheduler was added. The panel's recorded
+delivery state decides only the text bound (photo caption 1,024 vs text 4,096);
+it never changes the destination.
 
-## 3. Files changed
+## 3. Pagination design
+
+`_paginate(body, limit, measure=_rendered_units)` returns one page when the body
+already fits, otherwise it splits the body:
+
+1. paragraphs (blank-line boundaries);
+2. lines inside a paragraph;
+3. sentences (English and common RTL terminators);
+4. words;
+5. a UTF-16 hard cut as the last resort, with a guard that avoids cutting an
+   unclosed `**` or backtick span when a nearer boundary exists.
+
+A block that overflows the page in progress is split against the remaining
+space first, so short metadata does not consume page 1; the summary starts on
+the page the owner receives.
+
+Each page is rendered as:
+
+```
+**History & Intelligence**
+
+Page N/M
+
+<page content>
+```
+
+Page 1 is delivered automatically. A single-page result keeps the previous
+buttons and has no page indicator or paging controls. `Previous` is omitted on
+page 1 and `Next` on the last page (they are not disabled placeholders).
+Navigation is `action:history_page:<token>:<index>` and edits the existing
+panel in place.
+
+### Exact Telegram limits
+
+`_rendered_units` measures the text through `panel_render.render_edit("", text,
+[])` — the same renderer the editor uses immediately before the RPC — not a
+raw character count. This matters because the Glass UI font replaces Latin
+letters (and some digit runs) with mathematical glyphs outside the BMP, which
+cost two UTF-16 units each. The page budget also reserves the title and a
+two-digit `Page 99/99` indicator.
+
+Limits used: photo panel `appearance_service.MAX_CAPTION_CHARS` (1,024); text
+panel `MAX_RESULT_TEXT_CHARS` (4,096). The panel's `delivered_state` chooses the
+bound, with `preview_active()` as the existing fallback.
+
+## 4. Files changed
 
 | File | Change |
 |---|---|
-| `backend/bot/handlers/history.py` | Helper-Bot-only `_editor`; delivery edits the original panel; caption-aware text bound; Telegram-error classification; removed the replacement/Saved-Messages delivery path, result-view tokens and the "rerun from Saved Messages" notice |
-| `backend/helper/panel_edit.py` | `ExistingPanelEditor.last_error` records the refused exception TYPE (no behavior change for successful edits; stale generations are labelled) |
-| `tests/test_history_panel.py` | Replaced delivery tests: Helper Bot ownership, in-place edit, caption/text bounds, permission and invalid-reference classification, missing-handle behavior, no replacement, no Saved Messages, no self-client edit; existing retrieval/AI/link tests kept |
-| `INVESTIGATION.md`, `IMPLEMENTATION_REPORT.md` | Replaced in full with this verified state |
-| `ROADMAP.md` | P1 delivery record corrected to the Helper-Bot inline-edit approach |
+| `backend/bot/handlers/history.py` | Removed both display truncations; added page splitting, rendered-unit measurement, page state, `history_page` navigation, in-place page rendering, honest expired/refused-edit handling, and explicit retained-result bounds |
+| `tests/test_history_panel.py` | Added pagination, navigation, independence, stale/expired/invalid callback, failed-edit, missing-handle, new-run invalidation, TTL/size bound, exact limit, styled-font and complete-summary tests |
+| `ROADMAP.md` | Recorded the pagination implementation and its actual verification status |
+| `IMPLEMENTATION_REPORT.md` | Replaced in full with this report |
 
-Not changed: `history_service`, `history_ai_service`, ProviderManager/candidate
-behavior, prompts, panel lifecycle for other features, Appearance composition,
-other Saved Messages flows, database/schema, Render configuration.
-`DATABASE_ARCHITECTURE.md` was not modified and no SQL was executed.
+Not changed: `history_service`, `history_ai_service`, provider code, panel
+registries, `panel_edit.py`, database/Supabase, migrations,
+`DATABASE_ARCHITECTURE.md`, helper bot runtime. Nothing was deployed.
 
-## 4. Implemented behavior
+## 5. Page-state lifecycle, bounds and cleanup
 
-- **Edits the same message.** The summary is rendered into the original History
-  panel through the Helper Bot's inline edit. Message id, chat, `via_bot`
-  identity and the panel's keyboard/navigation context are preserved.
-- **Error-free short results.** A text panel carries the complete result up to
-  Telegram's 4096-character text limit; a photo panel carries a caption up to
-  1024.
-- **Long results.** On a media (photo) panel the text is deterministically
-  bounded to the caption limit with the visible marker
-  `… (bounded to this panel's Telegram limit)`, so the edit is valid and the
-  original message survives. On a text panel the full 2800-character summary
-  fits unchanged.
-- **No replacement, no redirection.** `_replace_with_text_result`,
-  `_owner_private_destination`, the one-shot `_RESULT_VIEWS` tokens, the
-  `replace_panel` call and the Saved Messages instruction were removed from the
-  History module. No new panel, message or chat is created in any failure path.
-- **Honest failure.** A refused edit is classified from the Telegram error type
-  (`permission`, `not_author`, `invalid_reference`, `caption_too_long`,
-  `text_too_long`, `no_inline_panel_handle`, `telegram_error`), logged as
-  `HISTORY_RESULT_DELIVERY_FAILED reason=helper_panel_edit_failed error=… kind=…`,
-  and never logged as `HISTORY_RESULT_DELIVERED`. The failure notice is
-  attempted on the same panel through the same Helper Bot editor; if that is
-  also refused, nothing is sent anywhere.
-- **One editing principal.** Progress, link, focus and result paints all use
-  the Helper Bot editor; the self-bot client is used only for non-panel
-  operations (deleting the owner's input message).
+- State is one in-memory `OrderedDict` keyed by a 12-hex UUID token.
+- Each `_PageState` stores the token, `(panel chat id, panel message id)`, the
+  tuple of page strings, timestamps and the current index. One panel can have
+  at most one retained state because `_remember_pages` invalidates that panel's
+  previous token first.
+- TTL: `_PAGE_STATE_TTL_S = 6 hours`, refreshed on a successful navigation.
+- Panel bound: `_PAGE_STATE_MAX = 16` states; the least-recently-used entry is
+  evicted deterministically.
+- Pruning is lazy, on state lookup/creation; there is no background cleanup
+  loop, timer, task or database row.
+- A new History run calls `_forget_panel_pages` before its first progress edit,
+  so buttons from the previous run can never paint a page that no longer
+  belongs to the panel.
+- Restarting the process drops state; old page buttons then produce the honest
+  on-panel "no longer available" notice.
+- Retained-result bounds: `MAX_RESULT_PAGES = 64` and
+  `MAX_RETAINED_RESULT_CHARS = 40_000` (sum of page UTF-16 units). If either is
+  exceeded, `_deliver_result` does not store state; it edits the SAME panel with
+  an honest failure (`result_too_long`) and nothing is sent anywhere else.
 
-## 5. Automated test results
+## 6. Callback and navigation safety
+
+- A callback carries its own 12-hex token; the state is looked up by token, then
+  validated against the callback's chat and panel message. A token from panel A
+  cannot paint panel B.
+- Unknown/expired tokens paint "These result pages are no longer available" on
+  the same panel through the same Helper Bot handle. Malformed tokens or
+  indexes, out-of-range indexes and stale chat/message bindings do not edit the
+  panel at all.
+- A refused page edit is logged as `HISTORY_PAGE_EDIT_FAILED` with a stable
+  failure kind; the index is not advanced and no `HISTORY_PAGE_DELIVERED` line
+  is written. `delivered`/index updates happen only after `editor.edit`
+  returns true.
+- A missing inline handle is reported as `kind=no_inline_panel_handle`; no
+  chat/message fallback exists because `_editor` never supplies the self client.
+- The existing callback gate serialises turns per panel, so two clicks on the
+  same panel cannot edit it concurrently.
+
+## 7. Tests executed and actual results
+
+Environment: `/tmp/venv`, Python 3.12. No live Telegram, provider, database or
+network call is used by these tests.
 
 | Check | Command | Result |
 |---|---|---|
-| Focused History panel suite | `pytest tests/test_history_panel.py -q` | **42 passed** |
-| Panel/lifecycle/callback/edit regressions | `pytest tests -q -k "history or panel or edit or callback or lifecycle or save_success or save_reply or taskloom"` | **881 passed, 3 skipped** |
-| Full suite | `pytest tests -q` | **7587 passed, 27 skipped, 6 failed** |
-| Compilation | `py_compile` on the changed modules + test file | exit 0 |
-| Whitespace | `git diff --check` | clean |
+| Focused History suite | `pytest tests/test_history_panel.py -q` | **55 passed** |
+| Panel/callback/lifecycle regressions | `pytest tests -q -k "history or panel or edit or callback or lifecycle"` | **863 passed, 3 skipped** |
+| Full suite | `pytest tests -q` | **7600 passed, 27 skipped, 6 failed** (same six pre-existing failures listed below) |
+| Compilation | `python3 -m py_compile backend/bot/handlers/history.py tests/test_history_panel.py` | **exit 0** |
+| Whitespace | `git diff --check` | **exit 0** |
 
-The six full-suite failures are the documented pre-existing ones (five
-documentation-drift assertions in `test_database_setup_order`,
-`test_private_message_db_security`, `test_aed_db_security`,
-`test_canonical_schema_reconciliation`, and the known scheduler-recovery flake);
-none touches a file changed here and none was weakened.
+The focused file now covers:
 
-The focused tests assert in particular:
+- a short result with no paging controls;
+- a long result split into pages;
+- first-page and last-page `Previous`/`Next` behavior;
+- walking every page in the same panel and preserving content;
+- exact 1,024/4,096 limits including title and page indicator;
+- a styled Glass UI font (non-BMP glyphs) staying within the limit;
+- paragraph/sentence/word splitting and balanced `**` markers;
+- a complete summary beyond the old 2,800-character display cap;
+- two panels with independent tokens/indexes and cross-panel rejection;
+- malformed, out-of-range, stale-chat and stale-message callbacks;
+- expired state answered honestly on the same panel;
+- a refused navigation edit not advancing state;
+- a missing inline handle making no edit;
+- a new run invalidating old pages;
+- TTL expiry, per-panel eviction, LRU/panel bound;
+- a result beyond the retained-page bound failing honestly on the original
+  panel with no state stored;
+- Helper-Bot-only edits, no self-client edit, no lifecycle call, no replacement
+  or Saved Messages delivery.
 
-- a summary edit reaches the Helper Bot with the EXACT
-  `InputBotInlineMessageID64` from the callback, and the self client records no
-  edit;
-- media results are bounded to `appearance_service.MAX_CAPTION_CHARS` with the
-  marker, text results keep the full summary;
-- `ChatAdminRequiredError` is logged as `kind=permission` and
-  `MessageIdInvalidError` as `kind=invalid_reference`, with no
-  `HISTORY_RESULT_DELIVERED`;
-- no inline handle fails as `kind=no_inline_panel_handle` with zero edits, zero
-  self-client edits and zero lifecycle replacements;
-- the module contains no `Saved Messages`, `replace_panel`, `get_lifecycle`,
-  `_RESULT_VIEWS` or old failure reasons, and constructs no Telegram client.
+### Full-suite failures (pre-existing)
 
-## 6. Original panel: edited in place
+The same six tests failed before this change (baseline: 7,587 passed, 27
+skipped, 6 failed). This change adds 13 focused tests; no History or pagination
+test is among the failures:
 
-Automated tests prove the edit is addressed to the original inline message
-handle. Telegram actually permits this because the Helper Bot owns the inline
-result — the same API is already used for Appearance panels. **No live Telegram
-edit was performed from this workspace**, so end-to-end delivery is not claimed
-(see §8).
+- `tests/test_aed_db_security.py::test_the_documentation_describes_the_restrictive_model`
+- `tests/test_canonical_schema_reconciliation.py::test_the_migration_is_forward_only_and_its_successors_stay_additive`
+- `tests/test_database_setup_order.py::test_the_section_does_not_pretend_the_sql_was_executed`
+- `tests/test_database_setup_order.py::test_the_waiting_answer_migration_is_absorbed_by_part_one`
+- `tests/test_private_message_db_security.py::test_the_rls_model_names_the_two_tables_as_server_only_exceptions`
+- `tests/test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`
 
-## 7. Saved Messages
+They are documentation/schema-drift and an unrelated scheduler-recovery test;
+none touches `history.py`, panel delivery or pagination. They were not modified
+to make them pass.
 
-The History delivery path contains **no** Saved Messages fallback, no
-replacement panel, no summary sent to Saved Messages, and no instruction to
-rerun from Saved Messages. The former owner-private gate and replacement code
-were deleted. Unrelated features that legitimately write to Saved Messages
-(Deep Save, retrieval) are untouched.
+## 8. What was verified automatically
 
-## 8. Live verification status and remaining limitations
+- Complete summary retention through page state (no 2,800-character cut, no
+  "truncated for display" marker).
+- Page text length measured after the actual font/render transform.
+- Navigation state isolation between two panels and rejection across panels.
+- Expiry, malformed callbacks, invalid indexes, failed edits and missing inline
+  handles.
+- Only the Helper Bot entity receives edits; the self-bot client receives none;
+  no other message/panel is created.
+- State bounds and TTL, and new-run invalidation.
 
-- **Not live-verified.** This workspace has no Telegram session, helper bot
-  token, Render access or Supabase credentials. No real History run was issued
-  and no production log after the fix was observed. Verification requires
-  pressing Run Summary on a History panel and confirming the panel edits in
-  place with no `HISTORY_RESULT_DELIVERY_FAILED` line.
-- A photo panel's caption cannot carry the full 2800-character summary; the
-  delivered text is bounded and marked. This is a Telegram message-type limit,
-  not a truncation bug, and the panel is never replaced to gain space.
-- A Helper Bot that is disconnected, removed from the chat, or not the owner of
-  the inline result cannot edit. The failure is logged by type and the panel
-  keeps its previous content; nothing is redirected.
-- If a future panel is created as an ordinary message instead of an inline
-  result, no inline handle exists and delivery fails honestly; creating a second
-  panel was explicitly rejected.
+## 9. Live Telegram verification status
 
-## 9. Git delivery
+**Not performed by this implementation session.** There are no Telegram,
+Render or Supabase credentials in the delivery environment, so no live panel,
+callback, caption or navigation was exercised.
 
-One scoped commit on top of `c18a2d5`, pushed directly to `origin/main` (no
-branch, no pull request, no rebase, no force-push, no history rewrite). The
-commit SHA, push result and independently re-fetched remote HEAD agreement are
-recorded in the delivery message for this task. The working tree is clean.
-No Render deployment was triggered; the service's auto-deploy is outside this
-workspace's control and must be observed separately.
+The owner previously reported one successful live result in the original panel
+for a summary that fit its panel. That is an owner observation from before
+pagination; it does not verify multi-page navigation, photo-caption paging, the
+styled-font measurement or any failure path. Those remain the owner's live
+acceptance step.
+
+## 10. Remaining limitations
+
+- Page state is process-local and expires after six hours. A restart or expiry
+  makes old page buttons show the honest "no longer available" notice; the owner
+  must run the summary again. This is preferred to unbounded or persistent
+  result state and required no schema change.
+- Navigation state is not persisted and is not shared across processes.
+- Splitting preserves all words and content, but whitespace exactly at a page
+  boundary may be normalised (for example a blank line becomes the page break).
+  An over-long unbroken token is cut at UTF-16 boundaries.
+- The 64-page/40,000-character safety bound refuses a result that exceeds it
+  rather than retaining unbounded state or silently truncating it.
+- Correctness of the text bound depends on Telegram accepting the measured
+  caption/message. A permission, deleted-panel or invalid-handle refusal is
+  handled honestly on the panel, but cannot be prevented client-side.
+- No deployment was performed.

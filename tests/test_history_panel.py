@@ -134,12 +134,12 @@ def _supergroup(cid=666, name="News"):
     )
 
 
-def _event():
+def _event(msg_id: int = PANEL_MSG):
     return SimpleNamespace(
         sender_id=OWNER,
         chat_id=PANEL_CHAT,
-        message_id=PANEL_MSG,
-        message=SimpleNamespace(id=PANEL_MSG),
+        message_id=msg_id,
+        message=SimpleNamespace(id=msg_id),
         query=SimpleNamespace(msg_id=INLINE_ID),
         raw_text="",
     )
@@ -160,6 +160,32 @@ def _labels(result) -> list[str]:
     return [getattr(button, "text", "") for row in rows for button in row]
 
 
+def _markup_datas(built) -> list[str]:
+    out: list[str] = []
+    for row in built or []:
+        for button in row:
+            data = getattr(button, "data", b"")
+            out.append(data.decode() if isinstance(data, bytes) else str(data))
+    return out
+
+
+def _page_token(datas: list[str]) -> tuple[str, list[str]]:
+    token = next(
+        data.split(":")[2]
+        for data in datas
+        if data.startswith("action:history_page:")
+    )
+    return token, datas
+
+
+def _text_units(text: str) -> int:
+    return history._text_units(text)
+
+
+def _norm(text: str) -> str:
+    return " ".join(str(text or "").split())
+
+
 def _chat(peer_id: int, name: str) -> history._Chat:
     return history._Chat(peer_id=peer_id, name=name, kind="private")
 
@@ -173,6 +199,7 @@ def test_the_history_panel_and_controls_are_registered_once():
     assert get_panel_title("history") == "History & Intelligence"
     assert get_action("history_run") is history._run_action
     assert get_action("history_count") is history._count_action
+    assert get_action("history_page") is history._page_action
     assert get_input("history", "focus")["handler"] is history._focus_input_handler
     assert get_input("history", "link")["handler"] is history._link_input_handler
 
@@ -819,8 +846,8 @@ def test_the_helper_bot_is_the_only_client_that_edits_the_panel(monkeypatch):
     assert client.edits == []
 
 
-def test_a_long_media_summary_is_bounded_into_the_same_panel(monkeypatch):
-    summary = "Summary " + "x" * 1500
+def test_a_long_media_summary_is_split_into_navigable_pages(monkeypatch):
+    summary = "Summary " + "word " * 300
     client = _wire_delivery(monkeypatch, summary, media=True)
     lifecycle = _Lifecycle()
     _patch_lifecycle(monkeypatch, lifecycle)
@@ -828,13 +855,18 @@ def test_a_long_media_summary_is_bounded_into_the_same_panel(monkeypatch):
     _summary_run(client)
 
     text = _helper.last_text
-    assert summary in text or text.startswith("**History & Intelligence**")
-    assert len(text) <= appearance_service.MAX_CAPTION_CHARS
-    assert "bounded to this panel's Telegram limit" in text
-    assert summary[:200] in text
+    assert "Page 1/" in text
+    assert "bounded to this panel's Telegram limit" not in text
+    assert _text_units(text) <= appearance_service.MAX_CAPTION_CHARS
     assert _helper.edits[-1][0] is INLINE_ID
     assert client.edits == []
     assert lifecycle.calls == []
+    datas = _markup_datas(_helper.edits[-1][2])
+    token, datas = _page_token(datas)
+    assert any(data.endswith(":1") for data in datas)
+    state = history._PAGE_STATES[token]
+    assert len(state.pages) >= 2
+    assert _norm("\n\n".join(state.pages)).find(_norm(summary)) >= 0
 
 
 def test_a_long_text_panel_summary_keeps_the_full_text(monkeypatch):
@@ -906,14 +938,270 @@ def test_no_inline_handle_fails_honestly_without_any_fallback(
     assert lifecycle.calls == []
 
 
-def test_delivery_text_bounds_media_and_text_panels_differently():
-    body = "z" * 4000
-    media_text = history._delivery_text(body, media_panel=True)
-    plain_text = history._delivery_text(body, media_panel=False)
-    assert len(media_text) <= appearance_service.MAX_CAPTION_CHARS
-    assert media_text.endswith("Telegram limit)")
-    assert len(plain_text) <= history.MAX_RESULT_TEXT_CHARS
-    assert history._delivery_text(body, media_panel=False) == plain_text
+def test_the_complete_generated_summary_is_retained_beyond_the_old_display_cap(monkeypatch):
+    summary = "Summary " + "word " * 650
+    _client, token, _datas = _paginated(monkeypatch, summary=summary)
+    state = history._PAGE_STATES[token]
+
+    joined = _norm("\n\n".join(state.pages))
+    assert _norm(summary) in joined
+    assert "truncated for display" not in joined
+    assert len(state.pages) >= 4
+
+
+def test_every_page_respects_its_panels_exact_telegram_limit():
+    for limit, words in (
+        (appearance_service.MAX_CAPTION_CHARS, 800),
+        (history.MAX_RESULT_TEXT_CHARS, 1500),
+    ):
+        body = "Paragraph " + "word " * words
+        pages = history._paginate(body, limit)
+        assert len(pages) >= 2
+        for index, page in enumerate(pages):
+            rendered = history._page_text(page, index, len(pages))
+            assert history._text_units(rendered) <= limit
+            assert f"Page {index + 1}/{len(pages)}" in rendered
+        assert _norm("\n\n".join(pages)) == _norm(body)
+
+
+def test_pages_respect_the_rendered_limit_under_a_styled_font(monkeypatch):
+    """The Glass UI font can double Latin characters (non-BMP math glyphs).
+
+    Pagination must measure the text exactly as the editor renders it, not the
+    raw source characters, otherwise a styled page would overflow Telegram.
+    """
+    from backend.helper import panel_render
+    from backend.services import settings_service
+
+    monkeypatch.setattr(settings_service, "dashboard_font", lambda: "sans_bold")
+    limit = appearance_service.MAX_CAPTION_CHARS
+    body = "Paragraph " + "word " * 400
+
+    pages = history._paginate(body, limit)
+
+    assert len(pages) >= 2
+    for index, page in enumerate(pages):
+        text = history._page_text(page, index, len(pages))
+        rendered, _built = panel_render.render_edit("", text, [])
+        assert len(rendered.encode("utf-16-le")) // 2 <= limit
+
+
+def test_a_short_result_is_one_page_without_paging_controls():
+    body = "A short summary."
+    pages = history._paginate(body, appearance_service.MAX_CAPTION_CHARS)
+    assert pages == [body]
+    assert "Page 1/" not in history._page_text(pages[0], 0, 1)
+
+
+def test_splitting_prefers_paragraphs_and_keeps_markdown_pairs_intact():
+    body = "\n\n".join(
+        f"**Section {i}**\n" + ("content words " * 20) for i in range(12)
+    )
+    pages = history._paginate(body, appearance_service.MAX_CAPTION_CHARS)
+    assert len(pages) >= 2
+    for page in pages:
+        assert page.count("**") % 2 == 0
+    assert _norm("\n\n".join(pages)) == _norm(body)
+    for left, right in zip(pages, pages[1:]):
+        assert not (left[-1:].isalnum() and right[:1].isalnum())
+
+
+def _paginated(
+    monkeypatch, *, summary="Summary " + "word " * 400,
+    chat=PANEL_CHAT, msg=PANEL_MSG,
+):
+    """Deliver a paginated media-panel result and return its token + buttons."""
+    client = _wire_delivery(monkeypatch, summary, media=False)
+    appearance_service.note_delivered(chat, msg, ("media", "v1"))
+    generation = history.begin_panel_operation(chat, msg)
+    _run(
+        history._run_summary(
+            client, object(), chat_id=CHAT, chat_name="Alice", count=100,
+            focus="", panel_chat_id=chat, panel_msg_id=msg,
+            inline_id=INLINE_ID, generation=generation,
+        )
+    )
+    datas = _markup_datas(_helper.edits[-1][2])
+    token, _datas = _page_token(datas)
+    return client, token, datas
+
+
+def _navigate(token, index, *, chat_id=PANEL_CHAT, msg_id=PANEL_MSG):
+    _run(history._page_action(_event(msg_id), f"{token}:{index}", chat_id))
+
+
+def test_pagination_navigation_walks_every_page_in_place(monkeypatch):
+    client, token, first_datas = _paginated(monkeypatch)
+    state = history._PAGE_STATES[token]
+    total = len(state.pages)
+    assert total >= 3
+
+    assert any(data.endswith(":1") for data in first_datas)
+    assert not any(data.endswith(":-1") for data in first_datas)
+    assert "Page 1/" in _helper.last_text
+    assert _text_units(_helper.last_text) <= appearance_service.MAX_CAPTION_CHARS
+    assert _helper.edits[-1][0] is INLINE_ID
+
+    _navigate(token, 1)
+    middle_datas = _markup_datas(_helper.edits[-1][2])
+    assert "Page 2/" in _helper.last_text
+    assert any(data.endswith(":0") for data in middle_datas)
+    assert any(data.endswith(":2") for data in middle_datas)
+
+    _navigate(token, total - 1)
+    last_datas = _markup_datas(_helper.edits[-1][2])
+    assert f"Page {total}/{total}" in _helper.last_text
+    assert any(data.endswith(f":{total - 2}") for data in last_datas)
+    assert not any(data.endswith(f":{total}") for data in last_datas)
+    assert state.index == total - 1
+    assert _text_units(_helper.last_text) <= appearance_service.MAX_CAPTION_CHARS
+    assert _helper.edits[-1][0] is INLINE_ID
+
+    joined = _norm("\n\n".join(state.pages))
+    assert "Summary " in joined
+    assert client.edits == []
+
+
+def test_two_panels_keep_independent_page_state(monkeypatch):
+    client, token_a, _ = _paginated(monkeypatch, msg=PANEL_MSG)
+    _client_second, token_b, _ = _paginated(monkeypatch, msg=PANEL_MSG + 1)
+    assert token_a != token_b
+    state_a = history._PAGE_STATES[token_a]
+    state_b = history._PAGE_STATES[token_b]
+    assert (state_a.chat_id, state_a.msg_id) == (PANEL_CHAT, PANEL_MSG)
+    assert (state_b.chat_id, state_b.msg_id) == (PANEL_CHAT, PANEL_MSG + 1)
+
+    _navigate(token_a, 1)
+    assert state_a.index == 1
+    assert state_b.index == 0
+
+    _navigate(token_b, 1, msg_id=PANEL_MSG + 1)
+    assert state_b.index == 1
+    assert state_a.index == 1
+    assert client.edits == []
+
+    # A token bound to panel A cannot paint panel B.
+    before = len(_helper.edits)
+    _navigate(token_a, 2, msg_id=PANEL_MSG + 1)
+    assert len(_helper.edits) == before
+    assert state_b.index == 1
+
+
+def test_invalid_and_stale_page_callbacks_never_edit_the_panel(monkeypatch):
+    _client, token, _datas = _paginated(monkeypatch)
+    state = history._PAGE_STATES[token]
+    before = len(_helper.edits)
+
+    _navigate(token, "not-a-number")
+    _navigate(token, 99)
+    _navigate(token, -1)
+    _navigate(token, 1, chat_id=PANEL_CHAT + 1)
+    _navigate(token, 1, msg_id=PANEL_MSG + 1)
+
+    assert len(_helper.edits) == before
+    assert state.index == 0
+
+
+def test_expired_or_unknown_pages_answer_honestly_on_the_same_panel(monkeypatch):
+    _client, token, _datas = _paginated(monkeypatch)
+    history._PAGE_STATES.pop(token, None)
+
+    _navigate(token, 1)
+    assert "no longer available" in _helper.last_text
+    assert _helper.edits[-1][0] is INLINE_ID
+
+    before = len(_helper.edits)
+    _navigate("deadbeef0000", 0)
+    assert len(_helper.edits) == before + 1
+    assert "no longer available" in _helper.last_text
+
+
+def test_a_refused_page_edit_does_not_advance_state(monkeypatch, caplog):
+    _client, token, _datas = _paginated(monkeypatch)
+    state = history._PAGE_STATES[token]
+    _helper.error = type("ChatAdminRequiredError", (Exception,), {}) ("no rights")
+
+    with caplog.at_level(logging.WARNING):
+        _navigate(token, 1)
+
+    assert state.index == 0
+    assert "HISTORY_PAGE_EDIT_FAILED" in caplog.text
+    assert "error=ChatAdminRequiredError" in caplog.text
+    assert "kind=permission" in caplog.text
+    assert "HISTORY_PAGE_DELIVERED" not in caplog.text
+
+
+def test_page_navigation_requires_the_inline_handle(monkeypatch, caplog):
+    _client, token, _datas = _paginated(monkeypatch)
+    state = history._PAGE_STATES[token]
+    before = len(_helper.edits)
+    event = _event()
+    event.query = None
+
+    with caplog.at_level(logging.WARNING):
+        _run(history._page_action(event, f"{token}:1", PANEL_CHAT))
+
+    assert len(_helper.edits) == before
+    assert state.index == 0
+    assert "kind=no_inline_panel_handle" in caplog.text
+
+
+def test_a_new_run_invalidates_the_previous_pages(monkeypatch):
+    _client, token, _datas = _paginated(monkeypatch)
+    assert history._page_state(token) is not None
+
+    _wire_delivery(monkeypatch, "short summary", media=False)
+    appearance_service.note_delivered(PANEL_CHAT, PANEL_MSG, ("media", "v1"))
+    _helper.error = type("ChatAdminRequiredError", (Exception,), {}) ("no rights")
+    generation = history.begin_panel_operation(PANEL_CHAT, PANEL_MSG)
+    _run(
+        history._run_summary(
+            _client, object(), chat_id=CHAT, chat_name="Alice", count=100,
+            focus="", panel_chat_id=PANEL_CHAT, panel_msg_id=PANEL_MSG,
+            inline_id=INLINE_ID, generation=generation,
+        )
+    )
+
+    assert history._page_state(token) is None
+    _helper.error = None
+    _navigate(token, 1)
+    assert "no longer available" in _helper.last_text
+
+
+def test_a_result_beyond_the_retained_bound_fails_honestly_without_state(
+    monkeypatch, caplog,
+):
+    history._PAGE_STATES.clear()
+    monkeypatch.setattr(history, "MAX_RESULT_PAGES", 2)
+    client = _wire_delivery(monkeypatch, "Summary " + "word " * 400, media=True)
+
+    with caplog.at_level(logging.WARNING):
+        _summary_run(client)
+
+    assert not history._PAGE_STATES
+    assert any("too long to page safely" in edit[1] for edit in _helper.edits)
+    assert "HISTORY_RESULT_PAGINATION_UNBOUNDED" in caplog.text
+    assert all(edit[0] is INLINE_ID for edit in _helper.edits)
+    assert client.edits == []
+
+
+def test_page_state_is_bounded_and_expires_without_a_cleanup_loop():
+    history._PAGE_STATES.clear()
+    for i in range(history._PAGE_STATE_MAX + 8):
+        history._remember_pages(10_000 + i, 20_000 + i, ["a", "b"], f"tok{i:04d}")
+    assert len(history._PAGE_STATES) <= history._PAGE_STATE_MAX
+
+    token = next(iter(history._PAGE_STATES))
+    history._PAGE_STATES[token].touched -= history._PAGE_STATE_TTL_S + 1
+    assert history._page_state(token) is None
+
+    history._PAGE_STATES.clear()
+    history._remember_pages(1, 2, ["a"], "only_a")
+    history._remember_pages(3, 4, ["a"], "only_b")
+    history._forget_panel_pages(1, 2)
+    assert "only_a" not in history._PAGE_STATES
+    assert "only_b" in history._PAGE_STATES
+
 
 
 def test_no_saved_messages_delivery_path_exists_in_history():
@@ -930,7 +1218,7 @@ def test_no_saved_messages_delivery_path_exists_in_history():
 
 
 def test_a_focused_long_summary_uses_the_corrected_delivery(monkeypatch):
-    summary = "Focused " + "f" * 1400
+    summary = "Focused " + "word " * 280
     client, calls = _wire_focus(monkeypatch, summary)
     history._STATE.focus = "decisions only"
     appearance_service.note_delivered(PANEL_CHAT, PANEL_MSG, ("media", "v1"))
@@ -942,7 +1230,7 @@ def test_a_focused_long_summary_uses_the_corrected_delivery(monkeypatch):
     _run(tasks[0])
 
     assert calls[0]["instruction"] == "decisions only"
-    assert summary[:200] in _helper.last_text
+    assert summary[:80] in _helper.last_text
     assert len(_helper.last_text) <= appearance_service.MAX_CAPTION_CHARS
     assert client.edits == []
     assert lifecycle.calls == []
@@ -959,7 +1247,7 @@ def test_a_long_link_summary_uses_the_corrected_delivery(monkeypatch):
     monkeypatch.setattr(history, "get_self_client", lambda: client)
     monkeypatch.setattr(history, "_manager", lambda: object())
     calls: list[dict] = []
-    summary = "Linked " + "l" * 1400
+    summary = "Linked " + "word " * 280
 
     async def _fetch(source, target):
         return message
@@ -987,7 +1275,7 @@ def test_a_long_link_summary_uses_the_corrected_delivery(monkeypatch):
     _run(tasks[0])
 
     assert calls[0]["current_message_id"] == linked + 1
-    assert summary[:200] in _helper.last_text
+    assert summary[:80] in _helper.last_text
     assert "Ending at: #500" in _helper.last_text
     assert len(_helper.last_text) <= appearance_service.MAX_CAPTION_CHARS
     assert client.edits == []

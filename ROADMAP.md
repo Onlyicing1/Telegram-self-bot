@@ -374,6 +374,44 @@ owner's own private chat, so a History panel in a group failed with
 - Live verification remains outstanding: it requires a real Telegram run with
   the Helper Bot connected and a History panel in the same chat.
 
+#### P1 long-result pagination (implemented)
+
+Status: **Implemented and offline-verified; live multi-page navigation has not
+been performed.** The owner previously reported one successful live summary in
+the original panel; that observation predates pagination and covered a result
+that fit its panel.
+
+- Root cause of lost text: delivery cut the body at the panel's Telegram limit
+  with a visible marker, and `_summary_body` separately discarded generated
+  text beyond 2,800 characters. Both cuts are removed; the complete generated
+  summary is now split across pages instead.
+- `_paginate` splits paragraphs first, then lines, sentences and words, and
+  falls back to a UTF-16 hard cut with a Markdown-marker guard. Page 1 is
+  delivered automatically and includes the first summary content.
+- Every page carries the title and `Page N/M`; the limit check runs through
+  `panel_render.render_edit`, so a styled Glass UI font (whose non-BMP glyphs
+  count as two UTF-16 units) cannot push a caption past 1,024 or a text panel
+  past 4,096.
+- `Previous` / `Next` are omitted at the first / last page; a single-page
+  result keeps the previous buttons and gets no paging controls.
+- Navigation uses `action:history_page:<token>:<index>` and edits only the
+  original panel through the Helper Bot's inline handle. No replacement panel,
+  second message, Saved Messages message or self-bot edit exists.
+- Retained page state is an in-memory `OrderedDict` keyed by a 12-hex token and
+  bound to `(panel chat, panel message)`: 6-hour TTL, at most 16 panels, lazily
+  pruned, and invalidated when a new run starts on that panel. No background
+  loop, database, schema or Supabase change was added.
+- Stale, expired, malformed and out-of-range callbacks never edit a page;
+  expired state paints an honest notice on the same panel. A refused page edit
+  is logged (`HISTORY_PAGE_EDIT_FAILED`) and never reported as delivered.
+  Results beyond 64 pages or 40,000 retained characters fail honestly on the
+  panel instead of growing state without bound.
+- Tests in `tests/test_history_panel.py` cover the complete summary beyond the
+  old cap, page navigation, first/last controls, independent panels, stale and
+  expired tokens, invalid indexes, failed edits, missing inline handles,
+  new-run invalidation, TTL/size bounds, exact caption/text limits (including a
+  styled font) and content preservation.
+
 ### Feature-level acceptance criteria
 
 1. Manual run summarizes exactly the stated chat and range, ≤1,000 messages,
@@ -412,9 +450,10 @@ owner's own private chat, so a History panel in a group failed with
 - **P1 — complete in code and offline tests.** Panel, bounded chat picker,
   manual and link summarization, range reporting and failure rendering are
   implemented with the existing engine, and the summary is delivered by the
-  Helper Bot editing the original panel in place. Live account runs were not possible in
-  the delivery environment and remain the owner's acceptance step. No schema
-  was required or changed.
+  Helper Bot editing the original panel in place. Long summaries are now
+  paginated in that same panel instead of truncated. Live account runs and
+  multi-page navigation were not possible in the delivery environment and
+  remain the owner's acceptance step. No schema was required or changed.
 - **P2–P7 — not started.** Each begins only after the previous phase's
   acceptance tests and live checks pass, and after any schema required by P2 is
   applied by the owner.

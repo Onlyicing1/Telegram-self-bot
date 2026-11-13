@@ -17,6 +17,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
+import time
+import uuid
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
 
@@ -73,14 +77,39 @@ DIALOGS_TIMEOUT_S = 15.0
 OPERATION_TIMEOUT_S = 300.0
 LINK_RESOLVE_TIMEOUT_S = 60.0
 
-#: Panel text is bounded so one Telegram edit cannot exceed its message limit.
-MAX_SUMMARY_CHARS = 2800
-
 #: Telegram's own bound for a text message. A panel with Appearance preview is
 #: a PHOTO message, so its text is a CAPTION (``appearance_service.MAX_CAPTION_CHARS``);
 #: a plain text panel carries this larger bound. The panel's on-screen state
 #: decides only how much text the SAME message can take — never its destination.
 MAX_RESULT_TEXT_CHARS = 4096
+
+#: A paginated result keeps the original inline panel and its Telegram limits.
+#: Only the rendered TEXT changes per page; nothing is created anywhere.
+#: A provider result is finite, but these hard caps keep retained page state
+#: bounded even if a provider ignores its output budget. Exceeding them is
+#: reported as an honest failure on the panel instead of silently dropping text.
+MAX_RESULT_PAGES = 64
+MAX_RETAINED_RESULT_CHARS = 40_000
+_PAGE_STATE_TTL_S = 6 * 60 * 60.0
+_PAGE_STATE_MAX = 16
+
+#: Bounded, panel-keyed page state for the CURRENT process. One entry per
+#: paginated result; replaced by the next run on the same panel, expired after
+#: ``_PAGE_STATE_TTL_S``, and capped at ``_PAGE_STATE_MAX``. A restart (or an
+#: expired entry) makes the old page buttons answer honestly instead of showing
+#: a page that no longer matches the panel.
+_PAGE_STATES: "OrderedDict[str, _PageState]" = OrderedDict()
+
+
+@dataclass
+class _PageState:
+    token: str
+    chat_id: int
+    msg_id: int
+    pages: tuple[str, ...]
+    created: float
+    touched: float
+    index: int = 0
 
 
 @dataclass
@@ -323,24 +352,211 @@ def _result_text(body: str) -> str:
     return f"**{TITLE}**\n\n{body}"
 
 
-def _delivery_text(body: str, *, media_panel: bool) -> str:
-    """The result text THIS panel message can actually carry.
+def _text_units(text: str) -> int:
+    """Telegram counts a message in UTF-16 code units, not Python characters."""
+    return len(str(text or "").encode("utf-16-le")) // 2
 
-    An inline photo panel's text is a CAPTION (Telegram's 1024-character
-    ceiling); a text panel carries up to ``MAX_RESULT_TEXT_CHARS``. The text is
-    bounded here with a visible marker, so an over-limit edit is never sent and
-    the original message is never replaced just to gain space.
+
+def _rendered_units(text: str) -> int:
+    """UTF-16 units of the text EXACTLY as the panel renderer emits it.
+
+    The Glass UI font can replace Latin letters with non-BMP mathematical
+    glyphs (two UTF-16 units each), so a raw character count can understate the
+    real Telegram length. Measuring through ``render_edit`` — the same call the
+    editor makes before sending — keeps every page within the true limit.
     """
-    limit = (
-        appearance_service.MAX_CAPTION_CHARS if media_panel
-        else MAX_RESULT_TEXT_CHARS
-    )
-    text = _result_text(body)
-    if len(text) <= limit:
-        return text
-    marker = "\n\n… (bounded to this panel's Telegram limit)"
-    keep = max(0, limit - len(marker))
-    return text[:keep].rstrip() + marker
+    try:
+        from backend.helper.panel_render import render_edit
+
+        rendered, _built = render_edit("", str(text or ""), [])
+        return _text_units(rendered)
+    except Exception:  # noqa: BLE001 — measurement must never block delivery
+        return _text_units(text)
+
+
+def _page_text(content: str, index: int, total: int) -> str:
+    """One page's rendered text, including the title and page indicator.
+
+    The page indicator is part of the SAME message, so its characters are part
+    of the Telegram limit the caller must respect.
+    """
+    header = f"**{TITLE}**\n\n"
+    if total <= 1:
+        return f"{header}{content}"
+    return f"{header}Page {index + 1}/{total}\n\n{content}"
+
+
+def _pack_units(
+    parts: list[str], joiner: str, limit: int, measure: Any,
+) -> list[str]:
+    """Greedily pack already-splittable pieces into limit-respecting chunks."""
+    chunks: list[str] = []
+    current = ""
+    for part in parts:
+        candidate = f"{current}{joiner}{part}" if current else part
+        if measure(candidate) <= limit:
+            current = candidate
+        else:
+            if current:
+                chunks.append(current)
+            current = part
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _markdown_safe_cut(text: str, cut: int) -> int:
+    """Back a hard cut out of an unclosed inline-Markdown span when possible.
+
+    Only ``**`` and backticks are considered; a span larger than a whole page
+    cannot be kept intact and is split at a word/character boundary instead.
+    """
+    for marker in ("**", "`"):
+        if text[:cut].count(marker) % 2 == 1:
+            opening = text.rfind(marker, 0, cut)
+            if opening > 0:
+                cut = opening
+    return cut
+
+
+def _hard_split(text: str, limit: int, measure: Any) -> list[str]:
+    """The last resort: cut by measured units, avoiding a split word/marker."""
+    out: list[str] = []
+    rest = text
+    while rest:
+        if measure(rest) <= limit:
+            out.append(rest)
+            break
+        low, high = 1, len(rest)
+        while low < high:
+            middle = (low + high + 1) // 2
+            if measure(rest[:middle]) <= limit:
+                low = middle
+            else:
+                high = middle - 1
+        cut = _markdown_safe_cut(rest, low) or low
+        out.append(rest[:cut])
+        rest = rest[cut:]
+    return out
+
+
+def _split_sentence(text: str, limit: int, measure: Any) -> list[str]:
+    if measure(text) <= limit:
+        return [text]
+    words = text.split(" ")
+    if len(words) > 1:
+        pieces: list[str] = []
+        for word in words:
+            pieces.extend(_hard_split(word, limit, measure))
+        return _pack_units(pieces, " ", limit, measure)
+    return _hard_split(text, limit, measure)
+
+
+def _split_line(line: str, limit: int, measure: Any) -> list[str]:
+    if measure(line) <= limit:
+        return [line]
+    # Sentence boundaries first (English and common RTL terminators).
+    sentences = re.split(r"(?<=[.!?؟…۔])\s+", line)
+    if len(sentences) > 1:
+        pieces: list[str] = []
+        for sentence in sentences:
+            pieces.extend(_split_sentence(sentence, limit, measure))
+        return _pack_units(pieces, " ", limit, measure)
+    return _split_sentence(line, limit, measure)
+
+
+def _split_block(block: str, limit: int, measure: Any) -> list[str]:
+    """Split one paragraph: lines, then sentences, then words, then units."""
+    if measure(block) <= limit:
+        return [block]
+    lines = block.split("\n")
+    if len(lines) > 1:
+        pieces: list[str] = []
+        for line in lines:
+            pieces.extend(_split_line(line, limit, measure))
+        return _pack_units(pieces, "\n", limit, measure)
+    return _split_line(block, limit, measure)
+
+
+def _split_prefix(text: str, budget: int, measure: Any) -> tuple[str, str]:
+    """Largest boundary-safe prefix that fits ``budget``, plus the remainder."""
+    if measure(text) <= budget:
+        return text, ""
+    pieces = _split_block(text, max(32, budget), measure)
+    first = pieces[0]
+    return first, text[len(first):].lstrip("\n ")
+
+
+def _split_blocks(body: str, limit: int, measure: Any) -> list[str]:
+    """Pack paragraphs into pages, splitting only blocks that cannot fit.
+
+    A block that overflows the page already in progress is split against the
+    REMAINING space first, so a short metadata block does not waste page 1 and
+    the summary begins on the page the owner receives.
+    """
+    blocks = [block for block in re.split(r"\n{2,}", body) if block.strip()]
+    pages: list[str] = []
+    current = ""
+    for block in blocks:
+        if current:
+            remaining = limit - measure(current) - 2
+            if measure(block) <= remaining:
+                current = f"{current}\n\n{block}"
+                continue
+            first, remainder = _split_prefix(block, remaining, measure)
+            if first.strip():
+                current = f"{current}\n\n{first}"
+                pages.append(current)
+                current = ""
+                block = remainder
+            else:
+                pages.append(current)
+                current = ""
+        if not block.strip():
+            continue
+        pieces = (
+            [block] if measure(block) <= limit
+            else _split_block(block, limit, measure)
+        )
+        for piece in pieces:
+            candidate = f"{current}\n\n{piece}" if current else piece
+            if measure(candidate) <= limit:
+                current = candidate
+            else:
+                if current:
+                    pages.append(current)
+                current = piece
+    if current:
+        pages.append(current)
+    return pages or [""]
+
+
+def _paginate(body: str, limit: int, measure: Any = _rendered_units) -> list[str]:
+    """The body as one or more pages that each fit ``limit`` INCLUDING chrome.
+
+    A body that already fits is returned unchanged (a single page, no paging
+    controls). Otherwise paragraphs are packed first and only a paragraph that
+    cannot fit is split, so words, lines and most Markdown structure survive.
+    """
+    if measure(_page_text(body, 0, 1)) <= limit:
+        return [body]
+    # Reserve the title AND the widest realistic "Page N/N" indicator so the
+    # content budget is measured against everything the message will contain.
+    reserve = measure(f"**{TITLE}**\n\nPage 99/99\n\n")
+    content_limit = max(64, limit - reserve)
+    pages = _split_blocks(body, content_limit, measure)
+    # The reserve covers "Page 99/99"; verify against the real indicators and
+    # shrink deterministically if a pathologically small limit needs it.
+    for _ in range(32):
+        total = len(pages)
+        if all(
+            measure(_page_text(page, index, total)) <= limit
+            for index, page in enumerate(pages)
+        ):
+            break
+        content_limit = max(48, content_limit - 8)
+        pages = _split_blocks(body, content_limit, measure)
+    return pages
 
 
 #: Telegram error → a stable, non-sensitive failure category for the log line.
@@ -361,15 +577,86 @@ def _edit_failure_kind(error: str) -> str:
     return _EDIT_ERROR_KINDS.get(str(error or ""), "telegram_error")
 
 
+def _panel_limit(panel_chat_id: int, panel_msg_id: int) -> tuple[int, bool]:
+    """The Telegram text limit of THIS panel and whether it is a media panel."""
+    state = appearance_service.delivered_state(panel_chat_id, panel_msg_id)
+    media_panel = (
+        state[0] == "media" if state else appearance_service.preview_active()
+    )
+    limit = (
+        appearance_service.MAX_CAPTION_CHARS if media_panel
+        else MAX_RESULT_TEXT_CHARS
+    )
+    return limit, media_panel
+
+
+def _forget_panel_pages(panel_chat_id: int, panel_msg_id: int) -> None:
+    """Invalidate every retained page state for one panel message."""
+    key = (int(panel_chat_id or 0), int(panel_msg_id or 0))
+    for token, state in list(_PAGE_STATES.items()):
+        if (state.chat_id, state.msg_id) == key:
+            _PAGE_STATES.pop(token, None)
+
+
+def _prune_pages(now: float | None = None) -> None:
+    moment = time.monotonic() if now is None else now
+    for token, state in list(_PAGE_STATES.items()):
+        if moment - state.touched > _PAGE_STATE_TTL_S:
+            _PAGE_STATES.pop(token, None)
+    while len(_PAGE_STATES) > _PAGE_STATE_MAX:
+        _PAGE_STATES.popitem(last=False)
+
+
+def _remember_pages(
+    chat_id: int, msg_id: int, pages: list[str], token: str,
+) -> str:
+    """Retain one bounded page state for this panel under its emitted token."""
+    _prune_pages()
+    _forget_panel_pages(chat_id, msg_id)
+    moment = time.monotonic()
+    _PAGE_STATES[token] = _PageState(
+        token=token,
+        chat_id=int(chat_id or 0),
+        msg_id=int(msg_id or 0),
+        pages=tuple(pages),
+        created=moment,
+        touched=moment,
+    )
+    while len(_PAGE_STATES) > _PAGE_STATE_MAX:
+        _PAGE_STATES.popitem(last=False)
+    return token
+
+
+def _page_state(token: str) -> _PageState | None:
+    _prune_pages()
+    state = _PAGE_STATES.get(str(token or ""))
+    if state is not None:
+        _PAGE_STATES.move_to_end(state.token)
+    return state
+
+
+def _paged_buttons(index: int, total: int, token: str) -> list:
+    """Page controls for a multi-page result; nothing extra for one page."""
+    builder = InlinePanelBuilder()
+    if total > 1:
+        if index > 0:
+            builder.add_row("Previous", f"action:history_page:{token}:{index - 1}")
+        if index + 1 < total:
+            builder.add_row("Next", f"action:history_page:{token}:{index + 1}")
+    builder.add_row("New Summary", f"panel:{PANEL_ID}")
+    builder.add_row(sym.label(sym.OP_HOME, "Home"), "panel:_nav:home")
+    builder.add_row(sym.label(sym.OP_CLOSE, "Close"), "panel:_nav:close")
+    return builder.build()
+
+
 async def _deliver_result(
     editor: ExistingPanelEditor,
     body: str,
-    buttons: list,
     *,
     panel_chat_id: int,
     panel_msg_id: int,
 ) -> tuple[bool, str]:
-    """Edit the ORIGINAL panel with the result; never replace or redirect it.
+    """Edit the ORIGINAL panel with page 1; never replace or redirect it.
 
     The panel's on-screen delivery state decides only how much text Telegram
     can carry (photo caption vs text message) — it never changes the
@@ -377,15 +664,33 @@ async def _deliver_result(
     inline-only editor); a refusal is returned as an honest failure and no
     other panel, chat or message is created.
     """
-    state = appearance_service.delivered_state(panel_chat_id, panel_msg_id)
-    media_panel = (
-        state[0] == "media" if state else appearance_service.preview_active()
-    )
-    text = _delivery_text(body, media_panel=media_panel)
+    limit, media_panel = _panel_limit(panel_chat_id, panel_msg_id)
+    pages = _paginate(body, limit)
+    total = len(pages)
+    retained_chars = sum(_text_units(page) for page in pages)
+    if total > MAX_RESULT_PAGES or retained_chars > MAX_RETAINED_RESULT_CHARS:
+        logger.warning(
+            "HISTORY_RESULT_PAGINATION_UNBOUNDED pages=%s chars=%s",
+            total, retained_chars,
+        )
+        await editor.edit(
+            _result_text(
+                f"{sym.STATE_FAILED} This summary is too long to page safely "
+                f"({retained_chars} characters). Nothing was sent anywhere else."
+            ),
+            _result_buttons(),
+        )
+        return False, "result_too_long"
+    token = uuid.uuid4().hex[:12] if total > 1 else ""
+    text = _page_text(pages[0], 0, total)
+    buttons = _paged_buttons(0, total, token) if total > 1 else _result_buttons()
     if await editor.edit(text, buttons):
+        if total > 1:
+            _remember_pages(panel_chat_id, panel_msg_id, pages, token)
         logger.info(
-            "HISTORY_RESULT_DELIVERED path=helper-inline-panel media=%s chars=%s",
-            media_panel, len(text),
+            "HISTORY_RESULT_DELIVERED path=helper-inline-panel media=%s "
+            "pages=%s chars=%s",
+            media_panel, total, _text_units(text),
         )
         return True, ""
     error = editor.last_error or "NoEditablePanel"
@@ -395,6 +700,75 @@ async def _deliver_result(
         "error=%s kind=%s", error, kind,
     )
     return False, kind
+
+
+async def _paint_page_unavailable(
+    event: Any, chat_id: int, msg_id: int, reason: str,
+) -> None:
+    """Say on the SAME panel that its paged result is no longer available."""
+    editor = _editor(
+        chat_id, msg_id, inline_message_id_from_event(event),
+    )
+    await editor.edit(
+        _result_text(
+            f"{sym.STATE_FAILED} These result pages are no longer available "
+            f"({reason}). Run the summary again."
+        ),
+        _result_buttons(),
+    )
+
+
+async def _page_action(event, extra: str, chat_id: int):
+    """Navigate one retained result page in the ORIGINAL panel.
+
+    Registered as ``action:history_page:<token>:<index>``. The token binds the
+    click to one panel message and one generation of the result; the callback's
+    own inline-message handle is the only edit surface. Nothing is created.
+    """
+    token, _, raw_index = str(extra or "").partition(":")
+    state = _page_state(token)
+    msg_id = int(getattr(event, "message_id", 0) or 0)
+    if state is None:
+        logger.info("HISTORY_PAGE_EXPIRED token=%s", str(token)[:12])
+        await _paint_page_unavailable(event, chat_id, msg_id, "expired")
+        return None
+    if state.chat_id != int(chat_id or 0) or (msg_id and state.msg_id != msg_id):
+        logger.warning(
+            "HISTORY_PAGE_STALE token=%s chat=%s msg=%s",
+            str(token)[:12], chat_id, msg_id,
+        )
+        return None
+    try:
+        index = int(raw_index)
+    except (TypeError, ValueError):
+        logger.warning("HISTORY_PAGE_INVALID token=%s", str(token)[:12])
+        return None
+    total = len(state.pages)
+    if not 0 <= index < total:
+        logger.warning(
+            "HISTORY_PAGE_INVALID token=%s index=%s total=%s",
+            str(token)[:12], index, total,
+        )
+        return None
+    editor = _editor(
+        chat_id, msg_id or state.msg_id, inline_message_id_from_event(event),
+    )
+    text = _page_text(state.pages[index], index, total)
+    if await editor.edit(text, _paged_buttons(index, total, token)):
+        state.index = index
+        state.touched = time.monotonic()
+        _PAGE_STATES.move_to_end(token)
+        logger.info(
+            "HISTORY_PAGE_DELIVERED token=%s page=%s/%s",
+            str(token)[:12], index + 1, total,
+        )
+    else:
+        logger.warning(
+            "HISTORY_PAGE_EDIT_FAILED token=%s error=%s kind=%s",
+            str(token)[:12], editor.last_error or "NoEditablePanel",
+            _edit_failure_kind(editor.last_error),
+        )
+    return None
 
 
 def _range_line(data: dict[str, Any]) -> str:
@@ -436,8 +810,8 @@ def _summary_body(
     body = "\n".join(lines)
     summary = str(text or "").strip()
     if summary:
-        if len(summary) > MAX_SUMMARY_CHARS:
-            summary = summary[:MAX_SUMMARY_CHARS].rstrip() + "\n\n… (summary truncated for display)"
+        # The complete generated summary is retained; pagination, not a
+        # display cap, is what makes it fit Telegram's per-message limit.
         body = f"{body}\n\n{summary}"
     return body
 
@@ -466,6 +840,9 @@ async def _run_summary(
     ending_at: int | None = None,
 ) -> None:
     editor = _editor(panel_chat_id, panel_msg_id, inline_id, generation)
+    # A new run invalidates the previous run's page buttons IMMEDIATELY, so a
+    # stale page click can never show a page that no longer matches this panel.
+    _forget_panel_pages(panel_chat_id, panel_msg_id)
     try:
         await _paint(
             editor,
@@ -514,7 +891,6 @@ async def _run_summary(
         delivered, kind = await _deliver_result(
             editor,
             body,
-            _result_buttons(),
             panel_chat_id=panel_chat_id,
             panel_msg_id=panel_msg_id,
         )
@@ -778,6 +1154,7 @@ def register(client=None, owner_id: int = 0) -> None:
     register_inline_builder(PANEL_ID, _inline_builder)
     register_action("history_count", _count_action)
     register_action("history_run", _run_action)
+    register_action("history_page", _page_action)
     register_input(
         PANEL_ID,
         "focus",
