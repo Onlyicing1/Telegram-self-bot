@@ -1,15 +1,31 @@
 # ROADMAP
 
-## Latest delivery: History Phase 3 — durable state investigation and design
+## Latest delivery: History Phase 3A — durable state investigation and design
 
-Status: **investigation and design complete; nothing implemented or deployed.**
+Status: **Phase 3A complete. Phase 3B not started. Nothing implemented or
+deployed.**
 Base: `62a18de07f1bc5bf8b51c36438f66ad8c4f4d498` (Phase 2).
 
-Phase 3 was deliberately investigation-only. It established, from current source,
+Phase 3A was deliberately investigation-only. It established, from current source,
 what the History path persists (nothing), what is lost on restart, why the
 existing task/occurrence fields cannot hold a cumulative summary, and the design of
 a dedicated durable state table and repository contract. `INVESTIGATION.md` is the
 source-backed deliverable.
+
+### Phase map
+
+| Phase | Scope | Status |
+|---|---|---|
+| **3A** | Durable History state investigation and design | **Complete** |
+| **3B** | Durable schema/repository implementation and its required oldest-first retrieval prerequisite | **Next, not started** |
+| **4** | Deterministic schedule UI | Deferred; numbering unchanged |
+| **5** | Scheduled History action | Deferred; numbering unchanged |
+| **6** | Shared History admission | Deferred; numbering unchanged |
+| **7** | Live validation | Deferred; numbering unchanged |
+
+Phase 3 remains the umbrella durable-state phase: 3A is the completed
+investigation/design stage and 3B is the implementation stage. No existing phase
+was renumbered.
 
 ### Verified findings
 
@@ -22,12 +38,12 @@ source-backed deliverable.
 - The current collector scans newest→oldest and keeps the newest subset
   (`history_service._collect`), so 60 eligible messages with `count=10` can return
   51–60 and omit 1–50. **This defect remains unfixed and is a blocking prerequisite
-  for scheduled processing.**
+  for Phase 3B and scheduled processing.**
 - Every peer classification is live; a stored peer type can only be an
   informational snapshot, never policy authority.
 - A new migration cannot be added alone: `DATABASE_ARCHITECTURE.md` is the schema
   authority and the suite requires every migration's table to be classified and the
-  canonical §31.3 setup block to match. The document is protected in Phase 3 and
+  canonical §31.3 setup block to match. The document is protected in Phase 3A and
   was not modified.
 
 ### Proposed design (not applied)
@@ -63,15 +79,35 @@ source-backed deliverable.
   `20261112160000`) and the documentation/test prerequisites for a future
   migration.
 - `IMPLEMENTATION_REPORT.md`, `INVESTIGATION.md` and this roadmap updated.
+- Owner-approved phase map (3A complete, 3B next, Phases 4–7 unchanged) and the
+  one-state-per-peer ownership lifecycle recorded.
 
 No production Python, test, migration or Supabase object was changed. No SQL was
 executed. No live Telegram/provider behavior was tested.
 
+### Approved ownership and lifecycle (V1)
+
+- Exactly one cumulative History state per `(owner_id, peer_id)`.
+- `UNIQUE (owner_id, peer_id)` is retained. It is deliberately **not** replaced by
+  an active-only uniqueness constraint.
+- Active, paused, completed, failed and expired tasks retain ownership of their
+  History state.
+- A second History schedule for the same peer is **refused** while that state
+  exists, including when the owning task is paused or terminal. The refusal must
+  direct the owner to resume or delete the existing schedule.
+- Pausing retains the summary and both cursors.
+- Physical task deletion cascades to the History state, allowing a new schedule
+  afterward.
+- Any future replacement/transfer operation must be explicit and owner-authorized.
+- Legacy `status='deleted'` is an invariant-repair case; it must not silently block
+  a peer forever.
+
 ---
 
-## Next stage: Phase 3 implementation — schema/repository (not started)
+## Next stage: Phase 3B — durable schema/repository and retrieval prerequisite (not started)
 
-This is the implementation of the Phase 3 design, not a new phase number.
+Phase 3B implements the Phase 3A design. It does not change the numbering or scope
+of Phase 4–7.
 
 1. **Owner approval and protected document update.** Update
    `DATABASE_ARCHITECTURE.md` with the `history_schedules` section, §22/§25
@@ -85,15 +121,25 @@ This is the implementation of the Phase 3 design, not a new phase number.
 4. **Oldest-first retrieval.** Fix the collector contract before any scheduled
    execution, using a stable upper bound, exclusive lower cursor and
    `reverse=True` via the existing facade.
-5. **Implementation tests** listed in `INVESTIGATION.md` §14.
-6. **Live validation** by the owner after the migration is applied.
+5. **Creation-path contract.** Expose the approved second-schedule refusal and the
+   task+state compensating delete for the Phase 4 wizard. Phase 3B does not build
+   the wizard or scheduled action.
+6. **Implementation tests** listed in `INVESTIGATION.md` §14.
+7. **Structural verification** after the owner applies the migration: table,
+   PK/FK/unique/check constraints, RLS, grants, and documentation/setup-order
+   reconciliation. Live scheduled validation remains Phase 7.
 
-### Blocking prerequisites
+### Blocking prerequisites for Phase 3B
 
-- `DATABASE_ARCHITECTURE.md` approval/update (protected in Phase 3).
-- Oldest-first retrieval fix and tests.
-- Explicit product decisions on start baseline, one schedule per peer, prior-summary
-  AI input, and task-deletion retention (`INVESTIGATION.md` §16).
+- `DATABASE_ARCHITECTURE.md` approval/update (protected in Phase 3A), including
+  the service-role-only RLS exception, and confirmation of the Phase 3B migration
+  number before the file is added.
+- Oldest-first retrieval fix and tests (Phase 3B).
+
+### Open product decisions for later phases
+
+- Start baseline (Phase 4), prior-summary AI input and summary-limit escape hatch
+  (Phase 5), and peer-migration re-pointing (`INVESTIGATION.md` §16).
 
 ---
 
@@ -106,8 +152,7 @@ This is the implementation of the Phase 3 design, not a new phase number.
 2. **Phase 5 — scheduled History action**: one new registered ToolExecutor action
    with no model-supplied identifiers, trusted task id, stable upper boundary,
    oldest-first catch-up, cumulative bounded summary, and one atomic CAS commit.
-   Not shippable before the retrieval prerequisite and the Phase 3 implementation
-   are complete.
+   Not shippable before the retrieval prerequisite and Phase 3B are complete.
 3. **Phase 6 — shared History admission**: one process-wide in-flight/start gate
    inside `history_ai_service`, because per-operation pacing does not coordinate the
    scheduler's bounded concurrent occurrences.
@@ -169,5 +214,5 @@ ProviderManager ownership were unchanged. See the commit history; it remains val
   (`test_task_scheduler::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`).
 
 These are the six pre-existing suite failures, reproduced identically at the
-Phase 2 base commit. Phase 3 changed only documentation and did not run or alter
+Phase 2 base commit. Phase 3A changed only documentation and did not run or alter
 those tests.

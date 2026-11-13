@@ -1,11 +1,11 @@
-# IMPLEMENTATION REPORT — History Phase 3: durable state investigation and design
+# IMPLEMENTATION REPORT — History Phase 3A: durable state investigation and design
 
 ## 1. Delivery status
 
-**This was investigation and design only.** It did not implement durable History,
-scheduled History, a repository, a migration or any runtime behavior. It did not
-modify production Python, tests, database migrations or protected architecture
-documents.
+**Phase 3A is complete; Phase 3B is next and not started.** This was investigation
+and design only. It did not implement durable History, scheduled History, a
+repository, a migration or any runtime behavior. It did not modify production
+Python, tests, database migrations or protected architecture documents.
 
 Explicitly:
 
@@ -28,8 +28,10 @@ this report was replaced.
 |---|---|
 | Repository | `Onlyicing1/Telegram-self-bot` |
 | Branch | `freebuff/peer-classification` (workspace branch) |
-| Local HEAD before edits | `62a18de07f1bc5bf8b51c36438f66ad8c4f4d498` (Phase 2) |
-| Freshly fetched `FETCH_HEAD` | `62a18de07f1bc5bf8b51c36438f66ad8c4f4d498` |
+| Local HEAD before Phase 3A edits | `62a18de07f1bc5bf8b51c36438f66ad8c4f4d498` (Phase 2) |
+| Freshly fetched `FETCH_HEAD` at Phase 3A start | `62a18de07f1bc5bf8b51c36438f66ad8c4f4d498` |
+| Documentation amendment base | `4877562284ded2b56593d202023f679805610455` |
+| Freshly fetched `FETCH_HEAD` at amendment | `4877562284ded2b56593d202023f679805610455` |
 | Phase 1 ancestry | `ffe72fd0bce9286e3d3d6583614b3b243bfd4fdf` is an ancestor |
 | Working tree before edits | clean |
 | Live deployment | none performed |
@@ -98,7 +100,7 @@ directly.
 14. migration strategy and verified numbering;
 15. exact implementation sequence;
 16. required tests;
-17. open decisions and evidence gaps.
+17. approved resolutions, open decisions and evidence gaps.
 
 Core proposed shape (not applied): one `history_schedules` row per History task and
 per `(owner_id, peer_id)`, linked to `ai_tasks(id) ON DELETE CASCADE`, with
@@ -109,6 +111,23 @@ deleted source message; 32 KiB is a hard, enforced ceiling with no silent
 truncation. The table is proposed as service-role-only RLS because it contains
 private chat content.
 
+### Approved Phase 3A resolutions
+
+- **Phase map:** Phase 3A (investigation/design) is complete. Phase 3B (durable
+  schema/repository plus its retrieval prerequisite) is next and not started.
+  Phase 4 (deterministic schedule UI), Phase 5 (scheduled History action), Phase 6
+  (shared admission) and Phase 7 (live validation) keep their existing numbers and
+  scopes.
+- **One state per peer:** exactly one cumulative History state per
+  `(owner_id, peer_id)`; `UNIQUE (owner_id, peer_id)` is retained. An active-only
+  uniqueness constraint is rejected.
+- **Lifecycle:** active, paused, completed, failed and expired tasks retain
+  ownership. A second History schedule for the peer is refused while the state
+  exists, including after pause or a terminal status. Pausing retains the summary
+  and cursors. Physical task deletion cascades the state and allows a new schedule
+  afterward. Any replacement/transfer is explicit and owner-authorized. Legacy
+  `status='deleted'` is an invariant-repair case, not a silent permanent block.
+
 **No proposed SQL was executed, and it is marked in `INVESTIGATION.md` as
 unapproved design material.**
 
@@ -116,9 +135,9 @@ unapproved design material.**
 
 | File | Change |
 |---|---|
-| `INVESTIGATION.md` | replaced with the Phase 3 source-backed investigation/design |
-| `ROADMAP.md` | Phase 3 investigation marked complete; implementation next; unresolved retrieval prerequisite recorded |
-| `IMPLEMENTATION_REPORT.md` | replaced with this truthful investigation-only report |
+| `INVESTIGATION.md` | Phase 3A source-backed investigation/design, approved ownership lifecycle, open decisions, Phase 3B sequence and tests |
+| `ROADMAP.md` | Phase 3A complete; Phase 3B next; Phases 4–7 unchanged; approved one-state-per-peer lifecycle |
+| `IMPLEMENTATION_REPORT.md` | replaced with this truthful Phase 3A investigation-only report |
 
 No other file was modified. `DATABASE_ARCHITECTURE.md`, `AI_MASTER_DESIGN.md`,
 production code, tests and `supabase/migrations/` were untouched.
@@ -129,8 +148,9 @@ Because this is documentation-only, no code tests were fabricated or run.
 
 | Check | Result |
 |---|---|
-| `git status --short` before edits | clean; Phase 2 HEAD verified |
-| `cloud_git fetch` | `FETCH_HEAD == 62a18de…` |
+| `git status --short` before Phase 3A edits | clean; Phase 2 HEAD verified |
+| `cloud_git fetch` at Phase 3A start | `FETCH_HEAD == 62a18de…` |
+| `git status --short` before this amendment | clean; `HEAD == FETCH_HEAD == 4877562…` |
 | Source review | History service/AI service/policy, Telegram facade, handler, task schema/repository, scheduler/coordinator, provenance, five History test files, migration files and relevant `DATABASE_ARCHITECTURE.md` sections |
 | Migration count/numbering | 41 files; latest `20261112160000`; no `20261113*`; no History table |
 | `git diff --check` | clean |
@@ -142,9 +162,10 @@ There is no claim that a live schema, table, RLS policy or grant exists.
 
 ## 7. Intentionally not implemented (and why)
 
-- No `history_schedules` migration: `DATABASE_ARCHITECTURE.md` is protected in this
-  phase, and the repository requires the document update before the migration.
-- No repository/service/tool: this phase is design-only.
+- No `history_schedules` migration: `DATABASE_ARCHITECTURE.md` is protected in
+  Phase 3A, and the repository requires the document update before the Phase 3B
+  migration.
+- No repository/service/tool: Phase 3A is design-only; Phase 3B has not started.
 - No scheduled History: it depends on the approved migration, repository,
   oldest-first retrieval and task-execution wiring.
 - No oldest-first retrieval fix: explicitly deferred, but recorded as a blocking
@@ -160,17 +181,17 @@ There is no claim that a live schema, table, RLS policy or grant exists.
 
 ## 8. Commit and remote verification
 
-The Phase 3 design content was delivered in commit
-`70a8aab86f63e8c6b2e0ddb69526f3b57e1f95e8` on top of `62a18de`. After the push, a
+The Phase 3A design was delivered in commit
+`70a8aab86f63e8c6b2e0ddb69526f3b57e1f95e8` on top of `62a18de`. After that push, a
 fresh fetch verified `HEAD == FETCH_HEAD == 70a8aab…`, and
-`git ls-remote origin refs/heads/main` reported the same SHA. The commit is a
-descendant of Phase 2 `62a18de` and Phase 1 `ffe72fd`.
+`git ls-remote origin refs/heads/main` reported the same SHA. Follow-up
+documentation commits `7073702…` and `4877562…` completed the field/retention
+table and corrected caption/privacy wording.
 
-Documentation-only follow-up commits complete the field/index/retention table,
-correct the caption/privacy wording and record this verification. The last of
-these is the current remote head; its exact SHA is reported in the delivery
-response because a commit cannot include its own hash before it exists. No
-force-push, rebase, reset or history rewrite was or will be used.
+This approved-decisions documentation update is the current remote head; its exact
+SHA is reported in the delivery response because a commit cannot include its own
+hash before it exists. All commits are descendants of Phase 2 `62a18de` and Phase
+1 `ffe72fd`. No force-push, rebase, reset or history rewrite was or will be used.
 
 ## 9. Limitations and open evidence
 
@@ -180,11 +201,13 @@ force-push, rebase, reset or history rewrite was or will be used.
 - The proposed table is not deployed; no runtime consumer exists.
 - The prior cumulative summary as AI input for compaction needs owner approval
   under the strict privacy wording (`INVESTIGATION.md` §10/§16).
-- One schedule per peer, start baseline, task-deletion retention, and peer-migration
-  re-pointing are product decisions recorded in `INVESTIGATION.md` §16.
+- One state per peer, retained through active/paused/completed/failed/expired, is
+  approved; physical deletion cascades it. Start baseline, prior-summary AI input,
+  peer-migration re-pointing, the summary-limit escape hatch, the RLS exception,
+  migration numbering and manual/scheduled overlap remain open in
+  `INVESTIGATION.md` §16.
 - Telegram content that was never successfully processed and later became
   unavailable cannot be recovered by this design, and the design does not claim
   otherwise.
-- Phase 3 implementation must update the protected schema document before adding
-  the migration; otherwise the canonical-schema/setup-order tests will correctly
-  fail.
+- Phase 3B must update the protected schema document before adding the migration;
+  otherwise the canonical-schema/setup-order tests will correctly fail.

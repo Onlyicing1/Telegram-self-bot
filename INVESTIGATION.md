@@ -1,9 +1,10 @@
-# INVESTIGATION — Phase 3: Durable History state, schema and repository design
+# INVESTIGATION — Phase 3A: Durable History state, schema and repository design
 
-**Status: investigation and design only. Nothing in this document is implemented,
-applied or deployed.** No production Python, test, migration or Supabase object
-was changed by this phase. The proposed SQL is unapproved design material, is not
-a migration file, and must not be executed by an agent.
+**Status: Phase 3A complete; Phase 3B not started. Investigation and design only;
+nothing in this document is implemented, applied or deployed.** No production
+Python, test, migration or Supabase object was changed by Phase 3A. The proposed
+SQL is unapproved design material, is not a migration file, and must not be
+executed by an agent.
 
 Base verified before investigation: `62a18de07f1bc5bf8b51c36438f66ad8c4f4d498`
 (Phase 2), which descends from Phase 1 `ffe72fd0bce9286e3d3d6583614b3b243bfd4fdf`.
@@ -188,10 +189,10 @@ durable store is unavailable.
   and that §31.3 is statement-identical to its embedded migrations
   (`test_database_setup_order`). A new migration without the corresponding
   document update fails those tests.
-- Therefore a future Phase 3 implementation cannot legally or test-wise add the
+- Therefore Phase 3B cannot legally or test-wise add the
   migration first: the owner must approve an update to
   `DATABASE_ARCHITECTURE.md` (new table section, §22 status, §31.3 canonical part,
-  and the table count) before the migration is written/applied. This phase does
+  and the table count) before the migration is written/applied. Phase 3A does
   **not** modify that protected document.
 
 ---
@@ -209,7 +210,8 @@ Why this shape:
   `ai_task_occurrences`) instead of inventing a second scheduler/store.
 - A History state is meaningful only while a task exists to read it; `task_id`
   gives lifecycle and ownership a single anchor.
-- The cumulative summary is per peer, not per occurrence. `UNIQUE
+- The cumulative summary is per peer, not per occurrence. The approved V1
+  invariant is exactly one state per `(owner_id, peer_id)`; `UNIQUE
   (owner_id, peer_id)` prevents two tasks from silently producing two divergent
   summaries for the same chat.
 - It does not overload `ai_tasks.actions`, `ai_task_occurrences.result_metadata`
@@ -218,6 +220,37 @@ Why this shape:
 The state row stores **the summary and its checkpoints**, not Telegram message
 bodies. It does not replace `classify_chat`: the peer type stored in the row is an
 informational snapshot only.
+
+### Approved V1 ownership and lifecycle
+
+The owner approved exactly one cumulative History state per `(owner_id, peer_id)`.
+`UNIQUE (owner_id, peer_id)` stays; it is deliberately **not** replaced by an
+active-only uniqueness constraint.
+
+| `ai_tasks.status` | History state row | A second History schedule for the peer |
+|---|---|---|
+| `active` | Owned and retained | **Refused** while the state exists |
+| `paused` | Retained; summary and both cursors unchanged | **Refused**; resume or delete the existing schedule |
+| `completed` | Retained; scheduled completion is terminal | **Refused**; delete the existing schedule to start fresh |
+| `failed` | Retained | **Refused** |
+| `expired` | Retained | **Refused** |
+| Physically deleted | Cascaded by the proposed `ON DELETE CASCADE` | **Allowed** afterward |
+| Legacy `status='deleted'` | Invariant-repair case | Must not be silently allowed to block the peer forever |
+
+- A second schedule is refused while the state row exists, including after pause
+  and after every terminal `ai_tasks` status. The refusal is a product refusal, not
+  an overwrite and not a second summary.
+- Pausing retains the summary and cursors so resuming continues from the durable
+  checkpoint.
+- Physical deletion of the task row is the only normal path that releases the
+  peer; the proposed foreign key cascades the state with it.
+- Any replacement or transfer of a History state to a different task must be an
+  explicit, owner-authorized operation. It is not part of V1 and is never inferred
+  from a new schedule request.
+- `status='deleted'` is a legacy task value, not a live deletion transition
+  (`task_delete` physically removes the row). A legacy row that still owns a state
+  is an invariant-repair case: it must not permanently block the peer without an
+  explicit repair path.
 
 ### Proposed columns (summary)
 
@@ -251,7 +284,7 @@ informational snapshot only.
 | `baseline_message_id` | Distinguishes "start from this point" from "no checkpoint yet"; prevents a new task from silently summarizing all history | New feature; current manual retrieval has no start concept | Yes (initial boundary) | Captured at creation; can be 0 for empty chat/backlog choice | No | Same row lifetime; needed to interpret cursors |
 | `last_scanned_message_id` | Retrieval cursor: everything at or below it has a durable disposition (content or safe skip) | Current collector has only in-memory bounds; retry after restart needs this | Yes | Monotonic; can be stale only if a stale writer wins (CAS prevents); not content | No | Same row lifetime |
 | `last_summarized_message_id` | Content coverage/reporting: all text content through here is represented in the summary or explicitly excluded | Needed to prove no gaps and to explain ranges | Yes for coverage | May be lower than scanned when only skipped tail messages exist; monotonic | No | Same row lifetime |
-| `summary_text` | The durable result that survives restart and deleted messages | The core Phase 3 requirement | Yes (content) | Sensitive private chat content; bounded; no identifier metadata is added (user-authored text can itself contain identifiers) | No | Latest only; replaced on commit; hard 32 KiB ceiling |
+| `summary_text` | The durable result that survives restart and deleted messages | The core durable-History requirement | Yes (content) | Sensitive private chat content; bounded; no identifier metadata is added (user-authored text can itself contain identifiers) | No | Latest only; replaced on commit; hard 32 KiB ceiling |
 | `summary_revision` | Distinguishes content revisions from status/error writes | Audit and future UI | Yes | Current value only; no revision bodies retained | No | Same row lifetime |
 | `status` | Health of the state (`active/degraded/blocked`) | Requirement H; separate from task scheduling status | Informational | Can lag a transient failure; never used to schedule | No index initially; a future UI listing degraded states may justify `(owner_id, status)` | Current value only |
 | `last_success_at` | Proves the last committed processing time | Requirement I | Informational | Stale only until next success; not sensitive | No | Overwritten; current value only |
@@ -279,8 +312,9 @@ informational snapshot only.
 
 - `PRIMARY KEY (task_id)` — one state per task.
 - `FOREIGN KEY (task_id) REFERENCES ai_tasks(id) ON DELETE CASCADE`.
-- `UNIQUE (owner_id, peer_id)` — one cumulative state per peer; prevents silent
-  duplicate schedules. (Open product decision; see §17.)
+- `UNIQUE (owner_id, peer_id)` — approved V1 invariant: exactly one cumulative
+  state per peer. It is intentionally not an active-only constraint; see the
+  lifecycle table above and §16.
 
 **Owner consistency.** `owner_id` is denormalized for owner-scoped queries, as it
 is on `ai_task_occurrences`. There is no `(task_id, owner_id)` composite foreign
@@ -338,7 +372,7 @@ panel setting.
 > `DATABASE_ARCHITECTURE.md`.
 
 ```sql
--- PROPOSED ONLY — NOT APPLIED. Do not execute as part of Phase 3.
+-- PROPOSED ONLY — NOT APPLIED. Do not execute as part of Phase 3A or Phase 3B.
 CREATE TABLE IF NOT EXISTS history_schedules (
     task_id                   bigint      PRIMARY KEY
                               REFERENCES ai_tasks(id) ON DELETE CASCADE,
@@ -459,8 +493,13 @@ class HistoryStateRepository:
 - **`create`**: inserts exactly one row. `task_id` must reference an existing
   `ai_tasks` row owned by `owner_id`. The application resolves the peer and
   captures `baseline_message_id` before calling; it never accepts a peer id from a
-  model. A unique `(owner_id, peer_id)` violation is a product error ("this peer
-  already has a History state"), not an overwrite. No in-memory fallback.
+  model. A unique `(owner_id, peer_id)` violation is the **approved product
+  refusal** while the peer's state exists, including when the owning task is
+  active, paused, completed, failed or expired: report that the peer already has a
+  History state and direct the owner to resume or delete that task. It is never an
+  overwrite and never creates a second summary. A physical task deletion frees the
+  key through the cascade. A legacy `status='deleted'` owner is an invariant-repair
+  case, not a silent permanent block. No in-memory fallback.
 - **`get`**: owner- and task-scoped. A missing row is `None`, not an empty state.
 - **`get_by_peer`**: owner/peer lookup for the creation UI and duplicate check.
 - **`commit_success`**: exactly one SQL/PostgREST `UPDATE` with
@@ -502,7 +541,7 @@ framework), the implementation sequence is:
    failure), so a History task can never exist without state.
 
 The scheduler must also fail closed if an `ai_tasks` History row has no state row.
-A future database function could make this atomic; this phase proposes the existing
+A future database function could make this atomic; Phase 3A proposes the existing
 compensating pattern, not a new transaction framework.
 
 ---
@@ -616,7 +655,8 @@ partially succeed. A transaction is not required for a single row.
 | Two scheduled occurrences for the same task overlap | Both may read the same version; one commit wins, the other gets `None` and discards its result. No duplicate cursor/summary. |
 | A manual summary overlaps scheduled History | Manual operations remain read-only and never commit state; they may duplicate provider work but cannot corrupt cursors. |
 | Task paused mid-run | The in-flight run may still commit its successfully generated summary; pause only stops future scheduling. The summary is valuable, and the state remains internally consistent. |
-| Task deleted/disabled mid-run | The FK cascade removes the state; the late CAS update returns zero rows and is discarded. No orphan state, no recreation. |
+| Task completed mid-run | Completion is terminal for a scheduled task but retains the state; an in-flight successful commit may still be recorded, and a later new schedule is refused until the owner deletes the task. |
+| Task physically deleted mid-run | The proposed FK cascade removes the state; the late CAS update returns zero rows and is discarded. No orphan state, no recreation. |
 | A stale worker commits after a newer revision | CAS returns zero rows; never overwrites. |
 | Duplicate execution after restart | If the prior commit succeeded, the cursor has advanced and the duplicate cannot include the same content. If it did not commit, no state changed and a retry re-reads the same range. The stored summary is never duplicated. |
 
@@ -710,7 +750,7 @@ affordable batch; it must never be silently dropped or truncated to make room.
 
 32 KiB is a **storage** bound, not a Telegram message bound. Delivery of a long
 summary may need the existing panel/page or chunking behavior; changing delivery
-is outside this phase and does not change the stored-summary ceiling.
+is outside Phase 3A/3B scope and does not change the stored-summary ceiling.
 
 ### Deletion/retention
 
@@ -791,7 +831,7 @@ The existing test suite actually pins this behavior:
 asserts that a `count=10` translation over 50 messages sends ids **41–50** to the
 provider. The name describes chronological output order, not the selected window.
 `tests/test_history_service.py` also pins the newest-first decreasing-`max_id`
-pagination. Any Phase 5 oldest-first implementation must update these tests
+pagination. The Phase 3B oldest-first implementation must update these tests
 deliberately, not merely add a parallel path; the five History test files
 (191 test functions) are the regression baseline.
 
@@ -824,10 +864,11 @@ argument forwarded. The smallest compatible extension is an optional
 `reverse: bool = False` on both layers, forwarded to `client.iter_messages`, plus
 an oldest-first path in `history_service._collect` / `fetch_history_page` that
 uses `min_id` as the upward cursor. `max_id` remains the exclusive stable upper
-bound. No cursor/order change is made in Phase 3.
+bound. No cursor/order change is made in Phase 3A; the fix belongs to Phase 3B.
 
-**This defect and contract are a prerequisite for Phase 5 scheduled catch-up. No
-scheduled History implementation may ship before it is fixed and tested.**
+**This defect and contract are a prerequisite for Phase 3B and for Phase 5
+scheduled catch-up. No scheduled History implementation may ship before it is
+fixed and tested.**
 
 ---
 
@@ -839,7 +880,7 @@ scheduled History implementation may ship before it is fixed and tested.**
   hardening migration.
 - Latest schema migration: `20261112160000_add_panel_settings_intelligent_reaction_probability.sql`.
 - No file matches `20261113*`, and no History table/migration exists.
-- `DATABASE_ARCHITECTURE.md` is the authority and is **protected in this phase**.
+- `DATABASE_ARCHITECTURE.md` is the authority and is **protected in Phase 3A**.
 - Its §24 requires a document update before a migration, and the suite requires
   every migration's table to be classified and the §31.3 setup block to match.
 
@@ -850,8 +891,9 @@ scheduled History implementation may ship before it is fixed and tested.**
 - One additive table creation, idempotent (`CREATE TABLE IF NOT EXISTS`,
   `DROP POLICY IF EXISTS`, `NOTIFY pgrst`), no changes to existing tables/columns/
   rows. `task_id` is the PK; no sequence.
-- It must be applied manually by the owner in the Supabase SQL editor. **No agent
-  may execute SQL or modify Supabase.**
+- It is a Phase 3B artifact; Phase 3A creates no migration. It must be applied
+  manually by the owner in the Supabase SQL editor. **No agent may execute SQL or
+  modify Supabase.**
 - Before the file is added, the owner must approve an update to
   `DATABASE_ARCHITECTURE.md`:
   - a new section for `history_schedules` (purpose, columns, constraints, RLS,
@@ -867,85 +909,77 @@ prerequisite, not a reason to bypass the tests.
 
 ---
 
-## 13. Exact implementation sequence for the next phase
+## 13. Exact implementation sequence for Phase 3B
+
+Phase 3B implements the durable schema/repository and the oldest-first retrieval
+prerequisite. The owner wizard is Phase 4; scheduled execution is Phase 5; live
+schedule validation is Phase 7. Phase 3B does not implement those.
 
 1. **Owner approval + documentation update** (separate, protected change): update
-   `DATABASE_ARCHITECTURE.md` with the table and canonical setup part.
+   `DATABASE_ARCHITECTURE.md` with the table and canonical setup part. The owner's
+   approval of the Phase 3B scope and one-state-per-peer invariant is recorded,
+   but the protected schema document still needs its own approved update.
 2. **Migration**: add the idempotent `20261113120000_create_history_schedules.sql`;
-   owner applies it manually; verify columns/constraints/RLS/grants.
+   the owner applies it manually. No agent executes SQL.
 3. **Repository**: add `HistoryStateRecord`,
    `HistoryStateRepository`, and the Supabase implementation; wire a durable-only
    accessor through `RepositoryManager` (no runtime in-memory fallback). Add a
    test-only fake.
 4. **Retrieval prerequisite**: add the optional reverse/oldest-first facade path
    and a history-service collector that never trims to the newest subset; add
-   tests for gaps/duplicates/bounds.
-5. **Scheduled service**: read state by trusted task id, re-resolve/classify the
-   peer, recompute `history_policy`, capture the stable upper bound, retrieve
-   oldest-first, summarize the batch with `with_identifiers=False`, merge with the
-   bounded cumulative summary, enforce the 32 KiB bound, and call
-   `commit_success` with the run's expected version.
-6. **Execution wiring**: register one deterministic action/tool with no
-   model-supplied peer/chat identifiers. The coordinator injects the trusted
-   `task_id` (and occurrence key only for logging); the tool never reads
-   `notification_destination.chat_id` as its source. Use the existing
-   `ToolExecutor`, scheduler and occurrence recovery; do not add a scheduler,
-   worker, client or listener.
-7. **Creation/UI**: the owner wizard resolves and classifies the peer from trusted
-   context, captures the baseline (latest id or explicit backlog), creates the
-   task, then the state row; on failure, compensatingly delete the task. Refuse a
-   second state for the same `(owner_id, peer_id)`.
-8. **Tests** (see §14).
-9. **Manual live validation** (owner, after apply): create a History task on a test
-   peer, run a boundary, restart the process, verify no re-summarization of the
-   committed range, delete an old source message, verify the stored summary remains,
-   simulate a provider failure and verify no cursor advance, and verify the
-   oldest-first ordering with >batch messages.
+   tests for gaps/duplicates/bounds. This is a Phase 3B deliverable, not a Phase 5
+   change.
+5. **Creation-path contract**: expose the owner/task-scoped `create` and
+   `get_by_peer` refusal path, including the approved lifecycle refusal and the
+   task-creation compensating delete. The deterministic owner wizard itself is
+   Phase 4, not Phase 3B.
+6. **Tests** (see §14), including the schema audit and repository/lifecycle cases.
+7. **Structural verification** after the owner applies the migration: verify the
+   table, PK/FK/unique/check constraints, RLS, grants, and migration/documentation
+   reconciliation. No live scheduled execution is part of Phase 3B.
 
-No step above was performed in Phase 3.
+No step above was performed in Phase 3A. Phase 3B has not started.
 
 ---
 
-## 14. Tests required for the implementation phase
+## 14. Tests required for Phase 3B
 
-1. **Policy/state unit**: every `PeerType` cap/choice still applies to a scheduled
-   count; no stored snapshot can bypass `classify_chat`.
-2. **Cursor semantics**: success advances both cursors correctly; a skipped-only
-   batch advances only the scanned cursor; mixed batch advances content coverage to
-   the last summarized id.
+1. **Repository lifecycle**: owner/task scoping; `UNIQUE (owner_id, peer_id)`;
+   refusal for an existing state while the owner is active, paused, completed,
+   failed or expired; physical task deletion cascades the state and allows a new
+   one; legacy `status='deleted'` repair behavior; no runtime in-memory fallback.
+2. **Cursor/state semantics**: success advances both cursors correctly; a
+   skipped-only batch advances only the scanned cursor; mixed batch advances
+   content coverage to the last summarized id.
 3. **Oldest-first**: 60 messages with batch 10 returns 1–10, 11–20, … not 51–60;
    no gaps/duplicates; stable upper bound excludes messages arriving mid-run.
 4. **Atomic commit**: summary + cursors + revision + version + success status are
    written together; transport failure writes none; stale CAS returns zero and
    leaves the row unchanged.
-5. **Failure cases**: provider failure, timeout, empty/invalid summary, persistence
-   failure, restart before/after commit, duplicate recovery—assert no cursor/summary
-   corruption.
-6. **Deleted/inaccessible**: existing summary remains after source deletion;
-   empty range does not advance; peer inaccessible blocks; peer migration/UNKNOWN
-   blocks and preserves summary.
+5. **Persistence/restart**: restart before/after commit and duplicate recovery
+   leave no partial summary or cursor; transport failure never falls back to RAM.
+6. **Source deletion**: an existing summary remains after a source message is
+   deleted; an empty range does not advance; no tombstone is invented.
 7. **Summary bound**: 32 KiB is enforced; an over-limit result is refused, not
    truncated, and the old summary remains.
-8. **Repository**: create/get owner scoping; unique `(owner_id, peer_id)`; cascade
-   deletion; no runtime in-memory fallback; PK/FK behavior.
-9. **Task creation**: task+state compensates on state failure; a History task
-   without state fails closed; task delete cascades state.
-10. **Execution context**: scheduled action receives trusted task id, ignores
-    model-supplied ids and `notification_destination.chat_id` as source; delivery
-    still uses the destination only.
-11. **Privacy**: prompt contains no message ids, sender ids, peer id/title,
-    task/occurrence/db ids, checkpoint values, unrelated context or memory; result
-    omits `first_message_id`/`last_message_id`.
-12. **Retry/performance**: no duplicate summary after restart; paced/concurrent
-    limits unchanged; capacity refusal remains honest.
-13. **Schema audit**: migration idempotent; doc classification and §31.3 part are
-    present; RLS enabled, zero policies, no client grants, service-role grants only.
-14. **No regressions**: Phase 1/2 suites, history panel/service/AI/capacity tests,
+8. **Creation-path contract**: repository-level task+state compensation and
+   second-schedule refusal; a History task without state fails closed; task delete
+   cascades state. The Phase 4 wizard integration is tested in Phase 4.
+9. **Schema audit**: migration idempotent; doc classification and §31.3 part are
+   present; RLS enabled, zero policies, no client grants, service-role grants only;
+   PK/FK/unique/check constraints verified after the owner applies it.
+10. **No regressions**: Phase 1/2 suites, history service/panel/AI/capacity tests,
     full suite baseline comparison.
+
+**Deferred to Phase 5** (not Phase 3B tests): provider failure/timeout/empty or
+invalid summary, scheduled execution context, AI prompt privacy, policy/count
+enforcement for a scheduled run, and retry/performance of the scheduled action.
+Their contracts remain specified in this document; their tests belong with the
+action that implements them.
 
 ---
 
-## 15. What this phase proves and does not prove
+## 15. What Phase 3A proves and does not prove
 
 ### Proven from source
 
@@ -969,56 +1003,67 @@ No step above was performed in Phase 3.
 - No production Python or test was modified.
 - No live Telegram or provider behavior was tested.
 - The table design is not deployed and has no runtime consumer.
-- The live database's current 28-table inventory was not re-audited in this phase;
+- The live database's current 28-table inventory was not re-audited in Phase 3A;
   the repository documents it as a manual audit.
 - Whether the owner permits sending the prior cumulative summary to the AI for
-  compaction is unresolved (see §17).
+  compaction remains unresolved (see §16).
 
 ---
 
-## 16. Open decisions and evidence gaps
+## 16. Approved resolutions, open decisions and evidence gaps
 
-1. **One state per peer vs multiple schedules per peer.** The design enforces
-   `UNIQUE (owner_id, peer_id)` and one state per task. If multiple independent
-   schedules for the same peer are required, the unique constraint and summary
-   ownership must be redesigned before implementation. Recommendation: one for the
-   first implementation, because two summaries for one peer are ambiguous and
-   duplicate provider work.
-2. **Start behavior.** `baseline_message_id` defaults to the newest message (new
+### Approved resolutions
+
+- **Phase numbering.** Phase 3A (investigation/design) is complete. Phase 3B
+  (durable schema/repository plus its retrieval prerequisite) is next and not
+  started. Phase 4 (deterministic schedule UI), Phase 5 (scheduled History
+  action), Phase 6 (shared admission) and Phase 7 (live validation) keep their
+  existing numbers and scopes.
+- **One state per peer.** V1 has exactly one cumulative History state per
+  `(owner_id, peer_id)`; `UNIQUE (owner_id, peer_id)` is retained. Active-only
+  uniqueness is rejected.
+- **Ownership lifecycle.** Active, paused, completed, failed and expired tasks
+  retain ownership. A second schedule for the peer is refused while the state
+  exists, including after pause or a terminal task status. Pausing keeps the
+  summary and cursors. Physical task deletion cascades the state and allows a new
+  schedule afterward. Any replacement/transfer is explicit and owner-authorized.
+- **Legacy `status='deleted'`.** It is an invariant-repair case, not a live
+  deletion path and not permission to block a peer forever.
+
+### Open decisions and evidence gaps
+
+1. **Start behavior.** `baseline_message_id` defaults to the newest message (new
    content only) or `0` for an explicit backlog. Phase 4 must expose this choice
    explicitly; silently summarizing years of backlog is not acceptable.
-3. **Prior summary as AI input.** Cumulative compaction needs it; §10's strict
+2. **Prior summary as AI input.** Cumulative compaction needs it; §10's strict
    "only" wording does not list it. Owner approval required. Recommendation: allow
    it as the bounded target artifact with `with_identifiers=False`, no metadata.
-4. **Task deletion semantics.** Proposed `ON DELETE CASCADE`: deleting the task
-   explicitly deletes the summary. Pausing retains it. Confirm this is the intended
-   privacy/retention behavior.
-5. **Peer migration / inaccessible peer.** Telegram basic-group→supergroup id
+3. **Peer migration / inaccessible peer.** Telegram basic-group→supergroup id
    migration has no alias map in the current code. The design blocks and asks the
    owner to re-point; do not infer a new id. Confirm this product behavior.
-6. **Summary-limit escape hatch.** `reset_summary` (explicit owner action) vs a
+4. **Summary-limit escape hatch.** `reset_summary` (explicit owner action) vs a
    future AI compaction worker. Recommendation: explicit reset/compaction, never
    silent truncation; no new worker in Phase 5.
-7. **RLS exception.** The table uses zero policies/service-role-only, deviating from
+5. **RLS exception.** The table uses zero policies/service-role-only, deviating from
    §24's generic SELECT policy. Owner must approve the documentation exception.
-8. **Migration numbering.** Proposed `20261113120000`; confirm after the protected
+6. **Migration numbering.** Proposed `20261113120000`; confirm after the protected
    document update and before writing the file.
-9. **Manual/scheduled overlap.** Manual summaries stay read-only and never advance
+7. **Manual/scheduled overlap.** Manual summaries stay read-only and never advance
    state. If duplicate provider work becomes a cost problem, a future admission
-   lock can coordinate them; not part of Phase 3.
-10. **Live schema.** The documented 28-table live inventory and the 3-record
-    migration history are manual audit facts, not re-verified against Supabase in
-    this phase.
+   lock can coordinate them; not part of Phase 3B.
+8. **Live schema.** The documented 28-table live inventory and the 3-record
+   migration history are manual audit facts, not re-verified against Supabase in
+   Phase 3A.
 
 ---
 
-## 17. Unresolved prerequisite for scheduled processing
+## 17. Unresolved prerequisite for Phase 3B and Phase 5
 
 The oldest-first retrieval defect remains **unfixed**. The current collector can
 return the newest subset of a range and silently omit older messages after a
-cursor. Until the contract in §11 is implemented and tested, Phase 5 scheduled
-History must not ship, even with durable state: a durable cursor would faithfully
-record a skipped range.
+cursor. Until the contract in §11 is implemented and tested in Phase 3B, Phase 5
+scheduled History must not ship, even with durable state: a durable cursor would
+faithfully record a skipped range.
 
-This investigation does not fix retrieval, does not change cursors, and does not
-claim scheduled History is implemented.
+Phase 3A does not fix retrieval, does not change cursors, and does not claim
+scheduled History is implemented.
