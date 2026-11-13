@@ -1,252 +1,150 @@
-# IMPLEMENTATION REPORT
+# IMPLEMENTATION REPORT — P1 History & Intelligence result-delivery hotfix
 
-## Feature and stage
+## 1. Scope and production evidence
 
-- **Feature:** Unified History & Event Intelligence
-- **Stage completed:** P1 — Manual and link-based history summarization in the
-  Glass UI
-- **Previous stage:** P0 — Investigation and specification (complete)
-- **Next stage:** P2 — Incremental retrieval and per-chat checkpoints
-- **Implementation commit:** `8434c2671a5bf8b8e4f186acd4913e1fa3ce2353`
-- **Integration merge:** `76fb610` (merge of `origin/main` at `c83a557` into
-  the P1 commit; no rebase, reset or force-push)
-- **Report/delivery commit:** the commit containing this report, created on top
-  of the merge and pushed to `origin/main`
+The P1 History & Intelligence panel could finish a summary successfully and still
+leave the owner on the Loading state. Deployed Render logs for request
+`glass-history` (2026-11-13T14:08–14:09Z) show:
 
-The original inspection found `origin/main == HEAD == c43c5fa` and no P0
-History & Event Intelligence artifacts in that checkout. P1 was implemented
-from the supplied brief. While delivery was in progress, `origin/main` advanced
-to `c83a557` with the actual P0 investigation and specification; the P1 commit
-was merged with that history and the implementation was checked against
-`INVESTIGATION.md` §11 and the P0 roadmap. The merged tree keeps the P0 work and
-the P1 implementation.
+- retrieval and every provider call completed with non-empty text;
+- the final panel edit failed with `The caption is too long
+  (caused by EditInlineBotMessageRequest)`;
+- the fallback self-client edit failed with `The action must be performed
+  through an inline bot callback (caused by EditMessageRequest)`.
 
-## Files changed by P1
+Both failures are consistent with the panel being a photo message owned by the
+Helper Bot's inline result: Telegram bounds its text to a caption, and only the
+inline bot can edit it.
 
-| File | Why |
-|---|---|
-| `backend/bot/handlers/history.py` | New `History & Intelligence` panel: bounded chat picker and paging, count/focus controls, manual background summarization, link resolution and link-boundary summarization, result/failure rendering, registration. No listener. |
-| `backend/bot/handlers/misc.py` | One main-menu row: `History & Intelligence` → `panel:history`. |
-| `backend/bot/router.py` | Imports and registers the history panel module with the other handlers. |
-| `backend/services/history_ai_service.py` | Adds `first_message_id`/`last_message_id` result metadata and a backwards-compatible `with_identifiers` option. Defaults preserve existing AI-chat behavior. |
-| `backend/services/appearance_service.py` | Adds `history` to the main-page IDs/defaults so the Appearance page's destination invariant covers the new menu panel. |
-| `tests/test_history_panel.py` | New focused P1 tests (registration, picker bounds, controls, run arguments, failures, timeout/cancellation/stale writers, link forms/boundaries, prompt isolation). |
-| `tests/test_appearance_ui.py` | Updates the expected main-menu count and checks the new entry is present. |
-| `ROADMAP.md` | Marks P1 complete in the existing P0/phase roadmap and records the actual implemented behavior, tests and deferred scope. |
+## 2. Root cause confirmed in source
 
-No other source file was changed by the P1 commit. The merge brought in the
-P0 documentation and the already-delivered Intelligent Reaction changes from
-`origin/main`; those are not P1 changes.
+- `backend/services/appearance_service.py`: with Appearance preview active the
+  panel is delivered as a PHOTO inline result whose text is its caption;
+  `MAX_CAPTION_CHARS = 1024` and `caption_for()` refuses longer text. Text-only
+  delivery is not caption-bounded.
+- `backend/bot/handlers/history.py`: `MAX_SUMMARY_CHARS = 2800`, plus metadata
+  lines, so a valid summary can exceed 1024. `_run_summary()` called
+  `_paint()` for the final result and ignored its Boolean return;
+  `_run_link()` delegated to the same function. The `finally` block released
+  the operation generation regardless, so a refused edit completed the
+  operation as if the result had been delivered.
+- `backend/helper/panel_edit.py`: `ExistingPanelEditor.edit()` returns `False`
+  (never raises) when both edit paths are refused. Its self-client fallback
+  cannot edit an inline-bot-owned message, which is exactly what production
+  logged.
 
-## Manual UI behavior
+Focus was **not** independently defective. The registration, pending-input
+consumption, `_focus_input_handler`, `_state` snapshot and
+`instruction=focus or None` pass-through were verified and are now covered by
+regression tests; Focus runs were affected only by the shared delivery defect.
 
-- Panel: `panel:history`, parent `menu`, title `History & Intelligence`; one
-  main-menu entry.
-- **Select Chat** reads the account's own dialogs with
-  `get_dialogs(limit=100)` under a 15-second RPC timeout. It shows eight chats
-  per page with Previous/Next, never scans beyond the 100-dialog bound, and
-  handles empty lists and RPC failures honestly. Selecting a chat re-validates
-  that peer against the same bounded list.
-- Count controls offer exactly 100, 250, 500 and 1000. `COUNTS` is filtered by
-  `history_service.MAX_HISTORY_MESSAGES`; any other value is rejected rather
-  than converted into an unbounded request. The 1,001 case is explicitly
-  tested.
-- **Set Focus Instruction** accepts optional text, normalizes whitespace,
-  enforces `history_ai_service.MAX_INSTRUCTION_CHARS` (500), and leaves the
-  previous focus unchanged when the input is too long. An empty message clears
-  the focus.
-- **Run Summary** validates the selected chat, obtains the existing
-  `get_self_client()` and `get_engine().provider_manager`, snapshots the state,
-  and launches one bounded background task. It calls
-  `history_ai_service.summarize_history` with `current_message_id=None`, the
-  selected chat, count and focus. No AI-chat tool call is involved.
-- While running, the panel shows bounded progress. The result reports the chat,
-  processed/requested counts, first/last message IDs when available, and whether
-  the window was complete, bounded/truncated or empty. A failure or empty
-  history is never rendered as a summary; provider/retrieval error text is
-  shown as a failure.
-- The panel uses `with_identifiers=False`, so the provider prompt contains only
-  normalized history text and the owner's focus — no message IDs, sender IDs,
-  usernames, chat IDs or links. Existing AI-chat callers keep the original
-  attributed prompt by default.
+## 3. Implemented fix (smallest supported delivery path)
 
-## Link-based behavior and exact range semantics
+Only `backend/bot/handlers/history.py` changed behaviourally:
 
-- **Summarize Message Link** is a registered input. It reuses
-  `save_service.parse_link_target` and `save_service._fetch_linked_message`;
-  no second parser, resolver, client or access path exists.
-- Supported forms are the parser's current forms:
-  `https://t.me/<username>/<message_id>`,
-  `https://t.me/c/<chat_id>/<message_id>` and `tg://openmessage` message links.
-  Chat-only links remain unsupported, as they are in the existing parser.
-- Resolution is bounded at 60 seconds. The resolved message ID is checked
-  against the requested ID, and the resolved chat is checked against the
-  requested numeric chat when the link supplies one. A link that parses does not
-  prove access.
-- The UI preserves the existing distinct failure categories and their specific
-  text: invalid/unsupported link, `peer_unresolved`, `message_missing`, and
-  `lookup_failed`, plus the panel's timeout/unexpected-error cases.
-- **Boundary:** the UI passes
-  `current_message_id = linked_message_id + 1`. The history service's
-  `before_id` is exclusive, and `history_ai_service._prepare` maps the current
-  message ID to that exclusive bound. Therefore the linked message is included,
-  no message newer than it is read, and the requested count ends at the linked
-  message. A focused regression test fetches with `before_id=13` for a linked
-  message `12`.
-- The result identifies the actual first/last processed IDs and states that the
-  linked message is the ending point. The selected count and focus are
-  snapshotted when the input is submitted.
+- `_deliver_result()` chooses the path from the ACTUAL recorded delivery state
+  (`appearance_service.delivered_state`). A media panel whose rendered result
+  exceeds the caption bound goes straight to the text replacement; a short
+  result still edits in place.
+- `_replace_with_text_result()` reuses the existing
+  `PanelLifecycleManager.replace_panel` (create the new inline panel first,
+  delete the old message only after it exists) with a non-empty query extra
+  (`result:<token>`). A non-empty extra makes
+  `appearance_service.apply_to_inline_results` skip media composition, so the
+  new panel is a genuine TEXT result with its keyboard/navigation intact.
+- Result views are carried in a bounded (`8`) one-shot `OrderedDict` keyed by a
+  random token; the inline builder drains the token, so no growing state, no
+  global "current result", and no replay.
+- Text is deterministically bounded to Telegram's text-message limit
+  (`MAX_RESULT_TEXT_CHARS = 4096`) with a visible truncation marker; it is NOT
+  truncated to the 1024 caption bound.
+- A replacement message is sent only when the panel chat is the owner's OWN
+  private chat (Saved Messages, `panel_chat_id == owner id`). In any other chat
+  no separate message is sent; the panel receives a short honest failure notice.
+- A refused final edit is no longer silent: `_run_summary()` checks the delivery
+  result, falls back to the text replacement, and otherwise attempts a short
+  failure notice and logs `HISTORY_RESULT_DELIVERY_FAILED` with a stable reason
+  (`destination_not_owner_private`, `replacement_failed`,
+  `replacement_raised`, `no_safe_text_path`). Operation-generation cleanup still
+  runs in `finally`.
+- No second Telegram client, listener, scheduler, worker, executor, provider
+  manager, persistent state or database object was added. `history_ai_service`,
+  `history_service`, the identifier-free prompt mode and all existing guards are
+  unchanged.
 
-## Services reused
+## 4. Files changed
 
-- `history_ai_service.summarize_history` — the single map-reduce engine and
-  provider budget/timeout/failure model.
-- `history_service` — bounded retrieval, provenance filtering and
-  `MAX_HISTORY_MESSAGES`.
-- `save_service.parse_link_target` / `_fetch_linked_message` — link parsing,
-  peer resolution, message validation and classified failures.
-- `get_engine().provider_manager` — the existing runtime provider manager; no
-  new manager was constructed.
-- `get_self_client()` — the existing authenticated self client; no new client.
-- `guarded_create_task`, `begin_panel_operation`/`finish_panel_operation`,
-  `ExistingPanelEditor`, `register_panel`/`register_action`/`register_input`/
-  `register_inline_builder`, `InlinePanelBuilder`, `input_state`,
-  `inline_sender` and the existing navigation/progress helpers.
-- Appearance page registration, so the new menu destination is covered by the
-  existing UI invariant.
+- `backend/bot/handlers/history.py` — delivery selection, text replacement,
+  bounded one-shot result views, owner-private destination guard, honest failure
+  handling.
+- `tests/test_history_panel.py` — 10 new regression tests (39 total in the
+  file): long media result replacement, short in-place render, text-bound
+  determinism, refused edit is an explicit failure with generation cleanup,
+  no replacement outside the owner's own chat, caption limit not applied to the
+  text path, Focus save/pass-through/clear/over-limit rejection, focused long
+  summary delivery, and link summary delivery through the same path.
+- `ROADMAP.md` — P1 result-delivery hotfix recorded in the History & Event
+  Intelligence entry.
+- `IMPLEMENTATION_REPORT.md` — this report.
 
-Long runs are finite: one `guarded_create_task` with a 300-second outer
-`asyncio.wait_for`, the engine's own timeout, the existing panel-operation
-generation (newest writer wins) and cancellation propagation. Input handlers
-validate and launch only; no scheduler, worker, permanent loop or new listener
-was added.
+No other file changed. No database, Supabase, schema, migration or deployment
+configuration was touched.
 
-## Tests executed and actual results
+## 5. Automated verification
 
-### Focused, merged tree
+- New/affected focused suite: `.venv/bin/python -m pytest
+  tests/test_history_panel.py -q` → **39 passed**.
+- Related panel/lifecycle/appearance/history selection:
+  `pytest tests/ -k "panel or lifecycle or appearance or history"`
+  → **705 passed, 3 skipped**.
+- Full suite (`pytest tests/ -q --ignore=tests/test_runtime_session_terminal.py`,
+  the untracked startup-hardening test from unrelated work that cannot collect
+  on this base) → **7571 passed, 6 failed, 27 skipped** in 144.34 s.
+- Untouched `origin/main` baseline (`96b93ea`, clean worktree) → **7560 passed,
+  6 failed, 27 skipped** in 163.47 s.
+- Baseline comparison: the SAME six failures exist on the untouched baseline and
+  none is in a file changed here:
+  1. `tests/test_aed_db_security.py::test_the_documentation_describes_the_restrictive_model`
+  2. `tests/test_canonical_schema_reconciliation.py::test_the_migration_is_forward_only_and_its_successors_stay_additive`
+  3. `tests/test_database_setup_order.py::test_the_section_does_not_pretend_the_sql_was_executed`
+  4. `tests/test_database_setup_order.py::test_the_waiting_answer_migration_is_absorbed_by_part_one`
+  5. `tests/test_private_message_db_security.py::test_the_rls_model_names_the_two_tables_as_server_only_exceptions`
+  6. `tests/test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`
+  These are documentation-drift assertions and one pre-existing scheduler
+  recovery failure, outside this hotfix's authorized scope.
+- `python -m compileall -q backend tests` → exit 0.
+- `git diff --check` → exit 0.
 
-Command:
+## 6. Live verification status
 
-```text
-python -m pytest tests/test_history_panel.py tests/test_history_service.py \
-  tests/test_history_ai_tools.py tests/test_appearance_ui.py \
-  tests/test_colored_buttons.py tests/test_cipher_category.py -q --tb=short
-```
+**No live Telegram verification was performed.** The fix is verified only by
+offline tests with scripted Telegram fakes and real composition/replacement
+code paths. It must not be described as operationally fixed until a real run
+with Appearance preview active and a summary longer than 1024 characters shows
+the text replacement on screen. No Render deploy was triggered.
 
-Result: **247 passed** (exit 0). This includes all P1 panel tests and the
-existing history/service/UI tests.
+## 7. Remaining limitations
 
-### Clean P1 commit before the P0 merge
+- The text replacement is allowed only in the owner's own private chat
+  (Saved Messages). A long summary started from a group or another chat gets a
+  short honest failure notice instead of a private-content message there; this
+  is deliberate.
+- Telegram's exact behaviour for the replacement inline result cannot be proven
+  offline (the test fakes the lifecycle call); only the actual Telegram client
+  confirms the message swap.
+- The caption-too-long detection relies on the recorded Appearance delivery
+  state; when that state is absent (e.g. after a restart) the first edit is
+  attempted and its refusal still falls back to the text replacement.
 
-A read-only archive of implementation commit `8434c26` was tested:
+## 8. Delivery
 
-```text
-python -m pytest tests/test_history_panel.py tests/test_history_service.py \
-  tests/test_history_ai_tools.py tests/test_appearance_ui.py -q --tb=short
-```
-
-Result: **175 passed** (exit 0).
-
-Full suite on the same clean P1 commit:
-
-```text
-python -m pytest -q --tb=no
-```
-
-Result: **6 failed, 7483 passed, 27 skipped** (exit 1).
-
-### Merged delivery tree
-
-```text
-python -m pytest -q --tb=no
-```
-
-Result: **6 failed, 7560 passed, 27 skipped** (exit 1).
-
-### Baseline comparison actually performed
-
-A read-only archive of the new remote baseline `c83a557` was tested with the
-same full-suite command:
-
-- Baseline `c83a557`: **6 failed, 7532 passed, 27 skipped**.
-- Merged P1 tree: **6 failed, 7560 passed, 27 skipped**.
-- Difference: exactly the **28 P1 tests** pass; the failure set is identical.
-
-The six baseline failures are:
-
-1. `tests/test_aed_db_security.py::test_the_documentation_describes_the_restrictive_model`
-2. `tests/test_canonical_schema_reconciliation.py::test_the_migration_is_forward_only_and_its_successors_stay_additive`
-3. `tests/test_database_setup_order.py::test_the_section_does_not_pretend_the_sql_was_executed`
-4. `tests/test_database_setup_order.py::test_the_waiting_answer_migration_is_absorbed_by_part_one`
-5. `tests/test_private_message_db_security.py::test_the_rls_model_names_the_two_tables_as_server_only_exceptions`
-6. `tests/test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`
-
-They are unchanged from the clean `c83a557` baseline and are not caused by P1.
-An earlier baseline at `c43c5fa` was also run before the P0 merge:
-**6 failed, 7455 passed, 27 skipped**, with the same six failure names.
-
-### Static checks
-
-```text
-python -m compileall -q backend tests   # exit 0
-git diff --check                        # exit 0
-git show --check --oneline 8434c26      # exit 0
-```
-
-## Deliberately not implemented
-
-P1 does not add per-chat checkpoints, incremental retrieval, previous-summary
-persistence, automatic per-chat processing, cadence configuration, scheduler
-integration, Event Intelligence candidates, Task/Memory/Saved Items
-integration, digest delivery, media downloads, OCR/STT/video processing, a new
-summarizer, a second ProviderManager, a new Telegram client, a new listener, a
-new scheduler/worker, a new AI tool, or any new database table/column/SQL.
-
-Chat-only links remain unsupported and deferred. There is no edit/delete
-detection. The existing 1,000-message and 500-character limits remain
-authoritative.
-
-## Database and deployment
-
-- **No database change was made. No table, column, index, policy or row was
-  created, modified or deleted. No Supabase operation or SQL was executed.**
-- `DATABASE_ARCHITECTURE.md` was not edited.
-- P1 requires no persistence and adds none.
-- **Deployment:** no application deployment was performed as part of P1.
-- **Live Telegram verification:** **not performed.** This environment has no
-  live Telegram self-account/provider run. The owner must still open the panel
-  on the real account, run one real chat and one public message link, and check
-  that the reported range matches Telegram. The panel fails honestly rather
-  than fabricating a summary if that live path is unavailable.
-
-## Remaining limitations and owner actions
-
-- Live panel/chat/link runs and permission behavior remain unverified on a real
-  account.
-- P1's chat picker is intentionally limited to the first 100 dialogs; a chat
-  outside that bound is not selectable in this phase.
-- A failed panel edit/delivery cannot show a result in Telegram; the failure is
-  logged by the existing editor and the operation still finishes without
-  claiming success.
-- P2's checkpoint persistence needs the owner's separate schema decision and
-  application; no migration is provided here.
-- Existing unrelated work: the pre-merge working-tree snapshot of the
-  previously uncommitted Intelligent Reaction changes is retained in the local
-  stash `pre-p1-merge: prior uncommitted intelligent reaction worktree`. The
-  same feature is now delivered on `origin/main` by later commits, so that
-  snapshot was not committed with P1 and was not discarded.
-
-## Git delivery
-
+- Repository: `Onlyicing1/Telegram-self-bot`.
 - Branch: `main`.
-- P1 implementation commit `8434c26` was pushed by merging the new
-  `origin/main` (`c83a557`) into it; merge commit `76fb610`. No rebase, reset,
-  force-push or history rewrite was used.
-- This report and the final roadmap/test updates are committed on top of the
-  merge and pushed to `origin/main`.
-- Remote `main` was fetched and checked after the push. The final verified
-  `origin/main` HEAD is the delivery commit containing this report; its exact
-  SHA is stated in the completion response.
-- Final working tree after delivery: clean, with no staged or unstaged P1
-  changes. The unrelated pre-merge snapshot remains in the local stash
-  described above.
+- Hotfix commit: **`678fab5bfdebf1a41084d6293a24acd65fdbd332`**
+  (`fix(history): deliver long summaries outside the photo-caption limit`).
+- This report is committed as the immediate child of that hotfix commit and
+  pushed in the same fast-forward push; `origin/main` is verified to equal the
+  report commit after the push (recorded in the delivery response).
+- Final working tree: clean except the pre-existing untracked
+  `tests/test_runtime_session_terminal.py` from unrelated in-progress work,
+  which was not staged or modified.
