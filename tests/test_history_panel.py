@@ -221,6 +221,10 @@ def test_count_accepts_only_the_offered_values():
     assert history._STATE.count == 500
     _run(history._count_action(None, "999", PANEL_CHAT))
     assert history._STATE.count == 500
+    # The established 1,000-message bound is authoritative; 1,001 is refused.
+    _run(history._count_action(None, "1001", PANEL_CHAT))
+    assert history._STATE.count == 500
+    assert max(history.COUNTS) == history.history_service.MAX_HISTORY_MESSAGES
 
 
 def test_focus_is_normalized_and_limited(monkeypatch):

@@ -1,62 +1,5 @@
 # ROADMAP
 
-## Feature: Unified History & Event Intelligence
-
-### P0 — Investigation and specification
-
-Status: **Complete** (P0 contract supplied to P1). The P1 brief's source
-requirements were treated as authoritative for this phase.
-
-### P1 — Manual and link-based history summarization
-
-Status: **Complete**. Delivered through the existing Glass UI and the existing
-history stack; no new summarizer, provider manager, Telegram client, listener,
-scheduler or persistence exists.
-
-- One `History & Intelligence` panel (`panel:history`, parent `menu`) with a
-  main-menu entry. It shows the selected chat, the bounded message count
-  (100/250/500/1000) and the optional focus instruction.
-- Chat selection lists the account's own dialogs with `get_dialogs(limit=100)`,
-  paginates eight per view, and handles empty lists and RPC failures without
-  fabricating entries. A selection is re-validated against that same bounded
-  list before a run.
-- Manual runs call `history_ai_service.summarize_history` directly with
-  `current_message_id=None`, the selected chat/count/focus, the existing
-  self-client and `get_engine().provider_manager`. No AI-chat tool call is
-  involved.
-- Link runs reuse `save_service.parse_link_target` and
-  `save_service._fetch_linked_message`, validate the resolved message id and
-  peer, then summarize with `current_message_id = linked_message_id + 1`. The
-  history service's upper bound is exclusive, so the linked message is the
-  last included message and nothing newer is read.
-- The result reports the selected chat, processed vs requested messages, the
-  exact first/last eligible message ids when available, and whether the window
-  was complete, bounded/truncated or empty. A provider/retrieval failure or an
-  empty history is never rendered as an invented summary.
-- The UI uses an optional, backwards-compatible anonymized summarization mode:
-  the provider receives history text and the owner's focus only, with no
-  message ids or sender ids. Existing AI-chat callers keep their original
-  attributed prompt by default.
-- Long runs execute in one finite `guarded_create_task` with an explicit
-  300-second envelope, the existing panel-operation generation (newest writer
-  wins) and `ExistingPanelEditor`; input handlers only validate and launch.
-  Cancellation propagates; no permanent loop or worker was added.
-- Tests: `tests/test_history_panel.py` covers registration/navigation, bounded
-  dialogs, selection validation, counts, focus limits, manual argument
-  passing, provider failure, empty history, timeout, cancellation, stale
-  writers, all supported link forms, distinct link failure kinds, peer/message
-  mismatch, the `linked_id + 1` boundary, and the UI prompt's identifier
-  isolation. `tests/test_history_ai_tools.py` remains green.
-- Acceptance: offline focused tests pass; no live Telegram or provider run was
-  performed in this environment.
-
-### P2 — Incremental retrieval and per-chat checkpoints
-
-Status: **Next**. Not implemented in P1. Per-chat checkpoints, incremental
-summarization, previous-summary persistence, automatic per-chat mode, cadence
-configuration, scheduler integration, Event Intelligence candidates, and
-automated digest delivery remain deliberately out of scope.
-
 ## Completed: Supabase live schema and privilege audit
 
 Status: **Audited, selectively hardened, live-verified, and documented.**
@@ -177,7 +120,8 @@ enabled column. Neither is **applied** — that remains a manual owner action.
 Status: **P0 complete — investigated, specified, no runtime change.** The
 source-verified investigation lives in `INVESTIGATION.md`; this section is the
 execution memory for the implementation phases. Base commit
-`ca0399b2156999a065444f31a31a58bb38841663`.
+`ca0399b2156999a065444f31a31a58bb38841663`. P1 is implemented on top of this
+specification; its verified outcome is recorded below.
 
 ### Problem and goal
 
@@ -323,7 +267,8 @@ Unresolved (owner or P-phase verification):
 - Whether `task_contract.validate_prepared_action` accepts an internal action
   kind, and whether one scheduled row per chat or one owner-level sweep is
   preferable. Neither is verified yet.
-- Exact chat-picker paging source/limits in the Glass UI.
+- Exact chat-picker paging source/limits in the Glass UI. Resolved in P1:
+  `get_dialogs(limit=100)`, eight chats per page, with no unbounded walk.
 - Deleted/edited messages cannot be detected or re-read without the archive
   subsystem; this is documented behavior, not coverage.
 
@@ -332,7 +277,7 @@ Unresolved (owner or P-phase verification):
 | Phase | Deliverable | Depends on | Status |
 |---|---|---|---|
 | P0 | Investigation + specification | — | **Complete** |
-| P1 | Manual + link-based summarization panel | P0 | Planned |
+| P1 | Manual + link-based summarization panel | P0 | **Complete (offline verified)** |
 | P2 | Incremental retrieval + per-chat checkpoint | P1 | Planned |
 | P3 | Opt-in automatic per-chat digest | P2 | Planned |
 | P4 | Text-first candidate pipeline | P2 (can ship independently) | Planned |
@@ -343,6 +288,47 @@ Unresolved (owner or P-phase verification):
 Per-phase detail (goal, user-visible behavior, reused files, likely changed
 files, persistence, security, failure, acceptance, automated tests, live tests,
 readiness) is in `INVESTIGATION.md` §11.
+
+### P1 implementation outcome
+
+Status: **Complete in code and offline tests; live Telegram verification not
+performed in the delivery environment.** Implementation commit
+`8434c26` (merged with P0 at `c83a557`). P1 is still manual only: no
+checkpoints, incremental runs, persistence, scheduler, automatic cadence or
+candidate pipeline exists.
+
+- One `History & Intelligence` panel (`panel:history`, parent `menu`) with one
+  main-menu row. It shows the selected chat, count (100/250/500/1000) and
+  optional focus.
+- `get_dialogs(limit=100)` supplies the picker, eight per page. Empty lists and
+  RPC failures are shown honestly; a chosen peer is re-validated against the
+  same bounded list before a run.
+- Manual runs call `history_ai_service.summarize_history` directly with
+  `current_message_id=None`, the selected chat/count/focus, the existing
+  self-client and `get_engine().provider_manager`. The AI-chat tool path is not
+  used.
+- Link runs reuse `save_service.parse_link_target` and
+  `_fetch_linked_message`, validate the resolved message and peer, and pass
+  `current_message_id = linked_message_id + 1`. Because the history upper bound
+  is exclusive, the linked message is included and newer messages are not.
+- Results report chat, processed/requested counts, first/last IDs, and whether
+  the window was complete, bounded/truncated or empty. Provider/retrieval
+  failures and empty history are never rendered as a summary.
+- The UI uses a backwards-compatible identifier-free summarization mode
+  (`with_identifiers=False`): the provider receives only history text and the
+  owner's focus, with no message or sender IDs. Existing AI-chat callers keep
+  their attributed prompt by default.
+- Runs use one finite `guarded_create_task`, a 300-second envelope, the
+  existing panel-operation generation and `ExistingPanelEditor`; cancellation
+  propagates and stale writers cannot overwrite a newer panel. Input handlers
+  only validate and launch.
+- Tests: `tests/test_history_panel.py` covers registration/navigation, dialog
+  bounds and paging, selection validation, count choices (including invalid
+  values), focus limits, manual argument passing, provider/empty/timeout
+  outcomes, cancellation, stale writers, all supported link forms and failure
+  kinds, peer/message validation, the `+1` boundary, and provider-prompt
+  identifier isolation. Existing history-service and history-AI tests remain
+  green.
 
 ### Feature-level acceptance criteria
 
@@ -379,6 +365,11 @@ readiness) is in `INVESTIGATION.md` §11.
 
 - **P0 — complete.** `ROADMAP.md` and `INVESTIGATION.md` updated; no source,
   migration, settings or runtime change.
-- **P1–P7 — not started.** Each begins only after the previous phase's
+- **P1 — complete in code and offline tests.** Panel, bounded chat picker,
+  manual and link summarization, range reporting and failure rendering are
+  implemented with the existing engine. Live account runs were not possible in
+  the delivery environment and remain the owner's acceptance step. No schema
+  was required or changed.
+- **P2–P7 — not started.** Each begins only after the previous phase's
   acceptance tests and live checks pass, and after any schema required by P2 is
   applied by the owner.

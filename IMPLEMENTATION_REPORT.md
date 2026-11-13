@@ -1,137 +1,178 @@
 # IMPLEMENTATION REPORT
 
-## Task objective
+## Feature and stage
 
-Remove wasted Intelligent Reaction AI requests when the owner sends one
-sentence as several separate Telegram messages faster than a single request
-completes: at most one Intelligent Reaction AI request may be in flight at a
-time, messages arriving meanwhile must be evaluated together in the next
-request, every message must keep its own identity and its own decision, and the
-result must be delivered to `origin/main`.
+- **Feature:** Unified History & Event Intelligence
+- **Stage completed:** P1 — Manual and link-based history summarization in the
+  Glass UI
+- **Previous stage:** P0 — Investigation and specification (complete)
+- **Next stage:** P2 — Incremental retrieval and per-chat checkpoints
+- **Implementation commit:** `8434c2671a5bf8b8e4f186acd4913e1fa3ce2353`
+- **Integration merge:** `76fb610` (merge of `origin/main` at `c83a557` into
+  the P1 commit; no rebase, reset or force-push)
+- **Report/delivery commit:** the commit containing this report, created on top
+  of the merge and pushed to `origin/main`
 
-## Root cause (established from source)
+The original inspection found `origin/main == HEAD == c43c5fa` and no P0
+History & Event Intelligence artifacts in that checkout. P1 was implemented
+from the supplied brief. While delivery was in progress, `origin/main` advanced
+to `c83a557` with the actual P0 investigation and specification; the P1 commit
+was merged with that history and the implementation was checked against
+`INVESTIGATION.md` §11 and the P0 roadmap. The merged tree keeps the P0 work and
+the P1 implementation.
 
-`backend/bot/handlers/intelligent_reaction.py` registers one
-`events.NewMessage(outgoing=True)` handler and calls
-`process_outgoing_message` once per outgoing update. Each call ran its own
-`manager.chat(...)` with **no shared in-flight state and no queue**: every
-update runs in its own handler coroutine, each awaited its own provider call
-concurrently, nothing recorded that an evaluation was already running, and
-nothing collected the messages that arrived meanwhile. Rapid successive
-messages therefore produced one concurrent AI request each.
+## Files changed by P1
 
-## Integration with the newer `main`
-
-While this work was in progress `origin/main` advanced by three commits that
-redesigned the SAME feature (`5701aed`, `098d594`, `dcad23c`): the probability
-became owner configuration (`panel_settings.intelligent_reaction_probability`,
-default 25) and the AI now returns only `{"reaction": <emoji|null>}`, with a
-legacy `probability` field invalidating the answer. The branches had diverged,
-so the delivery is a **merge** (no rebase, no force-push, no history rewrite)
-that keeps that redesign and ports the coalescing onto it. Nothing from
-`main` was reverted and no remote commit was lost.
-
-## Implementation details
-
-**Queue (leader/follower, per owner).** The first eligible message — one that
-already passed the owner's probability gate and the existing eligibility gates
-— becomes the leader in `_submit` and runs the AI request in its own handler
-coroutine with no delay. While that request is awaited, further eligible
-messages append themselves to the owner scope's pending list and await their own
-`asyncio.Future`. When the request finishes, the leader detaches the whole
-pending list and evaluates it in one request; messages arriving during that
-batch accumulate for the next one, repeating until the queue is empty. No task,
-loop, scheduler, worker, listener, Telegram client, provider path or executor
-was added.
-
-**Atomicity.** Append, leader claim and detach are plain synchronous code with
-no `await` between them, so on the single event loop the sequence cannot
-interleave with another coroutine and no message can be taken twice or lost.
-The state is rebound per event loop, so a restart or a fresh loop cannot inherit
-stale futures or a leader flag; leftover work is reported in one bounded log
-line instead of being forgotten silently.
-
-**Probability stays deterministic and per message.** The owner's percentage is
-read per message and the independent draw happens **before** queueing, so a 0%
-setting costs no catalog read, no AI call and no queue entry, and 100% always
-passes without consuming randomness. A coalesced batch therefore contains only
-messages that have already won their own probability decision; the AI never
-sees or influences it.
-
-**Identity.** Each queued `_Item` keeps its own `owner_id`, `client`,
-`chat_id`, `msg_id` and bounded context (message text, coarse chat type, reply
-flag, at most one replied-to text). The single-message contract is unchanged
-(`{"reaction": emoji|null}` through `build_ai_messages` /
-`parse_ai_reaction`). A coalesced batch sends one prompt carrying independent
-records labelled with a synthetic per-request id `1..n` (never Telegram ids)
-and expects `{"results": [{"id": <label>, "reaction": <emoji|null>}]}`.
-
-**Strict batch validation.** `parse_batch_ai_reactions` rejects the WHOLE
-answer for malformed JSON, unexpected top-level fields, an unexpected
-per-result field (including a legacy `probability`), a non-integer/unknown id,
-a duplicate id or a missing id — every message of that batch then fails as
-`skipped_invalid_ai_response` and nothing is sent, because the mapping is no
-longer trustworthy. A per-message `null` is `skipped_no_semantic_reaction`, an
-unusable emoji is `skipped_invalid_ai_response`, and a non-catalog emoji is
-`skipped_unsupported_reaction`; those fail only their own message. The emoji a
-batch result names is sent to that result's own `(chat_id, msg_id)`, through
-`reaction_service.react_to_message`, exactly once.
-
-**Bounds.** At most `MAX_BATCH_MESSAGES = 20` records and about
-`MAX_BATCH_PROMPT_CHARS = 12000` characters of message plus replied-to text per
-request, always taking at least one record. Overflow stays queued for the next
-request; text is never truncated to fit. Batch output is bounded at
-`MAX_BATCH_TOKENS = 256` and `MAX_BATCH_ANSWER_CHARS = 4000`.
-
-**Preserved gates.** The single listener, owner check, outgoing/sender proof,
-inline-origin exclusion, pending-panel-input exclusion, settings gate, the
-Auto-Reaction-wins conflict gate, the `(chat_id, msg_id)` dedup (now claimed
-before queueing, so a duplicate update while a message waits is rejected), the
-Telegram-catalog requirement and the one-attempt send are all unchanged.
-
-## Exact changed files
-
-| File | Change |
+| File | Why |
 |---|---|
-| `backend/services/intelligent_reaction_service.py` | Per-owner coalescing queue, batch prompt/parser for the react-only contract, per-message send, shared provider-call helper |
-| `tests/test_intelligent_reaction.py` | 12 new test functions (19 new cases, 125 in the file); fixture also resets the coalescer |
-| `AGENTS.md` | Corrected the Intelligent Reaction section (owner-set probability, AI reaction-only, coalescing) |
-| `ROADMAP.md` | Coalescing bullet in the Intelligent Reaction feature notes |
-| `IMPLEMENTATION_REPORT.md` | This report |
+| `backend/bot/handlers/history.py` | New `History & Intelligence` panel: bounded chat picker and paging, count/focus controls, manual background summarization, link resolution and link-boundary summarization, result/failure rendering, registration. No listener. |
+| `backend/bot/handlers/misc.py` | One main-menu row: `History & Intelligence` → `panel:history`. |
+| `backend/bot/router.py` | Imports and registers the history panel module with the other handlers. |
+| `backend/services/history_ai_service.py` | Adds `first_message_id`/`last_message_id` result metadata and a backwards-compatible `with_identifiers` option. Defaults preserve existing AI-chat behavior. |
+| `backend/services/appearance_service.py` | Adds `history` to the main-page IDs/defaults so the Appearance page's destination invariant covers the new menu panel. |
+| `tests/test_history_panel.py` | New focused P1 tests (registration, picker bounds, controls, run arguments, failures, timeout/cancellation/stale writers, link forms/boundaries, prompt isolation). |
+| `tests/test_appearance_ui.py` | Updates the expected main-menu count and checks the new entry is present. |
+| `ROADMAP.md` | Marks P1 complete in the existing P0/phase roadmap and records the actual implemented behavior, tests and deferred scope. |
 
-The merge also carries `main`'s own changes to the handler, General panel,
-settings service, probability migration, database docs and their tests; those
-are unmodified from `main`.
+No other source file was changed by the P1 commit. The merge brought in the
+P0 documentation and the already-delivered Intelligent Reaction changes from
+`origin/main`; those are not P1 changes.
+
+## Manual UI behavior
+
+- Panel: `panel:history`, parent `menu`, title `History & Intelligence`; one
+  main-menu entry.
+- **Select Chat** reads the account's own dialogs with
+  `get_dialogs(limit=100)` under a 15-second RPC timeout. It shows eight chats
+  per page with Previous/Next, never scans beyond the 100-dialog bound, and
+  handles empty lists and RPC failures honestly. Selecting a chat re-validates
+  that peer against the same bounded list.
+- Count controls offer exactly 100, 250, 500 and 1000. `COUNTS` is filtered by
+  `history_service.MAX_HISTORY_MESSAGES`; any other value is rejected rather
+  than converted into an unbounded request. The 1,001 case is explicitly
+  tested.
+- **Set Focus Instruction** accepts optional text, normalizes whitespace,
+  enforces `history_ai_service.MAX_INSTRUCTION_CHARS` (500), and leaves the
+  previous focus unchanged when the input is too long. An empty message clears
+  the focus.
+- **Run Summary** validates the selected chat, obtains the existing
+  `get_self_client()` and `get_engine().provider_manager`, snapshots the state,
+  and launches one bounded background task. It calls
+  `history_ai_service.summarize_history` with `current_message_id=None`, the
+  selected chat, count and focus. No AI-chat tool call is involved.
+- While running, the panel shows bounded progress. The result reports the chat,
+  processed/requested counts, first/last message IDs when available, and whether
+  the window was complete, bounded/truncated or empty. A failure or empty
+  history is never rendered as a summary; provider/retrieval error text is
+  shown as a failure.
+- The panel uses `with_identifiers=False`, so the provider prompt contains only
+  normalized history text and the owner's focus — no message IDs, sender IDs,
+  usernames, chat IDs or links. Existing AI-chat callers keep the original
+  attributed prompt by default.
+
+## Link-based behavior and exact range semantics
+
+- **Summarize Message Link** is a registered input. It reuses
+  `save_service.parse_link_target` and `save_service._fetch_linked_message`;
+  no second parser, resolver, client or access path exists.
+- Supported forms are the parser's current forms:
+  `https://t.me/<username>/<message_id>`,
+  `https://t.me/c/<chat_id>/<message_id>` and `tg://openmessage` message links.
+  Chat-only links remain unsupported, as they are in the existing parser.
+- Resolution is bounded at 60 seconds. The resolved message ID is checked
+  against the requested ID, and the resolved chat is checked against the
+  requested numeric chat when the link supplies one. A link that parses does not
+  prove access.
+- The UI preserves the existing distinct failure categories and their specific
+  text: invalid/unsupported link, `peer_unresolved`, `message_missing`, and
+  `lookup_failed`, plus the panel's timeout/unexpected-error cases.
+- **Boundary:** the UI passes
+  `current_message_id = linked_message_id + 1`. The history service's
+  `before_id` is exclusive, and `history_ai_service._prepare` maps the current
+  message ID to that exclusive bound. Therefore the linked message is included,
+  no message newer than it is read, and the requested count ends at the linked
+  message. A focused regression test fetches with `before_id=13` for a linked
+  message `12`.
+- The result identifies the actual first/last processed IDs and states that the
+  linked message is the ending point. The selected count and focus are
+  snapshotted when the input is submitted.
+
+## Services reused
+
+- `history_ai_service.summarize_history` — the single map-reduce engine and
+  provider budget/timeout/failure model.
+- `history_service` — bounded retrieval, provenance filtering and
+  `MAX_HISTORY_MESSAGES`.
+- `save_service.parse_link_target` / `_fetch_linked_message` — link parsing,
+  peer resolution, message validation and classified failures.
+- `get_engine().provider_manager` — the existing runtime provider manager; no
+  new manager was constructed.
+- `get_self_client()` — the existing authenticated self client; no new client.
+- `guarded_create_task`, `begin_panel_operation`/`finish_panel_operation`,
+  `ExistingPanelEditor`, `register_panel`/`register_action`/`register_input`/
+  `register_inline_builder`, `InlinePanelBuilder`, `input_state`,
+  `inline_sender` and the existing navigation/progress helpers.
+- Appearance page registration, so the new menu destination is covered by the
+  existing UI invariant.
+
+Long runs are finite: one `guarded_create_task` with a 300-second outer
+`asyncio.wait_for`, the engine's own timeout, the existing panel-operation
+generation (newest writer wins) and cancellation propagation. Input handlers
+validate and launch only; no scheduler, worker, permanent loop or new listener
+was added.
 
 ## Tests executed and actual results
 
-| Command | Result |
-|---|---|
-| `python -m pytest tests/test_intelligent_reaction.py -q` | **125 passed** (1.01 s) |
-| `python -m pytest tests -q` (merged tree) | **6 failed, 7532 passed, 27 skipped** (141.88 s) |
-| `python -m pytest tests -q` (baseline worktree at `dcad23c` = `origin/main`) | **6 failed, 7513 passed, 27 skipped** (162.13 s) |
-| `python -m compileall -q backend tests` | exit 0 |
-| `git diff --check` | exit 0 |
+### Focused, merged tree
 
-The 19 new cases cover: immediate first start with a follower only queueing;
-several messages sharing the next request (each mapped to its own id and
-emoji); a third batch; absence of any timer/debounce in the coalescer; `null`
-and unsupported results affecting only their own message; unknown, duplicate,
-missing, legacy-probability, extra-field and non-JSON batch answers failing the
-whole batch with nothing sent; recovery after a provider failure; cancellation
-settling followers and unblocking later messages; duplicate rejection while
-queued; the batch bound splitting a burst without loss; catalog outage failing
-the batch with no AI call; 0% never queueing or calling the AI; and a sustained
-25-message burst with one request in flight and no lost or duplicated message.
-They synchronise on events and on coalescer state, never on wall-clock sleeps.
+Command:
 
-## Full-suite failures and baseline status
+```text
+python -m pytest tests/test_history_panel.py tests/test_history_service.py \
+  tests/test_history_ai_tools.py tests/test_appearance_ui.py \
+  tests/test_colored_buttons.py tests/test_cipher_category.py -q --tb=short
+```
 
-Baseline status is **proven, not asserted**: the full suite was run in a
-throwaway worktree checked out at `dcad23c` (the exact `origin/main` commit this
-merge brings in, before the coalescing code) and produced the same six failures
-with 7513 passing. The merged tree produces exactly those six with 7532 passing
-(+19 tests, no new failure):
+Result: **247 passed** (exit 0). This includes all P1 panel tests and the
+existing history/service/UI tests.
+
+### Clean P1 commit before the P0 merge
+
+A read-only archive of implementation commit `8434c26` was tested:
+
+```text
+python -m pytest tests/test_history_panel.py tests/test_history_service.py \
+  tests/test_history_ai_tools.py tests/test_appearance_ui.py -q --tb=short
+```
+
+Result: **175 passed** (exit 0).
+
+Full suite on the same clean P1 commit:
+
+```text
+python -m pytest -q --tb=no
+```
+
+Result: **6 failed, 7483 passed, 27 skipped** (exit 1).
+
+### Merged delivery tree
+
+```text
+python -m pytest -q --tb=no
+```
+
+Result: **6 failed, 7560 passed, 27 skipped** (exit 1).
+
+### Baseline comparison actually performed
+
+A read-only archive of the new remote baseline `c83a557` was tested with the
+same full-suite command:
+
+- Baseline `c83a557`: **6 failed, 7532 passed, 27 skipped**.
+- Merged P1 tree: **6 failed, 7560 passed, 27 skipped**.
+- Difference: exactly the **28 P1 tests** pass; the failure set is identical.
+
+The six baseline failures are:
 
 1. `tests/test_aed_db_security.py::test_the_documentation_describes_the_restrictive_model`
 2. `tests/test_canonical_schema_reconciliation.py::test_the_migration_is_forward_only_and_its_successors_stay_additive`
@@ -140,49 +181,72 @@ with 7513 passing. The merged tree produces exactly those six with 7532 passing
 5. `tests/test_private_message_db_security.py::test_the_rls_model_names_the_two_tables_as_server_only_exceptions`
 6. `tests/test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`
 
-All six are documentation/inventory drift or order-dependent tests that touch
-no file changed here.
+They are unchanged from the clean `c83a557` baseline and are not caused by P1.
+An earlier baseline at `c43c5fa` was also run before the P0 merge:
+**6 failed, 7455 passed, 27 skipped**, with the same six failure names.
 
-## Compilation and diff checks
+### Static checks
 
-`python -m compileall -q backend tests` → exit 0. `git diff --check` → exit 0.
-The repository configures no ruff, flake8 or mypy, so there is no separate
-static/type check to run.
+```text
+python -m compileall -q backend tests   # exit 0
+git diff --check                        # exit 0
+git show --check --oneline 8434c26      # exit 0
+```
 
-## Cancellation and queue limitations
+## Deliberately not implemented
 
-- Coalescing is in-memory and per process; it does not coordinate across
-  processes or restarts. A replaced event loop cannot inherit queue state, and
-  any leftover is logged in one bounded warning.
-- The leader runs inside the handler coroutine of the message that started the
-  request. If it is cancelled (disconnect, shutdown), leadership is released
-  and the in-flight plus queued messages settle as `skipped_ai_failure` with
-  "the reaction batch was interrupted"; the next message starts cleanly.
-  Nothing is replayed, so no exactly-once guarantee is claimed.
-- A structurally invalid batch answer fails every message in that batch
-  (fail-closed) instead of guessing an assignment.
-- A batch may span chats (each message still executes against its own chat and
-  message id). The replied-to text is supplied by the existing handler per
-  message; only the AI request is coalesced.
-- A duplicate or edited update is rejected by the dedup guard, which is claimed
-  before queueing — a message waiting in the queue is already claimed.
+P1 does not add per-chat checkpoints, incremental retrieval, previous-summary
+persistence, automatic per-chat processing, cadence configuration, scheduler
+integration, Event Intelligence candidates, Task/Memory/Saved Items
+integration, digest delivery, media downloads, OCR/STT/video processing, a new
+summarizer, a second ProviderManager, a new Telegram client, a new listener, a
+new scheduler/worker, a new AI tool, or any new database table/column/SQL.
 
-## Live Telegram verification status
+Chat-only links remain unsupported and deferred. There is no edit/delete
+detection. The existing 1,000-message and 500-character limits remain
+authoritative.
 
-Not performed. No deployment, restart, live model call or Telegram UI
-interaction was made, and live latency was not measured; no latency improvement
-is claimed for the deployed runtime. Only the request-count and coalescing
-behaviour is proven, offline, against a scripted ProviderManager.
+## Database and deployment
 
-## Commit, branch and push
+- **No database change was made. No table, column, index, policy or row was
+  created, modified or deleted. No Supabase operation or SQL was executed.**
+- `DATABASE_ARCHITECTURE.md` was not edited.
+- P1 requires no persistence and adds none.
+- **Deployment:** no application deployment was performed as part of P1.
+- **Live Telegram verification:** **not performed.** This environment has no
+  live Telegram self-account/provider run. The owner must still open the panel
+  on the real account, run one real chat and one public message link, and check
+  that the reported range matches Telegram. The panel fails honestly rather
+  than fabricating a summary if that live path is unavailable.
 
-| Item | Value |
-|---|---|
-| Branch | `freebuff/f5137e20b1c5761eea04f020` |
-| Coalescing feature commits | `3a2e8ab` (implementation) and `da16483` (earlier report), built on `c43c5fa` |
-| `main` tip merged in | `dcad23c648039908ffc952b69908ba6cd586aed0` |
-| Delivery commits | merge `ea05653` carries the coalescing port onto `main`; this report ships in the docs commit immediately after it, which is the HEAD of `main`. A commit cannot embed its own hash, so the verified value is the `origin/main` HEAD recorded in the delivery summary |
-| Push | fast-forward from `dcad23c` to the merge commit; no force, no rebase, no history rewrite |
-| Verified `origin/main` HEAD | equal to the final local HEAD, confirmed with `git fetch`, `git rev-parse origin/main` and `git merge-base --is-ancestor` |
-| Migrations | `20261112140000_…enabled` is **already applied** on Supabase and is unchanged (never rewritten); `20261112160000_…probability` is **not applied** — applying it remains a manual owner action. No SQL was executed by this work |
-| Final working tree | clean apart from the gitignored `.venv/` |
+## Remaining limitations and owner actions
+
+- Live panel/chat/link runs and permission behavior remain unverified on a real
+  account.
+- P1's chat picker is intentionally limited to the first 100 dialogs; a chat
+  outside that bound is not selectable in this phase.
+- A failed panel edit/delivery cannot show a result in Telegram; the failure is
+  logged by the existing editor and the operation still finishes without
+  claiming success.
+- P2's checkpoint persistence needs the owner's separate schema decision and
+  application; no migration is provided here.
+- Existing unrelated work: the pre-merge working-tree snapshot of the
+  previously uncommitted Intelligent Reaction changes is retained in the local
+  stash `pre-p1-merge: prior uncommitted intelligent reaction worktree`. The
+  same feature is now delivered on `origin/main` by later commits, so that
+  snapshot was not committed with P1 and was not discarded.
+
+## Git delivery
+
+- Branch: `main`.
+- P1 implementation commit `8434c26` was pushed by merging the new
+  `origin/main` (`c83a557`) into it; merge commit `76fb610`. No rebase, reset,
+  force-push or history rewrite was used.
+- This report and the final roadmap/test updates are committed on top of the
+  merge and pushed to `origin/main`.
+- Remote `main` was fetched and checked after the push. The final verified
+  `origin/main` HEAD is the delivery commit containing this report; its exact
+  SHA is stated in the completion response.
+- Final working tree after delivery: clean, with no staged or unstaged P1
+  changes. The unrelated pre-merge snapshot remains in the local stash
+  described above.
