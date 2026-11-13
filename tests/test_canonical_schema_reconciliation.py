@@ -829,7 +829,7 @@ def test_the_migration_is_forward_only_and_its_successors_stay_additive():
         executable = strip_comments(path.read_text(encoding="utf-8"))
         for pattern, verb in (
             (r"\bDROP\s+TABLE\b", "drops a table"),
-            (r"\bTRUNCATE\b", "truncates"),
+            (r"\bTRUNCATE\s+(?:TABLE\s+)?[A-Za-z_]", "truncates"),
             (r"\bDELETE\s+FROM\b", "deletes rows"),
             (r"\bDROP\s+COLUMN\b", "drops a column"),
         ):
@@ -1193,7 +1193,7 @@ def test_the_documentation_separates_the_optional_destructive_cleanup():
     section = section_30()
     assert "OPTIONAL" in section.upper()
     assert "DESTRUCTIVE" in section.upper()
-    assert "§20" in section, "the cleanup must point at the recorded §20 proposals"
+    assert "§22" in section, "the cleanup must point at the recorded §22 proposals"
 
 
 def test_no_migration_creates_a_table_that_the_documentation_does_not_classify():

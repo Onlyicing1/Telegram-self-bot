@@ -234,8 +234,10 @@ async def test_ai_test_models_action_shows_usable_buttons_and_keeps_existing():
     # The final edit carries the canonical results view (shared with the
     # batch action path): usable models first, full diagnostics one tap away.
     body, buttons = ai_module._render_test_results(payload)
-    assert "**✓ Usable Models**" in body
-    assert "◇ **Groq**" in body
+    assert "**✓ Usable Models: 1**" in body
+    # The body no longer repeats the usable-model listing.
+    assert "◇ **Groq**" not in body
+    assert "gpt-oss-120b" not in body
     datas = _flatten_button_datas(buttons)
     # Only the AVAILABLE model becomes a one-tap selection button.
     assert "action:ai_pick_model:groq:openai/gpt-oss-120b" in datas

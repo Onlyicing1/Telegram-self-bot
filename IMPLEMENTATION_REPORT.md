@@ -24,7 +24,7 @@ History summarization. It does **not** add execution.
 - An identifier-free `scheduled_summary_payload` boundary in the History AI
   service (no production caller in this phase).
 - Focused tests and the canonical documentation updates, including §16.1 and
-  §31.3 part 15 of 15.
+  §31.3 part 18 of 18.
 - No scheduler, executor, lifecycle hook, UI, parser, notification, catch-up
   policy, second client or second update loop.
 
@@ -39,7 +39,7 @@ Files changed:
 | `backend/telegram_api/messages.py` | Optional `reverse` forwarding to Telethon |
 | `backend/telegram_api/api.py` | Facade forwarding of `reverse` |
 | `tests/test_history_schedules.py` | 25 focused Phase 3B tests |
-| `DATABASE_ARCHITECTURE.md` | §16.1, inventory 37/15, part 15, §20, §30.11, rollback/verification |
+| `DATABASE_ARCHITECTURE.md` | §16.1, inventory 42/18, part 18, §22, §30.11, rollback/verification |
 | `tests/test_database_setup_order.py` | 15-part / 37-file order and new-part assertions |
 | `tests/test_private_message_db_security.py` | Part totals 15/37 and final-banner assertions |
 | `tests/test_private_message_scope.py` | Part references 10/11/13 of 15 |
@@ -106,7 +106,7 @@ There is no owner foreign key because the repository has no owner table.
 
 Apply the entire file
 `supabase/migrations/20261113000001_create_history_schedules.sql` as
-`postgres` in the Supabase SQL editor (or as §31.3 part 15 of the one-paste
+`postgres` in the Supabase SQL editor (or as §31.3 part 18 of the one-paste
 setup). Its executable SQL is:
 
 ```sql
@@ -312,10 +312,12 @@ semantically redacted metadata. There is no production caller in Phase 3B.
     no gaps/duplicates, deleted gaps, AI skips, empty ranges and facade
     defaults;
   - identifier-free scheduled payload.
-- Existing database documentation/security/scope tests:
-  **196 passed** (`test_database_setup_order.py`,
-  `test_private_message_db_security.py`, `test_private_message_scope.py`).
-- Canonical schema classifier test for the new successor table: **1 passed**.
+- Merged documentation/setup/security/scope/canonical-schema suites:
+  **269 passed** in one run (`test_history_schedules.py`,
+  `test_database_setup_order.py`, `test_database_architecture_doc.py`,
+  `test_private_message_db_security.py`, `test_private_message_scope.py`,
+  `test_canonical_schema_reconciliation.py`). The full Appearance suites also
+  pass after the merge (`279 passed`).
 
 These are unit/repository/fallback tests. They do not contact live Supabase or
 live Telegram.
@@ -324,7 +326,7 @@ live Telegram.
 
 Command: `.venv/bin/python -m pytest -q`
 
-Result: **7263 passed, 27 skipped, 1 failed** in 144.01 s.
+Result: **7782 passed, 27 skipped, 1 failed** in 147.02 s.
 
 The single failure is the known pre-existing
 `tests/test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`
@@ -352,13 +354,28 @@ Consequently:
 Until the owner applies the migration, the Supabase repository degrades to the
 in-memory fallback and never reports the state as durably persisted.
 
+## 7.1 Merge integration with the latest upstream
+
+While Phase 3B was being delivered, `origin/main` advanced from the merged
+base `5f8437d` to `e2f1619` (10 newer History/Appearance/reaction/bandwidth
+commits). The upstream changes were merged normally. Conflicts were resolved
+in favour of the newer upstream implementation for Appearance, ROADMAP and
+unrelated files; the Phase 3B repository, service, migration, tests and
+documentation were re-applied on the resulting 42-file / 18-part baseline.
+The local stale `tests/test_appearance.py` was removed because upstream
+replaced it with the newer `test_appearance_ui`, `test_appearance_delivery`,
+`test_appearance_gallery` and `test_appearance_image_cache` suites. No
+Phase 3B code was dropped.
+
 ## 8. Commit SHA and remote verification
 
-The Phase 3B changes are committed as one commit on the delivery branch, then
-pushed normally to `origin/main` with `cloud_git` (no force, no rebase, no
-history rewrite). The exact commit SHA and the remote/ancestry/clean-tree
-verification results are reported in the final delivery message after the push
-succeeds. They can be re-checked with:
+The Phase 3B implementation is commit
+`417a6b84f86675993a45858fd3d73e1bcdaa9256`. The newer upstream `origin/main`
+`e2f16192907f3f874b689fd0fcc4ef2be1b7a860` was merged normally into it (no
+rebase, no force, no history rewrite); the reports and final documentation
+updates are part of that merge commit. The exact final HEAD and the
+remote/ancestry/clean-tree verification results are reported in the delivery
+message after the push succeeds. They can be re-checked with:
 
 ```bash
 git rev-parse HEAD

@@ -407,7 +407,9 @@ def test_ai_test_results_use_registry_glyphs_not_literals():
         "summary": {"available": 1, "failed": 1},
     }
     body, _buttons = ai_module._render_test_results(payload, current=("groq", "m1"))
-    assert f"**{sym.OP_SAVE} Usable Models**" in body
-    assert f"{sym.ICON_MODEL} **Groq**" in body
-    assert sym.MEDIA_VOICE in body          # the active model's in-place mark
+    assert f"**{sym.OP_SAVE} Usable Models: 1**" in body
+    assert sym.ICON_MODEL not in body       # no per-model listing in the body
     assert sym.STATE_FAILED in body         # the failure prefix
+    labels = [str(getattr(btn, "text", "")) for row in _buttons for btn in row]
+    # The active model's in-place mark lives in its button.
+    assert any(label.startswith(f"{sym.MEDIA_VOICE} ") for label in labels)

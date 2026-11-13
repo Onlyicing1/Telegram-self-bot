@@ -1,10 +1,10 @@
 # INVESTIGATION — Phase 3B: Durable History State and Oldest-First Retrieval
 
-> Source-verified against the repository at local HEAD
-> `bbe0ab76614eadbb6cb5ea0485a5368c1e6d3d98` (merge of the Appearance branch
-> and `5f8437d`, the then-current `origin/main`). The working tree was clean
-> before Phase 3B; no pre-existing modified or untracked project files were
-> present. Code is authoritative; this document records what the code actually
+> Source-verified against the repository at the latest upstream `origin/main`
+> `e2f16192907f3f874b689fd0fcc4ef2be1b7a860`, merged normally with the Phase 3B
+> commit `417a6b84f86675993a45858fd3d73e1bcdaa9256` (whose preflight base was
+> `bbe0ab76614eadbb6cb5ea0485a5368c1e6d3d98`). The working tree was clean before
+> Phase 3B; no pre-existing modified or untracked project files were present. Code is authoritative; this document records what the code actually
 > does, not what an earlier report claimed.
 >
 > Phase 3A approved this design. No SQL was executed against Supabase and no
@@ -13,11 +13,14 @@
 ## 1. Preflight and delivery state
 
 - Branch: `freebuff/99799eefb106784388e20bc8`.
-- HEAD: `bbe0ab76614eadbb6cb5ea0485a5368c1e6d3d98`
-  (`merge: integrate origin/main before Appearance delivery`).
-- `origin/main` was `5f8437d` at the merge; the local clone had no
-  `refs/remotes/origin/main` remote-tracking ref before delivery, so the remote
-  is verified with a fresh fetch after the push.
+- Preflight HEAD: `bbe0ab76614eadbb6cb5ea0485a5368c1e6d3d98`.
+- Phase 3B commit: `417a6b84f86675993a45858fd3d73e1bcdaa9256`.
+- Latest upstream `origin/main` fetched before delivery:
+  `e2f16192907f3f874b689fd0fcc4ef2be1b7a860` (10 newer History/Appearance/
+  reaction/bandwidth commits). It was merged normally, not rebased or forced.
+- The merge resolves the older local Appearance implementation in favour of
+  the newer upstream files; the upstream Appearance suites replace the stale
+  local `tests/test_appearance.py`.
 - `AGENTS.md` is the project's authority file and was read before source work.
 - The pre-existing unrelated merge history was preserved. No rebase, reset,
   force-push or history rewrite was performed.
@@ -198,17 +201,18 @@ No gaps are introduced by a short page; no duplicates are read across pages.
 ## 9. Documentation and migration inventory
 
 - Migration: `supabase/migrations/20261113000001_create_history_schedules.sql`.
-- Inventory: 37 repository migration files; the setup block has 15 parts.
+- Inventory: 42 repository migration files; the setup block has 18 parts.
 - `DATABASE_ARCHITECTURE.md`:
   - §16.1 documents the table, columns, constraints, index, FK, RLS and
     repository contract;
-  - §31.1 classifies the migration as part 15 of 15;
-  - §31.3 embeds the migration verbatim as part 15;
-  - §20 records it as **NOT APPLIED — owner action required**;
+  - §31.1 classifies the migration as part 18 of 18;
+  - §31.3 embeds the migration verbatim as part 18;
+  - §22 records it as **NOT APPLIED — owner action required**;
   - §30.11 lists it among the parts of the one-paste action;
   - §31.4/§31.5/§31.6 describe its part-specific rollback and verification.
-- The documentation tests were updated from 36/14 to 37/15, and the canonical
-  schema successor-table classifier now knows `history_schedules`.
+- The documentation tests were updated from the merged 41/17 baseline to
+  42/18, and the canonical schema successor-table classifier now knows
+  `history_schedules`.
 
 ## 10. Risks and limitations confirmed by inspection
 

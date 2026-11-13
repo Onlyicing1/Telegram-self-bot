@@ -35,6 +35,7 @@ import asyncio
 import json
 import logging
 import time
+from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from typing import Any
@@ -180,6 +181,7 @@ class Dispatcher:
         "_tool_executor",
         "_memory_manager",
         "_confirmation_store",
+        "_ai_request_times",
     )
 
     def __init__(
@@ -211,6 +213,9 @@ class Dispatcher:
         # Dispatcher is the orchestration boundary that creates and consumes
         # confirmations; per-instance ownership also isolates tests.
         self._confirmation_store = PendingConfirmationStore()
+        # Per-owner AI request rate limiter (documented 10 requests/minute).
+        # Independent of the outbound bandwidth governor.
+        self._ai_request_times: dict[Any, deque[float]] = {}
 
     @property
     def metrics(self) -> EngineMetrics:
@@ -385,6 +390,26 @@ class Dispatcher:
             return candidate
 
         safe_call(self._hooks, "before_execution", request)
+
+        # Per-owner AI request rate limiter (documented 10 requests/minute).
+        # Independent of the outbound bandwidth governor and of ProviderManager.
+        owner_id = getattr(request, "owner_id", None)
+        if isinstance(owner_id, int):
+            now_mono = time.monotonic()
+            window = self._ai_request_times.setdefault(owner_id, deque())
+            while window and now_mono - window[0] > 60.0:
+                window.popleft()
+            if len(window) >= 10:
+                logger.warning(
+                    "AI_REQUEST_RATE_LIMITED owner=%s count=%d", owner_id, len(window)
+                )
+                return EngineResult(
+                    success=False,
+                    text="AI request rate limit exceeded (10 requests per minute).",
+                    provider_name="",
+                    metadata={"rate_limited": True, "owner_id": owner_id},
+                )
+            window.append(now_mono)
 
         # Native tool definitions are computed once and passed to every
         # provider round only when this request permits tools. Providers

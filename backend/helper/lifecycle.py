@@ -160,6 +160,18 @@ class PanelLifecycleManager:
                 inline_message_id=inline_msg_id or inline_msg_id,
             )
 
+            # The inline builder knows what it actually produced (a photo result
+            # or a text one); record it against the message that now exists so
+            # later paints know whether media is already on screen.
+            try:
+                from backend.services import appearance_service
+
+                built = appearance_service.claim_built(panel_id)
+                if built is not None:
+                    appearance_service.note_delivered(msg_chat_id, msg_id, built)
+            except Exception:  # noqa: BLE001 — bookkeeping never breaks a panel
+                logger.debug("[LIFECYCLE] appearance delivery state not recorded")
+
             if settings_service.is_auto_close_enabled():
                 self._timers.start(
                     self._self_client, msg_chat_id, msg_id,
@@ -213,12 +225,6 @@ class PanelLifecycleManager:
                 if not title and not body and not buttons:
                     return False
 
-                # Reuse is a second render boundary: compose the Appearance
-                # layer before the text is laid out, exactly as the callback
-                # and initial-inline paths do.
-                from backend.services import appearance_service
-
-                title, body = appearance_service.compose(panel_id, title, body)
                 title, body, buttons = _finalize_panel(
                     title, body, buttons, panel_id, old_chat, old_msg
                 )
@@ -248,6 +254,91 @@ class PanelLifecycleManager:
             except Exception:
                 logger.warning("[LIFECYCLE] reuse failed — will create new")
                 return False
+
+    async def replace_panel(
+        self,
+        chat_id: int,
+        msg_id: int,
+        panel_id: str,
+        extra: str = "",
+    ) -> bool:
+        """Replace a panel message because its delivery state must change.
+
+        Telegram cannot turn a photo message back into a text one, and cannot
+        exchange the photo without uploading a new one, so a preview being
+        enabled, disabled or switched needs a NEW inline result. This is still
+        ONE persistent panel: the replacement is created FIRST, and only when
+        that succeeded is the old message deleted. A failed replacement
+        therefore never leaves the chat with no panel at all.
+
+        The lifecycle lock is not held here: ``create_panel`` takes it itself,
+        and deletion of the old message is a courtesy that cannot affect state.
+        """
+        if self._self_client is None:
+            return False
+        old_chat, old_msg = int(chat_id or 0), int(msg_id or 0)
+        from backend.helper import inline_engine
+        from backend.services import settings_service
+
+        query = f"{panel_id}:{extra}" if extra else panel_id
+        # ``create_panel`` destroys every session for the chat BEFORE it sends
+        # anything, so it must not be used here: a failed replacement would
+        # leave the visible panel untracked while its message still exists.
+        # The new message is sent first; the old one is released only after it
+        # exists.
+        try:
+            success, new_chat, new_msg, inline_msg_id = await inline_engine.trigger(
+                self._self_client, old_chat, query
+            )
+        except Exception:
+            logger.exception("[LIFECYCLE] replace_panel: trigger failed")
+            return False
+        if not success or not new_msg or (new_chat, new_msg) == (old_chat, old_msg):
+            logger.warning(
+                "[LIFECYCLE] replace_panel: no replacement message "
+                "(success=%s msg=%s)", success, new_msg,
+            )
+            return False
+
+        async with self._lock:
+            self._sessions.create(
+                new_chat, new_msg,
+                panel_type=panel_id,
+                extra=extra,
+                inline_message_id=inline_msg_id or "",
+            )
+            if settings_service.is_auto_close_enabled():
+                self._timers.start(
+                    self._self_client, new_chat, new_msg,
+                    owner_id=self._owner_id,
+                )
+            self._set_state(new_chat, new_msg, PanelState.ACTIVE)
+            try:
+                from backend.services import appearance_service
+
+                built = appearance_service.claim_built(panel_id)
+                if built is not None:
+                    appearance_service.note_delivered(new_chat, new_msg, built)
+            except Exception:  # noqa: BLE001 — bookkeeping never breaks a panel
+                logger.debug("[LIFECYCLE] replacement delivery state not recorded")
+            if (old_chat, old_msg) != (new_chat, new_msg):
+                await self._cleanup_locked(
+                    old_chat, old_msg, edit_message=False, event=None,
+                )
+
+        if old_chat and old_msg and (old_chat, old_msg) != (new_chat, new_msg):
+            try:
+                await self._self_client.delete_messages(old_chat, [old_msg])
+            except Exception as exc:  # noqa: BLE001 — the new panel is already up
+                logger.warning(
+                    "[LIFECYCLE] replaced panel but could not delete the old "
+                    "message chat=%s msg=%s: %s", old_chat, old_msg, exc,
+                )
+        logger.info(
+            "[LIFECYCLE] REPLACE panel='%s' old=%s:%s new=%s:%s",
+            panel_id, old_chat, old_msg, new_chat, new_msg,
+        )
+        return True
 
     # ── Close / Destroy ──
 
@@ -330,6 +421,12 @@ class PanelLifecycleManager:
         self._timers.stop(chat_id, msg_id)
         self._sessions.destroy(chat_id, msg_id)
         self.clear_render(chat_id, msg_id)
+        try:
+            from backend.services import appearance_service
+
+            appearance_service.forget_delivered(chat_id, msg_id)
+        except Exception:  # noqa: BLE001 — bookkeeping only
+            pass
         if self._owner_id:
             clear_pending(self._owner_id)
 

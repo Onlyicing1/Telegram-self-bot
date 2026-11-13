@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from typing import Any, Iterable
 
 from backend.helper import symbols as sym
+from backend.telegram_api.peers import PeerType, classify_entity
 
 logger = logging.getLogger(__name__)
 
@@ -360,12 +361,17 @@ def _entity(value: Any) -> Any:
 
 
 def _is_telegram_user(entity: Any, dialog: Any = None) -> bool:
-    try:
-        from telethon.tl.types import User
-        if isinstance(entity, User):
-            return True
-    except Exception:
-        pass
+    """Whether ``entity`` is a Telegram USER (human or bot).
+
+    The shared classifier owns real entities. The remaining branches are the
+    deliberate compatibility this module has always had with lightweight
+    non-Telethon doubles and with a dialog that already knows it is a private
+    user; they never turn an unidentifiable resolved entity into a user.
+    """
+    if classify_entity(entity) in (PeerType.PRIVATE_USER, PeerType.PRIVATE_BOT):
+        return True
+    if entity is None:
+        return False
     if entity.__class__.__name__ == "User":
         return True
     if entity.__class__.__name__ == "SimpleNamespace" and hasattr(entity, "first_name"):
@@ -374,6 +380,15 @@ def _is_telegram_user(entity: Any, dialog: Any = None) -> bool:
 
 
 def is_private_user_entity(entity: Any, owner_id: int | None = None, user_hint: bool = False) -> bool:
+    """Ghost Seen's private-HUMAN eligibility — feature policy, not taxonomy.
+
+    The taxonomy says what the peer is; Ghost Seen additionally excludes bots,
+    self, deleted accounts and the owner. Bot exclusion is taken from the shared
+    classifier for a real entity and kept attribute-based for the doubles this
+    module's tests use, so neither path loses its existing behaviour.
+    """
+    if classify_entity(entity) is PeerType.PRIVATE_BOT:
+        return False
     if entity is None or not (_is_telegram_user(entity) or user_hint):
         return False
     if any(bool(getattr(entity, attr, False)) for attr in ("bot", "is_bot", "is_self", "deleted")):

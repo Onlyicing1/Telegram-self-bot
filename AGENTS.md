@@ -245,6 +245,25 @@ layer — an execution interface, never just a text response.
   reached only through this category; the grouping is navigation only, so
   Anti-Edit / Anti-Delete keeps its existing private-chat capture scope.
 - **Settings / General**, **Context Panel**, **Health Dashboard**.
+- **Appearance** — the owner's personalization, kept out of Settings: a
+  shared static header, per-main-page title/body overrides for exactly the
+  top-level pages, and an optional preview image with its own switch. Values
+  are five `panel_settings` columns owned by `settings_service`
+  (`appearance_*`) and composed centrally by
+  `backend/services/appearance_service.py` at the panel render boundary, so
+  dynamic results, pickers and confirmations are never rewritten. The preview
+  is delivered as the panel message's OWN PHOTO with the page text as its
+  caption: the initial inline result is rebuilt as a photo result
+  (`InputBotInlineResult` type `photo`, `InputWebDocument` content) whose URL is
+  the versioned `/appearance/image/<version>?fmt=jpeg` rendition of the selected
+  object, so no URL ever appears in the message and Telegram renders no web-page
+  card. Only a durable Storage object key is stored, never bytes or a signed
+  URL. A panel message is either media-with-caption or text; because Telegram
+  cannot convert one into the other (or exchange a photo without uploading it),
+  enabling, disabling or switching the selected image REPLACES the panel message
+  through `PanelLifecycleManager.replace_panel` (create first, delete the old
+  message after). The Helper Bot is the only editor of this panel. See §31.3
+  part 15 of `DATABASE_ARCHITECTURE.md` and `IMPLEMENTATION_REPORT.md`.
 
 Actions (`action:*`), panels (`panel:*`), and inputs (`input:*`) are registered
 through `backend/helper` registries and dispatched by `panels._callback_router`.
@@ -516,6 +535,24 @@ error.
   own. What remains deterministic is validation, authorization, bounds and
   execution (`ToolRegistry`, `ToolExecutor`, `validate_action`, the task
   candidate contract, the content policy).
+- **Intelligent Reaction (AI-driven)**: `backend/services/intelligent_reaction_service.py`
+  is a second, independent reaction mode for the owner's own outgoing messages
+  (`panel_settings.intelligent_reaction_enabled`, OFF by default) and an
+  owner-set percentage (`panel_settings.intelligent_reaction_probability`,
+  0–100, default 25, read per message). The `ProviderManager` returns ONLY a
+  reaction from Telegram's available-reaction catalog (or null); deterministic
+  code owns the probability (0% never reacts, 100% always does, anything else
+  performs exactly one independent draw per message), validates the reaction
+  against the same catalog snapshot and executes ONE reaction through
+  `reaction_service.react_to_message`. There is no fixed ratio, quota or
+  rolling window, nothing falls back to the fixed Auto-Reaction emoji, and the
+  model receives only the message text, at most one replied-to text and a
+  coarse chat type (never ids, sender identity or history). An eligible
+  message starts its AI request immediately; messages arriving while one
+  request is in flight wait in a per-owner queue and share the next request
+  (one request in flight, no timer, no fixed window), each keeping its own id,
+  context and send. The two reaction modes are mutually exclusive in
+  `settings_service`.
 - **Tools**: stateless wrappers over services (`save`, `retrieve`, `delete`,
   `bio_*`, `username_*`, `organize_*`, `settings_*`, …). The `ToolExecutor`
   is the sole component that calls `tool.execute()`. The owner's message IS

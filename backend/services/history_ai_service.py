@@ -51,9 +51,12 @@ import re
 from dataclasses import dataclass
 from typing import Any, Sequence
 
-from backend.ai.prompt.budget import DEFAULT_MAX_CONTEXT_TOKENS, estimate_tokens
+from backend.ai.prompt.budget import (
+    DEFAULT_MAX_CONTEXT_TOKENS,
+    estimate_tokens_script_aware,
+)
 from backend.ai.providers.base.config import ProviderConfig
-from backend.services import history_service
+from backend.services import history_policy, history_service
 from backend.services.history_service import HistoryError, HistoryMessage
 
 logger = logging.getLogger(__name__)
@@ -172,6 +175,111 @@ def remaining_s(deadline: float | None) -> float | None:
     return max(0.0, float(deadline) - asyncio.get_running_loop().time())
 
 
+def map_call_capacity(budget_s: float) -> int:
+    """Provider calls one map phase can actually FINISH inside ``budget_s``.
+
+    Two independent constraints, and the smaller one wins:
+
+    * **Pacing.** Starts are at most ``MAX_CALL_SPACING_S`` apart, so the last
+      start plus one planned call must fit (``max_map_calls``).
+    * **Concurrency.** At most ``MAP_CONCURRENCY`` calls run at once; a call is
+      planned at ``ASSUMED_CALL_LATENCY_S``, so the phase can complete at most
+      ``MAP_CONCURRENCY`` calls per planning interval. Scheduled start times
+      alone are not a completion bound: N starts five seconds apart do not mean
+      N completions by the deadline when only two calls run concurrently.
+
+    ``ASSUMED_CALL_LATENCY_S`` is a PLANNING value (the provider HTTP bound, the
+    same one pacing uses), not a guarantee: the hard guarantee stays
+    :func:`call_timeout`'s bound and the phase deadline itself. A call slower
+    than planned consumes the remaining budget and fails the operation honestly
+    instead of silently overshooting it.
+    """
+    try:
+        budget = float(budget_s)
+    except (TypeError, ValueError):
+        budget = 0.0
+    paced = max_map_calls(budget)
+    if budget <= 0:
+        return 1
+    concurrent = MAP_CONCURRENCY * int(budget // ASSUMED_CALL_LATENCY_S)
+    return max(1, min(paced, concurrent))
+
+
+def required_ai_calls(chunk_count: int) -> int:
+    """Provider calls ONE history operation makes: a call per part, plus a merge.
+
+    One chunk needs no merge. Zero chunks (nothing with text) make no call.
+    ``ProviderManager``'s retries and fallbacks stay inside a single call and
+    are never counted as separate History-level passes.
+    """
+    if not isinstance(chunk_count, int) or chunk_count <= 0:
+        return 0
+    return chunk_count + (1 if chunk_count > 1 else 0)
+
+
+def _affordable_message_count(
+    messages: Sequence[HistoryMessage],
+    *,
+    with_attribution: bool,
+    token_budget: int,
+    with_ids: bool,
+    capacity: int,
+) -> int:
+    """Largest leading message count whose chunk count fits ``capacity``.
+
+    Used only to make a refusal actionable; it runs on the already-fetched
+    history (no Telegram read, no provider call) and reuses the exact chunker,
+    so the number it reports is the one the gate would accept.
+    """
+    limit = max(1, int(capacity))
+    low, high = 0, len(messages)
+    while low < high:
+        middle = (low + high + 1) // 2
+        chunks = _chunk_history(
+            messages[:middle], with_attribution=with_attribution,
+            token_budget=token_budget, with_ids=with_ids,
+        )
+        if len(chunks) <= limit:
+            low = middle
+        else:
+            high = middle - 1
+    return low
+
+
+def _capacity_refusal(
+    plan: HistoryPlan,
+    *,
+    chunks: int,
+    reduce_calls: int,
+    capacity: int,
+    budget_s: float,
+    with_attribution: bool,
+    token_budget: int,
+    with_ids: bool,
+) -> str:
+    """Honest, actionable refusal naming the REAL constraint.
+
+    The limit is the operation's own AI time budget under the existing pacing
+    and concurrency, not a provider rate-limit quota (no RPM/RPD value is read
+    anywhere). The text also states how much work one request can hold.
+    """
+    needed = chunks + reduce_calls
+    parts = f"{chunks} to cover the parts"
+    if reduce_calls:
+        parts += f" + {reduce_calls} to merge them"
+    affordable = _affordable_message_count(
+        plan.messages, with_attribution=with_attribution,
+        token_budget=token_budget, with_ids=with_ids, capacity=capacity,
+    )
+    return (
+        f"{sym.STATE_FAILED} These {len(plan.messages)} messages need {needed} AI calls "
+        f"({parts}), more than the {capacity} one request can finish inside its "
+        f"{budget_s:.0f}s AI budget while staying paced at one call every "
+        f"{MAX_CALL_SPACING_S:g}s with {MAP_CONCURRENCY} in flight. "
+        f"About {affordable} messages fit in one request."
+    )
+
+
 def call_timeout(deadline: float | None) -> float:
     """Effective timeout for ONE provider call.
 
@@ -196,6 +304,9 @@ ERROR_HISTORY = "history_unavailable"
 ERROR_PROVIDER = "ai_provider_failed"
 ERROR_TOO_LARGE = "history_too_large_for_one_request"
 ERROR_ENGINE = "ai_engine_unavailable"
+#: The requested count is not permitted for this chat's peer type. This is a
+#: PRODUCT policy refusal, distinct from retrieval and AI-capacity failures.
+ERROR_POLICY = "history_peer_policy"
 
 
 class HistoryAIError(Exception):
@@ -281,6 +392,29 @@ async def _prepare(
     effective = min(requested, bound)
     before_id = _coerce_int(current_message_id, 0) or None
 
+    # Product policy runs BEFORE any Telegram read or provider call: the chat's
+    # CURRENT entity is resolved and classified, then the count is validated
+    # against its peer type. The 1,000-message global bound above keeps its
+    # explicit "capped" note (never a silent clamp); the per-peer cap is NEVER
+    # clamped — an over-limit request is refused here.
+    try:
+        peer_type = await history_service.classify_chat(source, chat_id)
+    except HistoryError as exc:
+        logger.warning(
+            "AI_EXEC_TRACE request_id=%s stage=history_peer_resolve_failed "
+            "operation=%s error=%s",
+            request_id or "-", operation, exc,
+        )
+        raise HistoryAIError(str(exc), code=ERROR_HISTORY) from exc
+    refusal = history_policy.validate_count(peer_type, effective)
+    if refusal is not None:
+        logger.warning(
+            "AI_EXEC_TRACE request_id=%s stage=history_peer_policy_refused "
+            "operation=%s peer_type=%s count=%s",
+            request_id or "-", operation, peer_type.value, effective,
+        )
+        raise HistoryAIError(refusal, code=ERROR_POLICY)
+
     logger.info(
         "AI_EXEC_TRACE request_id=%s stage=history_retrieval_started "
         "operation=%s count=%s before_id=%s",
@@ -320,14 +454,14 @@ async def _prepare(
 
 
 def _estimate_tokens(text: str) -> int:
-    """Conservative branch of the project's token estimator (2 chars/token).
+    """Script-aware conservative estimate (see ``estimate_tokens_script_aware``).
 
-    ``backend/ai/prompt/budget.py`` documents the heuristic as 4 chars/token for
-    English and 2 for non-English, and states the estimate is deliberately
-    conservative. Taking the non-English branch for every chunk means a chunk of
-    Persian/Arabic or mixed text still fits its budget.
+    Latin-only text uses the documented 4 chars/token ratio; any non-ASCII
+    character (Persian, Arabic, mixed script, accented Latin, emoji) keeps the
+    2 chars/token worst case. The chunk budget itself is unchanged — only the
+    number of characters that fit inside it is measured correctly.
     """
-    return max(estimate_tokens(text, "English"), estimate_tokens(text, "Persian"))
+    return estimate_tokens_script_aware(text)
 
 
 def _visible_body(message: HistoryMessage) -> str:
@@ -382,11 +516,14 @@ class _Chunk:
     message_ids: tuple[int, ...]
 
 
-def _render_line(message: HistoryMessage, *, with_attribution: bool) -> str:
+def _render_line(
+    message: HistoryMessage, *, with_attribution: bool, with_id: bool = True,
+) -> str:
     body = _visible_body(message)
+    prefix = f"[{message.message_id}] " if with_id else ""
     if with_attribution:
-        return f"[{message.message_id}] {_attribution(message)}: {body}"
-    return f"[{message.message_id}] {body}"
+        return f"{prefix}{_attribution(message)}: {body}"
+    return f"{prefix}{body}"
 
 
 def _chunk_history(
@@ -394,6 +531,7 @@ def _chunk_history(
     *,
     with_attribution: bool,
     token_budget: int,
+    with_ids: bool = True,
 ) -> list[_Chunk]:
     """Cut the text-bearing messages into chunks that fit ``token_budget``.
 
@@ -414,7 +552,9 @@ def _chunk_history(
     for message in messages:
         if not message.text.strip():
             continue
-        line = _render_line(message, with_attribution=with_attribution)
+        line = _render_line(
+            message, with_attribution=with_attribution, with_id=with_ids,
+        )
         cost = _estimate_tokens(line) + 1
         if lines and used + cost > token_budget:
             _flush()
@@ -693,6 +833,8 @@ def _resolve_manager(provider_manager: Any) -> Any:
 
 def _result_data(plan: HistoryPlan, *, language: str = "") -> dict[str, Any]:
     """Small structured payload. Never carries message bodies or internals."""
+    first = plan.messages[0].message_id if plan.messages else None
+    last = plan.messages[-1].message_id if plan.messages else None
     return {
         "operation": plan.operation,
         "requested": plan.requested,
@@ -701,6 +843,24 @@ def _result_data(plan: HistoryPlan, *, language: str = "") -> dict[str, Any]:
         "truncated": plan.truncated,
         "capped": plan.capped,
         "language": language,
+        # The exact eligible range the operation covered, for callers that must
+        # report it (the History & Intelligence panel). Additive metadata: no
+        # message body, sender identity or peer id is exposed here.
+        "first_message_id": first,
+        "last_message_id": last,
+    }
+
+
+def _prepare_failure(exc: HistoryAIError) -> tuple[bool, str, dict[str, Any]]:
+    """The honest result for a planning failure.
+
+    A product-policy refusal is not a retrieval failure and must not be worded
+    as one: the chat was read fine, its type simply does not permit that count.
+    """
+    if exc.code == ERROR_POLICY:
+        return False, f"{sym.STATE_FAILED} {exc}", {"error": exc.code}
+    return False, f"{sym.STATE_FAILED} Couldn't read the Telegram history: {exc}", {
+        "error": exc.code,
     }
 
 
@@ -749,9 +909,7 @@ async def translate_history(
             current_message_id=current_message_id, request_id=request_id,
         )
     except HistoryAIError as exc:
-        return False, f"{sym.STATE_FAILED} Couldn't read the Telegram history: {exc}", {
-            "error": exc.code,
-        }
+        return _prepare_failure(exc)
 
     if not plan.messages:
         return True, "There are no messages to translate in this chat.", _result_data(plan)
@@ -762,12 +920,12 @@ async def translate_history(
     )
     budget = llm_budget(timeout_s)
     deadline = llm_deadline(budget)
-    capacity = max_map_calls(budget)
+    capacity = map_call_capacity(budget)
     if len(chunks) > capacity:
-        return False, (
-            f"{sym.STATE_FAILED} These {len(plan.messages)} messages need {len(chunks)} AI passes, "
-            f"more than the {capacity} one request can run while paced to stay "
-            "under the provider's rate limits. Try fewer messages."
+        return False, _capacity_refusal(
+            plan, chunks=len(chunks), reduce_calls=0, capacity=capacity,
+            budget_s=budget, with_attribution=False,
+            token_budget=TRANSLATE_CHUNK_TOKEN_BUDGET, with_ids=True,
         ), {"error": ERROR_TOO_LARGE, **_result_data(plan)}
 
     if not chunks:
@@ -815,6 +973,7 @@ async def summarize_history(
     current_message_id: Any = None,
     request_id: str = "",
     timeout_s: Any = None,
+    with_identifiers: bool = True,
 ) -> tuple[bool, str, dict[str, Any]]:
     """Summarize the most recent eligible Telegram messages with the LLM.
 
@@ -824,6 +983,9 @@ async def summarize_history(
     summary — no fake aggregation step.
 
     ``current_message_id`` excludes the requesting command from the history.
+    ``with_identifiers=False`` is the deterministic UI mode: the provider gets
+    only message text and the owner's instruction, never message ids or sender
+    ids. The default ``True`` preserves every existing caller's prompt.
     """
     manager = _resolve_manager(provider_manager)
     if manager is None:
@@ -838,9 +1000,7 @@ async def summarize_history(
             current_message_id=current_message_id, request_id=request_id,
         )
     except HistoryAIError as exc:
-        return False, f"{sym.STATE_FAILED} Couldn't read the Telegram history: {exc}", {
-            "error": exc.code,
-        }
+        return _prepare_failure(exc)
 
     if not plan.text_messages:
         if plan.messages:
@@ -848,8 +1008,9 @@ async def summarize_history(
         return True, "There are no messages to summarize in this chat.", _result_data(plan)
 
     chunks = _chunk_history(
-        plan.messages, with_attribution=True,
+        plan.messages, with_attribution=with_identifiers,
         token_budget=SUMMARIZE_CHUNK_TOKEN_BUDGET,
+        with_ids=with_identifiers,
     )
     budget = llm_budget(timeout_s)
     # One deadline for the whole operation; every call is bounded by what is left
@@ -860,12 +1021,17 @@ async def summarize_history(
     # that reservation: it may use the remaining budget up to the ceiling.
     map_budget = budget - ASSUMED_CALL_LATENCY_S if len(chunks) > 1 else budget
     map_deadline = min(deadline, llm_deadline(map_budget))
-    capacity = max_map_calls(map_budget)
+    # One merge call after the map phase when the history spans >1 chunk; its
+    # time is already reserved by ``map_budget`` above. The gate counts it, so
+    # the number in the message is the number of provider calls the operation
+    # actually makes (retries/fallbacks stay inside one call).
+    reduce_calls = 1 if len(chunks) > 1 else 0
+    capacity = map_call_capacity(map_budget)
     if len(chunks) > capacity:
-        return False, (
-            f"{sym.STATE_FAILED} These {len(plan.messages)} messages need {len(chunks)} AI passes, "
-            f"more than the {capacity} one request can run while paced to stay "
-            "under the provider's rate limits. Try fewer messages."
+        return False, _capacity_refusal(
+            plan, chunks=len(chunks), reduce_calls=reduce_calls, capacity=capacity,
+            budget_s=map_budget, with_attribution=with_identifiers,
+            token_budget=SUMMARIZE_CHUNK_TOKEN_BUDGET, with_ids=with_identifiers,
         ), {"error": ERROR_TOO_LARGE, **_result_data(plan)}
 
     system = _with_instruction(_SUMMARIZE_SYSTEM, plan.instruction)

@@ -20,7 +20,8 @@ Flow:
   5. Publish the AVAILABLE results as the runtime model-level fallback
      pool (free-first, configured model excluded). Discovery alone never
      qualifies a model, and neither the response/display cap nor an
-     unattempted target can enter the pool.
+     unattempted target can enter the pool. A COMPLETE feed is also persisted
+     for the startup restore; a partial run publishes nothing.
 
 Classification statuses:
   AVAILABLE, NOT_CONFIGURED, AUTH_ERROR, RATE_LIMITED,
@@ -41,6 +42,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Callable
 
+from backend.ai import candidate_pool
 from backend.ai.discovery import discover_providers, _get_env, get_provider_info, _PROVIDERS
 from backend.ai.model_discovery import (
     fallback_models,
@@ -624,7 +626,9 @@ def _feed_production_candidates(
     results: list[dict[str, Any]],
     complete_models: dict[str, list[Any]],
     providers_status: list[Any],
-) -> None:
+    *,
+    partial: bool = False,
+) -> dict[str, list[str]] | None:
     """Publish the AVAILABLE test results to the runtime model-level pool.
 
     The pool is the EXISTING ProviderManager contract
@@ -633,18 +637,30 @@ def _feed_production_candidates(
     panel is open, and the manager's own health/cooldown/quarantine rules
     still decide runtime use. A provider with no AVAILABLE model gets an
     empty candidate list (never the raw discovery set). Dummy is skipped.
+
+    A PARTIAL run (overall timeout / cancellation / interruption) publishes
+    nothing: its incomplete result set must not replace a complete pool with a
+    shorter one. Returns the exact feed published (including empty providers so
+    the durable restore can clear them), or ``None`` when nothing was published.
     """
+    if partial:
+        logger.info("CANDIDATE_POOL_SKIPPED reason=partial_run")
+        return None
     try:
         from backend.ai.engine.engine import get_engine
 
         feed = proven_usable_candidates(results, complete_models, providers_status)
         pm = get_engine().provider_manager
+        published: dict[str, list[str]] = {}
         for p in providers_status:
             if p.capability_kind != "chat" or not p.has_key or p.name == "dummy":
                 continue
-            pm.set_model_candidates(p.name, feed.get(p.name, []))
+            published[p.name] = list(feed.get(p.name, []))
+            pm.set_model_candidates(p.name, published[p.name])
+        return published
     except Exception as exc:
         logger.warning("Candidate-pool feed skipped: %s", exc)
+        return None
 
 
 async def test_all_models(
@@ -726,7 +742,12 @@ async def test_all_models(
             )
 
     annotate_is_free(results, complete_models, providers_status)
-    _feed_production_candidates(results, complete_models, providers_status)
+    feed = _feed_production_candidates(
+        results, complete_models, providers_status, partial=bool(pending),
+    )
+    if feed is not None:
+        # Persist only a COMPLETE feed; a partial run already refused above.
+        await candidate_pool.publish(feed)
 
     summary = _build_summary(results, len(discovered_models))
     logger.info(
@@ -939,7 +960,12 @@ async def test_all_models_streaming(
     # payload cap and the diagnostic budget bound TEST EXECUTION and DISPLAY
     # only — never this feed.
     annotate_is_free(results, complete_models, providers_status)
-    _feed_production_candidates(results, complete_models, providers_status)
+    feed = _feed_production_candidates(
+        results, complete_models, providers_status, partial=bool(pending),
+    )
+    if feed is not None:
+        # Persist only a COMPLETE feed; a partial run already refused above.
+        await candidate_pool.publish(feed)
 
     return {
         "success": True,

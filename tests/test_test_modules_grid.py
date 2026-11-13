@@ -164,8 +164,9 @@ def test_active_runtime_model_is_marked_in_place_not_duplicated():
     payload = _payload({"groq": ["m1", "m2"]})
     body, buttons = ai_module._render_test_results(payload, current=("groq", "m2"))
 
-    assert f"{sym.MEDIA_VOICE} `m2`" in body
-    assert f"{sym.BULLET} `m1`" in body
+    # The body is a bounded summary; model names live in their buttons only.
+    assert "Usable Models: 2" in body
+    assert "`m1`" not in body and "`m2`" not in body
     marks = [label for label in _labels(buttons) if label.startswith(f"{sym.MEDIA_VOICE} ")]
     assert len(marks) == 1
     assert any("m2" in label for label in marks)
@@ -178,9 +179,10 @@ def test_active_runtime_model_is_marked_in_place_not_duplicated():
 def test_non_active_results_keep_the_plain_usable_marker():
     payload = _payload({"groq": ["m1"]})
     body, buttons = ai_module._render_test_results(payload, current=("openai", "gpt-4o"))
-    assert f"{sym.BULLET} `m1`" in body
+    assert "Usable Models: 1" in body
     assert sym.MEDIA_VOICE not in body
-    assert all(not label.startswith(f"{sym.MEDIA_VOICE} ") for label in _labels(buttons))
+    pick = [label for label in _labels(buttons) if "m1" in label]
+    assert pick and not pick[0].startswith(f"{sym.MEDIA_VOICE} ")
 
 
 # ── Requirement: adaptive 2/3-column grid ──

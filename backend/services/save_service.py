@@ -45,6 +45,10 @@ from backend.diagnostics import record_event
 from backend.helper import symbols as sym
 from backend.runtime import save_trace
 from backend.services import settings_service
+try:
+    from backend.services import outbound_bandwidth_service as _outbound_bandwidth_service
+except Exception:  # noqa: BLE001
+    _outbound_bandwidth_service = None
 
 logger = logging.getLogger(__name__)
 
@@ -1652,6 +1656,10 @@ async def _deep_save_one(
                 upload_kwargs = _upload_kwargs_for_media(media, mime_type, file_name)
                 if upload_callback is not None:
                     upload_kwargs["progress_callback"] = upload_callback
+                if _outbound_bandwidth_service is not None:
+                    _reserve = getattr(_outbound_bandwidth_service, "reserve_outbound_bytes", None)
+                    if callable(_reserve):
+                        await _reserve("telegram_media", actual_size)
                 sent = await client.send_file(
                     "me",
                     tmp_path,
@@ -1960,6 +1968,10 @@ async def _deep_save_album(
         )
         try:
             t2 = asyncio.get_event_loop().time()
+            if _outbound_bandwidth_service is not None:
+                _reserve = getattr(_outbound_bandwidth_service, "reserve_outbound_bytes", None)
+                if callable(_reserve):
+                    await _reserve("telegram_media", total_size)
             sent = await client.send_file("me", media_items, caption=caption)
             record_event(
                 "save", "send_file",

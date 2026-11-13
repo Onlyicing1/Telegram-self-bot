@@ -30,8 +30,18 @@ from backend.helper.client import get_client
 from backend.helper.rpc_timeout import rpc_await
 from backend.helper.styles import PRIMARY
 from backend.helper import symbols as sym
+from backend.telegram_api.peers import PeerType, classify_entity
 
 _RPC_T = 30.0
+
+#: Display labels for the normalized peer vocabulary (General → Chat & IDs).
+_PEER_TYPE_LABELS = {
+    PeerType.PRIVATE_USER: "Private",
+    PeerType.PRIVATE_BOT: "Bot",
+    PeerType.BASIC_GROUP: "Group",
+    PeerType.SUPERGROUP: "Supergroup",
+    PeerType.BROADCAST_CHANNEL: "Channel",
+}
 
 
 def _resolve_tz() -> str:
@@ -61,6 +71,13 @@ def _build_general_buttons() -> list:
         "action:general_toggle_auto_reaction",
         PRIMARY,
     )
+    intel = settings_service.is_intelligent_reaction_enabled()
+    builder.add_row(
+        f"Intelligent Reaction: {sym.label(sym.OP_SAVE, 'ON') if intel else sym.label(sym.OP_CLOSE, 'OFF')}",
+        "action:general_toggle_intelligent_reaction",
+        PRIMARY,
+    )
+    builder.add_row("Set Reaction Probability", "input:general:intelligent_reaction_probability", PRIMARY)
     builder.add_row("Select Reaction", f"panel:{_REACTION_PANEL}", PRIMARY)
     return builder.build()
 
@@ -69,13 +86,20 @@ async def _general_body() -> str:
     from backend.services import settings_service
 
     auto = settings_service.is_auto_reaction_enabled()
+    intel = settings_service.is_intelligent_reaction_enabled()
+    probability = settings_service.intelligent_reaction_probability()
     emoji = settings_service.auto_reaction_emoji()
     selected = emoji if emoji else "— none —"
     return (
         "**General**\n\n"
         "Tap a button to execute instantly.\n\n"
         f"Auto-Reaction: {sym.label(sym.OP_SAVE, 'ON') if auto else sym.label(sym.OP_CLOSE, 'OFF')}\n"
-        f"Selected reaction: {selected}"
+        f"Selected reaction: {selected}\n"
+        f"Intelligent Reaction: {sym.label(sym.OP_SAVE, 'ON') if intel else sym.label(sym.OP_CLOSE, 'OFF')}\n"
+        f"Reaction Probability: {probability}%\n\n"
+        "_The two reaction modes are mutually exclusive: turning one ON turns the other OFF._\n\n"
+        "_Probability is the owner's fixed setting; the AI never changes it. "
+        "0% never reacts, 100% always reacts._"
     )
 
 
@@ -215,6 +239,9 @@ def _build_menu_buttons() -> list:
     )
     builder.add_row("Todo", "panel:todo", PRIMARY)
     builder.add_row("AI", "panel:ai", PRIMARY)
+    builder.add_row("History & Intelligence", "panel:history", PRIMARY)
+    # ONE new top-level category: appearance personalization lives under its
+    # own panel, never as individual controls on the main menu.
     builder.add_row("Appearance", "panel:appearance", PRIMARY)
     return builder.build()
 
@@ -375,6 +402,7 @@ async def _settings_panel_handler(event, extra: str) -> tuple[str, str, list] | 
     builder.add_row("Set Delete Batch Size", "input:settings:delete_batch_size", PRIMARY)
     builder.add_row("Set Log Retention", "input:settings:log_retention_days", PRIMARY)
     builder.add_row("Set Panel Timeout", "input:settings:panel_timeout_seconds", PRIMARY)
+    builder.add_row("Bandwidth Usage", f"panel:{_BANDWIDTH_PANEL}", PRIMARY)
     builder.add_row("Font", "panel:font", PRIMARY)
     return "Settings", await _build_settings_body(), builder.build()
 
@@ -544,9 +572,110 @@ async def _settings_language_handler(text, chat_id, msg_id, inline_chat_id, inli
             pass
 
 
+# ── Outbound bandwidth usage (read-only governor view) ────────────────────
+#: Child panel of Settings. It reads ONLY through the governor's
+#: ``get_outbound_usage()``; the handler never queries Supabase directly.
+_BANDWIDTH_PANEL = "bandwidth"
+_BANDWIDTH_UTC_NOTE = (
+    "Accounting periods use UTC — the daily period resets at 00:00 UTC and "
+    "the monthly period at 00:00 UTC on the 1st."
+)
+
+_BANDWIDTH_STATE_LABELS = {
+    "normal": "Normal",
+    "near_limit": "Near limit",
+    "exhausted": "Exhausted",
+}
+
+
+def _format_bandwidth_bytes(value) -> str:
+    """Render a byte count in decimal MB/GB with useful precision."""
+    try:
+        count = max(0, int(value))
+    except (TypeError, ValueError):
+        return "—"
+    if count >= 1_000_000_000:
+        return f"{count / 1_000_000_000:.3f} GB"
+    if count >= 1_000_000:
+        return f"{count / 1_000_000:.3f} MB"
+    if count >= 1_000:
+        return f"{count / 1_000:.1f} KB"
+    return f"{count} B"
+
+
+def _bandwidth_unavailable_body(detail: str) -> str:
+    return "\n".join([
+        f"{sym.STATE_WARNING} **Usage unavailable**",
+        "",
+        detail or "The stored accounting state could not be read.",
+        "",
+        "No usage figures are shown because an unreadable state cannot be "
+        "distinguished from a real zero by showing numbers.",
+        "",
+        _BANDWIDTH_UTC_NOTE,
+    ])
+
+
+def _bandwidth_body(usage: dict) -> str:
+    state = str(usage.get("state") or "normal")
+    label = _BANDWIDTH_STATE_LABELS.get(state, state)
+    return "\n".join([
+        f"**Today (UTC)** · {usage.get('daily_period') or '—'}",
+        f"Used: {_format_bandwidth_bytes(usage.get('daily_used_bytes'))} "
+        f"of {_format_bandwidth_bytes(usage.get('daily_limit_bytes'))}",
+        f"Remaining: {_format_bandwidth_bytes(usage.get('daily_remaining_bytes'))}",
+        "",
+        f"**This month (UTC)** · {usage.get('monthly_period') or '—'}",
+        f"Used: {_format_bandwidth_bytes(usage.get('monthly_used_bytes'))} "
+        f"of {_format_bandwidth_bytes(usage.get('monthly_limit_bytes'))}",
+        f"Remaining: {_format_bandwidth_bytes(usage.get('monthly_remaining_bytes'))}",
+        "",
+        f"**State:** {label}",
+        "",
+        _BANDWIDTH_UTC_NOTE,
+    ])
+
+
+async def _bandwidth_render(*, notice: str = "") -> tuple[str, str, list]:
+    from backend.services import outbound_bandwidth_service
+
+    try:
+        usage = await outbound_bandwidth_service.get_outbound_usage()
+    except Exception as exc:  # noqa: BLE001 — never fabricate a reading
+        usage = {
+            "available": False,
+            "detail": f"accounting read failed ({type(exc).__name__})",
+        }
+
+    if usage.get("available", True) is False:
+        body = _bandwidth_unavailable_body(str(usage.get("detail") or ""))
+    else:
+        body = _bandwidth_body(usage)
+        if notice:
+            body = f"{body}\n\n{notice}"
+
+    builder = InlinePanelBuilder()
+    builder.add_row(sym.label(sym.OP_REFRESH, "Refresh"), "action:bandwidth_refresh", PRIMARY)
+    return "Bandwidth Usage", body, builder.build()
+
+
+async def _bandwidth_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
+    return await _bandwidth_render()
+
+
+async def _bandwidth_refresh_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    """Re-read usage and repaint the SAME panel message (never a second one)."""
+    return await _bandwidth_render(notice=f"{sym.OP_REFRESH} Refreshed from the accounting service.")
+
+
 def _register_panels() -> None:
     register_panel("settings", _settings_panel_handler, parent="menu", title="Settings")
     register_inline_builder("settings", _settings_inline_builder)
+    register_panel(
+        _BANDWIDTH_PANEL, _bandwidth_panel_handler, parent="settings",
+        title="Bandwidth Usage",
+    )
+    register_action("bandwidth_refresh", _bandwidth_refresh_action)
     register_panel("general", _general_panel_handler, parent="menu", title="General")
     register_inline_builder("general", _general_inline_builder)
     register_panel(
@@ -566,6 +695,18 @@ def _register_panels() -> None:
     register_action("general_id", _general_id_action)
     register_action("general_health", _general_health_action)
     register_action("general_toggle_auto_reaction", _general_toggle_auto_reaction_action)
+    register_action(
+        "general_toggle_intelligent_reaction",
+        _general_toggle_intelligent_reaction_action,
+    )
+    register_input("general", "intelligent_reaction_probability", {
+        "handler": _general_intelligent_reaction_probability_handler,
+        "prompt": (
+            "**Reaction Probability**\n\n"
+            "Enter a whole number from 0 to 100 (0 never reacts, 100 always reacts):\n\n"
+            "_Reply below._"
+        ),
+    })
     register_input("settings", "auto_close_delay", {
         "handler": _settings_auto_close_delay_handler,
         "prompt": "**Auto-close Delay**\n\nEnter delay in seconds (5-3600):\n\n_Reply below._",
@@ -593,10 +734,10 @@ async def _general_ping_action(event, extra: str, chat_id: int) -> tuple[str, st
 
 
 async def _general_toggle_auto_reaction_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
-    """Toggle the Auto-Reaction SETTING and re-render the General panel.
+    """Toggle the fixed Auto-Reaction setting and re-render the General panel.
 
-    This flips the persisted setting only — no reaction engine exists yet, so
-    nothing reacts to any message as a side effect of this toggle.
+    Enabling it turns Intelligent Reaction OFF (the two modes are mutually
+    exclusive) — the label above the buttons reflects the resulting pair.
     """
     from backend.services import settings_service
 
@@ -606,7 +747,65 @@ async def _general_toggle_auto_reaction_action(event, extra: str, chat_id: int) 
         f"**General**\n\nAuto-Reaction is now "
         f"{sym.label(sym.OP_SAVE, 'ON') if enabled else sym.label(sym.OP_CLOSE, 'OFF')}."
     )
+    if enabled:
+        notice += " Intelligent Reaction was turned OFF."
     return "General", notice, _build_general_buttons()
+
+
+async def _general_toggle_intelligent_reaction_action(
+    event, extra: str, chat_id: int,
+) -> tuple[str, str, list] | None:
+    """Toggle the AI-driven Intelligent Reaction setting.
+
+    Enabling it turns the fixed Auto-Reaction OFF (the two modes are mutually
+    exclusive). The AI evaluates each outgoing message only while this setting
+    is ON; nothing reacts as a side effect of the click itself.
+    """
+    from backend.services import settings_service
+
+    settings_service.toggle_intelligent_reaction()
+    enabled = settings_service.is_intelligent_reaction_enabled()
+    notice = (
+        f"**General**\n\nIntelligent Reaction is now "
+        f"{sym.label(sym.OP_SAVE, 'ON') if enabled else sym.label(sym.OP_CLOSE, 'OFF')}."
+    )
+    if enabled:
+        notice += " Auto-Reaction was turned OFF."
+    return "General", notice, _build_general_buttons()
+
+
+async def _general_intelligent_reaction_probability_handler(
+    text, chat_id, msg_id, inline_chat_id, inline_msg_id,
+):
+    """Store the owner's fixed reaction probability (0–100 inclusive).
+
+    Validated before the write; a rejected database write is reported honestly
+    and leaves the effective value untouched (strict setter).
+    """
+    from backend.services import settings_service
+    from backend.helper.inline_engine import _self_client
+
+    raw = (text or "").strip().rstrip("%").strip()
+    if raw.isdigit() and 0 <= int(raw) <= 100:
+        percent = int(raw)
+        if settings_service.set_intelligent_reaction_probability(percent):
+            body = f"Reaction probability set to {percent}%"
+        else:
+            body = "Could not save the reaction probability; it was left unchanged."
+    else:
+        body = "Please enter a whole number between 0 and 100. Nothing was changed."
+
+    helper = get_client()
+    if helper and inline_chat_id and inline_msg_id:
+        try:
+            await helper.edit_message(inline_chat_id, inline_msg_id, body)
+        except Exception as exc:
+            logger.warning("settings intelligent_reaction_probability inline edit failed: %s", exc)
+    if _self_client:
+        try:
+            await _self_client.delete_messages(chat_id, [msg_id])
+        except Exception:
+            pass
 
 
 async def _general_id_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
@@ -625,12 +824,12 @@ async def _general_id_action(event, extra: str, chat_id: int) -> tuple[str, str,
         if client and event_chat_id:
             try:
                 entity = await client.get_entity(event_chat_id)
-                if hasattr(entity, "broadcast"):
-                    chat_type = "Channel" if entity.broadcast else "Group"
-                elif hasattr(entity, "megagroup") and entity.megagroup:
-                    chat_type = "Supergroup"
-                elif hasattr(entity, "first_name"):
-                    chat_type = "Private"
+                # The shared classifier reads Telegram's OWN flags. A Channel is
+                # either a broadcast channel or a supergroup (never both), and a
+                # basic group is not a supergroup.
+                chat_type = _PEER_TYPE_LABELS.get(
+                    classify_entity(entity), "Unknown",
+                )
                 name_parts = []
                 for attr in ("title", "first_name"):
                     val = getattr(entity, attr, "")

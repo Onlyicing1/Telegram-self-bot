@@ -84,6 +84,34 @@ def estimate_tokens(text: str, language: str = "English") -> int:
     return (char_count + ratio - 1) // ratio  # ceiling division
 
 
+def estimate_tokens_script_aware(text: str) -> int:
+    """Conservative estimate that never charges Latin-only text the non-Latin rate.
+
+    The generic estimator has two documented ratios (4 chars/token for English,
+    2 for non-English) and its callers pick one. Picking the non-Latin branch
+    unconditionally is safe but makes an English chunk hold half the text it
+    could, so a history chunker pays twice as many provider calls for the same
+    transcript.
+
+    This function distinguishes the cases by the text itself, conservatively:
+
+    * **ASCII-only** (Latin letters, digits, punctuation) → 4 chars/token, the
+      documented English ratio.
+    * **Any non-ASCII character** — Persian, Arabic, CJK, Cyrillic, accented
+      Latin, emoji — → the 2 chars/token ratio for the WHOLE string. Mixed
+      script is not weighted: one non-Latin character makes the conservative
+      branch apply, so a mixed chunk can never be underestimated by combining
+      ratios.
+
+    Empty text costs nothing. This is an estimate, never a tokenizer: callers
+    still bound the prompt by a budget they choose.
+    """
+    if not text:
+        return 0
+    ratio = 4 if text.isascii() else 2
+    return (len(text) + ratio - 1) // ratio  # ceiling division
+
+
 def estimate_tokens_for_sections(
     sections: dict[str, str],
     language: str = "English",

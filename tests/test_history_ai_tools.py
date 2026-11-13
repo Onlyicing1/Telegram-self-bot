@@ -48,6 +48,7 @@ from backend.ai.tools.history_ai import SummarizeHistoryTool, TranslateHistoryTo
 from backend.ai.tools.registry import create_default_registry
 from backend.services import history_ai_service, history_service
 from backend.telegram_api.api import TelegramAPI
+from backend.telegram_api.peers import PeerType
 
 CHAT = -100555000
 OWNER = 7770001
@@ -83,6 +84,11 @@ class _FakeClient:
         self._messages = list(messages)
         self.calls: list[dict[str, Any]] = []
 
+    async def get_entity(self, chat_id: Any):
+        from telethon.tl import types
+
+        return types.User(id=abs(int(chat_id)) or 1, first_name="Fake")
+
     def iter_messages(self, chat_id: Any, **kwargs: Any):
         self.calls.append({"chat_id": chat_id, **kwargs})
         limit = kwargs.get("limit")
@@ -104,6 +110,11 @@ class _FakeClient:
 
 
 class _FailingClient:
+    async def get_entity(self, chat_id: Any):
+        from telethon.tl import types
+
+        return types.User(id=abs(int(chat_id)) or 1, first_name="Fake")
+
     def iter_messages(self, chat_id: Any, **kwargs: Any):
         async def _boom():
             raise ConnectionError("mtproto down")
@@ -359,6 +370,45 @@ async def test_translate_count_beyond_the_bound_is_capped_and_stated(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_the_service_refuses_a_count_the_current_peer_does_not_permit(monkeypatch):
+    """Bypassing the panel cannot bypass the policy: the service boundary validates."""
+
+    async def _bot(source, chat_id):
+        return PeerType.PRIVATE_BOT
+
+    monkeypatch.setattr(history_service, "classify_chat", _bot)
+    provider = _ScriptedProvider(_summarizing_provider)
+    client = _FakeClient(_conversation(5))
+
+    result = await _run_summarize(_manager(provider), client, {"count": 1000})
+
+    assert result.success is False
+    assert result.data["error"] == history_ai_service.ERROR_POLICY
+    assert "limited to 300" in result.message
+    # Refused BEFORE any Telegram read or provider call.
+    assert client.calls == []
+    assert provider.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_the_service_refuses_an_unclassifiable_peer(monkeypatch):
+    async def _unknown(source, chat_id):
+        return PeerType.UNKNOWN
+
+    monkeypatch.setattr(history_service, "classify_chat", _unknown)
+    provider = _ScriptedProvider(_summarizing_provider)
+    client = _FakeClient(_conversation(2))
+
+    result = await _run_summarize(_manager(provider), client, {"count": 100})
+
+    assert result.success is False
+    assert result.data["error"] == history_ai_service.ERROR_POLICY
+    assert "could not be determined" in result.message
+    assert client.calls == []
+    assert provider.calls == 0
+
+
+@pytest.mark.asyncio
 async def test_translate_provider_failure_is_honest():
     provider = _ScriptedProvider(_translating_provider, fail_on_calls={1})
     result = await _run_translate(_manager(provider), _FakeClient(_conversation(3)), {"count": 3})
@@ -472,8 +522,18 @@ async def test_summarize_orders_history_before_summarizing():
 
 @pytest.mark.asyncio
 async def test_summarize_500_messages_map_reduces_within_the_budget():
+    """500 real-sized messages map-reduce inside an envelope that fits the calls.
+
+    The panel's default envelope cannot FINISH this many provider calls under
+    the concurrency-aware capacity model (see ``map_call_capacity``), so the
+    longer envelope is what proves the engine still processes every message.
+    """
     provider = _ScriptedProvider(_summarizing_provider)
-    result = await _run_summarize(_manager(provider), _FakeClient(_conversation(500)), {"count": 500})
+    context = _context_with_envelope(
+        _manager(provider), _FakeClient(_conversation(500, text="m" * 600)),
+        timeout_s=900.0,
+    )
+    result = await SummarizeHistoryTool(context).execute(context, {"count": 500})
 
     assert result.success is True
     assert result.data["processed"] == 500
@@ -621,7 +681,13 @@ async def test_history_too_large_for_one_request_is_refused_honestly(monkeypatch
     assert result.success is False
     assert result.data["error"] == history_ai_service.ERROR_TOO_LARGE
     assert provider.calls == 0
-    assert "fewer messages" in result.message
+    # The refusal names the real constraint (the request's AI time budget under
+    # pacing/concurrency) and how much work one request can hold -- never a
+    # provider rate-limit quota the service does not read.
+    assert "AI calls" in result.message
+    assert "one request can finish" in result.message
+    assert "About" in result.message
+    assert "rate limits" not in result.message
 
 
 @pytest.mark.asyncio
@@ -1044,7 +1110,8 @@ async def test_a_large_history_is_refused_under_a_short_envelope_but_runs_under_
     assert refused.success is False
     assert refused.data["error"] == history_ai_service.ERROR_TOO_LARGE
     assert short_provider.calls == 0
-    assert "rate limits" in refused.message
+    assert "AI budget" in refused.message
+    assert "rate limits" not in refused.message
 
     long_provider = _ScriptedProvider(_summarizing_provider)
     long_context = _context_with_envelope(
@@ -1222,11 +1289,14 @@ async def test_a_tighter_envelope_bounds_map_calls_and_the_reduce_by_the_budget(
     assumed = history_ai_service.ASSUMED_CALL_LATENCY_S
     bounds = _record_call_timeouts(monkeypatch)
     provider = _ScriptedProvider(_summarizing_provider)
+    # Four chunks: at 120s the concurrency-aware capacity is 4 map calls plus
+    # the reserved reduce, so this workload is accepted and every call bound is
+    # still governed by the remaining budget.
     context = _context_with_envelope(
-        _manager(provider), _FakeClient(_conversation(6)), timeout_s=120.0,
+        _manager(provider), _FakeClient(_conversation(4)), timeout_s=120.0,
     )
 
-    result = await SummarizeHistoryTool(context).execute(context, {"count": 6})
+    result = await SummarizeHistoryTool(context).execute(context, {"count": 4})
 
     budget = history_ai_service.llm_budget(120.0)
     map_values, reduce_value = bounds[:-1], bounds[-1]

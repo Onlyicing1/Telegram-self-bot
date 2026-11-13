@@ -6,15 +6,9 @@ import asyncio
 import logging
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import (
-    FileResponse,
-    HTMLResponse,
-    JSONResponse,
-    RedirectResponse,
-    Response,
-)
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 
 from backend.db import client as db_client
 from backend.health import snapshot as health_snapshot
@@ -315,62 +309,55 @@ def _apply_runtime_selection(provider: str, model: str) -> None:
         logger.warning("api/ai: runtime selection apply failed: %s", exc)
 
 
-def _public_base(request: Request) -> str:
-    """Absolute public origin for OG tags (env wins behind a proxy)."""
-    import os
+# ── Appearance preview ───────────────────────────────────────────────────────
+#
+# These two routes are registered BEFORE the SPA fallback (added in
+# mount_static below), so they are never shadowed by it and the existing
+# /guide mount is untouched.
+#
+#   /appearance/preview/<version> — the public page Telegram fetches for its
+#     web-page preview: Open Graph tags + an immediate continue to /guide/.
+#   /appearance/image/<version>   — the stored image itself, versioned per
+#     upload so a replacement is never served from Telegram's preview cache.
 
-    configured = os.getenv("PUBLIC_BASE_URL") or os.getenv("RENDER_EXTERNAL_URL") or ""
-    if configured:
-        return configured.rstrip("/")
-    return str(request.base_url).rstrip("/")
-
-
-@app.get("/preview/{version}/{panel_id}")
-async def panel_preview_page(version: str, panel_id: str, request: Request):
-    """The versioned document Telegram reads for the panel's link preview.
-
-    A crawler receives the Open Graph document; a human tap is redirected to
-    the existing Guide. The version is derived from the stored object key, so
-    replacing the image changes the URL and defeats Telegram's cache.
-    """
+@app.get("/appearance/preview/{version}")
+async def appearance_preview(version: str):
     from backend.services import appearance_service
 
-    key = appearance_service.preview_image_key()
-    if (
-        not key
-        or not appearance_service.preview_enabled()
-        or version != appearance_service.preview_version()
-        or not appearance_service.PAGE_ID_RE.match(panel_id or "")
-        or not appearance_service.public_base_url()
-    ):
+    meta = appearance_service.preview_meta(version)
+    if meta is None:
         raise HTTPException(status_code=404, detail="Not found")
-
-    user_agent = request.headers.get("user-agent", "")
-    if "telegram" not in user_agent.lower():
-        return RedirectResponse(url="/guide", status_code=302)
-    return HTMLResponse(appearance_service.og_html(panel_id))
+    return HTMLResponse(appearance_service.preview_html(meta))
 
 
-@app.get("/preview/{version}/{panel_id}/image")
-async def panel_preview_image(version: str, panel_id: str):
-    """Serve the owner's stored image publicly, without exposing a signed URL."""
-    from backend.services import appearance_service, preview_storage
+@app.get("/appearance/image/{version}")
+async def appearance_image(version: str, fmt: str = "", thumb: int = 0):
+    from backend.services import appearance_service
 
-    key = appearance_service.preview_image_key()
-    if (
-        not key
-        or not appearance_service.preview_enabled()
-        or version != appearance_service.preview_version()
-    ):
+    # Telegram fetches an inline photo as a JPEG web document, so the panel's
+    # media points here with ``?fmt=jpeg``, and its required THUMBNAIL document
+    # points here with ``?fmt=jpeg&thumb=1``. The stored object is untouched:
+    # both renditions are encoded on demand from the same bytes.
+    if (fmt or "").strip().lower() in ("jpeg", "jpg"):
+        encoded = await (
+            appearance_service.telegram_thumb(version)
+            if thumb
+            else appearance_service.telegram_photo(version)
+        )
+        if encoded is None:
+            raise HTTPException(status_code=404, detail="Not found")
+        return Response(
+            content=encoded,
+            media_type="image/jpeg",
+            headers={"Cache-Control": "public, max-age=31536000, immutable"},
+        )
+
+    payload = await appearance_service.image_payload(version)
+    if payload is None:
         raise HTTPException(status_code=404, detail="Not found")
-
-    payload = await asyncio.to_thread(preview_storage.download, key)
-    if not payload:
-        raise HTTPException(status_code=404, detail="Not found")
-    meta = appearance_service.preview_image_meta()
-    media_type = str(meta.get("mime") or "application/octet-stream")
+    data, media_type = payload
     return Response(
-        content=payload,
+        content=data,
         media_type=media_type,
         headers={"Cache-Control": "public, max-age=31536000, immutable"},
     )

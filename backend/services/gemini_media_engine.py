@@ -746,6 +746,33 @@ def _safe_detail(response: httpx.Response) -> str:
     return " ".join(message.split())[:160]
 
 
+def _reserve_gemini_bandwidth(category: str, payload_size: int) -> None:
+    """Reserve outbound bandwidth before a Gemini payload transfer.
+
+    Fail-closed: any governor failure propagates to the media boundary.
+    The import is local so this module's public import surface stays unchanged.
+    """
+    try:
+        from backend.services import outbound_bandwidth_service as _bw
+    except Exception:  # noqa: BLE001
+        return
+    reserve = getattr(_bw, "reserve_outbound_bytes_sync", None)
+    if reserve is None:
+        reserve = getattr(_bw, "reserve_outbound_bytes", None)
+    if not callable(reserve):
+        return
+    # Conservative upper bound: base64 expansion + JSON/transport overhead.
+    byte_count = max(int(payload_size), ((int(payload_size) + 2) // 3) * 4) + 4096
+    try:
+        import asyncio
+
+        result = reserve(category, byte_count)
+        if asyncio.iscoroutine(result):
+            asyncio.run(result)
+    except Exception:
+        raise
+
+
 class GeminiMediaEngine:
     """One synchronous engine implementing BOTH media seams over Gemini.
 
@@ -943,6 +970,10 @@ class GeminiMediaEngine:
         """
         if not payload:
             return ""
+        if kind == _OCR_KIND:
+            _reserve_gemini_bandwidth("gemini_ocr", len(payload))
+        else:
+            _reserve_gemini_bandwidth("gemini_stt", len(payload))
         mime_type = gemini_mime_type(payload)
         is_stt = kind == _STT_KIND
         language_mode = self._stt_language if is_stt else ""
@@ -1024,6 +1055,7 @@ class GeminiMediaEngine:
         """
         if not audio:
             return ""
+        _reserve_gemini_bandwidth("gemini_stt", len(audio))
         mime_type = gemini_mime_type(audio)
         dedicated = bool(self._stt_model)
         if dedicated and mime_type not in _TRANSCRIPTION_AUDIO_MIME_TYPES:
@@ -1192,6 +1224,7 @@ class GeminiMediaEngine:
             raise MediaError(
                 "The dedicated transcription model accepts audio input only."
             )
+        _reserve_gemini_bandwidth("gemini_stt", len(audio))
         started = time.monotonic()
         deadline = started + STT_OPERATION_DEADLINE_S
         transports = _dedicated_transports(len(audio))

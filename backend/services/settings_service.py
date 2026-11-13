@@ -48,18 +48,16 @@ Architecture:
 | dashboard_font          | str     | "default" | one of DASHBOARD_FONTS  |
 | auto_reaction_enabled   | bool    | false   | must be boolean         |
 | auto_reaction_emoji     | str     | ""      | non-empty string (a Telegram reaction emoji) |
-| appearance_header_title | str     | ""      | ≤64 chars; "" = no override |
-| appearance_header_body  | str     | ""      | ≤500 chars; "" = no override |
-| appearance_page_texts   | dict    | {}      | validated main-page ids/title/body map |
-| appearance_preview_enabled | bool | false   | must be boolean         |
-| appearance_preview_image | str    | ""      | "" or previews/<32 hex>.<png|jpg|webp> |
-| appearance_preview_meta | dict     | {}      | probed mime/width/height |
-
-The six appearance_* keys are written through set_setting_strict /
-set_many_strict (a rejected repository write is reported as failure and
-is never cached as if it had been saved).
+| intelligent_reaction_enabled | bool | false  | must be boolean         |
+| intelligent_reaction_probability | int | 25 | integer 0–100 inclusive |
+| appearance_header_title | str     | ""      | bounded text ("" = default header) |
+| appearance_header_body  | str     | ""      | bounded text ("" = default header) |
+| appearance_page_overrides | jsonb | {}      | page id → {title?, body?}, each bounded |
+| appearance_preview_enabled | bool  | false   | must be boolean         |
+| appearance_preview_image_key | str | ""      | bounded Storage object key ("" = none) |
 """
 import logging
+import re
 from typing import Any, Callable
 
 from backend.helper.font_style import FONT_KEYS
@@ -90,14 +88,20 @@ _DEFAULTS: dict[str, Any] = {
     "dashboard_font": "default",
     "auto_reaction_enabled": False,
     "auto_reaction_emoji": "",
-    # Glass UI Appearance (see backend/services/appearance_service.py).
+    "intelligent_reaction_enabled": False,
+    "intelligent_reaction_probability": 25,
     "appearance_header_title": "",
     "appearance_header_body": "",
-    "appearance_page_texts": {},
+    "appearance_page_overrides": {},
     "appearance_preview_enabled": False,
-    "appearance_preview_image": "",
-    "appearance_preview_meta": {},
+    "appearance_preview_image_key": "",
 }
+
+#: Appearance text is owner-supplied, so it is bounded here (the service layer
+#: applies the tighter per-field limits). 1024 characters is far more than a
+#: Glass UI panel title or description can usefully show.
+_APPEARANCE_TEXT_LIMIT = 1024
+_STORAGE_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9/_.-]*$")
 
 _cache: dict[str, Any] = {}
 _loaded: bool = False
@@ -127,18 +131,42 @@ def _validate_dashboard_font(value: Any) -> bool:
     return isinstance(value, str) and value in DASHBOARD_FONTS
 
 
-def _validate_appearance(key: str):
-    """Delegate to the Appearance module's own bounded validators.
+def _validate_appearance_text(value: Any) -> bool:
+    """Owner-supplied display text: a string, bounded, and NUL-free."""
+    return (
+        isinstance(value, str)
+        and len(value) <= _APPEARANCE_TEXT_LIMIT
+        and "\x00" not in value
+    )
 
-    Imported lazily: appearance_service reads this module at import time, so a
-    module-level import here would be circular.
+
+def _validate_page_overrides(value: Any) -> bool:
+    """Per-page overrides: page id → {title?, body?} with bounded values.
+
+    The page ids themselves are validated against the live eligible-page list
+    in ``appearance_service`` (this module only owns the column contract), so
+    an unrelated key can never be persisted through the generic setter.
     """
-    from backend.services import appearance_service
+    if not isinstance(value, dict) or len(value) > 64:
+        return False
+    for page_id, fields in value.items():
+        if not isinstance(page_id, str) or not page_id or len(page_id) > 64:
+            return False
+        if not isinstance(fields, dict) or not fields:
+            return False
+        if set(fields) - {"title", "body"}:
+            return False
+        for text in fields.values():
+            if not _validate_appearance_text(text) or not text.strip():
+                return False
+    return True
 
-    def validator(value: Any) -> bool:
-        return appearance_service.validate_for_key(key, value)
 
-    return validator
+def _validate_storage_key(value: Any) -> bool:
+    """A Storage object key (never a URL): empty, or a bounded safe path."""
+    if not isinstance(value, str) or len(value) > 256 or "\x00" in value:
+        return False
+    return value == "" or bool(_STORAGE_KEY_RE.match(value))
 
 
 
@@ -157,12 +185,13 @@ _VALIDATORS: dict[str, ValidatorFn] = {
     "dashboard_font": _validate_dashboard_font,
     "auto_reaction_enabled": _validate_bool,
     "auto_reaction_emoji": _validate_nonempty_str,
-    "appearance_header_title": _validate_appearance("appearance_header_title"),
-    "appearance_header_body": _validate_appearance("appearance_header_body"),
-    "appearance_page_texts": _validate_appearance("appearance_page_texts"),
-    "appearance_preview_enabled": _validate_appearance("appearance_preview_enabled"),
-    "appearance_preview_image": _validate_appearance("appearance_preview_image"),
-    "appearance_preview_meta": _validate_appearance("appearance_preview_meta"),
+    "intelligent_reaction_enabled": _validate_bool,
+    "intelligent_reaction_probability": _validate_int_range(0, 100),
+    "appearance_header_title": _validate_appearance_text,
+    "appearance_header_body": _validate_appearance_text,
+    "appearance_page_overrides": _validate_page_overrides,
+    "appearance_preview_enabled": _validate_bool,
+    "appearance_preview_image_key": _validate_storage_key,
 }
 
 
@@ -235,6 +264,45 @@ def is_valid_key(key: str) -> bool:
     return key in _DEFAULTS
 
 
+def _db_configured() -> bool:
+    """Whether a durable database is configured at all.
+
+    With no database the cache IS the configured store (the documented
+    in-memory fallback), so a cache-only write is not a lie. With a database
+    configured, a rejected write must never be reported as persisted.
+    """
+    try:
+        from backend.db import client as db_client
+        return db_client.get_db() is not None
+    except Exception:
+        return False
+
+
+def set_setting_strict(key: str, value: Any) -> bool:
+    """Like :func:`set_setting`, but never reports a rejected DB write as saved.
+
+    Used by the Appearance settings: when a database IS configured and the
+    repository rejects the write, the cache is left untouched and ``False`` is
+    returned, so the owner is told the truth instead of seeing a value that
+    disappears on the next restart/redeploy.
+    """
+    if not is_valid_key(key):
+        logger.warning("settings_service: unknown setting key '%s' rejected", key)
+        return False
+    validator = _VALIDATORS.get(key)
+    if validator and not validator(value):
+        logger.warning("settings_service: validation failed for '%s' = %r", key, value)
+        return False
+    if repo.update_field(key, value):
+        _refresh_from_db()
+        return True
+    if _db_configured():
+        logger.warning("settings_service: '%s' was NOT persisted (repository rejected the write)", key)
+        return False
+    _cache[key] = value
+    return True
+
+
 def set_setting(key: str, value: Any) -> bool:
     """Validate, write to DB via repository, refresh cache. Returns True on success."""
     # Fail closed for keys that are not real panel_settings columns: an
@@ -254,46 +322,6 @@ def set_setting(key: str, value: Any) -> bool:
         return True
 
     _cache[key] = value
-    return True
-
-
-def _validate_entry(key: str, value: Any) -> bool:
-    if not is_valid_key(key):
-        logger.warning("settings_service: unknown setting key '%s' rejected", key)
-        return False
-    validator = _VALIDATORS.get(key)
-    if validator and not validator(value):
-        logger.warning("settings_service: validation failed for '%s' = %r", key, value)
-        return False
-    return True
-
-
-def set_setting_strict(key: str, value: Any) -> bool:
-    """Persist a setting and report ONLY a real DB write as success.
-
-    Used by the Appearance surface: a rejected repository write must never be
-    reported (or cached) as if the owner's choice was saved.
-    """
-    if not _validate_entry(key, value):
-        return False
-    if not repo.update_field(key, value):
-        logger.warning("settings_service: strict write rejected for '%s'", key)
-        return False
-    _refresh_from_db()
-    return True
-
-
-def set_many_strict(fields: dict[str, Any]) -> bool:
-    """Persist several settings atomically (one repository UPDATE)."""
-    if not isinstance(fields, dict) or not fields:
-        return False
-    for key, value in fields.items():
-        if not _validate_entry(key, value):
-            return False
-    if not repo.update_fields(fields):
-        logger.warning("settings_service: strict multi-write rejected for %s", list(fields))
-        return False
-    _refresh_from_db()
     return True
 
 
@@ -429,7 +457,16 @@ def is_auto_reaction_enabled() -> bool:
 
 
 def set_auto_reaction_enabled(enabled: bool) -> bool:
-    return set_setting("auto_reaction_enabled", bool(enabled))
+    """Enable/disable the fixed Auto-Reaction mode.
+
+    The two reaction modes are mutually exclusive: enabling this one turns
+    Intelligent Reaction OFF in the same operation. Disabling writes nothing
+    else, so the ordinary off-switch stays a single-column write.
+    """
+    ok = set_setting("auto_reaction_enabled", bool(enabled))
+    if ok and enabled and is_intelligent_reaction_enabled():
+        set_setting("intelligent_reaction_enabled", False)
+    return ok
 
 
 def toggle_auto_reaction() -> bool:
@@ -452,3 +489,130 @@ def auto_reaction_emoji() -> str:
 
 def set_auto_reaction_emoji(emoji: str) -> bool:
     return set_setting("auto_reaction_emoji", emoji)
+
+
+def is_intelligent_reaction_enabled() -> bool:
+    """Whether the AI-driven Intelligent Reaction mode is enabled.
+
+    Independent of the fixed Auto-Reaction setting: this mode never reads
+    ``auto_reaction_emoji``. The two are mutually exclusive, and
+    ``set_intelligent_reaction_enabled(True)`` enforces that.
+    """
+    _ensure_loaded()
+    return bool(_cache.get("intelligent_reaction_enabled", False))
+
+
+def set_intelligent_reaction_enabled(enabled: bool) -> bool:
+    """Enable/disable Intelligent Reaction, turning Auto-Reaction OFF on enable."""
+    ok = set_setting("intelligent_reaction_enabled", bool(enabled))
+    if ok and enabled and is_auto_reaction_enabled():
+        set_setting("auto_reaction_enabled", False)
+    return ok
+
+
+def toggle_intelligent_reaction() -> bool:
+    """Flip Intelligent Reaction and return its NEW value."""
+    new_val = not is_intelligent_reaction_enabled()
+    set_intelligent_reaction_enabled(new_val)
+    return new_val
+
+
+def intelligent_reaction_probability() -> int:
+    """The owner's fixed reaction probability (an integer from 0 to 100).
+
+    Read for EVERY eligible outgoing message, so a saved change applies to the
+    next message with no restart. An unusable cached value falls back to the
+    documented default rather than to an accidental 0% or 100%.
+    """
+    _ensure_loaded()
+    value = _cache.get("intelligent_reaction_probability", 25)
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 100:
+        return 25
+    return value
+
+
+def set_intelligent_reaction_probability(value: Any) -> bool:
+    """Persist the probability and report the truth about the write.
+
+    The service validates the range BEFORE storing, and the strict setter never
+    leaves the effective cache claiming a value the database rejected. A write
+    the repository accepted is then confirmed against the persisted row: an
+    update that matched nothing, or a read that cannot return the stored value,
+    is reported as a failure and the effective value stays what the database
+    actually holds — never an optimistic success.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 100:
+        return False
+    if not set_setting_strict("intelligent_reaction_probability", value):
+        return False
+    if _db_configured():
+        row = repo.load()
+        if row is None or row.get("intelligent_reaction_probability") != value:
+            logger.warning(
+                "settings_service: intelligent_reaction_probability write was not "
+                "confirmed by the persisted row; the stored value was kept"
+            )
+            return False
+    return True
+
+
+# ── Typed accessors: Appearance personalization ──
+#
+# Every appearance value rides the same singleton row and the same
+# cache-first/write-through service. Empty means "use the built-in default",
+# so resetting a value is stored as "" (never as the current customized value).
+
+def appearance_header_title() -> str:
+    _ensure_loaded()
+    value = _cache.get("appearance_header_title", "")
+    return value if isinstance(value, str) else ""
+
+
+def set_appearance_header_title(value: str) -> bool:
+    return set_setting_strict("appearance_header_title", value)
+
+
+def appearance_header_body() -> str:
+    _ensure_loaded()
+    value = _cache.get("appearance_header_body", "")
+    return value if isinstance(value, str) else ""
+
+
+def set_appearance_header_body(value: str) -> bool:
+    return set_setting_strict("appearance_header_body", value)
+
+
+def appearance_page_overrides() -> dict[str, dict[str, str]]:
+    """Per-main-page text overrides; always a fresh, validated-shaped copy."""
+    _ensure_loaded()
+    value = _cache.get("appearance_page_overrides", {})
+    if not isinstance(value, dict):
+        return {}
+    return {
+        str(page_id): {str(field): str(text) for field, text in fields.items()}
+        for page_id, fields in value.items()
+        if isinstance(fields, dict)
+    }
+
+
+def set_appearance_page_overrides(value: dict[str, dict[str, str]]) -> bool:
+    return set_setting_strict("appearance_page_overrides", value)
+
+
+def appearance_preview_enabled() -> bool:
+    _ensure_loaded()
+    return bool(_cache.get("appearance_preview_enabled", False))
+
+
+def set_appearance_preview_enabled(enabled: bool) -> bool:
+    return set_setting_strict("appearance_preview_enabled", bool(enabled))
+
+
+def appearance_preview_image_key() -> str:
+    _ensure_loaded()
+    value = _cache.get("appearance_preview_image_key", "")
+    return value if isinstance(value, str) else ""
+
+
+def set_appearance_preview_image_key(key: str) -> bool:
+    return set_setting_strict("appearance_preview_image_key", key)

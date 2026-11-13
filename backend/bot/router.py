@@ -13,15 +13,16 @@ import traceback
 
 from telethon import events
 
-from backend.bot.handlers import misc, save, retrieve, delete, bio, discover, database, username, ai, ghost_seen_v2
+from backend.bot.handlers import misc, save, retrieve, delete, bio, discover, database, username, ai, ghost_seen_v2, history
 from backend.bot.handlers import (
-    appearance,
     ai_unified,
+    appearance,
     ai_credentials,
     anti_edit_delete,
     ai_stt_settings,
     ai_tts_settings,
     auto_reaction,
+    intelligent_reaction,
     emoji,
     emoji_replacement,
     private_message,
@@ -91,6 +92,8 @@ def register_all(client, owner_id: int, tz_str: str):
 
     handlers = [
         ("misc", lambda: misc.register(client, owner_id)),
+        # Appearance registers panels/actions/inputs only — no listener, no
+        # client, no update loop; the main menu links its one new category.
         ("appearance", lambda: appearance.register(client, owner_id)),
         ("save", lambda: save.register(client, owner_id, tz_str)),
         ("retrieve", lambda: retrieve.register(client, owner_id)),
@@ -100,6 +103,7 @@ def register_all(client, owner_id: int, tz_str: str):
         ("database", lambda: database.register(client, owner_id, tz_str)),
         ("username", lambda: username.register(client, owner_id, tz_str)),
         ("ai", lambda: ai.register(client, owner_id)),
+        ("history", lambda: history.register(client, owner_id)),
         ("ai_stt_settings", lambda: ai_stt_settings.register(client, owner_id)),
         ("ai_tts_settings", lambda: ai_tts_settings.register(client, owner_id)),
         ("emoji", lambda: emoji.register(client, owner_id)),
@@ -114,10 +118,14 @@ def register_all(client, owner_id: int, tz_str: str):
         ("private_message", lambda: private_message.register(client, owner_id, tz_str)),
         ("task_events", lambda: task_events.register(client, owner_id, tz_str)),
         ("todo", lambda: todo.register(client, owner_id, tz_str)),
-        # Auto-Reaction runs before the replacement pipeline: the reaction is
-        # applied to the ORIGINAL message id, and the replacement pipeline
-        # (which deletes the original) runs LAST so every other handler keeps
-        # its first claim on the owner's message.
+        # The two mutually exclusive reaction modes run before the replacement
+        # pipeline: a reaction is applied to the ORIGINAL message id, and the
+        # replacement pipeline (which deletes the original) runs LAST so every
+        # other handler keeps its first claim on the owner's message.
+        (
+            "intelligent_reaction",
+            lambda: intelligent_reaction.register(client, owner_id),
+        ),
         ("auto_reaction", lambda: auto_reaction.register(client, owner_id)),
         # The replacement pipeline runs LAST: every existing handler keeps its
         # first claim on the owner's message, and only then is the message

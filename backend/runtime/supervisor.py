@@ -68,6 +68,11 @@ from backend.services import settings_service
 
 logger = logging.getLogger(__name__)
 
+#: Bounded startup read of the durable AI candidate feed. It must never delay
+#: boot indefinitely; an unreadable store is logged and routing continues with
+#: each provider's configured model.
+CANDIDATE_RESTORE_TIMEOUT_S = 10.0
+
 _RPC_TIMEOUT = 15
 _REBUILD_TIMEOUT = 60
 _REGISTER_TIMEOUT = 30
@@ -243,6 +248,7 @@ class RuntimeSupervisor:
 
         self._wire_ai_tools()
         await self._apply_ai_config_at_boot()
+        await self._restore_ai_model_candidates()
 
     async def _apply_ai_config_at_boot(self) -> None:
         """Apply the persisted AI config to the live runtime once at startup.
@@ -262,6 +268,35 @@ class RuntimeSupervisor:
         except Exception as exc:
             trace_exception("AI_CONFIG_APPLY_BOOT_FAILED", exc)
             logger.warning("AI config boot restore failed: %s", exc)
+
+    async def _restore_ai_model_candidates(self) -> None:
+        """Restore the last COMPLETE Test Modules feed before updates can run.
+
+        The live pool is memory-only by design, so a restart would otherwise
+        leave every provider with only its configured default model. The
+        durable feed is bounded and freshness-checked (see
+        ``backend.ai.candidate_pool``); routing still re-proves each candidate
+        with a real attempt. A missing/stale/unreadable document is logged as
+        an explicit status and never blocks startup.
+        """
+        try:
+            from backend.ai import candidate_pool
+            from backend.ai.engine.engine import get_engine
+
+            manager = get_engine().provider_manager
+            result = await asyncio.wait_for(
+                candidate_pool.restore(manager), timeout=CANDIDATE_RESTORE_TIMEOUT_S,
+            )
+            logger.info(
+                "AI model candidate restore at boot: status=%s providers=%s models=%s",
+                result.get("status"), result.get("providers"), result.get("models"),
+            )
+        except asyncio.TimeoutError:
+            logger.warning("AI model candidate restore at boot: status=timeout")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — candidate restore is never fatal
+            logger.warning("AI model candidate restore failed: %s", type(exc).__name__)
 
     async def _provision_media_engines(self) -> None:
         """Provision the OPTIONAL OCR/STT engines behind the media boundary.

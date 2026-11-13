@@ -47,7 +47,17 @@ def _buttons_repr(buttons: list) -> tuple[tuple[str, ...], ...]:
     return tuple(result)
 
 
-async def _safe_edit(event, text: str, buttons: list, chat_id: int | None, msg_id: int | None) -> bool:
+async def _safe_edit(
+    event, text: str, buttons: list, chat_id: int | None, msg_id: int | None,
+    link_preview: bool | None = None,
+) -> bool:
+    """One edit of the panel message.
+
+    ``link_preview`` is left untouched (``None``) for every ordinary panel; the
+    Appearance layer passes it explicitly so a main page is either genuinely
+    text-only (disabled preview) or shows Telegram's web-page preview (enabled
+    preview with a stored image).
+    """
     lifecycle = get_lifecycle()
     key = (chat_id, msg_id)
     new_repr = (text, _buttons_repr(buttons))
@@ -57,7 +67,20 @@ async def _safe_edit(event, text: str, buttons: list, chat_id: int | None, msg_i
         return False
     started = time.monotonic()
     try:
-        await event.edit(text, buttons=buttons if buttons else [])
+        edit_kwargs: dict = {"buttons": buttons if buttons else []}
+        # Only a main page with an explicit preview policy carries the flag, so
+        # every other edit is byte-for-byte the call it has always been.
+        if link_preview is not None:
+            edit_kwargs["link_preview"] = link_preview
+        try:
+            await event.edit(text, **edit_kwargs)
+        except TypeError as exc:
+            # A client/event shim without the optional Telethon kwarg still gets
+            # the edit (text-only composition already removed any URL when the
+            # preview is disabled); never fail a panel paint over the flag.
+            if link_preview is None or "link_preview" not in str(exc):
+                raise
+            await event.edit(text, buttons=edit_kwargs["buttons"])
         lifecycle.set_render(chat_id or 0, msg_id or 0, text, new_repr)
         logger.info("[CALLBACK] edit OK (key=%s:%s)", chat_id, msg_id)
         return True
@@ -300,6 +323,32 @@ def _sync_timer(chat_id: int, msg_id: int, title: str, body: str, buttons: list)
         pass
 
 
+def _apply_appearance(panel_id: str, extra: str, result):
+    """Compose the Appearance layer onto one panel view.
+
+    This is the single callback-rendering boundary: the page's own handler has
+    already produced its title/body, and only an eligible main page's HOME view
+    (``extra == ""``) is rewritten. Action results and sub-views never pass
+    through here with an eligible empty ``extra``, so dynamic operational
+    content is never replaced.
+    """
+    if result is None:
+        return result
+    try:
+        from backend.services import appearance_service
+
+        if not appearance_service.is_eligible(panel_id):
+            return result
+        title, body, buttons = _extract_render_result(result)
+        new_title, new_body = appearance_service.with_preview(panel_id, extra, title, body)
+        if (new_title, new_body) == (title, body):
+            return result
+        return new_title, new_body, buttons
+    except Exception as exc:  # noqa: BLE001 — customization never breaks a panel
+        logger.warning("[APPEARANCE] composition skipped for panel '%s': %s", panel_id, exc)
+        return result
+
+
 def _extract_render_result(result) -> tuple[str, str, list]:
     if result is None:
         return "", "", []
@@ -313,21 +362,119 @@ def _extract_render_result(result) -> tuple[str, str, list]:
     return str(result), "", []
 
 
-async def _render_and_edit(event, result, panel_id: str, chat_id: int | None, msg_id: int | None) -> None:
+async def _render_and_edit(
+    event, result, panel_id: str, chat_id: int | None, msg_id: int | None,
+    *, home_view: bool = False,
+) -> None:
     title, body, buttons = _extract_render_result(result)
     if not title and not body and not buttons:
         logger.warning("[CALLBACK] render_and_edit: empty result for panel='%s'", panel_id)
         return
-    # ONE central composition point for callback renders. Pages without a
-    # customization are returned untouched by the service.
-    from backend.services import appearance_service
-
-    title, body = appearance_service.compose(panel_id, title, body)
+    if await _replace_for_delivery(
+        panel_id, title, body, chat_id, msg_id, home_view=home_view
+    ):
+        return
     title, body, buttons = _finalize_panel(title, body, buttons, panel_id, chat_id, msg_id)
     from backend.helper.panel_render import render_edit
     text, built_buttons = render_edit(title, body, buttons)
     _sync_timer(chat_id or 0, msg_id or 0, title, body, buttons)
-    await _present(event, text, built_buttons, chat_id, msg_id)
+    await _present(
+        event, text, built_buttons, chat_id, msg_id,
+        link_preview=_appearance_link_preview(panel_id),
+    )
+
+
+def _appearance_link_preview(panel_id: str) -> bool | None:
+    """The explicit web-page-preview policy for a main page, or ``None``.
+
+    A customizable main page NEVER asks Telegram for a web-page preview: with a
+    preview image enabled the image is the message's PHOTO (so the text contains
+    no link to expand), and with it disabled the panel is genuinely text-only.
+    Returning ``False`` suppresses the card in both states, which is what stops
+    the Render/Guide card the owner reported.
+    """
+    try:
+        from backend.services import appearance_service
+
+        if not appearance_service.is_eligible(panel_id):
+            return None
+        return False
+    except Exception:
+        return None
+
+
+async def _replace_for_delivery(
+    panel_id: str,
+    title: str,
+    body: str,
+    chat_id: int | None,
+    msg_id: int | None,
+    *,
+    home_view: bool = False,
+) -> bool:
+    """Replace the panel message only on a genuine MEDIA-delivery transition.
+
+    A panel message's delivery identity is exactly three facts: whether the
+    preview is enabled, which image version is selected, and whether the
+    message on screen is currently text or media. Ordinary content — a save
+    result, a model test's progress, a status or confirmation line — is NOT
+    part of that identity. Those paints must keep editing the message they
+    started from, because the operation producing them keeps addressing that
+    same message (``_edit_panel_message``); replacing it deletes the message
+    the operation is still updating, which is how an ordinary update used to
+    rebuild the panel and strand the section.
+
+    ``home_view`` marks the only paint that can legitimately require a
+    text↔media transition: an eligible main page's own HOME view, whose text
+    may be too long for a Telegram caption. An action result, a picker, a
+    confirmation or a progress line is operational and never replaces.
+
+    Returns ``True`` when a replacement was made, in which case the caller must
+    not paint the old message.
+    """
+    if not chat_id or not msg_id or not home_view:
+        return False
+    try:
+        from backend.services import appearance_service
+
+        if not appearance_service.is_eligible(panel_id):
+            return False
+        nav = get_lifecycle().sessions.current_nav(chat_id, msg_id)
+        extra = nav[1] if nav else ""
+        if extra:
+            return False
+        # The readiness verdict needs a (cached, 30 s) gallery listing. A probe
+        # that FAILED is not a verdict: keep the panel rather than trading the
+        # owner's image for text because Storage was briefly unreadable.
+        ready = await appearance_service.delivery_ready()
+        if (
+            not ready
+            and appearance_service.preview_active()
+            and appearance_service.delivery_unknown()
+        ):
+            logger.info(
+                "[APPEARANCE] delivery state unknown for panel '%s' — keeping "
+                "the existing message", panel_id,
+            )
+            return False
+        caption_fits = appearance_service.fits_as_caption(title, body)
+        if not appearance_service.needs_new_message(
+            chat_id, msg_id, caption_fits=caption_fits
+        ):
+            return False
+        replaced = await get_lifecycle().replace_panel(chat_id, msg_id, panel_id, "")
+        if replaced:
+            logger.info(
+                "[APPEARANCE] panel '%s' replaced to change its delivery state "
+                "(chat=%s msg=%s)", panel_id, chat_id, msg_id,
+            )
+        return replaced
+    except Exception as exc:  # noqa: BLE001 — a failed replacement keeps the panel
+        logger.warning(
+            "[APPEARANCE] delivery replacement skipped for panel '%s': %s",
+            panel_id, exc,
+        )
+        return False
 
 
 def _resolve_session(chat_id: int | None, msg_id: int | None, inline_message_id: str | None) -> tuple[Session | None, int, int]:
@@ -370,7 +517,10 @@ def _resolve_session(chat_id: int | None, msg_id: int | None, inline_message_id:
     return None, chat_id or 0, msg_id or 0
 
 
-async def _present(event, text: str, buttons: list, chat_id: int | None, msg_id: int | None) -> None:
+async def _present(
+    event, text: str, buttons: list, chat_id: int | None, msg_id: int | None,
+    link_preview: bool | None = None,
+) -> None:
     """Paint one view through the panel's single writer, outside the turn.
 
     The newest view wins: a view superseded while another paint is in flight is
@@ -384,7 +534,10 @@ async def _present(event, text: str, buttons: list, chat_id: int | None, msg_id:
         if painter.closed:
             return
         view_text, view_buttons = view
-        await _safe_edit(event, view_text, view_buttons, chat_id, msg_id)
+        paint_kwargs: dict = {}
+        if link_preview is not None:
+            paint_kwargs["link_preview"] = link_preview
+        await _safe_edit(event, view_text, view_buttons, chat_id, msg_id, **paint_kwargs)
 
     if painter.publish((text, buttons)):
         await painter.drain(_paint)
@@ -546,8 +699,10 @@ def register_callback_handlers(client, owner_id: int) -> None:
                 callback_gate.release_turn(chat_id, msg_id, turn)
 
             if paint is not None and outcome == "completed":
-                panel_id, result = paint
-                await _render_and_edit(event, result, panel_id, chat_id, msg_id)
+                panel_id, result, home_view = paint
+                await _render_and_edit(
+                    event, result, panel_id, chat_id, msg_id, home_view=home_view
+                )
         except asyncio.CancelledError:
             outcome = "cancelled"
             raise
@@ -575,7 +730,7 @@ def register_callback_handlers(client, owner_id: int) -> None:
             callback_gate.finish(admission, outcome)
 
 
-async def _handle_panel(event, remainder: str, chat_id: int, msg_id: int, owner_id: int, inline_msg_id: str | None = None) -> tuple[str, object] | None:
+async def _handle_panel(event, remainder: str, chat_id: int, msg_id: int, owner_id: int, inline_msg_id: str | None = None) -> tuple[str, object, bool] | None:
     """Run one panel query and RETURN what to paint; the router paints it."""
     parts = remainder.split(":", 1)
     panel_id = parts[0]
@@ -607,7 +762,7 @@ async def _handle_panel(event, remainder: str, chat_id: int, msg_id: int, owner_
 
     result = await handler(event, extra)
     logger.info("[CALLBACK] _handle_panel: handler returned (panel='%s')", panel_id)
-    return panel_id, result
+    return panel_id, _apply_appearance(panel_id, extra, result), not extra
 
 
 async def dispatch_click(
@@ -635,8 +790,10 @@ async def dispatch_click(
     else:
         raise ValueError(f"unknown callback prefix: {data[:64]}")
     if paint is not None:
-        panel_id, result = paint
-        await _render_and_edit(event, result, panel_id, chat_id, msg_id)
+        panel_id, result, home_view = paint
+        await _render_and_edit(
+            event, result, panel_id, chat_id, msg_id, home_view=home_view
+        )
 
 
 async def close_panel(event, chat_id: int, msg_id: int, owner_id: int) -> None:
@@ -650,7 +807,7 @@ async def close_panel(event, chat_id: int, msg_id: int, owner_id: int) -> None:
         callback_gate.forget_painter(chat_id, msg_id)
 
 
-async def _handle_navigation(event, action: str, chat_id: int, msg_id: int, owner_id: int) -> tuple[str, object] | None:
+async def _handle_navigation(event, action: str, chat_id: int, msg_id: int, owner_id: int) -> tuple[str, object, bool] | None:
     logger.info("[CALLBACK] _handle_navigation: action='%s' chat_id=%s msg_id=%s", action, chat_id, msg_id)
 
     if action == "close":
@@ -667,7 +824,7 @@ async def _handle_navigation(event, action: str, chat_id: int, msg_id: int, owne
             return None
         result = await handler(event, "")
         logger.info("[CALLBACK] _handle_navigation: home handled")
-        return "menu", result
+        return "menu", result, True
 
     if action == "back":
         lifecycle = get_lifecycle()
@@ -694,13 +851,13 @@ async def _handle_navigation(event, action: str, chat_id: int, msg_id: int, owne
             return None
         result = await handler(event, prev_extra)
         logger.info("[CALLBACK] _handle_navigation: back handled")
-        return prev_panel, result
+        return prev_panel, result, not prev_extra
 
     if action == "noop":
         return None
 
 
-async def _handle_action(event, remainder: str, chat_id: int, msg_id: int, owner_id: int) -> tuple[str, object] | None:
+async def _handle_action(event, remainder: str, chat_id: int, msg_id: int, owner_id: int) -> tuple[str, object, bool] | None:
     parts = remainder.split(":", 1)
     action_id = parts[0]
     extra = parts[1] if len(parts) > 1 else ""
@@ -722,7 +879,8 @@ async def _handle_action(event, remainder: str, chat_id: int, msg_id: int, owner
     nav = get_lifecycle().sessions.current_nav(chat_id, msg_id)
     current_panel = nav[0] if nav else action_id
     logger.info("[CALLBACK] _handle_action: handled action='%s'", action_id)
-    return current_panel, result
+    # An action's result is operational content, never a customizable home view.
+    return current_panel, result, False
 
 
 async def _handle_input(event, remainder: str, owner_id: int, chat_id: int, msg_id: int) -> None:
@@ -760,7 +918,6 @@ async def _handle_input(event, remainder: str, owner_id: int, chat_id: int, msg_
         inline_chat_id=chat_id or 0, inline_msg_id=msg_id or 0,
         inline_id=inline_message_id_from_event(event),
         extra=extra,
-        timeout=input_cfg.get("timeout", 60.0),
     )
 
     # The prompt is a SUB-VIEW of the panel. Its first row re-opens the panel
