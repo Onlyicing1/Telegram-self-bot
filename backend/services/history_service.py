@@ -145,6 +145,25 @@ class HistorySlice:
     truncated: bool
 
 
+@dataclass(frozen=True)
+class HistoryBatch:
+    """One bounded oldest-first incremental batch.
+
+    ``messages`` are eligible messages in chronological order. ``next_cursor``
+    is the exclusive lower cursor through which this batch actually processed
+    raw messages (including explicitly safe AI-provenance skips), so passing it
+    back as ``after_cursor`` never re-reads or skips an unprocessed message.
+    ``has_more`` is True when a bound stopped the batch before the stable upper
+    bound was exhausted.
+    """
+
+    chat_id: int
+    messages: tuple[HistoryMessage, ...]
+    scanned: int
+    next_cursor: int
+    has_more: bool
+
+
 def _coerce_int(value: Any) -> int:
     try:
         return int(value)
@@ -200,6 +219,7 @@ async def _fetch_page(
     limit: int,
     before_id: int | None,
     after_id: int | None,
+    reverse: bool = False,
 ) -> list[dict[str, Any]]:
     """One bounded Telegram page through the facade. Never silently empty."""
     try:
@@ -210,6 +230,7 @@ async def _fetch_page(
                 limit=limit,
                 min_id=after_id,
                 max_id=before_id,
+                reverse=reverse,
             ),
             timeout=HISTORY_RPC_TIMEOUT_S,
             label="history.iter_messages",
@@ -382,6 +403,86 @@ async def fetch_history_page(
         include_ai=include_ai,
     )
     return HistoryPage(chat_id=chat, messages=tuple(messages), has_more=truncated)
+
+
+async def fetch_oldest_history(
+    source: Any,
+    chat_id: Any,
+    *,
+    after_cursor: int = 0,
+    upper_cursor: int,
+    limit: int = DEFAULT_PAGE_SIZE,
+    page_size: int = DEFAULT_PAGE_SIZE,
+    include_ai: bool = False,
+) -> HistoryBatch:
+    """Read ONE bounded batch oldest → newest inside a stable id window.
+
+    ``after_cursor`` is the exclusive lower cursor (normally
+    ``scanned_cursor``) and ``upper_cursor`` the exclusive upper bound captured
+    once by the caller. The facade is asked for ``reverse=True`` so Telegram
+    yields the same bounded window oldest first; every page is also sorted and
+    deduplicated defensively. Consecutive calls that pass the returned
+    ``next_cursor`` back as ``after_cursor`` cover every message exactly once,
+    even when ids are missing (deleted/inaccessible messages) or the window
+    contains AI-provenance messages that are skipped explicitly.
+
+    ``has_more`` is conservative: a full page or a reached target/scan bound
+    reports True. An empty range, an exhausted chat and a batch that ended on a
+    short page report False.
+    """
+    chat = _require_chat_id(chat_id)
+    lower = _coerce_int(after_cursor)
+    upper = _coerce_int(upper_cursor)
+    if lower < 0 or upper <= 0:
+        raise HistoryError("oldest-first history needs a nonnegative lower cursor and a positive upper bound")
+    target = min(max(1, _coerce_int(limit)), MAX_HISTORY_MESSAGES)
+    size = _coerce_page_size(page_size)
+    if upper <= lower:
+        return HistoryBatch(chat, (), 0, lower, False)
+
+    client = _resolve_client(source)
+    collected: list[HistoryMessage] = []
+    scanned = 0
+    next_cursor = lower
+    has_more = False
+
+    while len(collected) < target and scanned < MAX_HISTORY_SCAN_MESSAGES:
+        page_limit = min(size, MAX_HISTORY_SCAN_MESSAGES - scanned)
+        raw = await _fetch_page(
+            client, chat, limit=page_limit, before_id=upper,
+            after_id=next_cursor, reverse=True,
+        )
+        if not raw:
+            break
+        ordered = sorted(
+            (_normalize(record, chat) for record in raw),
+            key=lambda message: message.message_id,
+        )
+        page_ids: set[int] = set()
+        stopped = False
+        for index, record in enumerate(ordered):
+            if record.message_id <= next_cursor or record.message_id >= upper:
+                continue
+            if record.message_id in page_ids:
+                continue
+            page_ids.add(record.message_id)
+            next_cursor = record.message_id
+            scanned += 1
+            if record.ai_provenance and not include_ai:
+                continue
+            collected.append(record)
+            if len(collected) >= target:
+                has_more = index + 1 < len(ordered) or len(raw) >= page_limit
+                stopped = True
+                break
+        if stopped:
+            break
+        if len(raw) < page_limit:
+            break
+
+    if scanned >= MAX_HISTORY_SCAN_MESSAGES and len(collected) < target:
+        has_more = True
+    return HistoryBatch(chat, tuple(collected), scanned, next_cursor, has_more)
 
 
 async def iter_history_pages(

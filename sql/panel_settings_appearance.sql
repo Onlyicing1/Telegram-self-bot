@@ -4,7 +4,7 @@
 # File: sql/panel_settings_appearance.sql
 # This is an owner-run setup script, deliberately NOT an entry in the audited
 # supabase/migrations/ history: the repository's canonical one-paste setup
-# (§31.3) and its 36-file inventory stay unchanged. Apply it after that setup.
+# (§31.3) and its 37-file inventory stay unchanged. Apply it after that setup.
 #
 # Glass UI Appearance columns
 

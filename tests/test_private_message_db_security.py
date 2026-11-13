@@ -59,8 +59,8 @@ BACKEND_VERBS = ("SELECT", "INSERT", "UPDATE", "DELETE")
 SETUP_BANNER = "ONE COMPLETE SUPABASE SETUP SCRIPT"
 PART_MARKER = re.compile(r"--[^\n]*\bPART (\d+) of (\d+)\b[^\n]*\n")
 PM_ACCESS_PART = 13
-TOTAL_PARTS = 14
-TOTAL_MIGRATIONS = 36
+TOTAL_PARTS = 15
+TOTAL_MIGRATIONS = 37
 AUTO_REACTION_PART = 14
 AUTO_REACTION_MIGRATION = "20261020160000_add_panel_settings_auto_reaction_settings.sql"
 
@@ -351,8 +351,11 @@ def test_the_private_message_access_part_is_the_thirteenth():
     )
     # The hardening keeps its place in the migration order; the Auto-Reaction
     # migration is the newer additive part appended after it.
-    assert PM_ACCESS_PART + 1 == AUTO_REACTION_PART == TOTAL_PARTS
-    assert AUTO_REACTION_MIGRATION in block[marks[-1].start(): marks[-1].end()]
+    assert PM_ACCESS_PART + 1 == AUTO_REACTION_PART
+    assert AUTO_REACTION_PART + 1 == TOTAL_PARTS
+    auto_banner = block[marks[AUTO_REACTION_PART - 1].start(): marks[AUTO_REACTION_PART - 1].end()]
+    assert AUTO_REACTION_MIGRATION in auto_banner
+    assert "20261113000001_create_history_schedules.sql" in block[marks[-1].start(): marks[-1].end()]
     assert TOTAL_PARTS == len(_recorded_order())
 
 
@@ -394,9 +397,9 @@ def test_the_documented_counts_match_the_repository():
     flat = _flat(_section("## 31. Canonical Database Setup"))
     assert f"all {TOTAL_MIGRATIONS} migrations" in flat
     assert f"{TOTAL_MIGRATIONS} files" in flat
-    assert "thirteen later additive migrations" in flat
-    assert len(_recorded_order()) - 1 == 13, (
-        "the snapshot plus thirteen later parts is what the prose must count"
+    assert "fourteen later additive migrations" in flat
+    assert len(_recorded_order()) - 1 == 14, (
+        "the snapshot plus fourteen later parts is what the prose must count"
     )
     assert f"parts 1–{TOTAL_PARTS} of §31.3" in flat
 

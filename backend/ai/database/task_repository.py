@@ -35,6 +35,15 @@ MAX_ACTIONS = 5
 MAX_PAYLOAD_BYTES = 32768
 MAX_METADATA_BYTES = 8192
 MAX_ATTEMPTS = 3
+# ── Scheduled History state (Phase 3B) ──────────────────────────────────────
+# ONE cumulative state per (owner_id, peer_id), owned by an ``ai_tasks`` row.
+# ``deleted`` is a legacy repair status, never a target a normal write may set:
+# it exists only so a stale row can be recognised and explicitly reused, not so
+# it can silently block a new schedule for the same peer forever.
+HISTORY_SCHEDULE_STATUSES = frozenset({"active", "paused", "completed", "failed", "expired", "deleted"})
+HISTORY_SCHEDULE_WRITABLE_STATUSES = HISTORY_SCHEDULE_STATUSES - {"deleted"}
+MAX_HISTORY_SUMMARY_BYTES = 32768
+MAX_HISTORY_ERROR_BYTES = 2048
 DB_TIMEOUT = 10.0
 # ── Todo steps (multi-step todos) ────────────────────────────────────────────
 # A step belongs to exactly ONE todo (an ``ai_tasks`` row with
@@ -434,6 +443,59 @@ class TodoStepRecord:
     @property
     def completed(self) -> bool: return self.status == "completed"
 
+@dataclass
+class HistoryScheduleRecord:
+    """The ONE durable cumulative History state for an owner and peer.
+
+    ``baseline_cursor`` is immutable after creation. ``scanned_cursor`` and
+    ``summarized_cursor`` are exclusive lower bounds and are monotonic; every
+    accepted write bumps ``version`` (the CAS token), while only a successful
+    summary commit or explicit reset bumps ``revision``.
+    """
+    id: int; task_id: int; owner_id: int; peer_id: int; status: str = "active"; baseline_cursor: int = 0; scanned_cursor: int = 0; summarized_cursor: int = 0; summary: str = ""; revision: int = 0; version: int = 1; last_error: str = ""; last_error_at: datetime | None = None; last_committed_at: datetime | None = None; created_at: datetime = field(default_factory=_now); updated_at: datetime = field(default_factory=_now)
+    def as_dict(self): return _copy(self.__dict__)
+
+def _bounded_text(value, limit: int, field_name: str) -> str:
+    if not isinstance(value, str): raise ValueError(f"{field_name} must be text")
+    if len(value.encode("utf-8")) > limit: raise ValueError(f"{field_name} exceeds {limit} UTF-8 bytes")
+    return value
+def _cursor_value(value, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{field_name} must be a nonnegative integer")
+    return value
+def _validate_history_schedule_input(data):
+    """Validate one complete row/payload before it can be stored or returned."""
+    for key in ("task_id", "owner_id"):
+        if isinstance(data.get(key), bool) or not isinstance(data.get(key), int) or data[key] <= 0:
+            raise ValueError(f"{key} must be a positive integer")
+    if isinstance(data.get("peer_id"), bool) or not isinstance(data.get("peer_id"), int) or data["peer_id"] == 0:
+        raise ValueError("peer_id must be a nonzero integer")
+    baseline = _cursor_value(data.get("baseline_cursor", 0), "baseline_cursor")
+    scanned = _cursor_value(data.get("scanned_cursor", 0), "scanned_cursor")
+    summarized = _cursor_value(data.get("summarized_cursor", 0), "summarized_cursor")
+    if not (baseline <= summarized <= scanned):
+        raise ValueError("cursors must satisfy baseline <= summarized <= scanned")
+    if data.get("status") not in HISTORY_SCHEDULE_STATUSES:
+        raise ValueError("invalid history schedule status")
+    _bounded_text(data.get("summary", ""), MAX_HISTORY_SUMMARY_BYTES, "summary")
+    _bounded_text(data.get("last_error", ""), MAX_HISTORY_ERROR_BYTES, "last_error")
+    if isinstance(data.get("revision"), bool) or not isinstance(data.get("revision", 0), int) or data["revision"] < 0:
+        raise ValueError("revision must be a nonnegative integer")
+    if isinstance(data.get("version"), bool) or not isinstance(data.get("version"), int) or data["version"] <= 0:
+        raise ValueError("version must be a positive integer")
+    error_at = data.get("last_error_at")
+    if (data.get("last_error", "") == "") != (error_at is None):
+        raise ValueError("last_error and last_error_at must be set together")
+
+def _history_schedule_from_row(row):
+    value = {"status": "active", "baseline_cursor": 0, "scanned_cursor": 0, "summarized_cursor": 0, "summary": "", "revision": 0, "version": 1, "last_error": "", "last_error_at": None, "last_committed_at": None, "created_at": None, "updated_at": None, **row}
+    value["id"] = int(value["id"]); value["task_id"] = int(value["task_id"]); value["owner_id"] = int(value["owner_id"]); value["peer_id"] = int(value["peer_id"])
+    value["baseline_cursor"] = int(value["baseline_cursor"]); value["scanned_cursor"] = int(value["scanned_cursor"]); value["summarized_cursor"] = int(value["summarized_cursor"])
+    value["revision"] = int(value["revision"]); value["version"] = int(value["version"])
+    for key in ("last_error_at", "last_committed_at", "created_at", "updated_at"): value[key] = _parse_dt(value[key])
+    _validate_history_schedule_input(value)
+    return HistoryScheduleRecord(**{key: value[key] for key in HistoryScheduleRecord.__dataclass_fields__})
+
 def _task_from_row(row):
     value = {**row, "id": int(row["id"]), "owner_id": int(row["owner_id"]), "version": int(row.get("version", 1))}
     value.setdefault("ai_instruction", None)
@@ -462,6 +524,14 @@ class TaskRepository:
     async def advance_next_run(self, owner_id, task_id, expected_version, next_run_at): raise NotImplementedError
     async def transition_task(self, owner_id, task_id, status, expected_version=None): raise NotImplementedError
     async def delete_task(self, owner_id, task_id, expected_version): raise NotImplementedError
+    # Scheduled History: ONE cumulative state per owner+peer. These are
+    # repository primitives only; no scheduler or executor calls them in Phase 3B.
+    async def create_history_schedule(self, owner_id, task_id, peer_id, *, baseline_cursor=0): raise NotImplementedError
+    async def get_history_schedule(self, owner_id, task_id): raise NotImplementedError
+    async def get_history_schedule_by_peer(self, owner_id, peer_id): raise NotImplementedError
+    async def commit_history_success(self, owner_id, peer_id, *, expected_version, summary, scanned_cursor, summarized_cursor, status=None): raise NotImplementedError
+    async def record_history_failure(self, owner_id, peer_id, *, expected_version, error, status=None): raise NotImplementedError
+    async def reset_history_summary(self, owner_id, peer_id, *, expected_version): raise NotImplementedError
     async def create_occurrence(self, owner_id, data): raise NotImplementedError
     async def get_occurrence(self, owner_id, task_id, occurrence_key): raise NotImplementedError
     async def list_occurrences(self, owner_id, task_id=None, limit=100): raise NotImplementedError
@@ -487,7 +557,7 @@ class TaskRepository:
 
 class InMemoryTaskRepository(TaskRepository):
     def __init__(self, id_floor: int = 0):
-        self._tasks={}; self._occurrences={}; self._steps={}; self._next_occurrence_id=1; self._next_step_id=1
+        self._tasks={}; self._occurrences={}; self._steps={}; self._history_schedules={}; self._next_history_schedule_id=1; self._next_occurrence_id=1; self._next_step_id=1
         # Provisional task ids start above ``id_floor``: when this repository
         # acts as the degraded store beside Supabase it must never reuse an id
         # the durable PostgreSQL sequence already issued, nor restart its
@@ -562,7 +632,65 @@ class InMemoryTaskRepository(TaskRepository):
         # statement, so the degraded store mirrors that exactly — no step row
         # may outlive the todo it belongs to.
         for key in [k for k,step in self._steps.items() if step.task_id==task_id and step.owner_id==owner_id]: del self._steps[key]
+        # Scheduled History state is the task's child too
+        # (history_schedules.task_id is ON DELETE CASCADE): no state outlives
+        # the task that owns it.
+        for key in [k for k,state in self._history_schedules.items() if state.task_id==task_id and state.owner_id==owner_id]: del self._history_schedules[key]
         return TaskDeletionResult(DELETION_DELETED,task_id,task=_copy(r))
+    async def create_history_schedule(self, owner_id, task_id, peer_id, *, baseline_cursor=0):
+        task=self._tasks.get(int(task_id)) if isinstance(task_id,int) else None
+        if not task or task.owner_id!=owner_id: raise ValueError("task not found for owner")
+        baseline=_cursor_value(baseline_cursor,"baseline_cursor")
+        now=_now(); key=(owner_id,int(peer_id))
+        existing=self._history_schedules.get(key)
+        if existing is not None:
+            if existing.status!="deleted": return None
+            existing.task_id=int(task_id); existing.status="active"; existing.baseline_cursor=baseline
+            existing.scanned_cursor=baseline; existing.summarized_cursor=baseline; existing.summary=""
+            existing.revision+=1; existing.version+=1; existing.last_error=""; existing.last_error_at=None
+            existing.last_committed_at=None; existing.updated_at=now
+            _validate_history_schedule_input(existing.as_dict())
+            return _copy(existing)
+        record_id=self._next_history_schedule_id
+        payload={"id":record_id,"task_id":int(task_id),"owner_id":owner_id,"peer_id":int(peer_id),"status":"active","baseline_cursor":baseline,"scanned_cursor":baseline,"summarized_cursor":baseline,"summary":"","revision":0,"version":1,"last_error":"","last_error_at":None,"last_committed_at":None,"created_at":now,"updated_at":now}
+        _validate_history_schedule_input(payload)
+        record=HistoryScheduleRecord(**payload); self._history_schedules[key]=record; self._next_history_schedule_id+=1
+        return _copy(record)
+    async def get_history_schedule(self, owner_id, task_id):
+        rows=sorted((r for r in self._history_schedules.values() if r.owner_id==owner_id and r.task_id==int(task_id)),key=lambda r:r.id)
+        return _copy(rows[0]) if rows else None
+    async def get_history_schedule_by_peer(self, owner_id, peer_id):
+        r=self._history_schedules.get((owner_id,int(peer_id)))
+        return _copy(r) if r else None
+    async def commit_history_success(self, owner_id, peer_id, *, expected_version, summary, scanned_cursor, summarized_cursor, status=None):
+        r=self._history_schedules.get((owner_id,int(peer_id)))
+        if r is None or r.version!=expected_version: return None
+        _bounded_text(summary,MAX_HISTORY_SUMMARY_BYTES,"summary")
+        scanned=_cursor_value(scanned_cursor,"scanned_cursor"); summarized=_cursor_value(summarized_cursor,"summarized_cursor")
+        target=r.status if status is None else status
+        if target not in HISTORY_SCHEDULE_WRITABLE_STATUSES: raise ValueError("invalid history schedule status")
+        if not summary.strip() and summary != r.summary: raise ValueError("an empty summary cannot replace the previous summary")
+        if scanned<r.scanned_cursor or summarized<r.summarized_cursor: raise ValueError("history cursors are monotonic")
+        if not (r.baseline_cursor<=summarized<=scanned): raise ValueError("cursors must satisfy baseline <= summarized <= scanned")
+        now=_now(); r.summary=summary; r.scanned_cursor=scanned; r.summarized_cursor=summarized
+        r.status=target; r.revision+=1; r.version+=1; r.last_error=""; r.last_error_at=None
+        r.last_committed_at=now; r.updated_at=now
+        return _copy(r)
+    async def record_history_failure(self, owner_id, peer_id, *, expected_version, error, status=None):
+        r=self._history_schedules.get((owner_id,int(peer_id)))
+        if r is None or r.version!=expected_version: return None
+        _bounded_text(error,MAX_HISTORY_ERROR_BYTES,"last_error")
+        if not error.strip(): raise ValueError("a failure needs a nonblank error")
+        target=r.status if status is None else status
+        if target not in HISTORY_SCHEDULE_WRITABLE_STATUSES: raise ValueError("invalid history schedule status")
+        now=_now(); r.last_error=error; r.last_error_at=now; r.status=target; r.version+=1; r.updated_at=now
+        return _copy(r)
+    async def reset_history_summary(self, owner_id, peer_id, *, expected_version):
+        r=self._history_schedules.get((owner_id,int(peer_id)))
+        if r is None or r.version!=expected_version: return None
+        now=_now(); r.summary=""; r.summarized_cursor=r.scanned_cursor; r.revision+=1; r.version+=1
+        r.last_error=""; r.last_error_at=None; r.last_committed_at=now; r.updated_at=now
+        return _copy(r)
     async def create_occurrence(self, owner_id, data):
         payload={**data,"owner_id":owner_id};task=self._tasks.get(payload.get("task_id"))
         if not task or task.owner_id!=owner_id:raise ValueError("task not found for owner")
@@ -1168,6 +1296,124 @@ class SupabaseTaskRepository(TaskRepository):
             return await self._fallback.delete_step(owner_id,step_id,expected_version)
         rows=getattr(result,"data",None);self._mark_supabase_ok()
         return bool(rows)
+
+    # ── Scheduled History state (Phase 3B) ──────────────────────────────────
+
+    async def create_history_schedule(self, owner_id, task_id, peer_id, *, baseline_cursor=0):
+        """Create the one owner+peer state, refusing a live existing owner.
+
+        A legacy ``deleted`` row is repaired in place (same id, reset cursors and
+        summary, revision/version advanced); any other status refuses the create.
+        The unique ``(owner_id, peer_id)`` constraint is the durable backstop.
+        """
+        task=await self.get_task(owner_id,int(task_id))
+        if task is None: raise ValueError("task not found for owner")
+        baseline=_cursor_value(baseline_cursor,"baseline_cursor")
+        payload={"task_id":int(task_id),"owner_id":owner_id,"peer_id":int(peer_id),"status":"active","baseline_cursor":baseline,"scanned_cursor":baseline,"summarized_cursor":baseline,"summary":"","revision":0,"version":1,"last_error":"","last_error_at":None,"last_committed_at":None}
+        _validate_history_schedule_input({**payload,"id":1,"created_at":_now(),"updated_at":_now()})
+        try:
+            existing=await self.get_history_schedule_by_peer(owner_id,int(peer_id))
+            if existing is not None:
+                return await self._repair_deleted_history_schedule(existing,task_id,baseline) if existing.status=="deleted" else None
+            result=await self._run(lambda:self._client.table("history_schedules").insert(payload).execute());row=getattr(result,"data",None)
+            if not row: raise RuntimeError("Supabase history schedule insert returned no row")
+            self._mark_supabase_ok()
+            return _history_schedule_from_row(row[0] if isinstance(row,list) else row)
+        except (ValueError,TypeError): raise
+        except asyncio.CancelledError: raise
+        except Exception as exc:
+            # A concurrent create may have won the unique constraint between the
+            # read above and this insert; a live row still refuses, a deleted
+            # row is repaired explicitly.
+            try: existing=await self.get_history_schedule_by_peer(owner_id,int(peer_id))
+            except Exception: existing=None
+            if existing is not None:
+                return await self._repair_deleted_history_schedule(existing,task_id,baseline) if existing.status=="deleted" else None
+            self._degrade("Supabase history schedule create failed; using fallback: %s",exc)
+            return await self._fallback.create_history_schedule(owner_id,task_id,peer_id,baseline_cursor=baseline)
+    async def _repair_deleted_history_schedule(self, current, task_id, baseline):
+        """Explicitly reuse a legacy ``deleted`` row for a new owning task."""
+        now=_now()
+        outgoing={"task_id":int(task_id),"status":"active","baseline_cursor":baseline,"scanned_cursor":baseline,"summarized_cursor":baseline,"summary":"","revision":current.revision+1,"version":current.version+1,"last_error":"","last_error_at":None,"last_committed_at":None,"updated_at":now}
+        try:
+            result=await self._run(lambda:self._client.table("history_schedules").update(outgoing).eq("id",current.id).eq("owner_id",current.owner_id).eq("version",current.version).execute());row=getattr(result,"data",None)
+        except asyncio.CancelledError: raise
+        except Exception as exc:
+            self._degrade("Supabase history schedule repair failed; using fallback: %s",exc)
+            return await self._fallback.create_history_schedule(current.owner_id,task_id,current.peer_id,baseline_cursor=baseline)
+        self._mark_supabase_ok()
+        return _history_schedule_from_row(row[0] if isinstance(row,list) else row) if row else None
+    async def get_history_schedule(self, owner_id, task_id):
+        try:
+            result=await self._run(lambda:self._client.table("history_schedules").select("*").eq("owner_id",owner_id).eq("task_id",int(task_id)).order("id").limit(1).execute());self._mark_supabase_ok()
+            rows=getattr(result,"data",None) or []
+            return _history_schedule_from_row(rows[0]) if rows else None
+        except asyncio.CancelledError: raise
+        except Exception as exc:
+            self._degrade("Supabase history schedule read failed; using fallback: %s",exc)
+            return await self._fallback.get_history_schedule(owner_id,task_id)
+    async def get_history_schedule_by_peer(self, owner_id, peer_id):
+        try:
+            result=await self._run(lambda:self._client.table("history_schedules").select("*").eq("owner_id",owner_id).eq("peer_id",int(peer_id)).maybe_single().execute());row=getattr(result,"data",None);self._mark_supabase_ok()
+            return _history_schedule_from_row(row[0] if isinstance(row,list) else row) if row else None
+        except asyncio.CancelledError: raise
+        except Exception as exc:
+            self._degrade("Supabase history schedule peer read failed; using fallback: %s",exc)
+            return await self._fallback.get_history_schedule_by_peer(owner_id,peer_id)
+    async def commit_history_success(self, owner_id, peer_id, *, expected_version, summary, scanned_cursor, summarized_cursor, status=None):
+        """Atomically persist summary + cursors + revision under ONE CAS write."""
+        current=await self.get_history_schedule_by_peer(owner_id,int(peer_id))
+        if current is None or current.version!=expected_version: return None
+        _bounded_text(summary,MAX_HISTORY_SUMMARY_BYTES,"summary")
+        scanned=_cursor_value(scanned_cursor,"scanned_cursor"); summarized=_cursor_value(summarized_cursor,"summarized_cursor")
+        target=current.status if status is None else status
+        if target not in HISTORY_SCHEDULE_WRITABLE_STATUSES: raise ValueError("invalid history schedule status")
+        if not summary.strip() and summary != current.summary: raise ValueError("an empty summary cannot replace the previous summary")
+        if scanned<current.scanned_cursor or summarized<current.summarized_cursor: raise ValueError("history cursors are monotonic")
+        if not (current.baseline_cursor<=summarized<=scanned): raise ValueError("cursors must satisfy baseline <= summarized <= scanned")
+        now=_now()
+        outgoing={"summary":summary,"scanned_cursor":scanned,"summarized_cursor":summarized,"status":target,"revision":current.revision+1,"version":expected_version+1,"last_error":"","last_error_at":None,"last_committed_at":now,"updated_at":now}
+        _validate_history_schedule_input({**current.as_dict(),**outgoing})
+        try:
+            result=await self._run(lambda:self._client.table("history_schedules").update(outgoing).eq("owner_id",owner_id).eq("peer_id",int(peer_id)).eq("version",expected_version).execute());row=getattr(result,"data",None);self._mark_supabase_ok()
+            return _history_schedule_from_row(row[0] if isinstance(row,list) else row) if row else None
+        except (ValueError,TypeError): raise
+        except asyncio.CancelledError: raise
+        except Exception as exc:
+            self._degrade("Supabase history commit failed; using fallback: %s",exc)
+            return await self._fallback.commit_history_success(owner_id,peer_id,expected_version=expected_version,summary=summary,scanned_cursor=scanned,summarized_cursor=summarized,status=status)
+    async def record_history_failure(self, owner_id, peer_id, *, expected_version, error, status=None):
+        """Record error metadata only; summary and both cursors are untouched."""
+        current=await self.get_history_schedule_by_peer(owner_id,int(peer_id))
+        if current is None or current.version!=expected_version: return None
+        _bounded_text(error,MAX_HISTORY_ERROR_BYTES,"last_error")
+        if not error.strip(): raise ValueError("a failure needs a nonblank error")
+        target=current.status if status is None else status
+        if target not in HISTORY_SCHEDULE_WRITABLE_STATUSES: raise ValueError("invalid history schedule status")
+        now=_now(); outgoing={"last_error":error,"last_error_at":now,"status":target,"version":expected_version+1,"updated_at":now}
+        _validate_history_schedule_input({**current.as_dict(),**outgoing})
+        try:
+            result=await self._run(lambda:self._client.table("history_schedules").update(outgoing).eq("owner_id",owner_id).eq("peer_id",int(peer_id)).eq("version",expected_version).execute());row=getattr(result,"data",None);self._mark_supabase_ok()
+            return _history_schedule_from_row(row[0] if isinstance(row,list) else row) if row else None
+        except (ValueError,TypeError): raise
+        except asyncio.CancelledError: raise
+        except Exception as exc:
+            self._degrade("Supabase history failure write failed; using fallback: %s",exc)
+            return await self._fallback.record_history_failure(owner_id,peer_id,expected_version=expected_version,error=error,status=status)
+    async def reset_history_summary(self, owner_id, peer_id, *, expected_version):
+        """Explicit owner-authorized reset: drop content coverage, keep cursors."""
+        current=await self.get_history_schedule_by_peer(owner_id,int(peer_id))
+        if current is None or current.version!=expected_version: return None
+        now=_now(); outgoing={"summary":"","summarized_cursor":current.scanned_cursor,"revision":current.revision+1,"version":expected_version+1,"last_error":"","last_error_at":None,"last_committed_at":now,"updated_at":now}
+        _validate_history_schedule_input({**current.as_dict(),**outgoing})
+        try:
+            result=await self._run(lambda:self._client.table("history_schedules").update(outgoing).eq("owner_id",owner_id).eq("peer_id",int(peer_id)).eq("version",expected_version).execute());row=getattr(result,"data",None);self._mark_supabase_ok()
+            return _history_schedule_from_row(row[0] if isinstance(row,list) else row) if row else None
+        except (ValueError,TypeError): raise
+        except asyncio.CancelledError: raise
+        except Exception as exc:
+            self._degrade("Supabase history reset failed; using fallback: %s",exc)
+            return await self._fallback.reset_history_summary(owner_id,peer_id,expected_version=expected_version)
 
 def get_task_repository():
     """Return the process-wide task repository (single authority).

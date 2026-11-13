@@ -84,6 +84,7 @@ SUCCESSOR_TABLES = (
     "private_message_senders",
     "aed_config",
     "aed_archive_entries",
+    "history_schedules",
 )
 
 # Identifiers that are SQL keywords/functions, not columns.

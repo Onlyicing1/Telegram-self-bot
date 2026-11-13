@@ -337,6 +337,29 @@ def _visible_body(message: HistoryMessage) -> str:
     return MEDIA_PLACEHOLDER if message.has_media else EMPTY_PLACEHOLDER
 
 
+def scheduled_summary_payload(
+    messages: Sequence[HistoryMessage], *, instruction: Any = "",
+) -> str:
+    """The ONLY text a scheduled History summarization may send to a model.
+
+    Message bodies and the owner-authored instruction, nothing else: no chat,
+    peer, sender or message identifiers, no sender attribution, no dates, no
+    media/task/occurrence/database metadata and no unrelated history. Empty and
+    media-only messages contribute nothing (there is no text to summarize).
+    Identifiers that the owner themselves typed INSIDE a message body are
+    content and are not semantically redacted.
+    """
+    body = "\n\n".join(
+        message.text.strip() for message in messages if message.text.strip()
+    )
+    instruction_text = _clamp_instruction(instruction)
+    if instruction_text and body:
+        return f"Owner instruction: {instruction_text}\n\n{body}"
+    if instruction_text:
+        return f"Owner instruction: {instruction_text}"
+    return body
+
+
 def _attribution(message: HistoryMessage) -> str:
     """Speaker label — same convention as the bounded Telegram context."""
     if message.out:

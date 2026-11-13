@@ -37,6 +37,7 @@ PRIVATE_MESSAGE_COUNTER_RESET = "20261016000001_add_private_message_counter_rese
 ANTI_EDIT_DELETE_TABLES = "20261017000001_create_anti_edit_delete_tables.sql"
 PRIVATE_MESSAGE_ACCESS = "20261020144423_harden_private_message_table_access.sql"
 AUTO_REACTION_SETTINGS = "20261020160000_add_panel_settings_auto_reaction_settings.sql"
+HISTORY_SCHEDULES = "20261113000001_create_history_schedules.sql"
 
 #: The order §31 documents — verified against the sources, not assumed. The TTS
 #: settings migration, the Todo schedule type, the Todo steps table, the Emoji &
@@ -52,7 +53,7 @@ DOCUMENTED_ORDER = (
     RECONCILE, VAULT_PART1, VAULT_PART2, DISPLAY_NAME, SEARCH_INDEXES, TTS_SETTINGS,
     TODO_SCHEDULE_TYPE, TODO_STEPS, EMOJI_TABLES, PRIVATE_MESSAGE_TABLES,
     PRIVATE_MESSAGE_COUNTER_RESET, ANTI_EDIT_DELETE_TABLES, PRIVATE_MESSAGE_ACCESS,
-    AUTO_REACTION_SETTINGS,
+    AUTO_REACTION_SETTINGS, HISTORY_SCHEDULES,
 )
 
 #: The banner that marks the ONE complete deployment block.
@@ -293,13 +294,14 @@ def test_the_anti_edit_delete_part_carries_the_two_tables():
     part that hardens the Private Message tables — which must follow the part
     that creates those tables and their policies."""
     spans = _part_spans(_setup_block())
-    assert list(spans)[-1] == AUTO_REACTION_SETTINGS, (
-        "the newest additive migration (the Auto-Reaction columns) closes the block"
+    assert list(spans)[-1] == HISTORY_SCHEDULES, (
+        "the newest additive migration (Scheduled History) closes the block"
     )
     order = list(spans)
-    assert order[-2] == PRIVATE_MESSAGE_ACCESS, (
-        "the Private Message access hardening must follow the tables it hardens"
+    assert order[-2] == AUTO_REACTION_SETTINGS, (
+        "the Auto-Reaction columns precede the newest Scheduled History part"
     )
+    assert order.index(AUTO_REACTION_SETTINGS) == order.index(PRIVATE_MESSAGE_ACCESS) + 1
     assert order.index(PRIVATE_MESSAGE_ACCESS) == order.index(ANTI_EDIT_DELETE_TABLES) + 1
     assert order.index(ANTI_EDIT_DELETE_TABLES) == order.index(PRIVATE_MESSAGE_COUNTER_RESET) + 1
     assert order.index(PRIVATE_MESSAGE_COUNTER_RESET) == order.index(PRIVATE_MESSAGE_TABLES) + 1, (
@@ -712,15 +714,15 @@ def test_the_audited_order_is_recorded_in_the_audit_table():
     """§31.1 names every embedded migration, and its PART table keeps the order.
 
     The audit now also classifies the 22 pre-reconciliation migrations, so the
-    order contract is checked against the table of the eleven EMBEDDED parts
+    order contract is checked against the table of the fifteen EMBEDDED parts
     (the first table in §31.1), not against the whole prose.
     """
     section = _section_31()
     audit = section[: section.index("### 31.2")]
-    assert "all 36 migrations" in _flat(audit) or "36 files" in audit, (
+    assert "all 37 migrations" in _flat(audit) or "37 files" in audit, (
         "the audit must state that every repository migration was classified"
     )
-    assert len(list(MIGRATIONS_DIR.glob("*.sql"))) == 36, (
+    assert len(list(MIGRATIONS_DIR.glob("*.sql"))) == 37, (
         "the audited count must equal the migrations actually in the repository"
     )
     embedded_table = audit[audit.index("| Order | Migration") :]
@@ -739,7 +741,7 @@ def test_the_documented_deviations_are_stated_explicitly():
     flat = _flat(_section_31())
     assert "display_name" in flat
     assert "42703" in flat, "the failure the ordering prevents must be named"
-    assert "thirteen later additive migrations" in flat, (
+    assert "fourteen later additive migrations" in flat, (
         "the later migrations must be acknowledged"
     )
     assert "add_todo_schedule_type" in flat, "the Todo schedule type must be acknowledged"
@@ -772,13 +774,13 @@ def test_the_section_does_not_pretend_the_sql_was_executed():
 # ─── 5. counts and the manual-action list must match the block ───────────────
 
 def test_the_later_part_count_matches_the_block():
-    """14 parts are the snapshot plus THIRTEEN later parts, and the prose says so."""
+    """15 parts are the snapshot plus FOURTEEN later parts, and the prose says so."""
     total = len(DOCUMENTED_ORDER)
-    assert total == 14
+    assert total == 15
     flat = _flat(_section_31())
-    assert "thirteen later additive migrations" in flat
+    assert "fourteen later additive migrations" in flat
     assert f"parts 2–{total}" in flat
-    assert "twelve later additive migrations" not in flat, (
+    assert "thirteen later additive migrations" not in flat, (
         "the snapshot is not one of the later parts"
     )
 
@@ -794,7 +796,7 @@ def test_the_manual_action_section_names_every_embedded_part():
     assert "parts 4, 5, 7, 8 and 9" not in flat, (
         "every later part must be listed, never a stale subset"
     )
-    assert "thirteen" in flat
+    assert "fourteen" in flat
 
 
 def test_the_waiting_answer_migration_is_absorbed_by_part_one():
@@ -813,7 +815,7 @@ def test_the_waiting_answer_migration_is_absorbed_by_part_one():
         "the inventory must say the snapshot already establishes it"
     )
     assert "owner action required" not in row
-    assert "**36** files" in _flat(status), (
+    assert "**37** files" in _flat(status), (
         "the audited file count must be the current one (36)"
     )
 
@@ -846,7 +848,7 @@ def test_the_auto_reaction_columns_arrive_in_their_own_additive_part():
         "the Auto-Reaction part must stay additive"
     )
     # The snapshot and every earlier part stay untouched by it.
-    for name in DOCUMENTED_ORDER[:-1]:
+    for name in DOCUMENTED_ORDER[:-2]:
         assert "auto_reaction" not in spans[name], (
             f"{name} must not carry the Auto-Reaction columns"
         )
@@ -855,3 +857,20 @@ def test_the_auto_reaction_columns_arrive_in_their_own_additive_part():
     assert AUTO_REACTION_SETTINGS in section_6, (
         "§6 must attribute the columns to their migration"
     )
+
+
+def test_the_history_schedules_part_is_last_and_service_role_only():
+    """The Phase 3B state table is part 15 and keeps the service-role posture."""
+    spans = _part_spans(_setup_block())
+    part = spans[HISTORY_SCHEDULES]
+    assert "CREATE TABLE IF NOT EXISTS history_schedules (" in part
+    assert "REFERENCES ai_tasks(id) ON DELETE CASCADE," in part
+    assert "UNIQUE (owner_id, peer_id)" in part
+    assert "octet_length(summary) <= 32768" in part
+    assert "ENABLE ROW LEVEL SECURITY;" in part
+    assert "CREATE POLICY" not in part
+    assert (
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE history_schedules "
+        "TO service_role;" in part
+    )
+    assert list(spans)[-1] == HISTORY_SCHEDULES

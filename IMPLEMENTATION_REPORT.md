@@ -1,214 +1,391 @@
-# IMPLEMENTATION REPORT — Glass UI Appearance (Stage 1)
+# IMPLEMENTATION REPORT — Phase 3B: Durable History State and Oldest-First Retrieval
 
 ## 1. Implemented
 
-### Architecture
-- One new `Appearance` main-menu category (`panel:appearance`), registered
-  through the existing `register_panel` / inline-builder / action / input
-  registries. No second navigation system, settings framework, table, listener,
-  client or update loop.
-- One central composition layer
-  (`backend/services/appearance_service.py::compose`) applied at the three
-  existing render boundaries:
-  - initial inline result (`panel_render.render`),
-  - callback edit (`panels._render_and_edit`),
-  - panel reuse (`lifecycle.try_reuse_panel`).
-  Handlers were not edited to replace strings.
-- Strict persistence: the Appearance surface uses
-  `settings_service.set_setting_strict` / `set_many_strict`; a rejected
-  repository write returns failure and does **not** only change the cache.
+Phase 3B adds the durable persistence and retrieval foundation for scheduled
+History summarization. It does **not** add execution.
 
-### Navigation and Unicode
-- The main menu gained exactly one row: `Appearance`.
-- Sections: Header Customization, Page Text Customization, Preview Image, each
-  with its own sub-panel and the existing Back/Home/Close convention.
-- Labels compose glyphs from `backend/helper/symbols.py`; two non-emoji Unicode
-  glyphs were added: `ICON_APPEARANCE = ◑` and `OP_UPLOAD = ⇧`. No variation
-  selectors, no new emoji, and callback data/identifiers/URLs are untouched by
-  the font pipeline.
+- One additive migration:
+  `supabase/migrations/20261113000001_create_history_schedules.sql`.
+- One `history_schedules` state per `(owner_id, peer_id)`, owned by an
+  `ai_tasks` row with `ON DELETE CASCADE`.
+- Repository primitives on the existing `TaskRepository` hierarchy:
+  `create_history_schedule`, `get_history_schedule`,
+  `get_history_schedule_by_peer`, `commit_history_success`,
+  `record_history_failure`, `reset_history_summary`.
+- A compatible `InMemoryTaskRepository` fallback, including task-delete
+  cascade semantics.
+- A `SupabaseTaskRepository` implementation using one CAS update per accepted
+  write.
+- Bounded oldest-first Telegram retrieval through an optional
+  `reverse: bool = False` parameter on `messages.iter_messages` and the
+  `TelegramAPI.iter_messages` facade, plus `fetch_oldest_history` and
+  `HistoryBatch` in the History service.
+- An identifier-free `scheduled_summary_payload` boundary in the History AI
+  service (no production caller in this phase).
+- Focused tests and the canonical documentation updates, including §16.1 and
+  §31.3 part 15 of 15.
+- No scheduler, executor, lifecycle hook, UI, parser, notification, catch-up
+  policy, second client or second update loop.
 
-### Global header
-- Independent global title and description overrides; edit title, edit
-  description, reset title, reset description, reset both.
-- Defaults are the actual per-page defaults held in code; an override is opt-in
-  and reset clears it (the current customized value is never its own default).
-- Bounded validation (title ≤64, description ≤500); invalid/oversized input is
-  rejected without changing the previous value; rejected writes are reported.
+Files changed:
 
-### Per-page text
-- Eligible pages are derived from the real top-level menu categories only:
-  `save`, `del`, `profile`, `db`, `general`, `settings`, `cipher`, `todo`,
-  `ai`, `appearance`. Sub-panels, pickers, input screens and dynamic result
-  screens are not eligible.
-- Each page independently supports title edit/body edit, title reset/body
-  reset/full reset, and shows the effective title/description.
-- Title-only and body-only overrides keep the other default. Dynamic content is
-  preserved: an override replaces the page's static description, and everything
-  after it remains verbatim. Duplicate leading title headings are removed when
-  a customization is active. Uncustomized pages render byte-identically.
-- Unknown page ids and unknown fields are rejected.
+| File | Change |
+|---|---|
+| `supabase/migrations/20261113000001_create_history_schedules.sql` | New table, index, RLS/grants, comments, verification and rollback note |
+| `backend/ai/database/task_repository.py` | Record model, validation, in-memory fallback, Supabase CAS methods, task cascade |
+| `backend/services/history_service.py` | `HistoryBatch` and bounded oldest-first retrieval |
+| `backend/services/history_ai_service.py` | Identifier-free scheduled payload |
+| `backend/telegram_api/messages.py` | Optional `reverse` forwarding to Telethon |
+| `backend/telegram_api/api.py` | Facade forwarding of `reverse` |
+| `tests/test_history_schedules.py` | 25 focused Phase 3B tests |
+| `DATABASE_ARCHITECTURE.md` | §16.1, inventory 37/15, part 15, §20, §30.11, rollback/verification |
+| `tests/test_database_setup_order.py` | 15-part / 37-file order and new-part assertions |
+| `tests/test_private_message_db_security.py` | Part totals 15/37 and final-banner assertions |
+| `tests/test_private_message_scope.py` | Part references 10/11/13 of 15 |
+| `tests/test_canonical_schema_reconciliation.py` | `history_schedules` classified as a successor table |
+| `sql/panel_settings_appearance.sql` | Inventory count 37 |
 
-### Preview image
-- Independent ON/OFF switch and stored-image reference; turning OFF never
-  deletes the image, and turning ON reuses it when present. ON with no image
-  shows an upload-or-skip notice and keeps the panel functional.
-- Upload/replace/remove through the EXISTING pending-input listener. Handlers
-  that declare `message` now receive the Telegram message; no second listener
-  was registered.
-- Validation parses the actual bytes (PNG/JPEG/WebP headers), enforces ≤5 MB and
-  16–4096 px per side, rejects malformed/unsupported media, bounds the download
-  before it starts, and cleans up a newly uploaded object if persisting its
-  reference fails. Replacement removes the old object only after the new
-  reference is persisted; removal clears the reference before deleting.
-- Durable storage reuses Supabase Storage via `PANEL_PREVIEW_BUCKET` (default
-  `panel-previews`). Only the object key (`previews/<32 hex>.<ext>`) and probed
-  metadata are stored in `panel_settings`; never image bytes and never an
-  expiring signed URL. No new image dependency.
+## 2. Database schema and migration created
 
-### Telegram link preview
-- `render(...)` uses `InputBotInlineMessageMediaWebPage` with
-  `force_small_media=True` and the existing `ReplyInlineMarkup` when the switch
-  is ON and an image/reference/public base exist; otherwise it uses
-  `InputBotInlineMessageText` (genuine text-only).
-- Public, versioned route `/preview/<version>/<panel>` serves Open Graph
-  metadata (`og:title`, `og:description`, `og:image` + type/width/height,
-  `og:url` = `/guide`) to Telegram and redirects a human browser to `/guide`.
-  `/preview/<version>/<panel>/image` streams the stored bytes.
-  The version is derived from the stored object key, so replacement changes the
-  URL identity and defeats Telegram's preview cache.
-- The stored image is served by the backend (service-role read); the bucket may
-  stay private.
+### 2.1 Shape
 
-### Editing ownership
-- Panel repaints use only the Helper Bot's inline identifier with
-  `messages.EditInlineBotMessageRequest` (media set to `InputMediaWebPage` or
-  `InputMediaEmpty`). There is no self-client edit and no self-client fallback
-  in this flow; the self client only downloads the owner's upload and deletes
-  that upload message. No replacement panel is ever sent.
-- Callbacks are registered on the Helper Bot
-  (`runtime/supervisor.py::register_callback_handlers(helper, …)`), so ordinary
-  callback edits are Helper Bot edits too.
+`public.history_schedules`:
 
-## 2. Tested and passed
+- `id bigserial PRIMARY KEY`
+- `task_id bigint NOT NULL REFERENCES ai_tasks(id) ON DELETE CASCADE`
+- `owner_id bigint NOT NULL`
+- `peer_id bigint NOT NULL` with `CHECK (peer_id <> 0)`
+- `status text NOT NULL DEFAULT 'active'`
+- `baseline_cursor bigint NOT NULL DEFAULT 0`
+- `scanned_cursor bigint NOT NULL DEFAULT 0`
+- `summarized_cursor bigint NOT NULL DEFAULT 0`
+- `summary text NOT NULL DEFAULT ''`
+- `revision bigint NOT NULL DEFAULT 0`
+- `version integer NOT NULL DEFAULT 1`
+- `last_error text NOT NULL DEFAULT ''`
+- `last_error_at timestamptz`
+- `last_committed_at timestamptz`
+- `created_at timestamptz NOT NULL DEFAULT now()`
+- `updated_at timestamptz NOT NULL DEFAULT now()`
 
-- Focused new suite `tests/test_appearance.py`: **30 passed**.
-  Covers navigation/registration, owner gating, defaults, global and per-page
-  composition, independence, resets, invalid/oversized input, strict-write
-  honesty, reload persistence, switch/image independence, version changes,
-  preview media vs. text-only rendering, OG document, PNG/JPEG/WebP probing,
-  malformed/oversized rejection, storage upload/remove, cleanup after a rejected
-  reference, Helper-Bot-only repaint, no-inline-identifier failure, and the web
-  routes (Telegram OG, human redirect, image bytes, stale version, switch OFF).
-- Existing focused regression set (symbols, Todo UI, Cipher menu, colored
-  buttons, Guide site, settings model contract, settings unknown key, private
-  message panel, premium emoji): **316 passed**.
-- Schema/inventory set (`test_database_setup_order`,
-  `test_private_message_db_security`, `test_canonical_schema_reconciliation`,
-  `test_appearance`): **132 passed**.
-- Full suite: **7020 passed, 27 skipped, 1 failed**.
-  The single failure is
-  `tests/test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`
-  ("interval advancement exceeded bound"). It reproduces in isolation, touches
-  no file in this change, and was already the repository's known scheduler
-  failure; it is reported as pre-existing, not fixed or hidden here.
-- `python -m py_compile` on every changed Python file: **passed**.
-- `git diff --check`: **passed**.
+Constraints:
 
-## 3. Not tested
+- `history_schedules_owner_peer_key UNIQUE (owner_id, peer_id)` — the one-state
+  ownership invariant.
+- `history_schedules_peer_nonzero CHECK (peer_id <> 0)`.
+- `history_schedules_status_check` — `active`, `paused`, `completed`, `failed`,
+  `expired`, `deleted` (the last is legacy repair only).
+- `history_schedules_baseline_nonnegative`,
+  `history_schedules_scanned_nonnegative`,
+  `history_schedules_summarized_nonnegative`.
+- `history_schedules_cursor_order CHECK (baseline_cursor <= summarized_cursor
+  AND summarized_cursor <= scanned_cursor)`.
+- `history_schedules_summary_size CHECK (octet_length(summary) <= 32768)` —
+  32 KiB of UTF-8, never truncated.
+- `history_schedules_revision_nonnegative`, `history_schedules_version_positive`.
+- `history_schedules_error_size CHECK (octet_length(last_error) <= 2048)`.
+- `history_schedules_error_pair CHECK ((last_error = '') = (last_error_at IS NULL))`.
 
-- No live Telegram client was used: small-preview rendering, tap-through,
-  keyboard retention, preview-cache invalidation, and media replacement on a
-  real inline message are **not live-verified**.
-- No Supabase project or Storage bucket was contacted; upload/download/remove
-  are tested against fakes only.
-- The SQL script has not been executed (and must not be by this agent).
+Index:
 
-## 4. Requires manual owner action
+- `idx_history_schedules_task_id (task_id)` for the owning-task lookup and the
+  cascade. The unique constraint serves owner+peer reads. There is no scheduler
+  query, so there is no status/next-run index.
 
-1. Apply `sql/panel_settings_appearance.sql` in the Supabase SQL editor as
-   `postgres`. Until then, Appearance writes fail honestly (columns absent).
-2. Create the private Storage bucket (the file's header contains the exact SQL):
-   `panel-previews`.
-3. Set the environment:
-   - `PANEL_PREVIEW_BUCKET=panel-previews`
-   - `PUBLIC_BASE_URL=https://<public-service-origin>`
-     (`RENDER_EXTERNAL_URL` is accepted as a fallback; without either, the panel
-     warns that Telegram cannot fetch the preview).
-4. Optionally add `ANON` read policy — **not required**: the backend reads with
-   the service-role key and serves the bytes.
+RLS/access:
 
-Rollback (also in the SQL file header):
+- RLS enabled, zero policies.
+- All privileges revoked from `PUBLIC`, `anon`, `authenticated`.
+- Exactly `SELECT, INSERT, UPDATE, DELETE` granted to `service_role`.
+
+There is no owner foreign key because the repository has no owner table.
+`task_id` is the only FK, and it cascades on physical task deletion.
+
+### 2.2 Exact manual application SQL
+
+Apply the entire file
+`supabase/migrations/20261113000001_create_history_schedules.sql` as
+`postgres` in the Supabase SQL editor (or as §31.3 part 15 of the one-paste
+setup). Its executable SQL is:
 
 ```sql
-ALTER TABLE panel_settings DROP COLUMN IF EXISTS appearance_preview_meta;
-ALTER TABLE panel_settings DROP COLUMN IF EXISTS appearance_preview_image;
-ALTER TABLE panel_settings DROP COLUMN IF EXISTS appearance_preview_enabled;
-ALTER TABLE panel_settings DROP COLUMN IF EXISTS appearance_page_texts;
-ALTER TABLE panel_settings DROP COLUMN IF EXISTS appearance_header_body;
-ALTER TABLE panel_settings DROP COLUMN IF EXISTS appearance_header_title;
+CREATE TABLE IF NOT EXISTS history_schedules (
+    id                  bigserial    PRIMARY KEY,
+    task_id             bigint       NOT NULL REFERENCES ai_tasks(id) ON DELETE CASCADE,
+    owner_id            bigint       NOT NULL,
+    peer_id             bigint       NOT NULL,
+    status              text         NOT NULL DEFAULT 'active',
+    baseline_cursor     bigint       NOT NULL DEFAULT 0,
+    scanned_cursor      bigint       NOT NULL DEFAULT 0,
+    summarized_cursor   bigint       NOT NULL DEFAULT 0,
+    summary             text         NOT NULL DEFAULT '',
+    revision            bigint       NOT NULL DEFAULT 0,
+    version             integer      NOT NULL DEFAULT 1,
+    last_error          text         NOT NULL DEFAULT '',
+    last_error_at       timestamptz,
+    last_committed_at   timestamptz,
+    created_at          timestamptz  NOT NULL DEFAULT now(),
+    updated_at          timestamptz  NOT NULL DEFAULT now(),
+    CONSTRAINT history_schedules_owner_peer_key UNIQUE (owner_id, peer_id),
+    CONSTRAINT history_schedules_peer_nonzero CHECK (peer_id <> 0),
+    CONSTRAINT history_schedules_status_check CHECK (
+        status IN ('active', 'paused', 'completed', 'failed', 'expired', 'deleted')
+    ),
+    CONSTRAINT history_schedules_baseline_nonnegative CHECK (baseline_cursor >= 0),
+    CONSTRAINT history_schedules_scanned_nonnegative CHECK (scanned_cursor >= 0),
+    CONSTRAINT history_schedules_summarized_nonnegative CHECK (summarized_cursor >= 0),
+    CONSTRAINT history_schedules_cursor_order CHECK (
+        baseline_cursor <= summarized_cursor
+        AND summarized_cursor <= scanned_cursor
+    ),
+    CONSTRAINT history_schedules_summary_size CHECK (octet_length(summary) <= 32768),
+    CONSTRAINT history_schedules_revision_nonnegative CHECK (revision >= 0),
+    CONSTRAINT history_schedules_version_positive CHECK (version > 0),
+    CONSTRAINT history_schedules_error_size CHECK (octet_length(last_error) <= 2048),
+    CONSTRAINT history_schedules_error_pair CHECK (
+        (last_error = '') = (last_error_at IS NULL)
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_history_schedules_task_id
+    ON history_schedules (task_id);
+
+ALTER TABLE history_schedules ENABLE ROW LEVEL SECURITY;
+
+REVOKE ALL ON TABLE history_schedules FROM PUBLIC, anon, authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE history_schedules TO service_role;
+
+COMMENT ON TABLE history_schedules IS
+    'ONE cumulative scheduled-History state per (owner_id, peer_id), owned by an ai_tasks row and deleted with it. Service-role only: RLS is enabled with zero policies and every privilege is revoked from PUBLIC/anon/authenticated. Cursors advance only through a successful compare-and-set commit; failures never replace the previous summary or advance either cursor.';
+COMMENT ON COLUMN history_schedules.baseline_cursor IS
+    'Immutable exclusive lower bound chosen at creation. Messages at or below it are outside this schedule.';
+COMMENT ON COLUMN history_schedules.scanned_cursor IS
+    'Exclusive lower cursor through which content has been successfully processed or explicitly safely skipped.';
+COMMENT ON COLUMN history_schedules.summarized_cursor IS
+    'Exclusive lower cursor through which content is actually covered by the cumulative summary; never greater than scanned_cursor.';
+COMMENT ON COLUMN history_schedules.summary IS
+    'Cumulative summary, at most 32 KiB of UTF-8. Never truncated on write; an over-limit result fails.';
+COMMENT ON COLUMN history_schedules.revision IS
+    'Successful content revisions (summary/reset commits); a recorded failure does not change it.';
+COMMENT ON COLUMN history_schedules.version IS
+    'Compare-and-set token incremented by every accepted write, including a recorded failure.';
+COMMENT ON COLUMN history_schedules.last_error IS
+    'Bounded diagnostic from the last failed processing attempt; empty when no error is recorded.';
+COMMENT ON COLUMN history_schedules.last_committed_at IS
+    'Timestamp of the last successful summary commit; NULL until the first commit.';
+
+NOTIFY pgrst, 'reload schema';
+
+SELECT 'history_schedules table' AS check, count(*) AS present
+FROM information_schema.tables
+WHERE table_schema = 'public'
+  AND table_name   = 'history_schedules';
+
+SELECT 'history_schedules columns' AS check, count(*) AS present
+FROM information_schema.columns
+WHERE table_schema = 'public'
+  AND table_name   = 'history_schedules';
+
+SELECT 'history_schedules policies' AS check, count(*) AS present
+FROM pg_policies
+WHERE schemaname = 'public'
+  AND tablename  = 'history_schedules';
 ```
 
-The script is intentionally **not** an audited `supabase/migrations/` entry, so
-the canonical §31 one-paste setup and its 36-file inventory are unchanged; it is
-manual setup, like the storage bucket itself.
+The migration file is the source of truth and includes the full explanatory
+header. Its SHA-256 at delivery is
+`1f58c28b41649312ecb3904b9089628039e17ff9e86d7d124d544a2c7a7b898a`.
 
-## 5. Not live-verified
+### 2.3 Dependency-safe rollback
 
-- Telegram's actual small-preview rendering and whether it honors
-  `force_small_media` on every client.
-- Whether an existing inline message keeps its webpage media across plain text
-  callback edits on current Telegram clients (the code deliberately sets the
-  media explicitly on every Appearance repaint, including `InputMediaEmpty` for
-  OFF).
-- Real Supabase Storage behavior (bucket permissions, object reads, replacement
-  cleanup).
+The table is a leaf: nothing else references `history_schedules`, while it
+references `ai_tasks`. Dropping it therefore has no dependent object to drop
+first and does not touch the owning tasks:
 
-## 6. Deferred
+```sql
+DROP TABLE IF EXISTS history_schedules;
+```
 
-- Curated image gallery, external image search, generated default image.
-- Web-dashboard upload workflow.
-- Multiple images, per-page preview images, rotation.
-- A shared strict-write migration for the legacy panel settings.
+This destroys the cumulative History state and is irreversible for data. It
+does not delete `ai_tasks` rows, any other table, column, index, policy, grant
+or row. No agent has executed it.
 
-## 7. Changed files
+## 3. Repository behavior
 
-New:
-- `backend/services/appearance_service.py`
-- `backend/services/image_probe.py`
-- `backend/services/preview_storage.py`
-- `backend/bot/handlers/appearance.py`
-- `sql/panel_settings_appearance.sql`
-- `tests/test_appearance.py`
+`create_history_schedule(owner_id, task_id, peer_id, baseline_cursor)`:
 
-Modified:
-- `backend/helper/symbols.py` (two non-emoji glyphs + registry entries)
-- `backend/helper/panel_render.py` (central composition + preview media)
-- `backend/helper/panels.py` (callback composition; input timeout config)
-- `backend/helper/lifecycle.py` (reuse composition)
-- `backend/helper/inline_engine.py` (panel-scoped render context)
-- `backend/helper/inline_sender.py` (optional `message` handler kwarg)
-- `backend/services/settings_service.py` (defaults/validators/strict setters)
-- `backend/bot/handlers/misc.py` (one menu entry)
-- `backend/bot/router.py` (register the Appearance handler)
-- `backend/web/app.py` (versioned preview + image routes)
-- `DATABASE_ARCHITECTURE.md` (§6 columns + manual-setup note)
-- `INVESTIGATION.md`, `ROADMAP.md`, `IMPLEMENTATION_REPORT.md`
+- verifies the task exists for the same owner;
+- refuses a live existing `(owner_id, peer_id)` row (`None`);
+- reuses a legacy `deleted` row in place, resetting task/baseline/cursors/
+  summary and advancing revision/version;
+- supports the `UNIQUE (owner_id, peer_id)` constraint as the durable backstop;
+- in the in-memory fallback, physically deleting the owning task removes the
+  state, mirroring the FK cascade.
 
-No secrets, credentials, image bytes or signed URLs were added.
+`commit_history_success`:
 
-## 8. Delivery state
+- validates the summary's UTF-8 byte bound before any write;
+- rejects a stale `expected_version` without writing;
+- rejects backwards cursors and any violation of
+  `baseline <= summarized <= scanned`;
+- rejects replacing a non-empty durable summary with an empty/blank summary;
+- writes summary, both cursors, status, `revision + 1`, `version + 1`,
+  `last_committed_at` and cleared error metadata in ONE CAS update filtered by
+  `owner_id`, `peer_id` and `version`.
 
-- Starting HEAD: `fa2dfd04c3cacbb78221a512576769fd6473ddb8`.
-- The delivery commit contains this report; its SHA is the repository HEAD at
-  delivery and is verified against a fresh `origin/main` fetch
-  (`git rev-parse origin/main` + `git merge-base --is-ancestor`).
-- Working tree after delivery: clean.
+`record_history_failure`:
 
-## 9. Completed stage / next stage
+- rejects a stale version without writing;
+- validates a nonblank, ≤2048-byte error;
+- writes only error, status, `version + 1` and timestamps;
+- never changes summary, cursors or revision.
 
-- **Completed:** Glass UI Appearance Stage 1 (header, per-page text, owner-
-  uploaded preview image, versioned Guide link preview, Helper-Bot-only edits).
-- **Next:** live Telegram verification (small preview, tap-through, keyboard,
-  replacement cache behavior) and, only if requested, reuse on more surfaces.
-  Manual schema/bucket setup must be applied before the feature can persist or
-  serve an image.
+`reset_history_summary`:
+
+- rejects a stale version without writing;
+- sets `summary = ''`, `summarized_cursor = scanned_cursor`, advances revision
+  and version, clears error metadata;
+- is explicit and owner-authorized, never automatic.
+
+On Supabase exception, the durable methods degrade to the existing fallback and
+record the degradation; they never claim a durable write succeeded. Live
+database behavior is not claimed, because no live database was contacted.
+
+## 4. Oldest-first retrieval
+
+`backend/telegram_api/messages.py` now accepts `reverse: bool = False` and adds
+`reverse=True` to Telethon's kwargs only when requested. The facade forwards
+the parameter without changing any other caller's default.
+
+`fetch_oldest_history`:
+
+- requires an exclusive lower cursor and a positive, stable upper bound;
+- returns an empty `HistoryBatch` when the range is empty, without a Telegram
+  call;
+- asks for oldest-first pages inside that fixed window;
+- sorts and deduplicates each page defensively;
+- ignores ids outside the window;
+- advances `next_cursor` for every processed raw message, including safe
+  AI-provenance skips;
+- stops on the target, the scan bound, a short page or an exhausted range;
+- reports `has_more` conservatively;
+- never re-reads a processed id when the returned cursor is passed back.
+
+Deleted/inaccessible ids create no gap because the next page starts strictly
+after the last processed cursor. A skipped-only batch can advance the scanned
+cursor without moving content coverage.
+
+## 5. AI context isolation
+
+`scheduled_summary_payload(messages, instruction="")` returns only:
+
+- `Owner instruction: <bounded instruction>`, when nonblank; and
+- the nonblank text bodies of the supplied messages, joined in order.
+
+It excludes chat/peer/message/sender/task/occurrence/database identifiers,
+sender attribution, dates, media metadata, peer title/username, unrelated chat
+history, memory and session history. Empty and media-only messages contribute
+nothing. Identifiers typed by a human inside message text are content, not
+semantically redacted metadata. There is no production caller in Phase 3B.
+
+## 6. Tests and validation actually performed
+
+### 6.1 Focused tests
+
+- `tests/test_history_schedules.py`: **25 passed**. Covers:
+  - create/get owner scoping and owned-task requirement;
+  - unique owner+peer refusal, including paused/completed/failed/expired
+    ownership;
+  - legacy `deleted` repair;
+  - in-memory task-delete cascade;
+  - one CAS write, stale-version rejection, owner-scoped writes;
+  - failure preserving summary/cursors/revision and bounded error;
+  - 32 KiB UTF-8 boundary and no truncation;
+  - empty-summary protection;
+  - safe skipped-only scanned-cursor advancement;
+  - monotonic cursor/order rejection;
+  - explicit reset semantics;
+  - fake-Supabase CAS payload shape and no write on a stale version;
+  - Supabase create refusing another owner's task;
+  - oldest-first ordering, `reverse=True` forwarding, stable upper bound,
+    no gaps/duplicates, deleted gaps, AI skips, empty ranges and facade
+    defaults;
+  - identifier-free scheduled payload.
+- Existing database documentation/security/scope tests:
+  **196 passed** (`test_database_setup_order.py`,
+  `test_private_message_db_security.py`, `test_private_message_scope.py`).
+- Canonical schema classifier test for the new successor table: **1 passed**.
+
+These are unit/repository/fallback tests. They do not contact live Supabase or
+live Telegram.
+
+### 6.2 Full suite
+
+Command: `.venv/bin/python -m pytest -q`
+
+Result: **7263 passed, 27 skipped, 1 failed** in 144.01 s.
+
+The single failure is the known pre-existing
+`tests/test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`
+(“interval advancement exceeded bound”). It is unrelated to Phase 3B and was
+not modified. No Phase 3B test failed.
+
+### 6.3 Static checks
+
+- `.venv/bin/python -m py_compile` on every changed Python module and test:
+  exit 0.
+- `git diff --check`: exit 0.
+
+## 7. Live Supabase status
+
+**No SQL was executed. No Supabase connection was made. The migration has NOT
+been applied or live-verified.** The owner must review and apply it manually.
+Consequently:
+
+- live RLS behavior was not tested;
+- live FK cascade behavior was not tested;
+- live CAS/unique-constraint concurrency was not tested;
+- no claim is made that the durable repository is working against a live
+  database.
+
+Until the owner applies the migration, the Supabase repository degrades to the
+in-memory fallback and never reports the state as durably persisted.
+
+## 8. Commit SHA and remote verification
+
+The Phase 3B changes are committed as one commit on the delivery branch, then
+pushed normally to `origin/main` with `cloud_git` (no force, no rebase, no
+history rewrite). The exact commit SHA and the remote/ancestry/clean-tree
+verification results are reported in the final delivery message after the push
+succeeds. They can be re-checked with:
+
+```bash
+git rev-parse HEAD
+git ls-remote origin refs/heads/main
+git merge-base --is-ancestor <commit> HEAD
+git status --porcelain
+```
+
+If a safe normal push cannot be completed, the delivery stops and reports the
+blocker instead of claiming success.
+
+## 9. Remaining limitations
+
+- Migration is unapplied; owner action is required.
+- No live Supabase integration test exists in this phase.
+- No scheduler/executor calls the repository or payload yet.
+- Summary compaction is an explicit reset, not automatic.
+- Deleted Telegram content cannot be recovered; the prior summary is retained.
+- `history_schedules` has no owner FK because there is no owner table; owner
+  scoping relies on the repository plus `UNIQUE (owner_id, peer_id)`.
+- A completed state is terminal; no reopen path is implemented.
+- The pre-existing scheduler test failure remains.
+
+## 10. Explicit Phase 4+ status
+
+Phase 4 and all later phases were **not implemented**. There is no scheduled
+History execution, no scheduler/lifecycle integration, no schedule UI, no
+natural-language schedule parsing, no notification, no catch-up/missed-run
+policy, no second scheduler/worker/executor, no second Telegram client and no
+second update loop in this change.
