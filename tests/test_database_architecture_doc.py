@@ -64,15 +64,15 @@ def test_every_migration_file_is_classified_in_the_audit_section():
     """§31 is the authoritative inventory: no migration may be omitted."""
     audit = section("## 31. Canonical Database Setup")
     missing = [path.name for path in MIGRATIONS if path.name[:14] not in audit]
-    assert len(MIGRATIONS) == 40, "the repository's migration count changed"
+    assert len(MIGRATIONS) == 41, "the repository's migration count changed"
     assert missing == [], f"migrations absent from §31: {missing}"
-    assert "all 39 migrations" in audit
+    assert "all 40 migrations" in audit
 
 
 def test_migration_status_states_the_same_count():
     status = section("## 22. Migration Status")
     flat = " ".join(status.split())
-    assert "**40** files" in flat
+    assert "**41** files" in flat
     assert "all **36** files" not in flat
 
 
@@ -124,8 +124,8 @@ def test_section_6_accessor_count_matches_the_settings_service():
     from backend.services.settings_service import _DEFAULTS
 
     panel = section("## 6. panel_settings")
-    assert len(_DEFAULTS) == 20
-    assert "**20 typed getters + 20 typed setters**" in panel
+    assert len(_DEFAULTS) == 21
+    assert "**21 typed getters + 21 typed setters**" in panel
     assert "14 typed getters" not in panel
     for column, _type, _default in APPEARANCE_COLUMNS:
         assert column in _DEFAULTS, f"{column} is not a settings key"

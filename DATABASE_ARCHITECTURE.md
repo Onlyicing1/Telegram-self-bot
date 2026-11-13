@@ -78,7 +78,7 @@ embedded in the schema snapshot. There is
 no "step 0", no second block to paste and no shell workflow. Open this section,
 copy §31.3, paste it into the Supabase SQL Editor as `postgres` and run it. §31.1 is the
 reconciliation audit that proves the block equals the effective final state of
-the 39 schema migration files classified below — including the two Todo migrations
+the 40 schema migration files classified below — including the two Todo migrations
 `20260926000001_add_todo_schedule_type.sql`,
 `20260927000001_add_todo_steps.sql`, the Taskloom question-status widening
 `20260927020000_add_waiting_answer_status.sql` (classified additive: it only
@@ -94,14 +94,20 @@ were created with, and adds no table of its own) and the Auto-Reaction columns
 part 14: the two `panel_settings` columns `settings_service` writes, which no
 earlier migration created).
 
-### 31.1 Reconciliation audit — 39 schema migrations; 17 embedded schema parts
+### 31.1 Reconciliation audit — 40 schema migrations; 17 embedded schema parts
 
 The script in §31.3 was reconciled against **every file currently in
-`supabase/migrations/` (40 files: 39 schema migrations — all 39 migrations are accounted for below — plus the separately applied privilege-hardening migration documented in §22)**, not against the list any earlier document
+`supabase/migrations/` (41 files: 40 schema migrations — all 40 migrations are accounted for below — plus the separately applied privilege-hardening migration documented in §22)**, not against the list any earlier document
 carried. Each migration was classified by its **effective schema change** —
 what a fresh database must end up with after it runs — and the classification
 is pinned by `tests/test_database_setup_order.py` (statement-identity for the
-seventeen embedded parts) and `tests/test_canonical_schema_reconciliation.py
+seventeen embedded parts). One schema migration is deliberately classified but
+not embedded: `20261112160000_add_panel_settings_intelligent_reaction_probability.sql`
+is additive POST-reconciliation — it adds exactly one `panel_settings` column
+(`intelligent_reaction_probability integer NOT NULL DEFAULT 25`, with a 0–100
+CHECK) and touches no other column, row, index, policy or grant, so embedding it
+would renumber parts 1–17 for no schema benefit. §6 documents the column and §22
+records that it is committed, not applied. and `tests/test_canonical_schema_reconciliation.py
 (column/constraint/seed equivalence for the snapshot).
 
 **The seventeen migrations whose SQL is embedded verbatim (parts 1–17 of §31.3):**
@@ -229,7 +235,7 @@ migration creates them.
    outbound-bandwidth accounting column (§6) — and part 17 — the Intelligent
    Reaction column (§6) — all embedded verbatim from their migration files.
 6. **What was corrected.** Documentation: the §31 intro, §31.1 and §22 state
-   the current count (40 migration files: 39 schema migrations plus the separately tracked post-setup privilege-hardening migration; 17 embedded parts; 16 canonical
+   the current count (41 migration files: 40 schema migrations plus the separately tracked post-setup privilege-hardening migration; 17 embedded parts; 16 canonical
    tables + `todo_steps` + the five Emoji & Reaction tables + the two Private
    Message tables + the two Anti-Edit / Anti-Delete tables), plus the
    counter-reset columns those two Private Message tables gain in part 11, the
@@ -3919,7 +3925,8 @@ a key-value store.
 | `appearance_preview_enabled` | `boolean` | NO | `false` | Appearance: the independent preview-image switch. OFF retains the stored image and renders a genuinely text-only panel. Part 15 of §31.3 |
 | `appearance_preview_image_key` | `text` | NO | `''` | Appearance: the durable Supabase Storage OBJECT KEY of the preview image (never bytes, never a signed/expiring URL). `''` = no image. Part 15 of §31.3 |
 | `outbound_bandwidth_state` | `jsonb` | NO | `'{}'` | Outbound bandwidth governor accounting: `{version, daily:{period,bytes}, monthly:{period,bytes}}` for the CURRENT UTC day/month; older periods read as zero and are pruned on the next reservation. Written only by `outbound_bandwidth_service.reserve_outbound_bytes` through `panel_settings_repository`; read by the governor and by the read-only Settings → Bandwidth Usage panel. Part 16 of §31.3 |
-| `intelligent_reaction_enabled` | `boolean` | NO | `false` | Intelligent Reaction: the independent, OFF-by-default switch for the AI-driven per-message reaction mode (AI probability + a Telegram-catalog reaction, then an independent random check). Never reads `auto_reaction_emoji`; mutually exclusive with `auto_reaction_enabled`. Written/read through `settings_service`, consumed by `intelligent_reaction_service.process_outgoing_message`. Created by `20261112140000_add_panel_settings_intelligent_reaction.sql` — part 17 of §31.3 |
+| `intelligent_reaction_enabled` | `boolean` | NO | `false` | Intelligent Reaction: the independent, OFF-by-default switch for the AI-driven per-message reaction mode. Never reads `auto_reaction_emoji`; mutually exclusive with `auto_reaction_enabled`. Written/read through `settings_service`, consumed by `intelligent_reaction_service.process_outgoing_message`. Created by `20261112140000_add_panel_settings_intelligent_reaction.sql` — part 17 of §31.3 |
+| `intelligent_reaction_probability` | `integer` | NO | `25` | Intelligent Reaction: the OWNER's fixed reaction percentage, 0–100 inclusive, enforced by a CHECK constraint. Read for every eligible outgoing message, so a saved change applies to the next message without a restart. The AI never decides or overrides it: the model only picks a reaction from Telegram's catalog (or none). 0% never reacts and costs no catalog/AI call; 100% always reacts; every other value performs exactly one independent draw per message. Created by `20261112160000_add_panel_settings_intelligent_reaction_probability.sql` (additive, post-reconciliation; §31.1) and needed by the running backend |
 | `ghost_seen_retention_seconds` | `bigint` | NO | `2592000` | Ghost Seen registry retention window in seconds (30 min–365 days); presets include sub-day durations |
 | `update_stale_seconds` | `integer` | NO | `300` | Update staleness threshold (seconds) |
 | `updated_at` | `timestamptz` | YES | `now()` | Last update timestamp |
@@ -3940,17 +3947,18 @@ RLS is enabled. Only SELECT is granted to `anon` + `authenticated`.
 `update_field`, `update_fields`, `reload`.
 
 **`backend/services/settings_service.py`** — cache-first reads,
-write-through cache, **20 typed getters + 20 typed setters**, per-setting
+write-through cache, **21 typed getters + 21 typed setters**, per-setting
 validators (`auto_close_enabled`, `auto_close_delay`, `max_deep_save_mb`,
 `delete_batch_size`, `log_retention_days`, `panel_timeout_seconds`,
 `allow_multiple_panels`, `reuse_existing_panel`, `language`,
 `debug_callbacks`, `owner_only`, `dashboard_font`,
 `auto_reaction_enabled`, `auto_reaction_emoji`, `intelligent_reaction_enabled`,
+`intelligent_reaction_probability`,
 and the five Appearance
 accessors `appearance_header_title`, `appearance_header_body`,
 `appearance_page_overrides`, `appearance_preview_enabled`,
 `appearance_preview_image_key`). `ghost_seen_retention_seconds` and
-`update_stale_seconds` are the only two of the 22 setting columns with **no
+`update_stale_seconds` are the only two of the 23 setting columns with **no
 accessor and no production consumer** (see §19.13, §19.14). See
 [§17 Panel Database](#17-panel-database) for the cache/validation model.
 
@@ -6035,10 +6043,11 @@ migration filenames.
 
 ### Repository and remote migration history
 
-- Repository contains **40 migration files** (**40** files: 39 schema migrations
-  plus the separately tracked post-setup privilege-hardening migration; the
-  Intelligent Reaction column migration is committed and not yet applied).
-- Supabase migration history contains **3 records**, not 40. The live schema
+- Repository contains **41 migration files** (**41** files: 40 schema migrations
+  plus the separately tracked post-setup privilege-hardening migration; both
+  Intelligent Reaction migrations — the enabled column and the probability
+  column — are committed and not yet applied).
+- Supabase migration history contains **3 records**, not 41. The live schema
   was evidently established through a mixture of canonical/manual setup and
   later tracked migrations. Do not invent the missing history rows.
 - Live history records:

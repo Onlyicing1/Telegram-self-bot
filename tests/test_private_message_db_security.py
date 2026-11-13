@@ -60,7 +60,7 @@ SETUP_BANNER = "ONE COMPLETE SUPABASE SETUP SCRIPT"
 PART_MARKER = re.compile(r"--[^\n]*\bPART (\d+) of (\d+)\b[^\n]*\n")
 PM_ACCESS_PART = 13
 TOTAL_PARTS = 17
-TOTAL_MIGRATIONS = 40
+TOTAL_MIGRATIONS = 41
 AUTO_REACTION_PART = 14
 AUTO_REACTION_MIGRATION = "20261020160000_add_panel_settings_auto_reaction_settings.sql"
 APPEARANCE_MIGRATION = "20261109000000_add_panel_settings_appearance.sql"
@@ -404,7 +404,7 @@ def test_the_setup_block_keeps_creating_the_policies_it_then_removes():
 def test_the_documented_counts_match_the_repository():
     assert len(list(MIGRATIONS_DIR.glob("*.sql"))) == TOTAL_MIGRATIONS
     flat = _flat(_section("## 31. Canonical Database Setup"))
-    assert "all 39 migrations" in flat
+    assert "all 40 migrations" in flat
     assert f"{TOTAL_MIGRATIONS} files" in flat
     assert "sixteen later additive migrations" in flat
     assert len(_recorded_order()) - 1 == 16, (

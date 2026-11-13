@@ -537,16 +537,22 @@ error.
   candidate contract, the content policy).
 - **Intelligent Reaction (AI-driven)**: `backend/services/intelligent_reaction_service.py`
   is a second, independent reaction mode for the owner's own outgoing messages
-  (`panel_settings.intelligent_reaction_enabled`, OFF by default). The existing
-  `ProviderManager` returns a per-message probability (0–100) and a reaction
-  from Telegram's available-reaction catalog; deterministic code then performs
-  that message's own independent random draw, validates the reaction against
-  the catalog and executes ONE reaction through
+  (`panel_settings.intelligent_reaction_enabled`, OFF by default) and an
+  owner-set percentage (`panel_settings.intelligent_reaction_probability`,
+  0–100, default 25, read per message). The `ProviderManager` returns ONLY a
+  reaction from Telegram's available-reaction catalog (or null); deterministic
+  code owns the probability (0% never reacts, 100% always does, anything else
+  performs exactly one independent draw per message), validates the reaction
+  against the same catalog snapshot and executes ONE reaction through
   `reaction_service.react_to_message`. There is no fixed ratio, quota or
   rolling window, nothing falls back to the fixed Auto-Reaction emoji, and the
-  model receives only the message text plus at most one replied-to text (never
-  ids, sender identity or history). The two reaction modes are mutually
-  exclusive in `settings_service`.
+  model receives only the message text, at most one replied-to text and a
+  coarse chat type (never ids, sender identity or history). An eligible
+  message starts its AI request immediately; messages arriving while one
+  request is in flight wait in a per-owner queue and share the next request
+  (one request in flight, no timer, no fixed window), each keeping its own id,
+  context and send. The two reaction modes are mutually exclusive in
+  `settings_service`.
 - **Tools**: stateless wrappers over services (`save`, `retrieve`, `delete`,
   `bio_*`, `username_*`, `organize_*`, `settings_*`, …). The `ToolExecutor`
   is the sole component that calls `tool.execute()`. The owner's message IS
