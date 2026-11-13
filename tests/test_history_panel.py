@@ -10,6 +10,9 @@ Pins the actual P1 boundaries:
   ``linked_id + 1`` as the EXCLUSIVE upper bound, so the linked message is
   included and nothing newer is;
 * provider/retrieval/timeout failures never become a fabricated summary;
+* result delivery edits the ORIGINAL History panel through the Helper Bot's
+  existing inline edit (``messages.editInlineBotMessage``), never the owner's
+  self-bot client, never a replacement panel and never Saved Messages;
 * a background operation is bounded and cannot overwrite a newer panel state.
 
 No live Telegram, provider or database is used.
@@ -21,7 +24,10 @@ import logging
 from types import SimpleNamespace
 
 import pytest
+from telethon.tl import types
+
 from backend.bot.handlers import history
+from backend.helper import lifecycle as lifecycle_module
 from backend.services import appearance_service
 from backend.helper.panel_edit import supersede_panel_operation
 from backend.helper.panels import get_action, get_input, get_panel
@@ -34,21 +40,48 @@ PANEL_CHAT = 7770001
 PANEL_MSG = 99
 USER_MSG = 100
 
+#: The inline-bot handle Telegram hands the Helper Bot when the panel's button
+#: is clicked. It is the ONLY supported way to edit an inline result message.
+INLINE_ID = types.InputBotInlineMessageID64(
+    dc_id=2, owner_id=OWNER, id=PANEL_MSG, access_hash=123456789,
+)
+
 
 def _run(coro):
     return asyncio.new_event_loop().run_until_complete(coro)
 
 
+class _HelperClient:
+    """The Helper Bot, as the History delivery path actually uses it."""
+
+    def __init__(self) -> None:
+        self.edits: list[tuple] = []
+        self.error: Exception | None = None
+
+    async def edit_message(self, entity, text=None, buttons=None, **kwargs):
+        if self.error is not None:
+            raise self.error
+        self.edits.append((entity, text, buttons))
+
+    @property
+    def last_text(self) -> str:
+        return self.edits[-1][1] if self.edits else ""
+
+
+_helper = _HelperClient()
+
+
 @pytest.fixture(autouse=True)
 def _fresh_state(monkeypatch):
     monkeypatch.setattr(history, "_STATE", history._State())
-    monkeypatch.setattr(history, "get_client", lambda: None)
-    monkeypatch.setattr(history, "_OWNER_ID", OWNER)
+    monkeypatch.setattr(history, "get_client", lambda: _helper)
     monkeypatch.setattr(history.utils, "get_peer_id", lambda entity: int(entity.id))
-    history._RESULT_VIEWS.clear()
+    _helper.edits.clear()
+    _helper.error = None
     appearance_service.reset_delivery_state()
     yield
-    history._RESULT_VIEWS.clear()
+    _helper.edits.clear()
+    _helper.error = None
     appearance_service.reset_delivery_state()
 
 
@@ -107,7 +140,7 @@ def _event():
         chat_id=PANEL_CHAT,
         message_id=PANEL_MSG,
         message=SimpleNamespace(id=PANEL_MSG),
-        query=None,
+        query=SimpleNamespace(msg_id=INLINE_ID),
         raw_text="",
     )
 
@@ -132,7 +165,6 @@ def _chat(peer_id: int, name: str) -> history._Chat:
 
 
 # ── registration and navigation ─────────────────────────────────────────────
-
 
 def test_the_history_panel_and_controls_are_registered_once():
     history.register(None, OWNER)
@@ -163,8 +195,6 @@ def test_the_initial_panel_renders_the_unselected_state():
 
 
 # ── dialogs ────────────────────────────────────────────────────────────────
-# ── dialogs ────────────────────────────────────────────────────────────────
-
 
 def test_dialog_enumeration_is_bounded_and_selectable(monkeypatch):
     client = _Client([_user(), _group(), _supergroup()])
@@ -222,7 +252,6 @@ def test_pagination_is_bounded_to_the_scanned_page(monkeypatch):
 
 # ── count and focus ────────────────────────────────────────────────────────
 
-
 def test_count_accepts_only_the_offered_values():
     _run(history._count_action(None, "500", PANEL_CHAT))
     assert history._STATE.count == 500
@@ -237,23 +266,27 @@ def test_count_accepts_only_the_offered_values():
 def test_focus_is_normalized_and_limited(monkeypatch):
     client = _Client()
     monkeypatch.setattr(history, "get_self_client", lambda: client)
-    _run(history._focus_input_handler("  be   concise ", CHAT, USER_MSG, CHAT, PANEL_MSG))
+    _run(
+        history._focus_input_handler(
+            "  be   concise ", CHAT, USER_MSG, CHAT, PANEL_MSG, INLINE_ID,
+        )
+    )
     assert history._STATE.focus == "be concise"
     assert client.deleted == [(CHAT, [USER_MSG])]
+    assert "Focus: be concise" in _helper.last_text
 
     before = history._STATE.focus
     _run(
         history._focus_input_handler(
             "x" * (history.history_ai_service.MAX_INSTRUCTION_CHARS + 1),
-            CHAT, USER_MSG, CHAT, PANEL_MSG,
+            CHAT, USER_MSG, CHAT, PANEL_MSG, INLINE_ID,
         )
     )
     assert history._STATE.focus == before
-    assert "characters or fewer" in client.last_text
+    assert "characters or fewer" in _helper.last_text
 
 
 # ── manual summarization ───────────────────────────────────────────────────
-
 
 def _capture_task(monkeypatch):
     tasks: list = []
@@ -307,9 +340,12 @@ def test_manual_run_passes_the_selected_chat_count_focus_and_no_current_message(
     assert call["instruction"] == "focus here"
     assert call["provider_manager"] is manager
     assert call["current_message_id"] is None
-    assert "Processed: 2 of 250 requested" in client.last_text
-    assert "Range: #10 – #11" in client.last_text
-    assert "A short summary." in client.last_text
+    assert "Processed: 2 of 250 requested" in _helper.last_text
+    assert "Range: #10 – #11" in _helper.last_text
+    assert "A short summary." in _helper.last_text
+    # The Helper Bot performed the edit against the inline message it owns.
+    assert _helper.edits[-1][0] is INLINE_ID
+    assert client.edits == []
 
 
 def test_manual_run_requires_an_accessible_selected_chat(monkeypatch):
@@ -331,8 +367,8 @@ def test_provider_failure_is_rendered_as_failure_not_a_summary(monkeypatch):
     tasks = _capture_task(monkeypatch)
     _run(history._run_action(_event(), "", PANEL_CHAT))
     _run(tasks[0])
-    assert "provider exploded" in _client.last_text
-    assert "Processed:" not in _client.last_text
+    assert "provider exploded" in _helper.last_text
+    assert "Processed:" not in _helper.last_text
 
 
 def test_empty_history_does_not_fabricate_a_summary(monkeypatch):
@@ -348,8 +384,8 @@ def test_empty_history_does_not_fabricate_a_summary(monkeypatch):
     tasks = _capture_task(monkeypatch)
     _run(history._run_action(_event(), "", PANEL_CHAT))
     _run(tasks[0])
-    assert "History: empty." in _client.last_text
-    assert "There are no messages to summarize" in _client.last_text
+    assert "History: empty." in _helper.last_text
+    assert "There are no messages to summarize" in _helper.last_text
 
 
 class _ClientHolder:
@@ -384,7 +420,6 @@ def _async(value):
 
 # ── timeout / stale writer ─────────────────────────────────────────────────
 
-
 def test_the_operation_has_an_explicit_timeout(monkeypatch):
     _wire_manual(monkeypatch)
 
@@ -397,8 +432,8 @@ def test_the_operation_has_an_explicit_timeout(monkeypatch):
     tasks = _capture_task(monkeypatch)
     _run(history._run_action(_event(), "", PANEL_CHAT))
     _run(tasks[0])
-    assert "timed out" in _client.value.last_text
-    assert "late summary" not in _client.value.last_text
+    assert "timed out" in _helper.last_text
+    assert "late summary" not in _helper.last_text
 
 
 def test_cancellation_propagates_without_a_terminal_fabrication(monkeypatch):
@@ -418,7 +453,7 @@ def test_cancellation_propagates_without_a_terminal_fabrication(monkeypatch):
             history._run_summary(
                 client, object(), chat_id=CHAT, chat_name="Alice", count=100,
                 focus="", panel_chat_id=PANEL_CHAT, panel_msg_id=PANEL_MSG,
-                inline_id=None, generation=gen,
+                inline_id=INLINE_ID, generation=gen,
             )
         )
         await asyncio.sleep(0)
@@ -427,7 +462,7 @@ def test_cancellation_propagates_without_a_terminal_fabrication(monkeypatch):
             await task
 
     _run(_scenario())
-    assert "should not render" not in client.last_text
+    assert "should not render" not in _helper.last_text
 
 
 def test_the_panel_provider_prompt_omits_ids_and_sender_metadata():
@@ -485,14 +520,14 @@ def test_a_superseded_operation_cannot_overwrite_the_newer_panel(monkeypatch):
         history._run_summary(
             client, object(), chat_id=CHAT, chat_name="Alice", count=100,
             focus="", panel_chat_id=PANEL_CHAT, panel_msg_id=PANEL_MSG,
-            inline_id=None, generation=generation,
+            inline_id=INLINE_ID, generation=generation,
         )
     )
+    assert _helper.edits == []
     assert client.edits == []
 
 
 # ── links ─────────────────────────────────────────────────────────────────
-
 
 def _wire_link(monkeypatch, message):
     client = _Client()
@@ -532,6 +567,7 @@ def test_link_run_uses_linked_id_plus_one_as_the_exclusive_boundary(monkeypatch)
     _run(
         history._link_input_handler(
             "https://t.me/news/500", CHAT, USER_MSG, PANEL_CHAT, PANEL_MSG,
+            INLINE_ID,
         )
     )
     _run(tasks[0])
@@ -540,8 +576,8 @@ def test_link_run_uses_linked_id_plus_one_as_the_exclusive_boundary(monkeypatch)
     assert calls[0]["count"] == 250
     assert calls[0]["instruction"] == "summarize decisions"
     assert calls[0]["current_message_id"] == linked + 1
-    assert "Ending at: #500" in client.last_text
-    assert "Range: #498 – #500" in client.last_text
+    assert "Ending at: #500" in _helper.last_text
+    assert "Range: #498 – #500" in _helper.last_text
     assert client.deleted == [(CHAT, [USER_MSG])]
 
 
@@ -551,6 +587,7 @@ def test_private_link_form_resolves_and_summarizes(monkeypatch):
     _run(
         history._link_input_handler(
             "https://t.me/c/3080318802/42", CHAT, USER_MSG, PANEL_CHAT, PANEL_MSG,
+            INLINE_ID,
         )
     )
     _run(tasks[0])
@@ -578,7 +615,7 @@ def test_tg_openmessage_form_resolves_and_summarizes(monkeypatch):
     _run(
         history._link_input_handler(
             "tg://openmessage?user_id=5406707941&message_id=209974",
-            CHAT, USER_MSG, PANEL_CHAT, PANEL_MSG,
+            CHAT, USER_MSG, PANEL_CHAT, PANEL_MSG, INLINE_ID,
         )
     )
     _run(tasks[0])
@@ -596,9 +633,10 @@ def test_an_invalid_link_is_rejected_before_any_resolution_or_ai(monkeypatch):
     _run(
         history._link_input_handler(
             "not a telegram link", CHAT, USER_MSG, PANEL_CHAT, PANEL_MSG,
+            INLINE_ID,
         )
     )
-    assert "not a Telegram message link" in client.last_text
+    assert "not a Telegram message link" in _helper.last_text
     assert client.deleted == [(CHAT, [USER_MSG])]
 
 
@@ -624,10 +662,11 @@ def test_link_failure_kinds_are_distinct(monkeypatch, kind, expected):
     _run(
         history._link_input_handler(
             "https://t.me/news/500", CHAT, USER_MSG, PANEL_CHAT, PANEL_MSG,
+            INLINE_ID,
         )
     )
     _run(tasks[0])
-    assert expected in client.last_text
+    assert expected in _helper.last_text
 
 
 def test_a_peer_or_message_mismatch_is_refused(monkeypatch):
@@ -636,20 +675,22 @@ def test_a_peer_or_message_mismatch_is_refused(monkeypatch):
     _run(
         history._link_input_handler(
             "https://t.me/c/3080318802/500", CHAT, USER_MSG, PANEL_CHAT, PANEL_MSG,
+            INLINE_ID,
         )
     )
     _run(tasks[0])
-    assert "requested chat" in client.last_text
+    assert "requested chat" in _helper.last_text
 
     wrong_id = SimpleNamespace(id=499, chat_id=-1003080318802, chat=None)
     client, _calls, tasks = _wire_link(monkeypatch, wrong_id)
     _run(
         history._link_input_handler(
             "https://t.me/c/3080318802/500", CHAT, USER_MSG, PANEL_CHAT, PANEL_MSG,
+            INLINE_ID,
         )
     )
     _run(tasks[0])
-    assert "requested message" in client.last_text
+    assert "requested message" in _helper.last_text
 
 
 def test_no_permanent_worker_or_loop_is_introduced():
@@ -701,23 +742,24 @@ def test_the_exclusive_boundary_includes_the_linked_message_and_excludes_newer()
     assert client.max_ids[0] == 13
 
 
-# ── result delivery: long media panels, text replacement, honest failure ────
+# ── result delivery: the Helper Bot edits the ORIGINAL panel ────────────────
 
 
 class _Lifecycle:
-    def __init__(self, ok=True, raises=None):
-        self.ok = ok
-        self.raises = raises
+    def __init__(self):
         self.calls: list[tuple[int, int, str, str]] = []
 
     async def replace_panel(self, chat_id, msg_id, panel_id, extra=""):
         self.calls.append((chat_id, msg_id, panel_id, extra))
-        if self.raises is not None:
-            raise self.raises
-        return self.ok
+        return True
 
 
-def _wire_delivery(monkeypatch, summary, *, media=True, long_edits_fail=False):
+def _patch_lifecycle(monkeypatch, lifecycle):
+    """Make ANY lifecycle replacement in this test visible (it must be none)."""
+    monkeypatch.setattr(lifecycle_module, "get_lifecycle", lambda: lifecycle)
+
+
+def _wire_delivery(monkeypatch, summary, *, media=True):
     client = _Client([_user(1234, "Alice")])
     _client.value = client
     monkeypatch.setattr(history, "get_self_client", lambda: client)
@@ -737,197 +779,154 @@ def _wire_delivery(monkeypatch, summary, *, media=True, long_edits_fail=False):
     history._STATE.chat_name = "Alice"
     if media:
         appearance_service.note_delivered(PANEL_CHAT, PANEL_MSG, ("media", "v1"))
-    if long_edits_fail:
-        async def _edit(chat_id, msg_id, text=None, **kwargs):
-            client.edits.append((chat_id, msg_id, text))
-            if len(text or "") > appearance_service.MAX_CAPTION_CHARS:
-                raise RuntimeError(
-                    "The caption is too long (caused by EditInlineBotMessageRequest)"
-                )
-
-        monkeypatch.setattr(client, "edit_message", _edit)
     return client
 
 
-def _summary_run(client):
+def _summary_run(client, *, inline_id=INLINE_ID):
     generation = history.begin_panel_operation(PANEL_CHAT, PANEL_MSG)
     _run(
         history._run_summary(
             client, object(), chat_id=CHAT, chat_name="Alice", count=100,
             focus="", panel_chat_id=PANEL_CHAT, panel_msg_id=PANEL_MSG,
-            inline_id=None, generation=generation,
+            inline_id=inline_id, generation=generation,
         )
     )
     return generation
 
 
-def test_a_long_media_summary_is_delivered_as_a_text_result(monkeypatch):
-    summary = "Summary " + "x" * 1500
-    client = _wire_delivery(monkeypatch, summary)
+def test_the_result_edits_the_original_panel_through_the_helper_bot(monkeypatch):
+    client = _wire_delivery(monkeypatch, "A short summary.", media=False)
     lifecycle = _Lifecycle()
-    monkeypatch.setattr(history, "get_lifecycle", lambda: lifecycle)
+    _patch_lifecycle(monkeypatch, lifecycle)
 
     _summary_run(client)
 
-    # The caption-bound edit is never attempted; the panel is replaced.
-    assert all(summary not in (text or "") for _c, _m, text in client.edits)
-    assert len(lifecycle.calls) == 1
-    chat_id, msg_id, panel_id, extra = lifecycle.calls[0]
-    assert (chat_id, msg_id, panel_id) == (PANEL_CHAT, PANEL_MSG, "history")
-    assert extra.startswith("result:")
-
-    results = _run(history._inline_builder(None, extra))
-    assert results[0].type == "article"
-    text = results[0].send_message.message
-    assert summary in text
-    assert len(text) > appearance_service.MAX_CAPTION_CHARS
-    assert len(text) <= history.MAX_RESULT_TEXT_CHARS
-    markup = results[0].send_message.reply_markup
-    datas = [
-        button.data.decode() if isinstance(button.data, bytes) else str(button.data)
-        for row in markup.rows for button in row.buttons
-    ]
-    assert any(data.startswith("panel:history") for data in datas)
-    assert "panel:_nav:home" in datas and "panel:_nav:close" in datas
-    # One-shot: the token cannot be replayed by another render.
-    assert _run(history._inline_builder(None, extra))[0].send_message.message != text
-
-
-def test_a_short_result_still_renders_in_place(monkeypatch):
-    client = _wire_delivery(monkeypatch, "A short summary.")
-    lifecycle = _Lifecycle()
-    monkeypatch.setattr(history, "get_lifecycle", lambda: lifecycle)
-
-    _summary_run(client)
-
+    assert "A short summary." in _helper.last_text
+    assert "Range: #1 – #5" in _helper.last_text
+    # The edit addresses the exact inline message the callback belongs to.
+    assert _helper.edits[-1][0] is INLINE_ID
+    # The owner's self client never edits the panel ...
+    assert client.edits == []
+    # ... and nothing is replaced or created anywhere.
     assert lifecycle.calls == []
-    assert "A short summary." in client.last_text
-    assert "Range: #1 – #5" in client.last_text
 
 
-def test_text_replacement_bounds_oversized_output_deterministically():
-    body = "y" * 10000
-    bounded = history._bounded_result_body(body)
-    assert len(history._result_text(bounded)) <= history.MAX_RESULT_TEXT_CHARS
-    assert bounded.endswith("message limit)")
-    assert bounded.startswith("y" * 100)
-    assert history._bounded_result_body(body) == bounded
+def test_the_helper_bot_is_the_only_client_that_edits_the_panel(monkeypatch):
+    client = _wire_delivery(monkeypatch, "short", media=False)
+    _summary_run(client)
+
+    assert _helper.edits, "the Helper Bot must perform the edits"
+    assert client.edits == []
 
 
-def test_a_failed_edit_is_never_reported_as_a_delivered_summary(
+def test_a_long_media_summary_is_bounded_into_the_same_panel(monkeypatch):
+    summary = "Summary " + "x" * 1500
+    client = _wire_delivery(monkeypatch, summary, media=True)
+    lifecycle = _Lifecycle()
+    _patch_lifecycle(monkeypatch, lifecycle)
+
+    _summary_run(client)
+
+    text = _helper.last_text
+    assert summary in text or text.startswith("**History & Intelligence**")
+    assert len(text) <= appearance_service.MAX_CAPTION_CHARS
+    assert "bounded to this panel's Telegram limit" in text
+    assert summary[:200] in text
+    assert _helper.edits[-1][0] is INLINE_ID
+    assert client.edits == []
+    assert lifecycle.calls == []
+
+
+def test_a_long_text_panel_summary_keeps_the_full_text(monkeypatch):
+    summary = "Summary " + "y" * 1500
+    client = _wire_delivery(monkeypatch, summary, media=False)
+    lifecycle = _Lifecycle()
+    _patch_lifecycle(monkeypatch, lifecycle)
+
+    _summary_run(client)
+
+    text = _helper.last_text
+    assert summary in text
+    assert len(text) <= history.MAX_RESULT_TEXT_CHARS
+    assert "bounded" not in text
+    assert lifecycle.calls == []
+
+
+def test_a_permission_refusal_is_classified_and_never_a_success(
     monkeypatch, caplog,
 ):
-    from backend.helper.panel_edit import panel_operation_is_current
-
-    client = _wire_delivery(monkeypatch, "small summary", media=False)
-    lifecycle = _Lifecycle(ok=False)
-    monkeypatch.setattr(history, "get_lifecycle", lambda: lifecycle)
-    painted: list[str] = []
-
-    async def _paint(editor, body, buttons=None):
-        painted.append(body)
-        return "could not be delivered" in body
-
-    monkeypatch.setattr(history, "_paint", _paint)
-
-    with caplog.at_level(logging.WARNING):
-        generation = _summary_run(client)
-
-    assert any("could not be delivered" in body for body in painted)
-    assert "HISTORY_RESULT_DELIVERY_FAILED" in caplog.text
-    assert panel_operation_is_current(PANEL_CHAT, PANEL_MSG, generation) is False
-
-
-def test_no_replacement_is_sent_outside_the_owners_own_chat(monkeypatch, caplog):
-    client = _wire_delivery(monkeypatch, "z" * 1500, long_edits_fail=True)
-    monkeypatch.setattr(history, "_OWNER_ID", 123456)
+    client = _wire_delivery(monkeypatch, "short summary", media=False)
     lifecycle = _Lifecycle()
-    monkeypatch.setattr(history, "get_lifecycle", lambda: lifecycle)
+    _patch_lifecycle(monkeypatch, lifecycle)
+    _helper.error = type("ChatAdminRequiredError", (Exception,), {})("no rights")
 
     with caplog.at_level(logging.WARNING):
         _summary_run(client)
 
+    assert "HISTORY_RESULT_DELIVERY_FAILED" in caplog.text
+    assert "reason=helper_panel_edit_failed" in caplog.text
+    assert "error=ChatAdminRequiredError" in caplog.text
+    assert "kind=permission" in caplog.text
+    assert "HISTORY_RESULT_DELIVERED" not in caplog.text
     assert lifecycle.calls == []
-    assert "destination_not_owner_private" in caplog.text
-    assert "could not be delivered" in client.last_text
+    assert client.edits == []
 
 
-def test_the_caption_limit_is_not_applied_to_the_text_path(monkeypatch):
-    summary = "s" * history.MAX_SUMMARY_CHARS
-    client = _wire_delivery(monkeypatch, summary)
+def test_an_invalid_or_deleted_panel_never_creates_a_replacement(
+    monkeypatch, caplog,
+):
+    client = _wire_delivery(monkeypatch, "short summary", media=False)
     lifecycle = _Lifecycle()
-    monkeypatch.setattr(history, "get_lifecycle", lambda: lifecycle)
+    _patch_lifecycle(monkeypatch, lifecycle)
+    _helper.error = type("MessageIdInvalidError", (Exception,), {})("gone")
 
-    _summary_run(client)
+    with caplog.at_level(logging.WARNING):
+        _summary_run(client)
 
-    extra = lifecycle.calls[0][3]
-    text = _run(history._inline_builder(None, extra))[0].send_message.message
-    assert len(text) > appearance_service.MAX_CAPTION_CHARS
-    assert summary in text
-
-
-# ── Focus: save, clear, bound, and delivery through the corrected path ──────
-
-
-def _wire_focus(monkeypatch, summary):
-    calls: list[dict] = []
-    client = _Client([_user(1234, "Alice")])
-    _client.value = client
-    monkeypatch.setattr(history, "get_self_client", lambda: client)
-    monkeypatch.setattr(
-        history, "_list_chats", lambda _c: _async(([_chat(1234, "Alice")], "")),
-    )
-    monkeypatch.setattr(history, "_manager", lambda: object())
-
-    async def _summarize(source, chat_id, **kwargs):
-        calls.append(dict(kwargs))
-        return True, summary, {
-            "requested": kwargs["count"], "processed": 3, "truncated": False,
-            "capped": False, "first_message_id": 1, "last_message_id": 3,
-        }
-
-    monkeypatch.setattr(history.history_ai_service, "summarize_history", _summarize)
-    history._STATE.chat_id = 1234
-    history._STATE.chat_name = "Alice"
-    return client, calls
+    assert "kind=invalid_reference" in caplog.text
+    assert "HISTORY_RESULT_DELIVERED" not in caplog.text
+    assert lifecycle.calls == []
+    assert client.edits == []
 
 
-def test_a_valid_focus_instruction_is_saved_and_reaches_the_summarizer(monkeypatch):
-    client, calls = _wire_focus(monkeypatch, "focused result")
-    tasks = _capture_task(monkeypatch)
+def test_no_inline_handle_fails_honestly_without_any_fallback(
+    monkeypatch, caplog,
+):
+    client = _wire_delivery(monkeypatch, "short summary", media=False)
+    lifecycle = _Lifecycle()
+    _patch_lifecycle(monkeypatch, lifecycle)
 
-    _run(history._focus_input_handler("  keep   decisions ", CHAT, USER_MSG, PANEL_CHAT, PANEL_MSG))
-    assert history._STATE.focus == "keep decisions"
+    with caplog.at_level(logging.WARNING):
+        _summary_run(client, inline_id=None)
 
-    _run(history._run_action(_event(), "", PANEL_CHAT))
-    _run(tasks[0])
-
-    assert calls[0]["instruction"] == "keep decisions"
-    assert "focused result" in client.last_text
-
-
-def test_an_empty_focus_instruction_clears_the_previous_value(monkeypatch):
-    client, calls = _wire_focus(monkeypatch, "unfocused result")
-    history._STATE.focus = "old focus"
-    tasks = _capture_task(monkeypatch)
-
-    _run(history._focus_input_handler("   ", CHAT, USER_MSG, PANEL_CHAT, PANEL_MSG))
-    assert history._STATE.focus == ""
-
-    _run(history._run_action(_event(), "", PANEL_CHAT))
-    _run(tasks[0])
-    assert calls[0]["instruction"] is None
+    assert "kind=no_inline_panel_handle" in caplog.text
+    assert "HISTORY_RESULT_DELIVERED" not in caplog.text
+    assert _helper.edits == []
+    assert client.edits == []
+    assert lifecycle.calls == []
 
 
-def test_an_over_limit_focus_is_rejected_without_replacing_the_previous_value(monkeypatch):
-    client, _calls = _wire_focus(monkeypatch, "unused")
-    history._STATE.focus = "previous"
-    too_long = "x" * (history.history_ai_service.MAX_INSTRUCTION_CHARS + 1)
+def test_delivery_text_bounds_media_and_text_panels_differently():
+    body = "z" * 4000
+    media_text = history._delivery_text(body, media_panel=True)
+    plain_text = history._delivery_text(body, media_panel=False)
+    assert len(media_text) <= appearance_service.MAX_CAPTION_CHARS
+    assert media_text.endswith("Telegram limit)")
+    assert len(plain_text) <= history.MAX_RESULT_TEXT_CHARS
+    assert history._delivery_text(body, media_panel=False) == plain_text
 
-    _run(history._focus_input_handler(too_long, CHAT, USER_MSG, PANEL_CHAT, PANEL_MSG))
 
-    assert history._STATE.focus == "previous"
-    assert "characters or fewer" in client.last_text
+def test_no_saved_messages_delivery_path_exists_in_history():
+    source = open(history.__file__, encoding="utf-8").read()
+    assert "Saved Messages" not in source
+    assert "replace_panel" not in source
+    assert "get_lifecycle" not in source
+    assert "destination_not_owner_private" not in source
+    assert "no_safe_text_path" not in source
+    assert "_RESULT_VIEWS" not in source
+    # No second Telegram client / lifecycle is created by this handler.
+    assert "TelegramClient(" not in source
+    assert "build_helper" not in source
 
 
 def test_a_focused_long_summary_uses_the_corrected_delivery(monkeypatch):
@@ -936,20 +935,17 @@ def test_a_focused_long_summary_uses_the_corrected_delivery(monkeypatch):
     history._STATE.focus = "decisions only"
     appearance_service.note_delivered(PANEL_CHAT, PANEL_MSG, ("media", "v1"))
     lifecycle = _Lifecycle()
-    monkeypatch.setattr(history, "get_lifecycle", lambda: lifecycle)
+    _patch_lifecycle(monkeypatch, lifecycle)
     tasks = _capture_task(monkeypatch)
 
     _run(history._run_action(_event(), "", PANEL_CHAT))
     _run(tasks[0])
 
     assert calls[0]["instruction"] == "decisions only"
-    assert all(summary not in (text or "") for _c, _m, text in client.edits)
-    extra = lifecycle.calls[0][3]
-    text = _run(history._inline_builder(None, extra))[0].send_message.message
-    assert summary in text
-
-
-# ── Link summaries use the same corrected delivery ─────────────────────────
+    assert summary[:200] in _helper.last_text
+    assert len(_helper.last_text) <= appearance_service.MAX_CAPTION_CHARS
+    assert client.edits == []
+    assert lifecycle.calls == []
 
 
 def test_a_long_link_summary_uses_the_corrected_delivery(monkeypatch):
@@ -979,19 +975,93 @@ def test_a_long_link_summary_uses_the_corrected_delivery(monkeypatch):
     monkeypatch.setattr(history.history_ai_service, "summarize_history", _summary)
     appearance_service.note_delivered(PANEL_CHAT, PANEL_MSG, ("media", "v1"))
     lifecycle = _Lifecycle()
-    monkeypatch.setattr(history, "get_lifecycle", lambda: lifecycle)
+    _patch_lifecycle(monkeypatch, lifecycle)
     tasks = _capture_task(monkeypatch)
 
     _run(
         history._link_input_handler(
             "https://t.me/news/500", CHAT, USER_MSG, PANEL_CHAT, PANEL_MSG,
+            INLINE_ID,
         )
     )
     _run(tasks[0])
 
     assert calls[0]["current_message_id"] == linked + 1
-    assert all(summary not in (text or "") for _c, _m, text in client.edits)
-    extra = lifecycle.calls[0][3]
-    text = _run(history._inline_builder(None, extra))[0].send_message.message
-    assert summary in text
-    assert "Ending at: #500" in text
+    assert summary[:200] in _helper.last_text
+    assert "Ending at: #500" in _helper.last_text
+    assert len(_helper.last_text) <= appearance_service.MAX_CAPTION_CHARS
+    assert client.edits == []
+    assert lifecycle.calls == []
+
+
+def _wire_focus(monkeypatch, summary):
+    calls: list[dict] = []
+    client = _Client([_user(1234, "Alice")])
+    _client.value = client
+    monkeypatch.setattr(history, "get_self_client", lambda: client)
+    monkeypatch.setattr(
+        history, "_list_chats", lambda _c: _async(([_chat(1234, "Alice")], "")),
+    )
+    monkeypatch.setattr(history, "_manager", lambda: object())
+
+    async def _summarize(source, chat_id, **kwargs):
+        calls.append(dict(kwargs))
+        return True, summary, {
+            "requested": kwargs["count"], "processed": 3, "truncated": False,
+            "capped": False, "first_message_id": 1, "last_message_id": 3,
+        }
+
+    monkeypatch.setattr(history.history_ai_service, "summarize_history", _summarize)
+    history._STATE.chat_id = 1234
+    history._STATE.chat_name = "Alice"
+    return client, calls
+
+
+def test_a_valid_focus_instruction_is_saved_and_reaches_the_summarizer(monkeypatch):
+    client, calls = _wire_focus(monkeypatch, "focused result")
+    tasks = _capture_task(monkeypatch)
+
+    _run(
+        history._focus_input_handler(
+            "  keep   decisions ", CHAT, USER_MSG, PANEL_CHAT, PANEL_MSG, INLINE_ID,
+        )
+    )
+    assert history._STATE.focus == "keep decisions"
+
+    _run(history._run_action(_event(), "", PANEL_CHAT))
+    _run(tasks[0])
+
+    assert calls[0]["instruction"] == "keep decisions"
+    assert "focused result" in _helper.last_text
+
+
+def test_an_empty_focus_instruction_clears_the_previous_value(monkeypatch):
+    client, calls = _wire_focus(monkeypatch, "unfocused result")
+    history._STATE.focus = "old focus"
+    tasks = _capture_task(monkeypatch)
+
+    _run(
+        history._focus_input_handler(
+            "   ", CHAT, USER_MSG, PANEL_CHAT, PANEL_MSG, INLINE_ID,
+        )
+    )
+    assert history._STATE.focus == ""
+
+    _run(history._run_action(_event(), "", PANEL_CHAT))
+    _run(tasks[0])
+    assert calls[0]["instruction"] is None
+
+
+def test_an_over_limit_focus_is_rejected_without_replacing_the_previous_value(monkeypatch):
+    client, _calls = _wire_focus(monkeypatch, "unused")
+    history._STATE.focus = "previous"
+    too_long = "x" * (history.history_ai_service.MAX_INSTRUCTION_CHARS + 1)
+
+    _run(
+        history._focus_input_handler(
+            too_long, CHAT, USER_MSG, PANEL_CHAT, PANEL_MSG, INLINE_ID,
+        )
+    )
+
+    assert history._STATE.focus == "previous"
+    assert "characters or fewer" in _helper.last_text

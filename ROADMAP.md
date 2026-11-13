@@ -345,35 +345,34 @@ candidate pipeline exists.
   identifier isolation. Existing history-service and history-AI tests remain
   green.
 
-#### P1 result-delivery hotfix (production evidence)
+#### P1 result-delivery correction (production evidence, final)
 
 Status: **Fixed in code and offline tests; live Telegram verification still
-outstanding.** Deployed logs showed the summary itself succeeding but the final
-panel edit failing with `The caption is too long` and the fallback self-client
-edit failing with `The action must be performed through an inline bot callback`,
-leaving the panel on its progress state.
+outstanding.** The previous hotfix replaced a caption-bound panel via
+`PanelLifecycleManager.replace_panel`, but replacement was allowed only in the
+owner's own private chat, so a History panel in a group failed with
+`destination_not_owner_private` / `no_safe_text_path`.
 
-- Root cause: with Appearance preview active the panel is a PHOTO message, so
-  its text is a caption bounded to 1024 characters, while the summary body may
-  reach 2800 plus metadata. `_run_summary` ignored `_paint()`'s `False` return,
-  so a refused edit still completed the operation as if delivered.
-- Fix: the delivery state recorded by `appearance_service` selects the path. A
-  media panel whose result exceeds the caption limit (or any refused final
-  edit) is delivered by `PanelLifecycleManager.replace_panel` as ONE text-only
-  panel: the non-empty replacement extra makes Appearance skip media
-  composition, the result view is carried by a bounded one-shot token, and the
-  existing lifecycle creates the new message before deleting the old one. No
-  second client, listener, worker, scheduler or persistence is added.
-- Safety: replacement is allowed only when the panel chat is the owner's OWN
-  private chat (Saved Messages); elsewhere the panel receives a short honest
-  failure notice and `HISTORY_RESULT_DELIVERY_FAILED` is logged. A failed
-  Telegram edit is never reported as a delivered summary.
+- Root cause: the panel is an inline result owned by the Helper Bot
+  (`inline_engine.trigger` → `result.click`), so only the Helper Bot's
+  `messages.editInlineBotMessage`, using the callback's inline message id, can
+  edit it. The old path also offered a self-client chat edit (invalid for an
+  inline-bot message) and then a replacement gated to the owner's private chat,
+  which is unreachable from the recorded group.
+- Fix: `history._editor` supplies only the Helper Bot (`self_client=None`);
+  delivery always edits the ORIGINAL panel through the callback's
+  `InputBotInlineMessageID`. The recorded delivery state chooses only the text
+  bound: a photo panel is a 1024-character caption (bounded with a visible
+  marker), a text panel carries up to 4096. No replacement panel, no Saved
+  Messages delivery and no "rerun from Saved Messages" instruction exists.
+- Failure: a refused edit is classified by Telegram error type and logged as
+  `HISTORY_RESULT_DELIVERY_FAILED reason=helper_panel_edit_failed`; the failure
+  notice uses the same panel, and a failed edit is never reported as delivered.
 - Focus was not independently defective: its save/normalize/clear path and the
-  `instruction=focus or None` pass-through are correct and now covered by
-  regression tests; Focus summaries were affected only by the shared delivery
-  defect.
+  `instruction=focus or None` pass-through are correct and covered by
+  regression tests.
 - Live verification remains outstanding: it requires a real Telegram run with
-  Appearance preview active and a summary above 1024 characters.
+  the Helper Bot connected and a History panel in the same chat.
 
 ### Feature-level acceptance criteria
 
@@ -412,7 +411,8 @@ leaving the panel on its progress state.
   migration, settings or runtime change.
 - **P1 — complete in code and offline tests.** Panel, bounded chat picker,
   manual and link summarization, range reporting and failure rendering are
-  implemented with the existing engine. Live account runs were not possible in
+  implemented with the existing engine, and the summary is delivered by the
+  Helper Bot editing the original panel in place. Live account runs were not possible in
   the delivery environment and remain the owner's acceptance step. No schema
   was required or changed.
 - **P2–P7 — not started.** Each begins only after the previous phase's

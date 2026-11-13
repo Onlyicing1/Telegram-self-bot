@@ -1,170 +1,164 @@
-# IMPLEMENTATION REPORT — AI candidate pool survives restart
+# IMPLEMENTATION REPORT — History summary delivered by editing the original panel
 
-## 1. Scope and production evidence
+_Base commit: `c18a2d5baeceefa66f064712bd36eba638b8faa5` (`main`, the
+test-workspace deployment carrying the failure). This document replaces all
+earlier reports; only the current verified state is described._
 
-Deployed commit: `16071f6a4264fc4d062540f201b099b83e137204` (`main`).
+## 1. Root cause (verified)
 
-A History Summary request failed with `AI_CANDIDATES_EXHAUSTED` after:
+The History workflow completed retrieval and AI generation; delivery failed
+with `destination_not_owner_private` and then `no_safe_text_path`.
 
-- Gemini / `gemini-3.1-flash-lite` → API 503;
-- NaraRouter / `deepseek-v4-flash` → rate limited;
-- OpenAI / `gpt-4o` → rate limited.
+`backend/bot/handlers/history.py::_deliver_result` never reached a supported
+edit when the panel was a photo message with a long summary:
 
-Routing logs showed `models=1` for Gemini, NaraRouter and OpenAI, `models=0` for
-Groq, SambaNova and Cohere, OpenRouter disabled and You.com excluded. The
-investigation is in `INVESTIGATION.md`; this report covers what was changed and
-what was actually verified.
+- with Appearance preview active the panel is delivered as an **inline photo
+  result**, so its text is a caption (1024 characters) while the summary body
+  can reach 2800 plus metadata;
+- the code therefore called `_replace_with_text_result`, which creates a
+  **replacement panel** through `PanelLifecycleManager.replace_panel`;
+- that replacement was gated by `_owner_private_destination()` — allowed only
+  when the panel chat equals the owner's own private chat. The recorded panel
+  source chat `-1002750223875` is a group, so it was refused with
+  `destination_not_owner_private`, and the operation ended with
+  `no_safe_text_path`.
 
-## 2. Root cause
+The same function's normal edit path built `ExistingPanelEditor` with BOTH the
+Helper Bot and the owner's self-bot client. For an inline-bot message the
+self-client edit is invalid (only the bot that sent the inline result may edit
+it), so that fallback could only hide the real failure. The failure text also
+instructed the owner to rerun from a Saved Messages panel, which is prohibited.
 
-1. `ProviderManager._model_candidates` is an in-memory dict.
-2. It is fed only by `backend/ai/model_tester.py::_feed_production_candidates()`
-   at the end of a Test Modules run in the same process.
-3. Startup (`RuntimeSupervisor`) applies the persisted provider configuration
-   but never restores or refreshes candidate models; the saved Test snapshot is
-   explicitly display-only and was never read by routing.
-4. Consequently every restart/redeploy starts with an empty pool, so each
-   provider contributes only its configured default model. A provider whose
-   configured model is already unavailable contributes zero candidates
-   (`models=0`). The fallback loop itself iterates every pair it is given and
-   was not truncating anything.
-5. A second defect: a partial Test Modules run (overall timeout/cancellation)
-   still published its incomplete AVAILABLE set, which could shrink a complete
-   in-memory pool.
+## 2. Helper Bot ownership and editing mechanism
 
-## 3. Implemented changes
+The History panel is an inline result: `inline_engine.trigger` runs
+`self_client.inline_query(helper, query)` and sends `result.click(chat)`, so the
+message is sent by the owner's account with the Helper Bot as `via_bot` and its
+inline-bot identity belongs to the Helper Bot. The callback arrives at the
+Helper Bot with `query.msg_id` as an `InputBotInlineMessageID` /
+`InputBotInlineMessageID64`.
 
-### `backend/ai/candidate_pool.py` (new)
+`history._editor` now builds `ExistingPanelEditor` with `helper=get_client()`
+and **`self_client=None`**, and `_run_action`/input handlers pass the inline
+handle obtained from the callback (`inline_message_id_from_event`). The edit is
+`messages.editInlineBotMessage` via Telethon's
+`edit_message(InputBotInlineMessageID, text=..., buttons=...)` — the same
+mechanism already used by `backend/bot/handlers/appearance.py` and the Save
+progress path. The owner's self-bot client is never supplied as an editor, and
+no second client is created.
 
-Durable, bounded publication of the proven candidate feed:
+## 3. Files changed
 
-- one `bot_settings` JSON document at `ai_model_candidates:v1`, through the
-  existing generic `settings_document_write` / `settings_document_state` API —
-  no new table, column, migration, SQL, or `DATABASE_ARCHITECTURE.md` change;
-- schema version, `published_at`, provider→model lists (ordered), bounded to 32
-  providers × 256 models × 200 chars, de-duplicated, `dummy` excluded;
-- provider entries with an empty list are persisted deliberately so a complete
-  run with no AVAILABLE model clears the restored entry;
-- refuse documents that are missing, unreadable, malformed, unsupported,
-  future-dated beyond clock skew, or older than `MAX_AGE_S = 24 h`;
-- `restore(manager)` populates only providers currently registered in the
-  process and returns an explicit status (`restored`, `missing`, `stale`,
-  `unavailable`, `malformed`, `no_registered_provider`) for boot logging;
-- a persistence failure returns `False`; it never breaks the live run, which
-  has already been armed in memory.
+| File | Change |
+|---|---|
+| `backend/bot/handlers/history.py` | Helper-Bot-only `_editor`; delivery edits the original panel; caption-aware text bound; Telegram-error classification; removed the replacement/Saved-Messages delivery path, result-view tokens and the "rerun from Saved Messages" notice |
+| `backend/helper/panel_edit.py` | `ExistingPanelEditor.last_error` records the refused exception TYPE (no behavior change for successful edits; stale generations are labelled) |
+| `tests/test_history_panel.py` | Replaced delivery tests: Helper Bot ownership, in-place edit, caption/text bounds, permission and invalid-reference classification, missing-handle behavior, no replacement, no Saved Messages, no self-client edit; existing retrieval/AI/link tests kept |
+| `INVESTIGATION.md`, `IMPLEMENTATION_REPORT.md` | Replaced in full with this verified state |
+| `ROADMAP.md` | P1 delivery record corrected to the Helper-Bot inline-edit approach |
 
-The document is a candidate list, not an availability guarantee. Restored
-candidates are still attempted by the normal router, and a failing pair is
-cooled down or marked unavailable by the existing `ProviderManager` rules.
+Not changed: `history_service`, `history_ai_service`, ProviderManager/candidate
+behavior, prompts, panel lifecycle for other features, Appearance composition,
+other Saved Messages flows, database/schema, Render configuration.
+`DATABASE_ARCHITECTURE.md` was not modified and no SQL was executed.
 
-### `backend/ai/model_tester.py`
+## 4. Implemented behavior
 
-- `_feed_production_candidates(..., partial=False)` now publishes nothing when
-  `partial=True` (logs `CANDIDATE_POOL_SKIPPED reason=partial_run`) and returns
-  the exact feed it applied (including empty providers), or `None` when it did
-  not publish.
-- Both `test_all_models()` and `test_all_models_streaming()` pass
-  `partial=bool(pending)` and, only when the feed is not `None`, call
-  `candidate_pool.publish(feed)`.
-- Complete-run publication to ProviderManager is unchanged (all AVAILABLE,
-  free-first, configured model excluded, no cap); only durability and
-  partial-run safety were added.
+- **Edits the same message.** The summary is rendered into the original History
+  panel through the Helper Bot's inline edit. Message id, chat, `via_bot`
+  identity and the panel's keyboard/navigation context are preserved.
+- **Error-free short results.** A text panel carries the complete result up to
+  Telegram's 4096-character text limit; a photo panel carries a caption up to
+  1024.
+- **Long results.** On a media (photo) panel the text is deterministically
+  bounded to the caption limit with the visible marker
+  `… (bounded to this panel's Telegram limit)`, so the edit is valid and the
+  original message survives. On a text panel the full 2800-character summary
+  fits unchanged.
+- **No replacement, no redirection.** `_replace_with_text_result`,
+  `_owner_private_destination`, the one-shot `_RESULT_VIEWS` tokens, the
+  `replace_panel` call and the Saved Messages instruction were removed from the
+  History module. No new panel, message or chat is created in any failure path.
+- **Honest failure.** A refused edit is classified from the Telegram error type
+  (`permission`, `not_author`, `invalid_reference`, `caption_too_long`,
+  `text_too_long`, `no_inline_panel_handle`, `telegram_error`), logged as
+  `HISTORY_RESULT_DELIVERY_FAILED reason=helper_panel_edit_failed error=… kind=…`,
+  and never logged as `HISTORY_RESULT_DELIVERED`. The failure notice is
+  attempted on the same panel through the same Helper Bot editor; if that is
+  also refused, nothing is sent anywhere.
+- **One editing principal.** Progress, link, focus and result paints all use
+  the Helper Bot editor; the self-bot client is used only for non-panel
+  operations (deleting the owner's input message).
 
-### `backend/runtime/supervisor.py`
-
-- `_build_and_register()` now awaits `_restore_ai_model_candidates()` after
-  `_apply_ai_config_at_boot()` and before the update run loop starts, so a
-  production request cannot be served before the restore attempt.
-- The restore is bounded by `CANDIDATE_RESTORE_TIMEOUT_S = 10 s`; a timeout,
-  unreadable document or any exception is logged and never blocks startup.
-  RuntimeSupervisor remains the sole lifecycle owner — no new task, loop,
-  worker or scheduler is created.
-
-### `tests/test_model_candidate_pool.py` (new, 13 tests)
-
-Covers:
-
-- publish/load round-trip, ordering, empty-provider entries, durable-write
-  failure reporting;
-- missing vs unreadable vs malformed vs unsupported documents;
-- stale document refused and fresh document restores every model in order;
-- unregistered providers ignored (no stale references);
-- repeated restore does not duplicate candidates;
-- a complete feed arms every eligible provider and clears providers with none;
-- a partial feed preserves the existing pool and a partial test run publishes
-  nothing;
-- restored candidates are actually attempted after the configured model fails:
-  the configured model's transient retry runs, then the restored sibling model
-  succeeds (this exercises the real `ProviderManager.chat()` loop);
-- the supervisor boot hook calls `candidate_pool.restore(manager)`.
-
-## 4. Verification actually executed
-
-All commands were run in this workspace with the project's `.venv`
-(Python 3.12.3).
+## 5. Automated test results
 
 | Check | Command | Result |
-| --- | --- | --- |
-| Focused routing/model tester | `pytest tests/test_model_candidate_pool.py tests/test_dynamic_model_fallback.py tests/test_model_tester.py -q` | **100 passed** |
-| History/supervisor/provider-manager/fallback selection | `pytest tests -q --ignore=tests/test_runtime_session_terminal.py -k "history or supervisor or provider_manager or dynamic_model"` | **214 passed** |
-| Full suite | `pytest tests -q --ignore=tests/test_runtime_session_terminal.py` | **7584 passed, 6 failed, 27 skipped** (144 s) |
-| Compilation | `python -m py_compile backend/ai/candidate_pool.py backend/ai/model_tester.py backend/runtime/supervisor.py tests/test_model_candidate_pool.py` | passed |
-| Whitespace/diff | `git diff --check` | passed |
+|---|---|---|
+| Focused History panel suite | `pytest tests/test_history_panel.py -q` | **42 passed** |
+| Panel/lifecycle/callback/edit regressions | `pytest tests -q -k "history or panel or edit or callback or lifecycle or save_success or save_reply or taskloom"` | **881 passed, 3 skipped** |
+| Full suite | `pytest tests -q` | **7587 passed, 27 skipped, 6 failed** |
+| Compilation | `py_compile` on the changed modules + test file | exit 0 |
+| Whitespace | `git diff --check` | clean |
 
-The 6 full-suite failures are the unchanged pre-existing baseline, not
-regressions:
+The six full-suite failures are the documented pre-existing ones (five
+documentation-drift assertions in `test_database_setup_order`,
+`test_private_message_db_security`, `test_aed_db_security`,
+`test_canonical_schema_reconciliation`, and the known scheduler-recovery flake);
+none touches a file changed here and none was weakened.
 
-- `tests/test_aed_db_security.py::test_the_documentation_describes_the_restrictive_model`
-- `tests/test_canonical_schema_reconciliation.py::test_the_migration_is_forward_only_and_its_successors_stay_additive`
-- `tests/test_database_setup_order.py::test_the_section_does_not_pretend_the_sql_was_executed`
-- `tests/test_database_setup_order.py::test_the_waiting_answer_migration_is_absorbed_by_part_one`
-- `tests/test_private_message_db_security.py::test_the_rls_model_names_the_two_tables_as_server_only_exceptions`
-- `tests/test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`
+The focused tests assert in particular:
 
-`tests/test_runtime_session_terminal.py` was excluded because it is a
-pre-existing **untracked** file (present before this task) whose collection
-errors; it is unrelated and was not modified or staged.
+- a summary edit reaches the Helper Bot with the EXACT
+  `InputBotInlineMessageID64` from the callback, and the self client records no
+  edit;
+- media results are bounded to `appearance_service.MAX_CAPTION_CHARS` with the
+  marker, text results keep the full summary;
+- `ChatAdminRequiredError` is logged as `kind=permission` and
+  `MessageIdInvalidError` as `kind=invalid_reference`, with no
+  `HISTORY_RESULT_DELIVERED`;
+- no inline handle fails as `kind=no_inline_panel_handle` with zero edits, zero
+  self-client edits and zero lifecycle replacements;
+- the module contains no `Saved Messages`, `replace_panel`, `get_lifecycle`,
+  `_RESULT_VIEWS` or old failure reasons, and constructs no Telegram client.
 
-## 5. Behavioral contract after this change
+## 6. Original panel: edited in place
 
-- A complete Test Modules run still arms the live manager immediately and now
-  also persists the exact feed.
-- After a restart, RuntimeSupervisor restores that feed once, before updates can
-  run, for providers registered in that process.
-- A restored candidate is only a candidate: routing re-proves it with a real
-  request; a dead pair is cooled down/marked unavailable and the existing
-  fallback continues to the next model.
-- A feed older than 24 hours is not restored; startup logs the reason and
-  routing behaves as before (configured models only).
-- A partial/timed-out test run changes neither the live pool nor the durable
-  document.
+Automated tests prove the edit is addressed to the original inline message
+handle. Telegram actually permits this because the Helper Bot owns the inline
+result — the same API is already used for Appearance panels. **No live Telegram
+edit was performed from this workspace**, so end-to-end delivery is not claimed
+(see §8).
 
-## 6. Remaining limitations and live behavior not verified
+## 7. Saved Messages
 
-- **No Render deployment or live History Summary request was performed.** The
-  production path was verified by source tracing and deterministic tests only.
-- The actual Supabase `bot_settings` write/read of `ai_model_candidates:v1` was
-  not exercised against the live database; it uses the same generic document
-  API as the existing Test snapshot.
-- Whether the observed Render process had run Test Modules since its last
-  restart is not knowable from the logs. The source proves the in-memory pool
-  could not survive that restart regardless.
-- The exact prior failure category (permanent `model_not_found` vs cooldown)
-  for the `models=0` providers is not logged; the pair-level unavailable map is
-  in-memory.
-- The 24-hour freshness window is a deliberate safety bound, not a live
-  availability proof. A model can go down after a fresh test.
+The History delivery path contains **no** Saved Messages fallback, no
+replacement panel, no summary sent to Saved Messages, and no instruction to
+rerun from Saved Messages. The former owner-private gate and replacement code
+were deleted. Unrelated features that legitimately write to Saved Messages
+(Deep Save, retrieval) are untouched.
 
-## 7. Required owner action after deploy
+## 8. Live verification status and remaining limitations
 
-1. Deploy this commit.
-2. Run **Test Modules once to completion** in the deployed process. The old
-   process never had durable publication, so the first complete post-deploy run
-   is what creates `ai_model_candidates:v1`. Until then, startup restore reports
-   `missing` and routing is unchanged.
-3. Send a History Summary request and inspect the `ROUTER_SCORE` /
-   `AI_FALLBACK_START` / `CANDIDATE_POOL_RESTORE` logs. A restart followed by
-   another History Summary must show the restored `models=N` counts without
-   re-running Test Modules.
-4. If more than 24 hours pass before the next restart, refresh with another
-   complete Test Modules run; an older document is intentionally refused.
+- **Not live-verified.** This workspace has no Telegram session, helper bot
+  token, Render access or Supabase credentials. No real History run was issued
+  and no production log after the fix was observed. Verification requires
+  pressing Run Summary on a History panel and confirming the panel edits in
+  place with no `HISTORY_RESULT_DELIVERY_FAILED` line.
+- A photo panel's caption cannot carry the full 2800-character summary; the
+  delivered text is bounded and marked. This is a Telegram message-type limit,
+  not a truncation bug, and the panel is never replaced to gain space.
+- A Helper Bot that is disconnected, removed from the chat, or not the owner of
+  the inline result cannot edit. The failure is logged by type and the panel
+  keeps its previous content; nothing is redirected.
+- If a future panel is created as an ordinary message instead of an inline
+  result, no inline handle exists and delivery fails honestly; creating a second
+  panel was explicitly rejected.
+
+## 9. Git delivery
+
+One scoped commit on top of `c18a2d5`, pushed directly to `origin/main` (no
+branch, no pull request, no rebase, no force-push, no history rewrite). The
+commit SHA, push result and independently re-fetched remote HEAD agreement are
+recorded in the delivery message for this task. The working tree is clean.
+No Render deployment was triggered; the service's auto-deploy is outside this
+workspace's control and must be observed separately.

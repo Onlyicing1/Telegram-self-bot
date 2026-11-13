@@ -164,6 +164,9 @@ class ExistingPanelEditor:
         self._generation = int(generation or 0)
         self._applied: tuple[str, tuple] | None = None
         self._inline_failed = False
+        #: The exception TYPE of the last refused attempt, for honest reporting.
+        #: Empty when the last edit succeeded or nothing was attempted.
+        self.last_error = ""
 
     @property
     def path(self) -> str:
@@ -197,6 +200,7 @@ class ExistingPanelEditor:
         if self._generation and not panel_operation_is_current(
             self._chat_id, self._msg_id, self._generation
         ):
+            self.last_error = "StalePanelOperation"
             logger.info(
                 "[PANEL_EDIT] stale operation dropped (chat=%s msg=%s gen=%s)",
                 self._chat_id, self._msg_id, self._generation,
@@ -208,6 +212,7 @@ class ExistingPanelEditor:
         if self.path == "helper-inline":
             if await self._edit_inline(rendered, built):
                 self._applied = (rendered, markup)
+                self.last_error = ""
                 return True
             logger.warning(
                 "[PANEL_EDIT] inline edit refused for chat=%s msg=%s — "
@@ -218,8 +223,11 @@ class ExistingPanelEditor:
         if self._self_client is not None and self._chat_id and self._msg_id:
             if await self._edit_chat(rendered, built):
                 self._applied = (rendered, markup)
+                self.last_error = ""
                 return True
 
+        if not self.last_error:
+            self.last_error = "NoEditablePanel"
         return False
 
     async def _edit_inline(self, rendered: str, built: list) -> bool:
@@ -236,6 +244,7 @@ class ExistingPanelEditor:
             # One refusal is enough: stop paying for a failing RPC on every
             # later milestone and use the panel's own coordinates instead.
             self._inline_failed = True
+            self.last_error = type(exc).__name__
             logger.warning("[PANEL_EDIT] inline panel edit failed: %s", exc)
             return False
 
@@ -255,6 +264,7 @@ class ExistingPanelEditor:
         except Exception as exc:  # noqa: BLE001 — progress never aborts a save
             if "not modified" in str(exc).lower():
                 return True
+            self.last_error = type(exc).__name__
             logger.warning(
                 "[PANEL_EDIT] panel edit failed chat=%s msg=%s: %s",
                 self._chat_id, self._msg_id, exc,

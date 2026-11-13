@@ -17,8 +17,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import uuid
-from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
 
@@ -35,8 +33,7 @@ from backend.helper import (
 )
 from backend.helper import symbols as sym
 from backend.helper.client import get_client
-from backend.helper.inline_engine import get_owner_id, get_self_client
-from backend.helper.lifecycle import get_lifecycle
+from backend.helper.inline_engine import get_self_client
 from backend.helper.panel_edit import (
     ExistingPanelEditor,
     begin_panel_operation,
@@ -80,20 +77,10 @@ LINK_RESOLVE_TIMEOUT_S = 60.0
 MAX_SUMMARY_CHARS = 2800
 
 #: Telegram's own bound for a text message. A panel with Appearance preview is
-#: a PHOTO message, so its text is a CAPTION (1024); the same text sent as a
-#: plain text message has this larger bound. The replacement path below uses it
-#: only after the delivery state proves the panel is media.
+#: a PHOTO message, so its text is a CAPTION (``appearance_service.MAX_CAPTION_CHARS``);
+#: a plain text panel carries this larger bound. The panel's on-screen state
+#: decides only how much text the SAME message can take — never its destination.
 MAX_RESULT_TEXT_CHARS = 4096
-
-#: One-shot result views for a text-only panel replacement, keyed by the token
-#: carried in the inline query. Bounded and drained on read, so no growing state
-#: and no global "current result" a later operation could repaint.
-_RESULT_VIEWS: "OrderedDict[str, tuple[str, str, list]]" = OrderedDict()
-_RESULT_VIEWS_MAX = 8
-
-#: The owner id registered at startup; a replacement message may only go to the
-#: owner's OWN private chat (Saved Messages), never to a group or another user.
-_OWNER_ID = 0
 
 
 @dataclass
@@ -307,14 +294,23 @@ def _manager() -> Any:
 
 
 def _editor(
-    chat_id: int, msg_id: int, inline_id: Any, client: Any, generation: int = 0,
+    chat_id: int, msg_id: int, inline_id: Any, generation: int = 0,
 ) -> ExistingPanelEditor:
+    """The ONE editor for a History panel: the Helper Bot's inline edit.
+
+    The panel is an inline message whose inline-bot identity belongs to the
+    Helper Bot, so ``messages.editInlineBotMessage`` (Telethon's
+    ``edit_message(InputBotInlineMessageID, ...)``) is the supported edit. The
+    owner's self-bot client is deliberately NOT supplied: the account that sent
+    an inline-bot result cannot edit it, and substituting that account would
+    hide a real ownership failure instead of reporting it.
+    """
     return ExistingPanelEditor(
         chat_id=chat_id,
         msg_id=msg_id,
         inline_id=inline_id,
         helper=get_client(),
-        self_client=client,
+        self_client=None,
         generation=generation,
     )
 
@@ -327,69 +323,42 @@ def _result_text(body: str) -> str:
     return f"**{TITLE}**\n\n{body}"
 
 
-def _bounded_result_body(body: str) -> str:
-    """The body, deterministically bounded to a Telegram TEXT message.
+def _delivery_text(body: str, *, media_panel: bool) -> str:
+    """The result text THIS panel message can actually carry.
 
-    The summary body is already bounded to ``MAX_SUMMARY_CHARS``; this is the
-    explicit outer contract for the text replacement path, with a visible
-    marker, so oversized output can never be silently lost or rejected.
+    An inline photo panel's text is a CAPTION (Telegram's 1024-character
+    ceiling); a text panel carries up to ``MAX_RESULT_TEXT_CHARS``. The text is
+    bounded here with a visible marker, so an over-limit edit is never sent and
+    the original message is never replaced just to gain space.
     """
-    if len(_result_text(body)) <= MAX_RESULT_TEXT_CHARS:
-        return body
-    marker = "\n\n… (result truncated at Telegram's message limit)"
-    keep = MAX_RESULT_TEXT_CHARS - len(_result_text("")) - len(marker)
-    return body[: max(0, keep)].rstrip() + marker
+    limit = (
+        appearance_service.MAX_CAPTION_CHARS if media_panel
+        else MAX_RESULT_TEXT_CHARS
+    )
+    text = _result_text(body)
+    if len(text) <= limit:
+        return text
+    marker = "\n\n… (bounded to this panel's Telegram limit)"
+    keep = max(0, limit - len(marker))
+    return text[:keep].rstrip() + marker
 
 
-def _store_result_view(body: str, buttons: list) -> str:
-    token = uuid.uuid4().hex[:12]
-    _RESULT_VIEWS[token] = (TITLE, _bounded_result_body(body), buttons)
-    while len(_RESULT_VIEWS) > _RESULT_VIEWS_MAX:
-        _RESULT_VIEWS.popitem(last=False)
-    return token
+#: Telegram error → a stable, non-sensitive failure category for the log line.
+_EDIT_ERROR_KINDS: dict[str, str] = {
+    "MessageAuthorRequiredError": "not_author",
+    "ChatAdminRequiredError": "permission",
+    "ChatWriteForbiddenError": "permission",
+    "MessageDeleteForbiddenError": "permission",
+    "MessageIdInvalidError": "invalid_reference",
+    "MessageNotModifiedError": "not_modified",
+    "MessageTooLongError": "text_too_long",
+    "MediaCaptionTooLongError": "caption_too_long",
+    "NoEditablePanel": "no_inline_panel_handle",
+}
 
 
-def _owner_private_destination(panel_chat_id: int) -> bool:
-    """Only the owner's own private chat may receive a replacement message."""
-    owner = int(_OWNER_ID or get_owner_id() or 0)
-    return bool(owner) and int(panel_chat_id or 0) == owner
-
-
-async def _replace_with_text_result(
-    panel_chat_id: int,
-    panel_msg_id: int,
-    body: str,
-    buttons: list,
-) -> bool:
-    """Deliver a long result as a TEXT panel in the owner's own chat.
-
-    A photo panel's caption cannot carry the whole summary, and Telegram cannot
-    turn that message into text. The existing lifecycle replacement sends ONE
-    new inline result FIRST and deletes the old message only after it exists;
-    the non-empty query extra also makes Appearance skip the media composition,
-    so the result is a genuine text panel (its keyboard and navigation intact).
-    """
-    if not _owner_private_destination(panel_chat_id):
-        logger.warning("HISTORY_RESULT_DELIVERY_FAILED reason=destination_not_owner_private")
-        return False
-    token = _store_result_view(body, buttons)
-    try:
-        replaced = await get_lifecycle().replace_panel(
-            panel_chat_id, panel_msg_id, PANEL_ID, f"result:{token}",
-        )
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:  # noqa: BLE001 — an honest delivery failure
-        logger.warning(
-            "HISTORY_RESULT_DELIVERY_FAILED reason=replacement_raised error=%s",
-            type(exc).__name__,
-        )
-        return False
-    if not replaced:
-        logger.warning("HISTORY_RESULT_DELIVERY_FAILED reason=replacement_failed")
-        return False
-    logger.info("HISTORY_RESULT_DELIVERED path=text-replacement")
-    return True
+def _edit_failure_kind(error: str) -> str:
+    return _EDIT_ERROR_KINDS.get(str(error or ""), "telegram_error")
 
 
 async def _deliver_result(
@@ -399,22 +368,33 @@ async def _deliver_result(
     *,
     panel_chat_id: int,
     panel_msg_id: int,
-) -> bool:
-    """Paint the result, replacing a caption-bound photo panel when necessary."""
+) -> tuple[bool, str]:
+    """Edit the ORIGINAL panel with the result; never replace or redirect it.
+
+    The panel's on-screen delivery state decides only how much text Telegram
+    can carry (photo caption vs text message) — it never changes the
+    destination. The Helper Bot performs the edit (``_editor`` builds an
+    inline-only editor); a refusal is returned as an honest failure and no
+    other panel, chat or message is created.
+    """
     state = appearance_service.delivered_state(panel_chat_id, panel_msg_id)
-    media_panel = bool(state and state[0] == "media")
-    if media_panel and len(_result_text(body)) > appearance_service.MAX_CAPTION_CHARS:
-        return await _replace_with_text_result(
-            panel_chat_id, panel_msg_id, body, buttons,
-        )
-    if await _paint(editor, body, buttons):
-        return True
-    # The edit path itself can be refused (a caption-bound photo message, or a
-    # message only the inline bot may edit). The text replacement is the
-    # supported fallback; the refusal itself is never reported as success.
-    return await _replace_with_text_result(
-        panel_chat_id, panel_msg_id, body, buttons,
+    media_panel = (
+        state[0] == "media" if state else appearance_service.preview_active()
     )
+    text = _delivery_text(body, media_panel=media_panel)
+    if await editor.edit(text, buttons):
+        logger.info(
+            "HISTORY_RESULT_DELIVERED path=helper-inline-panel media=%s chars=%s",
+            media_panel, len(text),
+        )
+        return True, ""
+    error = editor.last_error or "NoEditablePanel"
+    kind = _edit_failure_kind(error)
+    logger.warning(
+        "HISTORY_RESULT_DELIVERY_FAILED reason=helper_panel_edit_failed "
+        "error=%s kind=%s", error, kind,
+    )
+    return False, kind
 
 
 def _range_line(data: dict[str, Any]) -> str:
@@ -485,7 +465,7 @@ async def _run_summary(
     current_message_id: int | None = None,
     ending_at: int | None = None,
 ) -> None:
-    editor = _editor(panel_chat_id, panel_msg_id, inline_id, client, generation)
+    editor = _editor(panel_chat_id, panel_msg_id, inline_id, generation)
     try:
         await _paint(
             editor,
@@ -531,7 +511,7 @@ async def _run_summary(
             body = (
                 f"Chat: {chat_name}\n{text or (sym.STATE_FAILED + ' Summarization failed.')}"
             )
-        delivered = await _deliver_result(
+        delivered, kind = await _deliver_result(
             editor,
             body,
             _result_buttons(),
@@ -539,14 +519,19 @@ async def _run_summary(
             panel_msg_id=panel_msg_id,
         )
         if not delivered:
-            logger.warning("HISTORY_RESULT_DELIVERY_FAILED reason=no_safe_text_path")
-            # The result exists but no supported surface could show it. Say so
-            # on the panel instead of leaving the owner on the progress state;
-            # a failed edit is never reported as a delivered summary.
-            await _paint(
-                editor,
-                f"{sym.STATE_FAILED} The summary could not be delivered to this "
-                "panel. Run it again from your own Saved Messages panel.",
+            logger.warning(
+                "HISTORY_RESULT_DELIVERY_FAILED reason=no_safe_panel_edit "
+                "kind=%s", kind,
+            )
+            # The result exists but this panel could not be edited. Say so on
+            # the SAME panel through the SAME Helper Bot edit; a failed edit is
+            # never reported as a delivered summary, and no other chat or
+            # message is ever created.
+            await editor.edit(
+                _result_text(
+                    f"{sym.STATE_FAILED} The summary could not be delivered to "
+                    f"this panel ({kind}). Nothing was sent anywhere else."
+                ),
                 _result_buttons(),
             )
     finally:
@@ -624,7 +609,7 @@ async def _focus_input_handler(
         _STATE.focus = value
         notice = "Focus: " + (value or "cleared")
     client = get_self_client()
-    editor = _editor(inline_chat_id or chat_id, inline_msg_id or msg_id, inline_id, client)
+    editor = _editor(inline_chat_id or chat_id, inline_msg_id or msg_id, inline_id)
     await _paint(editor, _panel_body(notice), _panel_buttons())
     if client is not None and msg_id:
         try:
@@ -669,7 +654,7 @@ async def _run_link(
     inline_id: Any,
     generation: int,
 ) -> None:
-    editor = _editor(panel_chat_id, panel_msg_id, inline_id, client, generation)
+    editor = _editor(panel_chat_id, panel_msg_id, inline_id, generation)
     try:
         await _paint(editor, "Resolving the message link…", _progress_buttons())
         message, error = await _resolve_link(client, target)
@@ -732,7 +717,7 @@ async def _link_input_handler(
     panel_chat_id = inline_chat_id or chat_id
     panel_msg_id = inline_msg_id or msg_id
     if target.error:
-        editor = _editor(panel_chat_id, panel_msg_id, inline_id, client)
+        editor = _editor(panel_chat_id, panel_msg_id, inline_id)
         await _paint(
             editor,
             f"{sym.STATE_FAILED} {target.error}.",
@@ -741,14 +726,14 @@ async def _link_input_handler(
     else:
         manager = _manager()
         if client is None:
-            editor = _editor(panel_chat_id, panel_msg_id, inline_id, client)
+            editor = _editor(panel_chat_id, panel_msg_id, inline_id)
             await _paint(
                 editor,
                 f"{sym.STATE_FAILED} Telegram is not connected right now.",
                 _panel_buttons(),
             )
         elif manager is None:
-            editor = _editor(panel_chat_id, panel_msg_id, inline_id, client)
+            editor = _editor(panel_chat_id, panel_msg_id, inline_id)
             await _paint(
                 editor,
                 f"{sym.STATE_FAILED} The AI engine is not running.",
@@ -782,11 +767,6 @@ async def _link_input_handler(
 
 
 async def _inline_builder(event, extra: str) -> list:
-    if extra.startswith("result:"):
-        view = _RESULT_VIEWS.pop(extra[len("result:"):], None)
-        if view is None:
-            return [render(TITLE, "That result is no longer available. Run the summary again.", [])]
-        return [render(*view)]
     result = await _panel_handler(event, extra)
     title, body, buttons = result if result is not None else (TITLE, "", [])
     return [render(title, body, buttons)]
@@ -794,8 +774,6 @@ async def _inline_builder(event, extra: str) -> list:
 
 def register(client=None, owner_id: int = 0) -> None:
     """Register the History & Intelligence panel. No listener is added."""
-    global _OWNER_ID
-    _OWNER_ID = int(owner_id or 0)
     register_panel(PANEL_ID, _panel_handler, parent="menu", title=TITLE)
     register_inline_builder(PANEL_ID, _inline_builder)
     register_action("history_count", _count_action)
