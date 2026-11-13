@@ -166,11 +166,11 @@ fresh fetch verified `HEAD == FETCH_HEAD == 70a8aab…`, and
 `git ls-remote origin refs/heads/main` reported the same SHA. The commit is a
 descendant of Phase 2 `62a18de` and Phase 1 `ffe72fd`.
 
-A follow-up documentation-only commit completes the field/index/retention table
-and records this verification. It is the current remote head; its exact SHA is
-reported in the delivery response because a commit cannot include its own hash
-before it exists. No force-push, rebase, reset or history rewrite was or will be
-used.
+Documentation-only follow-up commits complete the field/index/retention table,
+correct the caption/privacy wording and record this verification. The last of
+these is the current remote head; its exact SHA is reported in the delivery
+response because a commit cannot include its own hash before it exists. No
+force-push, rebase, reset or history rewrite was or will be used.
 
 ## 9. Limitations and open evidence
 

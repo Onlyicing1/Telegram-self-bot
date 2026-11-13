@@ -548,7 +548,7 @@ previously committed summary.
 | 6 | Restart during summarization | unchanged | unchanged | unchanged | no commit; recovery contract decides occurrence; next run re-reads | no |
 | 7 | Restart after summary, before persistence | unchanged | unchanged | unchanged | same as 6; no partial state | no |
 | 8 | Restart after persistence | already advanced | already advanced | already stored | safe; next run starts after cursor; no duplicate | no |
-| 9 | Batch only media/empty text | advances to high-water | unchanged | unchanged (no text) | active; no AI call | no |
+| 9 | Batch contains only messages with no text (media-only without a caption, empty) | advances to high-water | unchanged | unchanged (no text) | active; no AI call | no |
 | 10 | Batch only AI-provenance messages | advances to high-water | unchanged | unchanged | active; no AI call | no |
 | 11 | Message deleted before fetch | available messages drive high-water; no tombstone for the deleted id | advances only for available text | available content summarized; prior summary untouched | no error; if the whole range is empty, no cursor advances | no |
 | 12 | Previously processed message becomes inaccessible | unchanged | unchanged | **retained**; never erased | no re-fetch of old range | no |
@@ -748,8 +748,10 @@ sender attribution. The future scheduled path must preserve that, and additional
   `history_ai_service._result_data` does include them, and the new path must omit
   them).
 - The summarizer must call the service with `with_identifiers=False` explicitly;
-  the service default is `True` for the existing tool path. Media/empty messages
-  are never sent as content (the chunker skips them); no media is downloaded.
+  the service default is `True` for the existing tool path. Messages with no text
+  (including media-only messages without a caption) are skipped by the chunker;
+  a caption is text and remains eligible, exactly as in the current manual path.
+  Media bytes are never downloaded.
 - The owner's authored instruction is the only instruction input. The task label,
   schedule, destination, IDs and occurrence metadata are not prompt material.
 - **Scope of the identifier rule.** It prohibits identifiers as *metadata*: no
