@@ -730,10 +730,10 @@ def test_the_audited_order_is_recorded_in_the_audit_table():
     """
     section = _section_31()
     audit = section[: section.index("### 31.2")]
-    assert "all 39 migrations" in _flat(audit) or "39 files" in audit, (
+    assert "all 40 migrations" in _flat(audit) or "40 files" in audit, (
         "the audit must state that every repository migration was classified"
     )
-    assert len(list(MIGRATIONS_DIR.glob("*.sql"))) == 40, (
+    assert len(list(MIGRATIONS_DIR.glob("*.sql"))) == 41, (
         "the audited count must equal the migrations actually in the repository"
     )
     embedded_table = audit[audit.index("| Order | Migration") :]
@@ -826,7 +826,7 @@ def test_the_waiting_answer_migration_is_absorbed_by_part_one():
         "the inventory must say the snapshot already establishes it"
     )
     assert "owner action required" not in row
-    assert "**40** files" in _flat(status), (
+    assert "**41** files" in _flat(status), (
         "the audited file count must be the current one (40)"
     )
 

@@ -49,6 +49,7 @@ Architecture:
 | auto_reaction_enabled   | bool    | false   | must be boolean         |
 | auto_reaction_emoji     | str     | ""      | non-empty string (a Telegram reaction emoji) |
 | intelligent_reaction_enabled | bool | false  | must be boolean         |
+| intelligent_reaction_probability | int | 25 | integer 0–100 inclusive |
 | appearance_header_title | str     | ""      | bounded text ("" = default header) |
 | appearance_header_body  | str     | ""      | bounded text ("" = default header) |
 | appearance_page_overrides | jsonb | {}      | page id → {title?, body?}, each bounded |
@@ -88,6 +89,7 @@ _DEFAULTS: dict[str, Any] = {
     "auto_reaction_enabled": False,
     "auto_reaction_emoji": "",
     "intelligent_reaction_enabled": False,
+    "intelligent_reaction_probability": 25,
     "appearance_header_title": "",
     "appearance_header_body": "",
     "appearance_page_overrides": {},
@@ -184,6 +186,7 @@ _VALIDATORS: dict[str, ValidatorFn] = {
     "auto_reaction_enabled": _validate_bool,
     "auto_reaction_emoji": _validate_nonempty_str,
     "intelligent_reaction_enabled": _validate_bool,
+    "intelligent_reaction_probability": _validate_int_range(0, 100),
     "appearance_header_title": _validate_appearance_text,
     "appearance_header_body": _validate_appearance_text,
     "appearance_page_overrides": _validate_page_overrides,
@@ -512,6 +515,45 @@ def toggle_intelligent_reaction() -> bool:
     new_val = not is_intelligent_reaction_enabled()
     set_intelligent_reaction_enabled(new_val)
     return new_val
+
+
+def intelligent_reaction_probability() -> int:
+    """The owner's fixed reaction probability (an integer from 0 to 100).
+
+    Read for EVERY eligible outgoing message, so a saved change applies to the
+    next message with no restart. An unusable cached value falls back to the
+    documented default rather than to an accidental 0% or 100%.
+    """
+    _ensure_loaded()
+    value = _cache.get("intelligent_reaction_probability", 25)
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 100:
+        return 25
+    return value
+
+
+def set_intelligent_reaction_probability(value: Any) -> bool:
+    """Persist the probability and report the truth about the write.
+
+    The service validates the range BEFORE storing, and the strict setter never
+    leaves the effective cache claiming a value the database rejected. A write
+    the repository accepted is then confirmed against the persisted row: an
+    update that matched nothing, or a read that cannot return the stored value,
+    is reported as a failure and the effective value stays what the database
+    actually holds — never an optimistic success.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 100:
+        return False
+    if not set_setting_strict("intelligent_reaction_probability", value):
+        return False
+    if _db_configured():
+        row = repo.load()
+        if row is None or row.get("intelligent_reaction_probability") != value:
+            logger.warning(
+                "settings_service: intelligent_reaction_probability write was not "
+                "confirmed by the persisted row; the stored value was kept"
+            )
+            return False
+    return True
 
 
 # ── Typed accessors: Appearance personalization ──
