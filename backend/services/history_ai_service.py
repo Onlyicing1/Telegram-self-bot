@@ -56,7 +56,7 @@ from backend.ai.prompt.budget import (
     estimate_tokens_script_aware,
 )
 from backend.ai.providers.base.config import ProviderConfig
-from backend.services import history_service
+from backend.services import history_policy, history_service
 from backend.services.history_service import HistoryError, HistoryMessage
 
 logger = logging.getLogger(__name__)
@@ -304,6 +304,9 @@ ERROR_HISTORY = "history_unavailable"
 ERROR_PROVIDER = "ai_provider_failed"
 ERROR_TOO_LARGE = "history_too_large_for_one_request"
 ERROR_ENGINE = "ai_engine_unavailable"
+#: The requested count is not permitted for this chat's peer type. This is a
+#: PRODUCT policy refusal, distinct from retrieval and AI-capacity failures.
+ERROR_POLICY = "history_peer_policy"
 
 
 class HistoryAIError(Exception):
@@ -388,6 +391,29 @@ async def _prepare(
     capped = requested > bound
     effective = min(requested, bound)
     before_id = _coerce_int(current_message_id, 0) or None
+
+    # Product policy runs BEFORE any Telegram read or provider call: the chat's
+    # CURRENT entity is resolved and classified, then the count is validated
+    # against its peer type. The 1,000-message global bound above keeps its
+    # explicit "capped" note (never a silent clamp); the per-peer cap is NEVER
+    # clamped — an over-limit request is refused here.
+    try:
+        peer_type = await history_service.classify_chat(source, chat_id)
+    except HistoryError as exc:
+        logger.warning(
+            "AI_EXEC_TRACE request_id=%s stage=history_peer_resolve_failed "
+            "operation=%s error=%s",
+            request_id or "-", operation, exc,
+        )
+        raise HistoryAIError(str(exc), code=ERROR_HISTORY) from exc
+    refusal = history_policy.validate_count(peer_type, effective)
+    if refusal is not None:
+        logger.warning(
+            "AI_EXEC_TRACE request_id=%s stage=history_peer_policy_refused "
+            "operation=%s peer_type=%s count=%s",
+            request_id or "-", operation, peer_type.value, effective,
+        )
+        raise HistoryAIError(refusal, code=ERROR_POLICY)
 
     logger.info(
         "AI_EXEC_TRACE request_id=%s stage=history_retrieval_started "
@@ -802,6 +828,19 @@ def _result_data(plan: HistoryPlan, *, language: str = "") -> dict[str, Any]:
     }
 
 
+def _prepare_failure(exc: HistoryAIError) -> tuple[bool, str, dict[str, Any]]:
+    """The honest result for a planning failure.
+
+    A product-policy refusal is not a retrieval failure and must not be worded
+    as one: the chat was read fine, its type simply does not permit that count.
+    """
+    if exc.code == ERROR_POLICY:
+        return False, f"{sym.STATE_FAILED} {exc}", {"error": exc.code}
+    return False, f"{sym.STATE_FAILED} Couldn't read the Telegram history: {exc}", {
+        "error": exc.code,
+    }
+
+
 def _finish(plan: HistoryPlan, body: str, language: str = "") -> tuple[bool, str, dict[str, Any]]:
     notes = plan.notes()
     text = body.strip()
@@ -847,9 +886,7 @@ async def translate_history(
             current_message_id=current_message_id, request_id=request_id,
         )
     except HistoryAIError as exc:
-        return False, f"{sym.STATE_FAILED} Couldn't read the Telegram history: {exc}", {
-            "error": exc.code,
-        }
+        return _prepare_failure(exc)
 
     if not plan.messages:
         return True, "There are no messages to translate in this chat.", _result_data(plan)
@@ -940,9 +977,7 @@ async def summarize_history(
             current_message_id=current_message_id, request_id=request_id,
         )
     except HistoryAIError as exc:
-        return False, f"{sym.STATE_FAILED} Couldn't read the Telegram history: {exc}", {
-            "error": exc.code,
-        }
+        return _prepare_failure(exc)
 
     if not plan.text_messages:
         if plan.messages:

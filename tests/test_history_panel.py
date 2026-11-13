@@ -86,12 +86,24 @@ def _fresh_state(monkeypatch):
 
 
 class _Client:
-    def __init__(self, dialogs=None, *, fail_dialogs=False):
+    def __init__(self, dialogs=None, *, fail_dialogs=False, entities=None):
         self.dialogs = list(dialogs or [])
         self.fail_dialogs = fail_dialogs
+        self.entities = dict(entities or {})
         self.dialog_limits: list[int] = []
         self.edits: list[tuple[int, int, str]] = []
         self.deleted: list[tuple[int, list[int]]] = []
+
+    async def get_entity(self, peer_id):
+        """The CURRENT entity for a peer, like Telegram's own resolution."""
+        if peer_id in self.entities:
+            return self.entities[peer_id]
+        wanted = abs(int(peer_id))
+        for dialog in self.dialogs:
+            entity = getattr(dialog, "entity", None)
+            if entity is not None and abs(int(getattr(entity, "id", 0))) == wanted:
+                return entity
+        raise ValueError(f"no entity for {peer_id}")
 
     async def get_dialogs(self, limit=None):
         self.dialog_limits.append(limit)
@@ -121,16 +133,44 @@ def _dialog(entity, *, name="", user=False, group=False, channel=False):
 
 
 def _user(uid=1234, name="Alice"):
-    return _dialog(SimpleNamespace(id=uid, first_name=name), name=name, user=True)
+    return _dialog(
+        types.User(id=uid, first_name=name), name=name, user=True,
+    )
+
+
+def _bot(uid=1235, name="HelperBot"):
+    return _dialog(
+        types.User(id=uid, first_name=name, bot=True), name=name, user=True,
+    )
 
 
 def _group(gid=555, name="Team"):
-    return _dialog(SimpleNamespace(id=gid, title=name, megagroup=False), name=name, group=True)
+    return _dialog(
+        types.Chat(
+            id=gid, title=name, photo=types.ChatPhotoEmpty(),
+            participants_count=3, date=None, version=1,
+        ),
+        name=name, group=True,
+    )
 
 
 def _supergroup(cid=666, name="News"):
     return _dialog(
-        SimpleNamespace(id=cid, title=name, megagroup=True), name=name, channel=True,
+        types.Channel(
+            id=cid, title=name, photo=types.ChatPhotoEmpty(), date=None,
+            megagroup=True, broadcast=False,
+        ),
+        name=name, channel=True,
+    )
+
+
+def _broadcast(cid=667, name="Channel"):
+    return _dialog(
+        types.Channel(
+            id=cid, title=name, photo=types.ChatPhotoEmpty(), date=None,
+            broadcast=True, megagroup=False,
+        ),
+        name=name, channel=True,
     )
 
 
@@ -279,7 +319,12 @@ def test_pagination_is_bounded_to_the_scanned_page(monkeypatch):
 
 # ── count and focus ────────────────────────────────────────────────────────
 
-def test_count_accepts_only_the_offered_values():
+def test_count_accepts_only_the_offered_values(monkeypatch):
+    client = _Client([_user(1234, "Alice")])
+    monkeypatch.setattr(history, "get_self_client", lambda: client)
+    _run(history._pick_chat("1234"))
+    assert history._STATE.peer_type is history.PeerType.PRIVATE_USER
+
     _run(history._count_action(None, "500", PANEL_CHAT))
     assert history._STATE.count == 500
     _run(history._count_action(None, "999", PANEL_CHAT))
@@ -288,6 +333,129 @@ def test_count_accepts_only_the_offered_values():
     _run(history._count_action(None, "1001", PANEL_CHAT))
     assert history._STATE.count == 500
     assert max(history.COUNTS) == history.history_service.MAX_HISTORY_MESSAGES
+
+
+@pytest.mark.parametrize(
+    ("dialog_factory", "peer_type", "expected"),
+    [
+        (_user, history.PeerType.PRIVATE_USER, (100, 250, 500, 1000)),
+        (_bot, history.PeerType.PRIVATE_BOT, (100, 250, 300)),
+        (_group, history.PeerType.BASIC_GROUP, (100, 250, 500, 1000)),
+        (_supergroup, history.PeerType.SUPERGROUP, (100, 250, 500, 1000)),
+        (_broadcast, history.PeerType.BROADCAST_CHANNEL, (100, 250, 300)),
+    ],
+)
+def test_the_panel_offers_only_the_selected_peers_counts(
+    monkeypatch, dialog_factory, peer_type, expected,
+):
+    dialog = dialog_factory()
+    client = _Client([dialog])
+    monkeypatch.setattr(history, "get_self_client", lambda: client)
+
+    _run(history._pick_chat(str(dialog.entity.id)))
+
+    assert history._STATE.peer_type is peer_type
+    result = history._panel_view()
+    datas = _buttons(result)
+    offered = tuple(
+        int(data.rsplit(":", 1)[1])
+        for data in datas
+        if data.startswith("action:history_count:")
+    )
+    assert offered == expected
+    for hidden in {100, 250, 500, 1000} - set(expected):
+        assert f"action:history_count:{hidden}" not in datas
+    assert f"Limit for this chat: {expected[-1]} messages" in result[1]
+
+
+def test_a_stale_capped_callback_is_refused_against_the_current_peer(monkeypatch):
+    client = _Client([_user(1234, "Alice"), _broadcast(667, "Channel")])
+    monkeypatch.setattr(history, "get_self_client", lambda: client)
+
+    _run(history._pick_chat("1234"))
+    _run(history._count_action(None, "1000", PANEL_CHAT))
+    assert history._STATE.count == 1000
+
+    # The selected peer is now a 300-cap broadcast channel. The old panel's
+    # 1,000 button still exists somewhere, but its callback is not trusted.
+    _run(history._pick_chat("667"))
+    assert history._STATE.peer_type is history.PeerType.BROADCAST_CHANNEL
+    assert history._STATE.count == 100
+
+    result = _run(history._count_action(None, "1000", PANEL_CHAT))
+    assert history._STATE.count == 100
+    assert "limited to 300" in result[1]
+    assert "100, 250 or 300" in result[1]
+
+    result = _run(history._count_action(None, "500", PANEL_CHAT))
+    assert history._STATE.count == 100
+    assert "limited to 300" in result[1]
+
+    _run(history._count_action(None, "300", PANEL_CHAT))
+    assert history._STATE.count == 300
+
+
+def test_capped_peers_refuse_1000_and_500_without_a_selection_change(monkeypatch):
+    client = _Client([_bot(1235, "HelperBot")])
+    monkeypatch.setattr(history, "get_self_client", lambda: client)
+    _run(history._pick_chat("1235"))
+
+    for refused in ("1000", "500"):
+        result = _run(history._count_action(None, refused, PANEL_CHAT))
+        assert history._STATE.count == 100
+        assert "limited to 300" in result[1]
+
+    _run(history._count_action(None, "300", PANEL_CHAT))
+    assert history._STATE.count == 300
+
+
+def test_a_run_with_a_stale_over_limit_count_never_reaches_the_provider(monkeypatch):
+    client = _Client([_broadcast(667, "Channel")])
+    monkeypatch.setattr(history, "get_self_client", lambda: client)
+    _run(history._pick_chat("667"))
+    monkeypatch.setattr(history, "_manager", lambda: object())
+    calls: list[str] = []
+
+    async def _must_not_summarize(*args, **kwargs):
+        calls.append("summarized")
+        return True, "should not render", {}
+
+    monkeypatch.setattr(history.history_ai_service, "summarize_history", _must_not_summarize)
+    history._STATE.count = 1000  # bypass the panel's count action
+
+    result = _run(history._run_action(_event(), "", PANEL_CHAT))
+
+    assert "limited to 300" in result[1]
+    assert calls == []
+    assert _helper.edits == []
+
+
+def test_an_unclassifiable_chat_cannot_be_selected(monkeypatch):
+    dialog = _dialog(SimpleNamespace(id=1234, first_name="?"), name="?", user=True)
+    client = _Client([dialog])
+    monkeypatch.setattr(history, "get_self_client", lambda: client)
+
+    result = _run(history._pick_chat("1234"))
+
+    assert history._STATE.chat_id == 0
+    assert history._STATE.peer_type is None
+    assert "could not be determined" in result[1]
+
+
+def test_an_unknown_peer_type_refuses_a_run(monkeypatch):
+    async def _unknown(source, chat_id):
+        return history.PeerType.UNKNOWN
+
+    monkeypatch.setattr(history.history_service, "classify_chat", _unknown)
+    monkeypatch.setattr(
+        history, "_list_chats", lambda _c: _async(([_chat(1234, "?")], "")),
+    )
+    history._STATE.chat_id = 1234
+
+    result = _run(history._run_action(_event(), "", PANEL_CHAT))
+
+    assert "could not be determined" in result[1]
+    assert history.sym.STATE_FAILED in result[1]
 
 
 def test_focus_is_normalized_and_limited(monkeypatch):
@@ -557,7 +725,15 @@ def test_a_superseded_operation_cannot_overwrite_the_newer_panel(monkeypatch):
 # ── links ─────────────────────────────────────────────────────────────────
 
 def _wire_link(monkeypatch, message):
-    client = _Client()
+    linked_chat = int(getattr(message, "chat_id", 0) or 0)
+    if linked_chat < 0:
+        entity = types.Channel(
+            id=abs(linked_chat), title="Linked chat",
+            photo=types.ChatPhotoEmpty(), date=None, megagroup=True, broadcast=False,
+        )
+    else:
+        entity = types.User(id=linked_chat or 1, first_name="Linked chat")
+    client = _Client(entities={linked_chat: entity} if linked_chat else None)
     _client.value = client
     monkeypatch.setattr(history, "get_self_client", lambda: client)
     monkeypatch.setattr(history, "_manager", lambda: object())
@@ -585,7 +761,10 @@ def test_link_run_uses_linked_id_plus_one_as_the_exclusive_boundary(monkeypatch)
     linked = 500
     message = SimpleNamespace(
         id=linked, chat_id=CHAT,
-        chat=SimpleNamespace(id=555, title="News", megagroup=True),
+        chat=types.Channel(
+            id=555, title="News", photo=types.ChatPhotoEmpty(), date=None,
+            megagroup=True, broadcast=False,
+        ),
     )
     client, calls, tasks = _wire_link(monkeypatch, message)
     history._STATE.count = 250
@@ -622,9 +801,34 @@ def test_private_link_form_resolves_and_summarizes(monkeypatch):
     assert calls[0]["current_message_id"] == 43
 
 
+def test_a_linked_broadcast_channel_refuses_a_1000_message_count(monkeypatch):
+    message = SimpleNamespace(
+        id=500, chat_id=CHAT,
+        chat=types.Channel(
+            id=667, title="Channel", photo=types.ChatPhotoEmpty(), date=None,
+            broadcast=True, megagroup=False,
+        ),
+    )
+    _client, calls, tasks = _wire_link(monkeypatch, message)
+    history._STATE.count = 1000
+
+    _run(
+        history._link_input_handler(
+            "https://t.me/news/500", CHAT, USER_MSG, PANEL_CHAT, PANEL_MSG,
+            INLINE_ID,
+        )
+    )
+    _run(tasks[0])
+
+    assert "limited to 300" in _helper.last_text
+    assert calls == []
+
+
 def test_tg_openmessage_form_resolves_and_summarizes(monkeypatch):
     message = SimpleNamespace(id=209974, chat_id=5406707941, chat=None)
-    _client.value = _Client()
+    _client.value = _Client(
+        entities={5406707941: types.User(id=5406707941, first_name="Linked")},
+    )
     monkeypatch.setattr(history, "get_self_client", lambda: _client.value)
     monkeypatch.setattr(history, "_manager", lambda: object())
     monkeypatch.setattr(
@@ -734,6 +938,9 @@ class _HistoryClient:
     def __init__(self, messages):
         self.messages = messages
         self.max_ids = []
+
+    async def get_entity(self, chat_id):
+        return types.User(id=abs(int(chat_id)) or 1, first_name="History")
 
     def iter_messages(self, chat_id, **kwargs):
         self.max_ids.append(kwargs.get("max_id"))
@@ -1240,7 +1447,10 @@ def test_a_long_link_summary_uses_the_corrected_delivery(monkeypatch):
     linked = 500
     message = SimpleNamespace(
         id=linked, chat_id=CHAT,
-        chat=SimpleNamespace(id=555, title="News", megagroup=True),
+        chat=types.Channel(
+            id=555, title="News", photo=types.ChatPhotoEmpty(), date=None,
+            megagroup=True, broadcast=False,
+        ),
     )
     client = _Client()
     _client.value = client

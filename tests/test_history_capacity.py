@@ -76,6 +76,11 @@ class _FakeClient:
     def __init__(self, messages: list[_FakeMessage]) -> None:
         self._messages = list(messages)
 
+    async def get_entity(self, chat_id: Any):
+        from telethon.tl import types
+
+        return types.User(id=abs(int(chat_id)) or 1, first_name="Fake")
+
     def iter_messages(self, chat_id: Any, **kwargs: Any):
         limit = kwargs.get("limit")
         min_id = kwargs.get("min_id")

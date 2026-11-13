@@ -51,6 +51,7 @@ from backend.telegram_api.peers import PeerType, classify_entity
 from backend.services import (
     appearance_service,
     history_ai_service,
+    history_policy,
     history_service,
     save_service,
 )
@@ -60,11 +61,10 @@ logger = logging.getLogger(__name__)
 PANEL_ID = "history"
 TITLE = "History & Intelligence"
 
-#: The existing per-request bound is authoritative; the UI offers only these.
-COUNTS: tuple[int, ...] = tuple(
-    value for value in (100, 250, 500, 1000)
-    if value <= history_service.MAX_HISTORY_MESSAGES
-)
+#: The largest set the panel can offer (a private user's choices). A selected
+#: peer's OWN choices come from ``history_policy`` and may be narrower — a bot
+#: chat and a broadcast channel are capped at 300, so 500/1,000 are never shown.
+COUNTS: tuple[int, ...] = history_policy.choices_for(PeerType.PRIVATE_USER)
 DEFAULT_COUNT = 100 if 100 in COUNTS else (COUNTS[0] if COUNTS else 0)
 
 #: One bounded Telegram dialog page; never an unbounded account walk.
@@ -117,6 +117,10 @@ class _PageState:
 class _State:
     chat_id: int = 0
     chat_name: str = ""
+    #: The CLASSIFIED type of the currently resolved selected entity. Bounded,
+    #: ephemeral panel state only — never persisted and never authoritative:
+    #: every selection and every run re-resolves the actual entity.
+    peer_type: PeerType | None = None
     count: int = DEFAULT_COUNT
     focus: str = ""
 
@@ -227,16 +231,32 @@ async def _list_chats(client: Any) -> tuple[list[_Chat], str]:
     return chats, ""
 
 
+def _clear_selection() -> None:
+    """Forget the selected peer after a classification failure — fail closed."""
+    _STATE.chat_id = 0
+    _STATE.chat_name = ""
+    _STATE.peer_type = None
+    _STATE.count = DEFAULT_COUNT
+
+
 def _panel_buttons() -> list:
     builder = InlinePanelBuilder()
     builder.add_row("Select Chat", f"panel:{PANEL_ID}:chats:0")
-    builder.add_buttons(
-        *[(str(value), f"action:history_count:{value}") for value in COUNTS[:2]]
+    # Only the selected peer's permitted counts are rendered. With no peer
+    # selected there is no honest count set to show, so the choice rows wait.
+    choices = (
+        history_policy.choices_for(_STATE.peer_type)
+        if _STATE.peer_type is not None
+        else ()
     )
-    if len(COUNTS) > 2:
+    if choices:
         builder.add_buttons(
-            *[(str(value), f"action:history_count:{value}") for value in COUNTS[2:]]
+            *[(str(value), f"action:history_count:{value}") for value in choices[:2]]
         )
+        if len(choices) > 2:
+            builder.add_buttons(
+                *[(str(value), f"action:history_count:{value}") for value in choices[2:]]
+            )
     builder.add_row("Set Focus Instruction", f"input:{PANEL_ID}:focus")
     builder.add_row("Run Summary", "action:history_run")
     builder.add_row("Summarize Message Link", f"input:{PANEL_ID}:link")
@@ -251,6 +271,11 @@ def _panel_body(notice: str = "") -> str:
         f"Messages: {_STATE.count}",
         f"Focus: {_STATE.focus or 'none'}",
     ]
+    if _STATE.peer_type is not None:
+        lines.append(
+            "Limit for this chat: "
+            f"{history_policy.maximum_for(_STATE.peer_type)} messages per request."
+        )
     if notice:
         lines.extend(["", notice])
     return "\n".join(lines)
@@ -307,7 +332,8 @@ async def _pick_chat(raw: str) -> tuple[str, str, list]:
         peer_id = int(raw)
     except (TypeError, ValueError):
         return _panel_view(f"{sym.STATE_FAILED} That chat selection is not valid.")
-    chats, error = await _list_chats(get_self_client())
+    client = get_self_client()
+    chats, error = await _list_chats(client)
     if error:
         return _panel_view(f"{sym.STATE_FAILED} {error}")
     chat = next((item for item in chats if item.peer_id == peer_id), None)
@@ -315,8 +341,23 @@ async def _pick_chat(raw: str) -> tuple[str, str, list]:
         return _panel_view(
             f"{sym.STATE_FAILED} That chat is no longer in the accessible list. Select it again."
         )
+    # Classify the entity Telegram returns for this chat RIGHT NOW. Dialog flags,
+    # the title, the peer id shape and any earlier selection are not evidence.
+    try:
+        peer_type = await history_service.classify_chat(client, chat.peer_id)
+    except history_service.HistoryError as exc:
+        _clear_selection()
+        return _panel_view(f"{sym.STATE_FAILED} {exc}")
+    if peer_type is PeerType.UNKNOWN:
+        _clear_selection()
+        return _panel_view(f"{sym.STATE_FAILED} {history_policy.UNKNOWN_REFUSAL}")
     _STATE.chat_id = chat.peer_id
     _STATE.chat_name = chat.name
+    _STATE.peer_type = peer_type
+    if _STATE.count not in history_policy.choices_for(peer_type):
+        # A NEW selection starts from the shared default; this is not a clamp of
+        # a request the owner made for this peer.
+        _STATE.count = DEFAULT_COUNT
     return _panel_view(f"Selected: {chat.name}")
 
 
@@ -325,10 +366,34 @@ async def _count_action(event, extra: str, chat_id: int) -> tuple[str, str, list
         value = int(extra)
     except (TypeError, ValueError):
         value = -1
-    if value not in COUNTS:
-        return _panel_view(f"{sym.STATE_FAILED} Choose one of the offered message counts.")
-    _STATE.count = value
-    return _panel_view(f"Message count set to {value}.")
+    if not _STATE.chat_id:
+        return _panel_view(
+            f"{sym.STATE_FAILED} Select a chat first; the available message counts "
+            "depend on the chat's type."
+        )
+    # The callback is NOT trusted: it may be an old panel's 1,000-message button
+    # arriving after the selected peer changed to a 300-cap chat (or the group
+    # itself migrated). Re-resolve and re-classify the CURRENT entity first.
+    try:
+        peer_type = await history_service.classify_chat(
+            get_self_client(), _STATE.chat_id,
+        )
+    except history_service.HistoryError as exc:
+        _STATE.peer_type = None
+        return _panel_view(f"{sym.STATE_FAILED} {exc}")
+    if peer_type is PeerType.UNKNOWN:
+        _STATE.peer_type = None
+        return _panel_view(f"{sym.STATE_FAILED} {history_policy.UNKNOWN_REFUSAL}")
+    if peer_type is not _STATE.peer_type:
+        _STATE.peer_type = peer_type
+        if _STATE.count not in history_policy.choices_for(peer_type):
+            _STATE.count = DEFAULT_COUNT
+    refusal = history_policy.validate_choice(peer_type, value)
+    if refusal is None:
+        _STATE.count = value
+        return _panel_view(f"Message count set to {value}.")
+    refusal = history_policy.validate_count(peer_type, value) or refusal
+    return _panel_view(f"{sym.STATE_FAILED} {refusal}")
 
 
 def _manager() -> Any:
@@ -933,6 +998,13 @@ async def _run_summary(
 
 
 async def _validated_chat(client: Any) -> str:
+    """Revalidate the selection against the CURRENT entity before any AI work.
+
+    This runs on every manual run, so an old panel callback or a peer whose type
+    changed (for example a basic group Telegram migrated to a supergroup, or a
+    new selection) can never be summarized under a stale policy. Returns the
+    deterministic refusal text, or an empty string when the request is allowed.
+    """
     if not _STATE.chat_id:
         return "Select a chat first."
     chats, error = await _list_chats(client)
@@ -940,7 +1012,19 @@ async def _validated_chat(client: Any) -> str:
         return error
     if not any(chat.peer_id == _STATE.chat_id for chat in chats):
         return "The selected chat is no longer accessible. Select it again."
-    return ""
+    try:
+        peer_type = await history_service.classify_chat(client, _STATE.chat_id)
+    except history_service.HistoryError as exc:
+        _STATE.peer_type = None
+        return str(exc)
+    if peer_type is PeerType.UNKNOWN:
+        _STATE.peer_type = None
+        return history_policy.UNKNOWN_REFUSAL
+    _STATE.peer_type = peer_type
+    refusal = history_policy.validate_count(peer_type, _STATE.count)
+    if refusal is None:
+        refusal = history_policy.validate_choice(peer_type, _STATE.count)
+    return refusal or ""
 
 
 async def _run_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
@@ -956,6 +1040,7 @@ async def _run_action(event, extra: str, chat_id: int) -> tuple[str, str, list] 
     snapshot = _State(
         chat_id=_STATE.chat_id,
         chat_name=_STATE.chat_name,
+        peer_type=_STATE.peer_type,
         count=_STATE.count,
         focus=_STATE.focus,
     )
@@ -1083,6 +1168,23 @@ async def _run_link(
         chat_name = _entity_name(getattr(message, "chat", None))
         if chat_name == "Unnamed chat" and target.username:
             chat_name = _short("@" + target.username.lstrip("@"))
+        # The linked message's OWN peer is classified from the entity Telegram
+        # returned with it; when that entity is absent it is resolved through the
+        # same boundary. A count the linked peer does not permit is refused
+        # BEFORE a summary is painted or any AI work starts.
+        peer_type = classify_entity(getattr(message, "chat", None))
+        if peer_type is PeerType.UNKNOWN:
+            try:
+                peer_type = await history_service.classify_chat(client, actual_chat)
+            except history_service.HistoryError as exc:
+                await _paint(editor, f"{sym.STATE_FAILED} {exc}", _result_buttons())
+                return
+        refusal = history_policy.validate_count(peer_type, count)
+        if refusal is None:
+            refusal = history_policy.validate_choice(peer_type, count)
+        if refusal is not None:
+            await _paint(editor, f"{sym.STATE_FAILED} {refusal}", _result_buttons())
+            return
         # The history API's upper bound is EXCLUSIVE: linked_id + 1 includes the
         # linked message itself and excludes everything newer than it.
         await _run_summary(

@@ -46,7 +46,9 @@ from backend.ai.context.provenance import (
     strip_ai_provenance_marker,
 )
 from backend.helper.rpc_timeout import rpc_await
+from backend.telegram_api.entities import get_entity as _facade_get_entity
 from backend.telegram_api.messages import iter_messages as _facade_iter_messages
+from backend.telegram_api.peers import PeerType, classify_entity
 
 logger = logging.getLogger(__name__)
 
@@ -298,6 +300,49 @@ async def _collect(
 
     truncated = bound_hit or trimmed or not exhausted
     return list(reversed(collected)), scanned, truncated
+
+
+async def classify_chat(source: Any, chat_id: Any) -> PeerType:
+    """Resolve the chat's CURRENT entity and classify it.
+
+    Product policy (per-peer count limits, and later scheduled processing) needs
+    the ACTUAL current entity, never a dialog display flag, a title, a username
+    or a cached earlier selection. This is one bounded resolution through the
+    existing Telegram facade, followed by the pure shared classifier; nothing is
+    cached or persisted, so a basic group Telegram migrated to a supergroup is
+    classified correctly on the next call.
+
+    Raises:
+        HistoryError: the entity could not be resolved. Callers must fail
+            closed rather than assume a type.
+    """
+    chat = _require_chat_id(chat_id)
+    # Entity resolution needs only the client's ``get_entity``; a caller that
+    # passes the raw client (or a test double) is valid here even when it is not
+    # a full retrieval source.
+    candidate = getattr(source, "client", None)
+    if candidate is not None and hasattr(candidate, "get_entity"):
+        client = candidate
+    elif hasattr(source, "get_entity"):
+        client = source
+    else:
+        client = _resolve_client(source)
+    try:
+        entity = await rpc_await(
+            _facade_get_entity(client, chat),
+            timeout=HISTORY_RPC_TIMEOUT_S,
+            label="history.classify_peer",
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.error(
+            "HISTORY_PEER_RESOLVE_FAILED chat_id=%s error=%r", chat, exc,
+        )
+        raise HistoryError(
+            f"Could not resolve chat {chat} to determine its type: {exc}"
+        ) from exc
+    return classify_entity(entity)
 
 
 async def fetch_recent_history(

@@ -1,180 +1,202 @@
-# IMPLEMENTATION REPORT — Peer Classification Phase 1 (reusable foundation)
+# IMPLEMENTATION REPORT — History Peer Policy Phase 2 (per-peer counts)
 
-Base commit: `ecc3779814f6bc0a45588cb35629c3aa5288550c` (`origin/main`, fetched and
-verified before any edit). This report replaces the previous History capacity
-report; that delivery remains in the repository history and its behaviour is
-unchanged.
+Base commit: `ffe72fd0bce9286e3d3d6583614b3b243bfd4fdf` (`origin/main`, Phase 1;
+fetched and verified as an ancestor before any edit). This report replaces the
+Phase 1 report; that delivery remains in the repository history and its
+classifier is unchanged.
 
 ## 1. What this delivery is
 
-One reusable, provider-independent Telegram peer classifier plus the migration of
-the four duplicated classification sites onto it. It answers only *what kind of
-peer a resolved Telethon entity is*. Feature policy (Ghost Seen eligibility,
-Anti-Edit/Delete bot exclusion, History limits, ownership, authorization) stays
-with each feature.
+A deterministic History product policy layered on the existing `PeerType`
+classifier, dynamic count choices for the History panel, rejection of stale or
+invalid count callbacks, and enforcement at every manual History summarization
+entry point. The policy answers only *how many messages one manual History
+request may cover for this chat*. It does not decide AI feasibility, retrieval
+order, scheduling or delivery.
 
-Nothing from later phases was started: no History caps or count changes, no
-retrieval/cursor change, no persistence, no scheduling, no ToolExecutor action,
-no database object, no provider or delivery change.
+Nothing from later phases was started: no incremental retrieval, no cursor change,
+no persistence, no database object, no scheduled History, no admission change, no
+provider or delivery change, no new client/scheduler/listener/executor/loop.
 
-## 2. Files changed
+## 2. Exact policy contract
+
+New **`backend/services/history_policy.py`** — pure, synchronous, no RPC/database/
+AI/UI imports. It consumes `PeerType` from `backend/telegram_api/peers.py`; the
+enum and classifier are not duplicated or modified.
+
+| PeerType | Hard maximum | Permitted panel choices |
+| --- | ---: | --- |
+| `PRIVATE_USER` | 1000 | 100, 250, 500, 1000 |
+| `PRIVATE_BOT` | 300 | 100, 250, 300 |
+| `BASIC_GROUP` | 1000 | 100, 250, 500, 1000 |
+| `SUPERGROUP` | 1000 | 100, 250, 500, 1000 |
+| `BROADCAST_CHANNEL` | 300 | 100, 250, 300 |
+| `UNKNOWN` | 0 | none — refuse |
+
+API:
+
+- `maximum_for(peer_type) -> int`
+- `choices_for(peer_type) -> tuple[int, ...]`
+- `validate_count(peer_type, requested) -> str | None` — hard-cap validation used
+  at the service boundary. Any positive `int` up to the maximum is accepted (AI
+  tools may compute a small literal count); negative/zero, booleans, strings,
+  floats, non-`PeerType` values and `UNKNOWN` are refused. An over-cap request is
+  **refused, never clamped with `min()`**.
+- `validate_choice(peer_type, requested) -> str | None` — the panel's narrower
+  validation: the value must be one of that peer's exact offered choices.
+- `UNKNOWN_REFUSAL` — deterministic “chat type could not be determined” text.
+
+The 300-message caps are hard product limits. `UNKNOWN` never falls back to the
+1,000-message policy, and refusal reasons are deterministic strings that name the
+actual limit and the offered choices.
+
+## 3. Classify the actual current entity
+
+`backend/services/history_service.py` gained:
+
+```python
+async def classify_chat(source, chat_id) -> PeerType
+```
+
+- Resolves the **currently returned Telethon entity** through the existing
+  `telegram_api.entities.get_entity` facade, bounded by `rpc_await` and the
+  History RPC timeout, then calls the Phase 1 `classify_entity`.
+- Accepts the runtime `TelegramAPI` source or a raw client with `get_entity`; it
+  does not require the full retrieval surface just to classify.
+- Raises `HistoryError` when resolution fails. Callers fail closed.
+- Nothing is cached or persisted, so a migrated group is classified correctly on
+  the next call.
+
+Peer type is never inferred from dialog flags, titles, usernames, id patterns,
+serialized display dictionaries, previous selections or a stale cached value.
+
+## 4. Panel changes
+
+`backend/bot/handlers/history.py`:
+
+- `_State` carries an ephemeral `peer_type: PeerType | None`; there is no
+  persistence and no new authoritative peer cache. `_pick_chat` classifies the
+  entity Telegram returns for the selected id, clears the selection on a
+  resolution failure or `UNKNOWN`, and resets a count that the new peer does not
+  offer to the shared default (100) **as part of a new selection**, not as a clamp
+  of a request.
+- `_panel_buttons` renders only `history_policy.choices_for(peer_type)`. A
+  broadcast channel and a bot show 100/250/300; the three large peer types show
+  100/250/500/1000. Invalid choices are **hidden**, not rendered disabled. With no
+  peer selected there is no honest choice set, so the count rows wait; the rest of
+  the panel (Select Chat, Focus, Run, Link) is unchanged.
+- `_panel_body` additionally states the current chat's limit when a peer is
+  selected.
+- `_count_action` re-resolves and re-classifies the **current** entity on every
+  callback instead of trusting callback data or the stored type. It then validates
+  the value against `choices_for`/`validate_count`: a stale 1,000 or 500 callback
+  arriving after the selection became a 300-cap peer is refused with the actual
+  limit (“A broadcast channel is limited to 300 messages per request; choose 100,
+  250 or 300.”) and the count is unchanged. It never clamps and never starts AI.
+- `_validated_chat` (used by `_run_action` before any manager lookup or summary
+  task) re-resolves the selected chat, re-classifies it, re-applies `validate_count`
+  and `validate_choice`, and refuses on `UNKNOWN`/resolution failure.
+- `COUNTS` now comes from the policy's large-peer choice set; `DEFAULT_COUNT`
+  remains 100.
+
+Existing rendering, navigation, inline-edit delivery, Helper Bot ownership, focus
+and link input flows are unchanged.
+
+## 5. Service-boundary enforcement
+
+`backend/services/history_ai_service._prepare` — shared by `summarize_history`
+and `translate_history` — now runs, before **any** retrieval or provider call:
+
+1. Resolve and classify the actual peer (`history_service.classify_chat`).
+2. Validate the effective count with `history_policy.validate_count`.
+3. Refuse with the new `ERROR_POLICY = "history_peer_policy"` and the policy text.
+4. Only then perform the existing bounded retrieval.
+5. The existing AI capacity gate still decides whether the workload fits; a
+   300-message product limit does not promise AI feasibility.
+
+A new `_prepare_failure` keeps the truthful message for a policy refusal instead
+of labelling it “Couldn't read the Telegram history”. The pre-existing global
+1,000-message bound keeps its explicit `capped` note (it is stated, not silent);
+per-peer caps are never clamped. Chunk size, concurrency, call spacing, deadlines,
+token estimation, provider routing and capacity arithmetic are untouched.
+
+## 6. Linked-message / `ending_at` path
+
+`_run_link` classifies the linked message's own chat from the entity Telegram
+returned with it, or resolves `actual_chat` when that entity is absent. It
+validates the count against the linked peer's policy **before** painting a
+summary or starting `_run_summary`. A broadcast-channel link with a stale
+1,000-message count is refused with the same honest limit. The exclusive
+`linked_id + 1` upper bound and the existing resolver/delivery are unchanged.
+
+## 7. Files changed
 
 | File | Change |
 | --- | --- |
-| `backend/telegram_api/peers.py` | **new** — `PeerType` + pure `classify_entity` |
-| `backend/bot/handlers/history.py` | `_chat_kind` now uses the classifier (legacy double fallbacks kept) |
-| `backend/bot/handlers/misc.py` | General → Chat & Message IDs type label now uses the classifier |
-| `backend/services/ghost_seen_v2.py` | `_is_telegram_user` / `is_private_user_entity` use the classifier; Ghost Seen's own exclusions untouched |
-| `backend/services/anti_edit_delete_service.py` | `is_bot_entity` uses the classifier; documented double fallback kept |
-| `tests/test_peer_classification.py` | **new** — 41 classifier + call-site tests |
+| `backend/services/history_policy.py` | **new** — pure per-peer cap/choice policy |
+| `backend/services/history_service.py` | `classify_chat` using the existing entity facade + classifier |
+| `backend/services/history_ai_service.py` | policy gate in `_prepare`, `ERROR_POLICY`, honest policy refusal message |
+| `backend/bot/handlers/history.py` | ephemeral peer type, dynamic choices, stale-callback and run/link revalidation |
+| `tests/test_history_policy.py` | **new** — 78 policy tests |
+| `tests/test_history_panel.py` | real Telethon fixtures, `get_entity`, dynamic-choice, stale-callback, UNKNOWN, no-provider and linked-cap tests |
+| `tests/test_history_ai_tools.py` | fake-client entity resolution, service-bypass and UNKNOWN refusal tests |
+| `tests/test_history_capacity.py` | fake-client entity resolution only |
 | `IMPLEMENTATION_REPORT.md`, `INVESTIGATION.md`, `ROADMAP.md` | this delivery's reports |
 
-No other file was touched, and no protected document was modified.
+`backend/telegram_api/peers.py` was **not** modified. No protected architecture
+document was modified.
 
-## 3. Classifier contract
+## 8. Tests and exact results
 
-```python
-class PeerType(str, Enum):
-    PRIVATE_USER = "private_user"
-    PRIVATE_BOT = "private_bot"
-    BASIC_GROUP = "basic_group"
-    SUPERGROUP = "supergroup"
-    BROADCAST_CHANNEL = "broadcast_channel"
-    UNKNOWN = "unknown"
-
-def classify_entity(entity: Any) -> PeerType
-```
-
-- Real Telethon types only, decided with `isinstance`: `User`, `Chat`, `Channel`.
-  Never `type(...).__name__`, never a Dialog boolean, never a title/username/id
-  pattern, never a service or model answer.
-- `User`: `PRIVATE_BOT` only when `User.bot is True`, otherwise `PRIVATE_USER`.
-  An absent flag is not read as a positive one.
-- `Chat`: `BASIC_GROUP`.
-- `Channel`: `BROADCAST_CHANNEL` when `broadcast is True` (checked first, so a
-  contradictory megagroup flag cannot turn a channel into a group); otherwise
-  `SUPERGROUP` when `megagroup is True` **or** `gigagroup is True`; otherwise
-  `UNKNOWN`. A gigagroup is a supergroup variant and deliberately has no separate
-  policy type.
-- `None`, unexpected objects, dialogs, serialized dicts, partial objects and
-  non-Telethon doubles: all `UNKNOWN`. No attribute is read for an object that
-  failed the `isinstance` gate (tested with an exploding object).
-- Pure and synchronous: no RPC, network, database, service, History, AI, panel or
-  scheduling import; no mutation; deterministic. It is a module function, not a
-  client, resolver, cache or update loop.
-- Peer type is never persisted here. It is derived from the currently resolved
-  entity every time, so a basic group migrated to a supergroup is classified
-  correctly on the next resolution.
-
-No resolver wrapper was added: every call site already resolves through
-`client.get_entity` (the existing boundary), so a second resolution path would be
-redundant.
-
-## 4. Call sites
-
-### Migrated
-
-1. **`history._chat_kind`** — the chat picker's label. Real entities now map
-   `private_user`/`private_bot` → `private`, `basic_group` → `group`,
-   `supergroup` → `supergroup`, `broadcast_channel` → `channel`. The display
-   vocabulary is unchanged. The legacy dialog/attribute branches are retained
-   **only** for the non-Telethon doubles the panel tests use and cannot upgrade a
-   real entity the classifier reported as `UNKNOWN` (that keeps the legacy
-   `chat` bucket). A real supergroup is no longer at risk of being labelled a
-   channel, and a real basic group is no longer labelled `chat`.
-2. **`misc._general_id_action`** — “General → Chat & Message IDs”. The old code
-   checked `hasattr(entity, "broadcast")` first, so a **supergroup was displayed
-   as “Group”** and the megagroup branch was unreachable for real channels. It
-   now shows `Channel`, `Supergroup`, `Group`, `Private` or `Bot` from the
-   classifier, and `Unknown` when the entity cannot be classified. Failure of the
-   lookup still leaves `Unknown` (never a guessed category).
-3. **`ghost_seen_v2`** — `_is_telegram_user` uses the classifier for real
-   entities, then keeps its long-standing double heuristics (`class name "User"`,
-   `SimpleNamespace` with `first_name`, `dialog.is_user`).
-   `is_private_user_entity` keeps Ghost Seen's own policy unchanged: bots, self,
-   deleted and the owner are excluded, and an entity id is required. Bot
-   exclusion is taken from the classifier for real entities and remains
-   attribute-based for doubles, so no existing behaviour was lost.
-4. **`anti_edit_delete_service.is_bot_entity`** — a real entity is a bot only when
-   the classifier says `PRIVATE_BOT`. The legacy class-name + `bot is True` branch
-   remains for the module's `User` test doubles; it can only confirm a bot, never
-   a human, and an unresolved/non-User entity still returns `False` (the safe
-   fallback the capture handlers rely on).
-
-### Intentionally not changed
-
-- `is_private_user_dialog` / `filter_private_dialogs`: their group/channel dialog
-  flags are a feature-level scope rule, not taxonomy; they only consume the
-  already-migrated helpers.
-- `anti_edit_delete_service._resolve_peer_bot` / its bounded cache and cooldown:
-  that is resolution reliability and feature policy (unknown → cooldown, never a
-  human), not classification.
-- `telegram_api.entities.get_dialogs`' serialized dict: unchanged, because
-  adding peer types to a display dict would create a second, weaker source of
-  truth. Callers that need the type resolve the entity, as these four sites do.
-- History retrieval, counts, panel text, AI capacity and delivery: untouched.
-- `AI_MASTER_DESIGN.md` and `DATABASE_ARCHITECTURE.md`: protected, untouched.
-
-## 5. Tests
-
-New `tests/test_peer_classification.py` (41 tests, all passing):
-
-- Vocabulary: exact six values, `str` compatibility, round-trip.
-- Real entities: human `User`, `User(bot=False)`, `User` with an absent bot flag,
-  bot `User`, basic `Chat`, broadcast `Channel`, megagroup `Channel`, explicit
-  `gigagroup=True` (with and without `megagroup`), channel with neither flag,
-  contradictory broadcast+megagroup.
-- Negative: `None`, `0`, `"user"`, `object()`, `{}`, `[]`, `SimpleNamespace`
-  doubles, dialog-like objects, partial flag-only objects, a `Channel` subclass
-  with missing flags.
-- Purity: not a coroutine, single `entity` parameter, deterministic, does not
-  mutate the entity, reads no attribute for an unknown object, and the module
-  source contains no async/runtime-service dependencies.
-- Call sites: History labels for every real type plus the double fallbacks;
-  General ID label for channel/supergroup/gigagroup/group/private/bot/unknown and
-  a failed lookup; Ghost Seen human/bot/group/channel plus owner and double
-  exclusions; Anti-Edit bot detection for real bot/human/group/channel and the
-  legacy double.
-
-Existing suites were run unchanged — no assertion was weakened or removed.
-
-## 6. Exact results
-
-Environment: `/tmp/iv` virtualenv from `backend/requirements.txt` plus `pytest`
-and `pytest-asyncio`, `PYTHONPATH=.`, no network and no Telegram.
+Environment: `/tmp/iv` virtualenv from `backend/requirements.txt` plus `pytest` and
+`pytest-asyncio`, `PYTHONPATH=.`, no network and no live Telegram.
 
 | Check | Result |
 | --- | --- |
-| `pytest tests/test_peer_classification.py tests/test_46_general_chat_ids.py tests/test_52_ghost_seen_v2_stage1.py tests/test_57_ghost_seen_v2_stage5_6.py tests/test_anti_edit_delete.py tests/test_history_panel.py tests/test_history_service.py` | **311 passed** |
-| Full suite (`pytest -q -p no:cacheprovider`) | **7,659 passed, 6 failed, 27 skipped** in 174.6 s |
-| The same 6 tests on a clean detached worktree at `ecc3779` | **6 failed** — identical list |
-| `py_compile` on all six changed Python files | exit 0 |
+| `tests/test_history_policy.py` | **78 passed** |
+| Policy + panel + AI tools + capacity + service + Phase 1 classifier (6 files) | **300 passed** |
+| Full suite (`pytest -q -p no:cacheprovider tests/`) | **7,750 passed, 6 failed, 27 skipped** in 145.51 s |
+| Baseline at Phase 1 base `ffe72fd` | 7,659 passed, **the same 6 failed**, 27 skipped |
+| `py_compile` on all changed Python files | exit 0 |
 | `git diff --check` | clean |
 
-The six failures are pre-existing and unrelated (documentation/DB-security/schema
-audits and one scheduler test); they reproduce unchanged at the base commit, so
-no new regression was introduced.
+The six failures are the previously documented pre-existing ones
+(`test_aed_db_security`, `test_canonical_schema_reconciliation`,
+`test_database_setup_order` ×2, `test_private_message_db_security`,
+`test_task_scheduler::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`),
+reproduced identically at the implementation base. No new regression.
 
-## 7. Scope compliance
+Policy tests cover the exact mapping for every `PeerType`, every accepted choice,
+500/1000 rejection for bots and channels, 300 for both capped types, 1000 for the
+large types, `UNKNOWN` refusal for every value, non-integers/booleans/strings/
+zero/negative/over-cap rejection, no clamping and deterministic refusal text.
+Panel tests cover the dynamic choices for all five real peer types, stale
+capped callbacks after a selection change, refusal without any provider call,
+`UNKNOWN` selection/run refusal, and linked-channel cap refusal. Service tests
+prove that bypassing the panel cannot bypass the policy: the refusal happens with
+zero `iter_messages` calls and zero provider calls.
 
-Not implemented in this phase: History per-peer caps, `history_policy.py`, count
-choices, retrieval/cursor changes, pagination, AI capacity, scheduled History,
-Taskloom changes, a new ToolExecutor action, any table/migration/SQL/Supabase
-change, peer-type persistence or cache, a second client/scheduler/worker/
-listener/executor/update loop, ProviderManager/routing/pacing changes, delivery
-changes, unrelated refactors or API renames. Nothing was deployed.
+## 9. Scope compliance
 
-## 8. Limitations and live status
+Not implemented: incremental/oldest-first retrieval, cursor changes, pagination,
+persistence or peer-type caching, database tables/migrations/SQL/Supabase,
+scheduled History, TaskScheduler/TaskExecutionCoordinator/RuntimeSupervisor/
+ToolExecutor changes, a new ToolExecutor action, ProviderManager/routing/pacing/
+capacity changes, another client/listener/executor/update loop, delivery
+destination changes, unrelated refactors or API renames. Nothing was deployed.
 
-- **No live Telegram validation**: no real dialogs were resolved against a live
-  account; every test uses real Telethon *entity objects* constructed locally.
-  The classifier's correctness therefore rests on Telethon's documented flags,
-  which is the authority it reads.
-- A `Channel` whose `broadcast` and `megagroup`/`gigagroup` flags are all unset
-  is `UNKNOWN` by design; callers must fail closed rather than pick a category.
-  There is no dashboard/UI consumer of `PeerType` yet.
-- `str(PeerType.X)` prints `PeerType.X` (standard `Enum` behaviour); compare
-  identity or use `.value`. The type is `str`-compatible for storage/JSON, which
-  no code does in this phase.
-- Later phases (policy, incremental cursors, durable schedules, admission) remain
-  unimplemented and are described in `INVESTIGATION.md` / `ROADMAP.md`.
+## 10. Limitations and live status
+
+- **No live Telegram validation**: no real dialogs, bots, channels or migrations
+  were exercised against an account. Tests construct real Telethon entity objects
+  locally; classification correctness rests on Telethon's entity flags, which is
+  what the Phase 1 classifier reads.
+- The policy is evaluated on Telegram's currently resolved entity. A peer that
+  Telegram cannot resolve is refused (`UNKNOWN`/`HistoryError`); it is never
+  guessed from title, id or dialog flags.
+- A 300-message product allowance can still be refused by the existing AI
+  capacity gate; that refusal remains truthful and independent.
+- Phase 3 (schema/repository investigation and implementation planning) and later
+  work remain unimplemented; see `INVESTIGATION.md` and `ROADMAP.md`. The
+  oldest-first incremental retrieval defect is still unfixed and is a prerequisite
+  for scheduled processing.

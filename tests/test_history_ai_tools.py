@@ -48,6 +48,7 @@ from backend.ai.tools.history_ai import SummarizeHistoryTool, TranslateHistoryTo
 from backend.ai.tools.registry import create_default_registry
 from backend.services import history_ai_service, history_service
 from backend.telegram_api.api import TelegramAPI
+from backend.telegram_api.peers import PeerType
 
 CHAT = -100555000
 OWNER = 7770001
@@ -83,6 +84,11 @@ class _FakeClient:
         self._messages = list(messages)
         self.calls: list[dict[str, Any]] = []
 
+    async def get_entity(self, chat_id: Any):
+        from telethon.tl import types
+
+        return types.User(id=abs(int(chat_id)) or 1, first_name="Fake")
+
     def iter_messages(self, chat_id: Any, **kwargs: Any):
         self.calls.append({"chat_id": chat_id, **kwargs})
         limit = kwargs.get("limit")
@@ -104,6 +110,11 @@ class _FakeClient:
 
 
 class _FailingClient:
+    async def get_entity(self, chat_id: Any):
+        from telethon.tl import types
+
+        return types.User(id=abs(int(chat_id)) or 1, first_name="Fake")
+
     def iter_messages(self, chat_id: Any, **kwargs: Any):
         async def _boom():
             raise ConnectionError("mtproto down")
@@ -356,6 +367,45 @@ async def test_translate_count_beyond_the_bound_is_capped_and_stated(monkeypatch
     assert requested == [history_service.MAX_HISTORY_MESSAGES]
     assert result.data["capped"] is True
     assert str(history_service.MAX_HISTORY_MESSAGES) in result.message
+
+
+@pytest.mark.asyncio
+async def test_the_service_refuses_a_count_the_current_peer_does_not_permit(monkeypatch):
+    """Bypassing the panel cannot bypass the policy: the service boundary validates."""
+
+    async def _bot(source, chat_id):
+        return PeerType.PRIVATE_BOT
+
+    monkeypatch.setattr(history_service, "classify_chat", _bot)
+    provider = _ScriptedProvider(_summarizing_provider)
+    client = _FakeClient(_conversation(5))
+
+    result = await _run_summarize(_manager(provider), client, {"count": 1000})
+
+    assert result.success is False
+    assert result.data["error"] == history_ai_service.ERROR_POLICY
+    assert "limited to 300" in result.message
+    # Refused BEFORE any Telegram read or provider call.
+    assert client.calls == []
+    assert provider.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_the_service_refuses_an_unclassifiable_peer(monkeypatch):
+    async def _unknown(source, chat_id):
+        return PeerType.UNKNOWN
+
+    monkeypatch.setattr(history_service, "classify_chat", _unknown)
+    provider = _ScriptedProvider(_summarizing_provider)
+    client = _FakeClient(_conversation(2))
+
+    result = await _run_summarize(_manager(provider), client, {"count": 100})
+
+    assert result.success is False
+    assert result.data["error"] == history_ai_service.ERROR_POLICY
+    assert "could not be determined" in result.message
+    assert client.calls == []
+    assert provider.calls == 0
 
 
 @pytest.mark.asyncio
