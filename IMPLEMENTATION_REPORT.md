@@ -1,150 +1,170 @@
-# IMPLEMENTATION REPORT — P1 History & Intelligence result-delivery hotfix
+# IMPLEMENTATION REPORT — AI candidate pool survives restart
 
 ## 1. Scope and production evidence
 
-The P1 History & Intelligence panel could finish a summary successfully and still
-leave the owner on the Loading state. Deployed Render logs for request
-`glass-history` (2026-11-13T14:08–14:09Z) show:
+Deployed commit: `16071f6a4264fc4d062540f201b099b83e137204` (`main`).
 
-- retrieval and every provider call completed with non-empty text;
-- the final panel edit failed with `The caption is too long
-  (caused by EditInlineBotMessageRequest)`;
-- the fallback self-client edit failed with `The action must be performed
-  through an inline bot callback (caused by EditMessageRequest)`.
+A History Summary request failed with `AI_CANDIDATES_EXHAUSTED` after:
 
-Both failures are consistent with the panel being a photo message owned by the
-Helper Bot's inline result: Telegram bounds its text to a caption, and only the
-inline bot can edit it.
+- Gemini / `gemini-3.1-flash-lite` → API 503;
+- NaraRouter / `deepseek-v4-flash` → rate limited;
+- OpenAI / `gpt-4o` → rate limited.
 
-## 2. Root cause confirmed in source
+Routing logs showed `models=1` for Gemini, NaraRouter and OpenAI, `models=0` for
+Groq, SambaNova and Cohere, OpenRouter disabled and You.com excluded. The
+investigation is in `INVESTIGATION.md`; this report covers what was changed and
+what was actually verified.
 
-- `backend/services/appearance_service.py`: with Appearance preview active the
-  panel is delivered as a PHOTO inline result whose text is its caption;
-  `MAX_CAPTION_CHARS = 1024` and `caption_for()` refuses longer text. Text-only
-  delivery is not caption-bounded.
-- `backend/bot/handlers/history.py`: `MAX_SUMMARY_CHARS = 2800`, plus metadata
-  lines, so a valid summary can exceed 1024. `_run_summary()` called
-  `_paint()` for the final result and ignored its Boolean return;
-  `_run_link()` delegated to the same function. The `finally` block released
-  the operation generation regardless, so a refused edit completed the
-  operation as if the result had been delivered.
-- `backend/helper/panel_edit.py`: `ExistingPanelEditor.edit()` returns `False`
-  (never raises) when both edit paths are refused. Its self-client fallback
-  cannot edit an inline-bot-owned message, which is exactly what production
-  logged.
+## 2. Root cause
 
-Focus was **not** independently defective. The registration, pending-input
-consumption, `_focus_input_handler`, `_state` snapshot and
-`instruction=focus or None` pass-through were verified and are now covered by
-regression tests; Focus runs were affected only by the shared delivery defect.
+1. `ProviderManager._model_candidates` is an in-memory dict.
+2. It is fed only by `backend/ai/model_tester.py::_feed_production_candidates()`
+   at the end of a Test Modules run in the same process.
+3. Startup (`RuntimeSupervisor`) applies the persisted provider configuration
+   but never restores or refreshes candidate models; the saved Test snapshot is
+   explicitly display-only and was never read by routing.
+4. Consequently every restart/redeploy starts with an empty pool, so each
+   provider contributes only its configured default model. A provider whose
+   configured model is already unavailable contributes zero candidates
+   (`models=0`). The fallback loop itself iterates every pair it is given and
+   was not truncating anything.
+5. A second defect: a partial Test Modules run (overall timeout/cancellation)
+   still published its incomplete AVAILABLE set, which could shrink a complete
+   in-memory pool.
 
-## 3. Implemented fix (smallest supported delivery path)
+## 3. Implemented changes
 
-Only `backend/bot/handlers/history.py` changed behaviourally:
+### `backend/ai/candidate_pool.py` (new)
 
-- `_deliver_result()` chooses the path from the ACTUAL recorded delivery state
-  (`appearance_service.delivered_state`). A media panel whose rendered result
-  exceeds the caption bound goes straight to the text replacement; a short
-  result still edits in place.
-- `_replace_with_text_result()` reuses the existing
-  `PanelLifecycleManager.replace_panel` (create the new inline panel first,
-  delete the old message only after it exists) with a non-empty query extra
-  (`result:<token>`). A non-empty extra makes
-  `appearance_service.apply_to_inline_results` skip media composition, so the
-  new panel is a genuine TEXT result with its keyboard/navigation intact.
-- Result views are carried in a bounded (`8`) one-shot `OrderedDict` keyed by a
-  random token; the inline builder drains the token, so no growing state, no
-  global "current result", and no replay.
-- Text is deterministically bounded to Telegram's text-message limit
-  (`MAX_RESULT_TEXT_CHARS = 4096`) with a visible truncation marker; it is NOT
-  truncated to the 1024 caption bound.
-- A replacement message is sent only when the panel chat is the owner's OWN
-  private chat (Saved Messages, `panel_chat_id == owner id`). In any other chat
-  no separate message is sent; the panel receives a short honest failure notice.
-- A refused final edit is no longer silent: `_run_summary()` checks the delivery
-  result, falls back to the text replacement, and otherwise attempts a short
-  failure notice and logs `HISTORY_RESULT_DELIVERY_FAILED` with a stable reason
-  (`destination_not_owner_private`, `replacement_failed`,
-  `replacement_raised`, `no_safe_text_path`). Operation-generation cleanup still
-  runs in `finally`.
-- No second Telegram client, listener, scheduler, worker, executor, provider
-  manager, persistent state or database object was added. `history_ai_service`,
-  `history_service`, the identifier-free prompt mode and all existing guards are
-  unchanged.
+Durable, bounded publication of the proven candidate feed:
 
-## 4. Files changed
+- one `bot_settings` JSON document at `ai_model_candidates:v1`, through the
+  existing generic `settings_document_write` / `settings_document_state` API —
+  no new table, column, migration, SQL, or `DATABASE_ARCHITECTURE.md` change;
+- schema version, `published_at`, provider→model lists (ordered), bounded to 32
+  providers × 256 models × 200 chars, de-duplicated, `dummy` excluded;
+- provider entries with an empty list are persisted deliberately so a complete
+  run with no AVAILABLE model clears the restored entry;
+- refuse documents that are missing, unreadable, malformed, unsupported,
+  future-dated beyond clock skew, or older than `MAX_AGE_S = 24 h`;
+- `restore(manager)` populates only providers currently registered in the
+  process and returns an explicit status (`restored`, `missing`, `stale`,
+  `unavailable`, `malformed`, `no_registered_provider`) for boot logging;
+- a persistence failure returns `False`; it never breaks the live run, which
+  has already been armed in memory.
 
-- `backend/bot/handlers/history.py` — delivery selection, text replacement,
-  bounded one-shot result views, owner-private destination guard, honest failure
-  handling.
-- `tests/test_history_panel.py` — 10 new regression tests (39 total in the
-  file): long media result replacement, short in-place render, text-bound
-  determinism, refused edit is an explicit failure with generation cleanup,
-  no replacement outside the owner's own chat, caption limit not applied to the
-  text path, Focus save/pass-through/clear/over-limit rejection, focused long
-  summary delivery, and link summary delivery through the same path.
-- `ROADMAP.md` — P1 result-delivery hotfix recorded in the History & Event
-  Intelligence entry.
-- `IMPLEMENTATION_REPORT.md` — this report.
+The document is a candidate list, not an availability guarantee. Restored
+candidates are still attempted by the normal router, and a failing pair is
+cooled down or marked unavailable by the existing `ProviderManager` rules.
 
-No other file changed. No database, Supabase, schema, migration or deployment
-configuration was touched.
+### `backend/ai/model_tester.py`
 
-## 5. Automated verification
+- `_feed_production_candidates(..., partial=False)` now publishes nothing when
+  `partial=True` (logs `CANDIDATE_POOL_SKIPPED reason=partial_run`) and returns
+  the exact feed it applied (including empty providers), or `None` when it did
+  not publish.
+- Both `test_all_models()` and `test_all_models_streaming()` pass
+  `partial=bool(pending)` and, only when the feed is not `None`, call
+  `candidate_pool.publish(feed)`.
+- Complete-run publication to ProviderManager is unchanged (all AVAILABLE,
+  free-first, configured model excluded, no cap); only durability and
+  partial-run safety were added.
 
-- New/affected focused suite: `.venv/bin/python -m pytest
-  tests/test_history_panel.py -q` → **39 passed**.
-- Related panel/lifecycle/appearance/history selection:
-  `pytest tests/ -k "panel or lifecycle or appearance or history"`
-  → **705 passed, 3 skipped**.
-- Full suite (`pytest tests/ -q --ignore=tests/test_runtime_session_terminal.py`,
-  the untracked startup-hardening test from unrelated work that cannot collect
-  on this base) → **7571 passed, 6 failed, 27 skipped** in 144.34 s.
-- Untouched `origin/main` baseline (`96b93ea`, clean worktree) → **7560 passed,
-  6 failed, 27 skipped** in 163.47 s.
-- Baseline comparison: the SAME six failures exist on the untouched baseline and
-  none is in a file changed here:
-  1. `tests/test_aed_db_security.py::test_the_documentation_describes_the_restrictive_model`
-  2. `tests/test_canonical_schema_reconciliation.py::test_the_migration_is_forward_only_and_its_successors_stay_additive`
-  3. `tests/test_database_setup_order.py::test_the_section_does_not_pretend_the_sql_was_executed`
-  4. `tests/test_database_setup_order.py::test_the_waiting_answer_migration_is_absorbed_by_part_one`
-  5. `tests/test_private_message_db_security.py::test_the_rls_model_names_the_two_tables_as_server_only_exceptions`
-  6. `tests/test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`
-  These are documentation-drift assertions and one pre-existing scheduler
-  recovery failure, outside this hotfix's authorized scope.
-- `python -m compileall -q backend tests` → exit 0.
-- `git diff --check` → exit 0.
+### `backend/runtime/supervisor.py`
 
-## 6. Live verification status
+- `_build_and_register()` now awaits `_restore_ai_model_candidates()` after
+  `_apply_ai_config_at_boot()` and before the update run loop starts, so a
+  production request cannot be served before the restore attempt.
+- The restore is bounded by `CANDIDATE_RESTORE_TIMEOUT_S = 10 s`; a timeout,
+  unreadable document or any exception is logged and never blocks startup.
+  RuntimeSupervisor remains the sole lifecycle owner — no new task, loop,
+  worker or scheduler is created.
 
-**No live Telegram verification was performed.** The fix is verified only by
-offline tests with scripted Telegram fakes and real composition/replacement
-code paths. It must not be described as operationally fixed until a real run
-with Appearance preview active and a summary longer than 1024 characters shows
-the text replacement on screen. No Render deploy was triggered.
+### `tests/test_model_candidate_pool.py` (new, 13 tests)
 
-## 7. Remaining limitations
+Covers:
 
-- The text replacement is allowed only in the owner's own private chat
-  (Saved Messages). A long summary started from a group or another chat gets a
-  short honest failure notice instead of a private-content message there; this
-  is deliberate.
-- Telegram's exact behaviour for the replacement inline result cannot be proven
-  offline (the test fakes the lifecycle call); only the actual Telegram client
-  confirms the message swap.
-- The caption-too-long detection relies on the recorded Appearance delivery
-  state; when that state is absent (e.g. after a restart) the first edit is
-  attempted and its refusal still falls back to the text replacement.
+- publish/load round-trip, ordering, empty-provider entries, durable-write
+  failure reporting;
+- missing vs unreadable vs malformed vs unsupported documents;
+- stale document refused and fresh document restores every model in order;
+- unregistered providers ignored (no stale references);
+- repeated restore does not duplicate candidates;
+- a complete feed arms every eligible provider and clears providers with none;
+- a partial feed preserves the existing pool and a partial test run publishes
+  nothing;
+- restored candidates are actually attempted after the configured model fails:
+  the configured model's transient retry runs, then the restored sibling model
+  succeeds (this exercises the real `ProviderManager.chat()` loop);
+- the supervisor boot hook calls `candidate_pool.restore(manager)`.
 
-## 8. Delivery
+## 4. Verification actually executed
 
-- Repository: `Onlyicing1/Telegram-self-bot`.
-- Branch: `main`.
-- Hotfix commit: **`678fab5bfdebf1a41084d6293a24acd65fdbd332`**
-  (`fix(history): deliver long summaries outside the photo-caption limit`).
-- This report is committed as the immediate child of that hotfix commit and
-  pushed in the same fast-forward push; `origin/main` is verified to equal the
-  report commit after the push (recorded in the delivery response).
-- Final working tree: clean except the pre-existing untracked
-  `tests/test_runtime_session_terminal.py` from unrelated in-progress work,
-  which was not staged or modified.
+All commands were run in this workspace with the project's `.venv`
+(Python 3.12.3).
+
+| Check | Command | Result |
+| --- | --- | --- |
+| Focused routing/model tester | `pytest tests/test_model_candidate_pool.py tests/test_dynamic_model_fallback.py tests/test_model_tester.py -q` | **100 passed** |
+| History/supervisor/provider-manager/fallback selection | `pytest tests -q --ignore=tests/test_runtime_session_terminal.py -k "history or supervisor or provider_manager or dynamic_model"` | **214 passed** |
+| Full suite | `pytest tests -q --ignore=tests/test_runtime_session_terminal.py` | **7584 passed, 6 failed, 27 skipped** (144 s) |
+| Compilation | `python -m py_compile backend/ai/candidate_pool.py backend/ai/model_tester.py backend/runtime/supervisor.py tests/test_model_candidate_pool.py` | passed |
+| Whitespace/diff | `git diff --check` | passed |
+
+The 6 full-suite failures are the unchanged pre-existing baseline, not
+regressions:
+
+- `tests/test_aed_db_security.py::test_the_documentation_describes_the_restrictive_model`
+- `tests/test_canonical_schema_reconciliation.py::test_the_migration_is_forward_only_and_its_successors_stay_additive`
+- `tests/test_database_setup_order.py::test_the_section_does_not_pretend_the_sql_was_executed`
+- `tests/test_database_setup_order.py::test_the_waiting_answer_migration_is_absorbed_by_part_one`
+- `tests/test_private_message_db_security.py::test_the_rls_model_names_the_two_tables_as_server_only_exceptions`
+- `tests/test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`
+
+`tests/test_runtime_session_terminal.py` was excluded because it is a
+pre-existing **untracked** file (present before this task) whose collection
+errors; it is unrelated and was not modified or staged.
+
+## 5. Behavioral contract after this change
+
+- A complete Test Modules run still arms the live manager immediately and now
+  also persists the exact feed.
+- After a restart, RuntimeSupervisor restores that feed once, before updates can
+  run, for providers registered in that process.
+- A restored candidate is only a candidate: routing re-proves it with a real
+  request; a dead pair is cooled down/marked unavailable and the existing
+  fallback continues to the next model.
+- A feed older than 24 hours is not restored; startup logs the reason and
+  routing behaves as before (configured models only).
+- A partial/timed-out test run changes neither the live pool nor the durable
+  document.
+
+## 6. Remaining limitations and live behavior not verified
+
+- **No Render deployment or live History Summary request was performed.** The
+  production path was verified by source tracing and deterministic tests only.
+- The actual Supabase `bot_settings` write/read of `ai_model_candidates:v1` was
+  not exercised against the live database; it uses the same generic document
+  API as the existing Test snapshot.
+- Whether the observed Render process had run Test Modules since its last
+  restart is not knowable from the logs. The source proves the in-memory pool
+  could not survive that restart regardless.
+- The exact prior failure category (permanent `model_not_found` vs cooldown)
+  for the `models=0` providers is not logged; the pair-level unavailable map is
+  in-memory.
+- The 24-hour freshness window is a deliberate safety bound, not a live
+  availability proof. A model can go down after a fresh test.
+
+## 7. Required owner action after deploy
+
+1. Deploy this commit.
+2. Run **Test Modules once to completion** in the deployed process. The old
+   process never had durable publication, so the first complete post-deploy run
+   is what creates `ai_model_candidates:v1`. Until then, startup restore reports
+   `missing` and routing is unchanged.
+3. Send a History Summary request and inspect the `ROUTER_SCORE` /
+   `AI_FALLBACK_START` / `CANDIDATE_POOL_RESTORE` logs. A restart followed by
+   another History Summary must show the restored `models=N` counts without
+   re-running Test Modules.
+4. If more than 24 hours pass before the next restart, refresh with another
+   complete Test Modules run; an older document is intentionally refused.

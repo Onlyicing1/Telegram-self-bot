@@ -1,5 +1,18 @@
 # ROADMAP
 
+## Latest delivery: AI candidate pool survives restart
+
+Status: **implemented and offline-verified; live deploy pending.** Test Modules
+results now persist as a bounded, freshness-checked `bot_settings` document and
+RuntimeSupervisor restores them once at boot, so production routing no longer
+falls back to one configured model per provider after a restart. Partial test
+runs no longer publish. ProviderManager remains the sole router; no schema or
+SQL change. Details: `IMPLEMENTATION_REPORT.md`.
+
+Next step: deploy, run Test Modules once to completion in the deployed process
+(that first complete run creates the durable feed), then verify a History
+Summary and a restart with `CANDIDATE_POOL_RESTORE` / `ROUTER_SCORE` logs.
+
 ## Completed: Supabase live schema and privilege audit
 
 Status: **Audited, selectively hardened, live-verified, and documented.**
@@ -118,7 +131,9 @@ enabled column. Neither is **applied** — that remains a manual owner action.
 ## Investigation complete (P0): Unified History & Event Intelligence
 
 Status: **P0 complete — investigated, specified, no runtime change.** The
-source-verified investigation lives in `INVESTIGATION.md`; this section is the
+source-verified P0 investigation is preserved at
+`ca0399b2156999a065444f31a31a58bb38841663:INVESTIGATION.md` (that file now
+holds the AI candidate-routing investigation); this section is the
 execution memory for the implementation phases. Base commit
 `ca0399b2156999a065444f31a31a58bb38841663`. P1 is implemented on top of this
 specification; its verified outcome is recorded below.
