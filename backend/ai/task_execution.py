@@ -52,6 +52,7 @@ from backend.ai.tools.executor import ToolExecutionResult, ToolExecutor
 from backend.ai.tools.registry import ToolRegistry
 from backend.ai.preparation_policy import (
     CONTENT_FIELDS,
+    POLICY_VIOLATION_CODES,
     PreparationPolicy,
     PreparationPolicyError,
     derive_policy,
@@ -71,8 +72,76 @@ MAX_PREPARATION_ATTEMPTS = 3
 _JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
 
 
+# Bounded, structured preparation failure categories. They are persisted as an
+# occurrence's failure classification instead of the generic ``unclassified``
+# the retry classifier produces for any ValueError-derived error, so a failed
+# preparation states WHICH stage failed without logging generated content,
+# prompts, provider payloads or credentials.
+PREPARATION_FAILURE_CATEGORIES = frozenset({
+    "provider_failure",
+    "empty_response",
+    "invalid_json",
+    "invalid_action_structure",
+    "content_policy_rejected",
+    "preparation_failed",
+})
+
+#: Provider evidence the manager/adapter already classify: an origin word is
+#: persisted, the provider's message never is.
+_PROVIDER_FAILURE_ORIGINS = frozenset({
+    "authentication", "rate_limit", "model_lookup", "request_validation",
+    "server", "timeout", "network", "provider",
+})
+_DIAGNOSTIC_TOKEN_RE = re.compile(r"[^a-z0-9_]+")
+
+
+def _bounded_provider_diagnostic(
+    value: Any, allowed: frozenset[str] | None = None
+) -> str:
+    """A provider-supplied diagnostic WORD, bounded and content-free."""
+    token = _DIAGNOSTIC_TOKEN_RE.sub("_", str(value or "").strip().lower())[:32]
+    if allowed is not None and token not in allowed:
+        return ""
+    return token.strip("_")
+
+
 class TaskPreparationError(ValueError):
-    """Occurrence-time AI argument preparation failed; the action must not run."""
+    """Occurrence-time AI argument preparation failed; the action must not run.
+
+    ``category`` and ``stage`` are the bounded, structured diagnosis the
+    occurrence persists. ``provider_origin``/``provider_finish_reason`` carry
+    the provider's OWN classification (rate limit, model lookup, safety block,
+    token truncation) — never its message and never any generated text.
+    ``policy_violation`` is the deterministic rule that rejected the content
+    (bounded vocabulary), or empty when this failure is not a policy one.
+    """
+
+    DEFAULT_CATEGORY = "preparation_failed"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        category: str | None = None,
+        stage: str = "preparation",
+        provider_origin: str = "",
+        provider_finish_reason: str = "",
+        policy_violation: str = "",
+        attempts: int = 1,
+    ) -> None:
+        super().__init__(message)
+        self.category = category if category in PREPARATION_FAILURE_CATEGORIES else self.DEFAULT_CATEGORY
+        self.stage = _bounded_provider_diagnostic(stage) or "preparation"
+        self.provider_origin = _bounded_provider_diagnostic(
+            provider_origin, _PROVIDER_FAILURE_ORIGINS
+        )
+        self.provider_finish_reason = _bounded_provider_diagnostic(provider_finish_reason)
+        # Only the bounded vocabulary is persisted; anything else is dropped
+        # rather than becoming an arbitrary diagnostic string.
+        self.policy_violation = (
+            policy_violation if policy_violation in POLICY_VIOLATION_CODES else ""
+        )
+        self.attempts = max(1, int(attempts)) if isinstance(attempts, int) else 1
 
 
 def present_calls(calls: list[dict[str, Any]], instruction: str) -> list[dict[str, Any]]:
@@ -202,46 +271,109 @@ class AIActionPreparator:
             # Transient provider failure — retryable under the existing contract.
             raise TimeoutError("task preparation provider timed out") from exc
         except Exception as exc:
-            raise TaskPreparationError(f"task preparation provider failed: {type(exc).__name__}") from exc
+            raise TaskPreparationError(
+                f"task preparation provider failed: {type(exc).__name__}",
+                category="provider_failure",
+                stage="provider_request",
+                provider_origin=type(exc).__name__,
+            ) from exc
+        response_meta = response.metadata if isinstance(response.metadata, dict) else {}
         if not response.success:
             raise TaskPreparationError(
-                f"task preparation provider failed: {response.provider_name or 'unknown'}"
+                f"task preparation provider failed: {response.provider_name or 'unknown'}",
+                category="provider_failure",
+                stage="provider_request",
+                provider_origin=str(
+                    response_meta.get("failure_origin") or response_meta.get("failure_type") or ""
+                ),
+                provider_finish_reason=str(response_meta.get("finish_reason") or ""),
             )
         raw = response.text
         if not isinstance(raw, str) or not raw.strip():
-            raise TaskPreparationError("task preparation returned no structured output")
+            # A transport success with no content is its own stage: the provider
+            # answered, the model produced nothing (e.g. a blocked/truncated
+            # candidate the adapter reports as an empty text).
+            raise TaskPreparationError(
+                "task preparation returned no structured output",
+                category="empty_response",
+                stage="provider_response",
+                provider_finish_reason=str(response_meta.get("finish_reason") or ""),
+            )
         try:
             value = _load_preparation_json(raw)
-        except json.JSONDecodeError as exc:
-            raise TaskPreparationError("task preparation returned invalid JSON") from exc
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            raise TaskPreparationError("task preparation returned invalid JSON") from exc
+            raise TaskPreparationError(
+                "task preparation returned invalid JSON",
+                category="invalid_json",
+                stage="parse",
+                provider_finish_reason=str(response_meta.get("finish_reason") or ""),
+            ) from exc
         if not isinstance(value, dict) or set(value) != {"actions"}:
-            raise TaskPreparationError("task preparation output must be {'actions': [...]}")
+            raise TaskPreparationError(
+                "task preparation output must be {'actions': [...]}",
+                category="invalid_action_structure",
+                stage="structure",
+            )
         actions = value["actions"]
         if not isinstance(actions, list) or len(actions) != len(templates):
-            raise TaskPreparationError("task preparation returned the wrong number of actions")
+            raise TaskPreparationError(
+                "task preparation returned the wrong number of actions",
+                category="invalid_action_structure",
+                stage="structure",
+            )
         prepared: list[dict[str, Any]] = []
         for template, action in zip(templates, actions, strict=True):
             if not isinstance(action, dict):
-                raise TaskPreparationError("each prepared action must be an object")
+                raise TaskPreparationError(
+                    "each prepared action must be an object",
+                    category="invalid_action_structure",
+                    stage="structure",
+                )
             # The model may fill arguments for the task's own tools ONLY; a
             # swapped or invented tool name fails closed here.
             if action.get("name") != template["name"]:
-                raise TaskPreparationError("prepared action tool name does not match the task definition")
+                raise TaskPreparationError(
+                    "prepared action tool name does not match the task definition",
+                    category="invalid_action_structure",
+                    stage="structure",
+                )
             arguments = action.get("arguments")
             if not isinstance(arguments, dict):
-                raise TaskPreparationError("prepared action arguments must be an object")
+                raise TaskPreparationError(
+                    "prepared action arguments must be an object",
+                    category="invalid_action_structure",
+                    stage="structure",
+                )
+            # Every argument the TASK declares must be filled: the model may
+            # supply values, never rename or drop a declared argument. Without
+            # this a plausible-looking reply ({"content": ...} for a tool that
+            # reads "text") would execute the tool with an empty value.
+            missing = [key for key in template.get("arguments", {}) if key not in arguments]
+            if missing:
+                raise TaskPreparationError(
+                    "prepared action arguments do not match the task's declared arguments",
+                    category="invalid_action_structure",
+                    stage="structure",
+                )
             try:
                 validate_prepared_action({"name": template["name"], "arguments": arguments})
             except TaskContractError as exc:
-                raise TaskPreparationError(str(exc)) from exc
+                raise TaskPreparationError(
+                    str(exc),
+                    category="invalid_action_structure",
+                    stage="structure",
+                ) from exc
             try:
                 validate_prepared_arguments(arguments, policy)
             except PreparationPolicyError as exc:
-                raise TaskPreparationError(f"prepared content violates the task policy: {exc}") from exc
+                raise TaskPreparationError(
+                    f"prepared content violates the task policy: {exc}",
+                    category="content_policy_rejected",
+                    stage="content_policy",
+                    policy_violation=exc.code,
+                ) from exc
             prepared.append({"name": template["name"], "arguments": dict(arguments)})
         return prepared
 
@@ -276,13 +408,22 @@ class AIActionPreparator:
             except TaskPreparationError as exc:
                 last_error = exc
                 # A structural violation that regeneration cannot fix (tool
-                # name swap, wrong action count) must not burn more rounds:
-                # only content-policy rejections are worth regenerating.
-                if "tool name" in str(exc) or "number of actions" in str(exc):
+                # name swap, wrong action count, renamed argument) must not
+                # burn more rounds: only content/parse rejections are worth
+                # regenerating.
+                if exc.category == "invalid_action_structure":
                     raise
             except TimeoutError:
                 raise
-        raise TaskPreparationError(f"task preparation failed after {attempt} attempts: {last_error}")
+        raise TaskPreparationError(
+            f"task preparation failed after {attempt} attempts: {last_error}",
+            category=getattr(last_error, "category", None),
+            stage=getattr(last_error, "stage", "preparation"),
+            provider_origin=getattr(last_error, "provider_origin", ""),
+            provider_finish_reason=getattr(last_error, "provider_finish_reason", ""),
+            policy_violation=getattr(last_error, "policy_violation", ""),
+            attempts=attempt,
+        )
 
 
 def _default_preparator() -> AIActionPreparator | None:
@@ -1263,8 +1404,12 @@ class TaskExecutionCoordinator:
             raise
         except Exception as exc:
             logger.warning(
-                "TASK_PREPARE_AHEAD_FAILED task_id=%s occurrence_key=%s exception=%s detail=%s",
-                occurrence.task_id, occurrence.occurrence_key, type(exc).__name__, str(exc)[:200],
+                "TASK_PREPARE_AHEAD_FAILED task_id=%s occurrence_key=%s exception=%s "
+                "category=%s stage=%s attempts=%s violation=%s detail=%s",
+                occurrence.task_id, occurrence.occurrence_key, type(exc).__name__,
+                getattr(exc, "category", ""), getattr(exc, "stage", ""),
+                getattr(exc, "attempts", ""), getattr(exc, "policy_violation", "") or "-",
+                str(exc)[:200],
             )
             return None
         prepared_at = datetime.now(timezone.utc).isoformat()
@@ -1375,8 +1520,7 @@ class TaskExecutionCoordinator:
                     tz_str=tz_str,
                 )
             except TaskPreparationError as exc:
-                message = str(exc)
-                if "tool name" in message or "number of actions" in message:
+                if exc.category == "invalid_action_structure":
                     raise  # structural — regeneration cannot fix it
                 last_error = exc
                 continue
@@ -1388,12 +1532,21 @@ class TaskExecutionCoordinator:
                     validate_prepared_arguments(call.get("arguments", {}), policy)
             except PreparationPolicyError as exc:
                 last_error = TaskPreparationError(
-                    f"prepared content violates the task policy: {exc}"
+                    f"prepared content violates the task policy: {exc}",
+                    category="content_policy_rejected",
+                    stage="content_policy",
+                    policy_violation=exc.code,
                 )
                 continue
             return prepared
         raise TaskPreparationError(
-            f"task preparation failed after {attempt} attempts: {last_error}"
+            f"task preparation failed after {attempt} attempts: {last_error}",
+            category=getattr(last_error, "category", None),
+            stage=getattr(last_error, "stage", "preparation"),
+            provider_origin=getattr(last_error, "provider_origin", ""),
+            provider_finish_reason=getattr(last_error, "provider_finish_reason", ""),
+            policy_violation=getattr(last_error, "policy_violation", ""),
+            attempts=attempt,
         )
 
     @staticmethod
@@ -1411,7 +1564,12 @@ class TaskExecutionCoordinator:
             try:
                 validate_prepared_arguments(call.get("arguments", {}), policy)
             except PreparationPolicyError as exc:
-                raise TaskPreparationError(f"prepared content violates the task policy: {exc}") from exc
+                raise TaskPreparationError(
+                    f"prepared content violates the task policy: {exc}",
+                    category="content_policy_rejected",
+                    stage="content_policy",
+                    policy_violation=exc.code,
+                ) from exc
 
     @staticmethod
     def _validate_prepared_calls(
@@ -1524,12 +1682,37 @@ class TaskExecutionCoordinator:
         runs: list[dict[str, Any]] | None = None,
     ) -> TaskExecutionResult:
         decision = classify_failure(error)
+        # A preparation failure knows its own bounded category/stage; the
+        # generic classifier would collapse every one of them into
+        # ``unclassified``, which is exactly the evidence this record must keep.
+        failure_class = decision.reason
+        diagnostics: dict[str, Any] = {}
+        if isinstance(error, TaskPreparationError):
+            failure_class = error.category
+            diagnostics = {
+                "failure_stage": error.stage,
+                "preparation_attempts": error.attempts,
+            }
+            if error.provider_origin:
+                diagnostics["provider_failure_origin"] = error.provider_origin
+            if error.provider_finish_reason:
+                diagnostics["provider_finish_reason"] = error.provider_finish_reason
+            if error.policy_violation:
+                diagnostics["policy_violation"] = error.policy_violation
+            logger.warning(
+                "TASK_PREPARATION_FAILED task_id=%s occurrence_key=%s category=%s "
+                "stage=%s attempts=%s origin=%s violation=%s",
+                occurrence.task_id, occurrence.occurrence_key, error.category,
+                error.stage, error.attempts, error.provider_origin or "-",
+                error.policy_violation or "-",
+            )
         error_metadata = _bounded_metadata({
-            "error_class": decision.reason,
+            "error_class": failure_class,
             "attempt": occurrence.attempt,
             "action_count": action_count,
             "successful_action_count": successful,
             **({ACTION_RUNS_KEY: runs} if runs else {}),
+            **diagnostics,
         })
         if decision.classification == FailureClass.RETRYABLE and can_retry(occurrence.attempt):
             retry_at = occurrence.updated_at + retry_delay(occurrence.attempt)
@@ -1551,7 +1734,8 @@ class TaskExecutionCoordinator:
                 metadata,
             )
         return await self._fail(
-            occurrence, decision.reason, successful, action_count, metadata, runs
+            occurrence, failure_class, successful, action_count, metadata, runs,
+            extra=diagnostics,
         )
 
     async def _fail(
@@ -1562,6 +1746,7 @@ class TaskExecutionCoordinator:
         count: int,
         metadata: dict[str, Any] | None = None,
         runs: list[dict[str, Any]] | None = None,
+        extra: dict[str, Any] | None = None,
     ) -> TaskExecutionResult:
         safe_error = str(error)[:512]
         error_metadata = _bounded_metadata({
@@ -1570,6 +1755,7 @@ class TaskExecutionCoordinator:
             "action_count": count,
             "successful_action_count": successful,
             **({ACTION_RUNS_KEY: runs} if runs else {}),
+            **(extra or {}),
         })
         updated = await self.repository.transition_occurrence(
             self.owner_id, occurrence.task_id, occurrence.occurrence_key,

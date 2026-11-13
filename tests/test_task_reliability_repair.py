@@ -236,14 +236,18 @@ def _dispatcher_with(responses, exec_results):
     return Dispatcher(conv, pb, pm, NOOP_HOOKS, EngineMetrics(), tool_executor=executor), executor
 
 
-def test_read_round_may_continue_classification():
-    from backend.ai.engine.dispatcher import _read_round_may_continue
+def test_verbatim_read_deferral_is_not_a_task_only_subset():
+    """The read-then-act deferral must not depend on a hard-coded tool subset.
 
-    assert _read_round_may_continue([{"name": "task_list"}]) is True
-    assert _read_round_may_continue([{"name": "task_inspect"}]) is True
-    assert _read_round_may_continue([{"name": "get_bio"}]) is False
-    assert _read_round_may_continue([{"name": "task_list"}, {"name": "get_bio"}]) is False
-    assert _read_round_may_continue([]) is False
+    ``task_list``/``task_inspect`` were the only reads allowed a continuation,
+    so every other read-then-act request (preview_save -> rename, get_bio ->
+    set, translate/summarize -> send) stopped after the read.
+    """
+    from backend.ai.engine.dispatcher import _VERBATIM_READ_TOOLS
+
+    assert "task_list" in _VERBATIM_READ_TOOLS
+    for name in ("get_bio", "preview_save", "translate_history", "summarize_history"):
+        assert name in _VERBATIM_READ_TOOLS, name
 
 
 @pytest.mark.asyncio

@@ -43,6 +43,7 @@ from typing import Any
 
 from backend.ai.tools.base import ToolResult, requires_owner_confirmation
 from backend.helper import symbols as sym
+from backend.ai.tools import lifecycle as tool_events
 from backend.ai.tools.context import ToolContext
 from backend.ai.tools.registry import ToolRegistry
 
@@ -153,6 +154,7 @@ class ToolExecutor:
         session_id: str = "",
         status_callback: Callable[[str], Awaitable[None]] | None = None,
         context_override: ToolContext | None = None,
+        round_no: int = 1,
     ) -> list[ToolExecutionResult]:
         """Execute a batch of tool calls from a provider response.
 
@@ -172,7 +174,18 @@ class ToolExecutor:
                 # overflow: the continuation protocol requires a tool response
                 # for EVERY assistant tool_call id, so results stay aligned
                 # 1:1 with the call list (index i is the skipped call i).
-                logger.warning("ToolExecutor: hit max %d tools per turn, skipping remaining", MAX_TOOLS_PER_TURN)
+                tool_events.emit(
+                    "AI_TOOL_EXECUTION_FAILED",
+                    request_id=str((ctx.extra or {}).get("request_id") or ""),
+                    round_no=round_no,
+                    tool_call_id=tool_events.call_id(call, round_no, i),
+                    tool=str(call.get("name", "") or call.get("tool", "") or "(unknown)"),
+                    provider=str((ctx.extra or {}).get("provider_name") or ""),
+                    model=str((ctx.extra or {}).get("model_name") or ""),
+                    status="rejected",
+                    error="max_tools_exceeded",
+                    detail=f"index={i + 1} limit={MAX_TOOLS_PER_TURN}",
+                )
                 results.append(ToolExecutionResult(
                     tool_name=str(call.get("name", "") or call.get("tool", "") or "(unknown)"),
                     success=False,
@@ -186,10 +199,16 @@ class ToolExecutor:
                 label = _STATUS_LABELS.get(tool_name, f"⏳ Running {tool_name}...")
                 try:
                     await status_callback(label)
-                except Exception as exc:
-                    logger.debug("ToolExecutor: status callback failed for '%s': %s", tool_name, exc)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug(
+                        "ToolExecutor: status callback failed for '%s': %s",
+                        tool_name, type(exc).__name__,
+                    )
 
-            result = await self._execute_single(call, owner_id, session_id, ctx)
+            result = await self._execute_single(
+                call, owner_id, session_id, ctx,
+                round_no=round_no, call_index=i,
+            )
             results.append(result)
 
         return results
@@ -201,6 +220,7 @@ class ToolExecutor:
         session_id: str = "",
         status_callback: Callable[[str], Awaitable[None]] | None = None,
         context_override: ToolContext | None = None,
+        round_no: int = 1,
     ) -> ToolExecutionResult:
         """Execute ONE tool call whose confirmation boundary is satisfied.
 
@@ -220,9 +240,12 @@ class ToolExecutor:
             try:
                 await status_callback(label)
             except Exception as exc:  # noqa: BLE001
-                logger.debug("ToolExecutor: status callback failed for '%s': %s", tool_name, exc)
+                logger.debug(
+                    "ToolExecutor: status callback failed for '%s': %s",
+                    tool_name, type(exc).__name__,
+                )
         return await self._execute_single(
-            call, owner_id, session_id, ctx, confirmed=True
+            call, owner_id, session_id, ctx, confirmed=True, round_no=round_no
         )
 
     async def _execute_single(
@@ -233,13 +256,33 @@ class ToolExecutor:
         context: ToolContext | None = None,
         *,
         confirmed: bool = False,
+        round_no: int = 1,
+        call_index: int = 0,
     ) -> ToolExecutionResult:
         """Execute a single tool call. Never raises."""
         ctx = context or self._context
         tool_name = call.get("name", "") or call.get("tool", "")
         arguments = call.get("arguments", {}) or call.get("parameters", {})
+        extra = ctx.extra or {}
+        # Every event of one AI request carries its own request id (built once
+        # by the Dispatcher) and the round it belongs to, so a tool call that
+        # spans several continuation rounds stays correlatable.
+        trace: dict[str, Any] = {
+            "request_id": str(extra.get("request_id") or ""),
+            "round_no": round_no,
+            "tool_call_id": tool_events.call_id(call, round_no, call_index),
+            "tool": tool_name,
+            "provider": str(extra.get("provider_name") or ""),
+            "model": str(extra.get("model_name") or ""),
+        }
 
         if not tool_name:
+            tool_events.emit(
+                "AI_TOOL_CALL_VALIDATION_FAILED",
+                status="rejected", error="missing_name",
+                detail="the tool call carried no name",
+                level=logging.WARNING, **trace,
+            )
             return ToolExecutionResult(
                 tool_name="(unknown)",
                 success=False,
@@ -251,6 +294,11 @@ class ToolExecutor:
             # Malformed arguments are a STRUCTURED failure: the tool is
             # never executed with fake {} arguments.
             detail = call.get("arguments_error") or "arguments could not be parsed"
+            tool_events.emit(
+                "AI_TOOL_CALL_VALIDATION_FAILED",
+                status="rejected", error="malformed_arguments",
+                level=logging.WARNING, **trace,
+            )
             return ToolExecutionResult(
                 tool_name=tool_name,
                 success=False,
@@ -259,6 +307,12 @@ class ToolExecutor:
             )
 
         if not isinstance(arguments, dict):
+            tool_events.emit(
+                "AI_TOOL_CALL_VALIDATION_FAILED",
+                status="rejected", error="malformed_arguments",
+                detail=f"args_type={type(arguments).__name__}",
+                level=logging.WARNING, **trace,
+            )
             return ToolExecutionResult(
                 tool_name=tool_name,
                 success=False,
@@ -268,6 +322,11 @@ class ToolExecutor:
 
         tool = self._registry.get(tool_name)
         if tool is None:
+            tool_events.emit(
+                "AI_TOOL_LOOKUP_FAILED",
+                status="not_registered", error="not_found",
+                level=logging.WARNING, **trace,
+            )
             return ToolExecutionResult(
                 tool_name=tool_name,
                 success=False,
@@ -279,6 +338,10 @@ class ToolExecutor:
         # Dispatcher uses to re-issue an already-owner-approved pending
         # action. Every other validation below still applies.
         if not confirmed and not self._is_auto_executable(tool):
+            tool_events.emit(
+                "AI_TOOL_CONFIRMATION_REQUIRED",
+                status="blocked", error="confirmation_required", **trace,
+            )
             return ToolExecutionResult(
                 tool_name=tool_name,
                 success=False,
@@ -290,6 +353,13 @@ class ToolExecutor:
                 error="confirmation_required",
             )
 
+        tool_events.emit(
+            "AI_TOOL_EXECUTION_STARTED",
+            status="started",
+            detail=tool_events.arg_shape(arguments),
+            level=logging.DEBUG,
+            **trace,
+        )
         start = time.perf_counter()
         try:
             # Long-running tools (e.g. Deep Save media transfer) must not be
@@ -318,6 +388,32 @@ class ToolExecutor:
                 name="ai:record-tool-call",
             )
 
+            if tool_result.success:
+                tool_events.emit(
+                    "AI_TOOL_EXECUTION_SUCCEEDED",
+                    status="success",
+                    elapsed_ms=latency_ms,
+                    detail=(
+                        f"result_type=success "
+                        f"message_chars={len(tool_result.message or '')} "
+                        f"data_keys={len(tool_result.data or {})}"
+                    ),
+                    level=logging.DEBUG,
+                    **trace,
+                )
+            else:
+                tool_events.emit(
+                    "AI_TOOL_EXECUTION_FAILED",
+                    status="failed",
+                    error="tool_result_unsuccessful",
+                    elapsed_ms=latency_ms,
+                    detail=(
+                        f"result_type=failure "
+                        f"message_chars={len(tool_result.message or '')}"
+                    ),
+                    level=logging.WARNING,
+                    **trace,
+                )
             return ToolExecutionResult(
                 tool_name=tool_name,
                 success=tool_result.success,
@@ -327,7 +423,17 @@ class ToolExecutor:
             )
         except asyncio.TimeoutError:
             latency_ms = (time.perf_counter() - start) * 1000
-            logger.warning("ToolExecutor: tool '%s' timed out", tool_name)
+            tool_events.emit(
+                "AI_TOOL_EXECUTION_TIMEOUT",
+                status="timeout",
+                error="timeout",
+                elapsed_ms=latency_ms,
+                detail=(
+                    f"timeout_s={getattr(tool, 'timeout_seconds', TOOL_TIMEOUT_SECONDS)}"
+                ),
+                level=logging.WARNING,
+                **trace,
+            )
             if tool_name in _DELETE_TOOL_NAMES:
                 logger.warning(
                     "DELETE_TIMEOUT request_id=%s tool=%s elapsed_ms=%.1f",
@@ -340,10 +446,19 @@ class ToolExecutor:
                 latency_ms=latency_ms,
                 error="timeout",
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             latency_ms = (time.perf_counter() - start) * 1000
             error_msg = f"{type(exc).__name__}: {exc}"
-            logger.warning("ToolExecutor: tool '%s' failed: %s", tool_name, exc)
+            # The exception TYPE is the bounded classification; its message may
+            # carry a credential or user content, so it is never logged.
+            tool_events.emit(
+                "AI_TOOL_EXECUTION_FAILED",
+                status="failed",
+                error=f"exception:{type(exc).__name__}",
+                elapsed_ms=latency_ms,
+                level=logging.WARNING,
+                **trace,
+            )
             return ToolExecutionResult(
                 tool_name=tool_name,
                 success=False,

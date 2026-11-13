@@ -45,6 +45,14 @@ AI_DISABLED = "AI_DISABLED"
 
 @dataclass(frozen=True)
 class ProviderResponse:
+    """Normalized provider answer.
+
+    ``tool_calls`` entries are ``{id, name, arguments}``. A provider may add
+    one opaque, provider-private ``thought_signature`` to the call that
+    produced it (Gemini does, and requires it back verbatim in the same
+    call). Adapters that do not understand it must never serialize it.
+    """
+
     text: str
     provider_name: str
     success: bool = False

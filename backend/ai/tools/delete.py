@@ -18,8 +18,12 @@ from backend.ai.tools.context import ToolContext
 from backend.helper.rpc_timeout import rpc_await
 
 
-_DELETE_TOOL_TIMEOUT_SECONDS = 30
-_DELETE_OPERATION_TIMEOUT_SECONDS = 25
+#: Delete's own bounded deadlines. A larger scope is hundreds of verified
+#: batches, so the operation gets a deadline long enough to finish a real
+#: request and short enough to stay a bounded tool call; the executor's own
+#: wait_for is the outer bound, and both report a PARTIAL result.
+_DELETE_TOOL_TIMEOUT_SECONDS = 180
+_DELETE_OPERATION_TIMEOUT_SECONDS = 150
 _DELETE_RPC_TIMEOUT_SECONDS = 5.0
 logger = logging.getLogger(__name__)
 
@@ -44,9 +48,11 @@ class DeleteTool(Tool):
 
     @property
     def description(self) -> str:
+        from backend.services.delete_service import MAX_DELETE_COUNT
+
         return (
             "Delete self-owned messages in the current chat by scope. Use count for "
-            "the last N self messages, mode=all for all self messages, "
+            f"the last N self messages (1-{MAX_DELETE_COUNT}), mode=all for all self messages, "
             "mode=until_time for a time range, mode=until_message for a message "
             "boundary, or semantic for a deterministic content predicate (exact "
             "word count, exact English word count, or a normalized topic filter). "
@@ -61,12 +67,16 @@ class DeleteTool(Tool):
 
     @property
     def parameters(self) -> dict[str, Any]:
+        from backend.services.delete_service import MAX_DELETE_COUNT
+
         return {
             "count": {
                 "type": "integer",
                 "minimum": 1,
-                "maximum": 500,
-                "description": "Number of self-owned messages to delete (1-500).",
+                "maximum": MAX_DELETE_COUNT,
+                "description": (
+                    f"Number of self-owned messages to delete (1-{MAX_DELETE_COUNT})."
+                ),
             },
             "mode": {
                 "type": "string",
@@ -123,6 +133,7 @@ class DeleteTool(Tool):
     async def execute(self, context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
         from backend.ai.persian import coerce_int
         from backend.services import delete_service
+        from backend.services.delete_service import MAX_DELETE_COUNT, DeleteReport
 
         count = coerce_int(arguments.get("count"))
         mode = str(arguments.get("mode") or "").strip().lower()
@@ -162,14 +173,17 @@ class DeleteTool(Tool):
             return ToolResult(
                 success=False,
                 message=(
-                    "Delete requires an explicit count between 1 and 500 "
+                    f"Delete requires an explicit count between 1 and {MAX_DELETE_COUNT} "
                     "(e.g. 'delete the last 5 messages'). No messages were deleted."
                 ),
             )
-        if count is not None and (count < 1 or count > 500):
+        if count is not None and (count < 1 or count > MAX_DELETE_COUNT):
             return ToolResult(
                 success=False,
-                message="Delete count must be between 1 and 500. No messages were deleted.",
+                message=(
+                    f"Delete count must be between 1 and {MAX_DELETE_COUNT}. "
+                    "No messages were deleted."
+                ),
             )
         chat_id = context.extra.get("chat_id") if context.extra else None
         if chat_id is None:
@@ -190,6 +204,10 @@ class DeleteTool(Tool):
             request_id or "-", chat_id, mode or "last_n", count or "-",
             request_message_id or "-", bool(query),
         )
+        # The service fills this with the real numbers; a timeout or a stopped
+        # batch is then reported from what actually happened, never from what
+        # was requested.
+        report = DeleteReport()
         try:
             if has_filtered_scope or request_message_id is not None:
                 # The service bounds every Telegram RPC; this outer deadline
@@ -212,6 +230,7 @@ class DeleteTool(Tool):
                         exclude_message_id=None,
                         tz_name=context.tz_str,
                         request_id=request_id,
+                        report=report,
                     ),
                     timeout=_DELETE_OPERATION_TIMEOUT_SECONDS,
                 )
@@ -220,17 +239,22 @@ class DeleteTool(Tool):
                 # ID is present; live AI requests always use the self-owned
                 # selector above so the active request is counted when in scope.
                 considered, deleted, error = await delete_service.do_del_last_n_real(
-                    client, chat_id, count
+                    client, chat_id, count, report=report,
                 )
         except asyncio.TimeoutError:
             logger.warning(
-                "DELETE_TIMEOUT request_id=%s chat_id=%s phase=operation",
-                request_id or "-", chat_id,
+                "DELETE_TIMEOUT request_id=%s chat_id=%s phase=operation deleted=%s",
+                request_id or "-", chat_id, report.deleted,
             )
             return ToolResult(
                 success=False,
-                message="Delete timed out while Telegram was processing the bounded operation.",
-                data={"count": 0, "timeout": True},
+                message=(
+                    f"Delete timed out after deleting {report.deleted} message(s); "
+                    "the remaining messages were not attempted."
+                    if report.deleted
+                    else "Delete timed out while Telegram was processing the bounded operation."
+                ),
+                data={"count": report.deleted, "timeout": True, "partial": True},
             )
         except Exception as exc:
             return ToolResult(
@@ -256,7 +280,21 @@ class DeleteTool(Tool):
             return ToolResult(
                 success=False,
                 message=f"Delete failed: {error}",
-                data={"count": deleted},
+                data={"count": deleted, "considered": considered, "partial": True},
+            )
+        if not report.complete:
+            logger.warning(
+                "DELETE_PARTIAL request_id=%s chat_id=%s considered=%s deleted=%s reason=%s",
+                request_id or "-", chat_id, report.considered, report.deleted,
+                report.reason or "-",
+            )
+            return ToolResult(
+                success=False,
+                message=(
+                    f"Delete stopped partially: deleted {report.deleted} of "
+                    f"{report.considered} candidate(s) after {report.reason or 'an early stop'}."
+                ),
+                data={"count": report.deleted, "considered": report.considered, "partial": True},
             )
         logger.info(
             "DELETE_SUCCESS request_id=%s chat_id=%s considered=%s deleted=%s",
@@ -454,12 +492,15 @@ class DeleteByIdTool(Tool):
         if chat_id is None:
             return ToolResult(success=False, message="No chat context for deletion.")
 
+        from backend.services.delete_service import DeleteReport
+
         client = context.telegram.client if context.telegram is not None else context.client
         if client is None:
             return ToolResult(success=False, message="No Telegram client available.")
+        report = DeleteReport()
         try:
             deleted, error = await delete_service.do_del_id_counts(
-                client, chat_id, message_id, exclude_message_id=None
+                client, chat_id, message_id, exclude_message_id=None, report=report,
             )
         except Exception as exc:
             return ToolResult(
@@ -471,7 +512,16 @@ class DeleteByIdTool(Tool):
             return ToolResult(
                 success=False,
                 message=f"Delete by ID failed: {error}",
-                data={"message_id": message_id, "count": deleted},
+                data={"message_id": message_id, "count": deleted, "partial": True},
+            )
+        if not report.complete:
+            return ToolResult(
+                success=False,
+                message=(
+                    f"Delete by ID stopped partially: deleted {report.deleted} message(s) "
+                    f"after {report.reason or 'an early stop'}."
+                ),
+                data={"message_id": message_id, "count": deleted, "partial": True},
             )
         if deleted == 0:
             return ToolResult(

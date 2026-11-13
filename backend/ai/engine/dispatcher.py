@@ -47,6 +47,7 @@ from backend.ai.confirmation import (
     confirmation_request_text,
     is_explicit_confirmation,
 )
+from backend.ai.continuation_diagnostic import schedule_continuation_diagnostic
 from backend.ai.engine.hooks import NOOP_HOOKS, EngineHooks, safe_call
 from backend.ai.engine.metrics import EngineMetrics
 from backend.ai.engine.result import EngineResult
@@ -59,6 +60,7 @@ from backend.ai.providers.manager.manager import ProviderManager
 from backend.ai.providers.registry.registry import ProviderRegistry
 from backend.ai.runtime.manager import ConversationManager
 from backend.ai.session.request import AIRequest
+from backend.ai.tools import lifecycle as tool_events
 from backend.ai.tools.executor import ToolExecutor, ToolExecutionResult
 from backend.ai.tools.registry import ToolRegistry, create_default_registry
 from backend.ai.tools.context import ToolContext
@@ -89,26 +91,43 @@ _VERBATIM_READ_TOOLS = frozenset(
     {"get_bio", "task_list", "translate_history", "summarize_history", "preview_save"}
 )
 
-# Read tools whose result is a PREREQUISITE for a CAS-guarded mutation in the
-# same request: task_transition/task_delete need the task's CURRENT version,
-# which only task_list/task_inspect can supply. A round that executed only
-# these tools therefore gets one continuation round before the verbatim
-# short-circuit applies (see Dispatcher._read_round_may_continue).
-_CAS_READ_TOOLS = frozenset({"task_list", "task_inspect"})
+# Read-then-act continuation policy (no tool-name subset any more): a read is a
+# PREREQUISITE for a later action just as often outside the task lifecycle: "pause task 11" needed task_list's CURRENT version (and
+# task_transition's CAS check), but "preview save 3 then rename it", "what's my
+# bio, then set it to ..." and a translate/summarize followed by "now send it"
+# are the same shape. The short-circuit therefore defers the verbatim text for
+# ONE continuation round for EVERY verbatim read tool (see
+# ``verbatim_read_pending`` in ``dispatch``) instead of a hard-coded subset.
+# The anti-paraphrase guarantee is unchanged: when the continuation produces no
+# tool call, the tool's own text is delivered verbatim.
 
 
-def _read_round_may_continue(tool_calls: list[dict[str, Any]]) -> bool:
-    """True when a read-only round may be a prerequisite for a mutation.
+_PARAM_DESCRIPTION_CHARS = 60
 
-    ``task_list``/``task_inspect`` feed the CAS-guarded task lifecycle tools,
-    which require the task's CURRENT version -- so a request such as "pause
-    task 11" legitimately reads first and mutates in the next round. Such a
-    round gets one continuation instead of the immediate verbatim
-    short-circuit; when the continuation produces no further tool call, the
-    verbatim tool output is delivered exactly as before.
+
+def _render_param(name: str, descriptor: Any, required: bool) -> str:
+    """Render one declared parameter as ``name*(type: description)``.
+
+    ``*`` marks a DECLARED required parameter (never inferred from a missing
+    ``default``); the type and description come from the registry descriptor,
+    and the description is whitespace-normalized and bounded so all 55 tools
+    stay a compact prompt block.
     """
-    names = {call.get("name", "") for call in tool_calls}
-    return bool(names) and names <= _CAS_READ_TOOLS
+    param_type = "any"
+    description = ""
+    if isinstance(descriptor, dict):
+        raw_type = descriptor.get("type")
+        if isinstance(raw_type, str) and raw_type.strip():
+            param_type = raw_type.strip()
+        raw_description = descriptor.get("description")
+        if isinstance(raw_description, str):
+            description = " ".join(raw_description.split())
+    if len(description) > _PARAM_DESCRIPTION_CHARS:
+        description = description[: _PARAM_DESCRIPTION_CHARS - 1].rstrip() + "…"
+    mark = "*" if required else ""
+    if description:
+        return f"{name}{mark}({param_type}: {description})"
+    return f"{name}{mark}({param_type})"
 
 
 _BLOCKED_FINISH_TOKENS = ("SAFETY", "RECITATION", "CONTENT_FILTER", "BLOCKED")
@@ -274,7 +293,7 @@ class Dispatcher:
                 )
             except Exception:
                 pass
-            logger.info(
+            logger.debug(
                 "AI_PROVIDER_CALL_START id=%s call=%s attempt=%d",
                 rid or "-", call_label, provider_call_count,
             )
@@ -351,7 +370,9 @@ class Dispatcher:
                 )
             except Exception:
                 pass
-            logger.info(
+            # A failed call is reported by AI_PROVIDER_CALL_FAILURE at WARNING;
+            # this per-call completion is success-path detail.
+            logger.debug(
                 "AI_PROVIDER_CALL_COMPLETE id=%s call=%s provider=%s success=%s elapsed_s=%.3f failure_type=%s fallback=%s",
                 rid or "-",
                 call_label,
@@ -372,12 +393,22 @@ class Dispatcher:
         tools_allowed = bool(getattr(request, "allow_tools", True))
         tool_definitions = self._build_tool_definitions() if tools_allowed else []
         chat_kwargs: dict[str, Any] = {"tools": tool_definitions} if tool_definitions else {}
-        logger.info(
-            "AI_TOOL_AVAILABILITY id=%s enabled=%s tools=%d names=%s",
+        logger.debug(
+            "AI_TOOL_AVAILABILITY id=%s enabled=%s tools=%d",
             rid or "-",
             tools_allowed,
             len(tool_definitions),
-            [d["function"]["name"] for d in tool_definitions],
+        )
+        tool_events.emit(
+            "AI_TOOL_REQUEST_RECEIVED",
+            request_id=rid,
+            round_no=0,
+            status="received",
+            detail=(
+                f"tools_enabled={tools_allowed} "
+                f"tool_defs={len(tool_definitions)} owner={request.owner_id}"
+            ),
+            level=logging.DEBUG,
         )
 
         # ── Stage 1: Conversation Runtime ──
@@ -432,7 +463,7 @@ class Dispatcher:
         # ── Stage 2: Prompt Builder ──
         try:
             _stage("PROMPT_BUILD")
-            logger.info("AI_PROMPT_BUILD id=%s", rid or "-")
+            logger.debug("AI_PROMPT_BUILD id=%s", rid or "-")
             # Tool schemas belong to the prompt's tool section, so they are
             # rendered before the build and handed to the Prompt Builder. The
             # full registry renders ~1.9k tokens; adding them after the build
@@ -462,7 +493,7 @@ class Dispatcher:
         try:
             provider_name = self._provider_manager.get_active_name()
             metadata["stages"].append("provider_manager")
-            logger.info(
+            logger.debug(
                 "AI_EXEC_TRACE request_id=%s stage=provider_selected provider=%s",
                 rid or "-", provider_name,
             )
@@ -497,13 +528,13 @@ class Dispatcher:
                     insert_at,
                     {"role": "system", "content": PROACTIVE_AUTHORIZED_RULES},
                 )
-                logger.info(
+                logger.debug(
                     "AI_EXEC_TRACE id=%s stage=proactive_authorized max_tools=%s",
                     rid or "-", 5,
                 )
             _stage("PROVIDER_REQUEST")
-            logger.info("AI_PROVIDER_REQUEST_START id=%s provider=%s", rid or "-", provider_name)
-            logger.info(
+            logger.debug("AI_PROVIDER_REQUEST_START id=%s provider=%s", rid or "-", provider_name)
+            logger.debug(
                 "AI_EXEC_TRACE request_id=%s stage=provider_request provider=%s",
                 rid or "-", provider_name,
             )
@@ -548,11 +579,11 @@ class Dispatcher:
 
             response = _reject_disabled_tool_calls(response)
             _mark_success("PROVIDER_REQUEST")
-            logger.info(
+            logger.debug(
                 "AI_PROVIDER_RESPONSE id=%s provider=%s success=%s",
                 rid or "-", response.provider_name or provider_name, response.success,
             )
-            logger.info(
+            logger.debug(
                 "AI_EXEC_TRACE request_id=%s stage=provider_response success=%s "
                 "structured=%s tool_calls=%d",
                 rid or "-", response.success, bool(response.tool_calls),
@@ -616,7 +647,7 @@ class Dispatcher:
                         retry_count, int(retry_meta["ai_retry_count"])
                     )
                     response = _reject_disabled_tool_calls(retry_response)
-                    logger.info("AI_PROVIDER_EMPTY_RESPONSE_RETRY_RECOVERED id=%s", rid or "-")
+                    logger.debug("AI_PROVIDER_EMPTY_RESPONSE_RETRY_RECOVERED id=%s", rid or "-")
 
             safe_call(self._hooks, "after_provider", response)
             metadata["stages"].append("provider")
@@ -695,7 +726,7 @@ class Dispatcher:
                     # directly (the nudge produced the structured output).
                     response = recovery_response
                     structured_action = True
-                    logger.info("AI_ACTION_RECOVERY_RETRY_RECOVERED id=%s", rid or "-")
+                    logger.debug("AI_ACTION_RECOVERY_RETRY_RECOVERED id=%s", rid or "-")
                 elif recovery_response.success and recovery_response.text:
                     candidate = self._apply_structured_action(recovery_response, request, rid)
                     if candidate.tool_calls:
@@ -703,7 +734,7 @@ class Dispatcher:
                         provider_usage_reported = provider_usage_reported or recovery_usage_reported
                         response = candidate
                         structured_action = True
-                        logger.info("AI_ACTION_RECOVERY_RETRY_RECOVERED id=%s", rid or "-")
+                        logger.debug("AI_ACTION_RECOVERY_RETRY_RECOVERED id=%s", rid or "-")
                     elif candidate.metadata.get("ai_action"):
                         # A clarify/invalid/unsupported action is a real
                         # deterministic outcome — prefer it over raw prose.
@@ -742,14 +773,43 @@ class Dispatcher:
         # the exhaustion handler never re-executes and never discards.
         last_round_executed = False
         # Verbatim read result held back for one continuation round so a
-        # read-then-mutate request can finish (see _read_round_may_continue).
+        # read-then-act request can finish (see the deferral inside the loop).
         verbatim_read_pending: str | None = None
         round_execution_failed = False
+        # A tool result that EXECUTED but could not be written to conversation
+        # history is its own condition -- never reported as "not executed".
+        tool_result_recording_failed = False
 
         for round_num in range(MAX_TOOL_ROUNDS):
-            if not response.success or not response.tool_calls:
+            round_no = round_num + 1
+            if not response.success:
+                break
+            if not response.tool_calls:
+                # A successful response with no tool call is a distinct outcome
+                # from a rejected or unexecuted tool call: name it explicitly.
+                tool_events.emit(
+                    "AI_TOOL_CALLS_EMPTY",
+                    request_id=rid,
+                    round_no=round_no,
+                    provider=response.provider_name or provider_name,
+                    model=self._response_model(response, request),
+                    status="no_tool_calls",
+                    detail=f"text_chars={len(response.text or '')}",
+                    level=logging.DEBUG,
+                )
                 break
             if not self._tool_executor:
+                tool_events.emit(
+                    "AI_TOOL_EXECUTION_SKIPPED",
+                    request_id=rid,
+                    round_no=round_no,
+                    provider=response.provider_name or provider_name,
+                    model=self._response_model(response, request),
+                    status="not_executed",
+                    error="no_tool_executor",
+                    detail=f"calls={len(response.tool_calls)}",
+                    level=logging.WARNING,
+                )
                 warnings.append(
                     "tool_execution_unavailable: no ToolExecutor attached — "
                     "pending tool calls were not executed"
@@ -759,43 +819,63 @@ class Dispatcher:
 
             try:
                 _stage("TOOL_PARSE")
-                logger.info(
-                    "AI_TOOL_PARSE id=%s tools=%s",
-                    rid or "-", [tc.get("name", "") for tc in response.tool_calls],
+                provider_label = response.provider_name or provider_name
+                model_label = self._response_model(response, request)
+                call_names = [str(tc.get("name", "") or "") for tc in response.tool_calls]
+                tool_events.emit(
+                    "AI_TOOL_CALLS_RECEIVED",
+                    request_id=rid,
+                    round_no=round_no,
+                    provider=provider_label,
+                    model=model_label,
+                    status="received",
+                    detail=(
+                        f"count={len(response.tool_calls)} "
+                        f"tools={','.join(tool_events.bounded(n, 40) for n in call_names[:8])}"
+                    ),
+                    level=logging.DEBUG,
                 )
-                for tc in response.tool_calls:
-                    args = tc.get("arguments") or {}
-                    keys = sorted(args.keys()) if isinstance(args, dict) else []
-                    logger.info(
-                        "AI_TOOL_ARGS id=%s tool=%s args=%s",
-                        rid or "-", tc.get("name", ""), keys,
-                    )
                 _stage("TOOL_EXECUTION")
-                logger.info("AI_TOOL_EXECUTION_START id=%s", rid or "-")
-                logger.info(
-                    "AI_EXECUTION_START id=%s tools=%s",
-                    rid or "-", [tc.get("name", "") for tc in response.tool_calls],
+                per_request_ctx = self._build_tool_context(
+                    request, provider=provider_label, model=model_label,
                 )
-                per_request_ctx = self._build_tool_context(request)
                 exec_results = await self._tool_executor.execute_calls(
                     response.tool_calls,
                     owner_id=request.owner_id,
                     session_id=request.session_id,
                     status_callback=status_callback,
                     context_override=per_request_ctx,
+                    round_no=round_no,
                 )
-                logger.info("AI_TOOL_EXECUTION_END id=%s results=%d", rid or "-", len(exec_results))
-                for er in exec_results:
-                    if er.success:
-                        logger.info(
-                            "AI_EXECUTION_RESULT id=%s action=%s success=True",
-                            rid or "-", er.tool_name,
-                        )
-                    else:
-                        logger.info(
-                            "AI_EXECUTION_ERROR id=%s action=%s error=%s",
-                            rid or "-", er.tool_name, er.error or er.message,
-                        )
+                # EXECUTION happened. This is recorded BEFORE any history or
+                # metadata write, so a later bookkeeping failure can never
+                # classify an executed call as "not executed" at the limit.
+                tool_rounds_executed = round_num + 1
+                last_round_executed = True
+                for index, er in enumerate(exec_results):
+                    tool_events.emit(
+                        "AI_TOOL_RESULT_RETURNED",
+                        request_id=rid,
+                        round_no=round_no,
+                        tool_call_id=(
+                            tool_events.call_id(response.tool_calls[index], round_no, index)
+                            if index < len(response.tool_calls) else ""
+                        ),
+                        tool=er.tool_name,
+                        provider=provider_label,
+                        model=model_label,
+                        status=(
+                            "confirmation_required" if er.needs_confirmation
+                            else ("success" if er.success else "failed")
+                        ),
+                        elapsed_ms=er.latency_ms,
+                        error=tool_events.error_class(er.error),
+                        detail=f"index={index + 1} message_chars={len(er.message or '')}",
+                        level=(
+                            logging.DEBUG if er.success and not er.needs_confirmation
+                            else logging.WARNING
+                        ),
+                    )
                     result_dict = er.as_dict()
                     if er.tool_name == "web_search" and isinstance(er.data, dict):
                         result_dict["query"] = er.data.get("query", "")
@@ -809,16 +889,26 @@ class Dispatcher:
                     # failures never silently disappear from history.
                     marker = sym.OP_SAVE if er.success else sym.STATE_FAILED
                     detail = er.message or er.error or "no message"
-                    self._conversation.add_tool_result(
-                        owner_id=request.owner_id,
-                        tool_name=er.tool_name,
-                        result=f"{marker} {detail}",
-                    )
+                    try:
+                        self._conversation.add_tool_result(
+                            owner_id=request.owner_id,
+                            tool_name=er.tool_name,
+                            result=f"{marker} {detail}",
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        # The tool RAN; only recording its outcome failed. A
+                        # history write must not abort the round, drop the real
+                        # result, or become "the call never executed".
+                        tool_result_recording_failed = True
+                        warnings.append(
+                            f"tool_history_round_{round_num + 1}: "
+                            f"{type(exc).__name__}"
+                        )
                 metadata["tool_results"] = all_tool_results
                 metadata["tool_rounds"] = round_num + 1
                 metadata["stages"].append(f"tool_execution_round_{round_num + 1}")
-                tool_rounds_executed = round_num + 1
-                last_round_executed = True
+                if tool_result_recording_failed:
+                    metadata["tool_result_recording_failed"] = True
 
                 # Permission-gated outcomes: create the bounded pending
                 # owner approval and stop the round (no continuation round
@@ -845,31 +935,20 @@ class Dispatcher:
                 # (production: a real bio was regenerated as unrelated text).
                 # Same contract as the structured-action path above.
                 if self._read_results_authoritative(response.tool_calls, exec_results):
-                    if _read_round_may_continue(response.tool_calls):
-                        # Live regression: "pause task 11" resolved to a single
-                        # task_list round, the verbatim short-circuit returned
-                        # the list, and the requested mutation was never
-                        # requested again. The calls already ran, so they are
-                        # never re-executed; the verbatim text is delivered
-                        # below unless the continuation proves the request
-                        # continues with a real tool call.
-                        verbatim_read_pending = self._summarize_tool_results(all_tool_results)
-                        response = replace(response, tool_calls=[], text="")
-                        logger.info(
-                            "AI_EXEC_TRACE id=%s stage=verbatim_tool_result_deferred tools=%s",
-                            rid or "-", [er.tool_name for er in exec_results],
-                        )
-                    else:
-                        logger.info(
-                            "AI_EXEC_TRACE id=%s stage=verbatim_tool_result tools=%s",
-                            rid or "-", [er.tool_name for er in exec_results],
-                        )
-                        response = replace(
-                            response,
-                            tool_calls=[],
-                            text=self._summarize_tool_results(all_tool_results),
-                        )
-                        break
+                    # Live regressions: "pause task 11" resolved to a single
+                    # task_list round and the verbatim short-circuit returned
+                    # the list, so the requested mutation was never requested
+                    # again. The calls already ran, so they are never
+                    # re-executed; the verbatim text is delivered below unless
+                    # the continuation proves the request continues with a real
+                    # tool call. This applies to EVERY verbatim read tool, not
+                    # a hard-coded task-only subset.
+                    verbatim_read_pending = self._summarize_tool_results(all_tool_results)
+                    response = replace(response, tool_calls=[], text="")
+                    logger.debug(
+                        "AI_EXEC_TRACE id=%s stage=verbatim_tool_result_deferred tools=%s",
+                        rid or "-", [er.tool_name for er in exec_results],
+                    )
             except Exception as exc:  # noqa: BLE001
                 round_execution_failed = True
                 warnings.append(f"tool_execution_round_{round_num + 1}: {exc}")
@@ -889,18 +968,47 @@ class Dispatcher:
             )
 
             continuation_messages = self._build_continuation_messages(messages, response, exec_results)
+            continuation_round = round_num + 2
             try:
                 _stage("PROVIDER_REQUEST")
-                logger.info("AI_PROVIDER_REQUEST_START id=%s round=%d", rid or "-", round_num + 2)
+                logger.debug("AI_PROVIDER_REQUEST_START id=%s round=%d", rid or "-", continuation_round)
+                tool_events.emit(
+                    "AI_TOOL_CONTINUATION_STARTED",
+                    request_id=rid,
+                    round_no=continuation_round,
+                    provider=provider_label,
+                    model=model_label,
+                    status="started",
+                    detail=f"tools_executed={len(exec_results)}",
+                    level=logging.DEBUG,
+                )
                 cont_response: ProviderResponse = await _provider_chat(
                     continuation_messages,
                     call_label=f"continuation_{round_num + 1}",
                     **chat_kwargs,
                 )
                 _mark_success("PROVIDER_REQUEST")
-                logger.info(
+                logger.debug(
                     "AI_PROVIDER_RESPONSE id=%s round=%d success=%s",
-                    rid or "-", round_num + 2, cont_response.success,
+                    rid or "-", continuation_round, cont_response.success,
+                )
+                tool_events.emit(
+                    "AI_TOOL_CONTINUATION_COMPLETED",
+                    request_id=rid,
+                    round_no=continuation_round,
+                    provider=cont_response.provider_name or provider_label,
+                    model=self._response_model(cont_response, request),
+                    status="success" if cont_response.success else "provider_failure",
+                    error=(
+                        "" if cont_response.success else tool_events.bounded(
+                            str((cont_response.metadata or {}).get("failure_type") or "provider_failure"),
+                            48,
+                        )
+                    ),
+                    detail=f"tool_calls={len(cont_response.tool_calls or [])}",
+                    level=(
+                        logging.DEBUG if cont_response.success else logging.WARNING
+                    ),
                 )
                 safe_call(self._hooks, "after_provider", cont_response)
                 metadata["stages"].append(f"provider_continuation_{round_num + 1}")
@@ -927,6 +1035,28 @@ class Dispatcher:
                 str(cont_response.metadata.get("fallback_to_model") or "")
                 or fallback_to_model
             )
+            cont_metadata = cont_response.metadata or {}
+            if cont_metadata.get("model_fallback") or cont_metadata.get("fallback"):
+                logger.info(
+                    "AI_CONTINUATION_FALLBACK id=%s round=%d kind=%s from=%s/%s "
+                    "to=%s/%s",
+                    rid or "-", round_num + 2,
+                    "model" if cont_metadata.get("model_fallback") else "provider",
+                    cont_metadata.get("fallback_from") or "-",
+                    cont_metadata.get("fallback_from_model") or "-",
+                    cont_metadata.get("fallback_to")
+                    or cont_response.provider_name or "-",
+                    fallback_to_model or "-",
+                )
+            # A continuation-only defect (a provider that served the first
+            # round but refuses the assistant-tool-call / tool-result turn)
+            # is invisible to ordinary model availability. The probe is
+            # bounded, single-flight, off the response path, and its result
+            # never feeds routing — this request's outcome is already decided
+            # by cont_response.
+            schedule_continuation_diagnostic(
+                self._provider_manager, cont_response, request_id=rid,
+            )
             if not cont_response.success:
                 failure_type = _provider_failure_type(cont_response)
 
@@ -946,7 +1076,7 @@ class Dispatcher:
                     response = replace(
                         cont_response, tool_calls=[], text=verbatim_read_pending
                     )
-                    logger.info(
+                    logger.debug(
                         "AI_EXEC_TRACE id=%s stage=verbatim_tool_result_delivered",
                         rid or "-",
                     )
@@ -995,38 +1125,67 @@ class Dispatcher:
                     f"after {tool_rounds_executed} round(s) (MAX_TOOL_ROUNDS={MAX_TOOL_ROUNDS})"
                 )
             else:
+                salvage_executed = False
                 try:
                     _stage("TOOL_EXECUTION")
                     logger.info(
                         "AI_TOOL_PENDING_EXEC_START id=%s tools=%s rounds_executed=%d limit=%d",
                         rid or "-", pending_names, tool_rounds_executed, MAX_TOOL_ROUNDS,
                     )
-                    per_request_ctx = self._build_tool_context(request)
+                    per_request_ctx = self._build_tool_context(
+                        request,
+                        provider=response.provider_name or provider_name,
+                        model=self._response_model(response, request),
+                    )
                     salvage_results = await self._tool_executor.execute_calls(
                         salvage_calls,
                         owner_id=request.owner_id,
                         session_id=request.session_id,
                         status_callback=status_callback,
                         context_override=per_request_ctx,
+                        round_no=tool_rounds_executed + 1,
                     )
+                    salvage_executed = True
                     for er in salvage_results:
                         all_tool_results.append(er.as_dict())
                         if er.needs_confirmation:
                             continue
                         marker = sym.OP_SAVE if er.success else sym.STATE_FAILED
                         detail = er.message or er.error or "no message"
-                        self._conversation.add_tool_result(
-                            owner_id=request.owner_id,
-                            tool_name=er.tool_name,
-                            result=f"{marker} {detail}",
-                        )
-                        logger.info(
-                            "AI_TOOL_PENDING_RESULT id=%s tool=%s success=%s",
-                            rid or "-", er.tool_name, er.success,
+                        try:
+                            self._conversation.add_tool_result(
+                                owner_id=request.owner_id,
+                                tool_name=er.tool_name,
+                                result=f"{marker} {detail}",
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            # Executed, but not recorded: a distinct state from
+                            # "never executed", and never a re-execution.
+                            tool_result_recording_failed = True
+                            warnings.append(
+                                f"tool_history_at_limit: {type(exc).__name__}"
+                            )
+                        tool_events.emit(
+                            "AI_TOOL_RESULT_RETURNED",
+                            request_id=rid,
+                            round_no=tool_rounds_executed + 1,
+                            tool=er.tool_name,
+                            status=(
+                                "confirmation_required" if er.needs_confirmation
+                                else ("success" if er.success else "failed")
+                            ),
+                            elapsed_ms=er.latency_ms,
+                            error=tool_events.error_class(er.error),
+                            detail="at_round_limit=True",
+                            level=(
+                                logging.DEBUG if er.success else logging.WARNING
+                            ),
                         )
                     metadata["tool_results"] = all_tool_results
                     metadata["stages"].append("pending_tool_execution_at_limit")
                     metadata["pending_calls_executed_at_limit"] = True
+                    if tool_result_recording_failed:
+                        metadata["tool_result_recording_failed"] = True
                     # Permission-gated salvage: turn the blocked call into a
                     # pending owner approval instead of claiming it ran.
                     salvage_confirmation = self._gate_confirmation_results(
@@ -1051,23 +1210,34 @@ class Dispatcher:
                         rid or "-", len(salvage_results), tool_rounds_executed, MAX_TOOL_ROUNDS,
                     )
                 except Exception as exc:  # noqa: BLE001
-                    rounds_exhausted = True
-                    metadata["tool_rounds_exhausted"] = True
-                    metadata["tool_rounds_executed"] = tool_rounds_executed
-                    metadata["pending_tool_calls"] = [
-                        {"name": tc.get("name", ""), "id": tc.get("id", "")}
-                        for tc in salvage_calls
-                    ]
                     warnings.append(f"pending_tool_execution_at_limit: {exc}")
-                    warnings.append(
-                        f"tool_round_limit_reached: {len(salvage_calls)} pending tool call(s) "
-                        f"after {tool_rounds_executed} round(s) (MAX_TOOL_ROUNDS={MAX_TOOL_ROUNDS})"
-                    )
+                    if salvage_executed:
+                        # They RAN. Claiming "not executed" here is exactly the
+                        # misclassification this handler must never produce: no
+                        # re-execution, no round-limit claim, real results kept.
+                        tool_result_recording_failed = True
+                        metadata["tool_result_recording_failed"] = True
+                        metadata["pending_calls_executed_at_limit"] = True
+                        metadata["tool_results"] = all_tool_results
+                        response = replace(response, tool_calls=[])
+                    else:
+                        rounds_exhausted = True
+                        metadata["tool_rounds_exhausted"] = True
+                        metadata["tool_rounds_executed"] = tool_rounds_executed
+                        metadata["pending_tool_calls"] = [
+                            {"name": tc.get("name", ""), "id": tc.get("id", "")}
+                            for tc in salvage_calls
+                        ]
+                        warnings.append(
+                            f"tool_round_limit_reached: {len(salvage_calls)} pending tool call(s) "
+                            f"after {tool_rounds_executed} round(s) (MAX_TOOL_ROUNDS={MAX_TOOL_ROUNDS})"
+                        )
                     logger.warning(
-                        "AI_TOOL_PENDING_EXEC_FAILED id=%s error=%s", rid or "-", exc
+                        "AI_TOOL_PENDING_EXEC_FAILED id=%s executed=%s error=%s",
+                        rid or "-", salvage_executed, exc,
                     )
 
-        logger.info(
+        logger.debug(
             "AI_TOOL_LOOP_END id=%s rounds_executed=%d limit=%d disposition=%s",
             rid or "-", tool_rounds_executed, MAX_TOOL_ROUNDS,
             (
@@ -1208,6 +1378,26 @@ class Dispatcher:
             metadata=metadata,
         )
 
+        # The final serving (provider, model) is reported ONLY for a served
+        # response: a failed candidate is itemized by AI_FALLBACK_START /
+        # AI_PROVIDER_FAILURE and is never presented as the answer's model.
+        logger.info(
+            "AI_RESULT id=%s success=%s provider=%s model=%s finish_state=%s "
+            "model_fallback=%s provider_fallback=%s fallback_to_model=%s "
+            "candidates_attempted=%s failure_type=%s latency_s=%.3f",
+            rid or "-",
+            result.success,
+            (result.provider or "-") if result.success else "-",
+            (result.model or "-") if result.success else "-",
+            finish_state,
+            model_fallback_used,
+            fallback_used,
+            fallback_to_model or "-",
+            (result.metadata or {}).get("candidates_attempted", "-"),
+            failure_type or "-",
+            latency,
+        )
+
         safe_call(self._hooks, "after_response", result)
 
         self._metrics.record(
@@ -1260,12 +1450,26 @@ class Dispatcher:
         except Exception as exc:  # noqa: BLE001
             logger.warning("AI usage persistence schedule failed: %r", exc)
 
-    def _build_tool_context(self, request: AIRequest) -> ToolContext:
+    @staticmethod
+    def _response_model(response: ProviderResponse, request: AIRequest) -> str:
+        """The model that produced this response (correlation only)."""
+        metadata = response.metadata or {}
+        return str(metadata.get("model") or getattr(request, "model", "") or "")
+
+    def _build_tool_context(
+        self,
+        request: AIRequest,
+        *,
+        provider: str = "",
+        model: str = "",
+    ) -> ToolContext:
         """Build a per-request ToolContext from the executor's base context.
 
         Enriches the base context's ``extra`` dict with ``chat_id`` and
         ``reply_msg`` from the current AIRequest so tools (save, delete,
-        etc.) can operate on the correct chat and replied-to message.
+        etc.) can operate on the correct chat and replied-to message. The
+        provider/model labels ride along so every tool-lifecycle event can
+        name them without the executor knowing about providers.
         """
         base = self._tool_executor._context
         extra: dict[str, Any] = dict(base.extra) if base.extra else {}
@@ -1278,6 +1482,8 @@ class Dispatcher:
         # than from model output — see task_contract's provenance rule.
         extra["request_text"] = request.user_message
         extra["request_id"] = request.request_id
+        extra["provider_name"] = provider
+        extra["model_name"] = model
         # Per-request proactive consent, proved from the OWNER'S message by the
         # ONE shared detector. Tools (create_task) read this instead of
         # re-deciding authorization — never stored, never a global mode.
@@ -1358,6 +1564,17 @@ class Dispatcher:
             getattr(request, "request_id", "") or "-",
             request.owner_id, request.chat_id, tool_name,
             pending is not None, extra_blocked,
+        )
+        tool_events.emit(
+            "AI_TOOL_CONFIRMATION_REQUIRED",
+            request_id=getattr(request, "request_id", "") or "",
+            round_no=1,
+            tool=tool_name,
+            status="pending_owner_approval" if pending is not None else "already_pending",
+            detail=(
+                f"stored={pending is not None} extra_blocked={extra_blocked} "
+                f"args={tool_events.arg_shape(arguments)}"
+            ),
         )
         return text
 
@@ -1517,7 +1734,7 @@ class Dispatcher:
             # "This request never entered the media path" must be a POSITIVE
             # trace — an absent trace is not evidence. Only classifier labels
             # travel here: never a chat id, a message id or any content.
-            logger.info(
+            logger.debug(
                 "AI_EXEC_TRACE request_id=%s stage=media_route_skipped "
                 "replied_media=%s request_media=%s",
                 rid or "-", replied_media, request_media,
@@ -1550,7 +1767,7 @@ class Dispatcher:
                 await status_callback(f"{sym.MEDIA_DOCUMENT} Reading media...")
             except Exception as exc:
                 logger.debug("Dispatcher: media status callback failed: %s", exc)
-        logger.info(
+        logger.debug(
             "AI_EXEC_TRACE request_id=%s stage=media_request target=%s "
             "replied_media=%s request_media=%s",
             rid or "-",
@@ -1618,7 +1835,7 @@ class Dispatcher:
         except Exception:  # noqa: BLE001
             pass
         metadata["media_status"] = answer.status
-        logger.info(
+        logger.debug(
             "AI_EXEC_TRACE request_id=%s stage=media_completed status=%s chars=%d",
             rid or "-", answer.status or "-", len(answer.text or ""),
         )
@@ -1658,7 +1875,7 @@ class Dispatcher:
         # Same shape as the provider structured-action path so diagnostics
         # and tests read a consistent ai_action object.
         meta["ai_action"] = {"action": action, "kind": kind, "target": target}
-        logger.info(
+        logger.debug(
             "AI_EXEC_TRACE request_id=%s stage=telegram_response success=%s",
             rid or "-", success,
         )
@@ -1713,7 +1930,7 @@ class Dispatcher:
         if not text:
             return response
 
-        logger.info("AI_ACTION_PARSE_START id=%s", rid or "-")
+        logger.debug("AI_ACTION_PARSE_START id=%s", rid or "-")
 
         # The MODEL's structured output is the only input here. There is no
         # deterministic pre-pass over the owner's message: local code validates
@@ -1721,13 +1938,13 @@ class Dispatcher:
         result = parse_action_text(text)
 
         if result.kind == "conversational":
-            logger.info(
+            logger.debug(
                 "AI_ACTION_PARSE_RESULT id=%s action=none reason=no_action "
                 "text_len=%d has_json=%s",
                 rid or "-", len(text), "{" in text,
             )
             return response
-        logger.info(
+        logger.debug(
             "AI_ACTION_PARSE_RESULT id=%s action=%s count=%s",
             rid or "-",
             result.action or result.kind,
@@ -1740,26 +1957,37 @@ class Dispatcher:
         meta["ai_action_target"] = result.target
 
         if result.kind == "clarify":
-            logger.info("AI_ACTION_VALIDATION id=%s result=clarify", rid or "-")
+            logger.debug("AI_ACTION_VALIDATION id=%s result=clarify", rid or "-")
             message = result.reason or "Could you clarify what you'd like me to do?"
             return replace(response, text=message, metadata=meta)
 
         if result.kind == "invalid":
-            logger.info(
-                "AI_ACTION_VALIDATION id=%s result=rejected error=%s",
-                rid or "-", result.error,
+            tool_events.emit(
+                "AI_TOOL_CALL_VALIDATION_FAILED",
+                request_id=rid,
+                round_no=1,
+                tool=str(result.action or ""),
+                status="rejected",
+                error=tool_events.error_class(result.error),
+                detail="structured action rejected by local validation",
+                level=logging.WARNING,
             )
             return replace(response, text=f"{sym.STATE_FAILED} {result.error}", metadata=meta)
 
         if result.kind == "unsupported":
-            logger.info(
-                "AI_ACTION_VALIDATION id=%s result=unsupported action=%s",
-                rid or "-", result.action,
+            tool_events.emit(
+                "AI_TOOL_CALL_VALIDATION_FAILED",
+                request_id=rid,
+                round_no=1,
+                tool=str(result.action or ""),
+                status="unsupported",
+                error="unsupported_action",
+                level=logging.WARNING,
             )
             return replace(response, text=f"{sym.STATE_FAILED} Unsupported action: {result.action}", metadata=meta)
 
-        logger.info("AI_ACTION_VALIDATION id=%s result=ok action=%s", rid or "-", result.action)
-        logger.info(
+        logger.debug("AI_ACTION_VALIDATION id=%s result=ok action=%s", rid or "-", result.action)
+        logger.debug(
             "AI_TARGET_RESOLUTION id=%s action=%s target=%s tools=%s",
             rid or "-", result.action, result.target,
             [tc.get("name") for tc in result.tool_calls],
@@ -1917,24 +2145,38 @@ class Dispatcher:
 
         Required parameters are marked with ``*`` from the SAME declared
         requiredness the native schemas carry, so the two representations of
-        the tool contract cannot disagree.
+        the tool contract cannot disagree. Parameter names, types and available
+        descriptions are rendered for every tool, whatever the schema shape.
         """
         if not schemas:
             return ""
         lines = ["[Available Tools] (name* = required)"]
         for s in schemas:
-            params = s.get("parameters", {})
-            required = set(s.get("required") or [])
+            raw_params = s.get("parameters") or {}
+            # ``list_schemas()`` returns a FLAT property map (param name ->
+            # descriptor) plus the DECLARED requiredness; only a full JSON
+            # schema carries a "properties" key. Reading "properties" alone
+            # rendered no parameter at all for all 55 tools (0/55 measured),
+            # so the model never saw the arguments of the tools it was asked to
+            # call. Mirror ``_build_tool_definitions``: handle BOTH shapes.
+            props: dict[str, Any] = {}
+            if isinstance(raw_params, dict):
+                if "properties" in raw_params:
+                    raw_props = raw_params.get("properties")
+                    props = raw_props if isinstance(raw_props, dict) else {}
+                    required = set(raw_params.get("required") or [])
+                else:
+                    props = raw_params
+                    required = set(s.get("required") or [])
+            else:
+                required = set()
             param_str = ""
-            if isinstance(params, dict):
-                props = params.get("properties", {})
-                if props:
-                    parts = []
-                    for pname, pinfo in props.items():
-                        ptype = pinfo.get("type", "any") if isinstance(pinfo, dict) else "any"
-                        mark = "*" if pname in required else ""
-                        parts.append(f"{pname}{mark}({ptype})")
-                    param_str = ", ".join(parts)
+            if props:
+                parts = [
+                    _render_param(pname, pinfo, pname in required)
+                    for pname, pinfo in props.items()
+                ]
+                param_str = ", ".join(parts)
             level = s.get("permission_level", "")
             if level in ("admin_only", "confirmation_required"):
                 safe_badge = "needs-confirm"
@@ -1973,8 +2215,9 @@ class Dispatcher:
         assistant_content = response.text or ""
         assistant_msg: dict[str, Any] = {"role": "assistant", "content": assistant_content}
         if response.tool_calls:
-            assistant_msg["tool_calls"] = [
-                {
+            calls: list[dict[str, Any]] = []
+            for tc in response.tool_calls:
+                call: dict[str, Any] = {
                     "id": tc.get("id", ""),
                     "type": "function",
                     "function": {
@@ -1982,8 +2225,13 @@ class Dispatcher:
                         "arguments": json.dumps(tc.get("arguments", {})),
                     },
                 }
-                for tc in response.tool_calls
-            ]
+                signature = tc.get("thought_signature")
+                if isinstance(signature, str) and signature:
+                    # Provider-owned opaque state travels with the call that
+                    # produced it; adapters that do not understand it drop it.
+                    call["thought_signature"] = signature
+                calls.append(call)
+            assistant_msg["tool_calls"] = calls
         messages.append(assistant_msg)
 
         # EVERY assistant tool call gets exactly one tool response, in order:

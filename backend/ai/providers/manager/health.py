@@ -204,10 +204,13 @@ class ProviderHealthTracker:
     def is_available(self, name: str) -> bool:
         return self.state(name) == ProviderHealthState.HEALTHY
 
-    def mark_cooling_down(self, name: str, seconds: float) -> None:
+    def mark_cooling_down(self, name: str, seconds: float, category: str = "") -> None:
         seconds = min(max(0.0, float(seconds)), MAX_COOLDOWN_SECONDS)
         self._cooldown_until[name] = time.monotonic() + seconds
-        logger.info("PROVIDER_COOLDOWN provider=%s seconds=%.1f", name, seconds)
+        logger.info(
+            "PROVIDER_COOLDOWN provider=%s category=%s seconds=%.1f",
+            name, category or "unknown", seconds,
+        )
 
     def mark_disabled(self, name: str) -> None:
         self._disabled.add(name)
@@ -259,7 +262,7 @@ class ProviderHealthTracker:
             seconds = float(retry_after)
         else:
             seconds = FAILURE_PENALTIES.get(category, DEFAULT_COOLDOWN_SECONDS)
-        self.mark_cooling_down(name, seconds)
+        self.mark_cooling_down(name, seconds, category)
         return ProviderHealthState.COOLING_DOWN
 
     def record_success(self, name: str) -> None:
@@ -342,17 +345,19 @@ class ProviderHealthTracker:
             seconds = float(retry_after)
         else:
             seconds = FAILURE_PENALTIES.get(category, DEFAULT_COOLDOWN_SECONDS)
-        self.mark_model_cooling(name, model, seconds)
+        self.mark_model_cooling(name, model, seconds, category)
         return ProviderHealthState.COOLING_DOWN
 
-    def mark_model_cooling(self, name: str, model: str, seconds: float) -> None:
+    def mark_model_cooling(
+        self, name: str, model: str, seconds: float, category: str = "",
+    ) -> None:
         if not model:
             return
         seconds = min(max(0.0, float(seconds)), MAX_COOLDOWN_SECONDS)
         self._model_until[(name, model)] = time.monotonic() + seconds
         logger.info(
-            "PROVIDER_MODEL_COOLDOWN provider=%s model=%s seconds=%.1f",
-            name, model, seconds,
+            "PROVIDER_MODEL_COOLDOWN provider=%s model=%s category=%s seconds=%.1f",
+            name, model, category or "unknown", seconds,
         )
 
     def record_model_success(self, name: str, model: str) -> None:

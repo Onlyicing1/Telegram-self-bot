@@ -160,7 +160,10 @@ _METADATA_ACTIONS = (*_SAVE_ACTIONS, "rename_saved_item", "update_saved_item_tag
 _ACCOUNT_IDENTITY_FIELDS = frozenset({"first_name", "last_name", "full_name", "username"})
 
 _MIN_DELETE_COUNT = 1
-_MAX_DELETE_COUNT = 500
+#: Mirrors ``delete_service.MAX_DELETE_COUNT`` (asserted in tests): the most
+#: candidates one Delete operation carries. This is a bound on a single call,
+#: not a ceiling on what the owner may ask the panel to delete.
+_MAX_DELETE_COUNT = 20000
 
 # A saved-item name/tag query is a short phrase, never a document (Save V2
 # Part 3 — the resolver's query bound).

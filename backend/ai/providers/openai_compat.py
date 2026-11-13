@@ -21,6 +21,33 @@ from backend.ai.providers.base.defaults import get_provider_default
 logger = logging.getLogger(__name__)
 
 
+def _openai_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Messages safe for an OpenAI-compatible request.
+
+    A continuation assembled from ANOTHER provider's answer can carry that
+    provider's private per-call fields (Gemini's ``thought_signature``). This
+    endpoint does not understand them, so they are dropped here rather than
+    sent — including when a fallback provider continues a Gemini-started turn.
+    Everything else in the message is passed through untouched.
+    """
+    clean: list[dict[str, Any]] = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            clean.append(msg)
+            continue
+        message = {key: value for key, value in msg.items() if key != "thought_signature"}
+        tool_calls = message.get("tool_calls")
+        if isinstance(tool_calls, list):
+            message["tool_calls"] = [
+                {key: value for key, value in tc.items() if key != "thought_signature"}
+                if isinstance(tc, dict)
+                else tc
+                for tc in tool_calls
+            ]
+        clean.append(message)
+    return clean
+
+
 class OpenAICompatProvider(BaseProvider):
     """Async base for OpenAI-compatible API providers."""
 
@@ -80,7 +107,7 @@ class OpenAICompatProvider(BaseProvider):
         model = str(kwargs.get("model") or self._config.default_model or "").strip()
         payload: dict[str, Any] = {
             "model": model,
-            "messages": messages,
+            "messages": _openai_messages(messages),
             "temperature": kwargs.get("temperature", self._config.temperature),
             "max_tokens": kwargs.get("max_tokens", self._config.max_tokens),
         }

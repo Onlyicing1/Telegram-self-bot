@@ -114,7 +114,7 @@ async def test_all_delete_is_bounded_and_chunked():
     assert result.success is True
     assert 10_000 in client.deleted
     assert len(client.deleted) == 206
-    assert client.iter_kwargs[0]["limit"] == 1000
+    assert client.iter_kwargs[0]["limit"] == delete_service._MAX_DELETE_SCAN_MESSAGES
     assert len(client.delete_batches) == 3
     assert all(len(batch) <= 100 for batch in client.delete_batches)
 
@@ -161,6 +161,9 @@ async def test_repeated_delete_requests_have_no_unbounded_history_or_confirmatio
     # Each request is self-owned and remains eligible; the newest request is
     # selected first for the first operation, then the next request is selected.
     assert client.deleted == [3, 2]
-    assert all(item["limit"] == 1000 for item in client.iter_kwargs)
+    assert all(
+        item["limit"] == delete_service._MAX_DELETE_SCAN_MESSAGES
+        for item in client.iter_kwargs
+    )
     assert "Deleted" not in first.message or first.data["count"] == 1
     assert "Deleted" not in second.message or second.data["count"] == 1
