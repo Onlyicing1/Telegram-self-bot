@@ -1,86 +1,119 @@
 # ROADMAP
 
-## Latest delivery: History Peer Policy Phase 2 — per-peer count limits
+## Latest delivery: History Phase 3 — durable state investigation and design
 
-Status: **implemented, tested, pushed.** Base: `ffe72fd0bce9286e3d3d6583614b3b243bfd4fdf`
-(Phase 1).
+Status: **investigation and design complete; nothing implemented or deployed.**
+Base: `62a18de07f1bc5bf8b51c36438f66ad8c4f4d498` (Phase 2).
 
-A deterministic product policy now decides how many messages one manual History
-request may cover per peer type, the panel offers only the permitted counts, stale
-callbacks are refused, and the policy is enforced at the service boundary and on
-the linked-message path.
+Phase 3 was deliberately investigation-only. It established, from current source,
+what the History path persists (nothing), what is lost on restart, why the
+existing task/occurrence fields cannot hold a cumulative summary, and the design of
+a dedicated durable state table and repository contract. `INVESTIGATION.md` is the
+source-backed deliverable.
 
-- `backend/services/history_policy.py`: `maximum_for`, `choices_for`,
-  `validate_count`, `validate_choice`, `UNKNOWN_REFUSAL`.
-- Exact mapping: `private_user` 1000 (100/250/500/1000), `private_bot` 300
-  (100/250/300), `basic_group` 1000 (100/250/500/1000), `supergroup` 1000
-  (100/250/500/1000), `broadcast_channel` 300 (100/250/300), `unknown` refused.
-- The 300-message caps are HARD: over-limit requests are refused, never silently
-  clamped. `unknown`/unresolvable peers never fall back to the 1,000 policy.
-- The actual current entity is resolved and classified on selection, on every count
-  callback, on every manual run, and for linked messages. Dialog flags, titles,
-  usernames, id patterns and cached selections are never used.
-- The panel hides 500/1000 for capped peers; stale callbacks are rejected against
-  the current peer with the real limit. Existing navigation, focus, link, inline
-  editing and delivery are unchanged.
-- The service gate resolves → classifies → validates → only then retrieves; the
-  existing AI capacity gate remains independent. Bypassing the panel cannot bypass
-  the policy.
+### Verified findings
 
-### Verified results
+- History retrieval and summarization are one-shot. The summary exists only in the
+  edited Telegram panel message; no application row, cursor or summary survives a
+  restart.
+- `ai_task_occurrences.result_metadata` is bounded at 8 KiB and belongs to the
+  occurrence lifecycle; `notification_destination.chat_id` is the delivery
+  destination, not the source peer. Neither is suitable for History state.
+- The current collector scans newest→oldest and keeps the newest subset
+  (`history_service._collect`), so 60 eligible messages with `count=10` can return
+  51–60 and omit 1–50. **This defect remains unfixed and is a blocking prerequisite
+  for scheduled processing.**
+- Every peer classification is live; a stored peer type can only be an
+  informational snapshot, never policy authority.
+- A new migration cannot be added alone: `DATABASE_ARCHITECTURE.md` is the schema
+  authority and the suite requires every migration's table to be classified and the
+  canonical §31.3 setup block to match. The document is protected in Phase 3 and
+  was not modified.
 
-| Check | Result |
-| --- | --- |
-| New policy suite | 78 passed |
-| Policy + panel + AI tools + capacity + service + Phase 1 classifier | 300 passed |
-| Full suite | 7,750 passed, 6 failed, 27 skipped |
-| The same 6 tests at the Phase 1 base | 6 failed — identical, pre-existing |
-| `py_compile` / `git diff --check` | clean |
+### Proposed design (not applied)
+
+- One dedicated `history_schedules` table, one row per History task and per
+  `(owner_id, peer_id)`, linked to `ai_tasks(id) ON DELETE CASCADE`.
+- Fields: owner, peer id, informational peer-type snapshot, baseline message id,
+  scanned and summarized cursors, bounded cumulative summary (32 KiB), summary
+  revision, state status, last success, bounded error diagnostic, CAS version and
+  timestamps.
+- `last_scanned_message_id` is the durable retrieval cursor; it advances only with
+  a successful atomic commit covering summarized content or explicit safe skips.
+  `last_summarized_message_id` records content coverage and never exceeds it.
+- Summary plus both cursors, revision and version commit in one CAS update.
+  A stale writer gets zero rows and discards its result; it never overwrites a newer
+  revision. No runtime in-memory fallback is allowed for durable checkpoints.
+- Service-role-only RLS (zero policies, no client grants) because the summary is
+  private chat content.
+- No raw messages, sender ids, titles/usernames or provider raw output are stored.
+  Deleted Telegram messages never erase a previously committed summary; they are
+  not recoverable.
 
 ### Completed
 
-- `history_policy.py` with the exact per-peer hard maximum and offered choices.
-- Dynamic panel choices based on the classified selected peer; invalid choices
-  hidden, not disabled.
-- Stale/invalid callback rejection with an honest limit explanation and no AI call.
-- Service-boundary enforcement in `history_ai_service._prepare` (summary and
-  translation) and linked-message/`ending_at` pre-validation.
-- `history_service.classify_chat` on the existing entity-resolution boundary.
-- `tests/test_history_policy.py` plus updated panel, AI-tool and capacity tests;
-  Phase 1 classifier tests retained.
-- Reports replaced/updated (`IMPLEMENTATION_REPORT.md`, `INVESTIGATION.md`, this
-  file).
+- Source-verified current History pipeline, bounds, provenance filtering, persistence
+  gaps and restart behavior.
+- Verified `ai_tasks` / `ai_task_occurrences` constraints, repository CAS patterns,
+  scheduler recovery/claim behavior and task deletion flow.
+- Field-by-field justification, proposed table DDL (unapproved), repository API,
+  atomic commit/CAS semantics, 14-case cursor/failure table, retention, privacy and
+  AI-isolation requirements.
+- Verified migration count/numbering (41 files; latest
+  `20261112160000`) and the documentation/test prerequisites for a future
+  migration.
+- `IMPLEMENTATION_REPORT.md`, `INVESTIGATION.md` and this roadmap updated.
+
+No production Python, test, migration or Supabase object was changed. No SQL was
+executed. No live Telegram/provider behavior was tested.
 
 ---
 
-## Next stage: Phase 3 — schema/repository investigation and planning
+## Next stage: Phase 3 implementation — schema/repository (not started)
 
-Status: **next, not started.**
+This is the implementation of the Phase 3 design, not a new phase number.
 
-- Investigate the durable History state shape (peer, both cursors, bounded summary,
-  revision, status, CAS version) and its repository contract.
-- Produce an implementation plan before writing any migration; no SQL may be
-  applied without the owner's explicit approval.
-- Keep `ai_task_occurrences.result_metadata` out of summary storage (hard 8 KiB
-  bound, occurrence lifecycle ownership).
-- Confirm the oldest-first retrieval prerequisite before any scheduled processing
-  (see `INVESTIGATION.md`; still unfixed).
+1. **Owner approval and protected document update.** Update
+   `DATABASE_ARCHITECTURE.md` with the `history_schedules` section, §22/§25
+   classification, canonical §31.3 part 1 SQL and the service-role-only RLS
+   exception. This must happen before the migration; the suite enforces it.
+2. **Manual migration.** Add the idempotent
+   `20261113120000_create_history_schedules.sql` (candidate name) after approval.
+   The owner applies it in the Supabase SQL editor; no agent executes SQL.
+3. **Repository.** Add `HistoryStateRepository` + Supabase implementation +
+   test-only in-memory fake. No runtime fallback; unavailable storage fails closed.
+4. **Oldest-first retrieval.** Fix the collector contract before any scheduled
+   execution, using a stable upper bound, exclusive lower cursor and
+   `reverse=True` via the existing facade.
+5. **Implementation tests** listed in `INVESTIGATION.md` §14.
+6. **Live validation** by the owner after the migration is applied.
+
+### Blocking prerequisites
+
+- `DATABASE_ARCHITECTURE.md` approval/update (protected in Phase 3).
+- Oldest-first retrieval fix and tests.
+- Explicit product decisions on start baseline, one schedule per peer, prior-summary
+  AI input, and task-deletion retention (`INVESTIGATION.md` §16).
 
 ---
 
 ## Later phases (deferred, in order)
 
-1. **Phase 4 — deterministic schedule UI**: owner wizard creates the task and its
-   state row through the existing TaskCreationService/TaskManagementService; the
+1. **Phase 4 — deterministic schedule UI**: owner wizard resolves/classifies the
+   peer, captures the baseline, creates the History task and its state row through
+   the existing TaskCreationService path, with a compensating delete on failure. The
    model never creates or mutates these schedules.
-2. **Phase 5 — scheduled History action**: one new registered ToolExecutor tool
-   with no model-supplied identifiers, a stable upper-bound cursor, oldest-first
-   catch-up and an atomic summary + checkpoint commit.
+2. **Phase 5 — scheduled History action**: one new registered ToolExecutor action
+   with no model-supplied identifiers, trusted task id, stable upper boundary,
+   oldest-first catch-up, cumulative bounded summary, and one atomic CAS commit.
+   Not shippable before the retrieval prerequisite and the Phase 3 implementation
+   are complete.
 3. **Phase 6 — shared History admission**: one process-wide in-flight/start gate
-   inside `history_ai_service`, because per-operation pacing does not coordinate
-   the scheduler's bounded concurrent occurrences.
-4. **Phase 7 — live validation** of a real schedule, a restart mid-run, a
-   deferral and a capped-peer refusal.
+   inside `history_ai_service`, because per-operation pacing does not coordinate the
+   scheduler's bounded concurrent occurrences.
+4. **Phase 7 — live validation** of a real schedule, a restart mid-run, a deletion
+   of a previously processed source message, a provider failure, and a capped-peer
+   refusal.
 
 ### Deferred evidence-backed constraints (unchanged)
 
@@ -90,6 +123,19 @@ Status: **next, not started.**
 - No verified chain-wide context floor, so the chunk budget must not grow.
 - `ASSUMED_CALL_LATENCY_S = 30` is a planning value; use
   `ProviderManager.metrics_snapshot` before changing pacing.
+- `ai_task_occurrences.result_metadata` stays out of summary storage (8 KiB bound,
+  occurrence lifecycle ownership).
+
+---
+
+## Previous delivery (complete, unchanged): History Peer Policy Phase 2
+
+Base `ffe72fd`: deterministic `history_policy` over the Phase 1 `PeerType`,
+per-peer caps (bot/channel 300, user/group/supergroup 1000), dynamic panel count
+choices, stale-callback rejection, service-boundary and linked-message enforcement.
+78 new policy tests; full suite 7,750 passed with the same 6 pre-existing failures.
+See the commit history and `IMPLEMENTATION_REPORT.md` history for details. It
+remains valid.
 
 ---
 
@@ -98,9 +144,9 @@ Status: **next, not started.**
 Base `ecc3779`: `PeerType` + pure `classify_entity` in
 `backend/telegram_api/peers.py`, migrated into the History picker label, General →
 Chat & Message IDs, Ghost Seen eligibility and Anti-Edit bot detection. Strict
-entity-flag precedence, fail-closed `unknown`, no persistence or cache. 41 new
-tests; reports in the commit history. It remains valid and was not modified by
-Phase 2.
+entity-flag precedence, fail-closed `unknown`, no persistence or cache. 41 tests.
+See the commit history. It remains valid and was not modified by Phase 2 or this
+investigation.
 
 ---
 
@@ -109,8 +155,7 @@ Phase 2.
 Base `7894f31`: script-aware token estimation, concurrency-aware map capacity,
 map + reduce call accounting, and an honest refusal naming the AI time budget and
 the affordable message count. Chunk budget, concurrency, pacing, deadlines and
-ProviderManager ownership were unchanged. See the commit history for its full
-report; it remains valid.
+ProviderManager ownership were unchanged. See the commit history; it remains valid.
 
 ---
 
@@ -124,4 +169,5 @@ report; it remains valid.
   (`test_task_scheduler::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`).
 
 These are the six pre-existing suite failures, reproduced identically at the
-Phase 2 base commit.
+Phase 2 base commit. Phase 3 changed only documentation and did not run or alter
+those tests.
