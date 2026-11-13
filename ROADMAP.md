@@ -1,87 +1,110 @@
 # ROADMAP
 
-## Latest delivery: History AI-pass capacity — accurate execution model
+## Latest delivery: Peer Classification Phase 1 — reusable foundation
 
-Status: **implemented, tested, awaiting live validation.**
-Base: `7894f312eab0eaf613d5babddb3efd515527ce12`.
+Status: **implemented, tested, pushed.** Base: `ecc3779814f6bc0a45588cb35629c3aa5288550c`.
 
-The History panel refused a 1,000-message summary with a sentence that claimed a
-provider rate-limit quota (45) and undercounted the work (89 map passes, reduce
-ignored). The real constraint is the request's own AI time budget under the hard
-5 s pacing and `MAP_CONCURRENCY = 2`. This delivery makes the arithmetic honest:
+A single pure classifier now answers what kind of Telegram peer a resolved
+entity is, and the four places that used to answer it differently consume it.
 
-- script-aware token estimation (Latin 4 chars/token, any non-ASCII 2
-  chars/token; mixed text stays conservative);
-- capacity = `min(pacing, MAP_CONCURRENCY × floor(map_budget / 30))` — 16 for the
-  300 s panel envelope, 12 for the 240 s AI-chat envelope;
-- pass count includes the reduce call (n map + 1 merge);
-- refusal before any provider call, stating the AI budget, the required calls
-  and how many messages one request accepts (~352 Latin / ~176 non-Latin at
-  300 s);
-- no change to pacing, concurrency, chunk budget, deadlines, ProviderManager or
-  translation behaviour.
+- `backend/telegram_api/peers.py`: `PeerType` (`private_user`, `private_bot`,
+  `basic_group`, `supergroup`, `broadcast_channel`, `unknown`) and
+  `classify_entity(entity)`.
+- Real Telethon types via `isinstance`; `User.bot`, `Channel.broadcast`,
+  `Channel.megagroup`, `Channel.gigagroup` are the only authorities. A gigagroup
+  is a supergroup variant (no separate type). No titles, usernames, id patterns,
+  Dialog booleans or AI output. Unknown fails closed.
+- Migrated: History chat-picker label, General → Chat & Message IDs type,
+  Ghost Seen user/private eligibility (its own exclusions kept), Anti-Edit/Delete
+  `is_bot_entity` (its safe fallback kept).
+- Not persisted and not cached: the type is derived from the currently resolved
+  entity on every classification.
 
 ### Verified results
 
 | Check | Result |
 | --- | --- |
-| Focused History + provider/fallback suites (8 files) | 277 passed |
-| Full suite | 7,618 passed, 6 failed, 27 skipped |
-| The same 6 failures on a clean `7894f31` worktree | 6 failed, 46 passed — identical, pre-existing |
-| Compile / `git diff --check` | clean |
+| New classifier + call-site suites (7 files) | 311 passed |
+| Full suite | 7,659 passed, 6 failed, 27 skipped |
+| The same 6 tests on a clean `ecc3779` worktree | 6 failed — identical, pre-existing |
+| `py_compile` / `git diff --check` | clean |
 
 ### Completed
 
-- Root cause established from source: mis-modelled completion capacity + the
-  reduce call not counted + a false rate-limit attribution.
-- `estimate_tokens_script_aware` in `backend/ai/prompt/budget.py`; the History
-  service uses it.
-- `map_call_capacity`, `required_ai_calls`, `_affordable_message_count`,
-  `_capacity_refusal` in `backend/services/history_ai_service.py`.
-- New `tests/test_history_capacity.py` (20 deterministic tests) plus four
-  adjusted tests in `tests/test_history_ai_tools.py`.
-- Canonical reports replaced (`IMPLEMENTATION_REPORT.md`, this file,
-  `INVESTIGATION.md`).
+- `PeerType` + pure `classify_entity` with a strict flag order and fail-closed
+  unknown handling.
+- Four call sites migrated without changing their feature policy, compatibility
+  doubles, or safe fallbacks.
+- `tests/test_peer_classification.py` (41 tests) with real Telethon entities,
+  negative/partial inputs, purity checks and per-call-site coverage.
+- Reports replaced (`IMPLEMENTATION_REPORT.md`, `INVESTIGATION.md`, this file).
 
-### Deferred (do not implement without new evidence)
+---
 
-1. **1,000-message single request.** Infeasible at 240–300 s with concurrency 2
-   and 4,000-token chunks: 16 calls hold ~352 Latin / ~176 non-Latin messages of
-   the observed size. Options, both requiring product/architecture decisions:
-   a longer panel envelope (≈ 900 s gives capacity ≈ 56, enough for 46 Latin
-   chunks) or a verified minimum context across the candidate chain that would
-   justify a larger chunk budget.
-2. **Larger chunk budget.** `get_model_context_length` is per model, the
-   fallback chain is private and dynamic, and most models report `0`. No
-   speculative registry, no blind 8,000-token increase.
-3. **Latency-based planning.** `ASSUMED_CALL_LATENCY_S = 30` is the provider HTTP
-   bound; real latencies are unmeasured. Use `ProviderManager.metrics_snapshot`
-   before touching concurrency, pacing or the envelope.
-4. **Panel copy.** The 500 and 1,000 options remain and are refused with the new
-   message; aligning the offered counts with what one request can finish is
-   panel work, out of this delivery's scope.
+## Next stage: Phase 2 — History per-peer policy
 
-### Next required validation
+Planned, **not started**:
 
-- One live 300-message summary on the deployed bot: confirm the accepted
-  workload completes, the refusal never fires for it, and record real call
-  latency.
-- One live refusal (500 or 1,000) to confirm the message renders correctly in
-  Telegram and the "About N messages fit" number is truthful for a real
-  transcript.
+- `backend/services/history_policy.py` mapping `PeerType` to the product caps
+  (`broadcast_channel` 300, `private_bot` 300, `private_user` 1000,
+  `basic_group` 1000, `supergroup` 1000, `unknown` refuses).
+- Resolve/classify the selected peer BEFORE applying the count; never silently
+  clamp a chosen count; explain an over-cap choice explicitly.
+- Keep the independent AI feasibility gate (300 messages is not automatically
+  feasible at the current envelope).
+- History panel count choices must reflect the cap for the selected peer without
+  changing retrieval, cursors, pagination or delivery.
+
+No History behaviour change ships in Phase 1.
+
+---
+
+## Later phases (deferred, in order)
+
+1. **Phase 3 — persistence**: owner-applied manual migration for a dedicated
+   `history_schedules` state table (peer, both cursors, bounded summary,
+   revision, status, CAS version). `ai_task_occurrences.result_metadata` stays
+   out of summary storage (8 KiB hard bound, occurrence lifecycle).
+2. **Phase 4 — deterministic schedule UI**: owner wizard creates the task and its
+   state row through the existing TaskCreationService/TaskManagementService; the
+   model never creates or mutates these schedules.
+3. **Phase 5 — scheduled History action**: one new registered ToolExecutor tool
+   with no model-supplied identifiers, a stable upper-bound cursor, oldest-first
+   catch-up and an atomic summary + checkpoint commit.
+4. **Phase 6 — shared History admission**: one process-wide in-flight/start gate
+   inside `history_ai_service`, because per-operation pacing does not coordinate
+   the scheduler's bounded concurrent occurrences.
+5. **Phase 7 — live validation** of a real schedule, a restart mid-run, a
+   deferral and a capped-peer refusal.
+
+### Deferred evidence-backed constraints (unchanged)
+
+- 1,000-message single-request summaries remain infeasible at 240–300 s with
+  concurrency 2 and 4,000-token chunks (~352 Latin / ~176 non-Latin messages).
+- No verified chain-wide context floor, so the chunk budget must not grow.
+- `ASSUMED_CALL_LATENCY_S = 30` is a planning value; use
+  `ProviderManager.metrics_snapshot` before changing pacing.
+
+---
+
+## Previous delivery (complete, unchanged): History AI-pass capacity
+
+Base `7894f31`: script-aware token estimation, concurrency-aware map capacity,
+map + reduce call accounting, and an honest refusal naming the AI time budget and
+the affordable message count. Chunk budget, concurrency, pacing, deadlines and
+ProviderManager ownership were unchanged. See the commit history for its full
+report; it remains valid.
 
 ---
 
 ## Open items carried over (untouched by this delivery)
 
-These were already open before this work and are **not** part of it:
-
 - Supabase public `SELECT` exposure and the two server-only table exceptions
-  (tracked by `test_aed_db_security`, `test_private_message_db_security`).
+  (`test_aed_db_security`, `test_private_message_db_security`).
 - Canonical schema reconciliation / migration-history documentation
   (`test_canonical_schema_reconciliation`, `test_database_setup_order`).
 - The recovered-interrupted-occurrence scheduler test
   (`test_task_scheduler::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`).
 
-They are the six pre-existing suite failures listed in
-`IMPLEMENTATION_REPORT.md` §8 and reproduce unchanged at the base commit.
+These are the six pre-existing suite failures, reproduced identically at the
+Phase 1 base commit.

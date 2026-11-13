@@ -30,8 +30,18 @@ from backend.helper.client import get_client
 from backend.helper.rpc_timeout import rpc_await
 from backend.helper.styles import PRIMARY
 from backend.helper import symbols as sym
+from backend.telegram_api.peers import PeerType, classify_entity
 
 _RPC_T = 30.0
+
+#: Display labels for the normalized peer vocabulary (General → Chat & IDs).
+_PEER_TYPE_LABELS = {
+    PeerType.PRIVATE_USER: "Private",
+    PeerType.PRIVATE_BOT: "Bot",
+    PeerType.BASIC_GROUP: "Group",
+    PeerType.SUPERGROUP: "Supergroup",
+    PeerType.BROADCAST_CHANNEL: "Channel",
+}
 
 
 def _resolve_tz() -> str:
@@ -814,12 +824,12 @@ async def _general_id_action(event, extra: str, chat_id: int) -> tuple[str, str,
         if client and event_chat_id:
             try:
                 entity = await client.get_entity(event_chat_id)
-                if hasattr(entity, "broadcast"):
-                    chat_type = "Channel" if entity.broadcast else "Group"
-                elif hasattr(entity, "megagroup") and entity.megagroup:
-                    chat_type = "Supergroup"
-                elif hasattr(entity, "first_name"):
-                    chat_type = "Private"
+                # The shared classifier reads Telegram's OWN flags. A Channel is
+                # either a broadcast channel or a supergroup (never both), and a
+                # basic group is not a supergroup.
+                chat_type = _PEER_TYPE_LABELS.get(
+                    classify_entity(entity), "Unknown",
+                )
                 name_parts = []
                 for attr in ("title", "first_name"):
                     val = getattr(entity, attr, "")

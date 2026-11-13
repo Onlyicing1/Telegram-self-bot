@@ -47,6 +47,7 @@ from backend.helper.panel_edit import (
 from backend.helper.panels import _progress_buttons
 from backend.helper.rpc_timeout import rpc_await
 from backend.runtime.task_guard import guarded_create_task
+from backend.telegram_api.peers import PeerType, classify_entity
 from backend.services import (
     appearance_service,
     history_ai_service,
@@ -138,6 +139,23 @@ def _short(value: Any, limit: int = 32) -> str:
 
 
 def _chat_kind(dialog: Any, entity: Any) -> str:
+    """The chat picker's display category for one dialog (the SAME vocabulary).
+
+    The shared classifier decides for a real Telegram entity, so a supergroup is
+    never shown as a channel and a basic group is never shown as a supergroup.
+    The legacy dialog/attribute fallbacks below are kept ONLY for the
+    non-Telethon doubles this panel is tested with; they cannot upgrade an
+    entity the classifier refused to identify.
+    """
+    peer_type = classify_entity(entity)
+    if peer_type in (PeerType.PRIVATE_USER, PeerType.PRIVATE_BOT):
+        return "private"
+    if peer_type is PeerType.SUPERGROUP:
+        return "supergroup"
+    if peer_type is PeerType.BROADCAST_CHANNEL:
+        return "channel"
+    if peer_type is PeerType.BASIC_GROUP:
+        return "group"
     if getattr(dialog, "is_user", False) or type(entity).__name__ == "User":
         return "private"
     if getattr(entity, "megagroup", False):

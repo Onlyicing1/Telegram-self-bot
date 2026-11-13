@@ -49,6 +49,8 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from backend.telegram_api.peers import PeerType, classify_entity
+
 
 # ── Content categories ───────────────────────────────────────────────────────
 
@@ -501,7 +503,15 @@ def is_bot_entity(entity: Any) -> bool:
     absence of evidence is never evidence either way, so callers keep their
     existing safe fallback (documented in the capture handlers) instead of
     guessing a peer's humanity from usernames, names or id patterns.
+
+    The shared classifier decides for a real Telethon entity. The legacy
+    class-name branch below is this module's long-standing compatibility with the
+    lightweight ``User`` doubles its tests use; it can only confirm a bot, never
+    a human, and never accepts an arbitrary duck-typed object in place of a
+    resolved entity.
     """
+    if classify_entity(entity) is PeerType.PRIVATE_BOT:
+        return True
     if entity is None or type(entity).__name__ != "User":
         return False
     return getattr(entity, "bot", None) is True

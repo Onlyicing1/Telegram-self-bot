@@ -1,105 +1,96 @@
-# INVESTIGATION — History AI-pass capacity ("89 AI passes vs 45")
+# INVESTIGATION — Peer classification and the History intelligence roadmap
 
-Base: `7894f312eab0eaf613d5babddb3efd515527ce12`.
-Status: investigation complete; the corrective implementation is described in
-`IMPLEMENTATION_REPORT.md`.
+Base: `ecc3779814f6bc0a45588cb35629c3aa5288550c`. Phase 1 is implemented
+(`backend/telegram_api/peers.py`); later phases are recorded here as unresolved
+work, not as behaviour that exists today.
 
-## 1. Symptom
+## 1. Why a shared classifier exists (verified before Phase 1)
 
-The History panel's 1,000-message summary failed instantly (no provider work):
+The same question — "what kind of peer is this?" — was answered four different
+ways, and each answer was partly wrong:
 
-> These 1000 messages need 89 AI passes, more than the 45 one request can run
-> while paced to stay under the provider's rate limits. Try fewer messages.
+| Site | Old rule | Defect |
+| --- | --- | --- |
+| `history._chat_kind` | `type(entity).__name__ == "User"`, `Dialog.is_channel` | class-name string; `Dialog.is_channel` is true for broadcast channels **and** supergroups, so correctness depended on check order; no `private_bot`, no gigagroup |
+| `misc._general_id_action` | `hasattr(entity, "broadcast")` first | every real `Channel` has the attribute, so a supergroup displayed as “Group” and the megagroup branch was unreachable |
+| `ghost_seen_v2._is_telegram_user` | class-name / `SimpleNamespace` / dialog heuristics | no entity-flag authority; bots handled only by a later attribute check |
+| `anti_edit_delete_service.is_bot_entity` | class-name + `bot is True` | no shared taxonomy; another copy of the same question |
 
-## 2. Verified facts (read from the source at the base commit)
+`telegram_api.entities.get_dialogs` returns only Dialog booleans
+(`is_user`/`is_group`/`is_channel`), which cannot separate a broadcast channel
+from a supergroup. Entity flags are the only authority.
 
-1. `backend/bot/handlers/history.py::_run_summary` calls
-   `summarize_history(..., timeout_s=300.0, with_identifiers=False)`; the
-   constant is `OPERATION_TIMEOUT_S = 300.0`. The AI-chat path uses
-   `ai_unified._AI_EXECUTE_TIMEOUT = 240`.
-2. `llm_budget(E) = max(20, E - 20)`; with a reduce pending,
-   `map_budget = llm_budget - 30`.
-3. `max_map_calls(B) = floor((B - 30) / 5) + 1`. For the panel:
-   LLM 280 s, map 250 s, **45**. For AI chat: 220 s, 190 s, 33. Translation has no
-   reduce, so its panel bound would be 51.
-4. `MAP_CONCURRENCY = 2` and the map loop holds a semaphore slot for the whole
-   call; starts are spaced by `call_spacing` (5 s max).
-5. `_chunk_history` uses `SUMMARIZE_CHUNK_TOKEN_BUDGET =
-   DEFAULT_MAX_CONTEXT_TOKENS = 4000`.
-6. `_estimate_tokens` was `max(estimate_tokens(text, "English"),
-   estimate_tokens(text, "Persian"))`, i.e. 2 chars/token for every string.
-7. A multi-chunk summary makes `len(chunks)` map calls **plus one reduce call**;
-   the gate compared `len(chunks)` with the capacity and never added the reduce.
-8. `ProviderConfig` has `max_tokens=4096`, `timeout=30`, `retry_count=3` and no
-   RPM/RPD/context fields. The only "rate limit" machinery is the 60 s provider
-   cooldown in `providers/manager/health.py` and the in-manager retry/fallback.
+## 2. Phase 1 decisions (implemented)
 
-## 3. Derived numbers for the observed history
+1. **Pure classifier, no resolver wrapper.** `classify_entity(entity)` takes a
+   resolved entity and performs no RPC. Every call site already resolves through
+   `client.get_entity`, so a second resolution boundary would be redundant.
+2. **Strict flag precedence.** `User.bot` only; `Channel.broadcast` first, then
+   `megagroup`/`gigagroup`; `Chat` is a basic group; everything else `UNKNOWN`.
+   A gigagroup is a supergroup variant with no separate policy type.
+3. **No persistence and no authoritative cache.** A peer type is derived from the
+   currently resolved entity every time. This avoids a stale type after Telegram
+   migrates a basic group to a supergroup. In-process caches that already exist
+   elsewhere (Anti-Edit's resolution reliability cache) remain feature policy and
+   were not turned into a type source.
+4. **Feature policy stays with the feature.** Ghost Seen keeps owner/self/deleted
+   exclusion; Anti-Edit keeps its safe `False` fallback for unresolved entities;
+   History keeps its label vocabulary and panel behaviour.
+5. **Compatibility is explicit.** Non-Telethon `User`/`SimpleNamespace` doubles
+   that existing tests use keep the legacy branches in the call sites. The shared
+   classifier itself never accepts a duck-typed object.
+6. **No new architecture.** No client, listener, update loop, scheduler, service,
+   database object, provider or delivery change.
 
-- 89 chunks ⇒ 88 full chunks × 4,000 estimated tokens ≈ 352 k estimated tokens
-  ⇒ ~352 estimated tokens per message ⇒ ~700 characters per message at
-  2 chars/token. Synthetic 700-character histories reproduce the class
-  (89–91 chunks for non-Latin text).
-- Actual calls: 90 (89 + 1 reduce), not 89.
-- With `MAP_CONCURRENCY = 2` and a 30 s planned call: 45 calls ≈ 675 s, far
-  beyond the 250 s map budget. Completion capacity is `2 × floor(250/30) = 16`
-  (± rounding). 45 starts five seconds apart is a schedule, not a completion
-  bound.
+## 3. Verified facts for later phases (read at this base, not implemented)
 
-## 4. What "45" actually is
+1. **Incremental retrieval can skip messages.** `history_service._collect` scans
+   newest→oldest and keeps the newest `target` (`history_service.py:295`). With
+   60 eligible messages after a cursor and `count=10`, it returns the
+   newest ten (51–60) and reports `truncated=True`, silently dropping 1–50. The
+   existing test only covers a range smaller than the requested count. Correct
+   catch-up needs oldest-first retrieval (Telethon `reverse=True`, not exposed by
+   the facade today), a stable upper bound, and exclusive cursors.
+2. **`ai_task_occurrences.result_metadata` cannot store summaries.** Hard CHECK
+   `octet_length(result_metadata::text) <= 8192`, repository
+   `MAX_METADATA_BYTES = 8192`, and the column is owned by the occurrence's
+   action/park/terminal lifecycle.
+3. **Scheduled actions receive only `notification_destination.chat_id`.**
+   `TaskExecutionCoordinator` injects it as `extra["chat_id"]` together with the
+   `scheduled_occurrence` marker. That field is the delivery destination, so it
+   cannot double as “the chat to read” without sending summaries into the
+   monitored chat.
+4. **The deterministic owner path already exists.** The Taskloom wizard builds a
+   `TaskCandidate` and persists through `TaskCreationService`; pause/resume/delete
+   use `TaskManagementService`. AI-created tasks are a separate path.
+5. **Pacing is per operation, not global.** `MAP_CONCURRENCY = 2` and 5 s spacing
+   apply inside one History operation, while the scheduler runs up to four
+   occurrences concurrently (`MAX_CONCURRENT_EXECUTIONS = 4`). The dispatcher's
+   10 requests/minute limiter covers interactive AI requests, not History map
+   loops. No shared History admission exists.
+6. **Recovery semantics are already honest.** A `running` occurrence becomes
+   `failed/restart_side_effect_uncertain`; unstarted future occurrences are left
+   untouched; claim CAS and deterministic `occurrence_key` prevent duplicates.
+7. **Capacity arithmetic stands.** At 240–300 s, capacity is 12–16 calls, roughly
+   352 Latin / 176 non-Latin messages of the observed size. 300 messages is not
+   automatically feasible.
 
-A **time-envelope** derivative: `(280 s − 20 s reserve − 30 s final call) / 5 s + 1`.
-It is not a provider quota. No code reads a provider RPM/RPD value, and the
-providers' documented free-tier limits (e.g. 15 RPM) were a design input for the
-5 s spacing, not something the gate computes.
+## 4. Phase 2 scope (next, not started)
 
-## 5. Assumptions
+`history_policy` mapping `PeerType` → product caps (channel 300, bot 300, user
+1000, basic group 1000, supergroup 1000, unknown refuses), resolved before the
+count is applied; no silent clamping; explicit over-cap explanation; the AI
+feasibility gate remains independent; panel count choices reflect the cap without
+changing retrieval, cursors, pagination or delivery.
 
-- The 30 s value is the provider HTTP timeout and a planning latency; real
-  summarization calls are probably much faster, but no measured latency is
-  stored anywhere the service can read.
-- The reduce call is one call; ProviderManager retries/fallbacks inside it are
-  not visible as separate History passes, but their wall time is real.
-- The observed 89 chunks came from a transcript averaging ~700 characters per
-  message with a mix of Latin and non-Latin text.
+## 5. Unresolved for later phases
 
-## 6. Rejected approaches
-
-| Approach | Why rejected |
-| --- | --- |
-| Raise `MAP_CONCURRENCY` | No measured provider headroom; a 429 triggers the 60 s cooldown and fails the rest of the operation. Forbidden by scope. |
-| Remove or shorten the 5 s spacing | Same: it is the rate-limit guard, not the bottleneck. |
-| Raise `SUMMARIZE_CHUNK_TOKEN_BUDGET` to 8,000 | No verified minimum context across the dynamic fallback chain (`get_model_context_length` is per model and returns 0 for most models). A fallback to a smaller model would overflow the prompt. |
-| Longer panel timeout | `backend/bot/handlers/history.py` is out of scope and a 15-minute Telegram operation is a product decision. |
-| Count the reduce by raising the gate to 46 | Still admits work that cannot finish; hides the real defect. |
-| Add an executor/queue/worker | Forbidden by scope; ProviderManager owns execution. |
-| Retry the whole summary | Duplicates ProviderManager and doubles provider load. |
-
-## 7. What was implemented (summary)
-
-Script-aware token estimation (Latin 4 chars/token, any non-ASCII 2
-chars/token); a concurrency-aware capacity function
-(`min(pacing, 2 × floor(B/30))`); honest map + reduce pass accounting; a refusal
-that names the time budget and the affordable message count instead of a
-non-existent provider quota. Chunk budget, concurrency, pacing, deadlines,
-ProviderManager ownership and translation behaviour are unchanged.
-
-## 8. Unresolved limitations
-
-1. **1,000 messages remain infeasible** in one request: capacity is 16 (300 s)
-   or 12 (240 s); 16 chunks hold ~352 Latin / ~176 non-Latin messages of the
-   observed size.
-2. No measured latency distribution, so the planning value stays at the HTTP
-   bound and may under-admit fast requests.
-3. No verified chain-wide context floor, so the 4,000-token chunk cannot grow.
-4. The panel still offers 500 and 1,000; both are refused, now with an accurate
-   explanation and an actionable "about N fit" number.
-
-## 9. Next validation (not performed here)
-
-- Run one 300-message summary on the deployed bot and record real call latency
-  from `ProviderManager.metrics_snapshot`.
-- With measured p95, decide between a longer panel envelope (product decision)
-  and a verified minimum-context contract across the candidate chain.
-- Re-check the panel copy so the offered counts match what one request can
-  actually complete.
+- Durable History state table (peer, both cursors, bounded summary, revision,
+  status, CAS version) and its manual migration; no SQL was written or applied.
+- Oldest-first window retrieval and the exact scanned-vs-summarized checkpoint
+  contract, including windows with no eligible text.
+- One new registered ToolExecutor action with no model-supplied identifiers and
+  an atomic summary + checkpoint commit.
+- Shared History admission/pacing across manual and scheduled work.
+- Notification/visibility of scheduled summaries, retention policy, and whether a
+  peer may have more than one schedule.

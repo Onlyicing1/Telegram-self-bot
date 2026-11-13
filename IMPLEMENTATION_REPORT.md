@@ -1,245 +1,180 @@
-# IMPLEMENTATION REPORT — History AI-pass capacity (accurate execution model)
+# IMPLEMENTATION REPORT — Peer Classification Phase 1 (reusable foundation)
 
-Base commit: `7894f312eab0eaf613d5babddb3efd515527ce12` (`main`).
-Delivered commit: the commit that contains this file — verify with
-`git log -1 --format=%H -- IMPLEMENTATION_REPORT.md`.
+Base commit: `ecc3779814f6bc0a45588cb35629c3aa5288550c` (`origin/main`, fetched and
+verified before any edit). This report replaces the previous History capacity
+report; that delivery remains in the repository history and its behaviour is
+unchanged.
 
-This report replaces the previous pagination report. Pagination itself is unchanged.
+## 1. What this delivery is
 
-## 1. Exact root cause
+One reusable, provider-independent Telegram peer classifier plus the migration of
+the four duplicated classification sites onto it. It answers only *what kind of
+peer a resolved Telethon entity is*. Feature policy (Ghost Seen eligibility,
+Anti-Edit/Delete bot exclusion, History limits, ownership, authorization) stays
+with each feature.
 
-The 1,000-message History summary was refused before any provider call with:
+Nothing from later phases was started: no History caps or count changes, no
+retrieval/cursor change, no persistence, no scheduling, no ToolExecutor action,
+no database object, no provider or delivery change.
 
-> These 1000 messages need 89 AI passes, more than the 45 one request can run
-> while paced to stay under the provider's rate limits.
+## 2. Files changed
 
-Two independent defects produced that sentence:
-
-1. **The pass count was wrong (undercounted).** `_chunk_history` produced 89 map
-   chunks; the map-reduce operation then makes **one reduce call** as well, so
-   the real number of provider calls was 90. The gate counted only map chunks.
-2. **The capacity number was not a completion bound.** `max_map_calls(250)` = 45
-   comes from start spacing only: `(250 - 30) / 5 + 1`. It ignores
-   `MAP_CONCURRENCY = 2`. With two calls in flight and a planned call duration of
-   30 s, the phase can *complete* `2 * floor(250 / 30) = 16` calls inside 250 s —
-   45 calls would need ≈ 675 s. The gate therefore admitted workloads it could
-   not finish, and reported the 45 as a provider rate-limit quota, although no
-   RPM/RPD value is read anywhere in the codebase (the only provider limits are
-   the HTTP timeout, retry count and the in-process cooldown).
-
-A third, contributing defect made the situation worse without being the cause:
-
-3. **Token estimation charged every message the Persian worst case.** `_estimate_tokens`
-   returned `max(en, fa)` — 2 characters per token for all text, including
-   English. A Latin transcript was therefore cut into twice as many chunks as its
-   documented 4-chars/token ratio requires.
-
-## 2. Old and new formulas
-
-| Quantity | Old | New |
-| --- | --- | --- |
-| LLM budget | `max(20, E - 20)` | unchanged |
-| Map budget (reduce reserved) | `budget - 30` | unchanged |
-| Pacing bound | `max_map_calls(B) = floor((B-30)/5)+1` | unchanged (kept as the pacing half) |
-| Concurrency bound | *not modelled* | `MAP_CONCURRENCY * floor(B / 30)` |
-| Capacity used by the gate | pacing bound only | `min(pacing, concurrency)`, at least 1 |
-| Pass count | `len(chunks)` (reduce ignored) | `chunks + 1` when `chunks > 1` |
-| Token estimate | `max(en, fa)` = 2 chars/token always | ASCII → 4 chars/token; any non-ASCII → 2 chars/token |
-| Chunk budget | 4000 estimated tokens | unchanged (see §5) |
-| Refusal wording | "more than N one request can run … provider's rate limits" | names the AI time budget, the real call count, and how many messages fit |
-
-`ASSUMED_CALL_LATENCY_S = 30` remains a **planning** value (the provider HTTP
-bound, already used for pacing). It is not claimed as a worst-case guarantee:
-the hard bound stays `call_timeout` (finite, ≤ 120 s, ≤ remaining budget) and
-the map-phase deadline. A call slower than planned consumes the budget and fails
-honestly instead of overrunning it.
-
-## 3. Numerical comparison — the text the field reported
-
-Synthetic history with the observed shape: 1,000 messages, ~700 characters each
-(≈ 700 k characters total), panel path (`with_identifiers=False`, 4,000-token
-chunks, 300 s envelope → LLM budget 280 s, map budget 250 s).
-
-| Metric | Before | After |
-| --- | --- | --- |
-| Capacity reported by the gate | 45 | **16** (pacing 45 ∩ concurrency `2 × 8`) |
-| Chunks, English text | 88 | **46** (script-aware estimate) |
-| Provider calls, English | 88 (+1 uncounted) | **47** (46 map + 1 reduce) |
-| Chunks, Persian/Arabic text | 89 | **91** (same 2-chars/token estimate) |
-| Provider calls, Persian | 89 (+1 uncounted) | **92** |
-| Outcome, 1,000 messages | refused, wrong reason | **refused, accurate reason** |
-| Largest accepted request, English | — | **352 messages** (16 chunks) |
-| Largest accepted request, non-Latin | — | **176 messages** (16 chunks) |
-
-AI-chat envelope (240 s → LLM 220 s, map 190 s): pacing 33, capacity **12**;
-affordable 264 Latin / 132 non-Latin messages.
-
-**The 1,000-message option is not feasible in one request under the current
-envelope, concurrency and 4,000-token chunk policy.** That is arithmetic, not a
-missing optimisation: 16 calls × 4,000 estimated tokens = 64 k estimated tokens,
-i.e. roughly 350 Latin or 175 Persian messages of the observed size. Making
-1,000 feasible needs a longer envelope (≈ 900 s → capacity ≈ 56 → 46 chunks fit)
-or a verified larger chunk budget; neither is safe with today's evidence and
-both are listed as deferred, not implemented.
-
-## 4. Exact implementation changes
-
-### `backend/ai/prompt/budget.py`
-
-- Added `estimate_tokens_script_aware(text)`:
-  - empty → 0;
-  - `text.isascii()` → ceiling `len/4` (documented English ratio);
-  - any non-ASCII character → ceiling `len/2` for the **whole** string.
-  Mixed text is never weighted: one non-Latin character keeps the conservative
-  branch, so a mixed chunk cannot be underestimated by combining ratios.
-  Accented Latin (`café`) is non-ASCII and therefore conservative.
-
-### `backend/services/history_ai_service.py`
-
-- `_estimate_tokens` now delegates to `estimate_tokens_script_aware`.
-- Added `map_call_capacity(budget_s)` = `max(1, min(max_map_calls(B),
-  MAP_CONCURRENCY * floor(B / 30)))`, with the concurrency half documented as a
-  completion bound, not a start schedule.
-- Added `required_ai_calls(chunk_count)`: `0 → 0`, `1 → 1`, `n > 1 → n + 1`.
-  ProviderManager retries/fallbacks stay inside one call and are never counted
-  as additional History-level passes.
-- Added `_affordable_message_count(...)`: binary search over the already-fetched
-  history using the **same chunker**, so the refusal can state how many messages
-  one request accepts (no extra Telegram read, no provider call).
-- Added `_capacity_refusal(...)`: one message builder for summarize and
-  translate. It reports required calls (map + reduce), the capacity, the AI time
-  budget, the pacing/concurrency settings, and the affordable message count; it
-  no longer mentions provider rate limits.
-- `summarize_history`: computes `reduce_calls = 1 if len(chunks) > 1 else 0`,
-  gates on `map_call_capacity(map_budget)`, and passes both into the refusal.
-  The reduce reservation (`map_budget = budget - 30`) is unchanged, and the
-  reduce call itself still runs under the operation deadline.
-- `translate_history`: same capacity function and refusal builder; translation
-  prompts, ids, ordering and output assembly are unchanged.
-
-### Tests
-
-- `tests/test_history_capacity.py` (new, 20 tests): script-aware estimation for
-  English / Persian / Arabic / mixed / empty / accented; Latin-vs-non-Latin
-  chunk counts; the chunk budget pinned at the policy value and the absence of
-  any context-metadata lookup; oversized single message preserved whole;
-  map/reduce accounting; reduce reservation; concurrency-aware capacity
-  (250 s → 16, never above pacing, degrades to 1); the 1,000-message class
-  refused before any provider call with accurate wording; the reported
-  affordable count re-run and accepted; an accepted workload making exactly its
-  counted calls; provider failure delegated to ProviderManager (one
-  `manager.chat` call); translation identity/output unchanged; owner
-  instruction present in every system prompt.
-- `tests/test_history_ai_tools.py` (4 adjustments, no assertion weakened):
-  the 500-message map-reduce test now uses real-sized messages and the longer
-  envelope its 20+ calls need; two refusals assert the new, accurate wording
-  (and the absence of the false "rate limits" claim); the tighter-envelope
-  deadline test uses four chunks, the number 120 s can actually finish.
-
-### Unchanged on purpose
-
-`backend/bot/handlers/history.py` (panel pagination, delivery, `OPERATION_TIMEOUT_S`),
-`MAP_CONCURRENCY = 2`, 5 s pacing, `SUMMARIZE_CHUNK_TOKEN_BUDGET = 4000`,
-ProviderManager routing/fallback/retry/cooldown, translation prompts and output.
-
-## 5. Context-budget assumptions and the evidence for keeping 4,000
-
-- The only context metadata in the project is
-  `backend/ai/model_discovery.py::get_model_context_length(provider, model)`
-  (in-memory cache, `0` = unknown). It is **per model**, and
-  `ProviderManager`'s candidate chain is private and dynamic: any fallback
-  candidate can serve a call.
-- There is no chain-wide minimum, no `context_length` on `ProviderConfig`, and
-  no configured floor; most discovered models report `0`.
-- A chunk sized for the active model's context would therefore be unsafe the
-  moment a fallback to a smaller-context model happened — exactly the failure
-  the project's safety policy exists to prevent.
-- Per the task's own rule ("if there is no reliable way to establish a safe
-  larger context budget across fallback candidates, do not blindly increase the
-  chunk size"), the budget stays at `DEFAULT_MAX_CONTEXT_TOKENS = 4000`. A test
-  pins this and asserts the service does not consult model context metadata.
-
-A single message larger than the chunk budget is still its own chunk, never
-split and never truncated (tested); it is bounded only by the model's own limit,
-which is the pre-existing behaviour of the summarization path.
-
-## 6. Map/Reduce call accounting
-
-| Situation | Map calls | Reduce calls | Logical provider calls |
-| --- | --- | --- | --- |
-| No text message | 0 | 0 | 0 |
-| 1 chunk | 1 | 0 | 1 |
-| n > 1 chunks | n | 1 | n + 1 |
-| Provider retry/fallback | — | — | still 1 logical call (inside `manager.chat`) |
-
-Time cost of retries is not pretended to be zero: every attempt runs under the
-same phase deadline, and the reduce reservation is one planned call (30 s), not
-zero. A pathological multi-candidate fallback can consume the reservation; the
-deadline then ends the operation with an honest timeout rather than overrunning
-the caller's envelope.
-
-## 7. Concurrency and deadline accounting
-
-- `map_call_capacity` = smaller of the pacing bound and
-  `MAP_CONCURRENCY × floor(map_budget / 30)`.
-- `_map` still holds a semaphore slot for the whole call and every call is
-  `wait_for`-bounded by `call_timeout` (≤ 120 s, ≤ remaining deadline).
-- The map phase keeps its own deadline (`map_deadline`), strictly earlier than
-  the operation deadline when a reduce follows.
-- The reduce call is bounded by the remaining operation budget, not by the
-  reservation.
-- No deadline, pacing interval or concurrency value was removed or relaxed.
-
-## 8. Tests executed and actual results
-
-Environment: fresh venv, `PYTHONPATH=.`, `pytest -q -p no:cacheprovider`, worktree
-at `7894f31` plus this change. No network, no Telegram, scripted provider inside
-the real `ProviderManager`.
-
-| Command | Result |
+| File | Change |
 | --- | --- |
-| `pytest tests/test_history_capacity.py tests/test_history_ai_tools.py tests/test_history_panel.py tests/test_history_service.py tests/test_17_providers.py tests/test_23_provider_mesh.py tests/test_dynamic_model_fallback.py tests/test_ai_fallback_logging.py` | **277 passed** |
-| `pytest tests` (full suite) | **7,618 passed, 6 failed, 27 skipped** in 170 s |
-| Same 6 tests on a clean worktree at `7894f31` (no changes) | **6 failed, 46 passed** — identical list |
+| `backend/telegram_api/peers.py` | **new** — `PeerType` + pure `classify_entity` |
+| `backend/bot/handlers/history.py` | `_chat_kind` now uses the classifier (legacy double fallbacks kept) |
+| `backend/bot/handlers/misc.py` | General → Chat & Message IDs type label now uses the classifier |
+| `backend/services/ghost_seen_v2.py` | `_is_telegram_user` / `is_private_user_entity` use the classifier; Ghost Seen's own exclusions untouched |
+| `backend/services/anti_edit_delete_service.py` | `is_bot_entity` uses the classifier; documented double fallback kept |
+| `tests/test_peer_classification.py` | **new** — 41 classifier + call-site tests |
+| `IMPLEMENTATION_REPORT.md`, `INVESTIGATION.md`, `ROADMAP.md` | this delivery's reports |
 
-Pre-existing failures (unrelated: documentation/DB security/scheduler tests,
-identical at the base commit):
+No other file was touched, and no protected document was modified.
 
-- `test_aed_db_security.py::test_the_documentation_describes_the_restrictive_model`
-- `test_canonical_schema_reconciliation.py::test_the_migration_is_forward_only_and_its_successors_stay_additive`
-- `test_database_setup_order.py::test_the_section_does_not_pretend_the_sql_was_executed`
-- `test_database_setup_order.py::test_the_waiting_answer_migration_is_absorbed_by_part_one`
-- `test_private_message_db_security.py::test_the_rls_model_names_the_two_tables_as_server_only_exceptions`
-- `test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`
+## 3. Classifier contract
 
-Compilation: `python -m py_compile backend/services/history_ai_service.py
-backend/ai/prompt/budget.py backend/services/history_service.py` — OK.
-Whitespace: `git diff --check` — clean.
+```python
+class PeerType(str, Enum):
+    PRIVATE_USER = "private_user"
+    PRIVATE_BOT = "private_bot"
+    BASIC_GROUP = "basic_group"
+    SUPERGROUP = "supergroup"
+    BROADCAST_CHANNEL = "broadcast_channel"
+    UNKNOWN = "unknown"
 
-## 9. What was not verified live
+def classify_entity(entity: Any) -> PeerType
+```
 
-- No deployed bot run: no real Telegram history, no real provider latency
-  measurement. Every number above comes from the deterministic model and the
-  synthetic 700-character histories.
-- Real p50/p95 call latency is unmeasured; `ASSUMED_CALL_LATENCY_S = 30` is the
-  provider HTTP bound, deliberately conservative. If production latency is much
-  lower, the capacity model under-admits (safe direction); this is the first
-  thing to measure before any envelope change.
-- The panel's 500/1,000 buttons still exist (handler untouched by scope) and will
-  be refused with the new message at the current envelope.
+- Real Telethon types only, decided with `isinstance`: `User`, `Chat`, `Channel`.
+  Never `type(...).__name__`, never a Dialog boolean, never a title/username/id
+  pattern, never a service or model answer.
+- `User`: `PRIVATE_BOT` only when `User.bot is True`, otherwise `PRIVATE_USER`.
+  An absent flag is not read as a positive one.
+- `Chat`: `BASIC_GROUP`.
+- `Channel`: `BROADCAST_CHANNEL` when `broadcast is True` (checked first, so a
+  contradictory megagroup flag cannot turn a channel into a group); otherwise
+  `SUPERGROUP` when `megagroup is True` **or** `gigagroup is True`; otherwise
+  `UNKNOWN`. A gigagroup is a supergroup variant and deliberately has no separate
+  policy type.
+- `None`, unexpected objects, dialogs, serialized dicts, partial objects and
+  non-Telethon doubles: all `UNKNOWN`. No attribute is read for an object that
+  failed the `isinstance` gate (tested with an exploding object).
+- Pure and synchronous: no RPC, network, database, service, History, AI, panel or
+  scheduling import; no mutation; deterministic. It is a module function, not a
+  client, resolver, cache or update loop.
+- Peer type is never persisted here. It is derived from the currently resolved
+  entity every time, so a basic group migrated to a supergroup is classified
+  correctly on the next resolution.
 
-## 10. Remaining limitations
+No resolver wrapper was added: every call site already resolves through
+`client.get_entity` (the existing boundary), so a second resolution path would be
+redundant.
 
-1. **1,000 messages cannot be summarized in one request** at 240–300 s,
-   concurrency 2 and 4,000-token chunks. Documented, not worked around.
-2. The capacity model is a planning bound, not a guarantee of any individual
-   call's latency; the deadline remains the hard stop.
-3. No verified cross-fallback context floor, so the chunk budget cannot safely
-   grow (see §5).
-4. `_affordable_message_count` runs the chunker over a binary search of the
-   history only when a request is refused (bounded, no I/O), but it is still
-   O(n log n) over up to 1,000 messages.
-5. Deferred next steps (not implemented): measure real latencies from
-   `ProviderManager.metrics_snapshot`; consider a longer panel envelope with the
-   product owner; or introduce a verified minimum context across the candidate
-   chain before raising the chunk budget.
+## 4. Call sites
+
+### Migrated
+
+1. **`history._chat_kind`** — the chat picker's label. Real entities now map
+   `private_user`/`private_bot` → `private`, `basic_group` → `group`,
+   `supergroup` → `supergroup`, `broadcast_channel` → `channel`. The display
+   vocabulary is unchanged. The legacy dialog/attribute branches are retained
+   **only** for the non-Telethon doubles the panel tests use and cannot upgrade a
+   real entity the classifier reported as `UNKNOWN` (that keeps the legacy
+   `chat` bucket). A real supergroup is no longer at risk of being labelled a
+   channel, and a real basic group is no longer labelled `chat`.
+2. **`misc._general_id_action`** — “General → Chat & Message IDs”. The old code
+   checked `hasattr(entity, "broadcast")` first, so a **supergroup was displayed
+   as “Group”** and the megagroup branch was unreachable for real channels. It
+   now shows `Channel`, `Supergroup`, `Group`, `Private` or `Bot` from the
+   classifier, and `Unknown` when the entity cannot be classified. Failure of the
+   lookup still leaves `Unknown` (never a guessed category).
+3. **`ghost_seen_v2`** — `_is_telegram_user` uses the classifier for real
+   entities, then keeps its long-standing double heuristics (`class name "User"`,
+   `SimpleNamespace` with `first_name`, `dialog.is_user`).
+   `is_private_user_entity` keeps Ghost Seen's own policy unchanged: bots, self,
+   deleted and the owner are excluded, and an entity id is required. Bot
+   exclusion is taken from the classifier for real entities and remains
+   attribute-based for doubles, so no existing behaviour was lost.
+4. **`anti_edit_delete_service.is_bot_entity`** — a real entity is a bot only when
+   the classifier says `PRIVATE_BOT`. The legacy class-name + `bot is True` branch
+   remains for the module's `User` test doubles; it can only confirm a bot, never
+   a human, and an unresolved/non-User entity still returns `False` (the safe
+   fallback the capture handlers rely on).
+
+### Intentionally not changed
+
+- `is_private_user_dialog` / `filter_private_dialogs`: their group/channel dialog
+  flags are a feature-level scope rule, not taxonomy; they only consume the
+  already-migrated helpers.
+- `anti_edit_delete_service._resolve_peer_bot` / its bounded cache and cooldown:
+  that is resolution reliability and feature policy (unknown → cooldown, never a
+  human), not classification.
+- `telegram_api.entities.get_dialogs`' serialized dict: unchanged, because
+  adding peer types to a display dict would create a second, weaker source of
+  truth. Callers that need the type resolve the entity, as these four sites do.
+- History retrieval, counts, panel text, AI capacity and delivery: untouched.
+- `AI_MASTER_DESIGN.md` and `DATABASE_ARCHITECTURE.md`: protected, untouched.
+
+## 5. Tests
+
+New `tests/test_peer_classification.py` (41 tests, all passing):
+
+- Vocabulary: exact six values, `str` compatibility, round-trip.
+- Real entities: human `User`, `User(bot=False)`, `User` with an absent bot flag,
+  bot `User`, basic `Chat`, broadcast `Channel`, megagroup `Channel`, explicit
+  `gigagroup=True` (with and without `megagroup`), channel with neither flag,
+  contradictory broadcast+megagroup.
+- Negative: `None`, `0`, `"user"`, `object()`, `{}`, `[]`, `SimpleNamespace`
+  doubles, dialog-like objects, partial flag-only objects, a `Channel` subclass
+  with missing flags.
+- Purity: not a coroutine, single `entity` parameter, deterministic, does not
+  mutate the entity, reads no attribute for an unknown object, and the module
+  source contains no async/runtime-service dependencies.
+- Call sites: History labels for every real type plus the double fallbacks;
+  General ID label for channel/supergroup/gigagroup/group/private/bot/unknown and
+  a failed lookup; Ghost Seen human/bot/group/channel plus owner and double
+  exclusions; Anti-Edit bot detection for real bot/human/group/channel and the
+  legacy double.
+
+Existing suites were run unchanged — no assertion was weakened or removed.
+
+## 6. Exact results
+
+Environment: `/tmp/iv` virtualenv from `backend/requirements.txt` plus `pytest`
+and `pytest-asyncio`, `PYTHONPATH=.`, no network and no Telegram.
+
+| Check | Result |
+| --- | --- |
+| `pytest tests/test_peer_classification.py tests/test_46_general_chat_ids.py tests/test_52_ghost_seen_v2_stage1.py tests/test_57_ghost_seen_v2_stage5_6.py tests/test_anti_edit_delete.py tests/test_history_panel.py tests/test_history_service.py` | **311 passed** |
+| Full suite (`pytest -q -p no:cacheprovider`) | **7,659 passed, 6 failed, 27 skipped** in 174.6 s |
+| The same 6 tests on a clean detached worktree at `ecc3779` | **6 failed** — identical list |
+| `py_compile` on all six changed Python files | exit 0 |
+| `git diff --check` | clean |
+
+The six failures are pre-existing and unrelated (documentation/DB-security/schema
+audits and one scheduler test); they reproduce unchanged at the base commit, so
+no new regression was introduced.
+
+## 7. Scope compliance
+
+Not implemented in this phase: History per-peer caps, `history_policy.py`, count
+choices, retrieval/cursor changes, pagination, AI capacity, scheduled History,
+Taskloom changes, a new ToolExecutor action, any table/migration/SQL/Supabase
+change, peer-type persistence or cache, a second client/scheduler/worker/
+listener/executor/update loop, ProviderManager/routing/pacing changes, delivery
+changes, unrelated refactors or API renames. Nothing was deployed.
+
+## 8. Limitations and live status
+
+- **No live Telegram validation**: no real dialogs were resolved against a live
+  account; every test uses real Telethon *entity objects* constructed locally.
+  The classifier's correctness therefore rests on Telethon's documented flags,
+  which is the authority it reads.
+- A `Channel` whose `broadcast` and `megagroup`/`gigagroup` flags are all unset
+  is `UNKNOWN` by design; callers must fail closed rather than pick a category.
+  There is no dashboard/UI consumer of `PeerType` yet.
+- `str(PeerType.X)` prints `PeerType.X` (standard `Enum` behaviour); compare
+  identity or use `.value`. The type is `str`-compatible for storage/JSON, which
+  no code does in this phase.
+- Later phases (policy, incremental cursors, durable schedules, admission) remain
+  unimplemented and are described in `INVESTIGATION.md` / `ROADMAP.md`.
