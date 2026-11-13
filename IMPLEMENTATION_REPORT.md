@@ -1,230 +1,245 @@
-# IMPLEMENTATION REPORT — History & Intelligence paginated summaries
+# IMPLEMENTATION REPORT — History AI-pass capacity (accurate execution model)
 
-_Base commit: `c18a2d5baeceefa66f064712bd36eba638b8faa5`. The Helper-Bot
-in-place delivery fix from `77b762b` is the starting point for this change.
-This document replaces all earlier reports and describes only the current
-state._
+Base commit: `7894f312eab0eaf613d5babddb3efd515527ce12` (`main`).
+Delivered commit: the commit that contains this file — verify with
+`git log -1 --format=%H -- IMPLEMENTATION_REPORT.md`.
 
-## 1. Root cause of the truncation
+This report replaces the previous pagination report. Pagination itself is unchanged.
 
-Two independent cuts discarded generated text:
+## 1. Exact root cause
 
-1. **Delivery cut.** The result was fitted to the panel's Telegram limit with a
-   visible truncation marker, so a long summary could not be read past the
-   first caption/message.
-2. **Generation cut.** `_summary_body` discarded everything after
-   `MAX_SUMMARY_CHARS = 2800` and appended `… (summary truncated for display)`.
-   This happened BEFORE delivery, so pagination alone would still have paged an
-   already-truncated string.
+The 1,000-message History summary was refused before any provider call with:
 
-Both cuts are gone. `_summary_body` now keeps the complete generated summary,
-and the delivery path splits that complete body into pages. There is no
-truncation marker for the summary any more.
+> These 1000 messages need 89 AI passes, more than the 45 one request can run
+> while paced to stay under the provider's rate limits.
 
-## 2. Delivery ownership (unchanged)
+Two independent defects produced that sentence:
 
-The panel is an inline result sent by the owner's account with the Helper Bot
-as its inline identity. The only editor remains the Helper Bot:
+1. **The pass count was wrong (undercounted).** `_chunk_history` produced 89 map
+   chunks; the map-reduce operation then makes **one reduce call** as well, so
+   the real number of provider calls was 90. The gate counted only map chunks.
+2. **The capacity number was not a completion bound.** `max_map_calls(250)` = 45
+   comes from start spacing only: `(250 - 30) / 5 + 1`. It ignores
+   `MAP_CONCURRENCY = 2`. With two calls in flight and a planned call duration of
+   30 s, the phase can *complete* `2 * floor(250 / 30) = 16` calls inside 250 s —
+   45 calls would need ≈ 675 s. The gate therefore admitted workloads it could
+   not finish, and reported the 45 as a provider rate-limit quota, although no
+   RPM/RPD value is read anywhere in the codebase (the only provider limits are
+   the HTTP timeout, retry count and the in-process cooldown).
 
-- `history._editor` builds `ExistingPanelEditor` with `helper=get_client()` and
-  **`self_client=None`**;
-- the edit is Telethon's `edit_message(InputBotInlineMessageID, text=...,
-  buttons=...)` (`messages.editInlineBotMessage`) using the callback's own
-  inline handle;
-- page navigation uses the same editor and the same handle.
+A third, contributing defect made the situation worse without being the cause:
 
-No replacement panel, second message, Saved Messages message, redirect, new
-Telegram client, update loop or scheduler was added. The panel's recorded
-delivery state decides only the text bound (photo caption 1,024 vs text 4,096);
-it never changes the destination.
+3. **Token estimation charged every message the Persian worst case.** `_estimate_tokens`
+   returned `max(en, fa)` — 2 characters per token for all text, including
+   English. A Latin transcript was therefore cut into twice as many chunks as its
+   documented 4-chars/token ratio requires.
 
-## 3. Pagination design
+## 2. Old and new formulas
 
-`_paginate(body, limit, measure=_rendered_units)` returns one page when the body
-already fits, otherwise it splits the body:
+| Quantity | Old | New |
+| --- | --- | --- |
+| LLM budget | `max(20, E - 20)` | unchanged |
+| Map budget (reduce reserved) | `budget - 30` | unchanged |
+| Pacing bound | `max_map_calls(B) = floor((B-30)/5)+1` | unchanged (kept as the pacing half) |
+| Concurrency bound | *not modelled* | `MAP_CONCURRENCY * floor(B / 30)` |
+| Capacity used by the gate | pacing bound only | `min(pacing, concurrency)`, at least 1 |
+| Pass count | `len(chunks)` (reduce ignored) | `chunks + 1` when `chunks > 1` |
+| Token estimate | `max(en, fa)` = 2 chars/token always | ASCII → 4 chars/token; any non-ASCII → 2 chars/token |
+| Chunk budget | 4000 estimated tokens | unchanged (see §5) |
+| Refusal wording | "more than N one request can run … provider's rate limits" | names the AI time budget, the real call count, and how many messages fit |
 
-1. paragraphs (blank-line boundaries);
-2. lines inside a paragraph;
-3. sentences (English and common RTL terminators);
-4. words;
-5. a UTF-16 hard cut as the last resort, with a guard that avoids cutting an
-   unclosed `**` or backtick span when a nearer boundary exists.
+`ASSUMED_CALL_LATENCY_S = 30` remains a **planning** value (the provider HTTP
+bound, already used for pacing). It is not claimed as a worst-case guarantee:
+the hard bound stays `call_timeout` (finite, ≤ 120 s, ≤ remaining budget) and
+the map-phase deadline. A call slower than planned consumes the budget and fails
+honestly instead of overrunning it.
 
-A block that overflows the page in progress is split against the remaining
-space first, so short metadata does not consume page 1; the summary starts on
-the page the owner receives.
+## 3. Numerical comparison — the text the field reported
 
-Each page is rendered as:
+Synthetic history with the observed shape: 1,000 messages, ~700 characters each
+(≈ 700 k characters total), panel path (`with_identifiers=False`, 4,000-token
+chunks, 300 s envelope → LLM budget 280 s, map budget 250 s).
 
-```
-**History & Intelligence**
+| Metric | Before | After |
+| --- | --- | --- |
+| Capacity reported by the gate | 45 | **16** (pacing 45 ∩ concurrency `2 × 8`) |
+| Chunks, English text | 88 | **46** (script-aware estimate) |
+| Provider calls, English | 88 (+1 uncounted) | **47** (46 map + 1 reduce) |
+| Chunks, Persian/Arabic text | 89 | **91** (same 2-chars/token estimate) |
+| Provider calls, Persian | 89 (+1 uncounted) | **92** |
+| Outcome, 1,000 messages | refused, wrong reason | **refused, accurate reason** |
+| Largest accepted request, English | — | **352 messages** (16 chunks) |
+| Largest accepted request, non-Latin | — | **176 messages** (16 chunks) |
 
-Page N/M
+AI-chat envelope (240 s → LLM 220 s, map 190 s): pacing 33, capacity **12**;
+affordable 264 Latin / 132 non-Latin messages.
 
-<page content>
-```
+**The 1,000-message option is not feasible in one request under the current
+envelope, concurrency and 4,000-token chunk policy.** That is arithmetic, not a
+missing optimisation: 16 calls × 4,000 estimated tokens = 64 k estimated tokens,
+i.e. roughly 350 Latin or 175 Persian messages of the observed size. Making
+1,000 feasible needs a longer envelope (≈ 900 s → capacity ≈ 56 → 46 chunks fit)
+or a verified larger chunk budget; neither is safe with today's evidence and
+both are listed as deferred, not implemented.
 
-Page 1 is delivered automatically. A single-page result keeps the previous
-buttons and has no page indicator or paging controls. `Previous` is omitted on
-page 1 and `Next` on the last page (they are not disabled placeholders).
-Navigation is `action:history_page:<token>:<index>` and edits the existing
-panel in place.
+## 4. Exact implementation changes
 
-### Exact Telegram limits
+### `backend/ai/prompt/budget.py`
 
-`_rendered_units` measures the text through `panel_render.render_edit("", text,
-[])` — the same renderer the editor uses immediately before the RPC — not a
-raw character count. This matters because the Glass UI font replaces Latin
-letters (and some digit runs) with mathematical glyphs outside the BMP, which
-cost two UTF-16 units each. The page budget also reserves the title and a
-two-digit `Page 99/99` indicator.
+- Added `estimate_tokens_script_aware(text)`:
+  - empty → 0;
+  - `text.isascii()` → ceiling `len/4` (documented English ratio);
+  - any non-ASCII character → ceiling `len/2` for the **whole** string.
+  Mixed text is never weighted: one non-Latin character keeps the conservative
+  branch, so a mixed chunk cannot be underestimated by combining ratios.
+  Accented Latin (`café`) is non-ASCII and therefore conservative.
 
-Limits used: photo panel `appearance_service.MAX_CAPTION_CHARS` (1,024); text
-panel `MAX_RESULT_TEXT_CHARS` (4,096). The panel's `delivered_state` chooses the
-bound, with `preview_active()` as the existing fallback.
+### `backend/services/history_ai_service.py`
 
-## 4. Files changed
+- `_estimate_tokens` now delegates to `estimate_tokens_script_aware`.
+- Added `map_call_capacity(budget_s)` = `max(1, min(max_map_calls(B),
+  MAP_CONCURRENCY * floor(B / 30)))`, with the concurrency half documented as a
+  completion bound, not a start schedule.
+- Added `required_ai_calls(chunk_count)`: `0 → 0`, `1 → 1`, `n > 1 → n + 1`.
+  ProviderManager retries/fallbacks stay inside one call and are never counted
+  as additional History-level passes.
+- Added `_affordable_message_count(...)`: binary search over the already-fetched
+  history using the **same chunker**, so the refusal can state how many messages
+  one request accepts (no extra Telegram read, no provider call).
+- Added `_capacity_refusal(...)`: one message builder for summarize and
+  translate. It reports required calls (map + reduce), the capacity, the AI time
+  budget, the pacing/concurrency settings, and the affordable message count; it
+  no longer mentions provider rate limits.
+- `summarize_history`: computes `reduce_calls = 1 if len(chunks) > 1 else 0`,
+  gates on `map_call_capacity(map_budget)`, and passes both into the refusal.
+  The reduce reservation (`map_budget = budget - 30`) is unchanged, and the
+  reduce call itself still runs under the operation deadline.
+- `translate_history`: same capacity function and refusal builder; translation
+  prompts, ids, ordering and output assembly are unchanged.
 
-| File | Change |
-|---|---|
-| `backend/bot/handlers/history.py` | Removed both display truncations; added page splitting, rendered-unit measurement, page state, `history_page` navigation, in-place page rendering, honest expired/refused-edit handling, and explicit retained-result bounds |
-| `tests/test_history_panel.py` | Added pagination, navigation, independence, stale/expired/invalid callback, failed-edit, missing-handle, new-run invalidation, TTL/size bound, exact limit, styled-font and complete-summary tests |
-| `ROADMAP.md` | Recorded the pagination implementation and its actual verification status |
-| `IMPLEMENTATION_REPORT.md` | Replaced in full with this report |
+### Tests
 
-Not changed: `history_service`, `history_ai_service`, provider code, panel
-registries, `panel_edit.py`, database/Supabase, migrations,
-`DATABASE_ARCHITECTURE.md`, helper bot runtime. Nothing was deployed.
+- `tests/test_history_capacity.py` (new, 20 tests): script-aware estimation for
+  English / Persian / Arabic / mixed / empty / accented; Latin-vs-non-Latin
+  chunk counts; the chunk budget pinned at the policy value and the absence of
+  any context-metadata lookup; oversized single message preserved whole;
+  map/reduce accounting; reduce reservation; concurrency-aware capacity
+  (250 s → 16, never above pacing, degrades to 1); the 1,000-message class
+  refused before any provider call with accurate wording; the reported
+  affordable count re-run and accepted; an accepted workload making exactly its
+  counted calls; provider failure delegated to ProviderManager (one
+  `manager.chat` call); translation identity/output unchanged; owner
+  instruction present in every system prompt.
+- `tests/test_history_ai_tools.py` (4 adjustments, no assertion weakened):
+  the 500-message map-reduce test now uses real-sized messages and the longer
+  envelope its 20+ calls need; two refusals assert the new, accurate wording
+  (and the absence of the false "rate limits" claim); the tighter-envelope
+  deadline test uses four chunks, the number 120 s can actually finish.
 
-## 5. Page-state lifecycle, bounds and cleanup
+### Unchanged on purpose
 
-- State is one in-memory `OrderedDict` keyed by a 12-hex UUID token.
-- Each `_PageState` stores the token, `(panel chat id, panel message id)`, the
-  tuple of page strings, timestamps and the current index. One panel can have
-  at most one retained state because `_remember_pages` invalidates that panel's
-  previous token first.
-- TTL: `_PAGE_STATE_TTL_S = 6 hours`, refreshed on a successful navigation.
-- Panel bound: `_PAGE_STATE_MAX = 16` states; the least-recently-used entry is
-  evicted deterministically.
-- Pruning is lazy, on state lookup/creation; there is no background cleanup
-  loop, timer, task or database row.
-- A new History run calls `_forget_panel_pages` before its first progress edit,
-  so buttons from the previous run can never paint a page that no longer
-  belongs to the panel.
-- Restarting the process drops state; old page buttons then produce the honest
-  on-panel "no longer available" notice.
-- Retained-result bounds: `MAX_RESULT_PAGES = 64` and
-  `MAX_RETAINED_RESULT_CHARS = 40_000` (sum of page UTF-16 units). If either is
-  exceeded, `_deliver_result` does not store state; it edits the SAME panel with
-  an honest failure (`result_too_long`) and nothing is sent anywhere else.
+`backend/bot/handlers/history.py` (panel pagination, delivery, `OPERATION_TIMEOUT_S`),
+`MAP_CONCURRENCY = 2`, 5 s pacing, `SUMMARIZE_CHUNK_TOKEN_BUDGET = 4000`,
+ProviderManager routing/fallback/retry/cooldown, translation prompts and output.
 
-## 6. Callback and navigation safety
+## 5. Context-budget assumptions and the evidence for keeping 4,000
 
-- A callback carries its own 12-hex token; the state is looked up by token, then
-  validated against the callback's chat and panel message. A token from panel A
-  cannot paint panel B.
-- Unknown/expired tokens paint "These result pages are no longer available" on
-  the same panel through the same Helper Bot handle. Malformed tokens or
-  indexes, out-of-range indexes and stale chat/message bindings do not edit the
-  panel at all.
-- A refused page edit is logged as `HISTORY_PAGE_EDIT_FAILED` with a stable
-  failure kind; the index is not advanced and no `HISTORY_PAGE_DELIVERED` line
-  is written. `delivered`/index updates happen only after `editor.edit`
-  returns true.
-- A missing inline handle is reported as `kind=no_inline_panel_handle`; no
-  chat/message fallback exists because `_editor` never supplies the self client.
-- The existing callback gate serialises turns per panel, so two clicks on the
-  same panel cannot edit it concurrently.
+- The only context metadata in the project is
+  `backend/ai/model_discovery.py::get_model_context_length(provider, model)`
+  (in-memory cache, `0` = unknown). It is **per model**, and
+  `ProviderManager`'s candidate chain is private and dynamic: any fallback
+  candidate can serve a call.
+- There is no chain-wide minimum, no `context_length` on `ProviderConfig`, and
+  no configured floor; most discovered models report `0`.
+- A chunk sized for the active model's context would therefore be unsafe the
+  moment a fallback to a smaller-context model happened — exactly the failure
+  the project's safety policy exists to prevent.
+- Per the task's own rule ("if there is no reliable way to establish a safe
+  larger context budget across fallback candidates, do not blindly increase the
+  chunk size"), the budget stays at `DEFAULT_MAX_CONTEXT_TOKENS = 4000`. A test
+  pins this and asserts the service does not consult model context metadata.
 
-## 7. Tests executed and actual results
+A single message larger than the chunk budget is still its own chunk, never
+split and never truncated (tested); it is bounded only by the model's own limit,
+which is the pre-existing behaviour of the summarization path.
 
-Environment: `/tmp/venv`, Python 3.12. No live Telegram, provider, database or
-network call is used by these tests.
+## 6. Map/Reduce call accounting
 
-| Check | Command | Result |
-|---|---|---|
-| Focused History suite | `pytest tests/test_history_panel.py -q` | **55 passed** |
-| Panel/callback/lifecycle regressions | `pytest tests -q -k "history or panel or edit or callback or lifecycle"` | **863 passed, 3 skipped** |
-| Full suite | `pytest tests -q` | **7600 passed, 27 skipped, 6 failed** (same six pre-existing failures listed below) |
-| Compilation | `python3 -m py_compile backend/bot/handlers/history.py tests/test_history_panel.py` | **exit 0** |
-| Whitespace | `git diff --check` | **exit 0** |
+| Situation | Map calls | Reduce calls | Logical provider calls |
+| --- | --- | --- | --- |
+| No text message | 0 | 0 | 0 |
+| 1 chunk | 1 | 0 | 1 |
+| n > 1 chunks | n | 1 | n + 1 |
+| Provider retry/fallback | — | — | still 1 logical call (inside `manager.chat`) |
 
-The focused file now covers:
+Time cost of retries is not pretended to be zero: every attempt runs under the
+same phase deadline, and the reduce reservation is one planned call (30 s), not
+zero. A pathological multi-candidate fallback can consume the reservation; the
+deadline then ends the operation with an honest timeout rather than overrunning
+the caller's envelope.
 
-- a short result with no paging controls;
-- a long result split into pages;
-- first-page and last-page `Previous`/`Next` behavior;
-- walking every page in the same panel and preserving content;
-- exact 1,024/4,096 limits including title and page indicator;
-- a styled Glass UI font (non-BMP glyphs) staying within the limit;
-- paragraph/sentence/word splitting and balanced `**` markers;
-- a complete summary beyond the old 2,800-character display cap;
-- two panels with independent tokens/indexes and cross-panel rejection;
-- malformed, out-of-range, stale-chat and stale-message callbacks;
-- expired state answered honestly on the same panel;
-- a refused navigation edit not advancing state;
-- a missing inline handle making no edit;
-- a new run invalidating old pages;
-- TTL expiry, per-panel eviction, LRU/panel bound;
-- a result beyond the retained-page bound failing honestly on the original
-  panel with no state stored;
-- Helper-Bot-only edits, no self-client edit, no lifecycle call, no replacement
-  or Saved Messages delivery.
+## 7. Concurrency and deadline accounting
 
-### Full-suite failures (pre-existing)
+- `map_call_capacity` = smaller of the pacing bound and
+  `MAP_CONCURRENCY × floor(map_budget / 30)`.
+- `_map` still holds a semaphore slot for the whole call and every call is
+  `wait_for`-bounded by `call_timeout` (≤ 120 s, ≤ remaining deadline).
+- The map phase keeps its own deadline (`map_deadline`), strictly earlier than
+  the operation deadline when a reduce follows.
+- The reduce call is bounded by the remaining operation budget, not by the
+  reservation.
+- No deadline, pacing interval or concurrency value was removed or relaxed.
 
-The same six tests failed before this change (baseline: 7,587 passed, 27
-skipped, 6 failed). This change adds 13 focused tests; no History or pagination
-test is among the failures:
+## 8. Tests executed and actual results
 
-- `tests/test_aed_db_security.py::test_the_documentation_describes_the_restrictive_model`
-- `tests/test_canonical_schema_reconciliation.py::test_the_migration_is_forward_only_and_its_successors_stay_additive`
-- `tests/test_database_setup_order.py::test_the_section_does_not_pretend_the_sql_was_executed`
-- `tests/test_database_setup_order.py::test_the_waiting_answer_migration_is_absorbed_by_part_one`
-- `tests/test_private_message_db_security.py::test_the_rls_model_names_the_two_tables_as_server_only_exceptions`
-- `tests/test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`
+Environment: fresh venv, `PYTHONPATH=.`, `pytest -q -p no:cacheprovider`, worktree
+at `7894f31` plus this change. No network, no Telegram, scripted provider inside
+the real `ProviderManager`.
 
-They are documentation/schema-drift and an unrelated scheduler-recovery test;
-none touches `history.py`, panel delivery or pagination. They were not modified
-to make them pass.
+| Command | Result |
+| --- | --- |
+| `pytest tests/test_history_capacity.py tests/test_history_ai_tools.py tests/test_history_panel.py tests/test_history_service.py tests/test_17_providers.py tests/test_23_provider_mesh.py tests/test_dynamic_model_fallback.py tests/test_ai_fallback_logging.py` | **277 passed** |
+| `pytest tests` (full suite) | **7,618 passed, 6 failed, 27 skipped** in 170 s |
+| Same 6 tests on a clean worktree at `7894f31` (no changes) | **6 failed, 46 passed** — identical list |
 
-## 8. What was verified automatically
+Pre-existing failures (unrelated: documentation/DB security/scheduler tests,
+identical at the base commit):
 
-- Complete summary retention through page state (no 2,800-character cut, no
-  "truncated for display" marker).
-- Page text length measured after the actual font/render transform.
-- Navigation state isolation between two panels and rejection across panels.
-- Expiry, malformed callbacks, invalid indexes, failed edits and missing inline
-  handles.
-- Only the Helper Bot entity receives edits; the self-bot client receives none;
-  no other message/panel is created.
-- State bounds and TTL, and new-run invalidation.
+- `test_aed_db_security.py::test_the_documentation_describes_the_restrictive_model`
+- `test_canonical_schema_reconciliation.py::test_the_migration_is_forward_only_and_its_successors_stay_additive`
+- `test_database_setup_order.py::test_the_section_does_not_pretend_the_sql_was_executed`
+- `test_database_setup_order.py::test_the_waiting_answer_migration_is_absorbed_by_part_one`
+- `test_private_message_db_security.py::test_the_rls_model_names_the_two_tables_as_server_only_exceptions`
+- `test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`
 
-## 9. Live Telegram verification status
+Compilation: `python -m py_compile backend/services/history_ai_service.py
+backend/ai/prompt/budget.py backend/services/history_service.py` — OK.
+Whitespace: `git diff --check` — clean.
 
-**Not performed by this implementation session.** There are no Telegram,
-Render or Supabase credentials in the delivery environment, so no live panel,
-callback, caption or navigation was exercised.
+## 9. What was not verified live
 
-The owner previously reported one successful live result in the original panel
-for a summary that fit its panel. That is an owner observation from before
-pagination; it does not verify multi-page navigation, photo-caption paging, the
-styled-font measurement or any failure path. Those remain the owner's live
-acceptance step.
+- No deployed bot run: no real Telegram history, no real provider latency
+  measurement. Every number above comes from the deterministic model and the
+  synthetic 700-character histories.
+- Real p50/p95 call latency is unmeasured; `ASSUMED_CALL_LATENCY_S = 30` is the
+  provider HTTP bound, deliberately conservative. If production latency is much
+  lower, the capacity model under-admits (safe direction); this is the first
+  thing to measure before any envelope change.
+- The panel's 500/1,000 buttons still exist (handler untouched by scope) and will
+  be refused with the new message at the current envelope.
 
 ## 10. Remaining limitations
 
-- Page state is process-local and expires after six hours. A restart or expiry
-  makes old page buttons show the honest "no longer available" notice; the owner
-  must run the summary again. This is preferred to unbounded or persistent
-  result state and required no schema change.
-- Navigation state is not persisted and is not shared across processes.
-- Splitting preserves all words and content, but whitespace exactly at a page
-  boundary may be normalised (for example a blank line becomes the page break).
-  An over-long unbroken token is cut at UTF-16 boundaries.
-- The 64-page/40,000-character safety bound refuses a result that exceeds it
-  rather than retaining unbounded state or silently truncating it.
-- Correctness of the text bound depends on Telegram accepting the measured
-  caption/message. A permission, deleted-panel or invalid-handle refusal is
-  handled honestly on the panel, but cannot be prevented client-side.
-- No deployment was performed.
+1. **1,000 messages cannot be summarized in one request** at 240–300 s,
+   concurrency 2 and 4,000-token chunks. Documented, not worked around.
+2. The capacity model is a planning bound, not a guarantee of any individual
+   call's latency; the deadline remains the hard stop.
+3. No verified cross-fallback context floor, so the chunk budget cannot safely
+   grow (see §5).
+4. `_affordable_message_count` runs the chunker over a binary search of the
+   history only when a request is refused (bounded, no I/O), but it is still
+   O(n log n) over up to 1,000 messages.
+5. Deferred next steps (not implemented): measure real latencies from
+   `ProviderManager.metrics_snapshot`; consider a longer panel envelope with the
+   product owner; or introduce a verified minimum context across the candidate
+   chain before raising the chunk budget.
