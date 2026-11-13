@@ -181,8 +181,8 @@ behaviour is proven, offline, against a scripted ProviderManager.
 | Branch | `freebuff/f5137e20b1c5761eea04f020` |
 | Coalescing feature commits | `3a2e8ab` (implementation) and `da16483` (earlier report), built on `c43c5fa` |
 | `main` tip merged in | `dcad23c648039908ffc952b69908ba6cd586aed0` |
-| Delivery commit | the merge commit that contains this report (HEAD of `main`); a commit cannot embed its own hash, so the verified value is the `origin/main` HEAD recorded in the delivery summary |
+| Delivery commits | merge `ea05653` carries the coalescing port onto `main`; this report ships in the docs commit immediately after it, which is the HEAD of `main`. A commit cannot embed its own hash, so the verified value is the `origin/main` HEAD recorded in the delivery summary |
 | Push | fast-forward from `dcad23c` to the merge commit; no force, no rebase, no history rewrite |
 | Verified `origin/main` HEAD | equal to the final local HEAD, confirmed with `git fetch`, `git rev-parse origin/main` and `git merge-base --is-ancestor` |
-| Migrations | `20261112140000_…enabled` and `20261112160000_…probability` are **not applied**; that remains a manual owner action |
+| Migrations | `20261112140000_…enabled` is **already applied** on Supabase and is unchanged (never rewritten); `20261112160000_…probability` is **not applied** — applying it remains a manual owner action. No SQL was executed by this work |
 | Final working tree | clean apart from the gitignored `.venv/` |
