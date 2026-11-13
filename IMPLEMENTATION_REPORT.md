@@ -58,8 +58,12 @@ directly.
   authoritative History source.
 - The current collector (`history_service._collect`) scans newest→oldest and keeps
   the newest `target` after trimming (`collected[:target]`), then reverses. It can
-  omit older eligible messages after a cursor. This is the known defect and remains
-  **unfixed**.
+  omit older eligible messages after a cursor. The existing test
+  `test_translate_requests_exactly_the_requested_count_oldest_to_newest` actually
+  asserts that `count=10` over 50 messages sends ids 41–50, so the current suite
+  pins this behavior. This is the known defect and remains **unfixed**; the five
+  History test files (191 test functions) are the baseline for a deliberate future
+  update.
 - Classification (`history_service.classify_chat` → Phase 1 `classify_entity`) is
   live and performed through the existing entity resolution boundary. No stored
   type can be authoritative.
@@ -127,7 +131,7 @@ Because this is documentation-only, no code tests were fabricated or run.
 |---|---|
 | `git status --short` before edits | clean; Phase 2 HEAD verified |
 | `cloud_git fetch` | `FETCH_HEAD == 62a18de…` |
-| Source review | History service/AI service/policy, Telegram facade, handler, task schema/repository, scheduler/coordinator, provenance, migration files and relevant `DATABASE_ARCHITECTURE.md` sections |
+| Source review | History service/AI service/policy, Telegram facade, handler, task schema/repository, scheduler/coordinator, provenance, five History test files, migration files and relevant `DATABASE_ARCHITECTURE.md` sections |
 | Migration count/numbering | 41 files; latest `20261112160000`; no `20261113*`; no History table |
 | `git diff --check` | clean |
 | Final diff review | documentation-only; no production/test/migration/protected-doc changes |
@@ -156,11 +160,17 @@ There is no claim that a live schema, table, RLS policy or grant exists.
 
 ## 8. Commit and remote verification
 
-This documentation-only change is delivered as the single Phase 3 commit on top of
-`62a18de`. Because a commit cannot include its own hash before it exists, the exact
-SHA is reported in the delivery response and verified after the push with a fresh
-fetch (`HEAD == FETCH_HEAD`, new commit descendant of `62a18de`). No force-push,
-rebase, reset or history rewrite was or will be used.
+The Phase 3 design content was delivered in commit
+`70a8aab86f63e8c6b2e0ddb69526f3b57e1f95e8` on top of `62a18de`. After the push, a
+fresh fetch verified `HEAD == FETCH_HEAD == 70a8aab…`, and
+`git ls-remote origin refs/heads/main` reported the same SHA. The commit is a
+descendant of Phase 2 `62a18de` and Phase 1 `ffe72fd`.
+
+A follow-up documentation-only commit completes the field/index/retention table
+and records this verification. It is the current remote head; its exact SHA is
+reported in the delivery response because a commit cannot include its own hash
+before it exists. No force-push, rebase, reset or history rewrite was or will be
+used.
 
 ## 9. Limitations and open evidence
 

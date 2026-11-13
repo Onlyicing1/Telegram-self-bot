@@ -242,22 +242,22 @@ informational snapshot only.
 
 ### Field-by-field justification
 
-| Field | Why it is needed | Source requirement | Authoritative? | Derived/stale/sensitive? |
-|---|---|---|---|---|
-| `task_id` | Binds state to the one existing durable task and its lifecycle | `ai_tasks` is the scheduler's authority; occurrence FK pattern | Yes (identity) | Not derivable; not sensitive |
-| `owner_id` | Every repository operation filters owner; prevents cross-owner access | Existing repository pattern | Yes | Denormalized from task; repository validates; not sensitive beyond owner identity |
-| `peer_id` | The source chat to read; never taken from delivery or model | `notification_destination` is delivery-only; current panel passes a numeric chat to retrieval | Yes (target) | Can become stale if Telegram migrates a basic group to a supergroup; sensitive (chat identifier) |
-| `peer_type_snapshot` | Display/diagnostic "last known type" while a peer is unreachable | Phase 1 `PeerType`; Phase 2 policy | **No** | Stale by design; never used for policy; not sensitive |
-| `baseline_message_id` | Distinguishes "start from this point" from "no checkpoint yet"; prevents a new task from silently summarizing all history | New feature; current manual retrieval has no start concept | Yes (initial boundary) | Captured at creation; can be 0 for empty chat/backlog choice |
-| `last_scanned_message_id` | Retrieval cursor: everything at or below it has a durable disposition (content or safe skip) | Current collector has only in-memory bounds; retry after restart needs this | Yes | Monotonic; can be stale only if a stale writer wins (CAS prevents); not content |
-| `last_summarized_message_id` | Content coverage/reporting: all text content through here is represented in the summary or explicitly excluded | Needed to prove no gaps and to explain ranges | Yes for coverage | May be lower than scanned when only skipped tail messages exist; monotonic |
-| `summary_text` | The durable result that survives restart and deleted messages | The core Phase 3 requirement | Yes (content) | Sensitive private chat content; bounded; never includes Telegram ids/sender metadata by construction |
-| `summary_revision` | Distinguishes content revisions from status/error writes | Audit and future UI | Yes | Derived history not retained; no sensitive value |
-| `status` | Health of the state (`active/degraded/blocked`) | Requirement H; separate from task scheduling status | Informational | Can lag a transient failure; never used to schedule |
-| `last_success_at` | Proves the last committed processing time | Requirement I | Informational | Stale only until next success; not sensitive |
-| `last_error_class`/`last_error_detail` | Bounded diagnostics, safe to show/operate | Requirement J | Informational | Must never contain message text/provider raw output/credentials; bounded |
-| `version` | Optimistic concurrency guard for every write | Existing task/step/occurrence CAS pattern | Yes | Incremented every write; not sensitive |
-| `created_at`/`updated_at` | Retention and operational audit | Existing table convention | Informational | Not sensitive |
+| Field | Why it is needed | Source requirement | Authoritative? | Derived/stale/sensitive? | Index? | Retention? |
+|---|---|---|---|---|---|---|
+| `task_id` | Binds state to the one existing durable task and its lifecycle | `ai_tasks` is the scheduler's authority; occurrence FK pattern | Yes (identity) | Not derivable; not sensitive | PK (implicit unique index); no extra index | Deleted with the task via cascade; no separate retention |
+| `owner_id` | Every repository operation filters owner; prevents cross-owner access | Existing repository pattern | Yes | Denormalized from task; repository validates; not sensitive beyond owner identity | Second column of `UNIQUE (owner_id, peer_id)`; no separate index | Same row lifetime |
+| `peer_id` | The source chat to read; never taken from delivery or model | `notification_destination` is delivery-only; current panel passes a numeric chat to retrieval | Yes (target) | Can become stale if Telegram migrates a basic group to a supergroup; sensitive (chat identifier) | Second column of the unique key; no separate index | Same row lifetime |
+| `peer_type_snapshot` | Display/diagnostic "last known type" while a peer is unreachable | Phase 1 `PeerType`; Phase 2 policy | **No** | Stale by design; never used for policy; not sensitive | No | Overwritten each run; no history |
+| `baseline_message_id` | Distinguishes "start from this point" from "no checkpoint yet"; prevents a new task from silently summarizing all history | New feature; current manual retrieval has no start concept | Yes (initial boundary) | Captured at creation; can be 0 for empty chat/backlog choice | No | Same row lifetime; needed to interpret cursors |
+| `last_scanned_message_id` | Retrieval cursor: everything at or below it has a durable disposition (content or safe skip) | Current collector has only in-memory bounds; retry after restart needs this | Yes | Monotonic; can be stale only if a stale writer wins (CAS prevents); not content | No | Same row lifetime |
+| `last_summarized_message_id` | Content coverage/reporting: all text content through here is represented in the summary or explicitly excluded | Needed to prove no gaps and to explain ranges | Yes for coverage | May be lower than scanned when only skipped tail messages exist; monotonic | No | Same row lifetime |
+| `summary_text` | The durable result that survives restart and deleted messages | The core Phase 3 requirement | Yes (content) | Sensitive private chat content; bounded; no identifier metadata is added (user-authored text can itself contain identifiers) | No | Latest only; replaced on commit; hard 32 KiB ceiling |
+| `summary_revision` | Distinguishes content revisions from status/error writes | Audit and future UI | Yes | Current value only; no revision bodies retained | No | Same row lifetime |
+| `status` | Health of the state (`active/degraded/blocked`) | Requirement H; separate from task scheduling status | Informational | Can lag a transient failure; never used to schedule | No index initially; a future UI listing degraded states may justify `(owner_id, status)` | Current value only |
+| `last_success_at` | Proves the last committed processing time | Requirement I | Informational | Stale only until next success; not sensitive | No | Overwritten; current value only |
+| `last_error_class`/`last_error_detail` | Bounded diagnostics, safe to show/operate | Requirement J | Informational | Must never contain message text/provider raw output/credentials; bounded | No | Overwritten each failure; no history |
+| `version` | Optimistic concurrency guard for every write | Existing task/step/occurrence CAS pattern | Yes | Incremented every write; not sensitive | No | Current value only |
+| `created_at`/`updated_at` | Retention and operational audit | Existing table convention | Informational | Not sensitive | No | Same row lifetime; no time-based purge initially |
 
 ### Fields deliberately rejected
 
@@ -281,6 +281,14 @@ informational snapshot only.
 - `FOREIGN KEY (task_id) REFERENCES ai_tasks(id) ON DELETE CASCADE`.
 - `UNIQUE (owner_id, peer_id)` — one cumulative state per peer; prevents silent
   duplicate schedules. (Open product decision; see §17.)
+
+**Owner consistency.** `owner_id` is denormalized for owner-scoped queries, as it
+is on `ai_task_occurrences`. There is no `(task_id, owner_id)` composite foreign
+key because `ai_tasks` has no unique pair to reference; a mismatch is prevented by
+the repository validating the task's owner at creation and by every read/write
+filtering both `owner_id` and `task_id`. This mirrors the documented logical
+`ai_task_occurrences.owner_id` relationship, not a new ownership model. A future
+database trigger could enforce it; that is not proposed here.
 - `peer_id <> 0`.
 - `baseline_message_id >= 0`.
 - `last_scanned_message_id IS NULL OR last_scanned_message_id >= baseline_message_id`.
@@ -297,7 +305,9 @@ informational snapshot only.
 No index beyond the PK and `UNIQUE (owner_id, peer_id)` is needed: the unique
 index serves both the owner-scoped peer lookup and the owner prefix; reads by task
 use the PK. A `(owner_id, status)` index is not justified until a UI actually lists
-degraded states at scale.
+degraded states at scale. No field has an independent retention window: the row is
+small, diagnostics and the summary are overwritten in place, and only the latest
+summary is kept.
 
 ### Ownership, RLS and grants
 
@@ -530,7 +540,7 @@ previously committed summary.
 
 | # | Case | Scanned cursor | Summarized cursor | Summary | Retry / state | Human? |
 |---|---|---|---|---|---|---|
-| 1 | Batch fetched; summarization succeeds | advances to batch high-water | advances to highest summarized content | updated atomically | no; active | no |
+| 1 | Batch fetched; summarization succeeds | advances to the highest **dispositioned** message (not raw fetched past an unprocessed text message) | advances to highest summarized content | updated atomically | no; active | no |
 | 2 | Provider fails | unchanged | unchanged | unchanged | degraded `provider_failed`; retry appropriate | no |
 | 3 | Provider times out | unchanged | unchanged | unchanged | degraded `provider_timeout`; retry | no |
 | 4 | Empty/invalid summary | unchanged | unchanged | unchanged | degraded `invalid_summary`; retry | no unless persistent |
@@ -693,7 +703,14 @@ algorithm:
 
 This is a hard ceiling, not a guarantee that a schedule can run forever without
 compaction. A very long-lived, high-volume schedule may reach it; the design fails
-honestly rather than silently dropping history.
+honestly rather than silently dropping history. The merge prompt that combines the
+prior summary with a new batch must pass through the same AI capacity gate as any
+other History request: a large prior summary consumes context and reduces the
+affordable batch; it must never be silently dropped or truncated to make room.
+
+32 KiB is a **storage** bound, not a Telegram message bound. Delivery of a long
+summary may need the existing panel/page or chunking behavior; changing delivery
+is outside this phase and does not change the stored-summary ceiling.
 
 ### Deletion/retention
 
@@ -735,13 +752,20 @@ sender attribution. The future scheduled path must preserve that, and additional
   are never sent as content (the chunker skips them); no media is downloaded.
 - The owner's authored instruction is the only instruction input. The task label,
   schedule, destination, IDs and occurrence metadata are not prompt material.
+- **Scope of the identifier rule.** It prohibits identifiers as *metadata*: no
+  `[id]` prefixes, sender attribution, peer/task/checkpoint fields or database keys
+  are added. The owner's message text is passed as content and may itself contain
+  a phone number, link, numeric id or similar string; that is user-authored content,
+  not an injected identifier, and this design does not attempt semantic redaction
+  of it. Any stricter content-redaction requirement would need a separate,
+  approved design.
 
 ### Open privacy decision
 
 A cumulative summary update needs the prior stored summary as context for the
 merge/compaction step. That summary is the target artifact, was generated under
-`with_identifiers=False`, and contains no Telegram ids/sender metadata by
-construction. It is not "unrelated conversation history" or a prior AI session.
+`with_identifiers=False`, and contains no identifier metadata added by the
+pipeline. It is not "unrelated conversation history" or a prior AI session.
 However, the strict reading of the requirement lists only new message text and the
 owner instruction as permitted input. This must be explicitly approved before
 Phase 5; if the owner forbids it, cumulative AI compaction is not possible without
@@ -757,9 +781,17 @@ a different deterministic strategy. This is recorded in §17.
 large bound, keeps `collected[:target]` — the newest `target` eligible messages —
 then reverses them. It does not stop at the oldest requested boundary. With 60
 eligible messages after a cursor and `count=10`, it can return messages 51–60 and
-silently omit 1–50. The existing tests cover only a range smaller than the requested
-count. This is the known defect from the prior investigation; **Phase 3 does not
-fix it**.
+silently omit 1–50. This is the known defect from the prior investigation; **Phase
+3 does not fix it**.
+
+The existing test suite actually pins this behavior:
+`tests/test_history_ai_tools.py::test_translate_requests_exactly_the_requested_count_oldest_to_newest`
+asserts that a `count=10` translation over 50 messages sends ids **41–50** to the
+provider. The name describes chronological output order, not the selected window.
+`tests/test_history_service.py` also pins the newest-first decreasing-`max_id`
+pagination. Any Phase 5 oldest-first implementation must update these tests
+deliberately, not merely add a parallel path; the five History test files
+(191 test functions) are the regression baseline.
 
 ### Required retrieval contract for scheduled processing
 
@@ -784,11 +816,13 @@ fix it**.
 ### Smallest facade change (not implemented)
 
 `backend/telegram_api/messages.py::iter_messages` currently accepts `limit`,
-`from_user`, `min_id`, `max_id` and calls Telethon without `reverse`. The smallest
-compatible extension is an optional `reverse: bool = False` forwarded to
-`client.iter_messages`, plus an oldest-first path in `history_service._collect` /
-`fetch_history_page` that uses `min_id` as the upward cursor. `max_id` remains the
-exclusive stable upper bound. No cursor/order change is made in Phase 3.
+`from_user`, `min_id`, `max_id` and calls Telethon without `reverse`. The
+`TelegramAPI` facade in `backend/telegram_api/api.py` also needs the optional
+argument forwarded. The smallest compatible extension is an optional
+`reverse: bool = False` on both layers, forwarded to `client.iter_messages`, plus
+an oldest-first path in `history_service._collect` / `fetch_history_page` that
+uses `min_id` as the upward cursor. `max_id` remains the exclusive stable upper
+bound. No cursor/order change is made in Phase 3.
 
 **This defect and contract are a prerequisite for Phase 5 scheduled catch-up. No
 scheduled History implementation may ship before it is fixed and tested.**
@@ -920,8 +954,9 @@ No step above was performed in Phase 3.
   delivery-only.
 - Classification is live and policy is live; a stored type would be a stale
   diagnostic at best.
-- The collector has the documented newest-first defect; it is not suitable for
-  scheduled catch-up.
+- The collector has the documented newest-first defect; existing tests pin it
+  (`count=10` over 50 messages sends 41–50), so it is not suitable for scheduled
+  catch-up without a deliberate test update.
 - A durable table/repository is required; a small additive table linked to
   `ai_tasks` is the least invasive fit with the existing scheduler/repository.
 
