@@ -17,10 +17,12 @@ No live Telegram, provider or database is used.
 from __future__ import annotations
 
 import asyncio
+import logging
 from types import SimpleNamespace
 
 import pytest
 from backend.bot.handlers import history
+from backend.services import appearance_service
 from backend.helper.panel_edit import supersede_panel_operation
 from backend.helper.panels import get_action, get_input, get_panel
 from backend.helper.panel_registry import get_panel_parent, get_panel_title
@@ -41,8 +43,13 @@ def _run(coro):
 def _fresh_state(monkeypatch):
     monkeypatch.setattr(history, "_STATE", history._State())
     monkeypatch.setattr(history, "get_client", lambda: None)
+    monkeypatch.setattr(history, "_OWNER_ID", OWNER)
     monkeypatch.setattr(history.utils, "get_peer_id", lambda entity: int(entity.id))
+    history._RESULT_VIEWS.clear()
+    appearance_service.reset_delivery_state()
     yield
+    history._RESULT_VIEWS.clear()
+    appearance_service.reset_delivery_state()
 
 
 class _Client:
@@ -692,3 +699,299 @@ def test_the_exclusive_boundary_includes_the_linked_message_and_excludes_newer()
     assert [m.message_id for m in slice_.messages] == [8, 9, 10, 11, 12]
     assert 13 not in [m.message_id for m in slice_.messages]
     assert client.max_ids[0] == 13
+
+
+# ── result delivery: long media panels, text replacement, honest failure ────
+
+
+class _Lifecycle:
+    def __init__(self, ok=True, raises=None):
+        self.ok = ok
+        self.raises = raises
+        self.calls: list[tuple[int, int, str, str]] = []
+
+    async def replace_panel(self, chat_id, msg_id, panel_id, extra=""):
+        self.calls.append((chat_id, msg_id, panel_id, extra))
+        if self.raises is not None:
+            raise self.raises
+        return self.ok
+
+
+def _wire_delivery(monkeypatch, summary, *, media=True, long_edits_fail=False):
+    client = _Client([_user(1234, "Alice")])
+    _client.value = client
+    monkeypatch.setattr(history, "get_self_client", lambda: client)
+    monkeypatch.setattr(
+        history, "_list_chats", lambda _c: _async(([_chat(1234, "Alice")], "")),
+    )
+    monkeypatch.setattr(history, "_manager", lambda: object())
+
+    async def _summarize(source, chat_id, **kwargs):
+        return True, summary, {
+            "requested": kwargs["count"], "processed": 5, "truncated": False,
+            "capped": False, "first_message_id": 1, "last_message_id": 5,
+        }
+
+    monkeypatch.setattr(history.history_ai_service, "summarize_history", _summarize)
+    history._STATE.chat_id = 1234
+    history._STATE.chat_name = "Alice"
+    if media:
+        appearance_service.note_delivered(PANEL_CHAT, PANEL_MSG, ("media", "v1"))
+    if long_edits_fail:
+        async def _edit(chat_id, msg_id, text=None, **kwargs):
+            client.edits.append((chat_id, msg_id, text))
+            if len(text or "") > appearance_service.MAX_CAPTION_CHARS:
+                raise RuntimeError(
+                    "The caption is too long (caused by EditInlineBotMessageRequest)"
+                )
+
+        monkeypatch.setattr(client, "edit_message", _edit)
+    return client
+
+
+def _summary_run(client):
+    generation = history.begin_panel_operation(PANEL_CHAT, PANEL_MSG)
+    _run(
+        history._run_summary(
+            client, object(), chat_id=CHAT, chat_name="Alice", count=100,
+            focus="", panel_chat_id=PANEL_CHAT, panel_msg_id=PANEL_MSG,
+            inline_id=None, generation=generation,
+        )
+    )
+    return generation
+
+
+def test_a_long_media_summary_is_delivered_as_a_text_result(monkeypatch):
+    summary = "Summary " + "x" * 1500
+    client = _wire_delivery(monkeypatch, summary)
+    lifecycle = _Lifecycle()
+    monkeypatch.setattr(history, "get_lifecycle", lambda: lifecycle)
+
+    _summary_run(client)
+
+    # The caption-bound edit is never attempted; the panel is replaced.
+    assert all(summary not in (text or "") for _c, _m, text in client.edits)
+    assert len(lifecycle.calls) == 1
+    chat_id, msg_id, panel_id, extra = lifecycle.calls[0]
+    assert (chat_id, msg_id, panel_id) == (PANEL_CHAT, PANEL_MSG, "history")
+    assert extra.startswith("result:")
+
+    results = _run(history._inline_builder(None, extra))
+    assert results[0].type == "article"
+    text = results[0].send_message.message
+    assert summary in text
+    assert len(text) > appearance_service.MAX_CAPTION_CHARS
+    assert len(text) <= history.MAX_RESULT_TEXT_CHARS
+    markup = results[0].send_message.reply_markup
+    datas = [
+        button.data.decode() if isinstance(button.data, bytes) else str(button.data)
+        for row in markup.rows for button in row.buttons
+    ]
+    assert any(data.startswith("panel:history") for data in datas)
+    assert "panel:_nav:home" in datas and "panel:_nav:close" in datas
+    # One-shot: the token cannot be replayed by another render.
+    assert _run(history._inline_builder(None, extra))[0].send_message.message != text
+
+
+def test_a_short_result_still_renders_in_place(monkeypatch):
+    client = _wire_delivery(monkeypatch, "A short summary.")
+    lifecycle = _Lifecycle()
+    monkeypatch.setattr(history, "get_lifecycle", lambda: lifecycle)
+
+    _summary_run(client)
+
+    assert lifecycle.calls == []
+    assert "A short summary." in client.last_text
+    assert "Range: #1 – #5" in client.last_text
+
+
+def test_text_replacement_bounds_oversized_output_deterministically():
+    body = "y" * 10000
+    bounded = history._bounded_result_body(body)
+    assert len(history._result_text(bounded)) <= history.MAX_RESULT_TEXT_CHARS
+    assert bounded.endswith("message limit)")
+    assert bounded.startswith("y" * 100)
+    assert history._bounded_result_body(body) == bounded
+
+
+def test_a_failed_edit_is_never_reported_as_a_delivered_summary(
+    monkeypatch, caplog,
+):
+    from backend.helper.panel_edit import panel_operation_is_current
+
+    client = _wire_delivery(monkeypatch, "small summary", media=False)
+    lifecycle = _Lifecycle(ok=False)
+    monkeypatch.setattr(history, "get_lifecycle", lambda: lifecycle)
+    painted: list[str] = []
+
+    async def _paint(editor, body, buttons=None):
+        painted.append(body)
+        return "could not be delivered" in body
+
+    monkeypatch.setattr(history, "_paint", _paint)
+
+    with caplog.at_level(logging.WARNING):
+        generation = _summary_run(client)
+
+    assert any("could not be delivered" in body for body in painted)
+    assert "HISTORY_RESULT_DELIVERY_FAILED" in caplog.text
+    assert panel_operation_is_current(PANEL_CHAT, PANEL_MSG, generation) is False
+
+
+def test_no_replacement_is_sent_outside_the_owners_own_chat(monkeypatch, caplog):
+    client = _wire_delivery(monkeypatch, "z" * 1500, long_edits_fail=True)
+    monkeypatch.setattr(history, "_OWNER_ID", 123456)
+    lifecycle = _Lifecycle()
+    monkeypatch.setattr(history, "get_lifecycle", lambda: lifecycle)
+
+    with caplog.at_level(logging.WARNING):
+        _summary_run(client)
+
+    assert lifecycle.calls == []
+    assert "destination_not_owner_private" in caplog.text
+    assert "could not be delivered" in client.last_text
+
+
+def test_the_caption_limit_is_not_applied_to_the_text_path(monkeypatch):
+    summary = "s" * history.MAX_SUMMARY_CHARS
+    client = _wire_delivery(monkeypatch, summary)
+    lifecycle = _Lifecycle()
+    monkeypatch.setattr(history, "get_lifecycle", lambda: lifecycle)
+
+    _summary_run(client)
+
+    extra = lifecycle.calls[0][3]
+    text = _run(history._inline_builder(None, extra))[0].send_message.message
+    assert len(text) > appearance_service.MAX_CAPTION_CHARS
+    assert summary in text
+
+
+# ── Focus: save, clear, bound, and delivery through the corrected path ──────
+
+
+def _wire_focus(monkeypatch, summary):
+    calls: list[dict] = []
+    client = _Client([_user(1234, "Alice")])
+    _client.value = client
+    monkeypatch.setattr(history, "get_self_client", lambda: client)
+    monkeypatch.setattr(
+        history, "_list_chats", lambda _c: _async(([_chat(1234, "Alice")], "")),
+    )
+    monkeypatch.setattr(history, "_manager", lambda: object())
+
+    async def _summarize(source, chat_id, **kwargs):
+        calls.append(dict(kwargs))
+        return True, summary, {
+            "requested": kwargs["count"], "processed": 3, "truncated": False,
+            "capped": False, "first_message_id": 1, "last_message_id": 3,
+        }
+
+    monkeypatch.setattr(history.history_ai_service, "summarize_history", _summarize)
+    history._STATE.chat_id = 1234
+    history._STATE.chat_name = "Alice"
+    return client, calls
+
+
+def test_a_valid_focus_instruction_is_saved_and_reaches_the_summarizer(monkeypatch):
+    client, calls = _wire_focus(monkeypatch, "focused result")
+    tasks = _capture_task(monkeypatch)
+
+    _run(history._focus_input_handler("  keep   decisions ", CHAT, USER_MSG, PANEL_CHAT, PANEL_MSG))
+    assert history._STATE.focus == "keep decisions"
+
+    _run(history._run_action(_event(), "", PANEL_CHAT))
+    _run(tasks[0])
+
+    assert calls[0]["instruction"] == "keep decisions"
+    assert "focused result" in client.last_text
+
+
+def test_an_empty_focus_instruction_clears_the_previous_value(monkeypatch):
+    client, calls = _wire_focus(monkeypatch, "unfocused result")
+    history._STATE.focus = "old focus"
+    tasks = _capture_task(monkeypatch)
+
+    _run(history._focus_input_handler("   ", CHAT, USER_MSG, PANEL_CHAT, PANEL_MSG))
+    assert history._STATE.focus == ""
+
+    _run(history._run_action(_event(), "", PANEL_CHAT))
+    _run(tasks[0])
+    assert calls[0]["instruction"] is None
+
+
+def test_an_over_limit_focus_is_rejected_without_replacing_the_previous_value(monkeypatch):
+    client, _calls = _wire_focus(monkeypatch, "unused")
+    history._STATE.focus = "previous"
+    too_long = "x" * (history.history_ai_service.MAX_INSTRUCTION_CHARS + 1)
+
+    _run(history._focus_input_handler(too_long, CHAT, USER_MSG, PANEL_CHAT, PANEL_MSG))
+
+    assert history._STATE.focus == "previous"
+    assert "characters or fewer" in client.last_text
+
+
+def test_a_focused_long_summary_uses_the_corrected_delivery(monkeypatch):
+    summary = "Focused " + "f" * 1400
+    client, calls = _wire_focus(monkeypatch, summary)
+    history._STATE.focus = "decisions only"
+    appearance_service.note_delivered(PANEL_CHAT, PANEL_MSG, ("media", "v1"))
+    lifecycle = _Lifecycle()
+    monkeypatch.setattr(history, "get_lifecycle", lambda: lifecycle)
+    tasks = _capture_task(monkeypatch)
+
+    _run(history._run_action(_event(), "", PANEL_CHAT))
+    _run(tasks[0])
+
+    assert calls[0]["instruction"] == "decisions only"
+    assert all(summary not in (text or "") for _c, _m, text in client.edits)
+    extra = lifecycle.calls[0][3]
+    text = _run(history._inline_builder(None, extra))[0].send_message.message
+    assert summary in text
+
+
+# ── Link summaries use the same corrected delivery ─────────────────────────
+
+
+def test_a_long_link_summary_uses_the_corrected_delivery(monkeypatch):
+    linked = 500
+    message = SimpleNamespace(
+        id=linked, chat_id=CHAT,
+        chat=SimpleNamespace(id=555, title="News", megagroup=True),
+    )
+    client = _Client()
+    _client.value = client
+    monkeypatch.setattr(history, "get_self_client", lambda: client)
+    monkeypatch.setattr(history, "_manager", lambda: object())
+    calls: list[dict] = []
+    summary = "Linked " + "l" * 1400
+
+    async def _fetch(source, target):
+        return message
+
+    async def _summary(source, chat_id, **kwargs):
+        calls.append({"chat_id": chat_id, **kwargs})
+        return True, summary, {
+            "requested": kwargs["count"], "processed": 3, "truncated": False,
+            "capped": False, "first_message_id": linked - 2, "last_message_id": linked,
+        }
+
+    monkeypatch.setattr(history.save_service, "_fetch_linked_message", _fetch)
+    monkeypatch.setattr(history.history_ai_service, "summarize_history", _summary)
+    appearance_service.note_delivered(PANEL_CHAT, PANEL_MSG, ("media", "v1"))
+    lifecycle = _Lifecycle()
+    monkeypatch.setattr(history, "get_lifecycle", lambda: lifecycle)
+    tasks = _capture_task(monkeypatch)
+
+    _run(
+        history._link_input_handler(
+            "https://t.me/news/500", CHAT, USER_MSG, PANEL_CHAT, PANEL_MSG,
+        )
+    )
+    _run(tasks[0])
+
+    assert calls[0]["current_message_id"] == linked + 1
+    assert all(summary not in (text or "") for _c, _m, text in client.edits)
+    extra = lifecycle.calls[0][3]
+    text = _run(history._inline_builder(None, extra))[0].send_message.message
+    assert summary in text
+    assert "Ending at: #500" in text

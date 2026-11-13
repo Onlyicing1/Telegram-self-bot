@@ -330,6 +330,36 @@ candidate pipeline exists.
   identifier isolation. Existing history-service and history-AI tests remain
   green.
 
+#### P1 result-delivery hotfix (production evidence)
+
+Status: **Fixed in code and offline tests; live Telegram verification still
+outstanding.** Deployed logs showed the summary itself succeeding but the final
+panel edit failing with `The caption is too long` and the fallback self-client
+edit failing with `The action must be performed through an inline bot callback`,
+leaving the panel on its progress state.
+
+- Root cause: with Appearance preview active the panel is a PHOTO message, so
+  its text is a caption bounded to 1024 characters, while the summary body may
+  reach 2800 plus metadata. `_run_summary` ignored `_paint()`'s `False` return,
+  so a refused edit still completed the operation as if delivered.
+- Fix: the delivery state recorded by `appearance_service` selects the path. A
+  media panel whose result exceeds the caption limit (or any refused final
+  edit) is delivered by `PanelLifecycleManager.replace_panel` as ONE text-only
+  panel: the non-empty replacement extra makes Appearance skip media
+  composition, the result view is carried by a bounded one-shot token, and the
+  existing lifecycle creates the new message before deleting the old one. No
+  second client, listener, worker, scheduler or persistence is added.
+- Safety: replacement is allowed only when the panel chat is the owner's OWN
+  private chat (Saved Messages); elsewhere the panel receives a short honest
+  failure notice and `HISTORY_RESULT_DELIVERY_FAILED` is logged. A failed
+  Telegram edit is never reported as a delivered summary.
+- Focus was not independently defective: its save/normalize/clear path and the
+  `instruction=focus or None` pass-through are correct and now covered by
+  regression tests; Focus summaries were affected only by the shared delivery
+  defect.
+- Live verification remains outstanding: it requires a real Telegram run with
+  Appearance preview active and a summary above 1024 characters.
+
 ### Feature-level acceptance criteria
 
 1. Manual run summarizes exactly the stated chat and range, ≤1,000 messages,
