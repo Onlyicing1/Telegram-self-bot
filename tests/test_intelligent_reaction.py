@@ -30,6 +30,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import json
+import re
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -73,6 +74,7 @@ def _env(monkeypatch):
         settings_service._cache[key] = value
     input_state.clear_all()
     engine.reset_loop_guard()
+    engine.reset_coalescer()
     reaction_source_service.reset_cache()
 
     async def _catalog(client, *, force: bool = False):
@@ -836,3 +838,529 @@ def test_general_body_states_the_mode_and_the_exclusion():
     body = _run(misc._general_body())
     assert "Intelligent Reaction" in body
     assert "mutually exclusive" in body
+
+
+# ── 10. dynamic request coalescing ──────────────────────────────────────────
+#
+# These tests synchronise on events and on the coalescer's own state, never on
+# wall-clock sleeps, so they prove the protocol rather than a timing accident.
+
+
+def _results(count: int, probability: Any = 0, reaction: Any = "👍") -> ProviderResponse:
+    """A batch answer carrying one identifiably labelled result per message."""
+    return _raw(json.dumps({
+        "results": [
+            {"id": index, "probability": probability, "reaction": reaction}
+            for index in range(1, count + 1)
+        ],
+    }))
+
+
+def _prompt_size(messages) -> int:
+    """How many message records the prompt carries (1 for the single contract)."""
+    content = messages[1]["content"]
+    labels = re.findall(r"^Message \d+:$", content, re.MULTILINE)
+    return len(labels) or 1
+
+
+def _prompt_text(messages) -> str:
+    return messages[1]["content"]
+
+
+async def _until(predicate, attempts: int = 10000) -> None:
+    """Yield cooperatively until ``predicate`` holds (no timed sleep)."""
+    for _ in range(attempts):
+        if predicate():
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("condition was not reached")
+
+
+class _GateProvider:
+    """ProviderManager fake whose calls block until the test releases them.
+
+    Records each arrived call (so a test can prove exactly one is in flight)
+    and answers with the next scripted response once released.
+    """
+
+    def __init__(self, *answers: Any) -> None:
+        self.answers = list(answers)
+        self.calls: list[list[dict[str, Any]]] = []
+        self.in_flight = 0
+        self.max_in_flight = 0
+        self._gates: list[asyncio.Event] = []
+        self._changed = asyncio.Event()
+
+    async def chat(self, messages, **kwargs):
+        self.calls.append(messages)
+        self.in_flight += 1
+        self.max_in_flight = max(self.max_in_flight, self.in_flight)
+        gate = asyncio.Event()
+        self._gates.append(gate)
+        self._changed.set()
+        try:
+            await gate.wait()
+        finally:
+            self.in_flight -= 1
+        if not self.answers:
+            raise AssertionError("unexpected extra AI call")
+        answer = self.answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    async def wait_for_call(self, count: int) -> None:
+        while len(self.calls) < count:
+            await self._changed.wait()
+            self._changed.clear()
+
+    def release(self, index: int) -> None:
+        self._gates[index].set()
+
+
+class _AutoProvider:
+    """Fast provider that answers any prompt and records concurrency."""
+
+    def __init__(self) -> None:
+        self.calls: list[list[dict[str, Any]]] = []
+        self.in_flight = 0
+        self.max_in_flight = 0
+
+    async def chat(self, messages, **kwargs):
+        self.calls.append(messages)
+        self.in_flight += 1
+        self.max_in_flight = max(self.max_in_flight, self.in_flight)
+        await asyncio.sleep(0)  # let any competing coroutine interleave
+        self.in_flight -= 1
+        size = _prompt_size(messages)
+        if size == 1 and "results" not in _prompt_text(messages):
+            return _raw(json.dumps({"probability": 0, "reaction": "👍"}))
+        return _results(size)
+
+
+def _scope():
+    return engine._scope_for(OWNER)
+
+
+def test_the_first_message_starts_immediately_and_a_follower_only_queues():
+    async def main():
+        client = _Client()
+        client.add(MSG, text="a")
+        client.add(MSG2, text="b")
+        provider = _GateProvider(_ok(0, "👍"), _ok(0, "👍"))
+        _enable()
+
+        first = asyncio.create_task(_process(client, _outgoing(MSG, "a"), provider))
+        await provider.wait_for_call(1)
+        assert len(provider.calls) == 1  # A's request began with nothing queued
+
+        second = asyncio.create_task(_process(client, _outgoing(MSG2, "b"), provider))
+        await _until(lambda: len(_scope().pending) == 1)
+        assert len(provider.calls) == 1, "B must not start a concurrent request"
+
+        provider.release(0)
+        await provider.wait_for_call(2)
+        provider.release(1)
+        assert (await first)["status"] == engine.STATUS_NOT_SELECTED
+        assert (await second)["status"] == engine.STATUS_NOT_SELECTED
+
+        assert len(provider.calls) == 2
+        assert provider.max_in_flight == 1
+        assert _prompt_size(provider.calls[1]) == 1
+        assert "b" in _prompt_text(provider.calls[1])
+        assert _scope().leader is False and _scope().pending == []
+
+    asyncio.run(main())
+
+
+def test_messages_arriving_during_a_request_are_batched_together():
+    async def main():
+        client = _Client()
+        ids = [MSG, MSG2, 557, 558]
+        for index, msg_id in enumerate(ids):
+            client.add(msg_id, text=f"m{index}")
+        provider = _GateProvider(
+            _ok(100, "👍"),
+            _raw(json.dumps({"results": [
+                {"id": 1, "probability": 100, "reaction": "🎉"},
+                {"id": 2, "probability": 100, "reaction": "🔥"},
+                {"id": 3, "probability": 0, "reaction": "😢"},
+            ]})),
+        )
+        _enable()
+
+        first = asyncio.create_task(_process(client, _outgoing(ids[0], "m0"), provider))
+        await provider.wait_for_call(1)
+        rest = [
+            asyncio.create_task(_process(client, _outgoing(ids[i], f"m{i}"), provider))
+            for i in range(1, 4)
+        ]
+        await _until(lambda: len(_scope().pending) == 3)
+
+        provider.release(0)
+        await provider.wait_for_call(2)
+        assert _prompt_size(provider.calls[1]) == 3, "B, C and D must share one request"
+        provider.release(1)
+
+        results = await asyncio.gather(first, *rest)
+        assert [result["status"] for result in results] == [
+            engine.STATUS_REACTED,
+            engine.STATUS_REACTED,
+            engine.STATUS_REACTED,
+            engine.STATUS_NOT_SELECTED,
+        ]
+        # Each decision landed on its OWN message id, with its own emoji.
+        assert [call.msg_id for call in client.reaction_calls] == ids[:3]
+        assert [call.reaction[0].emoticon for call in client.reaction_calls] == ["👍", "🎉", "🔥"]
+        assert provider.max_in_flight == 1
+        assert _scope().leader is False and _scope().pending == []
+
+    asyncio.run(main())
+
+
+def test_messages_arriving_during_the_second_batch_form_a_third_batch():
+    async def main():
+        client = _Client()
+        ids = [MSG, MSG2, 557, 558, 559]
+        for index, msg_id in enumerate(ids):
+            client.add(msg_id, text=f"m{index}")
+        provider = _GateProvider(_ok(0, "👍"), _results(2), _results(2))
+        _enable()
+
+        first = asyncio.create_task(_process(client, _outgoing(ids[0], "m0"), provider))
+        await provider.wait_for_call(1)
+        second = asyncio.create_task(_process(client, _outgoing(ids[1], "m1"), provider))
+        third = asyncio.create_task(_process(client, _outgoing(ids[2], "m2"), provider))
+        await _until(lambda: len(_scope().pending) == 2)
+
+        provider.release(0)
+        await provider.wait_for_call(2)
+        assert _prompt_size(provider.calls[1]) == 2
+
+        fourth = asyncio.create_task(_process(client, _outgoing(ids[3], "m3"), provider))
+        fifth = asyncio.create_task(_process(client, _outgoing(ids[4], "m4"), provider))
+        await _until(lambda: len(_scope().pending) == 2)
+
+        provider.release(1)
+        await provider.wait_for_call(3)
+        assert _prompt_size(provider.calls[2]) == 2, "E and F form the third request"
+        assert "m3" in _prompt_text(provider.calls[2])
+        assert "m4" in _prompt_text(provider.calls[2])
+        provider.release(2)
+
+        results = await asyncio.gather(first, second, third, fourth, fifth)
+        assert [result["status"] for result in results] == [engine.STATUS_NOT_SELECTED] * 5
+        assert len(provider.calls) == 3
+        assert provider.max_in_flight == 1
+
+    asyncio.run(main())
+
+
+def test_no_artificial_delay_or_timer_exists_in_the_coalescer():
+    code = _code_only(engine.__file__)
+    for forbidden in ("asyncio.sleep", "time.sleep", "call_later", "debounce", "timedelta"):
+        assert forbidden not in code, forbidden
+
+
+def test_a_null_result_leaves_the_other_messages_untouched():
+    async def main():
+        client = _Client()
+        ids = [MSG, MSG2, 557]
+        for index, msg_id in enumerate(ids):
+            client.add(msg_id, text=f"m{index}")
+        provider = _GateProvider(
+            _ok(0, "👍"),
+            _raw(json.dumps({"results": [
+                {"id": 1, "probability": 100, "reaction": "👍"},
+                {"id": 2, "probability": 100, "reaction": None},
+            ]})),
+        )
+        _enable()
+        first = asyncio.create_task(_process(client, _outgoing(ids[0], "m0"), provider))
+        await provider.wait_for_call(1)
+        rest = [
+            asyncio.create_task(_process(client, _outgoing(ids[i], f"m{i}"), provider))
+            for i in range(1, 3)
+        ]
+        await _until(lambda: len(_scope().pending) == 2)
+        provider.release(0)
+        await provider.wait_for_call(2)
+        assert _prompt_size(provider.calls[1]) == 2
+        provider.release(1)
+        results = await asyncio.gather(first, *rest)
+        assert [result["status"] for result in results] == [
+            engine.STATUS_NOT_SELECTED,
+            engine.STATUS_REACTED,
+            engine.STATUS_NO_REACTION,
+        ]
+        assert [call.msg_id for call in client.reaction_calls] == [ids[1]]
+
+    asyncio.run(main())
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        # unknown id
+        _raw(json.dumps({"results": [
+            {"id": 1, "probability": 100, "reaction": "👍"},
+            {"id": 9, "probability": 100, "reaction": "👍"},
+        ]})),
+        # duplicate id
+        _raw(json.dumps({"results": [
+            {"id": 1, "probability": 100, "reaction": "👍"},
+            {"id": 1, "probability": 100, "reaction": "👍"},
+        ]})),
+        # missing result
+        _raw(json.dumps({"results": [
+            {"id": 1, "probability": 100, "reaction": "👍"},
+        ]})),
+        # not a results list
+        _raw(json.dumps({"probability": 100})),
+        # a result for another message must never be reused
+        _raw(json.dumps({"results": [{"probability": 100, "reaction": "👍"}]})),
+    ],
+)
+def test_an_unmappable_batch_answer_fails_every_message_and_sends_nothing(answer):
+    async def main():
+        client = _Client()
+        client.add(MSG, text="a")
+        client.add(MSG2, text="b")
+        client.add(557, text="c")
+        provider = _GateProvider(_ok(0, "👍"), answer)
+        _enable()
+        first = asyncio.create_task(_process(client, _outgoing(MSG, "a"), provider))
+        await provider.wait_for_call(1)
+        followers = [
+            asyncio.create_task(_process(client, _outgoing(MSG2, "b"), provider)),
+            asyncio.create_task(_process(client, _outgoing(557, "c"), provider)),
+        ]
+        await _until(lambda: len(_scope().pending) == 2)
+        provider.release(0)
+        await provider.wait_for_call(2)
+        assert _prompt_size(provider.calls[1]) == 2
+        provider.release(1)
+        results = await asyncio.gather(first, *followers)
+        assert results[0]["status"] == engine.STATUS_NOT_SELECTED
+        assert results[1]["status"] == engine.STATUS_FAILED
+        assert results[2]["status"] == engine.STATUS_FAILED
+        assert client.reaction_calls == []
+
+    asyncio.run(main())
+
+
+def test_an_invalid_reaction_fails_only_its_own_message():
+    async def main():
+        client = _Client()
+        client.add(MSG, text="a")
+        client.add(MSG2, text="b")
+        client.add(557, text="c")
+        provider = _GateProvider(
+            _ok(0, "👍"),
+            _raw(json.dumps({"results": [
+                {"id": 1, "probability": 100, "reaction": "🦄"},
+                {"id": 2, "probability": 100, "reaction": "🔥"},
+            ]})),
+        )
+        _enable()
+        first = asyncio.create_task(_process(client, _outgoing(MSG, "a"), provider))
+        await provider.wait_for_call(1)
+        followers = [
+            asyncio.create_task(_process(client, _outgoing(MSG2, "b"), provider)),
+            asyncio.create_task(_process(client, _outgoing(557, "c"), provider)),
+        ]
+        await _until(lambda: len(_scope().pending) == 2)
+        provider.release(0)
+        await provider.wait_for_call(2)
+        provider.release(1)
+        results = await asyncio.gather(first, *followers)
+        assert results[0]["status"] == engine.STATUS_NOT_SELECTED
+        assert results[1]["status"] == engine.STATUS_FAILED
+        assert "catalog" in (results[1]["error"] or "")
+        assert results[2]["status"] == engine.STATUS_REACTED
+        assert [call.msg_id for call in client.reaction_calls] == [557]
+
+    asyncio.run(main())
+
+
+def test_a_failed_request_does_not_block_the_next_message():
+    async def main():
+        client = _Client()
+        client.add(MSG, text="a")
+        client.add(MSG2, text="b")
+        provider = _GateProvider(RuntimeError("provider exploded"), _ok(100, "👍"))
+        _enable()
+
+        first = asyncio.create_task(_process(client, _outgoing(MSG, "a"), provider))
+        await provider.wait_for_call(1)
+        provider.release(0)
+        assert (await first)["status"] == engine.STATUS_FAILED
+        assert _scope().leader is False and _scope().pending == []
+
+        second = asyncio.create_task(_process(client, _outgoing(MSG2, "b"), provider))
+        await provider.wait_for_call(2)
+        provider.release(1)
+        result = await second
+        assert result["status"] == engine.STATUS_REACTED
+        assert [call.msg_id for call in client.reaction_calls] == [MSG2]
+
+    asyncio.run(main())
+
+
+def test_a_cancelled_leader_does_not_strand_the_queue_or_block_later_messages():
+    async def main():
+        client = _Client()
+        client.add(MSG, text="a")
+        client.add(MSG2, text="b")
+        client.add(557, text="c")
+        provider = _GateProvider(_results(1))
+        _enable()
+
+        first = asyncio.create_task(_process(client, _outgoing(MSG, "a"), provider))
+        await provider.wait_for_call(1)
+        second = asyncio.create_task(_process(client, _outgoing(MSG2, "b"), provider))
+        await _until(lambda: len(_scope().pending) == 1)
+
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+
+        interrupted = await second
+        assert interrupted["status"] == engine.STATUS_FAILED
+        assert "interrupted" in (interrupted["error"] or "")
+        assert _scope().leader is False and _scope().pending == []
+        assert client.reaction_calls == []
+
+        recovered = await _process(client, _outgoing(557, "c"), _Provider(_ok(100, "👍")))
+        assert recovered["status"] == engine.STATUS_REACTED
+        assert [call.msg_id for call in client.reaction_calls] == [557]
+
+    asyncio.run(main())
+
+
+def test_a_duplicate_update_while_queued_is_still_rejected():
+    async def main():
+        client = _Client()
+        client.add(MSG, text="a")
+        provider = _GateProvider(_ok(100, "👍"))
+        _enable()
+        first = asyncio.create_task(_process(client, _outgoing(MSG, "a"), provider))
+        await provider.wait_for_call(1)
+        duplicate = await _process(client, _outgoing(MSG, "a"), provider)
+        assert duplicate["status"] == engine.STATUS_DUPLICATE
+        await _until(lambda: len(_scope().pending) == 0)
+        provider.release(0)
+        assert (await first)["status"] == engine.STATUS_REACTED
+        assert len(provider.calls) == 1
+        assert len(client.reaction_calls) == 1
+
+    asyncio.run(main())
+
+
+def test_the_batch_bound_splits_a_burst_without_losing_messages(monkeypatch):
+    monkeypatch.setattr(engine, "MAX_BATCH_MESSAGES", 2)
+
+    async def main():
+        client = _Client()
+        ids = [MSG, MSG2, 557, 558]
+        for index, msg_id in enumerate(ids):
+            client.add(msg_id, text=f"m{index}")
+        provider = _GateProvider(_ok(0, "👍"), _results(2), _ok(0, "👍"))
+        _enable()
+        first = asyncio.create_task(_process(client, _outgoing(ids[0], "m0"), provider))
+        await provider.wait_for_call(1)
+        rest = [
+            asyncio.create_task(_process(client, _outgoing(ids[i], f"m{i}"), provider))
+            for i in range(1, 4)
+        ]
+        await _until(lambda: len(_scope().pending) == 3)
+        provider.release(0)
+        await provider.wait_for_call(2)
+        assert _prompt_size(provider.calls[1]) == 2
+        provider.release(1)
+        await provider.wait_for_call(3)
+        assert _prompt_size(provider.calls[2]) == 1, "the overflow is the next request"
+        provider.release(2)
+        results = await asyncio.gather(first, *rest)
+        assert [result["status"] for result in results] == [engine.STATUS_NOT_SELECTED] * 4
+
+    asyncio.run(main())
+
+
+def test_each_queued_message_keeps_its_own_probability_and_draw():
+    async def main():
+        client = _Client()
+        client.add(MSG, text="a")
+        client.add(MSG2, text="b")
+        client.add(557, text="c")
+        provider = _GateProvider(_ok(0, "👍"), _results(2, 50, "👍"))
+        _enable()
+        first = asyncio.create_task(_process(client, _outgoing(MSG, "a"), provider, rng=0.9))
+        await provider.wait_for_call(1)
+        losing = asyncio.create_task(
+            _process(client, _outgoing(MSG2, "b"), provider, rng=0.9)
+        )
+        winning = asyncio.create_task(
+            _process(client, _outgoing(557, "c"), provider, rng=0.1)
+        )
+        await _until(lambda: len(_scope().pending) == 2)
+        provider.release(0)
+        await provider.wait_for_call(2)
+        provider.release(1)
+        results = await asyncio.gather(first, losing, winning)
+        assert results[0]["status"] == engine.STATUS_NOT_SELECTED
+        assert results[1]["status"] == engine.STATUS_NOT_SELECTED
+        assert results[2]["status"] == engine.STATUS_REACTED
+        assert results[2]["probability"] == 50
+        assert [call.msg_id for call in client.reaction_calls] == [557]
+
+    asyncio.run(main())
+
+
+def test_a_catalog_outage_fails_the_whole_batch_without_an_ai_call(monkeypatch):
+    async def _down(client, *, force: bool = False):
+        return {"ok": False, "error": "E_TELEGRAM", "detail": "down", "options": []}
+
+    monkeypatch.setattr(reaction_source_service, "load_reactions", _down)
+
+    async def main():
+        client = _Client()
+        client.add(MSG, text="a")
+        client.add(MSG2, text="b")
+        provider = _Provider()  # would raise if called
+        _enable()
+        results = await asyncio.gather(
+            _process(client, _outgoing(MSG, "a"), provider),
+            _process(client, _outgoing(MSG2, "b"), provider),
+        )
+        assert [result["status"] for result in results] == [
+            engine.STATUS_CATALOG_UNAVAILABLE,
+            engine.STATUS_CATALOG_UNAVAILABLE,
+        ]
+        assert client.reaction_calls == []
+
+    asyncio.run(main())
+
+
+def test_a_sustained_burst_never_overlaps_requests_and_loses_nothing():
+    async def main():
+        client = _Client()
+        ids = [1000 + index for index in range(25)]
+        for index, msg_id in enumerate(ids):
+            client.add(msg_id, text=f"<m{index:02d}>")
+        provider = _AutoProvider()
+        _enable()
+
+        results = await asyncio.gather(*(
+            _process(client, _outgoing(msg_id, f"<m{index:02d}>"), provider)
+            for index, msg_id in enumerate(ids)
+        ))
+
+        assert provider.max_in_flight == 1, "only one AI request may be in flight"
+        assert all(result["status"] == engine.STATUS_NOT_SELECTED for result in results)
+        prompts = "\n".join(_prompt_text(call) for call in provider.calls)
+        for index in range(len(ids)):
+            assert prompts.count(f"<m{index:02d}>") == 1, f"message {index} lost or duplicated"
+        assert _scope().leader is False and _scope().pending == []
+
+    asyncio.run(main())
