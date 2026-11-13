@@ -359,11 +359,14 @@ class _Chunk:
     message_ids: tuple[int, ...]
 
 
-def _render_line(message: HistoryMessage, *, with_attribution: bool) -> str:
+def _render_line(
+    message: HistoryMessage, *, with_attribution: bool, with_id: bool = True,
+) -> str:
     body = _visible_body(message)
+    prefix = f"[{message.message_id}] " if with_id else ""
     if with_attribution:
-        return f"[{message.message_id}] {_attribution(message)}: {body}"
-    return f"[{message.message_id}] {body}"
+        return f"{prefix}{_attribution(message)}: {body}"
+    return f"{prefix}{body}"
 
 
 def _chunk_history(
@@ -371,6 +374,7 @@ def _chunk_history(
     *,
     with_attribution: bool,
     token_budget: int,
+    with_ids: bool = True,
 ) -> list[_Chunk]:
     """Cut the text-bearing messages into chunks that fit ``token_budget``.
 
@@ -391,7 +395,9 @@ def _chunk_history(
     for message in messages:
         if not message.text.strip():
             continue
-        line = _render_line(message, with_attribution=with_attribution)
+        line = _render_line(
+            message, with_attribution=with_attribution, with_id=with_ids,
+        )
         cost = _estimate_tokens(line) + 1
         if lines and used + cost > token_budget:
             _flush()
@@ -670,6 +676,8 @@ def _resolve_manager(provider_manager: Any) -> Any:
 
 def _result_data(plan: HistoryPlan, *, language: str = "") -> dict[str, Any]:
     """Small structured payload. Never carries message bodies or internals."""
+    first = plan.messages[0].message_id if plan.messages else None
+    last = plan.messages[-1].message_id if plan.messages else None
     return {
         "operation": plan.operation,
         "requested": plan.requested,
@@ -678,6 +686,11 @@ def _result_data(plan: HistoryPlan, *, language: str = "") -> dict[str, Any]:
         "truncated": plan.truncated,
         "capped": plan.capped,
         "language": language,
+        # The exact eligible range the operation covered, for callers that must
+        # report it (the History & Intelligence panel). Additive metadata: no
+        # message body, sender identity or peer id is exposed here.
+        "first_message_id": first,
+        "last_message_id": last,
     }
 
 
@@ -792,6 +805,7 @@ async def summarize_history(
     current_message_id: Any = None,
     request_id: str = "",
     timeout_s: Any = None,
+    with_identifiers: bool = True,
 ) -> tuple[bool, str, dict[str, Any]]:
     """Summarize the most recent eligible Telegram messages with the LLM.
 
@@ -801,6 +815,9 @@ async def summarize_history(
     summary — no fake aggregation step.
 
     ``current_message_id`` excludes the requesting command from the history.
+    ``with_identifiers=False`` is the deterministic UI mode: the provider gets
+    only message text and the owner's instruction, never message ids or sender
+    ids. The default ``True`` preserves every existing caller's prompt.
     """
     manager = _resolve_manager(provider_manager)
     if manager is None:
@@ -825,8 +842,9 @@ async def summarize_history(
         return True, "There are no messages to summarize in this chat.", _result_data(plan)
 
     chunks = _chunk_history(
-        plan.messages, with_attribution=True,
+        plan.messages, with_attribution=with_identifiers,
         token_budget=SUMMARIZE_CHUNK_TOKEN_BUDGET,
+        with_ids=with_identifiers,
     )
     budget = llm_budget(timeout_s)
     # One deadline for the whole operation; every call is bounded by what is left

@@ -224,6 +224,7 @@ def _build_menu_buttons() -> list:
     )
     builder.add_row("Todo", "panel:todo", PRIMARY)
     builder.add_row("AI", "panel:ai", PRIMARY)
+    builder.add_row("History & Intelligence", "panel:history", PRIMARY)
     # ONE new top-level category: appearance personalization lives under its
     # own panel, never as individual controls on the main menu.
     builder.add_row("Appearance", "panel:appearance", PRIMARY)

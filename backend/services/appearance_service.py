@@ -67,6 +67,7 @@ MAIN_PAGE_IDS: tuple[str, ...] = (
     "cipher",
     "todo",
     "ai",
+    "history",
     "appearance",
 )
 
@@ -89,6 +90,7 @@ PAGE_DEFAULTS: dict[str, tuple[str, str]] = {
     "cipher": ("Cipher", "Private Communications\n\nChoose a section:"),
     "todo": ("Todo", ""),
     "ai": ("AI", ""),
+    "history": ("History & Intelligence", ""),
     "appearance": ("Appearance", ""),
 }
 

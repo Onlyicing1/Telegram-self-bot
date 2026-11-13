@@ -184,8 +184,9 @@ def _labels(rows) -> list[str]:
 def test_main_menu_gains_exactly_one_category():
     data = _data(misc._build_menu_buttons())
     assert "panel:appearance" in data
-    # The pre-existing nine categories plus the one new Appearance entry.
-    assert len(data) == 10
+    assert "panel:history" in data
+    # The pre-existing categories plus Appearance and History & Intelligence.
+    assert len(data) == 11
     for expected in (
         "panel:save",
         "panel:del",

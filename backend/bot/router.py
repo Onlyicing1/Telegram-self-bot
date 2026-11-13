@@ -13,7 +13,7 @@ import traceback
 
 from telethon import events
 
-from backend.bot.handlers import misc, save, retrieve, delete, bio, discover, database, username, ai, ghost_seen_v2
+from backend.bot.handlers import misc, save, retrieve, delete, bio, discover, database, username, ai, ghost_seen_v2, history
 from backend.bot.handlers import (
     ai_unified,
     appearance,
@@ -103,6 +103,7 @@ def register_all(client, owner_id: int, tz_str: str):
         ("database", lambda: database.register(client, owner_id, tz_str)),
         ("username", lambda: username.register(client, owner_id, tz_str)),
         ("ai", lambda: ai.register(client, owner_id)),
+        ("history", lambda: history.register(client, owner_id)),
         ("ai_stt_settings", lambda: ai_stt_settings.register(client, owner_id)),
         ("ai_tts_settings", lambda: ai_tts_settings.register(client, owner_id)),
         ("emoji", lambda: emoji.register(client, owner_id)),

@@ -1,5 +1,62 @@
 # ROADMAP
 
+## Feature: Unified History & Event Intelligence
+
+### P0 — Investigation and specification
+
+Status: **Complete** (P0 contract supplied to P1). The P1 brief's source
+requirements were treated as authoritative for this phase.
+
+### P1 — Manual and link-based history summarization
+
+Status: **Complete**. Delivered through the existing Glass UI and the existing
+history stack; no new summarizer, provider manager, Telegram client, listener,
+scheduler or persistence exists.
+
+- One `History & Intelligence` panel (`panel:history`, parent `menu`) with a
+  main-menu entry. It shows the selected chat, the bounded message count
+  (100/250/500/1000) and the optional focus instruction.
+- Chat selection lists the account's own dialogs with `get_dialogs(limit=100)`,
+  paginates eight per view, and handles empty lists and RPC failures without
+  fabricating entries. A selection is re-validated against that same bounded
+  list before a run.
+- Manual runs call `history_ai_service.summarize_history` directly with
+  `current_message_id=None`, the selected chat/count/focus, the existing
+  self-client and `get_engine().provider_manager`. No AI-chat tool call is
+  involved.
+- Link runs reuse `save_service.parse_link_target` and
+  `save_service._fetch_linked_message`, validate the resolved message id and
+  peer, then summarize with `current_message_id = linked_message_id + 1`. The
+  history service's upper bound is exclusive, so the linked message is the
+  last included message and nothing newer is read.
+- The result reports the selected chat, processed vs requested messages, the
+  exact first/last eligible message ids when available, and whether the window
+  was complete, bounded/truncated or empty. A provider/retrieval failure or an
+  empty history is never rendered as an invented summary.
+- The UI uses an optional, backwards-compatible anonymized summarization mode:
+  the provider receives history text and the owner's focus only, with no
+  message ids or sender ids. Existing AI-chat callers keep their original
+  attributed prompt by default.
+- Long runs execute in one finite `guarded_create_task` with an explicit
+  300-second envelope, the existing panel-operation generation (newest writer
+  wins) and `ExistingPanelEditor`; input handlers only validate and launch.
+  Cancellation propagates; no permanent loop or worker was added.
+- Tests: `tests/test_history_panel.py` covers registration/navigation, bounded
+  dialogs, selection validation, counts, focus limits, manual argument
+  passing, provider failure, empty history, timeout, cancellation, stale
+  writers, all supported link forms, distinct link failure kinds, peer/message
+  mismatch, the `linked_id + 1` boundary, and the UI prompt's identifier
+  isolation. `tests/test_history_ai_tools.py` remains green.
+- Acceptance: offline focused tests pass; no live Telegram or provider run was
+  performed in this environment.
+
+### P2 — Incremental retrieval and per-chat checkpoints
+
+Status: **Next**. Not implemented in P1. Per-chat checkpoints, incremental
+summarization, previous-summary persistence, automatic per-chat mode, cadence
+configuration, scheduler integration, Event Intelligence candidates, and
+automated digest delivery remain deliberately out of scope.
+
 ## Completed: Supabase live schema and privilege audit
 
 Status: **Audited, selectively hardened, live-verified, and documented.**
