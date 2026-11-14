@@ -149,6 +149,11 @@ remain two separate durable writes, not one transaction.
 - Cancellation during the shielded delete propagates immediately; the bounded
   deletion continues, but its final durability is not awaited by the cancelled
   caller.
+- A cancellation delivered INSIDE the initial task repository write, before
+  `TaskCreationService.create()` returns a task object, remains the pre-existing
+  general creation window: there is no task id for the History wrapper to
+  compensate. The covered boundary is cancellation after the task object exists
+  and before/while the state row is written.
 - No deployment or schema change was made.
 
 ## 1. Phase 3B foundation (historical section)
