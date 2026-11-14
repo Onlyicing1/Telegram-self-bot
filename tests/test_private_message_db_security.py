@@ -365,7 +365,7 @@ def test_the_private_message_access_part_is_the_thirteenth():
     assert "20261112140000_add_panel_settings_intelligent_reaction.sql" in block[
         marks[-2].start(): marks[-2].end()
     ], "the Intelligent Reaction column precedes the newest part"
-    assert "20261113000001_create_history_schedules.sql" in block[
+    assert "20261114180758_create_history_schedules.sql" in block[
         marks[-1].start(): marks[-1].end()
     ], "the newest additive part is the Scheduled History state table"
     assert TOTAL_PARTS == len(_recorded_order())

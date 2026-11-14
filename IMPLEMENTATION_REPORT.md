@@ -6,7 +6,7 @@ Phase 3B adds the durable persistence and retrieval foundation for scheduled
 History summarization. It does **not** add execution.
 
 - One additive migration:
-  `supabase/migrations/20261113000001_create_history_schedules.sql`.
+  `supabase/migrations/20261114180758_create_history_schedules.sql`.
 - One `history_schedules` state per `(owner_id, peer_id)`, owned by an
   `ai_tasks` row with `ON DELETE CASCADE`.
 - Repository primitives on the existing `TaskRepository` hierarchy:
@@ -34,7 +34,7 @@ Files changed:
 
 | File | Change |
 |---|---|
-| `supabase/migrations/20261113000001_create_history_schedules.sql` | New table, index, RLS/grants, comments, verification and rollback note |
+| `supabase/migrations/20261114180758_create_history_schedules.sql` | New table, index, RLS/grants, comments, verification and rollback note (applied; remote version matches the filename) |
 | `backend/ai/database/task_repository.py` | Record model, validation, in-memory fallback, Supabase CAS methods, task cascade |
 | `backend/services/history_service.py` | `HistoryBatch` and bounded oldest-first retrieval |
 | `backend/services/history_ai_service.py` | Identifier-free scheduled payload |
@@ -106,7 +106,7 @@ There is no owner foreign key because the repository has no owner table.
 ### 2.2 Exact manual application SQL
 
 Apply the entire file
-`supabase/migrations/20261113000001_create_history_schedules.sql` as
+`supabase/migrations/20261114180758_create_history_schedules.sql` as
 `postgres` in the Supabase SQL editor (or as §31.3 part 18 of the one-paste
 setup). Its executable SQL is:
 
@@ -353,19 +353,28 @@ pre-existing, not caused by Phase 3B or by the merge. No Phase 3B test failed.
 
 ## 7. Live Supabase status
 
-**No SQL was executed. No Supabase connection was made. The migration has NOT
-been applied or live-verified.** The owner must review and apply it manually.
-Consequently:
+**The migration is applied to the connected Supabase project.** The live
+migration history records version `20261114180758`, name
+`create_history_schedules`. The repository filename was reconciled from
+`20261113000001` to that recorded version; the SQL is byte-identical
+(`git hash-object` unchanged).
 
-- live RLS behavior was not tested;
-- live FK cascade behavior was not tested;
-- live CAS/unique-constraint concurrency was not tested;
-- no claim is made that the durable repository is working against a live
-  database.
+Owner-performed live checks:
 
-Until the owner applies the migration, every durable History read and write
-raises `HistoryStorageUnavailable`; the repository never reports the state as
-durably persisted and never substitutes process memory.
+- table structure and all declared constraints;
+- RLS enabled with zero policies and the intended grants;
+- sequence privileges required by the `bigserial` insertion path;
+- a transactional CAS probe (stale-version rejection) — **rolled back and no
+test row was left behind**.
+
+No coding agent executed SQL, applied or reapplied the migration, ran
+`supabase migration repair`, or modified `supabase_migrations.schema_migrations`
+or any live object. These live checks verify the schema/access contract and one
+CAS transaction; they do **not** verify production scheduled History execution
+(no scheduler or executor calls the repository yet) and they do not verify live
+Telegram retrieval. The durable-only fail-closed behavior (an
+`HistoryStorageUnavailable` when the store is unavailable) remains the
+repository contract.
 
 ## 7.1 Merge integration with the latest upstream
 
@@ -418,8 +427,9 @@ blocker instead of claiming success.
 
 ## 9. Remaining limitations
 
-- Migration is unapplied; owner action is required.
-- No live Supabase integration test exists in this phase.
+- The migration is applied (remote `20261114180758`); the live schema/access
+  checks and one transactional CAS probe passed, but full production History
+  execution and live Telegram retrieval remain unimplemented and unverified.
 - No scheduler/executor calls the repository or payload yet.
 - Summary compaction is an explicit reset, not automatic.
 - Deleted Telegram content cannot be recovered; the prior summary is retained.

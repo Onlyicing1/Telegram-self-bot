@@ -203,14 +203,15 @@ No gaps are introduced by a short page; no duplicates are read across pages.
 
 ## 9. Documentation and migration inventory
 
-- Migration: `supabase/migrations/20261113000001_create_history_schedules.sql`.
+- Migration: `supabase/migrations/20261114180758_create_history_schedules.sql`
+  (applied; the filename matches the recorded remote version).
 - Inventory: 42 repository migration files; the setup block has 18 parts.
 - `DATABASE_ARCHITECTURE.md`:
   - §16.1 documents the table, columns, constraints, index, FK, RLS and
     repository contract;
   - §31.1 classifies the migration as part 18 of 18;
   - §31.3 embeds the migration verbatim as part 18;
-  - §22 records it as **NOT APPLIED — owner action required**;
+  - §22 records it as **APPLIED** (remote version `20261114180758`, 2026-11-14);
   - §30.11 lists it among the parts of the one-paste action;
   - §31.4/§31.5/§31.6 describe its part-specific rollback and verification.
 - The documentation tests were updated from the merged 41/17 baseline to
@@ -219,12 +220,15 @@ No gaps are introduced by a short page; no duplicates are read across pages.
 
 ## 10. Risks and limitations confirmed by inspection
 
-- The live Supabase table does not exist until the owner applies the migration.
-  Until then every durable History operation fails closed with
-  `HistoryStorageUnavailable`; process memory is never substituted, so a
-  checkpoint can never be reported successful and then lost on restart.
-- Live database RLS, cascade and CAS behavior were not executed or verified;
-  only the fake-client query shape and the in-memory fallback were tested.
+- The live migration is applied and its history record is `20261114180758`;
+  the repository filename now matches it. When the store is unavailable (or the
+  table absent in another environment) every durable History operation fails
+  closed with `HistoryStorageUnavailable`; process memory is never substituted,
+  so a checkpoint can never be reported successful and then lost on restart.
+- Live schema/access checks and one transactional CAS probe were performed by
+  the owner and rolled back with no test row left behind. Full production
+  History execution and live Telegram retrieval were **not** executed; the
+  fake-client query shape and the in-memory fake remain the unit-test basis.
 - The migration provides no automatic summary compaction. Reset is explicit.
 - Deleted or inaccessible Telegram messages cannot be reconstructed.
 - No scheduler or execution path calls these primitives in Phase 3B; the
@@ -257,6 +261,19 @@ merge residue, corrected in the follow-up commit:
 
 The roadmap and this document now describe Phase 3B as implemented, audited and
 not live-verified.
+
+### Migration version reconciliation (2026-11-14)
+
+The migration was applied by the owner while the repository still named it
+`20261113000001_create_history_schedules.sql`; Supabase recorded version
+`20261114180758` for the same migration name. The repository file was renamed to
+`20261114180758_create_history_schedules.sql` with its SQL byte-identical
+(verified by blob hash), and every active reference — `DATABASE_ARCHITECTURE.md`
+(inventory, §16.1, §22, part 18 banner and setup list), `ROADMAP.md`,
+`IMPLEMENTATION_REPORT.md`, this document, `tests/test_database_setup_order.py`
+and `tests/test_private_message_db_security.py` — was updated. No SQL was
+executed, no migration was re-applied, and neither the live table nor
+`supabase_migrations.schema_migrations` was modified.
 
 ## 12. Explicit non-goals
 

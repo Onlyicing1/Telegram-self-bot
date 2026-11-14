@@ -305,7 +305,7 @@ migration creates them.
    (no table, column, index, row or stored value changes), and it is the ONE
    part of this block whose purpose is to REDUCE access rather than add schema.
 | 17 | `20261112140000_add_panel_settings_intelligent_reaction.sql` | The Intelligent Reaction setting's ONE `panel_settings` column (§6): `intelligent_reaction_enabled boolean NOT NULL DEFAULT false` — the independent, OFF-by-default switch for the AI-driven per-message reaction mode (`intelligent_reaction_service`). Added WITHOUT a default first so an existing column keeps its value, then the final default is bound, only `NULL`s are backfilled, and the `NOT NULL` binding is applied. Deliberately separate from the fixed Auto-Reaction columns of part 14 (the two modes are mutually exclusive). Plus `NOTIFY pgrst` and one column verification query. Additive ALTER only: no table, index, constraint, policy, grant or row is created | **§31.3, part 17 of 18** (§6 documents the column) |
-| 18 | `20261113000001_create_history_schedules.sql` | The ONE cumulative Scheduled History state table (§16.1): `task_id` → `ai_tasks(id)` `ON DELETE CASCADE`, `owner_id` + `peer_id` with `UNIQUE (owner_id, peer_id)`, immutable `baseline_cursor`, monotonic `scanned_cursor` / `summarized_cursor` with `baseline <= summarized <= cursor`, a 32 KiB UTF-8-bounded `summary`, `revision` + CAS `version`, bounded error metadata, lifecycle status CHECK (including legacy `deleted` for explicit repair), one task-id index, and a service-role-only RLS posture (zero policies; all client privileges revoked; four DML verbs granted to `service_role`). No owner FK exists because the repository has no owner table. Additive: no existing table, column, index, policy, grant or row is touched | **§31.3, part 18 of 18** (§16.1 documents it) |
+| 18 | `20261114180758_create_history_schedules.sql` | The ONE cumulative Scheduled History state table (§16.1): `task_id` → `ai_tasks(id)` `ON DELETE CASCADE`, `owner_id` + `peer_id` with `UNIQUE (owner_id, peer_id)`, immutable `baseline_cursor`, monotonic `scanned_cursor` / `summarized_cursor` with `baseline <= summarized <= cursor`, a 32 KiB UTF-8-bounded `summary`, `revision` + CAS `version`, bounded error metadata, lifecycle status CHECK (including legacy `deleted` for explicit repair), one task-id index, and a service-role-only RLS posture (zero policies; all client privileges revoked; four DML verbs granted to `service_role`). No owner FK exists because the repository has no owner table. Additive: no existing table, column, index, policy, grant or row is touched | **§31.3, part 18 of 18** (§16.1 documents it) |
 
 ### 31.2 The order, and why it is this order (source-proven)
 
@@ -3404,7 +3404,7 @@ WHERE table_schema = 'public'
   AND column_name  = 'intelligent_reaction_enabled';
 
 
--- ─── PART 18 of 18 — 20261113000001_create_history_schedules.sql (Scheduled History state) ───
+-- ─── PART 18 of 18 — 20261114180758_create_history_schedules.sql (Scheduled History state) ───
 
 /*
 # Scheduled History state (Phase 3B)
@@ -3789,7 +3789,7 @@ The exact status of every table is in [§19](#19-known-inconsistencies),
 | `private_message_config`, `private_message_senders` | `20260929000001` + `20261016000001` + `20261020144423` | `private_message_service`, `db/client.py` | **MANUAL-ONLY** — §31.3 parts 10/11/13; see §33. |
 | `aed_config`, `aed_archive_entries` | `20261017000001` | `anti_edit_delete_service`, `db/client.py` | **MANUAL-ONLY** — §31.3 part 12; see §34. |
 | `api_credentials` | `20260919000001` + `20260919000002` | credential-vault code (§29); secrets live in Supabase Vault, never in this table | **MANUAL-ONLY** — §31.3 parts 2/3; see §29. |
-| `history_schedules` | `20261113000001` | `TaskRepository` history-schedule primitives (Phase 3B) | **MANUAL-ONLY, NOT APPLIED** — §31.3 part 18; see §16.1. Until applied, every durable History operation fails closed (`HistoryStorageUnavailable`) instead of substituting process memory. |
+| `history_schedules` | `20261114180758` | `TaskRepository` history-schedule primitives (Phase 3B) | **APPLIED** (remote version `20261114180758`, 2026-11-14) — §31.3 part 18; see §16.1. The repository filename now matches the recorded remote version. Live structure, constraints, RLS/grants, sequence privileges and a transactional CAS probe were verified; the probe was rolled back with no row left behind. Scheduled History execution is still unimplemented. |
 | `ai_preferences` | none | repository interface + in-memory only | Specified (§14), **no producer, no migration**. |
 
 ### Emoji & Reaction Tables (MANUAL-ONLY migration)
@@ -5568,9 +5568,14 @@ project has the migration applied.
 
 Phase 3B adds ONE cumulative History state per `(owner_id, peer_id)`, stored in
 the dedicated `history_schedules` table. The migration is
-`supabase/migrations/20261113000001_create_history_schedules.sql` (embedded as
-§31.3 part 18). Live Supabase application is manual and **has not been
-verified**; no SQL was executed by the coding agent.
+`supabase/migrations/20261114180758_create_history_schedules.sql` (embedded as
+§31.3 part 18). It has been applied to the connected Supabase project by the
+owner; the live migration history records version `20261114180758`, name
+`create_history_schedules`, and the repository filename now matches that
+version. The live table structure, constraints, RLS posture, grants, sequence
+privileges and a transactional CAS probe were checked; the probe was rolled
+back and left no test row behind. No coding agent executed SQL or modified the
+migration history, and scheduled History execution is still unimplemented.
 
 The table is owned by one `ai_tasks` row and is never a second task system:
 
@@ -5638,7 +5643,7 @@ Supabase repository and `InMemoryTaskRepository`):
   assertion by itself).
 
 **Durable-only contract.** History state is a durable checkpoint. When Supabase
-is unavailable, times out, or the migration is unapplied, every History read and
+is unavailable, times out, or the table is absent, every History read and
 write raises `HistoryStorageUnavailable` and writes nothing. A commit is
 reported successful only when the durable row is returned; process memory is
 never substituted for the table, and a restart therefore cannot silently lose a
@@ -5669,8 +5674,8 @@ future changes require separate review.
 
 ## 18. RLS Policy Model
 
-All 28 application tables have RLS enabled. The live project currently has
-22 canonical SELECT policies for `anon` + `authenticated`; six tables have
+All 29 application tables have RLS enabled. The live project currently has
+22 canonical SELECT policies for `anon` + `authenticated`; seven tables have
 zero policies. All backend reads and writes use the service-role client.
 
 The live audit and hardening migration
@@ -5696,10 +5701,10 @@ The following five tables are deliberately service-role-only:
 `private_message_config` and `private_message_senders`. They have RLS
 enabled and no client grants. `ai_preferences` is the sixth no-policy table:
 it is non-canonical, empty, has no current repository consumer and is retained
-for now rather than destructively dropped. The unapplied Phase 3B table
-`history_schedules` (§16.1) is a seventh zero-policy, service-role-only table
-when its migration is applied; it is not part of the current live 28-table
-inventory.
+for now rather than destructively dropped. The Phase 3B table
+`history_schedules` (§16.1) is the seventh zero-policy, service-role-only table;
+it is part of the live 29-table inventory since its migration was applied on
+2026-11-14.
 
 ### Remaining public-read exposure — unresolved
 
@@ -6284,11 +6289,14 @@ migration filenames.
   plus the separately tracked post-setup privilege-hardening migration; both
   Intelligent Reaction migrations — the enabled column and the probability
   column — are committed and not yet applied).
-- Phase 3B's `20261113000001_create_history_schedules.sql` is committed but
-  **NOT applied**: the live project therefore still has no
-  `history_schedules` table, and every durable History operation fails closed
-  (`HistoryStorageUnavailable`) instead of substituting process memory.
-- Supabase migration history contains **3 records**, not 42. The live schema
+- Phase 3B's `20261114180758_create_history_schedules.sql` is **applied** to
+  the connected project: the live migration history records version
+  `20261114180758` (name `create_history_schedules`), and the repository
+  filename matches that version. Live structure, constraints, RLS/grants,
+  sequence privileges and a transactional CAS probe were verified; the probe
+  was rolled back with no row left behind. Scheduled History execution is still
+  not implemented.
+- Supabase migration history contains **4 records**, not 42. The live schema
   was evidently established through a mixture of canonical/manual setup and
   later tracked migrations. Do not invent the missing history rows.
 - Live history records:
@@ -6296,6 +6304,8 @@ migration filenames.
     The history version differs from the repository filename prefix.
   - `20261111143543` — `harden_public_schema_privileges`.
   - `20261112000000` — `add_panel_settings_outbound_bandwidth`.
+  - `20261114180758` — `create_history_schedules`.
+    The repository filename was reconciled to this recorded version.
 - The hardening migration is stored in the repository as
   `supabase/migrations/20261111143543_harden_public_schema_privileges.sql`.
   It has been applied and verified against the live project.
@@ -8578,7 +8588,7 @@ agent.
    `20261109000000_add_panel_settings_appearance.sql` (part 15),
    `20261112000000_add_panel_settings_outbound_bandwidth.sql` (part 16) and
    `20261112140000_add_panel_settings_intelligent_reaction.sql` (part 17) and
-   `20261113000001_create_history_schedules.sql` (part 18). It
+   `20261114180758_create_history_schedules.sql` (part 18). It
    is one transaction-safe, re-runnable statement batch.
    (`supabase/canonical_bootstrap.sql` and the migration file remain the
    byte-identical convenience copies of the snapshot part.)

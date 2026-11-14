@@ -40,7 +40,7 @@ AUTO_REACTION_SETTINGS = "20261020160000_add_panel_settings_auto_reaction_settin
 APPEARANCE_SETTINGS = "20261109000000_add_panel_settings_appearance.sql"
 OUTBOUND_BANDWIDTH = "20261112000000_add_panel_settings_outbound_bandwidth.sql"
 INTELLIGENT_REACTION = "20261112140000_add_panel_settings_intelligent_reaction.sql"
-HISTORY_SCHEDULES = "20261113000001_create_history_schedules.sql"
+HISTORY_SCHEDULES = "20261114180758_create_history_schedules.sql"
 
 #: The order §31 documents — verified against the sources, not assumed. The TTS
 #: settings migration, the Todo schedule type, the Todo steps table, the Emoji &

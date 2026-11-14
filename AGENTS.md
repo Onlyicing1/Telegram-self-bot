@@ -662,7 +662,9 @@ error.
   owner-scoped CAS repository primitives that raise `HistoryStorageUnavailable`
   when Supabase is unavailable or the migration is unapplied. There is no
   runtime in-memory History fallback — a checkpoint is never reported committed
-  from process memory. The migration is owner-applied and not applied yet.
+  from process memory. The migration is applied to the connected project
+  (recorded remote version `20261114180758`); the repository filename matches
+  that version.
 
 ---
 

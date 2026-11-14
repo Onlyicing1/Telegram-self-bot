@@ -3,8 +3,10 @@
 ## Latest delivery: History Phase 3B — durable state and oldest-first retrieval (audited)
 
 Status: **Phase 3B implemented, independently audited and corrected. The
-migration is NOT applied and live durable behavior is NOT verified. Phase 4 is
-deferred.**
+migration is APPLIED to the connected Supabase project (remote version
+`20261114180758`); the repository filename now matches it. Live schema/access
+checks and a transactional CAS probe passed. Full production History execution
+and live Telegram behavior remain unverified, and Phase 4 is still deferred.**
 Audited delivery commit: `a12c20779bc634cb4511fb0e79443b882e8a1a85`
 (Phase 3B implementation `417a6b8`, upstream parent `e2f1619`).
 Phase 3A base: `62a18de`.
@@ -14,8 +16,8 @@ Phase 3A base: `62a18de`.
 | Phase | Scope | Status |
 |---|---|---|
 | **3A** | Durable History state investigation and design | **Complete** |
-| **3B** | Durable schema/repository, oldest-first retrieval, identifier-free payload boundary | **Implemented and audited** — migration unapplied, live behavior unverified |
-| **4** | Deterministic schedule UI | **Deferred** until the owner applies the migration |
+| **3B** | Durable schema/repository, oldest-first retrieval, identifier-free payload boundary | **Implemented and audited** — migration applied (remote `20261114180758`); scheduled execution unverified |
+| **4** | Deterministic schedule UI | **Deferred**; migration applied, execution path not built |
 | **5** | Scheduled History action | Deferred; numbering unchanged |
 | **6** | Shared History admission | Deferred; numbering unchanged |
 | **7** | Live validation | Deferred; numbering unchanged |
@@ -24,8 +26,9 @@ Phase 3 remains the umbrella durable-state phase. No phase was renumbered.
 
 ### What Phase 3B actually delivers (source-verified)
 
-- One additive migration, `supabase/migrations/20261113000001_create_history_schedules.sql`
-  (part 18 of 18; inventory 42 files):
+- One additive migration, `supabase/migrations/20261114180758_create_history_schedules.sql`
+  (part 18 of 18; inventory 42 files), applied to the connected project with
+  remote version `20261114180758`:
   `task_id → ai_tasks(id) ON DELETE CASCADE`, `UNIQUE (owner_id, peer_id)`,
   immutable `baseline_cursor`, monotonic `scanned_cursor`/`summarized_cursor`
   with `baseline <= summarized <= scanned`, a 32 KiB UTF-8-bounded `summary`,
@@ -38,7 +41,7 @@ Phase 3 remains the umbrella durable-state phase. No phase was renumbered.
   `record_history_failure`, `reset_history_summary`.
 - **Durable-only production semantics.** Every History read/write is a single
   owner-scoped (and, for writes, CAS-versioned) durable operation. When the store
-  is unavailable, times out, or the migration is unapplied, the operation raises
+  is unavailable, times out, or the table is absent, the operation raises
   `HistoryStorageUnavailable` and writes nothing. Process memory is never
   substituted; `InMemoryTaskRepository` is an explicitly injected test fake only.
 - Bounded oldest-first retrieval: optional `reverse` on
@@ -78,17 +81,29 @@ Phase 3 remains the umbrella durable-state phase. No phase was renumbered.
   merge-integrity comparison against both parents, migration/§31.3 reconciliation.
 - `IMPLEMENTATION_REPORT.md` and `INVESTIGATION.md` record the audited state.
 
+### Applied migration and verification (2026-11-14)
+
+- The migration is **applied** to the connected Supabase project. Its live
+  migration-history record is version `20261114180758`, name
+  `create_history_schedules`; the repository filename was reconciled from
+  `20261113000001` to match that recorded version. The SQL is byte-identical.
+- Owner-performed live checks passed for the table structure, constraints, RLS
+  configuration, grants and sequence privileges.
+- A transactional CAS probe ran against the live table and was **rolled back**;
+  it left no test row behind.
+- No coding agent executed SQL, applied a migration, repaired the migration
+  history or modified any Supabase object.
+
 ### Not verified / blockers
 
-- **The migration has not been applied to Supabase.** No SQL was executed and no
-  live database was contacted. Live RLS, FK cascade, unique-constraint and CAS
-  behavior are unverified.
+- **Full production History execution is not implemented or verified**: no
+  scheduler/executor calls the repository or the payload yet; Phase 3B remains
+  foundation only.
 - **No live Telegram behavior was tested**: no real oldest-first run, no restart
   mid-run, no deleted-message gap run.
-- No scheduler/executor calls the repository or the payload yet; Phase 3B is
-  foundation only.
-- **Phase 4 is deferred** until the owner applies the migration and confirms the
-  live durable behavior.
+- **Phase 4 is deferred** until the owner accepts Phase 3B and the scheduled
+  execution path is designed; applying the migration was the blocking
+  prerequisite and is now complete.
 
 ### Deferred evidence-backed constraints (unchanged)
 
@@ -178,5 +193,5 @@ ProviderManager ownership were unchanged.
 - `tests/test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`
   (“interval advancement exceeded bound”) — the only full-suite failure at
   `a12c207`, reproduced identically at both parents; not caused by Phase 3B.
-- Applying `20261113000001_create_history_schedules.sql` remains an owner action.
-- Live durable History behavior remains unverified until that application.
+- Full production History execution and live Telegram behavior remain
+  unverified (the migration itself is applied).
