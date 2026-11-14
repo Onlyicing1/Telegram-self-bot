@@ -588,9 +588,12 @@ class TaskExecutionCoordinator:
         # occurrence, not to an interactive owner request. It is written here
         # from runtime state (never from a model or a candidate) and is what
         # lets a tool tell the two apart — durable task creation is refused
-        # from this context (see backend.ai.task_contract).
+        # from this context (see backend.ai.task_contract). The VALUE is the
+        # occurrence's own durable key, not a bare boolean, so a consumer can
+        # require a real scheduled-occurrence identity and prove it belongs to
+        # the injected task id.
         occurrence_extra = dict(execution_context.extra) if execution_context.extra else {}
-        occurrence_extra[SCHEDULED_OCCURRENCE_EXTRA] = True
+        occurrence_extra[SCHEDULED_OCCURRENCE_EXTRA] = occurrence.occurrence_key
         # The task id is runtime state, not a task argument: it lets an
         # owner-created History action load its own durable child row without
         # trusting anything the model or candidate supplied. Keep it scoped to

@@ -240,7 +240,7 @@ async def test_coordinator_marks_the_occurrence_context():
     ).execute(occurrence)
 
     assert result.success is True
-    assert tool.seen_extra.get("scheduled_occurrence") is True
+    assert tool.seen_extra.get("scheduled_occurrence") == "k"
     assert "scheduled_occurrence" not in (task.actions[0].get("arguments") or {})
 
 

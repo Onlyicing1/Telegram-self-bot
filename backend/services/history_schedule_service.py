@@ -176,13 +176,11 @@ async def run_scheduled_history(
                 version=state.version,
             )
         try:
-            committed = await repo.commit_history_success(
+            committed = await repo.advance_history_scan(
                 owner_id,
                 state.peer_id,
                 expected_version=state.version,
-                summary=state.summary,
                 scanned_cursor=next_scanned,
-                summarized_cursor=state.summarized_cursor,
             )
         except HistoryStorageUnavailable:
             raise

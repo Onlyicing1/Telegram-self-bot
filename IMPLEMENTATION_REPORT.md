@@ -29,10 +29,11 @@ Key files in this delivery:
 
 No model path can create or mutate the History schedule: `TaskCreationService`
 rejects the action unless the trusted owner-wizard set is explicitly passed; the
-action reads only the coordinator-injected task ID and the durable state row. No
-new scheduler, executor, repository, Telegram client, listener, update loop or
-persistence path was added. The action receives no peer, task, message or cursor
-identifier from its arguments.
+action reads only the coordinator-injected task ID and occurrence key, then the
+durable state row. No new scheduler, executor, repository, Telegram client,
+listener, update loop or persistence path was added. The action receives no peer,
+task, message, occurrence or cursor identifier from its arguments. The trusted
+provenance contract was strengthened by the targeted audit correction in §0.3.
 
 ### 0.1 Verification actually run in this delivery (self-checks, not an audit)
 
@@ -58,8 +59,97 @@ identifier from its arguments.
   fails closed.
 - Live scheduled execution and live Telegram retrieval remain unverified.
 - Phase 6 shared admission and Phase 7 live validation remain deferred.
-- No independent audit has been performed; this report records implementation
-  and self-checks only.
+- The independent review findings are corrected in §0.3; no live audit was
+  performed.
+
+## 0.3 Targeted audit corrections (current)
+
+This correction addresses the two findings from the independent review of the
+Scheduled History implementation, plus focused cancellation/compensation
+coverage. No Phase 5 expansion, Phase 6 admission, Phase 7 live validation,
+SQL/Supabase change, deployment or new scheduler/worker/repository path was
+introduced.
+
+### 0.3.1 Safe-skip CAS semantics
+
+- Added `advance_history_scan(owner_id, peer_id, *, expected_version,
+  scanned_cursor)` to the repository contract, the injected in-memory test
+  fake and `SupabaseTaskRepository`. It performs ONE CAS-guarded write with only
+  `scanned_cursor`, `version` and `updated_at` in the payload.
+- It preserves `baseline_cursor`, `summarized_cursor`, `summary`, `revision`,
+  `last_committed_at` and failure metadata; a stale version returns `None`
+  without issuing a write, and a non-monotonic/ordered cursor raises before any
+  mutation. Durable-only fail-closed behavior is unchanged.
+- The safe-skip branch in `history_schedule_service.run_scheduled_history()`
+  now uses this operation instead of `commit_history_success()`. Successful
+  summary commits still use `commit_history_success()` and still increment
+  `revision` and set `last_committed_at`.
+
+Tests: `test_scanned_only_advance_preserves_summary_revision_and_commit_time`,
+`test_supabase_scanned_only_advance_writes_only_the_scan_fields`,
+`test_a_safe_skip_advances_only_the_scan_cursor`; the existing commit and
+fail-closed tests were retained/extended.
+
+### 0.3.2 Scheduled-occurrence provenance
+
+The History action previously authorized on `SCHEDULED_TASK_ID_EXTRA` alone.
+The coordinator now injects `SCHEDULED_OCCURRENCE_EXTRA` as the claimed
+occurrence's own `occurrence_key` (the existing typed occurrence identity), not
+a bare boolean. `scheduled_occurrence_provenance()` in `task_contract.py`
+requires BOTH markers, validates the task id and bounded key, and treats a key
+whose numeric task prefix names another task as inconsistent. The tool rejects
+missing/invalid/inconsistent provenance and any argument other than the
+owner-authored `instruction` before calling the service — therefore before any
+repository lookup or Telegram/history retrieval. Model-supplied task, peer,
+occurrence or cursor arguments are never read.
+
+Tests: both markers valid; task-id only; occurrence-only; missing; malformed
+(boolean, blank, oversized); foreign-task prefix; model-supplied identity
+arguments; and the coordinator injection assertion.
+
+### 0.3.3 Cancellation and compensation
+
+No production change was needed beyond the existing compensated two-write
+creation. The exact-version durable compensation, stale/missing/non-durable
+deletion outcomes, cancellation at the state-creation boundary, and cancellation
+during compensation are now covered. Cancellation is re-raised, never swallowed;
+the already-started deletion is protected by `asyncio.shield` and is bounded by
+the repository operation (no new background worker or loop). Task and state
+remain two separate durable writes, not one transaction.
+
+### 0.3.4 Verification actually run for this correction
+
+- Focused History schedule/repository/UI + task recursion/creation/execution/
+  repository command:
+  `.venv/bin/python -m pytest tests/test_history_schedule.py tests/test_history_schedules.py tests/test_history_schedule_ui.py tests/test_task_recursion_and_message_id_provenance.py tests/test_task_creation_diagnostics.py tests/test_task_execution.py tests/test_task_repository.py -q`
+  → **102 passed**.
+- Wider focused set (History panel/capacity/tools/policy/service, task chains/
+  wait/answers/conditions/scheduler/restart, tool contracts): **647 passed,
+  1 failed** — the scheduler test below.
+- Full suite:
+  `.venv/bin/python -m pytest tests -q --ignore=tests/test_runtime_session_terminal.py`
+  → **7,816 passed, 27 skipped, 1 failed** in 209s.
+- The only failure,
+  `tests/test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`,
+  was reproduced **identically on untouched base `27e1d23`** in a disposable
+  worktree (`interval advancement exceeded bound`), so it is not caused by this
+  correction. It was not changed.
+- `tests/test_runtime_session_terminal.py` is the pre-existing untracked file
+  whose collection errors; it was excluded, not modified or staged.
+- `.venv/bin/python -m compileall -q backend tests`: pass.
+- `git diff --check`: pass.
+
+### 0.3.5 Remaining limitations
+
+- No live Telegram scheduled execution, live Supabase CAS probe or restart
+  catch-up run was performed for this correction.
+- The task and History-state writes remain separate durable operations; a crash
+  exactly between them can leave a task without state, where the action fails
+  closed.
+- Cancellation during the shielded delete propagates immediately; the bounded
+  deletion continues, but its final durability is not awaited by the cancelled
+  caller.
+- No deployment or schema change was made.
 
 ## 1. Phase 3B foundation (historical section)
 
@@ -507,7 +597,9 @@ blocker instead of claiming success.
 - `history_schedules` has no owner FK because there is no owner table; owner
   scoping relies on the repository plus `UNIQUE (owner_id, peer_id)`.
 - A completed state is terminal; no reopen path is implemented.
-- The pre-existing scheduler test failure remains.
+- `tests/test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`
+  still fails; it was re-verified identically on untouched base `27e1d23` and
+  was not changed.
 - Phase 6 shared History admission and Phase 7 live validation remain deferred.
 
 ## 10. Explicit Phase 4/5 implementation status

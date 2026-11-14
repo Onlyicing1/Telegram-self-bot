@@ -14,12 +14,49 @@ MAX_AI_INSTRUCTION_CHARS = 4096
 MAX_PREPARATION_METADATA_BYTES = 8192
 MAX_TOOL_NAME_CHARS = 128
 
-#: ``ToolContext.extra`` key marking a context that belongs to a CLAIMED
-#: SCHEDULED occurrence. It is written ONLY by ``TaskExecutionCoordinator``
-#: from trusted runtime state — never by a model, a candidate field, or a task
-#: argument — so it is the one trustworthy signal that a tool call originates
-#: from a scheduled occurrence rather than from an interactive owner request.
+#: ``ToolContext.extra`` key carrying the CLAIMED occurrence's own identity
+#: (``OccurrenceRecord.occurrence_key``). It is written ONLY by
+#: ``TaskExecutionCoordinator`` from trusted runtime state — never by a model,
+#: a candidate field, or a task argument — so it is the one trustworthy signal
+#: that a tool call originates from a scheduled occurrence rather than from an
+#: interactive owner request. The value is the existing occurrence key, whose
+#: deterministic ``<task_id>:...`` prefix lets a consumer prove it belongs to
+#: the injected task id without a second identity scheme.
 SCHEDULED_OCCURRENCE_EXTRA = "scheduled_occurrence"
+
+#: The repository's own occurrence-key bound (``occurrence_key`` validator).
+MAX_OCCURRENCE_KEY_CHARS = 256
+
+
+def scheduled_occurrence_provenance(extra: Any) -> tuple[int, str, str]:
+    """``(task_id, occurrence_key, error)`` from TRUSTED runtime context only.
+
+    Both coordinator-injected markers are required. The occurrence key is the
+    existing typed occurrence identity; when its scheduler/event prefix names a
+    task id, that id must match the injected task id or the pair is
+    inconsistent and fails closed. A boolean/absent marker, a blank or
+    oversized key, a non-positive task id, or a model-supplied value is
+    invalid. Callers must use this before any repository or Telegram lookup.
+    """
+    if not isinstance(extra, dict):
+        return 0, "", "missing"
+    task_id = extra.get(SCHEDULED_TASK_ID_EXTRA)
+    occurrence_key = extra.get(SCHEDULED_OCCURRENCE_EXTRA)
+    if task_id is None or occurrence_key is None:
+        return 0, "", "missing"
+    if isinstance(task_id, bool) or not isinstance(task_id, int) or task_id <= 0:
+        return 0, "", "invalid"
+    if (
+        not isinstance(occurrence_key, str)
+        or occurrence_key != occurrence_key.strip()
+        or not occurrence_key
+        or len(occurrence_key) > MAX_OCCURRENCE_KEY_CHARS
+    ):
+        return 0, "", "invalid"
+    prefix, separator, _rest = occurrence_key.partition(":")
+    if separator and prefix.isdigit() and int(prefix) != task_id:
+        return 0, "", "inconsistent"
+    return task_id, occurrence_key, ""
 
 #: ``ToolContext.extra`` key carrying the owning ``ai_tasks.id`` of a CLAIMED
 #: scheduled occurrence. Like the origin marker above, it is written only by

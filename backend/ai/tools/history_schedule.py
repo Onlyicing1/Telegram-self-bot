@@ -2,15 +2,19 @@
 
 The action is intentionally argument-thin: the peer, baseline and durable state
 come from the task's server-created ``history_schedules`` row, addressed by the
-trusted task id injected into the scheduled occurrence context. The model
-cannot create this action through the natural-language task path.
+coordinator-injected task id AND scheduled-occurrence key. Both trusted markers
+are required; the model cannot create this action through the natural-language
+task path and cannot supply an identity through tool arguments.
 """
 from __future__ import annotations
 
 import logging
 from typing import Any
 
-from backend.ai.task_contract import SCHEDULED_HISTORY_ACTION, SCHEDULED_TASK_ID_EXTRA
+from backend.ai.task_contract import (
+    SCHEDULED_HISTORY_ACTION,
+    scheduled_occurrence_provenance,
+)
 from backend.ai.tools.base import PermissionLevel, Tool, ToolResult
 from backend.ai.tools.context import ToolContext
 from backend.services import history_schedule_service
@@ -46,8 +50,9 @@ class ScheduledHistoryTool(Tool):
     def description(self) -> str:
         return (
             "Internal scheduled History action. It advances the owner-created "
-            "History checkpoint for the current task; it takes no peer, task or "
-            "cursor argument and is unavailable outside a scheduled occurrence."
+            "History checkpoint for the current task; it takes no identity, peer "
+            "or cursor argument and is unavailable outside its scheduled "
+            "occurrence."
         )
 
     @property
@@ -85,18 +90,32 @@ class ScheduledHistoryTool(Tool):
 
     async def execute(self, context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
         extra = context.extra if context is not None else None
-        task_id = extra.get(SCHEDULED_TASK_ID_EXTRA) if extra else None
-        try:
-            task_key = int(task_id)
-        except (TypeError, ValueError):
-            task_key = 0
-        if task_key <= 0:
+        # Both markers are coordinator-injected from the claimed occurrence.
+        # A task id alone, a bare boolean/old marker, a marker belonging to
+        # another task, or any model-supplied identity fails closed HERE —
+        # before repository lookup or Telegram/history retrieval.
+        task_key, _occurrence_key, provenance_error = (
+            scheduled_occurrence_provenance(extra)
+        )
+        if provenance_error:
             return ToolResult(
                 success=False,
-                message="This action is only available inside a scheduled task.",
-                data={"error": "scheduled_history_task_missing"},
+                message=(
+                    "This action is only available inside its scheduled task "
+                    "occurrence."
+                ),
+                data={"error": f"scheduled_history_provenance_{provenance_error}"},
             )
 
+        if not isinstance(arguments, dict) or set(arguments) - {"instruction"}:
+            return ToolResult(
+                success=False,
+                message=(
+                    "The History action accepts only the owner-authored "
+                    "instruction argument."
+                ),
+                data={"error": "scheduled_history_arguments_invalid"},
+            )
         instruction = arguments.get("instruction")
         if instruction is not None and not isinstance(instruction, str):
             return ToolResult(

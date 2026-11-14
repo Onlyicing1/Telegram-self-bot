@@ -555,6 +555,7 @@ class TaskRepository:
     async def get_history_schedule(self, owner_id, task_id): raise NotImplementedError
     async def get_history_schedule_by_peer(self, owner_id, peer_id): raise NotImplementedError
     async def commit_history_success(self, owner_id, peer_id, *, expected_version, summary, scanned_cursor, summarized_cursor, status=None): raise NotImplementedError
+    async def advance_history_scan(self, owner_id, peer_id, *, expected_version, scanned_cursor): raise NotImplementedError
     async def record_history_failure(self, owner_id, peer_id, *, expected_version, error, status=None): raise NotImplementedError
     async def reset_history_summary(self, owner_id, peer_id, *, expected_version): raise NotImplementedError
     async def create_occurrence(self, owner_id, data): raise NotImplementedError
@@ -700,6 +701,21 @@ class InMemoryTaskRepository(TaskRepository):
         now=_now(); r.summary=summary; r.scanned_cursor=scanned; r.summarized_cursor=summarized
         r.status=target; r.revision+=1; r.version+=1; r.last_error=""; r.last_error_at=None
         r.last_committed_at=now; r.updated_at=now
+        return _copy(r)
+    async def advance_history_scan(self, owner_id, peer_id, *, expected_version, scanned_cursor):
+        """Advance ONLY the scanned cursor under the CAS version.
+
+        A safe-skip batch (media-only or AI-provenance messages) is progress in
+        coverage, not a content revision: summary, summarized_cursor,
+        revision, last_committed_at and failure metadata are untouched.
+        """
+        r=self._history_schedules.get((owner_id,int(peer_id)))
+        if r is None or r.version!=expected_version: return None
+        scanned=_cursor_value(scanned_cursor,"scanned_cursor")
+        if scanned<r.scanned_cursor: raise ValueError("history cursors are monotonic")
+        if not (r.baseline_cursor<=r.summarized_cursor<=scanned): raise ValueError("cursors must satisfy baseline <= summarized <= scanned")
+        r.scanned_cursor=scanned; r.version+=1; r.updated_at=_now()
+        _validate_history_schedule_input(r.as_dict())
         return _copy(r)
     async def record_history_failure(self, owner_id, peer_id, *, expected_version, error, status=None):
         r=self._history_schedules.get((owner_id,int(peer_id)))
@@ -1421,6 +1437,27 @@ class SupabaseTaskRepository(TaskRepository):
         except asyncio.CancelledError: raise
         except Exception as exc:
             self._history_unavailable("Supabase history commit failed: %s",exc)
+    async def advance_history_scan(self, owner_id, peer_id, *, expected_version, scanned_cursor):
+        """Persist ONLY a scanned-cursor advance under ONE CAS write.
+
+        Safe-skip batches must not fabricate a content revision: the payload
+        deliberately omits summary, summarized_cursor, revision,
+        last_committed_at and failure metadata.
+        """
+        current=await self.get_history_schedule_by_peer(owner_id,int(peer_id))
+        if current is None or current.version!=expected_version: return None
+        scanned=_cursor_value(scanned_cursor,"scanned_cursor")
+        if scanned<current.scanned_cursor: raise ValueError("history cursors are monotonic")
+        if not (current.baseline_cursor<=current.summarized_cursor<=scanned): raise ValueError("cursors must satisfy baseline <= summarized <= scanned")
+        now=_now(); outgoing={"scanned_cursor":scanned,"version":expected_version+1,"updated_at":now}
+        _validate_history_schedule_input({**current.as_dict(),**outgoing})
+        try:
+            result=await self._run(lambda:self._client.table("history_schedules").update(outgoing).eq("owner_id",owner_id).eq("peer_id",int(peer_id)).eq("version",expected_version).execute());row=getattr(result,"data",None);self._mark_supabase_ok()
+            return _history_schedule_from_row(row[0] if isinstance(row,list) else row) if row else None
+        except (ValueError,TypeError): raise
+        except asyncio.CancelledError: raise
+        except Exception as exc:
+            self._history_unavailable("Supabase history scan advance failed: %s",exc)
     async def record_history_failure(self, owner_id, peer_id, *, expected_version, error, status=None):
         """Record error metadata only; summary and both cursors are untouched."""
         current=await self.get_history_schedule_by_peer(owner_id,int(peer_id))

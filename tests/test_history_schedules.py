@@ -276,6 +276,42 @@ async def test_safe_skipped_only_batch_can_advance_scanned_not_summarized():
 
 
 @pytest.mark.asyncio
+async def test_scanned_only_advance_preserves_summary_revision_and_commit_time():
+    repo = InMemoryTaskRepository()
+    task = await _task(repo)
+    state = await repo.create_history_schedule(OWNER, task.id, PEER, baseline_cursor=10)
+    state = await repo.commit_history_success(
+        OWNER, PEER, expected_version=state.version,
+        summary="durable summary", scanned_cursor=40, summarized_cursor=35,
+    )
+    committed_at = state.last_committed_at
+
+    advanced = await repo.advance_history_scan(
+        OWNER, PEER, expected_version=state.version, scanned_cursor=60,
+    )
+
+    assert advanced is not None
+    assert advanced.scanned_cursor == 60
+    assert advanced.summarized_cursor == 35
+    assert advanced.summary == "durable summary"
+    assert advanced.baseline_cursor == 10
+    assert advanced.revision == state.revision
+    assert advanced.last_committed_at == committed_at
+    assert advanced.version == state.version + 1
+
+    stale = await repo.advance_history_scan(
+        OWNER, PEER, expected_version=state.version, scanned_cursor=99,
+    )
+    assert stale is None
+    current = await repo.get_history_schedule_by_peer(OWNER, PEER)
+    assert current.scanned_cursor == 60 and current.version == advanced.version
+    with pytest.raises(ValueError):
+        await repo.advance_history_scan(
+            OWNER, PEER, expected_version=current.version, scanned_cursor=59,
+        )
+
+
+@pytest.mark.asyncio
 async def test_cursors_must_be_monotonic_and_ordered():
     repo = InMemoryTaskRepository()
     task = await _task(repo)
@@ -477,6 +513,44 @@ async def test_supabase_failure_and_reset_keep_their_own_payload_contract():
 
 
 @pytest.mark.asyncio
+async def test_supabase_scanned_only_advance_writes_only_the_scan_fields():
+    client = _FakeClient([_row()])
+    repo = SupabaseTaskRepository(client, InMemoryTaskRepository())
+
+    result = await repo.advance_history_scan(
+        OWNER, PEER, expected_version=3, scanned_cursor=40,
+    )
+
+    assert result is not None
+    assert result.scanned_cursor == 40
+    assert result.summarized_cursor == 18
+    assert result.summary == "old"
+    assert result.revision == 2
+    assert result.last_committed_at is not None
+    assert result.version == 4
+    writes = [q for q in client.queries if q.operation == "update"]
+    assert len(writes) == 1
+    payload = writes[0].payload
+    assert payload["scanned_cursor"] == 40
+    assert payload["version"] == 4
+    for untouched in (
+        "summary", "summarized_cursor", "revision", "last_committed_at",
+        "last_error", "last_error_at", "baseline_cursor", "status",
+    ):
+        assert untouched not in payload
+    assert ("owner_id", OWNER) in writes[0].filters
+    assert ("peer_id", PEER) in writes[0].filters
+    assert ("version", 3) in writes[0].filters
+
+    client.queries.clear()
+    stale = await repo.advance_history_scan(
+        OWNER, PEER, expected_version=3, scanned_cursor=41,
+    )
+    assert stale is None
+    assert all(q.operation != "update" for q in client.queries)
+
+
+@pytest.mark.asyncio
 async def test_supabase_stale_commit_issues_no_write():
     client = _FakeClient([_row(version=4)])
     repo = SupabaseTaskRepository(client, InMemoryTaskRepository())
@@ -559,6 +633,10 @@ async def test_unavailable_store_writes_fail_closed_without_touching_memory():
             scanned_cursor=5, summarized_cursor=5,
         )
     with pytest.raises(HistoryStorageUnavailable):
+        await repo.advance_history_scan(
+            OWNER, PEER, expected_version=1, scanned_cursor=5,
+        )
+    with pytest.raises(HistoryStorageUnavailable):
         await repo.record_history_failure(OWNER, PEER, expected_version=1, error="boom")
     with pytest.raises(HistoryStorageUnavailable):
         await repo.reset_history_summary(OWNER, PEER, expected_version=1)
@@ -589,6 +667,10 @@ async def test_a_failed_cas_write_is_never_replayed_against_memory():
             scanned_cursor=40, summarized_cursor=35,
         )
     with pytest.raises(HistoryStorageUnavailable):
+        await repo.advance_history_scan(
+            OWNER, PEER, expected_version=3, scanned_cursor=40,
+        )
+    with pytest.raises(HistoryStorageUnavailable):
         await repo.record_history_failure(
             OWNER, PEER, expected_version=3, error="provider failed",
         )
@@ -603,8 +685,8 @@ def test_the_supabase_history_contract_never_invokes_the_fallback():
     for name in (
         "create_history_schedule", "_repair_deleted_history_schedule",
         "get_history_schedule", "get_history_schedule_by_peer",
-        "commit_history_success", "record_history_failure",
-        "reset_history_summary",
+        "commit_history_success", "advance_history_scan",
+        "record_history_failure", "reset_history_summary",
     ):
         source = inspect.getsource(getattr(SupabaseTaskRepository, name))
         assert "self._fallback." not in source, f"{name} can still fall back to memory"
