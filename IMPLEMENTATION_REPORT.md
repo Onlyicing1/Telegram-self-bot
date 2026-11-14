@@ -130,10 +130,10 @@ remain two separate durable writes, not one transaction.
 
 - Focused provenance/History schedule command:
   `.venv/bin/python -m pytest tests/test_history_schedule.py tests/test_history_schedules.py tests/test_history_schedule_ui.py tests/test_task_recursion_and_message_id_provenance.py -q`
-  → **90 passed**.
+  → **92 passed**.
 - Full suite:
   `.venv/bin/python -m pytest tests -q --ignore=tests/test_runtime_session_terminal.py`
-  → **7,832 passed, 27 skipped, 1 failed** in 146.65s.
+  → **7,834 passed, 27 skipped, 1 failed** in 146.63s.
 - The only failure,
   `tests/test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`,
   was reproduced **identically on untouched base `27e1d23`** in a disposable

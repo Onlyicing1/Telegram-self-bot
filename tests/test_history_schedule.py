@@ -530,6 +530,8 @@ async def test_the_tool_requires_both_trusted_scheduled_markers(monkeypatch):
     ("task_id", "marker", "expected_error"),
     [
         (77, VALID_SCHEDULED_KEY, ""),
+        (77, "", "invalid"),
+        (77, "   ", "invalid"),
         (77, "k", "invalid"),
         (77, "77", "invalid"),
         (77, "77:", "invalid"),
