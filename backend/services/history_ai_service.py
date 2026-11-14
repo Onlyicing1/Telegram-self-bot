@@ -569,6 +569,67 @@ def _chunk_history(
 # ── provider calls ────────────────────────────────────────────────────────
 
 
+_SAFE_FAILURE_ORIGINS = {
+    "authentication": "auth",
+    "auth": "auth",
+    "endpoint": "endpoint",
+    "internal": "internal",
+    "model_lookup": "model_not_found",
+    "model_not_found": "model_not_found",
+    "network": "network",
+    "provider": "provider",
+    "rate_limit": "rate_limit",
+    "rate_limited": "rate_limit",
+    "request": "request",
+    "request_validation": "request",
+    "server": "server",
+    "timeout": "timeout",
+}
+_SAFE_FINISH_REASONS = {
+    "blocked": "blocked",
+    "content_filter": "content_filter",
+    "function_call": "tool_calls",
+    "length": "length",
+    "max_tokens": "length",
+    "recitation": "recitation",
+    "safety": "safety",
+    "stop": "stop",
+    "tool_call": "tool_calls",
+    "tool_calls": "tool_calls",
+}
+
+
+def _safe_failure_origin(metadata: Any) -> str:
+    """Map only known provider metadata values; arbitrary strings stay hidden."""
+    if not isinstance(metadata, dict):
+        return "unknown"
+    raw = metadata.get("failure_origin") or metadata.get("failure_type")
+    if not isinstance(raw, str):
+        return "unknown"
+    return _SAFE_FAILURE_ORIGINS.get(raw.strip().lower(), "unknown")
+
+
+def _safe_finish_reason(metadata: Any) -> str:
+    """Allowlist the stable completion reasons; never echo provider text."""
+    if not isinstance(metadata, dict):
+        return "none"
+    raw = metadata.get("finish_reason")
+    if not isinstance(raw, str):
+        return "none"
+    key = raw.strip().lower()
+    if not key:
+        return "none"
+    return _SAFE_FINISH_REASONS.get(key, "unknown")
+
+
+def _safe_fallback_exhausted(metadata: Any) -> bool | str:
+    """Return only a real boolean (or explicitly unknown), never truthiness."""
+    if not isinstance(metadata, dict) or "fallback_exhausted" not in metadata:
+        return False
+    value = metadata.get("fallback_exhausted")
+    return value if isinstance(value, bool) else "unknown"
+
+
 def _failure_reason(response: Any) -> str:
     metadata = getattr(response, "metadata", None) or {}
     category = str(metadata.get("failure_type") or "").strip()
@@ -656,13 +717,10 @@ async def _call(
             "AI_EXEC_TRACE request_id=%s stage=provider_call_failed error=%s",
             request_id or "-", _failure_reason(response),
         )
-        failure_origin = str(
-            metadata.get("failure_origin") or metadata.get("failure_type") or ""
-        ) or "-"
         occurrence_trace(
             "provider_call_result", outcome="provider_failed",
-            provider=provider, failure_origin=failure_origin,
-            fallback_exhausted=bool(metadata.get("fallback_exhausted", False)),
+            provider=provider, failure_origin=_safe_failure_origin(metadata),
+            fallback_exhausted=_safe_fallback_exhausted(metadata),
             category="provider_response_failure",
         )
         raise HistoryAIError(
@@ -678,7 +736,7 @@ async def _call(
         occurrence_trace(
             "provider_call_result", outcome="empty_output", provider=provider,
             category="provider_empty_output",
-            finish_reason=str(metadata.get("finish_reason") or "-"),
+            finish_reason=_safe_finish_reason(metadata),
         )
         raise HistoryAIError(
             "the AI provider returned an empty response", code=ERROR_PROVIDER,

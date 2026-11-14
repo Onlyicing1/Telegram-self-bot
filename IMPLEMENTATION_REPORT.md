@@ -70,6 +70,15 @@ or peer/chat identifiers. Raw exception messages are not used in occurrence
 trace fields; only the exception class and a stable category are emitted.
 Per-message and per-loop-iteration logging is not added.
 
+Provider metadata is not traced verbatim. `failure_origin` is mapped through
+an explicit allowlist (authentication/rate limit/network/server/request/
+timeout/provider/model lookup), and unknown or malformed values become
+`unknown`. `finish_reason` is likewise allowlisted (`stop`, `length`,
+`content_filter`, `safety`, `recitation`, `tool_calls`, `blocked`), with unknown
+values becoming `unknown`. `fallback_exhausted` is logged only as a real
+boolean or `unknown`, never by truthiness. Provider bodies, error messages,
+request ids and arbitrary metadata strings are never copied into the trace.
+
 ## 2. Instrumented stages and files
 
 | File | Trace coverage |
@@ -80,14 +89,35 @@ Per-message and per-loop-iteration logging is not added.
 | `backend/ai/tools/history_schedule.py` | Tool invocation, provenance result, argument result, service call/result/exception |
 | `backend/services/history_schedule_service.py` | Task identity, state lookup/validation, peer policy, upper bound, retrieval, safe skip, AI call, output validation, CAS commit, failure lifecycle, terminal checkpoint |
 | `backend/services/history_ai_service.py` | Chunking/map capacity, provider call/timeout/failure/empty output, map/reduce result |
-| `backend/ai/database/task_repository.py` | Occurrence create/existing result; narrow History read/CAS outcomes for get, commit, scan advance, failure write and reset, in both in-memory test fake and Supabase |
+| `backend/ai/database/task_repository.py` | Occurrence create/existing result; `repository_fallback` for task/occurrence reads and writes that degrade to memory; narrow History read/CAS outcomes for get, commit, scan advance, failure write and reset, in both in-memory test fake and Supabase |
 | `backend/ai/task_creation.py` | Creation entry/validation, duplicate check, separate task write, durability refusal, separate state write, compensation start/result, final creation result |
 | `backend/bot/handlers/history.py` | Creation entry, eligibility, durable-storage availability, peer validation, baseline, definition validation, handler result |
-| `tests/test_history_schedule_tracing.py` | 19 focused trace cases covering the required scenarios |
+| `tests/test_history_schedule_tracing.py` | 22 focused trace cases covering the required scenarios, including repository fallback and provider metadata allowlisting |
 
 The service and creation public functions are thin tracing wrappers around
 renamed unchanged implementations; no behavior was moved to a new execution
 authority.
+
+### 2.1 Repository fallback events
+
+A Supabase occurrence/task operation that degrades to memory emits:
+
+```text
+repository_fallback operation=<operation> outcome=memory_fallback category=memory_fallback fallback_backend=InMemoryTaskRepository result=present|missing|hit|miss|rows count=<n>
+```
+
+If the fallback itself raises, the event is
+`outcome=fallback_failed exception=<class>` and the original exception is
+re-raised unchanged. Cancellation is reported as `fallback_cancelled` and
+re-raised. The fallback behavior, CAS checks, retry/recovery policy and state
+transitions are unchanged.
+
+This event is the only proof that a successful-looking operation was served by
+process memory rather than Supabase. It is silent outside an occurrence scope.
+`repository_fallback` is emitted for `create_occurrence`, `get_occurrence`,
+`claim_occurrence`, `transition_occurrence`, occurrence list/recovery/retry/
+waiting-answer reads, `resume_waiting_for_answer`, and the task read/update
+paths used during an occurrence. A durable operation emits no such event.
 
 ## 3. What the first live run should emit
 
@@ -148,6 +178,14 @@ operation=advance_history_scan ... revision_unchanged=True` must show that only
 the scan cursor advanced. A summary commit must show old/new revision and
 version values on the repository and commit events.
 
+On a degraded Supabase path, a `repository_fallback operation=...` event can
+appear immediately after the corresponding occurrence read, claim, transition,
+list or task read/write. Its `outcome=memory_fallback` means the operation
+succeeded only in process memory; `outcome=fallback_failed` means the memory
+fallback also failed. A durable operation emits no fallback event. Presence of
+`occurrence_persist_result` or `repository_read_result` alone does not prove
+durability.
+
 To find the first failing or missing stage, filter the complete log by the
 occurrence's `trace_id` and read the stages in order. The last occurrence stage
 before the trace stops is the boundary that did not complete:
@@ -155,6 +193,10 @@ before the trace stops is the boundary that did not complete:
 - No `due_task_discovered`: the scheduler did not select the task (status,
   `next_run_at`, due query) or schedule parsing rejected it; look for the
   existing `Task <id> was not scheduled` warning.
+- `repository_fallback outcome=memory_fallback` after any occurrence/task
+  operation: the result came from memory, not Supabase, and is not durable even
+  if the operation otherwise succeeded. `outcome=fallback_failed` means both
+  the durable operation and the memory fallback failed.
 - `claim_result outcome=conflict|not_claimed`: another execution/state owns it.
 - `execution_handoff` without `execution_entered`: coordinator invocation
   failed or no execution authority was present.
@@ -207,9 +249,10 @@ Command:
 .venv/bin/python -m pytest tests/test_history_schedule_tracing.py -q
 ```
 
-Result: **19 passed**, 1 warning, 0 failed.
+Result: **22 passed**, 1 warning, 0 failed.
 
-The 19 cases cover all 18 required scenarios: ordered success stages; the same
+The 22 cases cover all 18 required scenarios plus repository fallback and
+provider metadata allowlisting: ordered success stages; the same
 correlation id across scheduler/coordinator/tool/service; retry with distinct
 attempt; concurrent isolation; reset after success, exception and cancellation;
 ordinary-request silence; invalid provenance rejection before the service;
@@ -219,21 +262,24 @@ oversized output versus provider failure; CAS conflict versus durable error;
 scan-only versus summary commit; compensation success/failure; and absence of
 message, summary, instruction, credential and provider-body content.
 
-The provider-boundary test exercises the real `summarize_incremental()` with a
-fake provider response for provider failure, timeout and empty output.
+The provider-boundary tests exercise the real `summarize_incremental()` with a
+fake provider response for provider failure, timeout, empty output, arbitrary
+multiline metadata, and known safe metadata values. Repository fallback tests
+use `SupabaseTaskRepository` with a failing fake client and an in-memory
+fallback; no live Supabase call is made.
 
 ### 4.2 Focused History/scheduler/execution regression
 
 Command:
 
 ```
-.venv/bin/python -m pytest tests/test_history_schedule.py tests/test_history_schedules.py \
-  tests/test_history_schedule_ui.py tests/test_task_execution.py \
-  tests/test_task_scheduler.py tests/test_task_creation_diagnostics.py \
-  tests/test_task_recursion_and_message_id_provenance.py -q
+.venv/bin/python -m pytest tests/test_task_repository.py tests/test_task_hardening.py \
+  tests/test_task_fallback_classification.py tests/test_history_schedules.py \
+  tests/test_history_schedule.py tests/test_history_schedule_ui.py \
+  tests/test_task_execution.py tests/test_task_scheduler.py -q
 ```
 
-Result: **114 passed, 1 failed**. The only failure is the pre-existing
+Result: **139 passed, 1 failed**. The only failure is the pre-existing
 `tests/test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`
 (“interval advancement exceeded bound”), reproduced before this delivery and
 unrelated to tracing.
@@ -246,7 +292,7 @@ Command:
 .venv/bin/python -m pytest tests -q --ignore=tests/test_runtime_session_terminal.py
 ```
 
-Result: **7,853 passed, 27 skipped, 1 failed** in 146.01 s. The one failure is
+Result: **7,856 passed, 27 skipped, 1 failed** in 144.98 s. The one failure is
 the same pre-existing scheduler recovery test. `tests/test_runtime_session_terminal.py`
 is the pre-existing untracked file with collection errors; it was excluded and
 not modified.
@@ -289,14 +335,18 @@ do not prove Scheduled History works end-to-end.
   stages are correlated.
 - The exact event sequence is covered by tests but is not a versioned external
   telemetry schema; future stages must keep the same bounded-field discipline.
-- Provider identity and fallback metadata are logged only when the existing
-  provider response exposes them. The trace does not invent or force-fetch
-  cooldown state.
+- The provider allowlist preserves only known failure origins and finish
+  reasons. A provider-private string outside those sets is intentionally
+  reported as `unknown`; it is not available for diagnosis. The trace does not
+  invent or force-fetch cooldown/retry state.
 - Per-stage duration is emitted for the checkpoint and execution result, not
   every intermediate stage. The ordered stages still localize the failing
   boundary.
 - Persistent failure metadata continues to use the existing bounded repository
   error text; tracing deliberately does not add summary or message content.
+- A fallback event identifies the losing durable operation but does not retry
+  the durable write or change the operation's return value. The existing
+  fallback/cooldown health contract remains authoritative.
 - The pre-existing scheduler recovery test failure remains open and untouched.
 
 ## 7. Historical implementation state (unchanged)

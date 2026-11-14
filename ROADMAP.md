@@ -76,16 +76,21 @@ Phase 4 creation, then Phase 4 completed. No phase was renumbered.
   terminal outcome; tool provenance/argument validation and service invocation;
   durable state lookup/validation, peer policy, stable upper bound, retrieval,
   safe skip, AI/provider, output validation, CAS commit and failure metadata;
-  narrow repository read/CAS outcomes.
+  narrow repository read/CAS outcomes and occurrence-visible memory-fallback
+  outcomes.
 - Trace output carries only bounded operational metadata. It never logs message
   bodies, summaries, owner instructions, prompts, provider bodies, credentials
-  or peer identifiers; raw exception text is not used. Ordinary Telegram/AI
-  requests emit no scheduled trace because the occurrence scope is absent.
-- Focused tests cover ordered success, cross-stage correlation, retry attempt
-  separation, concurrent isolation, reset after success/exception/cancellation,
-  ordinary-request silence, provenance rejection, storage/state, peer-policy,
-  retrieval, AI/provider, safe-skip/summary, output, CAS/durable-error,
-  compensation and content-privacy distinctions.
+  or peer identifiers; raw exception text is not used. Provider metadata values
+  are allowlisted, with unknown origins/reasons normalized to `unknown`.
+  Ordinary Telegram/AI requests emit no scheduled trace because the occurrence
+  scope is absent.
+- Twenty focused test functions (22 parameterized cases) cover ordered
+  success, cross-stage correlation, retry attempt separation, concurrent
+  isolation, reset after success/exception/cancellation, ordinary-request
+  silence, provenance rejection, storage/state, peer-policy, retrieval,
+  AI/provider, safe-skip/summary, output, CAS/durable-error, compensation,
+  repository memory-fallback success/failure, provider metadata allowlisting
+  and content-privacy distinctions.
 - No schema, migration, scheduler, worker, execution path, cursor/CAS rule,
   provider policy or retrieval limit was changed.
 
@@ -157,7 +162,7 @@ Phase 4 creation, then Phase 4 completed. No phase was renumbered.
 - Phase 7 observability prerequisite: occurrence-scoped end-to-end tracing for
   creation/compensation, scheduler/occurrence lifecycle, coordinator actions,
   the History tool/service, AI/provider boundary and repository CAS outcomes;
-  19 focused trace tests pass, including correlation, retry, concurrency,
+  22 focused trace cases pass, including correlation, retry, concurrency,
   cleanup, failure distinctions and content privacy.
 - `IMPLEMENTATION_REPORT.md` and `INVESTIGATION.md` record the audited state.
 

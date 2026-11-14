@@ -1050,6 +1050,57 @@ class SupabaseTaskRepository(TaskRepository):
             self._mark_fallback(exc)
         if announce:
             logger.warning(message, exc)
+    def _trace_fallback(
+        self, operation: str, outcome: str, *, exc: BaseException | None = None,
+        result: str = "", count: int | None = None,
+    ) -> None:
+        """Trace one occurrence-visible fallback without changing its behavior.
+
+        The event is emitted only when an occurrence scope is active; ordinary
+        task traffic stays silent. It carries no owner/peer/message ids or raw
+        exception text.
+        """
+        fields: dict[str, Any] = {
+            "operation": operation,
+            "outcome": outcome,
+            "category": "memory_fallback",
+            "fallback_backend": type(self._fallback).__name__,
+        }
+        if exc is not None:
+            fields["exception"] = type(exc).__name__
+        if result:
+            fields["result"] = result
+        if count is not None:
+            fields["count"] = count
+        occurrence_trace("repository_fallback", **fields)
+
+    async def _fallback_for(self, operation: str, call, *, result_kind: str = "record"):
+        """Run the existing fallback and report its outcome, never replacing it."""
+        try:
+            result = await call()
+        except asyncio.CancelledError:
+            self._trace_fallback(operation, "fallback_cancelled")
+            raise
+        except Exception as exc:
+            self._trace_fallback(operation, "fallback_failed", exc=exc)
+            raise
+        if result_kind == "rows":
+            self._trace_fallback(
+                operation, "memory_fallback", result="rows",
+                count=len(result or []),
+            )
+        elif result_kind == "hit_miss":
+            self._trace_fallback(
+                operation, "memory_fallback",
+                result="hit" if result is not None else "miss",
+            )
+        else:
+            self._trace_fallback(
+                operation, "memory_fallback",
+                result="present" if result is not None else "missing",
+            )
+        return result
+
     def _history_unavailable(self, message: str, exc: Exception):
         """Log once per episode, keep the degraded diagnostic, and fail closed.
 
@@ -1163,7 +1214,12 @@ class SupabaseTaskRepository(TaskRepository):
             result=await self._run(lambda:self._client.table("ai_tasks").select("*").eq("id",task_id).eq("owner_id",owner_id).maybe_single().execute());row=getattr(result,"data",None);self._mark_supabase_ok()
             if not row:return None
             record=_task_from_row(row[0] if isinstance(row,list) else row);self._observe_durable_task(record);return record
-        except Exception as exc:self._degrade("Supabase task read failed; using fallback: %s",exc);return await self._fallback.get_task(owner_id,task_id)
+        except Exception as exc:
+            self._degrade("Supabase task read failed; using fallback: %s",exc)
+            return await self._fallback_for(
+                "get_task", lambda: self._fallback.get_task(owner_id,task_id),
+                result_kind="hit_miss",
+            )
     async def list_tasks(self, owner_id):
         try:
             result=await self._run(lambda:self._client.table("ai_tasks").select("*").eq("owner_id",owner_id).order("updated_at",desc=True).execute());self._mark_supabase_ok()
@@ -1208,7 +1264,13 @@ class SupabaseTaskRepository(TaskRepository):
         try:
             result=await self._run(lambda:self._client.table("ai_tasks").update(outgoing).eq("id",task_id).eq("owner_id",owner_id).eq("version",expected_version).execute());row=getattr(result,"data",None);self._mark_supabase_ok();return _task_from_row(row[0] if isinstance(row,list) else row) if row else None
         except (ValueError,TypeError):raise
-        except Exception as exc:self._degrade("Supabase task update failed; using fallback: %s",exc);return self._annotate_fallback(await self._fallback.update_task(owner_id,task_id,expected_version,updates))
+        except Exception as exc:
+            self._degrade("Supabase task update failed; using fallback: %s",exc)
+            updated=await self._fallback_for(
+                "update_task",
+                lambda: self._fallback.update_task(owner_id,task_id,expected_version,updates),
+            )
+            return self._annotate_fallback(updated)
     async def advance_next_run(self, owner_id, task_id, expected_version, next_run_at): return await self.update_task(owner_id,task_id,expected_version,{"next_run_at":next_run_at})
     async def transition_task(self, owner_id, task_id, status, expected_version=None):
         current=await self.get_task(owner_id,task_id)
@@ -1282,38 +1344,76 @@ class SupabaseTaskRepository(TaskRepository):
                 "operation=create_occurrence exception=%s",
                 exc,
             )
-            return await self._fallback.create_occurrence(owner_id,data)
+            return await self._fallback_for(
+                "create_occurrence",
+                lambda: self._fallback.create_occurrence(owner_id,data),
+            )
     async def get_occurrence(self, owner_id, task_id, occurrence_key):
         try:
             result=await self._run(lambda:self._client.table("ai_task_occurrences").select("*").eq("task_id",task_id).eq("occurrence_key",occurrence_key).eq("owner_id",owner_id).maybe_single().execute());row=getattr(result,"data",None);self._mark_supabase_ok();return _occurrence_from_row(row[0] if isinstance(row,list) else row) if row else None
-        except Exception as exc:self._degrade("Supabase occurrence read failed; using fallback: %s",exc);return await self._fallback.get_occurrence(owner_id,task_id,occurrence_key)
+        except Exception as exc:
+            self._degrade("Supabase occurrence read failed; using fallback: %s",exc)
+            return await self._fallback_for(
+                "get_occurrence",
+                lambda: self._fallback.get_occurrence(owner_id,task_id,occurrence_key),
+                result_kind="hit_miss",
+            )
     async def list_occurrences(self, owner_id, task_id=None, limit=100):
         try:
             query=self._client.table("ai_task_occurrences").select("*").eq("owner_id",owner_id)
             if task_id is not None:query=query.eq("task_id",task_id)
             result=await self._run(lambda:query.order("scheduled_for",desc=True).limit(limit).execute());self._mark_supabase_ok();return [_occurrence_from_row(row) for row in (getattr(result,"data",None) or [])]
-        except Exception as exc:self._degrade("Supabase occurrence list failed; using fallback: %s",exc);return await self._fallback.list_occurrences(owner_id,task_id,limit)
+        except Exception as exc:
+            self._degrade("Supabase occurrence list failed; using fallback: %s",exc)
+            return await self._fallback_for(
+                "list_occurrences",
+                lambda: self._fallback.list_occurrences(owner_id,task_id,limit),
+                result_kind="rows",
+            )
     async def list_recoverable_occurrences(self, owner_id, limit=100):
         try:
             result=await self._run(lambda:self._client.table("ai_task_occurrences").select("*").eq("owner_id",owner_id).in_("status",["claimed","running","interrupted"]).order("updated_at").limit(limit).execute());self._mark_supabase_ok();return [_occurrence_from_row(row) for row in (getattr(result,"data",None) or [])]
-        except Exception as exc:self._degrade("Supabase recovery query failed; using fallback: %s",exc);return await self._fallback.list_recoverable_occurrences(owner_id,limit)
+        except Exception as exc:
+            self._degrade("Supabase recovery query failed; using fallback: %s",exc)
+            return await self._fallback_for(
+                "list_recoverable_occurrences",
+                lambda: self._fallback.list_recoverable_occurrences(owner_id,limit),
+                result_kind="rows",
+            )
     async def list_due_retry_occurrences(self, owner_id, now, limit=10):
         try:
             result=await self._run(lambda:self._client.table("ai_task_occurrences").select("*").eq("owner_id",owner_id).eq("status","retry_pending").lte("retry_at",_serialize(now)).order("retry_at").limit(limit).execute());self._mark_supabase_ok();return [_occurrence_from_row(row) for row in (getattr(result,"data",None) or [])]
-        except Exception as exc:self._degrade("Supabase retry query failed; using fallback: %s",exc);return await self._fallback.list_due_retry_occurrences(owner_id,now,limit)
+        except Exception as exc:
+            self._degrade("Supabase retry query failed; using fallback: %s",exc)
+            return await self._fallback_for(
+                "list_due_retry_occurrences",
+                lambda: self._fallback.list_due_retry_occurrences(owner_id,now,limit),
+                result_kind="rows",
+            )
     async def list_waiting_answer_occurrences(self, owner_id, limit=10):
         """The owner's parked questions (oldest first); degrades to the fallback."""
         try:
             result=await self._run(lambda:self._client.table("ai_task_occurrences").select("*").eq("owner_id",owner_id).eq("status",WAITING_ANSWER_STATUS).order("updated_at").limit(limit).execute());self._mark_supabase_ok();return [_occurrence_from_row(row) for row in (getattr(result,"data",None) or [])]
         except asyncio.CancelledError:raise
-        except Exception as exc:self._degrade("Supabase pending-question query failed; using fallback: %s",exc);return await self._fallback.list_waiting_answer_occurrences(owner_id,limit)
+        except Exception as exc:
+            self._degrade("Supabase pending-question query failed; using fallback: %s",exc)
+            return await self._fallback_for(
+                "list_waiting_answer_occurrences",
+                lambda: self._fallback.list_waiting_answer_occurrences(owner_id,limit),
+                result_kind="rows",
+            )
     async def claim_occurrence(self, owner_id, task_id, occurrence_key):
         current=await self.get_occurrence(owner_id,task_id,occurrence_key)
         if not current or current.status not in {"claimed","retry_pending","interrupted"}:return None
         now=_now().isoformat()
         try:
             result=await self._run(lambda:self._client.table("ai_task_occurrences").update({"status":"running","claimed_at":current.claimed_at.isoformat() if current.claimed_at else now,"started_at":now,"updated_at":now}).eq("task_id",task_id).eq("occurrence_key",occurrence_key).eq("owner_id",owner_id).eq("status",current.status).execute());row=getattr(result,"data",None);self._mark_supabase_ok();return _occurrence_from_row(row[0] if isinstance(row,list) else row) if row else None
-        except Exception as exc:self._degrade("Supabase occurrence claim failed; using fallback: %s",exc);return await self._fallback.claim_occurrence(owner_id,task_id,occurrence_key)
+        except Exception as exc:
+            self._degrade("Supabase occurrence claim failed; using fallback: %s",exc)
+            return await self._fallback_for(
+                "claim_occurrence",
+                lambda: self._fallback.claim_occurrence(owner_id,task_id,occurrence_key),
+            )
     async def _occurrence_transition_write(self, owner_id, task_id, occurrence_key, current_status, outgoing):
         """One CAS update: only the row still in ``current_status`` may move."""
         return await self._run(lambda:self._client.table("ai_task_occurrences").update(outgoing).eq("task_id",task_id).eq("occurrence_key",occurrence_key).eq("owner_id",owner_id).eq("status",current_status).execute())
@@ -1353,7 +1453,12 @@ class SupabaseTaskRepository(TaskRepository):
                         )
             if result is None:
                 self._degrade("Supabase occurrence transition failed; using fallback: %s",exc)
-                return await self._fallback.transition_occurrence(owner_id,task_id,occurrence_key,status,**updates)
+                return await self._fallback_for(
+                    "transition_occurrence",
+                    lambda: self._fallback.transition_occurrence(
+                        owner_id,task_id,occurrence_key,status,**updates
+                    ),
+                )
         row=getattr(result,"data",None);self._mark_supabase_ok();return _occurrence_from_row(row[0] if isinstance(row,list) else row) if row else None
     async def resume_waiting_for_answer(self, owner_id, task_id, occurrence_key, *, answer, answer_metadata):
         """The ONE resume edge for a parked question: ONE CAS write consumes it.
@@ -1379,7 +1484,13 @@ class SupabaseTaskRepository(TaskRepository):
         except asyncio.CancelledError:raise
         except Exception as exc:
             self._degrade("Supabase answer-resume failed; using fallback: %s",exc)
-            return await self._fallback.resume_waiting_for_answer(owner_id,task_id,occurrence_key,answer=answer,answer_metadata=answer_metadata)
+            return await self._fallback_for(
+                "resume_waiting_for_answer",
+                lambda: self._fallback.resume_waiting_for_answer(
+                    owner_id,task_id,occurrence_key,
+                    answer=answer,answer_metadata=answer_metadata,
+                ),
+            )
 
     def _step_payload(self, owner_id, payload):
         value={**payload,"owner_id":owner_id};_validate_step_input(value);return {k:_serialize(v) for k,v in value.items() if k not in {"id","created_at","updated_at"}}

@@ -19,6 +19,7 @@ from backend.ai.database.task_repository import (
     DELETION_STALE,
     HistoryStorageUnavailable,
     InMemoryTaskRepository,
+    SupabaseTaskRepository,
     TaskDeletionResult,
 )
 from backend.ai.retry import retry_delay
@@ -43,6 +44,7 @@ from backend.ai.tools.registry import ToolRegistry, create_default_registry
 from backend.services import history_ai_service, history_schedule_service, history_service
 from backend.services.history_service import HistoryBatch, HistoryMessage
 from backend.telegram_api.peers import PeerType
+from tests.test_task_repository import FakeClient, occurrence_data, task_data
 
 OWNER = 92001
 PEER = -10092001
@@ -735,7 +737,111 @@ async def test_provider_failure_timeout_and_empty_output_are_distinct_and_conten
 
     _empty, empty_trace = await _run("empty")
     assert "stage=provider_call_result outcome=empty_output" in empty_trace
+    assert "finish_reason=stop" in empty_trace
     assert "SECRET_PROVIDER_BODY" not in empty_trace
+
+
+@pytest.mark.asyncio
+async def test_provider_metadata_is_allowlisted_before_tracing(caplog):
+    caplog.set_level(logging.INFO)
+
+    class _Manager:
+        async def chat(self, messages, **kwargs):
+            return SimpleNamespace(
+                success=False,
+                text="SECRET_PROVIDER_BODY",
+                provider_name="fake-provider",
+                metadata={
+                    "failure_origin": "SECRET_ORIGIN" + chr(10) + "SECRET_SECOND_LINE",
+                    "failure_type": "SECRET_FAILURE_TYPE",
+                    "fallback_exhausted": "SECRET_TRUTHY_STRING",
+                    "finish_reason": "SECRET_FINISH_REASON",
+                },
+            )
+
+    with occurrence_scope(KEY, task_id=77, attempt=1):
+        ok, _message_text, _data = await history_ai_service.summarize_incremental(
+            (_message(11),), provider_manager=_Manager(), timeout_s=30,
+        )
+    assert ok is False
+    trace = "\n".join(_lines(caplog))
+    assert "stage=provider_call_result outcome=provider_failed" in trace
+    assert "failure_origin=unknown" in trace
+    assert "fallback_exhausted=unknown" in trace
+    for secret in (
+        "SECRET_PROVIDER_BODY", "SECRET_ORIGIN", "SECRET_SECOND_LINE",
+        "SECRET_FAILURE_TYPE", "SECRET_TRUTHY_STRING", "SECRET_FINISH_REASON",
+    ):
+        assert secret not in trace
+
+
+@pytest.mark.asyncio
+async def test_repository_occurrence_fallbacks_are_correlated_and_content_free(caplog):
+    caplog.set_level(logging.INFO)
+    fallback = InMemoryTaskRepository()
+    task = await fallback.create_task(10, task_data())
+    repo = SupabaseTaskRepository(
+        FakeClient(error=RuntimeError("SECRET_DATABASE_ERROR_TEXT")), fallback,
+    )
+
+    with occurrence_scope(KEY, task_id=task.id, attempt=1):
+        created = await repo.create_occurrence(10, occurrence_data(task.id))
+        read = await repo.get_occurrence(10, task.id, created.occurrence_key)
+        missing = await repo.get_occurrence(10, task.id, "missing")
+        claimed = await repo.claim_occurrence(10, task.id, created.occurrence_key)
+        transitioned = await repo.transition_occurrence(
+            10, task.id, created.occurrence_key, "succeeded"
+        )
+
+    assert read is not None and missing is None and claimed.status == "running"
+    assert transitioned.status == "succeeded"
+    lines = _lines(caplog)
+    trace = "\n".join(lines)
+    for operation in (
+        "get_task", "get_occurrence", "create_occurrence", "claim_occurrence",
+        "transition_occurrence",
+    ):
+        assert f"stage=repository_fallback operation={operation}" in trace
+    for line in lines:
+        if "stage=repository_fallback" in line:
+            assert f"trace_id={KEY}" in line
+            assert "outcome=memory_fallback" in line
+            assert "fallback_backend=InMemoryTaskRepository" in line
+    assert "result=present" in trace
+    assert "operation=get_occurrence outcome=memory_fallback category=memory_fallback " \
+        "fallback_backend=InMemoryTaskRepository result=miss" in trace
+    assert "SECRET_DATABASE_ERROR_TEXT" not in trace
+
+
+@pytest.mark.asyncio
+async def test_failed_repository_fallback_is_distinct_and_ordinary_requests_are_silent(caplog):
+    caplog.set_level(logging.INFO)
+
+    class _ExplodingFallback(InMemoryTaskRepository):
+        async def get_occurrence(self, owner_id, task_id, occurrence_key):
+            raise RuntimeError("SECRET_FALLBACK_ERROR_TEXT")
+
+    repo = SupabaseTaskRepository(
+        FakeClient(error=RuntimeError("SECRET_DATABASE_ERROR_TEXT")),
+        _ExplodingFallback(),
+    )
+    with occurrence_scope(KEY, task_id=77, attempt=1):
+        with pytest.raises(RuntimeError):
+            await repo.get_occurrence(10, 7, "k1")
+
+    trace = "\n".join(_lines(caplog))
+    assert "stage=repository_fallback operation=get_occurrence outcome=fallback_failed" in trace
+    assert "exception=RuntimeError" in trace
+    assert "SECRET_FALLBACK_ERROR_TEXT" not in trace
+    assert "SECRET_DATABASE_ERROR_TEXT" not in trace
+
+    caplog.clear()
+    outside = SupabaseTaskRepository(
+        FakeClient(error=RuntimeError("SECRET_DATABASE_ERROR_TEXT")),
+        InMemoryTaskRepository(),
+    )
+    assert await outside.get_occurrence(10, 7, "k1") is None
+    assert _lines(caplog) == []
 
 
 @pytest.mark.asyncio
