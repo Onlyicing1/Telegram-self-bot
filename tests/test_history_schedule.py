@@ -20,6 +20,7 @@ from backend.ai.task_contract import (
     SCHEDULED_HISTORY_ACTION,
     SCHEDULED_OCCURRENCE_EXTRA,
     SCHEDULED_TASK_ID_EXTRA,
+    scheduled_occurrence_provenance,
 )
 from backend.ai.task_creation import (
     HistoryScheduleCreationError,
@@ -27,6 +28,7 @@ from backend.ai.task_creation import (
     TaskCreationService,
 )
 from backend.ai.task_execution import TaskExecutionCoordinator
+from backend.ai.task_scheduler import occurrence_key
 from backend.ai.tools.base import PermissionLevel, ToolResult
 from backend.ai.tools.context import ToolContext
 from backend.ai.tools.executor import ToolExecutor
@@ -39,6 +41,7 @@ from backend.telegram_api.peers import PeerType
 OWNER = 7001
 PEER = -1007001
 REF = datetime(2026, 11, 14, 12, 0, tzinfo=timezone.utc)
+VALID_SCHEDULED_KEY = occurrence_key(77, REF)
 
 
 def _message(message_id: int, text: str = "hello") -> HistoryMessage:
@@ -492,28 +495,22 @@ async def test_the_tool_requires_both_trusted_scheduled_markers(monkeypatch):
 
     occurrence_only = ToolContext(
         None, OWNER, "UTC",
-        extra={SCHEDULED_OCCURRENCE_EXTRA: "77:2026-11-14T12:00:00+00:00"},
+        extra={SCHEDULED_OCCURRENCE_EXTRA: VALID_SCHEDULED_KEY},
     )
     result = await ScheduledHistoryTool(occurrence_only).execute(occurrence_only, {})
     assert result.success is False
     assert result.data["error"] == "scheduled_history_provenance_missing"
 
-    for marker in (True, "", "   ", "999:2026-11-14T12:00:00+00:00", "x" * 257):
-        context = ToolContext(
-            None, OWNER, "UTC",
-            extra={
-                SCHEDULED_TASK_ID_EXTRA: 77,
-                SCHEDULED_OCCURRENCE_EXTRA: marker,
-            },
-        )
-        result = await ScheduledHistoryTool(context).execute(context, {})
-        assert result.success is False, marker
-        expected = (
-            "scheduled_history_provenance_inconsistent"
-            if marker == "999:2026-11-14T12:00:00+00:00"
-            else "scheduled_history_provenance_invalid"
-        )
-        assert result.data["error"] == expected, marker
+    arbitrary = ToolContext(
+        None, OWNER, "UTC",
+        extra={
+            SCHEDULED_TASK_ID_EXTRA: 77,
+            SCHEDULED_OCCURRENCE_EXTRA: "k",
+        },
+    )
+    result = await ScheduledHistoryTool(arbitrary).execute(arbitrary, {})
+    assert result.success is False
+    assert result.data["error"] == "scheduled_history_provenance_invalid"
 
     assert seen == []
 
@@ -521,12 +518,54 @@ async def test_the_tool_requires_both_trusted_scheduled_markers(monkeypatch):
         None, OWNER, "UTC",
         extra={
             SCHEDULED_TASK_ID_EXTRA: 77,
-            SCHEDULED_OCCURRENCE_EXTRA: "77:2026-11-14T12:00:00+00:00",
+            SCHEDULED_OCCURRENCE_EXTRA: VALID_SCHEDULED_KEY,
         },
     )
     result = await ScheduledHistoryTool(context).execute(context, {})
     assert result.success is True
     assert seen == [77]
+
+
+@pytest.mark.parametrize(
+    ("task_id", "marker", "expected_error"),
+    [
+        (77, VALID_SCHEDULED_KEY, ""),
+        (77, "k", "invalid"),
+        (77, "77", "invalid"),
+        (77, "77:", "invalid"),
+        (77, "77:invalid", "invalid"),
+        (77, "77:2026-11-14T12:00:00", "invalid"),
+        (77, "77:2026-11-14T12:00:00Z", "invalid"),
+        (77, "77:2026-11-14T12:00:00+01:00", "invalid"),
+        (77, "78:2026-11-14T12:00:00+00:00", "inconsistent"),
+        (True, VALID_SCHEDULED_KEY, "invalid"),
+        (0, VALID_SCHEDULED_KEY, "invalid"),
+        (-1, VALID_SCHEDULED_KEY, "invalid"),
+        (77, " " + VALID_SCHEDULED_KEY, "invalid"),
+        (77, VALID_SCHEDULED_KEY + " ", "invalid"),
+        (77, "x" * 257, "invalid"),
+    ],
+)
+def test_occurrence_provenance_requires_the_exact_scheduler_key(
+    task_id, marker, expected_error,
+):
+    task_key, occurrence, error = scheduled_occurrence_provenance({
+        SCHEDULED_TASK_ID_EXTRA: task_id,
+        SCHEDULED_OCCURRENCE_EXTRA: marker,
+    })
+    assert error == expected_error
+    if expected_error:
+        assert (task_key, occurrence) == (0, "")
+    else:
+        assert (task_key, occurrence) == (77, VALID_SCHEDULED_KEY)
+
+
+def test_a_generated_key_with_microseconds_is_valid():
+    key = occurrence_key(77, REF.replace(microsecond=123456))
+    assert scheduled_occurrence_provenance({
+        SCHEDULED_TASK_ID_EXTRA: 77,
+        SCHEDULED_OCCURRENCE_EXTRA: key,
+    }) == (77, key, "")
 
 
 @pytest.mark.asyncio
@@ -544,7 +583,7 @@ async def test_model_supplied_identity_arguments_are_refused_before_any_lookup(m
         None, OWNER, "UTC",
         extra={
             SCHEDULED_TASK_ID_EXTRA: 77,
-            SCHEDULED_OCCURRENCE_EXTRA: "77:2026-11-14T12:00:00+00:00",
+            SCHEDULED_OCCURRENCE_EXTRA: VALID_SCHEDULED_KEY,
         },
     )
     for arguments in (
@@ -634,14 +673,15 @@ async def test_the_coordinator_injects_the_occurrence_task_id():
         "actions": [{"name": SCHEDULED_HISTORY_ACTION, "arguments": {}}],
         "notification_destination": {},
     })
+    key = occurrence_key(task.id, REF)
     await repo.create_occurrence(OWNER, {
-        "task_id": task.id, "occurrence_key": "k", "definition_version": task.version,
+        "task_id": task.id, "occurrence_key": key, "definition_version": task.version,
         "action_snapshot": [
             {"name": SCHEDULED_HISTORY_ACTION, "arguments": {}}
         ],
         "scheduled_for": REF,
     })
-    await repo.claim_occurrence(OWNER, task.id, "k")
+    await repo.claim_occurrence(OWNER, task.id, key)
     probe = _ProbeTool()
     registry = ToolRegistry()
     registry.register(probe)
@@ -650,9 +690,9 @@ async def test_the_coordinator_injects_the_occurrence_task_id():
         repo, ToolExecutor(registry, context), OWNER, context,
     )
     result = await coordinator.execute(
-        await repo.get_occurrence(OWNER, task.id, "k"),
+        await repo.get_occurrence(OWNER, task.id, key),
     )
     assert result.success
     assert probe.extra is not None
     assert probe.extra[SCHEDULED_TASK_ID_EXTRA] == task.id
-    assert probe.extra[SCHEDULED_OCCURRENCE_EXTRA] == "k"
+    assert probe.extra[SCHEDULED_OCCURRENCE_EXTRA] == key

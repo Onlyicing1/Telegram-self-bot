@@ -31,12 +31,15 @@ MAX_OCCURRENCE_KEY_CHARS = 256
 def scheduled_occurrence_provenance(extra: Any) -> tuple[int, str, str]:
     """``(task_id, occurrence_key, error)`` from TRUSTED runtime context only.
 
-    Both coordinator-injected markers are required. The occurrence key is the
-    existing typed occurrence identity; when its scheduler/event prefix names a
-    task id, that id must match the injected task id or the pair is
-    inconsistent and fails closed. A boolean/absent marker, a blank or
-    oversized key, a non-positive task id, or a model-supplied value is
-    invalid. Callers must use this before any repository or Telegram lookup.
+    Both coordinator-injected markers are required. The occurrence key must be
+    the exact string produced by the existing Scheduler generator
+    (``<task_id>:<UTC ISO-8601 timestamp>``): arbitrary nonblank strings are
+    not identities. The prefix must match the injected task id and the
+    timestamp must be timezone-aware, canonical UTC and byte-identical to
+    ``datetime.isoformat()`` after UTC normalization. A boolean/absent marker,
+    a blank or oversized key, a non-positive task id, or a model-supplied
+    value is invalid; a numeric prefix naming another task is inconsistent.
+    Callers must use this before any repository or Telegram lookup.
     """
     if not isinstance(extra, dict):
         return 0, "", "missing"
@@ -53,9 +56,23 @@ def scheduled_occurrence_provenance(extra: Any) -> tuple[int, str, str]:
         or len(occurrence_key) > MAX_OCCURRENCE_KEY_CHARS
     ):
         return 0, "", "invalid"
-    prefix, separator, _rest = occurrence_key.partition(":")
-    if separator and prefix.isdigit() and int(prefix) != task_id:
+    prefix, separator, timestamp_text = occurrence_key.partition(":")
+    if not separator or not prefix.isdigit() or not timestamp_text:
+        return 0, "", "invalid"
+    if prefix != str(task_id):
         return 0, "", "inconsistent"
+    try:
+        timestamp = datetime.fromisoformat(timestamp_text)
+    except (TypeError, ValueError):
+        return 0, "", "invalid"
+    if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+        return 0, "", "invalid"
+    try:
+        canonical = f"{task_id}:{timestamp.astimezone(timezone.utc).isoformat()}"
+    except (OverflowError, ValueError):
+        return 0, "", "invalid"
+    if canonical != occurrence_key:
+        return 0, "", "invalid"
     return task_id, occurrence_key, ""
 
 #: ``ToolContext.extra`` key carrying the owning ``ai_tasks.id`` of a CLAIMED

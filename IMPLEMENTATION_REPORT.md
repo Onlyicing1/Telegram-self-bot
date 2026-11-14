@@ -96,16 +96,25 @@ The History action previously authorized on `SCHEDULED_TASK_ID_EXTRA` alone.
 The coordinator now injects `SCHEDULED_OCCURRENCE_EXTRA` as the claimed
 occurrence's own `occurrence_key` (the existing typed occurrence identity), not
 a bare boolean. `scheduled_occurrence_provenance()` in `task_contract.py`
-requires BOTH markers, validates the task id and bounded key, and treats a key
-whose numeric task prefix names another task as inconsistent. The tool rejects
-missing/invalid/inconsistent provenance and any argument other than the
-owner-authored `instruction` before calling the service — therefore before any
-repository lookup or Telegram/history retrieval. Model-supplied task, peer,
-occurrence or cursor arguments are never read.
+requires BOTH markers and now enforces the EXACT Scheduler-generated format
+from `task_scheduler.occurrence_key()`:
+`<task_id>:<scheduled_for.astimezone(UTC).isoformat()>`, including the
+canonical `+00:00` UTC offset. A key must be a nonblank string with no leading
+or trailing whitespace, a numeric prefix exactly equal to the injected task id,
+a valid timezone-aware ISO-8601 timestamp, and a byte-identical canonical UTC
+round-trip; arbitrary strings such as `"k"`, `"77"`, `"77:invalid"`, `Z`/
+non-UTC offsets, naive timestamps, foreign prefixes, and oversized keys are
+rejected. The tool rejects missing/invalid/inconsistent provenance and any
+argument other than the owner-authored `instruction` before calling the
+service — therefore before any repository lookup or Telegram/history retrieval.
+Model-supplied task, peer, occurrence or cursor arguments are never read.
 
-Tests: both markers valid; task-id only; occurrence-only; missing; malformed
-(boolean, blank, oversized); foreign-task prefix; model-supplied identity
-arguments; and the coordinator injection assertion.
+Tests: a generated valid key (including microseconds); task-id only;
+occurrence-only; missing; boolean/non-positive task ids; blank/whitespace;
+arbitrary strings; missing/invalid/naive timestamps; `Z` and non-UTC offsets;
+foreign prefix; oversized key; valid provenance reaching the service;
+model-supplied identity arguments; and the coordinator injection assertion using
+a real generated key.
 
 ### 0.3.3 Cancellation and compensation
 
@@ -119,16 +128,12 @@ remain two separate durable writes, not one transaction.
 
 ### 0.3.4 Verification actually run for this correction
 
-- Focused History schedule/repository/UI + task recursion/creation/execution/
-  repository command:
-  `.venv/bin/python -m pytest tests/test_history_schedule.py tests/test_history_schedules.py tests/test_history_schedule_ui.py tests/test_task_recursion_and_message_id_provenance.py tests/test_task_creation_diagnostics.py tests/test_task_execution.py tests/test_task_repository.py -q`
-  → **102 passed**.
-- Wider focused set (History panel/capacity/tools/policy/service, task chains/
-  wait/answers/conditions/scheduler/restart, tool contracts): **647 passed,
-  1 failed** — the scheduler test below.
+- Focused provenance/History schedule command:
+  `.venv/bin/python -m pytest tests/test_history_schedule.py tests/test_history_schedules.py tests/test_history_schedule_ui.py tests/test_task_recursion_and_message_id_provenance.py -q`
+  → **90 passed**.
 - Full suite:
   `.venv/bin/python -m pytest tests -q --ignore=tests/test_runtime_session_terminal.py`
-  → **7,816 passed, 27 skipped, 1 failed** in 209s.
+  → **7,832 passed, 27 skipped, 1 failed** in 146.65s.
 - The only failure,
   `tests/test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`,
   was reproduced **identically on untouched base `27e1d23`** in a disposable
@@ -138,6 +143,8 @@ remain two separate durable writes, not one transaction.
   whose collection errors; it was excluded, not modified or staged.
 - `.venv/bin/python -m compileall -q backend tests`: pass.
 - `git diff --check`: pass.
+
+No live scheduled execution was attempted; all results above are offline tests.
 
 ### 0.3.5 Remaining limitations
 

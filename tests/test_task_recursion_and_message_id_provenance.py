@@ -25,6 +25,7 @@ from backend.ai.database.task_repository import InMemoryTaskRepository
 from backend.ai.providers.base.contract import ProviderResponse
 from backend.ai.providers.manager.manager import ProviderManager
 from backend.ai.task_execution import TaskExecutionCoordinator
+from backend.ai.task_scheduler import occurrence_key
 from backend.ai.tools.base import PermissionLevel, ToolResult
 from backend.ai.tools.context import ToolContext
 from backend.ai.tools.delete import DeleteMessageByIdTool
@@ -195,8 +196,9 @@ class _CapturingTool:
         return ToolResult(True, "ok")
 
 
-def _seed_occurrence(repo, owner, actions, key="k"):
+def _seed_occurrence(repo, owner, actions, key=None):
     async def _seed():
+        scheduled_for = datetime.now(timezone.utc)
         task = await repo.create_task(
             owner,
             {
@@ -208,18 +210,19 @@ def _seed_occurrence(repo, owner, actions, key="k"):
                 "notification_destination": {},
             },
         )
+        occurrence_name = key or occurrence_key(task.id, scheduled_for)
         await repo.create_occurrence(
             owner,
             {
                 "task_id": task.id,
-                "occurrence_key": key,
+                "occurrence_key": occurrence_name,
                 "definition_version": task.version,
                 "action_snapshot": actions,
-                "scheduled_for": datetime.now(timezone.utc),
+                "scheduled_for": scheduled_for,
             },
         )
-        await repo.claim_occurrence(owner, task.id, key)
-        return task, await repo.get_occurrence(owner, task.id, key)
+        await repo.claim_occurrence(owner, task.id, occurrence_name)
+        return task, await repo.get_occurrence(owner, task.id, occurrence_name), occurrence_name
 
     return _seed()
 
@@ -228,7 +231,7 @@ def _seed_occurrence(repo, owner, actions, key="k"):
 async def test_coordinator_marks_the_occurrence_context():
     """The marker is written by the coordinator, not by task/candidate data."""
     repo = InMemoryTaskRepository()
-    task, occurrence = await _seed_occurrence(
+    task, occurrence, key = await _seed_occurrence(
         repo, OWNER, [{"name": "capture", "arguments": {}}]
     )
     tool = _CapturingTool()
@@ -240,7 +243,7 @@ async def test_coordinator_marks_the_occurrence_context():
     ).execute(occurrence)
 
     assert result.success is True
-    assert tool.seen_extra.get("scheduled_occurrence") == "k"
+    assert tool.seen_extra.get("scheduled_occurrence") == key
     assert "scheduled_occurrence" not in (task.actions[0].get("arguments") or {})
 
 
@@ -248,7 +251,7 @@ async def test_coordinator_marks_the_occurrence_context():
 async def test_occurrence_of_a_create_task_action_persists_no_child():
     """End-to-end: the recursive case is blocked and no child task is written."""
     repo = InMemoryTaskRepository()
-    task, occurrence = await _seed_occurrence(
+    task, occurrence, _key = await _seed_occurrence(
         repo,
         OWNER,
         [{"name": "create_task", "arguments": {"request": "every 1 minute send hi"}}],
@@ -271,7 +274,7 @@ async def test_occurrence_of_a_create_task_action_persists_no_child():
 @pytest.mark.asyncio
 async def test_ordinary_scheduled_actions_still_execute():
     repo = InMemoryTaskRepository()
-    task, occurrence = await _seed_occurrence(
+    task, occurrence, key = await _seed_occurrence(
         repo, OWNER, [{"name": "capture", "arguments": {}}]
     )
     tool = _CapturingTool()
@@ -283,7 +286,7 @@ async def test_ordinary_scheduled_actions_still_execute():
     ).execute(occurrence)
 
     assert result.success is True and result.status == "succeeded"
-    assert (await repo.get_occurrence(OWNER, task.id, "k")).status == "succeeded"
+    assert (await repo.get_occurrence(OWNER, task.id, key)).status == "succeeded"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
