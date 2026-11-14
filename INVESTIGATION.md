@@ -30,7 +30,8 @@
 Phase 3B adds the durable foundation for scheduled History summarization only:
 
 1. one `history_schedules` table and one additive migration;
-2. repository primitives, with a compatible in-memory fallback;
+2. durable-only repository primitives (an explicitly injected in-memory
+   repository exists only as a test fake);
 3. bounded oldest-first Telegram retrieval;
 4. focused tests and canonical database documentation.
 
@@ -159,9 +160,11 @@ write, including a recorded failure. Therefore:
 - a reset is an explicit owner-authorized write that sets `summary = ''` and
   moves `summarized_cursor` to `scanned_cursor`; it is never automatic.
 
-The in-memory fallback mirrors the same checks and performs each accepted
+The in-memory test fake mirrors the same checks and performs each accepted
 mutation as one event-loop-atomic dictionary write. It removes the state when
-the owning task is physically deleted, mirroring the SQL cascade.
+the owning task is physically deleted, mirroring the SQL cascade. It is never a
+production substitute: when the durable store is unavailable, every History
+operation raises `HistoryStorageUnavailable` and nothing is written to memory.
 
 An empty summary is allowed only when it is equal to the current summary (the
 safe skipped-only case). It can never replace a non-empty durable summary.
@@ -217,8 +220,9 @@ No gaps are introduced by a short page; no duplicates are read across pages.
 ## 10. Risks and limitations confirmed by inspection
 
 - The live Supabase table does not exist until the owner applies the migration.
-  Until then the Supabase repository degrades to the in-memory fallback and
-  never claims durability.
+  Until then every durable History operation fails closed with
+  `HistoryStorageUnavailable`; process memory is never substituted, so a
+  checkpoint can never be reported successful and then lost on restart.
 - Live database RLS, cascade and CAS behavior were not executed or verified;
   only the fake-client query shape and the in-memory fallback were tested.
 - The migration provides no automatic summary compaction. Reset is explicit.
@@ -228,7 +232,33 @@ No gaps are introduced by a short page; no duplicates are read across pages.
 - The pre-existing `tests/test_task_scheduler.py` failure is unrelated to this
   phase and was not modified.
 
-## 11. Explicit non-goals
+## 11. Audit corrections (post-delivery)
+
+An independent source audit of the delivery commit found two defects and one
+merge residue, corrected in the follow-up commit:
+
+1. **Durable-only violation.** `SupabaseTaskRepository`'s six History methods
+   caught every exception and returned `self._fallback` records, so a store
+   outage, timeout or unapplied migration silently became volatile process
+   memory while the caller received a successful-looking row. They now raise
+   `HistoryStorageUnavailable` (logging the failure once, keeping the degraded
+   diagnostic) and never touch the fallback. `create_history_schedule` also
+   refuses to proceed when the owning task could only be read from memory.
+2. **Missing regression coverage.** Six new tests prove reads, writes, CAS
+   writes and creation fail closed, that the in-memory fake is untouched, and
+   that no History method references `self._fallback`. The fake client's
+   `maybe_single()` now returns `None` for zero rows, matching PostgREST.
+3. **Merge residue.** Three files from the pre-upstream Appearance
+   implementation (`backend/services/image_probe.py`,
+   `backend/services/preview_storage.py`, `sql/panel_settings_appearance.sql`)
+   were left in the tree by the merge although the upstream line never had
+   them and no code or test references them. They were removed; the upstream
+   Appearance implementation and its three replacement suites are unchanged.
+
+The roadmap and this document now describe Phase 3B as implemented, audited and
+not live-verified.
+
+## 12. Explicit non-goals
 
 Phase 3B does not implement TaskScheduler integration, lifecycle hooks,
 scheduled History execution, schedule UI, natural-language parsing,

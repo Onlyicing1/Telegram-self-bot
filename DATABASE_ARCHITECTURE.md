@@ -451,9 +451,10 @@ migration creates them.
     service-role-only (zero policies, client privileges revoked, four DML verbs
     granted to `service_role`). It depends only on `ai_tasks` existing (part 1)
     and is independent of every other part, so any position after part 1 is
-    valid; it is appended last, newest last (§30.11). Without it, Phase 3B's
-    schedule repository degrades to the in-memory fallback and never reports a
-    schedule as durably persisted.
+    valid; it is appended last, newest last (§30.11). Without it, every durable
+    Phase 3B History operation fails closed (`HistoryStorageUnavailable`); the
+    schedule repository never reports a schedule as durably persisted and never
+    substitutes process memory.
 
 > **The order is repository-proven, recorded honestly.** The requested set named
 > four files, with the canonical reconciliation first and the Save V2 search
@@ -3788,7 +3789,7 @@ The exact status of every table is in [§19](#19-known-inconsistencies),
 | `private_message_config`, `private_message_senders` | `20260929000001` + `20261016000001` + `20261020144423` | `private_message_service`, `db/client.py` | **MANUAL-ONLY** — §31.3 parts 10/11/13; see §33. |
 | `aed_config`, `aed_archive_entries` | `20261017000001` | `anti_edit_delete_service`, `db/client.py` | **MANUAL-ONLY** — §31.3 part 12; see §34. |
 | `api_credentials` | `20260919000001` + `20260919000002` | credential-vault code (§29); secrets live in Supabase Vault, never in this table | **MANUAL-ONLY** — §31.3 parts 2/3; see §29. |
-| `history_schedules` | `20261113000001` | `TaskRepository` history-schedule primitives (Phase 3B) | **MANUAL-ONLY, NOT APPLIED** — §31.3 part 18; see §16.1. Until applied, the repository degrades to its in-memory fallback and never claims durability. |
+| `history_schedules` | `20261113000001` | `TaskRepository` history-schedule primitives (Phase 3B) | **MANUAL-ONLY, NOT APPLIED** — §31.3 part 18; see §16.1. Until applied, every durable History operation fails closed (`HistoryStorageUnavailable`) instead of substituting process memory. |
 | `ai_preferences` | none | repository interface + in-memory only | Specified (§14), **no producer, no migration**. |
 
 ### Emoji & Reaction Tables (MANUAL-ONLY migration)
@@ -5618,9 +5619,9 @@ Supabase repository and `InMemoryTaskRepository`):
 
 - `create_history_schedule(owner_id, task_id, peer_id, baseline_cursor)` —
   verifies the task belongs to the owner, refuses a live existing owner+peer
-  row, and repairs a legacy `deleted` row in place. The in-memory fallback
-  removes the state when the task is physically deleted, mirroring the FK
-  cascade.
+  row, and repairs a legacy `deleted` row in place. The `InMemoryTaskRepository`
+  test fake (never a production fallback) removes the state when the task is
+  physically deleted, mirroring the FK cascade.
 - `get_history_schedule(owner_id, task_id)` / `get_history_schedule_by_peer`.
 - `commit_history_success(...)` — ONE CAS update of summary, both cursors,
   revision, status and version together, guarded by `owner_id + peer_id +
@@ -5631,7 +5632,18 @@ Supabase repository and `InMemoryTaskRepository`):
   it never touches the summary or either cursor, and never bumps revision.
 - `reset_history_summary(...)` — explicit owner-authorized reset of the summary
   to `''`, with `summarized_cursor = scanned_cursor`, revision/version advanced.
-  Compaction is never automatic or destructive.
+  Compaction is never automatic or destructive. The reset intentionally
+  abandons prior coverage; it does not claim the abandoned content is
+  summarized (the cursor is the next processing boundary, not a coverage
+  assertion by itself).
+
+**Durable-only contract.** History state is a durable checkpoint. When Supabase
+is unavailable, times out, or the migration is unapplied, every History read and
+write raises `HistoryStorageUnavailable` and writes nothing. A commit is
+reported successful only when the durable row is returned; process memory is
+never substituted for the table, and a restart therefore cannot silently lose a
+checkpoint that was reported as committed. `InMemoryTaskRepository` remains
+available only as an explicitly injected test fake.
 
 No scheduler, execution coordinator, UI or natural-language schedule parser is
 part of Phase 3B. The repository primitives are foundation only.
@@ -6274,8 +6286,8 @@ migration filenames.
   column — are committed and not yet applied).
 - Phase 3B's `20261113000001_create_history_schedules.sql` is committed but
   **NOT applied**: the live project therefore still has no
-  `history_schedules` table, and the schedule repository degrades to its
-  in-memory fallback without claiming durability.
+  `history_schedules` table, and every durable History operation fails closed
+  (`HistoryStorageUnavailable`) instead of substituting process memory.
 - Supabase migration history contains **3 records**, not 42. The live schema
   was evidently established through a mixture of canonical/manual setup and
   later tracked migrations. Do not invent the missing history rows.

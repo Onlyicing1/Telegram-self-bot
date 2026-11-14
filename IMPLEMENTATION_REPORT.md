@@ -13,8 +13,10 @@ History summarization. It does **not** add execution.
   `create_history_schedule`, `get_history_schedule`,
   `get_history_schedule_by_peer`, `commit_history_success`,
   `record_history_failure`, `reset_history_summary`.
-- A compatible `InMemoryTaskRepository` fallback, including task-delete
-  cascade semantics.
+- `InMemoryTaskRepository` as an explicitly injected test fake (task-delete
+  cascade included). Production History persistence is durable-only: an
+  unavailable store raises `HistoryStorageUnavailable` and never substitutes
+  process memory.
 - A `SupabaseTaskRepository` implementation using one CAS update per accepted
   write.
 - Bounded oldest-first Telegram retrieval through an optional
@@ -38,13 +40,12 @@ Files changed:
 | `backend/services/history_ai_service.py` | Identifier-free scheduled payload |
 | `backend/telegram_api/messages.py` | Optional `reverse` forwarding to Telethon |
 | `backend/telegram_api/api.py` | Facade forwarding of `reverse` |
-| `tests/test_history_schedules.py` | 25 focused Phase 3B tests |
+| `tests/test_history_schedules.py` | 31 focused Phase 3B tests |
 | `DATABASE_ARCHITECTURE.md` | §16.1, inventory 42/18, part 18, §22, §30.11, rollback/verification |
 | `tests/test_database_setup_order.py` | 15-part / 37-file order and new-part assertions |
 | `tests/test_private_message_db_security.py` | Part totals 15/37 and final-banner assertions |
 | `tests/test_private_message_scope.py` | Part references 10/11/13 of 15 |
 | `tests/test_canonical_schema_reconciliation.py` | `history_schedules` classified as a successor table |
-| `sql/panel_settings_appearance.sql` | Inventory count 37 |
 
 ## 2. Database schema and migration created
 
@@ -248,9 +249,12 @@ or row. No agent has executed it.
   and version, clears error metadata;
 - is explicit and owner-authorized, never automatic.
 
-On Supabase exception, the durable methods degrade to the existing fallback and
-record the degradation; they never claim a durable write succeeded. Live
-database behavior is not claimed, because no live database was contacted.
+On Supabase exception the durable methods FAIL CLOSED: they record the
+degradation and raise `HistoryStorageUnavailable`. They never return a
+memory-only row and never report a durable write as successful. This is
+enforced by tests and by a structural assertion that no History method
+references `self._fallback`. Live database behavior is not claimed, because no
+live database was contacted.
 
 ## 4. Oldest-first retrieval
 
@@ -293,7 +297,7 @@ semantically redacted metadata. There is no production caller in Phase 3B.
 
 ### 6.1 Focused tests
 
-- `tests/test_history_schedules.py`: **25 passed**. Covers:
+- `tests/test_history_schedules.py`: **31 passed**. Covers:
   - create/get owner scoping and owned-task requirement;
   - unique owner+peer refusal, including paused/completed/failed/expired
     ownership;
@@ -311,7 +315,11 @@ semantically redacted metadata. There is no production caller in Phase 3B.
   - oldest-first ordering, `reverse=True` forwarding, stable upper bound,
     no gaps/duplicates, deleted gaps, AI skips, empty ranges and facade
     defaults;
-  - identifier-free scheduled payload.
+  - identifier-free scheduled payload;
+  - durable-only failure: unavailable reads, writes and creation raise
+    `HistoryStorageUnavailable` and never touch the injected fake;
+  - a failed CAS write is not replayed against memory;
+  - a structural guard that no History method references `self._fallback`.
 - Merged documentation/setup/security/scope/canonical-schema suites:
   **269 passed** in one run (`test_history_schedules.py`,
   `test_database_setup_order.py`, `test_database_architecture_doc.py`,
@@ -319,19 +327,23 @@ semantically redacted metadata. There is no production caller in Phase 3B.
   `test_canonical_schema_reconciliation.py`). The full Appearance suites also
   pass after the merge (`279 passed`).
 
-These are unit/repository/fallback tests. They do not contact live Supabase or
-live Telegram.
+These are unit/repository tests against fake clients and an explicitly injected
+in-memory fake. They do not contact live Supabase or live Telegram.
 
 ### 6.2 Full suite
 
 Command: `.venv/bin/python -m pytest -q`
 
-Result: **7782 passed, 27 skipped, 1 failed** in 147.02 s.
+Result: **7788 passed, 27 skipped, 1 failed** in 163.08 s (after the audit
+corrections).
 
-The single failure is the known pre-existing
+The single failure is
 `tests/test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`
-(“interval advancement exceeded bound”). It is unrelated to Phase 3B and was
-not modified. No Phase 3B test failed.
+(“interval advancement exceeded bound”). It was reproduced on clean worktrees at
+the delivery commit `a12c207`, its Phase 3B parent `417a6b8` and the upstream
+parent `e2f1619`; `git diff e2f1619 a12c207 -- tests/test_task_scheduler.py
+backend/ai/task_scheduler.py` is empty. It is therefore demonstrably
+pre-existing, not caused by Phase 3B or by the merge. No Phase 3B test failed.
 
 ### 6.3 Static checks
 
@@ -351,31 +363,48 @@ Consequently:
 - no claim is made that the durable repository is working against a live
   database.
 
-Until the owner applies the migration, the Supabase repository degrades to the
-in-memory fallback and never reports the state as durably persisted.
+Until the owner applies the migration, every durable History read and write
+raises `HistoryStorageUnavailable`; the repository never reports the state as
+durably persisted and never substitutes process memory.
 
 ## 7.1 Merge integration with the latest upstream
 
 While Phase 3B was being delivered, `origin/main` advanced from the merged
 base `5f8437d` to `e2f1619` (10 newer History/Appearance/reaction/bandwidth
-commits). The upstream changes were merged normally. Conflicts were resolved
-in favour of the newer upstream implementation for Appearance, ROADMAP and
-unrelated files; the Phase 3B repository, service, migration, tests and
-documentation were re-applied on the resulting 42-file / 18-part baseline.
-The local stale `tests/test_appearance.py` was removed because upstream
-replaced it with the newer `test_appearance_ui`, `test_appearance_delivery`,
-`test_appearance_gallery` and `test_appearance_image_cache` suites. No
-Phase 3B code was dropped.
+commits). The upstream changes were merged normally; the delivery commit
+`a12c207` has parents `417a6b8` and `e2f1619`.
+
+Audit of the merge (blob comparison against both parents):
+
+- The merged Appearance implementation and suites are byte-identical to
+  upstream (`backend/bot/handlers/appearance.py`,
+  `backend/services/appearance_service.py`, `test_appearance_delivery.py`,
+  `test_appearance_gallery.py`, `test_appearance_image_cache.py`).
+- `tests/test_appearance.py` was deleted by the upstream line itself (absent at
+  `e2f1619`); the merge did not remove local coverage. Its replacement suites
+  are present with upstream blobs, so no Appearance coverage was lost.
+- The merge did leave three files from the pre-upstream Appearance
+  implementation in the tree (`backend/services/image_probe.py`,
+  `backend/services/preview_storage.py`,
+  `sql/panel_settings_appearance.sql`). None existed upstream, none is imported
+  or referenced by code or tests, and the manual SQL script duplicates the
+  Appearance columns already carried by migration part 15. The audit commit
+  removes all three; no live behavior changes.
+- The merge took upstream's History-focused ROADMAP wholesale and dropped the
+  local Appearance roadmap section. The audit commit integrates both (Phase 3A
+  complete, Phase 3B implemented, Appearance Stage 2/validation and Phases 4–7
+  preserved).
+- No Phase 3B code was dropped.
 
 ## 8. Commit SHA and remote verification
 
 The Phase 3B implementation is commit
-`417a6b84f86675993a45858fd3d73e1bcdaa9256`. The newer upstream `origin/main`
-`e2f16192907f3f874b689fd0fcc4ef2be1b7a860` was merged normally into it (no
-rebase, no force, no history rewrite); the reports and final documentation
-updates are part of that merge commit. The exact final HEAD and the
+`417a6b84f86675993a45858fd3d73e1bcdaa9256`; the delivered merge commit audited
+here is `a12c20779bc634cb4511fb0e79443b882e8a1a85` (parents `417a6b8`,
+`e2f1619`). The audit corrections and this report are the commit that contains
+it. No rebase, force or history rewrite was used. The exact HEAD and the
 remote/ancestry/clean-tree verification results are reported in the delivery
-message after the push succeeds. They can be re-checked with:
+message. They can be re-checked with:
 
 ```bash
 git rev-parse HEAD

@@ -1,9 +1,11 @@
 """Phase 3B — durable History schedules and oldest-first retrieval.
 
-The repository tests run against the real ``InMemoryTaskRepository`` fallback and
-a fake Supabase table shaped like the durable client; no live Supabase is
-contacted. The retrieval tests use a Telethon-shaped fake supporting
-``reverse=True``. Nothing here claims live Telegram behaviour.
+The repository tests run against an explicitly injected in-memory fake and a
+fake Supabase table shaped like the durable client; no live Supabase is
+contacted. Production History state is durable-only: an unavailable store must
+fail closed and never be replayed against process memory. The retrieval tests
+use a Telethon-shaped fake supporting ``reverse=True``. Nothing here claims live
+Telegram behaviour.
 """
 from __future__ import annotations
 
@@ -16,6 +18,7 @@ import pytest
 from backend.ai.context.provenance import AI_PROVENANCE_MARKER
 from backend.ai.database.task_repository import (
     MAX_HISTORY_SUMMARY_BYTES,
+    HistoryStorageUnavailable,
     InMemoryTaskRepository,
     SupabaseTaskRepository,
 )
@@ -400,7 +403,9 @@ class _FakeQuery:
         elif self.operation == "update":
             for row in matches:
                 row.update(self.payload)
-        return SimpleNamespace(data=(matches[0] if self.single else matches))
+        if self.single:
+            return SimpleNamespace(data=(matches[0] if matches else None))
+        return SimpleNamespace(data=matches)
 
 
 class _FakeClient:
@@ -502,6 +507,115 @@ async def test_supabase_create_refuses_a_task_that_is_not_the_owners(monkeypatch
     monkeypatch.setattr(repo, "get_task", owned)
     created = await repo.create_history_schedule(OWNER, 7, PEER)
     assert created is not None and created.task_id == 7
+
+
+# ── durable-only: no runtime in-memory fallback for History ─────────────────
+
+
+class _UnavailableClient:
+    """Every table call fails: store down, or the migration is not applied."""
+
+    def table(self, name: str):
+        raise RuntimeError(f"supabase unavailable ({name})")
+
+
+class _WriteFailingClient(_FakeClient):
+    """Reads work, writes fail: a CAS write that cannot be confirmed."""
+
+    def table(self, name: str):
+        query = super().table(name)
+        if name == "history_schedules":
+            def _refuse(_payload):
+                raise RuntimeError("write failed")
+            query.update = _refuse
+        return query
+
+
+@pytest.mark.asyncio
+async def test_unavailable_store_reads_fail_closed_and_never_read_memory():
+    fallback = InMemoryTaskRepository()
+    task = await _task(fallback)
+    seeded = await fallback.create_history_schedule(OWNER, task.id, PEER, baseline_cursor=5)
+    repo = SupabaseTaskRepository(_UnavailableClient(), fallback)
+
+    with pytest.raises(HistoryStorageUnavailable):
+        await repo.get_history_schedule_by_peer(OWNER, PEER)
+    with pytest.raises(HistoryStorageUnavailable):
+        await repo.get_history_schedule(OWNER, task.id)
+    # The injected fake was neither read through nor mutated.
+    assert (await fallback.get_history_schedule_by_peer(OWNER, PEER)).version == seeded.version
+
+
+@pytest.mark.asyncio
+async def test_unavailable_store_writes_fail_closed_without_touching_memory():
+    fallback = InMemoryTaskRepository()
+    task = await _task(fallback)
+    await fallback.create_history_schedule(OWNER, task.id, PEER)
+    repo = SupabaseTaskRepository(_UnavailableClient(), fallback)
+
+    with pytest.raises(HistoryStorageUnavailable):
+        await repo.commit_history_success(
+            OWNER, PEER, expected_version=1, summary="new",
+            scanned_cursor=5, summarized_cursor=5,
+        )
+    with pytest.raises(HistoryStorageUnavailable):
+        await repo.record_history_failure(OWNER, PEER, expected_version=1, error="boom")
+    with pytest.raises(HistoryStorageUnavailable):
+        await repo.reset_history_summary(OWNER, PEER, expected_version=1)
+
+    current = await fallback.get_history_schedule_by_peer(OWNER, PEER)
+    assert current.summary == "" and current.scanned_cursor == 0
+    assert current.summarized_cursor == 0 and current.version == 1
+
+
+@pytest.mark.asyncio
+async def test_unavailable_store_refuses_history_creation_instead_of_using_memory():
+    fallback = InMemoryTaskRepository()
+    task = await _task(fallback)
+    repo = SupabaseTaskRepository(_UnavailableClient(), fallback)
+
+    with pytest.raises(HistoryStorageUnavailable):
+        await repo.create_history_schedule(OWNER, task.id, PEER)
+    assert await fallback.get_history_schedule_by_peer(OWNER, PEER) is None
+
+
+@pytest.mark.asyncio
+async def test_a_failed_cas_write_is_never_replayed_against_memory():
+    repo = SupabaseTaskRepository(_WriteFailingClient([_row()]), InMemoryTaskRepository())
+
+    with pytest.raises(HistoryStorageUnavailable):
+        await repo.commit_history_success(
+            OWNER, PEER, expected_version=3, summary="new",
+            scanned_cursor=40, summarized_cursor=35,
+        )
+    with pytest.raises(HistoryStorageUnavailable):
+        await repo.record_history_failure(
+            OWNER, PEER, expected_version=3, error="provider failed",
+        )
+    with pytest.raises(HistoryStorageUnavailable):
+        await repo.reset_history_summary(OWNER, PEER, expected_version=3)
+
+
+def test_the_supabase_history_contract_never_invokes_the_fallback():
+    """Durable-only is structural: no History method may reference the fake."""
+    import inspect
+
+    for name in (
+        "create_history_schedule", "_repair_deleted_history_schedule",
+        "get_history_schedule", "get_history_schedule_by_peer",
+        "commit_history_success", "record_history_failure",
+        "reset_history_summary",
+    ):
+        source = inspect.getsource(getattr(SupabaseTaskRepository, name))
+        assert "self._fallback." not in source, f"{name} can still fall back to memory"
+
+
+@pytest.mark.asyncio
+async def test_an_explicitly_injected_in_memory_repository_still_works():
+    repo = InMemoryTaskRepository()
+    task = await _task(repo)
+    created = await repo.create_history_schedule(OWNER, task.id, PEER, baseline_cursor=3)
+    assert created is not None and created.baseline_cursor == 3
 
 
 # ── oldest-first retrieval ──────────────────────────────────────────────────

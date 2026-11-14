@@ -514,6 +514,26 @@ def _step_from_row(row):
     _validate_step_input(value)
     return TodoStepRecord(**{key: value[key] for key in TodoStepRecord.__dataclass_fields__})
 
+HISTORY_UNAVAILABLE_MESSAGE = (
+    "durable History storage is unavailable; process memory is not a durable "
+    "History checkpoint"
+)
+
+
+class HistoryStorageUnavailable(RuntimeError):
+    """The durable History store could not confirm an operation.
+
+    History checkpoints are durable state: the approved Phase 3A/3B contract is
+    durable-only. When the store is unavailable (outage, timeout, unapplied
+    migration) the operation must FAIL CLOSED. Substituting the in-memory
+    repository would turn a supposedly durable checkpoint into volatile process
+    memory and report success for a write no restart can see.
+
+    ``InMemoryTaskRepository`` remains available as an explicitly injected test
+    fake, never as a production substitute.
+    """
+
+
 class TaskRepository:
     async def create_task(self, owner_id, data): raise NotImplementedError
     async def get_task(self, owner_id, task_id): raise NotImplementedError
@@ -920,6 +940,19 @@ class SupabaseTaskRepository(TaskRepository):
             self._mark_fallback(exc)
         if announce:
             logger.warning(message, exc)
+    def _history_unavailable(self, message: str, exc: Exception):
+        """Log once per episode, keep the degraded diagnostic, and fail closed.
+
+        Unlike the generic task path this never calls ``self._fallback``:
+        History state is durable-only, so process memory is not a substitute.
+        """
+        local = _classify_degradation(exc) == FALLBACK_REASON_LOCAL_RESOURCE
+        announce = (not local) or (not self._degraded_announced)
+        self._mark_fallback(exc)
+        if announce:
+            logger.warning(message, exc)
+        raise HistoryStorageUnavailable(HISTORY_UNAVAILABLE_MESSAGE) from exc
+
     def _annotate_fallback(self, record):
         if record is not None:
             record.fallback_backend = type(self._fallback).__name__
@@ -1308,6 +1341,11 @@ class SupabaseTaskRepository(TaskRepository):
         """
         task=await self.get_task(owner_id,int(task_id))
         if task is None: raise ValueError("task not found for owner")
+        if self._fallback_active:
+            # The owning task could only be read from process memory: the
+            # durable store is already unconfirmed, so a create must not
+            # proceed against it (and must never write a memory-only row).
+            raise HistoryStorageUnavailable(HISTORY_UNAVAILABLE_MESSAGE)
         baseline=_cursor_value(baseline_cursor,"baseline_cursor")
         payload={"task_id":int(task_id),"owner_id":owner_id,"peer_id":int(peer_id),"status":"active","baseline_cursor":baseline,"scanned_cursor":baseline,"summarized_cursor":baseline,"summary":"","revision":0,"version":1,"last_error":"","last_error_at":None,"last_committed_at":None}
         _validate_history_schedule_input({**payload,"id":1,"created_at":_now(),"updated_at":_now()})
@@ -1326,11 +1364,10 @@ class SupabaseTaskRepository(TaskRepository):
             # read above and this insert; a live row still refuses, a deleted
             # row is repaired explicitly.
             try: existing=await self.get_history_schedule_by_peer(owner_id,int(peer_id))
-            except Exception: existing=None
+            except HistoryStorageUnavailable: raise
             if existing is not None:
                 return await self._repair_deleted_history_schedule(existing,task_id,baseline) if existing.status=="deleted" else None
-            self._degrade("Supabase history schedule create failed; using fallback: %s",exc)
-            return await self._fallback.create_history_schedule(owner_id,task_id,peer_id,baseline_cursor=baseline)
+            self._history_unavailable("Supabase history schedule create failed: %s",exc)
     async def _repair_deleted_history_schedule(self, current, task_id, baseline):
         """Explicitly reuse a legacy ``deleted`` row for a new owning task."""
         now=_now()
@@ -1339,8 +1376,7 @@ class SupabaseTaskRepository(TaskRepository):
             result=await self._run(lambda:self._client.table("history_schedules").update(outgoing).eq("id",current.id).eq("owner_id",current.owner_id).eq("version",current.version).execute());row=getattr(result,"data",None)
         except asyncio.CancelledError: raise
         except Exception as exc:
-            self._degrade("Supabase history schedule repair failed; using fallback: %s",exc)
-            return await self._fallback.create_history_schedule(current.owner_id,task_id,current.peer_id,baseline_cursor=baseline)
+            self._history_unavailable("Supabase history schedule repair failed: %s",exc)
         self._mark_supabase_ok()
         return _history_schedule_from_row(row[0] if isinstance(row,list) else row) if row else None
     async def get_history_schedule(self, owner_id, task_id):
@@ -1350,16 +1386,14 @@ class SupabaseTaskRepository(TaskRepository):
             return _history_schedule_from_row(rows[0]) if rows else None
         except asyncio.CancelledError: raise
         except Exception as exc:
-            self._degrade("Supabase history schedule read failed; using fallback: %s",exc)
-            return await self._fallback.get_history_schedule(owner_id,task_id)
+            self._history_unavailable("Supabase history schedule read failed: %s",exc)
     async def get_history_schedule_by_peer(self, owner_id, peer_id):
         try:
             result=await self._run(lambda:self._client.table("history_schedules").select("*").eq("owner_id",owner_id).eq("peer_id",int(peer_id)).maybe_single().execute());row=getattr(result,"data",None);self._mark_supabase_ok()
             return _history_schedule_from_row(row[0] if isinstance(row,list) else row) if row else None
         except asyncio.CancelledError: raise
         except Exception as exc:
-            self._degrade("Supabase history schedule peer read failed; using fallback: %s",exc)
-            return await self._fallback.get_history_schedule_by_peer(owner_id,peer_id)
+            self._history_unavailable("Supabase history schedule peer read failed: %s",exc)
     async def commit_history_success(self, owner_id, peer_id, *, expected_version, summary, scanned_cursor, summarized_cursor, status=None):
         """Atomically persist summary + cursors + revision under ONE CAS write."""
         current=await self.get_history_schedule_by_peer(owner_id,int(peer_id))
@@ -1380,8 +1414,7 @@ class SupabaseTaskRepository(TaskRepository):
         except (ValueError,TypeError): raise
         except asyncio.CancelledError: raise
         except Exception as exc:
-            self._degrade("Supabase history commit failed; using fallback: %s",exc)
-            return await self._fallback.commit_history_success(owner_id,peer_id,expected_version=expected_version,summary=summary,scanned_cursor=scanned,summarized_cursor=summarized,status=status)
+            self._history_unavailable("Supabase history commit failed: %s",exc)
     async def record_history_failure(self, owner_id, peer_id, *, expected_version, error, status=None):
         """Record error metadata only; summary and both cursors are untouched."""
         current=await self.get_history_schedule_by_peer(owner_id,int(peer_id))
@@ -1398,8 +1431,7 @@ class SupabaseTaskRepository(TaskRepository):
         except (ValueError,TypeError): raise
         except asyncio.CancelledError: raise
         except Exception as exc:
-            self._degrade("Supabase history failure write failed; using fallback: %s",exc)
-            return await self._fallback.record_history_failure(owner_id,peer_id,expected_version=expected_version,error=error,status=status)
+            self._history_unavailable("Supabase history failure write failed: %s",exc)
     async def reset_history_summary(self, owner_id, peer_id, *, expected_version):
         """Explicit owner-authorized reset: drop content coverage, keep cursors."""
         current=await self.get_history_schedule_by_peer(owner_id,int(peer_id))
@@ -1412,8 +1444,7 @@ class SupabaseTaskRepository(TaskRepository):
         except (ValueError,TypeError): raise
         except asyncio.CancelledError: raise
         except Exception as exc:
-            self._degrade("Supabase history reset failed; using fallback: %s",exc)
-            return await self._fallback.reset_history_summary(owner_id,peer_id,expected_version=expected_version)
+            self._history_unavailable("Supabase history reset failed: %s",exc)
 
 def get_task_repository():
     """Return the process-wide task repository (single authority).

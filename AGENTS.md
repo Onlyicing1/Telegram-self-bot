@@ -657,7 +657,12 @@ error.
   replanning, no chat history ever enters the execution context).
 - **Persistence**: `backend/ai/persistence.py` + `backend/ai/database/`
   record config, sessions, usage, tool history, and provider stats with the
-  same Supabase-or-fallback pattern.
+  same Supabase-or-fallback pattern. **Scheduled History state is the one
+  durable-only exception** (Phase 3B): `history_schedules` is written through
+  owner-scoped CAS repository primitives that raise `HistoryStorageUnavailable`
+  when Supabase is unavailable or the migration is unapplied. There is no
+  runtime in-memory History fallback — a checkpoint is never reported committed
+  from process memory. The migration is owner-applied and not applied yet.
 
 ---
 
