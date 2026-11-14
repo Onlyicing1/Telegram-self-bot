@@ -36,7 +36,12 @@ from backend.ai.task_contract import (
     resolve_conditions,
     validate_ai_instruction,
 )
-from backend.ai.task_trace import bound_text, task_trace
+from backend.ai.task_trace import (
+    bound_text,
+    history_creation_scope,
+    history_creation_trace,
+    task_trace,
+)
 from backend.ai.tools.base import (
     declared_any_arguments,
     declared_required_arguments,
@@ -553,6 +558,9 @@ class TaskCreationService:
         cancellation. The returned boolean is durable deletion only, never a
         memory-only fallback claim.
         """
+        history_creation_trace(
+            "compensation_started", task_id=task.id, version=task.version
+        )
         try:
             result = await asyncio.shield(
                 self.repository.delete_task(
@@ -560,10 +568,25 @@ class TaskCreationService:
                 )
             )
         except asyncio.CancelledError:
+            history_creation_trace(
+                "compensation_result", outcome="cancelled", task_id=task.id
+            )
             raise
-        except Exception:  # noqa: BLE001 - compensation is best effort
+        except Exception as exc:  # noqa: BLE001 - compensation is best effort
+            history_creation_trace(
+                "compensation_result", outcome="error", task_id=task.id,
+                exception=type(exc).__name__,
+            )
             return False
-        return bool(getattr(result, "durable", False))
+        outcome = str(getattr(result, "outcome", "unknown"))
+        durable = bool(getattr(result, "durable", False))
+        history_creation_trace(
+            "compensation_result",
+            outcome="durable_deleted" if durable else outcome,
+            durable=durable, task_id=task.id,
+            fallback_backend=getattr(result, "fallback_backend", "") or "none",
+        )
+        return durable
 
     async def create_history_schedule_task(
         self,
@@ -580,8 +603,68 @@ class TaskCreationService:
         accepted only through ``trusted_owner_actions``. The task is persisted
         first because ``history_schedules.task_id`` is its child, and any state
         failure removes that exact task under CAS.
+
+        The wrapper owns only the creation trace scope; the implementation
+        below is the unchanged two-write + compensation path.
         """
+        with history_creation_scope() as trace_id:
+            history_creation_trace(
+                "creation_service_entered",
+                candidate_type=type(candidate).__name__,
+                baseline_positive=bool(
+                    isinstance(baseline_cursor, int)
+                    and not isinstance(baseline_cursor, bool)
+                    and baseline_cursor >= 0
+                ),
+            )
+            try:
+                task, state = await self._create_history_schedule_task(
+                    candidate,
+                    reference,
+                    peer_id=peer_id,
+                    baseline_cursor=baseline_cursor,
+                )
+            except asyncio.CancelledError:
+                history_creation_trace(
+                    "creation_result", outcome="cancelled", trace_id=trace_id,
+                )
+                raise
+            except HistoryScheduleCreationError as exc:
+                history_creation_trace(
+                    "creation_result", outcome="failed",
+                    category="history_schedule_creation_error",
+                    task_id=exc.task_id,
+                    rollback_durable=exc.rollback_durable,
+                )
+                raise
+            except Exception as exc:  # noqa: BLE001 - trace then preserve semantics
+                history_creation_trace(
+                    "creation_result", outcome="failed",
+                    category="unhandled_creation_exception",
+                    exception=type(exc).__name__,
+                )
+                raise
+            history_creation_trace(
+                "creation_result", outcome="succeeded",
+                task_id=task.id, task_version=task.version,
+                state_version=state.version, state_revision=state.revision,
+            )
+            return task, state
+
+    async def _create_history_schedule_task(
+        self,
+        candidate: TaskCandidate,
+        reference: datetime,
+        *,
+        peer_id: int,
+        baseline_cursor: int,
+    ) -> tuple[TaskRecord, Any]:
+        """The unchanged creation/compensation implementation."""
         if not isinstance(candidate, TaskCandidate):
+            history_creation_trace(
+                "creation_validation_result", outcome="rejected",
+                category="candidate_type_invalid",
+            )
             raise TypeError("a History schedule needs a validated TaskCandidate")
         actions = candidate.actions
         if (
@@ -589,29 +672,86 @@ class TaskCreationService:
             or not isinstance(actions[0], dict)
             or actions[0].get("name") != SCHEDULED_HISTORY_ACTION
         ):
+            history_creation_trace(
+                "creation_validation_result", outcome="rejected",
+                category="action_set_invalid", action_count=len(actions),
+            )
             raise HistoryScheduleCreationError(
                 "a History schedule must contain exactly one scheduled_history action"
             )
         if isinstance(peer_id, bool) or not isinstance(peer_id, int) or peer_id == 0:
+            history_creation_trace(
+                "creation_validation_result", outcome="rejected",
+                category="peer_invalid",
+            )
             raise HistoryScheduleCreationError("a History schedule needs a real peer")
         if isinstance(baseline_cursor, bool) or not isinstance(baseline_cursor, int) or baseline_cursor < 0:
+            history_creation_trace(
+                "creation_validation_result", outcome="rejected",
+                category="baseline_invalid",
+            )
             raise HistoryScheduleCreationError("the History baseline must be a nonnegative message id")
-
-        existing = await self.repository.get_history_schedule_by_peer(
-            self.owner_id, peer_id,
+        history_creation_trace(
+            "creation_validation_result", outcome="passed",
+            action_count=len(actions),
         )
+
+        history_creation_trace("duplicate_check_started")
+        try:
+            existing = await self.repository.get_history_schedule_by_peer(
+                self.owner_id, peer_id,
+            )
+        except asyncio.CancelledError:
+            history_creation_trace(
+                "duplicate_check_result", outcome="cancelled",
+            )
+            raise
+        except Exception as exc:  # noqa: BLE001 - trace then preserve semantics
+            history_creation_trace(
+                "duplicate_check_result", outcome="failed",
+                exception=type(exc).__name__, category="durable_store",
+            )
+            raise
         if existing is not None and existing.status != "deleted":
+            history_creation_trace(
+                "duplicate_check_result", outcome="duplicate",
+                status=existing.status, revision=existing.revision,
+            )
             raise HistoryScheduleCreationError(
                 "this chat already has a durable History checkpoint; delete its "
                 "task before creating another schedule"
             )
+        history_creation_trace(
+            "duplicate_check_result",
+            outcome="reusable_deleted" if existing is not None else "not_found",
+        )
 
-        task = await self.create(
-            candidate, reference,
-            trusted_owner_actions=OWNER_ONLY_TASK_ACTIONS,
+        history_creation_trace("task_write_started")
+        try:
+            task = await self.create(
+                candidate, reference,
+                trusted_owner_actions=OWNER_ONLY_TASK_ACTIONS,
+            )
+        except asyncio.CancelledError:
+            history_creation_trace("task_write_result", outcome="cancelled")
+            raise
+        except Exception as exc:  # noqa: BLE001 - trace then preserve semantics
+            history_creation_trace(
+                "task_write_result", outcome="failed",
+                exception=type(exc).__name__,
+            )
+            raise
+        history_creation_trace(
+            "task_write_result", outcome="committed",
+            task_id=task.id, task_version=task.version,
+            backend=str(getattr(task, "fallback_backend", "") or "durable"),
         )
         fallback = str(getattr(task, "fallback_backend", "") or "")
         if fallback:
+            history_creation_trace(
+                "durable_requirement_result", outcome="refused",
+                category="fallback_backend", task_id=task.id,
+            )
             rolled_back = await self._delete_created_history_task(task)
             raise HistoryScheduleCreationError(
                 "History schedules require durable storage; the task was not kept",
@@ -619,6 +759,10 @@ class TaskCreationService:
                 rollback_durable=rolled_back,
             )
 
+        history_creation_trace(
+            "state_write_started", task_id=task.id,
+            baseline_positive=bool(baseline_cursor),
+        )
         state = None
         try:
             state = await self.repository.create_history_schedule(
@@ -628,14 +772,28 @@ class TaskCreationService:
                 baseline_cursor=baseline_cursor,
             )
             if state is None:
+                history_creation_trace(
+                    "state_write_result", outcome="duplicate", task_id=task.id,
+                )
                 raise HistoryScheduleCreationError(
                     "this chat already has a durable History checkpoint"
                 )
+            history_creation_trace(
+                "state_write_result", outcome="committed", task_id=task.id,
+                state_version=state.version, state_revision=state.revision,
+            )
             return task, state
         except asyncio.CancelledError:
+            history_creation_trace(
+                "state_write_result", outcome="cancelled", task_id=task.id,
+            )
             await self._delete_created_history_task(task)
             raise
         except Exception as exc:
+            history_creation_trace(
+                "state_write_result", outcome="failed", task_id=task.id,
+                exception=type(exc).__name__, category="durable_store",
+            )
             rolled_back = await self._delete_created_history_task(task)
             if isinstance(exc, HistoryScheduleCreationError):
                 raise HistoryScheduleCreationError(

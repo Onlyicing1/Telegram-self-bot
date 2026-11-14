@@ -15,6 +15,7 @@ from backend.ai.task_contract import (
     SCHEDULED_HISTORY_ACTION,
     scheduled_occurrence_provenance,
 )
+from backend.ai.task_trace import occurrence_trace
 from backend.ai.tools.base import PermissionLevel, Tool, ToolResult
 from backend.ai.tools.context import ToolContext
 from backend.services import history_schedule_service
@@ -89,6 +90,7 @@ class ScheduledHistoryTool(Tool):
         )
 
     async def execute(self, context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
+        occurrence_trace("tool_invocation", action=self.name)
         extra = context.extra if context is not None else None
         # Both markers are coordinator-injected from the claimed occurrence.
         # A task id alone, a bare boolean/old marker, a marker belonging to
@@ -98,6 +100,10 @@ class ScheduledHistoryTool(Tool):
             scheduled_occurrence_provenance(extra)
         )
         if provenance_error:
+            occurrence_trace(
+                "provenance_result", outcome="rejected",
+                category=provenance_error,
+            )
             return ToolResult(
                 success=False,
                 message=(
@@ -106,8 +112,16 @@ class ScheduledHistoryTool(Tool):
                 ),
                 data={"error": f"scheduled_history_provenance_{provenance_error}"},
             )
+        occurrence_trace(
+            "provenance_result", outcome="passed", task_marker=True,
+            occurrence_marker=True,
+        )
 
         if not isinstance(arguments, dict) or set(arguments) - {"instruction"}:
+            occurrence_trace(
+                "arguments_result", outcome="rejected",
+                category="arguments_invalid",
+            )
             return ToolResult(
                 success=False,
                 message=(
@@ -118,12 +132,21 @@ class ScheduledHistoryTool(Tool):
             )
         instruction = arguments.get("instruction")
         if instruction is not None and not isinstance(instruction, str):
+            occurrence_trace(
+                "arguments_result", outcome="rejected",
+                category="instruction_invalid",
+            )
             return ToolResult(
                 success=False,
                 message="The History schedule instruction must be text.",
                 data={"error": "scheduled_history_instruction_invalid"},
             )
+        occurrence_trace(
+            "arguments_result", outcome="passed",
+            instruction_present=bool(instruction),
+        )
 
+        occurrence_trace("service_invocation_started")
         try:
             ok, message, data = await history_schedule_service.run_scheduled_history(
                 _source(context),
@@ -134,6 +157,10 @@ class ScheduledHistoryTool(Tool):
                 request_id=_request_id(context),
             )
         except Exception as exc:  # noqa: BLE001 — tool boundaries never crash the chain
+            occurrence_trace(
+                "service_result", outcome="exception",
+                exception=type(exc).__name__, category="service_exception",
+            )
             logger.warning(
                 "HISTORY_SCHEDULE_ACTION_FAILED task_id=%s error=%s",
                 task_key, type(exc).__name__,
@@ -143,4 +170,9 @@ class ScheduledHistoryTool(Tool):
                 message=f"Scheduled History failed: {type(exc).__name__}: {exc}",
                 data={"error": "scheduled_history_failed"},
             )
+        occurrence_trace(
+            "service_result", outcome="success" if ok else "failed",
+            error_category=(data or {}).get("error", "-"),
+            processed=(data or {}).get("processed", "-"),
+        )
         return ToolResult(success=ok, message=message, data=data)

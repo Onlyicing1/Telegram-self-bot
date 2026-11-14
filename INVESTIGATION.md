@@ -285,3 +285,31 @@ scheduled History execution, schedule UI, natural-language parsing,
 notifications, catch-up/missed-run policy, a second scheduler/executor/client/
 loop, or unrelated AI/provider changes. Phase 4 and later phases are not
 implemented.
+
+> Temporal note: the Phase 3B investigation above is preserved as recorded.
+> Phases 4 and the Phase 5 prerequisite were subsequently implemented as
+> documented in `ROADMAP.md` and `IMPLEMENTATION_REPORT.md`. Phase 6 remains
+> deferred and Phase 7 remains the live-validation phase.
+
+## 13. Diagnostic tracing for the first live Scheduled History run
+
+An observability-only occurrence trace was added after the Phase 4/5 work. It
+does not change the diagnosis or invariants above; it makes the deferred live
+validation diagnosable without a new scheduler or persistence path.
+
+- `SCHEDULED_OCCURRENCE_TRACE` uses the exact durable occurrence key as its
+  stable `trace_id` and carries a separate `attempt`. Scheduler, coordinator,
+  tool, History service, AI/provider and repository-history events share it.
+- `HISTORY_SCHEDULE_TRACE` covers owner creation, the separate task/state
+  writes and compensation with a short-lived creation id.
+- The trace remains silent for ordinary Telegram/AI requests because separate
+  context variables are unbound outside their scopes. The existing
+  `AI_TASK_TRACE` create-task binding is untouched.
+- The expected first-run order and the method for identifying the first missing
+  stage are recorded in `IMPLEMENTATION_REPORT.md` §3. In particular, the last
+  emitted occurrence stage before the trace stops localizes the boundary;
+  peer refusal, retrieval failure, provider failure, invalid output, CAS
+  conflict and durable error have distinct stable categories.
+- No live occurrence or live Supabase operation was exercised by the tracing
+  tests. The earlier conclusion remains: only the owner-performed live run can
+  validate the real Telegram/provider/deployment behavior.

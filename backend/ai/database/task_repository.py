@@ -18,6 +18,7 @@ from backend.ai.task_contract import (
     validate_pending_question,
     validate_prepared_action,
 )
+from backend.ai.task_trace import occurrence_trace
 
 logger = logging.getLogger(__name__)
 TASK_STATUSES = frozenset({"active", "paused", "completed", "failed", "expired", "deleted"})
@@ -684,13 +685,31 @@ class InMemoryTaskRepository(TaskRepository):
         return _copy(record)
     async def get_history_schedule(self, owner_id, task_id):
         rows=sorted((r for r in self._history_schedules.values() if r.owner_id==owner_id and r.task_id==int(task_id)),key=lambda r:r.id)
+        occurrence_trace(
+            "repository_read_result", operation="get_history_schedule",
+            outcome="found" if rows else "missing",
+            version=rows[0].version if rows else "-",
+            status=rows[0].status if rows else "-",
+        )
         return _copy(rows[0]) if rows else None
     async def get_history_schedule_by_peer(self, owner_id, peer_id):
         r=self._history_schedules.get((owner_id,int(peer_id)))
         return _copy(r) if r else None
     async def commit_history_success(self, owner_id, peer_id, *, expected_version, summary, scanned_cursor, summarized_cursor, status=None):
         r=self._history_schedules.get((owner_id,int(peer_id)))
-        if r is None or r.version!=expected_version: return None
+        if r is None:
+            occurrence_trace(
+                "repository_cas_result", operation="commit_history_success",
+                outcome="missing", expected_version=expected_version,
+            )
+            return None
+        if r.version!=expected_version:
+            occurrence_trace(
+                "repository_cas_result", operation="commit_history_success",
+                outcome="stale", expected_version=expected_version,
+                row_version=r.version,
+            )
+            return None
         _bounded_text(summary,MAX_HISTORY_SUMMARY_BYTES,"summary")
         scanned=_cursor_value(scanned_cursor,"scanned_cursor"); summarized=_cursor_value(summarized_cursor,"summarized_cursor")
         target=r.status if status is None else status
@@ -701,6 +720,12 @@ class InMemoryTaskRepository(TaskRepository):
         now=_now(); r.summary=summary; r.scanned_cursor=scanned; r.summarized_cursor=summarized
         r.status=target; r.revision+=1; r.version+=1; r.last_error=""; r.last_error_at=None
         r.last_committed_at=now; r.updated_at=now
+        occurrence_trace(
+            "repository_cas_result", operation="commit_history_success",
+            outcome="committed", old_version=expected_version,
+            new_version=r.version, old_revision=r.revision-1,
+            new_revision=r.revision,
+        )
         return _copy(r)
     async def advance_history_scan(self, owner_id, peer_id, *, expected_version, scanned_cursor):
         """Advance ONLY the scanned cursor under the CAS version.
@@ -710,34 +735,97 @@ class InMemoryTaskRepository(TaskRepository):
         revision, last_committed_at and failure metadata are untouched.
         """
         r=self._history_schedules.get((owner_id,int(peer_id)))
-        if r is None or r.version!=expected_version: return None
+        if r is None:
+            occurrence_trace(
+                "repository_cas_result", operation="advance_history_scan",
+                outcome="missing", expected_version=expected_version,
+            )
+            return None
+        if r.version!=expected_version:
+            occurrence_trace(
+                "repository_cas_result", operation="advance_history_scan",
+                outcome="stale", expected_version=expected_version,
+                row_version=r.version,
+            )
+            return None
         scanned=_cursor_value(scanned_cursor,"scanned_cursor")
         if scanned<r.scanned_cursor: raise ValueError("history cursors are monotonic")
         if not (r.baseline_cursor<=r.summarized_cursor<=scanned): raise ValueError("cursors must satisfy baseline <= summarized <= scanned")
         r.scanned_cursor=scanned; r.version+=1; r.updated_at=_now()
         _validate_history_schedule_input(r.as_dict())
+        occurrence_trace(
+            "repository_cas_result", operation="advance_history_scan",
+            outcome="committed", old_version=expected_version,
+            new_version=r.version, revision_unchanged=True,
+        )
         return _copy(r)
     async def record_history_failure(self, owner_id, peer_id, *, expected_version, error, status=None):
         r=self._history_schedules.get((owner_id,int(peer_id)))
-        if r is None or r.version!=expected_version: return None
+        if r is None:
+            occurrence_trace(
+                "repository_cas_result", operation="record_history_failure",
+                outcome="missing", expected_version=expected_version,
+            )
+            return None
+        if r.version!=expected_version:
+            occurrence_trace(
+                "repository_cas_result", operation="record_history_failure",
+                outcome="stale", expected_version=expected_version,
+                row_version=r.version,
+            )
+            return None
         _bounded_text(error,MAX_HISTORY_ERROR_BYTES,"last_error")
         if not error.strip(): raise ValueError("a failure needs a nonblank error")
         target=r.status if status is None else status
         if target not in HISTORY_SCHEDULE_WRITABLE_STATUSES: raise ValueError("invalid history schedule status")
         now=_now(); r.last_error=error; r.last_error_at=now; r.status=target; r.version+=1; r.updated_at=now
+        occurrence_trace(
+            "repository_cas_result", operation="record_history_failure",
+            outcome="recorded", old_version=expected_version,
+            new_version=r.version, revision_unchanged=True,
+        )
         return _copy(r)
     async def reset_history_summary(self, owner_id, peer_id, *, expected_version):
         r=self._history_schedules.get((owner_id,int(peer_id)))
-        if r is None or r.version!=expected_version: return None
+        if r is None:
+            occurrence_trace(
+                "repository_cas_result", operation="reset_history_summary",
+                outcome="missing", expected_version=expected_version,
+            )
+            return None
+        if r.version!=expected_version:
+            occurrence_trace(
+                "repository_cas_result", operation="reset_history_summary",
+                outcome="stale", expected_version=expected_version,
+                row_version=r.version,
+            )
+            return None
         now=_now(); r.summary=""; r.summarized_cursor=r.scanned_cursor; r.revision+=1; r.version+=1
         r.last_error=""; r.last_error_at=None; r.last_committed_at=now; r.updated_at=now
+        occurrence_trace(
+            "repository_cas_result", operation="reset_history_summary",
+            outcome="committed", old_version=expected_version,
+            new_version=r.version, old_revision=r.revision-1,
+            new_revision=r.revision,
+        )
         return _copy(r)
     async def create_occurrence(self, owner_id, data):
         payload={**data,"owner_id":owner_id};task=self._tasks.get(payload.get("task_id"))
         if not task or task.owner_id!=owner_id:raise ValueError("task not found for owner")
         _validate_occurrence_input(payload);key=(payload["task_id"],payload["occurrence_key"])
-        if key in self._occurrences:return _copy(self._occurrences[key])
-        r=OccurrenceRecord(self._next_occurrence_id,payload["task_id"],owner_id,payload["occurrence_key"].strip(),payload["definition_version"],_copy(payload["action_snapshot"]),payload["scheduled_for"],payload.get("attempt",1),payload.get("status","claimed"),payload.get("claimed_at"),payload.get("started_at"),payload.get("finished_at"),payload.get("retry_at"),_copy(payload.get("error_metadata",{})),_copy(payload.get("result_metadata",{})),preparation_metadata=_copy(payload.get("preparation_metadata",{})));self._occurrences[key]=r;self._next_occurrence_id+=1;return _copy(r)
+        if key in self._occurrences:
+            existing=self._occurrences[key]
+            occurrence_trace(
+                "occurrence_persist_result", outcome="already_exists",
+                status=existing.status, attempt=existing.attempt,
+            )
+            return _copy(existing)
+        r=OccurrenceRecord(self._next_occurrence_id,payload["task_id"],owner_id,payload["occurrence_key"].strip(),payload["definition_version"],_copy(payload["action_snapshot"]),payload["scheduled_for"],payload.get("attempt",1),payload.get("status","claimed"),payload.get("claimed_at"),payload.get("started_at"),payload.get("finished_at"),payload.get("retry_at"),_copy(payload.get("error_metadata",{})),_copy(payload.get("result_metadata",{})),preparation_metadata=_copy(payload.get("preparation_metadata",{})));self._occurrences[key]=r;self._next_occurrence_id+=1
+        occurrence_trace(
+            "occurrence_persist_result", outcome="created",
+            status=r.status, attempt=r.attempt,
+        )
+        return _copy(r)
     async def get_occurrence(self, owner_id, task_id, occurrence_key):
         r=self._occurrences.get((task_id,occurrence_key));return _copy(r) if r and r.owner_id==owner_id else None
     async def list_occurrences(self, owner_id, task_id=None, limit=100): return [_copy(r) for r in list(self._occurrences.values()) if r.owner_id==owner_id and (task_id is None or r.task_id==task_id)][:max(0,limit)]
@@ -1170,12 +1258,21 @@ class SupabaseTaskRepository(TaskRepository):
         payload=self._occurrence_payload(owner_id,data)
         try:
             existing=await self.get_occurrence(owner_id,payload["task_id"],payload["occurrence_key"])
-            if existing:return existing
+            if existing:
+                occurrence_trace(
+                    "occurrence_persist_result", outcome="already_exists",
+                    status=existing.status, attempt=existing.attempt,
+                )
+                return existing
             logger.info("TASK_OCCURRENCE_PERSIST_CREATE_ATTEMPT repository=%s owner_id=%s task_id=%s", type(self).__name__, owner_id, payload["task_id"])
             result=await self._run(lambda:self._client.table("ai_task_occurrences").insert(payload).execute());row=getattr(result,"data",None)
             if not row:raise RuntimeError("Supabase occurrence insert returned no row")
             self._mark_supabase_ok()
             record = _occurrence_from_row(row[0] if isinstance(row,list) else row)
+            occurrence_trace(
+                "occurrence_persist_result", outcome="created",
+                status=record.status, attempt=record.attempt,
+            )
             logger.info("TASK_OCCURRENCE_PERSIST_CREATE_SUCCESS repository=%s occurrence_id=%s", type(self).__name__, record.id)
             return record
         except (ValueError,TypeError):raise
@@ -1405,9 +1502,20 @@ class SupabaseTaskRepository(TaskRepository):
         try:
             result=await self._run(lambda:self._client.table("history_schedules").select("*").eq("owner_id",owner_id).eq("task_id",int(task_id)).order("id").limit(1).execute());self._mark_supabase_ok()
             rows=getattr(result,"data",None) or []
-            return _history_schedule_from_row(rows[0]) if rows else None
+            record=_history_schedule_from_row(rows[0]) if rows else None
+            occurrence_trace(
+                "repository_read_result", operation="get_history_schedule",
+                outcome="found" if record is not None else "missing",
+                version=record.version if record is not None else "-",
+                status=record.status if record is not None else "-",
+            )
+            return record
         except asyncio.CancelledError: raise
         except Exception as exc:
+            occurrence_trace(
+                "repository_read_result", operation="get_history_schedule",
+                outcome="durable_error", exception=type(exc).__name__,
+            )
             self._history_unavailable("Supabase history schedule read failed: %s",exc)
     async def get_history_schedule_by_peer(self, owner_id, peer_id):
         try:
@@ -1419,7 +1527,19 @@ class SupabaseTaskRepository(TaskRepository):
     async def commit_history_success(self, owner_id, peer_id, *, expected_version, summary, scanned_cursor, summarized_cursor, status=None):
         """Atomically persist summary + cursors + revision under ONE CAS write."""
         current=await self.get_history_schedule_by_peer(owner_id,int(peer_id))
-        if current is None or current.version!=expected_version: return None
+        if current is None:
+            occurrence_trace(
+                "repository_cas_result", operation="commit_history_success",
+                outcome="missing", expected_version=expected_version,
+            )
+            return None
+        if current.version!=expected_version:
+            occurrence_trace(
+                "repository_cas_result", operation="commit_history_success",
+                outcome="stale", expected_version=expected_version,
+                row_version=current.version,
+            )
+            return None
         _bounded_text(summary,MAX_HISTORY_SUMMARY_BYTES,"summary")
         scanned=_cursor_value(scanned_cursor,"scanned_cursor"); summarized=_cursor_value(summarized_cursor,"summarized_cursor")
         target=current.status if status is None else status
@@ -1432,10 +1552,23 @@ class SupabaseTaskRepository(TaskRepository):
         _validate_history_schedule_input({**current.as_dict(),**outgoing})
         try:
             result=await self._run(lambda:self._client.table("history_schedules").update(outgoing).eq("owner_id",owner_id).eq("peer_id",int(peer_id)).eq("version",expected_version).execute());row=getattr(result,"data",None);self._mark_supabase_ok()
-            return _history_schedule_from_row(row[0] if isinstance(row,list) else row) if row else None
+            committed=_history_schedule_from_row(row[0] if isinstance(row,list) else row) if row else None
+            occurrence_trace(
+                "repository_cas_result", operation="commit_history_success",
+                outcome="committed" if committed is not None else "cas_conflict",
+                old_version=expected_version,
+                new_version=committed.version if committed is not None else "-",
+                old_revision=current.revision,
+                new_revision=committed.revision if committed is not None else "-",
+            )
+            return committed
         except (ValueError,TypeError): raise
         except asyncio.CancelledError: raise
         except Exception as exc:
+            occurrence_trace(
+                "repository_cas_result", operation="commit_history_success",
+                outcome="durable_error", exception=type(exc).__name__,
+            )
             self._history_unavailable("Supabase history commit failed: %s",exc)
     async def advance_history_scan(self, owner_id, peer_id, *, expected_version, scanned_cursor):
         """Persist ONLY a scanned-cursor advance under ONE CAS write.
@@ -1445,7 +1578,19 @@ class SupabaseTaskRepository(TaskRepository):
         last_committed_at and failure metadata.
         """
         current=await self.get_history_schedule_by_peer(owner_id,int(peer_id))
-        if current is None or current.version!=expected_version: return None
+        if current is None:
+            occurrence_trace(
+                "repository_cas_result", operation="advance_history_scan",
+                outcome="missing", expected_version=expected_version,
+            )
+            return None
+        if current.version!=expected_version:
+            occurrence_trace(
+                "repository_cas_result", operation="advance_history_scan",
+                outcome="stale", expected_version=expected_version,
+                row_version=current.version,
+            )
+            return None
         scanned=_cursor_value(scanned_cursor,"scanned_cursor")
         if scanned<current.scanned_cursor: raise ValueError("history cursors are monotonic")
         if not (current.baseline_cursor<=current.summarized_cursor<=scanned): raise ValueError("cursors must satisfy baseline <= summarized <= scanned")
@@ -1453,15 +1598,39 @@ class SupabaseTaskRepository(TaskRepository):
         _validate_history_schedule_input({**current.as_dict(),**outgoing})
         try:
             result=await self._run(lambda:self._client.table("history_schedules").update(outgoing).eq("owner_id",owner_id).eq("peer_id",int(peer_id)).eq("version",expected_version).execute());row=getattr(result,"data",None);self._mark_supabase_ok()
-            return _history_schedule_from_row(row[0] if isinstance(row,list) else row) if row else None
+            committed=_history_schedule_from_row(row[0] if isinstance(row,list) else row) if row else None
+            occurrence_trace(
+                "repository_cas_result", operation="advance_history_scan",
+                outcome="committed" if committed is not None else "cas_conflict",
+                old_version=expected_version,
+                new_version=committed.version if committed is not None else "-",
+                revision_unchanged=True,
+            )
+            return committed
         except (ValueError,TypeError): raise
         except asyncio.CancelledError: raise
         except Exception as exc:
+            occurrence_trace(
+                "repository_cas_result", operation="advance_history_scan",
+                outcome="durable_error", exception=type(exc).__name__,
+            )
             self._history_unavailable("Supabase history scan advance failed: %s",exc)
     async def record_history_failure(self, owner_id, peer_id, *, expected_version, error, status=None):
         """Record error metadata only; summary and both cursors are untouched."""
         current=await self.get_history_schedule_by_peer(owner_id,int(peer_id))
-        if current is None or current.version!=expected_version: return None
+        if current is None:
+            occurrence_trace(
+                "repository_cas_result", operation="record_history_failure",
+                outcome="missing", expected_version=expected_version,
+            )
+            return None
+        if current.version!=expected_version:
+            occurrence_trace(
+                "repository_cas_result", operation="record_history_failure",
+                outcome="stale", expected_version=expected_version,
+                row_version=current.version,
+            )
+            return None
         _bounded_text(error,MAX_HISTORY_ERROR_BYTES,"last_error")
         if not error.strip(): raise ValueError("a failure needs a nonblank error")
         target=current.status if status is None else status
@@ -1470,23 +1639,60 @@ class SupabaseTaskRepository(TaskRepository):
         _validate_history_schedule_input({**current.as_dict(),**outgoing})
         try:
             result=await self._run(lambda:self._client.table("history_schedules").update(outgoing).eq("owner_id",owner_id).eq("peer_id",int(peer_id)).eq("version",expected_version).execute());row=getattr(result,"data",None);self._mark_supabase_ok()
-            return _history_schedule_from_row(row[0] if isinstance(row,list) else row) if row else None
+            recorded=_history_schedule_from_row(row[0] if isinstance(row,list) else row) if row else None
+            occurrence_trace(
+                "repository_cas_result", operation="record_history_failure",
+                outcome="recorded" if recorded is not None else "cas_conflict",
+                old_version=expected_version,
+                new_version=recorded.version if recorded is not None else "-",
+                revision_unchanged=True,
+            )
+            return recorded
         except (ValueError,TypeError): raise
         except asyncio.CancelledError: raise
         except Exception as exc:
+            occurrence_trace(
+                "repository_cas_result", operation="record_history_failure",
+                outcome="durable_error", exception=type(exc).__name__,
+            )
             self._history_unavailable("Supabase history failure write failed: %s",exc)
     async def reset_history_summary(self, owner_id, peer_id, *, expected_version):
         """Explicit owner-authorized reset: drop content coverage, keep cursors."""
         current=await self.get_history_schedule_by_peer(owner_id,int(peer_id))
-        if current is None or current.version!=expected_version: return None
+        if current is None:
+            occurrence_trace(
+                "repository_cas_result", operation="reset_history_summary",
+                outcome="missing", expected_version=expected_version,
+            )
+            return None
+        if current.version!=expected_version:
+            occurrence_trace(
+                "repository_cas_result", operation="reset_history_summary",
+                outcome="stale", expected_version=expected_version,
+                row_version=current.version,
+            )
+            return None
         now=_now(); outgoing={"summary":"","summarized_cursor":current.scanned_cursor,"revision":current.revision+1,"version":expected_version+1,"last_error":"","last_error_at":None,"last_committed_at":now,"updated_at":now}
         _validate_history_schedule_input({**current.as_dict(),**outgoing})
         try:
             result=await self._run(lambda:self._client.table("history_schedules").update(outgoing).eq("owner_id",owner_id).eq("peer_id",int(peer_id)).eq("version",expected_version).execute());row=getattr(result,"data",None);self._mark_supabase_ok()
-            return _history_schedule_from_row(row[0] if isinstance(row,list) else row) if row else None
+            committed=_history_schedule_from_row(row[0] if isinstance(row,list) else row) if row else None
+            occurrence_trace(
+                "repository_cas_result", operation="reset_history_summary",
+                outcome="committed" if committed is not None else "cas_conflict",
+                old_version=expected_version,
+                new_version=committed.version if committed is not None else "-",
+                old_revision=current.revision,
+                new_revision=committed.revision if committed is not None else "-",
+            )
+            return committed
         except (ValueError,TypeError): raise
         except asyncio.CancelledError: raise
         except Exception as exc:
+            occurrence_trace(
+                "repository_cas_result", operation="reset_history_summary",
+                outcome="durable_error", exception=type(exc).__name__,
+            )
             self._history_unavailable("Supabase history reset failed: %s",exc)
 
 def get_task_repository():

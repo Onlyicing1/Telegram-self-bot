@@ -29,6 +29,7 @@ from typing import Any
 from telethon import utils
 
 from backend.ai.engine.engine import get_engine
+from backend.ai.task_trace import history_creation_scope, history_creation_trace
 from backend.helper import (
     InlinePanelBuilder,
     register_action,
@@ -415,7 +416,22 @@ async def _schedule_panel(event, extra: str) -> tuple[str, str, list] | None:
 
 
 async def _create_scheduled_history() -> tuple[str, str, list]:
-    """The owner-only creation boundary; no model is involved."""
+    """Wrap the owner-only creation boundary in one trace scope.
+
+    The scope is short-lived and reset in ``finally`` by the context manager.
+    It carries no peer/chat identifier or owner-authored focus text.
+    """
+    with history_creation_scope():
+        history_creation_trace(
+            "creation_entered", cadence=_SCHEDULE.cadence,
+            baseline_mode=_SCHEDULE.baseline_mode,
+            focus_present=bool(_normalize_focus(_STATE.focus)),
+        )
+        return await _create_scheduled_history_impl()
+
+
+async def _create_scheduled_history_impl() -> tuple[str, str, list]:
+    """The unchanged owner-only creation path; no model is involved."""
     from backend.ai.database.manager import get_repository_manager
     from backend.ai.task_candidate import TaskCandidate
     from backend.ai.task_contract import SCHEDULED_HISTORY_ACTION
@@ -425,8 +441,14 @@ async def _create_scheduled_history() -> tuple[str, str, list]:
     )
 
     if _OWNER_ID <= 0:
+        history_creation_trace(
+            "eligibility_result", outcome="rejected", category="owner_missing"
+        )
         return _schedule_view(f"{sym.STATE_FAILED} The owner id is unavailable.")
     if not _SCHEDULE.peer_id:
+        history_creation_trace(
+            "eligibility_result", outcome="rejected", category="peer_missing"
+        )
         return _schedule_view(f"{sym.STATE_FAILED} Select a chat in History first.")
 
     manager = get_repository_manager()
@@ -435,20 +457,44 @@ async def _create_scheduled_history() -> tuple[str, str, list]:
         getattr(manager, "supabase_available", False)
         and getattr(repository, "supports_durable_history", False)
     ):
+        history_creation_trace(
+            "durability_result", outcome="unavailable",
+            supabase_available=bool(getattr(manager, "supabase_available", False)),
+            repository_durable=bool(
+                getattr(repository, "supports_durable_history", False)
+            ),
+        )
         return _schedule_view(
             f"{sym.STATE_FAILED} Durable History storage is unavailable; nothing was created."
         )
+    history_creation_trace("durability_result", outcome="available")
 
     client = get_self_client()
     if client is None:
+        history_creation_trace(
+            "telegram_result", outcome="unavailable", category="client_unavailable"
+        )
         return _schedule_view(f"{sym.STATE_FAILED} Telegram is not connected right now.")
+    history_creation_trace("peer_validation_started")
     try:
         peer_type = await history_service.classify_chat(client, _SCHEDULE.peer_id)
     except history_service.HistoryError as exc:
+        history_creation_trace(
+            "peer_validation_result", outcome="failed",
+            exception=type(exc).__name__, category="peer_classification",
+        )
         return _schedule_view(f"{sym.STATE_FAILED} {exc}")
     if peer_type is PeerType.UNKNOWN or history_policy.maximum_for(peer_type) <= 0:
+        history_creation_trace(
+            "peer_validation_result", outcome="refused", peer_type=peer_type.value,
+            category="peer_policy",
+        )
         return _schedule_view(f"{sym.STATE_FAILED} {history_policy.UNKNOWN_REFUSAL}")
     _SCHEDULE.peer_type = peer_type
+    history_creation_trace(
+        "peer_validation_result", outcome="passed", peer_type=peer_type.value,
+        maximum=history_policy.maximum_for(peer_type),
+    )
 
     try:
         baseline = (
@@ -459,11 +505,18 @@ async def _create_scheduled_history() -> tuple[str, str, list]:
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # noqa: BLE001 - no task may exist without a baseline
+        history_creation_trace(
+            "baseline_result", outcome="failed",
+            exception=type(exc).__name__, category="baseline_capture",
+        )
         logger.warning("HISTORY_SCHEDULE_BASELINE_FAILED error=%s", type(exc).__name__)
         return _schedule_view(
             f"{sym.STATE_FAILED} Could not capture the chat baseline ({type(exc).__name__}); "
             "nothing was created."
         )
+    history_creation_trace(
+        "baseline_result", outcome="captured", backlog=baseline == 0,
+    )
 
     schedule_type, schedule, cadence_label = _schedule_cadence()
     arguments: dict[str, Any] = {}
@@ -481,9 +534,15 @@ async def _create_scheduled_history() -> tuple[str, str, list]:
             "deliver_result": True,
         },
     }
+    history_creation_trace(
+        "definition_validation_started", schedule_type=schedule_type,
+        action_count=len(candidate.get("actions", [])),
+    )
     try:
         validated = TaskCandidate.from_untrusted(candidate)
+        history_creation_trace("definition_validation_result", outcome="passed")
         service = TaskCreationService(repository, _OWNER_ID)
+        history_creation_trace("creation_service_call_started")
         task, _state = await service.create_history_schedule_task(
             validated,
             datetime.now(timezone.utc),
@@ -491,6 +550,11 @@ async def _create_scheduled_history() -> tuple[str, str, list]:
             baseline_cursor=baseline,
         )
     except HistoryScheduleCreationError as exc:
+        history_creation_trace(
+            "creation_handler_result", outcome="failed",
+            category="history_schedule_creation_error",
+            task_id=exc.task_id, rollback_durable=exc.rollback_durable,
+        )
         if exc.task_id:
             notice = (
                 f"{sym.STATE_FAILED} The checkpoint could not be saved; task "
@@ -501,8 +565,16 @@ async def _create_scheduled_history() -> tuple[str, str, list]:
             notice = f"{sym.STATE_FAILED} {exc} Nothing durable was created."
         return _schedule_view(notice)
     except asyncio.CancelledError:
+        history_creation_trace(
+            "creation_handler_result", outcome="cancelled"
+        )
         raise
     except Exception as exc:  # noqa: BLE001 - honest failure, never a fake task
+        history_creation_trace(
+            "creation_handler_result", outcome="failed",
+            category="unhandled_creation_exception",
+            exception=type(exc).__name__,
+        )
         logger.warning("HISTORY_SCHEDULE_CREATE_FAILED error=%s", type(exc).__name__)
         return _schedule_view(
             f"{sym.STATE_FAILED} Could not create the schedule "
@@ -510,6 +582,9 @@ async def _create_scheduled_history() -> tuple[str, str, list]:
         )
 
     _SCHEDULE.created_task_id = int(task.id)
+    history_creation_trace(
+        "creation_handler_result", outcome="succeeded", task_id=task.id
+    )
     return _schedule_view(
         f"{sym.STATE_COMPLETED} Task #{task.id} created · {cadence_label} · "
         f"baseline {baseline}."

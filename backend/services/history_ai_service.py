@@ -56,6 +56,7 @@ from backend.ai.prompt.budget import (
     estimate_tokens_script_aware,
 )
 from backend.ai.providers.base.config import ProviderConfig
+from backend.ai.task_trace import occurrence_trace
 from backend.services import history_policy, history_service
 from backend.services.history_service import HistoryError, HistoryMessage
 
@@ -612,6 +613,7 @@ async def _call(
         "AI_EXEC_TRACE request_id=%s stage=provider_call_started timeout_s=%.1f",
         request_id or "-", timeout,
     )
+    occurrence_trace("provider_call_started", timeout_s=f"{timeout:.1f}")
     try:
         response = await asyncio.wait_for(
             manager.chat(messages, tools=[]),
@@ -625,6 +627,10 @@ async def _call(
             "timeout_s=%.1f",
             request_id or "-", timeout,
         )
+        occurrence_trace(
+            "provider_call_result", outcome="timeout",
+            timeout_s=f"{timeout:.1f}", category="provider_timeout",
+        )
         raise HistoryAIError(
             f"the AI provider did not respond within {timeout:g}s",
             code=ERROR_PROVIDER,
@@ -634,15 +640,30 @@ async def _call(
             "AI_EXEC_TRACE request_id=%s stage=provider_call_failed error=%s",
             request_id or "-", type(exc).__name__,
         )
+        occurrence_trace(
+            "provider_call_result", outcome="exception",
+            exception=type(exc).__name__, category="provider_exception",
+        )
         raise HistoryAIError(
             f"the AI provider call failed: {type(exc).__name__}: {exc}",
             code=ERROR_PROVIDER,
         ) from exc
 
+    metadata = getattr(response, "metadata", None) or {}
+    provider = str(getattr(response, "provider_name", "") or "") or "-"
     if not getattr(response, "success", False):
         logger.warning(
             "AI_EXEC_TRACE request_id=%s stage=provider_call_failed error=%s",
             request_id or "-", _failure_reason(response),
+        )
+        failure_origin = str(
+            metadata.get("failure_origin") or metadata.get("failure_type") or ""
+        ) or "-"
+        occurrence_trace(
+            "provider_call_result", outcome="provider_failed",
+            provider=provider, failure_origin=failure_origin,
+            fallback_exhausted=bool(metadata.get("fallback_exhausted", False)),
+            category="provider_response_failure",
         )
         raise HistoryAIError(
             f"the AI provider failed ({_failure_reason(response)})",
@@ -654,12 +675,21 @@ async def _call(
             "AI_EXEC_TRACE request_id=%s stage=provider_call_failed error=empty_response",
             request_id or "-",
         )
+        occurrence_trace(
+            "provider_call_result", outcome="empty_output", provider=provider,
+            category="provider_empty_output",
+            finish_reason=str(metadata.get("finish_reason") or "-"),
+        )
         raise HistoryAIError(
             "the AI provider returned an empty response", code=ERROR_PROVIDER,
         )
     logger.info(
         "AI_EXEC_TRACE request_id=%s stage=provider_call_completed chars=%s",
         request_id or "-", len(text),
+    )
+    occurrence_trace(
+        "provider_call_result", outcome="completed", provider=provider,
+        output_chars=len(text),
     )
     return text
 
@@ -686,6 +716,10 @@ async def _map(
         "AI_EXEC_TRACE request_id=%s stage=map_planned calls=%s spacing_s=%.2f "
         "budget_s=%.0f concurrency=%s",
         request_id or "-", len(chunks), spacing, budget_s, MAP_CONCURRENCY,
+    )
+    occurrence_trace(
+        "ai_map_started", calls=len(chunks), budget_s=f"{budget_s:.0f}",
+        concurrency=MAP_CONCURRENCY,
     )
 
     async def _one(index: int, chunk: _Chunk) -> str:
@@ -717,6 +751,10 @@ async def _map(
             raise result
     failures = [r for r in results if isinstance(r, BaseException)]
     if failures:
+        occurrence_trace(
+            "ai_map_result", outcome="failed", failures=len(failures),
+            exception=type(failures[0]).__name__, category="provider_failure",
+        )
         first = failures[0]
         if isinstance(first, HistoryAIError):
             raise first
@@ -724,6 +762,7 @@ async def _map(
             f"the AI provider failed: {type(first).__name__}: {first}",
             code=ERROR_PROVIDER,
         )
+    occurrence_trace("ai_map_result", outcome="completed", calls=len(results))
     return [str(r) for r in results]
 
 
@@ -983,12 +1022,20 @@ async def summarize_incremental(
     """
     manager = _resolve_manager(provider_manager)
     if manager is None:
+        occurrence_trace(
+            "ai_summarization_result", outcome="engine_unavailable",
+            category="ai_engine_unavailable",
+        )
         return False, f"{sym.STATE_FAILED} Summarization unavailable — the AI engine is not running.", {
             "error": ERROR_ENGINE,
         }
 
     text_messages = tuple(message for message in messages if message.text.strip())
     if not text_messages:
+        occurrence_trace(
+            "ai_summarization_result", outcome="no_text_messages",
+            text_messages=0,
+        )
         return True, "", {"processed": len(messages), "text_messages": 0}
 
     chunks = _chunk_history(
@@ -997,18 +1044,29 @@ async def summarize_incremental(
         token_budget=SUMMARIZE_CHUNK_TOKEN_BUDGET,
         with_ids=False,
     )
+    occurrence_trace(
+        "ai_chunking_result", text_messages=len(text_messages), chunks=len(chunks),
+        previous_summary_present=bool(str(previous_summary or "").strip()),
+    )
     budget = llm_budget(timeout_s)
     deadline = llm_deadline(budget)
     map_budget = budget - ASSUMED_CALL_LATENCY_S if len(chunks) > 1 else budget
     map_deadline = min(deadline, llm_deadline(map_budget))
     capacity = map_call_capacity(map_budget)
     if len(chunks) > capacity:
+        occurrence_trace(
+            "ai_capacity_result", outcome="refused", chunks=len(chunks),
+            capacity=capacity, category="ai_time_budget",
+        )
         return False, (
             f"{sym.STATE_FAILED} This batch needs {len(chunks)} AI calls, more "
             f"than the {capacity} one scheduled run can finish inside its "
             f"{map_budget:.0f}s budget."
         ), {"error": ERROR_TOO_LARGE, "processed": len(messages), "chunks": len(chunks)}
-
+    occurrence_trace(
+        "ai_capacity_result", outcome="accepted", chunks=len(chunks),
+        capacity=capacity,
+    )
     system = _with_instruction(
         _SUMMARIZE_SYSTEM, _clamp_instruction(instruction),
     )
@@ -1043,15 +1101,27 @@ async def summarize_incremental(
     except asyncio.CancelledError:
         raise
     except HistoryAIError as exc:
+        occurrence_trace(
+            "ai_summarization_result", outcome="failed", error_code=exc.code,
+            chunks=len(chunks), category="provider_failure",
+        )
         return False, f"{sym.STATE_FAILED} Summary failed: {exc}", {
             "error": exc.code, "processed": len(messages), "chunks": len(chunks),
         }
 
     final = final.strip()
     if not final:
+        occurrence_trace(
+            "ai_output_result", outcome="empty", chunks=len(chunks),
+            category="empty_generated_output",
+        )
         return False, f"{sym.STATE_FAILED} The AI provider returned an empty summary.", {
             "error": ERROR_PROVIDER, "processed": len(messages), "chunks": len(chunks),
         }
+    occurrence_trace(
+        "ai_output_result", outcome="generated", chunks=len(chunks),
+        output_chars=len(final),
+    )
     return True, final, {
         "processed": len(messages),
         "text_messages": len(text_messages),

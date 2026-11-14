@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from backend.ai.database.task_repository import OccurrenceRecord, TaskRepository
 from backend.ai.retry import can_retry, retry_delay
 from backend.ai.scheduling import ScheduleError, catch_up_occurrence, parse_schedule
+from backend.ai.task_trace import occurrence_scope, occurrence_trace
 
 logger = logging.getLogger(__name__)
 
@@ -105,56 +106,86 @@ class TaskScheduler:
         async with self._recovery_lock:
             recovered = 0
             now = datetime.now(timezone.utc)
-            for occurrence in await self.repository.list_recoverable_occurrences(self.owner_id, MAX_RECOVERY_PER_START):
-                try:
-                    # A pre-created occurrence whose boundary is still in the
-                    # future was never started — it must stay untouched so the
-                    # wake loop executes it exactly once AT its boundary (with
-                    # its durably prepared action if one was persisted).
-                    # Recovery must not arm a backoff on it or execute early.
-                    if (
-                        occurrence.status == "claimed"
-                        and occurrence.scheduled_for is not None
-                        and occurrence.scheduled_for > now
-                    ):
-                        continue
-                    if occurrence.status == "running":
-                        # A running row is past the durable claim boundary: an
-                        # external tool may already have produced a side
-                        # effect. Recovery cannot prove whether the process
-                        # died before or after that effect, so retrying it
-                        # would trade an honest uncertain failure for a
-                        # possible duplicate Telegram mutation.
-                        resolved = await self.repository.transition_occurrence(
-                            self.owner_id,
-                            occurrence.task_id,
-                            occurrence.occurrence_key,
-                            "failed",
-                            retry_at=None,
-                            error_metadata={
-                                "error_class": "restart_side_effect_uncertain",
-                                "attempt": occurrence.attempt,
-                            },
-                        )
-                        recovered += resolved is not None
-                        continue
-                    if occurrence.status == "claimed":
-                        occurrence = await self.repository.transition_occurrence(
-                            self.owner_id, occurrence.task_id, occurrence.occurrence_key, "interrupted"
-                        )
-                        if occurrence is None:
+            pending = await self.repository.list_recoverable_occurrences(
+                self.owner_id, MAX_RECOVERY_PER_START
+            )
+            logger.debug(
+                "TASK_SCHEDULER_TRACE stage=recovery_scan candidates=%s", len(pending)
+            )
+            for occurrence in pending:
+                with occurrence_scope(
+                    occurrence.occurrence_key,
+                    task_id=occurrence.task_id,
+                    attempt=occurrence.attempt,
+                ):
+                    occurrence_trace(
+                        "recovery_evaluated", status=occurrence.status,
+                        scheduled_for_future=bool(
+                            occurrence.scheduled_for is not None
+                            and occurrence.scheduled_for > now
+                        ),
+                    )
+                    try:
+                        # A pre-created occurrence whose boundary is still in the
+                        # future was never started — it must stay untouched so the
+                        # wake loop executes it exactly once AT its boundary (with
+                        # its durably prepared action if one was persisted).
+                        # Recovery must not arm a backoff on it or execute early.
+                        if (
+                            occurrence.status == "claimed"
+                            and occurrence.scheduled_for is not None
+                            and occurrence.scheduled_for > now
+                        ):
+                            occurrence_trace("recovery_result", outcome="deferred_future")
                             continue
-                    if occurrence.status == "interrupted":
-                        resolved = await self._resolve_interrupted(occurrence)
-                        recovered += resolved is not None
-                except ValueError:
-                    continue
+                        if occurrence.status == "running":
+                            # A running row is past the durable claim boundary: an
+                            # external tool may already have produced a side
+                            # effect. Recovery cannot prove whether the process
+                            # died before or after that effect, so retrying it
+                            # would trade an honest uncertain failure for a
+                            # possible duplicate Telegram mutation.
+                            resolved = await self.repository.transition_occurrence(
+                                self.owner_id,
+                                occurrence.task_id,
+                                occurrence.occurrence_key,
+                                "failed",
+                                retry_at=None,
+                                error_metadata={
+                                    "error_class": "restart_side_effect_uncertain",
+                                    "attempt": occurrence.attempt,
+                                },
+                            )
+                            recovered += resolved is not None
+                            occurrence_trace(
+                                "recovery_result",
+                                outcome=(
+                                    "side_effect_uncertain_failed"
+                                    if resolved is not None else "stale"
+                                ),
+                                failure_category="restart_side_effect_uncertain",
+                            )
+                            continue
+                        if occurrence.status == "claimed":
+                            occurrence_trace("recovery_transition", outcome="interrupted")
+                            occurrence = await self.repository.transition_occurrence(
+                                self.owner_id, occurrence.task_id, occurrence.occurrence_key, "interrupted"
+                            )
+                            if occurrence is None:
+                                occurrence_trace("recovery_result", outcome="stale")
+                                continue
+                        if occurrence.status == "interrupted":
+                            resolved = await self._resolve_interrupted(occurrence)
+                            recovered += resolved is not None
+                    except ValueError:
+                        occurrence_trace("recovery_result", outcome="stale")
+                        continue
             return recovered
 
     async def _resolve_interrupted(self, occurrence: OccurrenceRecord) -> OccurrenceRecord | None:
         metadata = {"error_class": "restart_interrupted", "attempt": occurrence.attempt}
         if can_retry(occurrence.attempt):
-            return await self.repository.transition_occurrence(
+            resolved = await self.repository.transition_occurrence(
                 self.owner_id, occurrence.task_id, occurrence.occurrence_key,
                 "retry_pending",
                 retry_at=occurrence.updated_at + retry_delay(occurrence.attempt),
@@ -162,43 +193,87 @@ class TaskScheduler:
                 finished_at=None,
                 error_metadata=metadata,
             )
-        return await self.repository.transition_occurrence(
+            occurrence_trace(
+                "recovery_result",
+                outcome="retry_pending" if resolved is not None else "stale",
+                failure_category="restart_interrupted",
+                next_attempt=occurrence.attempt + 1,
+            )
+            return resolved
+        resolved = await self.repository.transition_occurrence(
             self.owner_id, occurrence.task_id, occurrence.occurrence_key,
             "failed",
             retry_at=None,
             error_metadata=metadata,
         )
+        occurrence_trace(
+            "recovery_result",
+            outcome="failed_retry_exhausted" if resolved is not None else "stale",
+            failure_category="restart_interrupted",
+        )
+        return resolved
 
     async def _notify_outcome(self, task_id: int, occurrence_key: str, status: str) -> None:
         notifier = self.outcome_notifier
         if notifier is None:
+            occurrence_trace("outcome_notification", outcome="skipped", status=status)
             return
         if status not in ("succeeded", "failed", "retry_pending", "cancelled"):
+            occurrence_trace("outcome_notification", outcome="not_applicable", status=status)
             return
+        occurrence_trace("outcome_notification_started", status=status)
         try:
             await notifier.notify_persisted(task_id, occurrence_key, status)
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
+            occurrence_trace(
+                "outcome_notification", outcome="failed", status=status,
+                exception=type(exc).__name__,
+            )
             logger.exception("Task notification failed for %s", occurrence_key)
+            return
+        occurrence_trace("outcome_notification", outcome="completed", status=status)
 
     async def _execute_claimed(self, occurrence: OccurrenceRecord, reference: datetime) -> bool:
         coordinator = self.execution_coordinator
         if coordinator is None:
+            occurrence_trace("execution_handoff", outcome="skipped", reason="no_coordinator")
             return False
-        claimed = await self.repository.claim_occurrence(
-            self.owner_id, occurrence.task_id, occurrence.occurrence_key
-        )
-        if claimed is None or claimed.status != "running":
-            return False
-        # The wake loop's reference is the execution's clock too: one coherent
-        # instant per wake decides a durable wait boundary, so a woken
-        # boundary is judged against the same "now" that selected it.
-        result = await coordinator.execute(claimed, now=reference)
-        await self._notify_outcome(
-            occurrence.task_id, occurrence.occurrence_key, getattr(result, "status", "unknown")
-        )
-        return True
+        with occurrence_scope(
+            occurrence.occurrence_key,
+            task_id=occurrence.task_id,
+            attempt=occurrence.attempt,
+        ):
+            occurrence_trace("claim_attempt", prior_status=occurrence.status)
+            claimed = await self.repository.claim_occurrence(
+                self.owner_id, occurrence.task_id, occurrence.occurrence_key
+            )
+            if claimed is None:
+                occurrence_trace("claim_result", outcome="conflict")
+                return False
+            if claimed.status != "running":
+                occurrence_trace(
+                    "claim_result", outcome="not_claimed", status=claimed.status
+                )
+                return False
+            occurrence_trace("claim_result", outcome="claimed", status=claimed.status)
+            # The wake loop's reference is the execution's clock too: one coherent
+            # instant per wake decides a durable wait boundary, so a woken
+            # boundary is judged against the same "now" that selected it.
+            occurrence_trace("execution_handoff", outcome="started")
+            result = await coordinator.execute(claimed, now=reference)
+            occurrence_trace(
+                "execution_result",
+                success=bool(getattr(result, "success", False)),
+                status=getattr(result, "status", "unknown"),
+                action_count=getattr(result, "action_count", 0),
+                successful_actions=getattr(result, "successful_actions", 0),
+            )
+            await self._notify_outcome(
+                occurrence.task_id, occurrence.occurrence_key, getattr(result, "status", "unknown")
+            )
+            return True
 
     async def _execute_claimed_batch(
         self, occurrences: list[OccurrenceRecord], reference: datetime
@@ -233,6 +308,7 @@ class TaskScheduler:
         due = await self.repository.list_due_retry_occurrences(
             self.owner_id, reference, MAX_RETRIES_PER_WAKE
         )
+        logger.debug("TASK_SCHEDULER_TRACE stage=retry_discovery due=%s", len(due or []))
         return await self._execute_claimed_batch(list(due or []), reference)
 
     async def _process_due_task(self, task, reference: datetime) -> tuple[int, bool]:
@@ -253,42 +329,74 @@ class TaskScheduler:
             schedule = parse_schedule(task.schedule_type, task.schedule)
             scheduled, following = catch_up_occurrence(schedule, task.next_run_at, reference)
             key = occurrence_key(task.id, scheduled)
-            occurrence = await self.repository.create_occurrence(self.owner_id, {
-                "task_id": task.id, "occurrence_key": key, "definition_version": task.version,
-                "action_snapshot": task.actions, "scheduled_for": scheduled,
-            })
-            counted = 0
-            if occurrence is not None and occurrence.status == "claimed":
-                if self.execution_coordinator is not None:
-                    # Only an occurrence whose persisted state proves it was
-                    # never started may be executed here. retry_pending is
-                    # owned by the bounded retry path (which honors retry_at —
-                    # critical after a restart, where recovery has just armed
-                    # the backoff), and running/interrupted/terminal states
-                    # belong to recovery or are already finished. The claim CAS
-                    # in _execute_claimed is the final duplicate guard.
-                    counted = 1 if await self._execute_claimed(occurrence, reference) else 0
-                else:
-                    # No execution authority: park the occurrence for
-                    # deterministic recovery (same contract as the event
-                    # dispatcher) instead of leaving it silently claimed.
-                    try:
-                        await self.repository.transition_occurrence(
-                            self.owner_id, task.id, key, "interrupted"
-                        )
-                    except ValueError:
-                        pass
-                    counted = 1
-            next_run = None if (following is None or task.schedule_type == "once") else following
-            advanced = await self.repository.advance_next_run(
-                self.owner_id, task.id, task.version, next_run
-            )
-            if following is not None and task.schedule_type != "once":
-                await self._prepare_next_ahead(task, following, reference)
-            return counted, advanced is not None
         except (ScheduleError, ValueError) as exc:
             logger.warning("Task %s was not scheduled: %s", task.id, exc)
             return 0, False
+
+        with occurrence_scope(key, task_id=task.id, attempt=1):
+            occurrence_trace(
+                "due_task_discovered",
+                schedule_type=getattr(task, "schedule_type", "unknown"),
+                scheduled_for=scheduled.isoformat(),
+            )
+            try:
+                occurrence_trace("occurrence_create_started")
+                occurrence = await self.repository.create_occurrence(self.owner_id, {
+                    "task_id": task.id, "occurrence_key": key, "definition_version": task.version,
+                    "action_snapshot": task.actions, "scheduled_for": scheduled,
+                })
+                occurrence_trace(
+                    "occurrence_create_result",
+                    outcome="returned" if occurrence is not None else "none",
+                    status=getattr(occurrence, "status", "-") if occurrence else "-",
+                )
+                counted = 0
+                if occurrence is not None and occurrence.status == "claimed":
+                    if self.execution_coordinator is not None:
+                        # Only an occurrence whose persisted state proves it was
+                        # never started may be executed here. retry_pending is
+                        # owned by the bounded retry path (which honors retry_at —
+                        # critical after a restart, where recovery has just armed
+                        # the backoff), and running/interrupted/terminal states
+                        # belong to recovery or are already finished. The claim CAS
+                        # in _execute_claimed is the final duplicate guard.
+                        counted = 1 if await self._execute_claimed(occurrence, reference) else 0
+                    else:
+                        # No execution authority: park the occurrence for
+                        # deterministic recovery (same contract as the event
+                        # dispatcher) instead of leaving it silently claimed.
+                        try:
+                            await self.repository.transition_occurrence(
+                                self.owner_id, task.id, key, "interrupted"
+                            )
+                            occurrence_trace("execution_handoff", outcome="parked", reason="no_coordinator")
+                        except ValueError:
+                            occurrence_trace("execution_handoff", outcome="stale", reason="no_coordinator")
+                        counted = 1
+                elif occurrence is not None:
+                    occurrence_trace(
+                        "execution_handoff", outcome="skipped",
+                        reason="occurrence_not_claimed", status=occurrence.status,
+                    )
+                next_run = None if (following is None or task.schedule_type == "once") else following
+                advanced = await self.repository.advance_next_run(
+                    self.owner_id, task.id, task.version, next_run
+                )
+                occurrence_trace(
+                    "occurrence_boundary_advanced",
+                    outcome="advanced" if advanced is not None else "stale",
+                    next_run=(next_run.isoformat() if isinstance(next_run, datetime) else "none"),
+                )
+                if following is not None and task.schedule_type != "once":
+                    await self._prepare_next_ahead(task, following, reference)
+                return counted, advanced is not None
+            except (ScheduleError, ValueError) as exc:
+                occurrence_trace(
+                    "scheduler_rejected", exception=type(exc).__name__,
+                    category="schedule_or_state_invalid",
+                )
+                logger.warning("Task %s was not scheduled: %s", task.id, exc)
+                return 0, False
 
     async def _run_due_sweeps(self, reference: datetime) -> int:
         """Serve EVERY due task in this wake, bounded but not serialized.
@@ -304,6 +412,10 @@ class TaskScheduler:
         processed = 0
         for _sweep in range(MAX_SWEEPS_PER_WAKE):
             due = await self.repository.list_due_tasks(self.owner_id, reference, MAX_TASKS_PER_WAKE)
+            logger.debug(
+                "TASK_SCHEDULER_TRACE stage=due_sweep due=%s sweep=%s",
+                len(due or []), _sweep + 1,
+            )
             if not due:
                 break
             semaphore = asyncio.Semaphore(max(1, min(MAX_CONCURRENT_EXECUTIONS, len(due))))

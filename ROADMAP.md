@@ -1,12 +1,16 @@
 # ROADMAP
 
-## Latest delivery: History Phase 4 + prerequisite Phase 5 action — owner creation and scheduled checkpoint
+## Latest delivery: Scheduled History diagnostics tracing — Phase 7 prerequisite
 
-Status: **Phase 4's owner wizard/task+state creation and the prerequisite
-registered Phase 5 action are implemented and focused-tested. The Phase 3B
-migration remains APPLIED to the connected Supabase project (remote version
-`20261114180758`). Live Telegram execution, restart/catch-up validation and
-provider-failure validation remain unverified; Phase 6/7 stay deferred.**
+Status: **An observability-only, occurrence-scoped diagnostic trace layer is
+implemented for the existing Scheduled History lifecycle. It changes no
+execution, scheduler, cursor, CAS, retrieval, provider, creation or
+compensation semantics. Phase 4's owner wizard/task+state creation and the
+prerequisite registered Phase 5 action remain implemented and focused-tested.
+The Phase 3B migration remains APPLIED to the connected Supabase project
+(remote version `20261114180758`). Live Telegram execution, restart/catch-up
+validation and provider-failure validation remain unverified; Phase 6/7 stay
+deferred.**
 The owner chose to move the registered action and trusted task-id plumbing ahead
 of Phase 4 as a prerequisite; no phase was renumbered. Phase 3B audited commit:
 `a12c20779bc634cb4511fb0e79443b882e8a1a85` (implementation `417a6b8`, upstream
@@ -21,7 +25,7 @@ parent `e2f1619`). Phase 3A base: `62a18de`.
 | **4** | Deterministic schedule UI | **Implemented** — owner wizard, trusted creation path and compensating deletion |
 | **5** | Scheduled History action | **Prerequisite implemented** — registered action, trusted task id, bounded catch-up, CAS commit; live validation deferred |
 | **6** | Shared History admission | Deferred; numbering unchanged |
-| **7** | Live validation | Deferred; numbering unchanged |
+| **7** | Live validation | Deferred; numbering unchanged — occurrence tracing prerequisite delivered |
 
 Phase 3 remains the umbrella durable-state phase. The owner changed only the
 delivery order: the Phase 5 action/trusted task-id plumbing was required before
@@ -53,6 +57,37 @@ Phase 4 creation, then Phase 4 completed. No phase was renumbered.
 - **No new scheduler, executor, repository, Telegram client, listener, update
   loop or persistence path.** The existing scheduler/coordinator/executor and
   durable-only repository remain the only execution and state paths.
+
+### Scheduled History diagnostics tracing (Phase 7 prerequisite)
+
+- `AI_TASK_TRACE` remains the existing `create_task` request trace and is not
+  rebound for scheduled work. `backend/ai/task_trace.py` adds independent
+  occurrence and History-creation context variables, scopes and bounded
+  structured emitters.
+- `SCHEDULED_OCCURRENCE_TRACE` carries one stable `trace_id` per durable
+  occurrence (the Scheduler occurrence key, `<task_id>:<scheduled_for UTC ISO>`),
+  the task id and a separate `attempt`; `HISTORY_SCHEDULE_TRACE` covers owner
+  creation and compensation with a short-lived random creation id.
+- Covered stages: owner creation, duplicate/durability checks, separate task
+  and state writes, compensation; scheduler recovery, due discovery,
+  occurrence creation/idempotent existence, claim, handoff, retry/terminal
+  result and notification; coordinator validation, provenance injection,
+  action-chain planning, each action start/result, timeout/cancellation and
+  terminal outcome; tool provenance/argument validation and service invocation;
+  durable state lookup/validation, peer policy, stable upper bound, retrieval,
+  safe skip, AI/provider, output validation, CAS commit and failure metadata;
+  narrow repository read/CAS outcomes.
+- Trace output carries only bounded operational metadata. It never logs message
+  bodies, summaries, owner instructions, prompts, provider bodies, credentials
+  or peer identifiers; raw exception text is not used. Ordinary Telegram/AI
+  requests emit no scheduled trace because the occurrence scope is absent.
+- Focused tests cover ordered success, cross-stage correlation, retry attempt
+  separation, concurrent isolation, reset after success/exception/cancellation,
+  ordinary-request silence, provenance rejection, storage/state, peer-policy,
+  retrieval, AI/provider, safe-skip/summary, output, CAS/durable-error,
+  compensation and content-privacy distinctions.
+- No schema, migration, scheduler, worker, execution path, cursor/CAS rule,
+  provider policy or retrieval limit was changed.
 
 ### What Phase 3B actually delivers (source-verified)
 
@@ -119,6 +154,11 @@ Phase 4 creation, then Phase 4 completed. No phase was renumbered.
 - Independent audit of Phase 3B: repository/CAS/cursor review, durable-only
   enforcement, merge-integrity comparison against both parents,
   migration/§31.3 reconciliation.
+- Phase 7 observability prerequisite: occurrence-scoped end-to-end tracing for
+  creation/compensation, scheduler/occurrence lifecycle, coordinator actions,
+  the History tool/service, AI/provider boundary and repository CAS outcomes;
+  19 focused trace tests pass, including correlation, retry, concurrency,
+  cleanup, failure distinctions and content privacy.
 - `IMPLEMENTATION_REPORT.md` and `INVESTIGATION.md` record the audited state.
 
 ### Applied migration and verification (2026-11-14)
@@ -140,7 +180,9 @@ Phase 4 creation, then Phase 4 completed. No phase was renumbered.
   run against a live Telegram chat; the action and UI are covered by focused
   tests with injected retrieval/provider doubles.
 - **No live restart/catch-up run, deleted-message gap run, provider-failure run
-  or capped-peer refusal was exercised.** These remain Phase 7 work.
+  or capped-peer refusal was exercised.** These remain Phase 7 work. The new
+  tracing was verified only with offline tests and test doubles; its first
+  production sequence is still to be observed.
 - **Task and state are two durable writes**: state failure is compensated by
   deleting the exact created task, but this is not a single cross-table
   transaction. A crash between the two writes can leave an owner-created task

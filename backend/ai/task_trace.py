@@ -1,32 +1,50 @@
-"""Request-correlated trace helper for the create_task pipeline.
+"""Correlated trace helpers for task creation and scheduled occurrences.
 
-``[CREATE_TASK_TRACE]`` lines are emitted only while a create_task request
-is bound (see ``bind_request``), so the provider and repository layers
-shared with normal chat traffic stay completely silent outside task
-creation. Every line carries the correlation id plus the bound owner/chat
-context; the helper also remembers the most recent stage and failure
-category so the terminal ``exit`` line can report where a request ended
-without extra plumbing through the layers.
+Three independent context variables keep unrelated traffic silent:
 
-Sanitization: this helper never logs credentials — it only formats what
-callers pass, and callers pass bounded, task-scoped values (request text,
-candidate fields, exception class names). ``bound_text`` flattens control
-characters and truncates with an explicit marker so log lines stay
-single-line and bounded.
+* ``_binding`` is the existing create_task request binding (``AI_TASK_TRACE``).
+  It is emitted only while ``bind_request`` is active, so provider/repository
+  layers shared with ordinary chat never emit create-task stages there.
+* ``_occurrence_binding`` is the durable scheduled-occurrence binding
+  (``SCHEDULED_OCCURRENCE_TRACE``). Its trace id is the scheduler occurrence key
+  and it carries the task id and current attempt, so scheduler, coordinator,
+  tool, service, provider and persistence stages share one correlation id.
+  It is emitted only inside ``occurrence_scope``; ordinary Telegram/AI
+  requests never emit these stages.
+* ``_history_creation_binding`` is a short-lived owner-creation scope
+  (``HISTORY_SCHEDULE_TRACE``). Creation has no durable occurrence yet, so it
+  gets its own bounded trace id and is restored before the callback returns.
+
+Sanitization: callers pass bounded operational values (ids, statuses, names,
+counts, exception classes, stable categories) — never message text, summaries,
+instructions, prompts, provider payloads or credentials. ``bound_text``
+flattens control characters and truncates with an explicit marker so every
+line is single-line and bounded.
 """
 from __future__ import annotations
 
+import contextlib
 import contextvars
 import logging
-from typing import Any
+import uuid
+from typing import Any, Iterator
 
 logger = logging.getLogger(__name__)
 
 TRACE_PREFIX = "AI_TASK_TRACE"
+OCCURRENCE_TRACE_PREFIX = "SCHEDULED_OCCURRENCE_TRACE"
+HISTORY_CREATION_TRACE_PREFIX = "HISTORY_SCHEDULE_TRACE"
 _DEFAULT_BOUND_CHARS = 240
+_OCCURRENCE_FIELD_CHARS = 160
 
 _binding: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
     "create_task_trace_binding", default=None
+)
+_occurrence_binding: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
+    "scheduled_occurrence_trace_binding", default=None
+)
+_history_creation_binding: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
+    "history_creation_trace_binding", default=None
 )
 
 
@@ -98,4 +116,107 @@ def task_trace(stage: str, **fields: Any) -> None:
     if binding:
         parts.extend(f"{key}={value}" for key, value in binding["context"].items())
     parts.extend(f"{key}={value}" for key, value in fields.items())
+    logger.info(" ".join(parts))
+
+
+def _trace_value(value: Any, limit: int = _OCCURRENCE_FIELD_CHARS) -> str:
+    """Single-line, bounded trace field; never raises on odd caller values."""
+    try:
+        text = " ".join(str(value).split())
+    except Exception:  # noqa: BLE001 - tracing must never break an operation
+        return "invalid"
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}…(+{len(text) - limit} chars)"
+
+
+def new_history_trace_id() -> str:
+    """A bounded, non-secret correlation id for the owner creation flow."""
+    return f"hist-{uuid.uuid4().hex[:12]}"
+
+
+def current_occurrence() -> dict[str, Any] | None:
+    """A copy of the active scheduled-occurrence binding, if any."""
+    binding = _occurrence_binding.get()
+    return dict(binding) if binding else None
+
+
+@contextlib.contextmanager
+def occurrence_scope(
+    trace_id: str,
+    *,
+    task_id: int,
+    attempt: int,
+    **context: Any,
+) -> Iterator[dict[str, Any]]:
+    """Bind one durable occurrence for the duration of an async call tree.
+
+    ``trace_id`` is the scheduler-generated occurrence key, which is stable
+    across retries. ``attempt`` is the durable attempt carried by the row at
+    this stage, so a retry remains correlated but is distinguishable. The
+    token is always reset in ``finally``; concurrent asyncio tasks each carry
+    their own copied context, so bindings cannot mix.
+    """
+    bounded_context = {
+        str(key): _trace_value(value) for key, value in context.items()
+    }
+    token = _occurrence_binding.set(
+        {
+            "trace_id": _trace_value(trace_id, 256),
+            "task_id": int(task_id) if isinstance(task_id, int) and not isinstance(task_id, bool) else 0,
+            "attempt": int(attempt) if isinstance(attempt, int) and not isinstance(attempt, bool) else 0,
+            "context": bounded_context,
+        }
+    )
+    try:
+        binding = _occurrence_binding.get() or {}
+        yield binding
+    finally:
+        _occurrence_binding.reset(token)
+
+
+def occurrence_trace(stage: str, **fields: Any) -> None:
+    """Emit one occurrence-correlated record; silent outside the scope."""
+    binding = _occurrence_binding.get()
+    if binding is None:
+        return
+    parts = [
+        f"{OCCURRENCE_TRACE_PREFIX} trace_id={binding['trace_id']} "
+        f"task_id={binding['task_id']} attempt={binding['attempt']} stage={stage}",
+    ]
+    parts.extend(f"{key}={value}" for key, value in binding["context"].items())
+    for key, value in fields.items():
+        if key in {"trace_id", "task_id", "attempt", "stage"}:
+            continue
+        parts.append(f"{key}={_trace_value(value)}")
+    logger.info(" ".join(parts))
+
+
+@contextlib.contextmanager
+def history_creation_scope(trace_id: str = "") -> Iterator[str]:
+    """Bind one owner creation flow; reuse an existing outer creation scope."""
+    existing = _history_creation_binding.get()
+    if existing is not None:
+        yield str(existing["trace_id"])
+        return
+    chosen = _trace_value(trace_id, 128) if trace_id else new_history_trace_id()
+    token = _history_creation_binding.set({"trace_id": chosen})
+    try:
+        yield chosen
+    finally:
+        _history_creation_binding.reset(token)
+
+
+def history_creation_trace(stage: str, **fields: Any) -> None:
+    """Emit one owner-creation record; silent outside the creation scope."""
+    binding = _history_creation_binding.get()
+    if binding is None:
+        return
+    parts = [
+        f"{HISTORY_CREATION_TRACE_PREFIX} trace_id={binding['trace_id']} stage={stage}",
+    ]
+    for key, value in fields.items():
+        if key in {"trace_id", "stage"}:
+            continue
+        parts.append(f"{key}={_trace_value(value)}")
     logger.info(" ".join(parts))

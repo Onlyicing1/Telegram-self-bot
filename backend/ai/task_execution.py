@@ -62,6 +62,7 @@ from backend.ai.preparation_policy import (
     validate_prepared_arguments,
 )
 from backend.ai.retry import FailureClass, classify_failure, retry_delay, can_retry
+from backend.ai.task_trace import occurrence_scope, occurrence_trace
 
 logger = logging.getLogger(__name__)
 MAX_EXECUTION_SECONDS = 60.0
@@ -567,9 +568,58 @@ class TaskExecutionCoordinator:
     async def execute(
         self, occurrence: OccurrenceRecord, *, now: datetime | None = None
     ) -> TaskExecutionResult:
+        """Execute one claimed occurrence inside its durable trace scope.
+
+        The scope is re-entered here so direct coordinator callers (tests,
+        recovery, future call sites) get the same correlation as the
+        scheduler. The scheduler's outer scope and this one share the same
+        occurrence key; the token is always reset in ``finally``.
+        """
+        with occurrence_scope(
+            occurrence.occurrence_key,
+            task_id=occurrence.task_id,
+            attempt=occurrence.attempt,
+        ):
+            occurrence_trace(
+                "execution_entered",
+                status=occurrence.status,
+                owner_match=occurrence.owner_id == self.owner_id,
+                action_count=len(occurrence.action_snapshot or []),
+            )
+            try:
+                result = await self._execute_occurrence(occurrence, now=now)
+            except asyncio.CancelledError:
+                occurrence_trace("execution_cancelled", category="cancelled")
+                raise
+            except Exception as exc:  # noqa: BLE001 - never hide the real failure
+                occurrence_trace(
+                    "execution_exception", exception=type(exc).__name__,
+                    category="unhandled_execution_exception",
+                )
+                raise
+            occurrence_trace(
+                "execution_finished",
+                success=result.success,
+                status=result.status,
+                action_count=result.action_count,
+                successful_actions=result.successful_actions,
+            )
+            return result
+
+    async def _execute_occurrence(
+        self, occurrence: OccurrenceRecord, *, now: datetime | None = None
+    ) -> TaskExecutionResult:
         if occurrence.owner_id != self.owner_id:
+            occurrence_trace(
+                "validation_result", check="owner", outcome="failed",
+                category="owner_mismatch",
+            )
             return TaskExecutionResult(False, "failed", 0, 0, "owner_mismatch")
         if occurrence.status != "running":
+            occurrence_trace(
+                "validation_result", check="status", outcome="failed",
+                category="occurrence_not_running", status=occurrence.status,
+            )
             return TaskExecutionResult(False, occurrence.status, 0, 0, "occurrence_not_running")
         # The instant wait eligibility is judged against: the caller's
         # reference when it has one (the wake loop's own clock), otherwise the
@@ -599,12 +649,19 @@ class TaskExecutionCoordinator:
         # trusting anything the model or candidate supplied. Keep it scoped to
         # chains that actually carry that action; ordinary scheduled tools keep
         # exactly the context they had before.
-        if any(
+        has_scheduled_history = any(
             isinstance(action, dict)
             and (action.get("name") or action.get("tool")) == SCHEDULED_HISTORY_ACTION
             for action in (occurrence.action_snapshot or [])
-        ):
+        )
+        if has_scheduled_history:
             occurrence_extra[SCHEDULED_TASK_ID_EXTRA] = occurrence.task_id
+        occurrence_trace(
+            "provenance_injected",
+            scheduled_history=has_scheduled_history,
+            task_marker=has_scheduled_history,
+            occurrence_marker=True,
+        )
         task = await self.repository.get_task(self.owner_id, occurrence.task_id)
         if task is not None:
             dest = task.notification_destination or {}
@@ -621,11 +678,19 @@ class TaskExecutionCoordinator:
 
         actions = occurrence.action_snapshot
         if not isinstance(actions, list) or not actions or len(actions) > 5:
+            occurrence_trace(
+                "validation_result", check="action_snapshot", outcome="failed",
+                category="invalid_action_snapshot",
+            )
             return await self._fail(occurrence, "invalid_action_snapshot", 0, 0)
         calls: list[dict[str, Any]] = []
         execution_calls: list[dict[str, Any]] = []
         for action in actions:
             if not isinstance(action, dict):
+                occurrence_trace(
+                    "validation_result", check="action_snapshot", outcome="failed",
+                    category="invalid_action",
+                )
                 return await self._fail(occurrence, "invalid_action", 0, 0)
             if CONDITION_KEY in action:
                 # A condition declares no tool call: it is recorded under its own
@@ -637,11 +702,23 @@ class TaskExecutionCoordinator:
             name = action.get("name") or action.get("tool")
             arguments = action.get("arguments", action.get("parameters", {}))
             if not isinstance(name, str) or not name or not isinstance(arguments, dict):
+                occurrence_trace(
+                    "validation_result", check="action_snapshot", outcome="failed",
+                    category="invalid_action",
+                )
                 return await self._fail(occurrence, "invalid_action", 0, 0)
             if self.executor._registry.get(name) is None:
+                occurrence_trace(
+                    "validation_result", check="registered_action", outcome="failed",
+                    category="unregistered_action", action=name,
+                )
                 return await self._fail(occurrence, "unregistered_action", 0, 0)
             calls.append({"name": name, "arguments": arguments})
         execution_calls = calls
+        occurrence_trace(
+            "actions_planned", count=len(calls),
+            actions=",".join(str(call["name"]) for call in calls),
+        )
 
         # AI-assisted occurrences: only tasks that persist an ai_instruction
         # pay for a provider round. Static tasks keep the exact deterministic
@@ -660,9 +737,14 @@ class TaskExecutionCoordinator:
             generation_authorized=generation_authorized,
         )
         if reference_error:
+            occurrence_trace(
+                "validation_result", check="action_chain", outcome="failed",
+                category="invalid_action_reference",
+            )
             return await self._fail(
                 occurrence, f"invalid_action_reference: {reference_error}", 0, 0
             )
+        occurrence_trace("validation_result", check="action_chain", outcome="passed")
 
         # The bounded conditional structure, re-proved with the SAME rule
         # creation enforced: at most one condition, one contiguous run per
@@ -675,6 +757,10 @@ class TaskExecutionCoordinator:
             generation_authorized=generation_authorized,
         )
         if condition_error:
+            occurrence_trace(
+                "validation_result", check="condition_chain", outcome="failed",
+                category="invalid_condition",
+            )
             return await self._fail(
                 occurrence, f"invalid_condition: {condition_error}", 0, 0
             )
@@ -689,6 +775,10 @@ class TaskExecutionCoordinator:
             reference=reference,
         )
         if wait_error:
+            occurrence_trace(
+                "validation_result", check="wait_boundary", outcome="failed",
+                category="invalid_wait_boundary",
+            )
             return await self._fail(
                 occurrence, f"invalid_wait_boundary: {wait_error}", 0, 0
             )
@@ -701,6 +791,10 @@ class TaskExecutionCoordinator:
         # rule fails closed BEFORE anything executes.
         question_error = question_chain_error(actions)
         if question_error:
+            occurrence_trace(
+                "validation_result", check="question_chain", outcome="failed",
+                category="invalid_question",
+            )
             return await self._fail(
                 occurrence, f"invalid_question: {question_error}", 0, 0
             )
@@ -710,9 +804,17 @@ class TaskExecutionCoordinator:
         # action resumes where it stopped.
         prior_runs, record_error = _recorded_runs(occurrence)
         if record_error:
+            occurrence_trace(
+                "validation_result", check="action_record", outcome="failed",
+                category="invalid_action_record",
+            )
             return await self._fail(occurrence, record_error, 0, 0)
         mismatch = _run_record_mismatch(prior_runs, calls)
         if mismatch:
+            occurrence_trace(
+                "validation_result", check="action_record", outcome="failed",
+                category="invalid_action_record",
+            )
             return await self._fail(occurrence, mismatch, 0, 0)
 
         # A resumed question: the answer-consuming CAS already flipped this
@@ -782,13 +884,14 @@ class TaskExecutionCoordinator:
         # path even when the chain is cut short by a timeout or an exception.
         state: dict[int, dict[str, Any]] = {run["position"]: run for run in prior_runs}
         started = time.perf_counter()
-        execution_timeout = MAX_EXECUTION_SECONDS
-        if any(
-            isinstance(action, dict)
-            and (action.get("name") or action.get("tool")) == SCHEDULED_HISTORY_ACTION
-            for action in actions
-        ):
-            execution_timeout = MAX_SCHEDULED_HISTORY_EXECUTION_SECONDS
+        execution_timeout = (
+            MAX_SCHEDULED_HISTORY_EXECUTION_SECONDS
+            if has_scheduled_history else MAX_EXECUTION_SECONDS
+        )
+        occurrence_trace(
+            "execution_started", action_count=len(calls),
+            timeout_s=execution_timeout,
+        )
         try:
             outcome = await asyncio.wait_for(
                 self._execute_chain(
@@ -799,7 +902,20 @@ class TaskExecutionCoordinator:
             )
         except asyncio.CancelledError:
             raise
+        except asyncio.TimeoutError as exc:
+            occurrence_trace(
+                "execution_timeout", timeout_s=execution_timeout,
+                category="execution_timeout",
+            )
+            return await self.handle_failure(
+                occurrence, exc, action_count=len(calls),
+                runs=_ordered_runs(state) or None,
+            )
         except Exception as exc:
+            occurrence_trace(
+                "execution_failed", exception=type(exc).__name__,
+                category="execution_exception",
+            )
             return await self.handle_failure(
                 occurrence, exc, action_count=len(calls),
                 runs=_ordered_runs(state) or None,
@@ -834,7 +950,16 @@ class TaskExecutionCoordinator:
             **self._preparation_updates(task, calls),
         )
         if updated is None:
+            occurrence_trace(
+                "terminal_outcome", outcome="unknown",
+                category="state_persist_failed",
+            )
             return TaskExecutionResult(False, "unknown", len(calls), successful, "state_persist_failed", metadata)
+        occurrence_trace(
+            "terminal_outcome", outcome="succeeded",
+            successful_actions=successful, action_count=len(calls),
+            duration_ms=duration_ms,
+        )
         await self._deliver_result(task, outcome.results, execution_context, occurrence.occurrence_key)
         return TaskExecutionResult(True, "succeeded", len(calls), successful, metadata=metadata)
 
@@ -952,11 +1077,19 @@ class TaskExecutionCoordinator:
                 break
             if recorded is not None and recorded["status"] == "succeeded":
                 skipped += 1
+                occurrence_trace(
+                    "action_result", position=position, action=name,
+                    outcome="already_succeeded",
+                )
                 continue
             if recorded is not None and recorded["status"] == BRANCH_SKIPPED_STATUS:
                 # Durable proof that this action belongs to the branch this
                 # occurrence never selected: nothing to re-derive, never run.
                 not_selected += 1
+                occurrence_trace(
+                    "action_result", position=position, action=name,
+                    outcome="branch_not_selected",
+                )
                 continue
             if layout is not None and position == layout.condition_position:
                 # The ONE conditional decision of this occurrence: its source is
@@ -975,6 +1108,10 @@ class TaskExecutionCoordinator:
                     break
                 state[position] = build_action_run(
                     position, name, "succeeded", output=condition_run_output(matched)
+                )
+                occurrence_trace(
+                    "action_result", position=position, action=name,
+                    outcome="condition_evaluated", selected_branch=branch_name(matched),
                 )
                 # The SELECTION becomes durable BEFORE either branch runs: a
                 # crash after this write resumes the SAME branch and can never
@@ -1004,10 +1141,18 @@ class TaskExecutionCoordinator:
                         position, name, BRANCH_SKIPPED_STATUS
                     )
                     not_selected += 1
+                    occurrence_trace(
+                        "action_result", position=position, action=name,
+                        outcome="branch_not_selected",
+                    )
                     continue
             boundary = waits[position - 1] if position - 1 < len(waits) else None
             if boundary is not None and reference < boundary:
                 paused_at, paused_until = position, boundary
+                occurrence_trace(
+                    "action_wait", position=position, action=name,
+                    outcome="parked", not_before=boundary.isoformat(),
+                )
                 break
             if name == QUESTION_TOOL:
                 arguments = execution_calls[position - 1].get("arguments", {})
@@ -1026,6 +1171,10 @@ class TaskExecutionCoordinator:
                 # owner's correlated reply consumes it.
                 state[position] = build_action_run(position, name, "pending")
                 await self._persist_runs(occurrence, state)
+                occurrence_trace(
+                    "action_started", position=position, action=name,
+                    action_kind="question",
+                )
                 result = (await self.executor.execute_calls(
                     [{"name": name, "arguments": resolved}],
                     owner_id=self.owner_id,
@@ -1033,6 +1182,10 @@ class TaskExecutionCoordinator:
                     context_override=execution_context,
                 ))[0]
                 results.append(result)
+                occurrence_trace(
+                    "action_result", position=position, action=name,
+                    outcome="succeeded" if result.success else "failed",
+                )
                 if not result.success:
                     # Existing action failure semantics: the question was NOT
                     # asked, nothing is answered, nothing is parked — the
@@ -1094,6 +1247,7 @@ class TaskExecutionCoordinator:
                 break
             state[position] = build_action_run(position, name, "running")
             await self._persist_runs(occurrence, state)
+            occurrence_trace("action_started", position=position, action=name)
             result = (await self.executor.execute_calls(
                 [{"name": name, "arguments": resolved}],
                 owner_id=self.owner_id,
@@ -1101,6 +1255,11 @@ class TaskExecutionCoordinator:
                 context_override=execution_context,
             ))[0]
             results.append(result)
+            occurrence_trace(
+                "action_result", position=position, action=name,
+                outcome="succeeded" if result.success else "failed",
+                error_category="tool_failure" if not result.success else "-",
+            )
             if not result.success:
                 failure = self._action_failure(result)
                 state[position] = build_action_run(
@@ -1221,6 +1380,10 @@ class TaskExecutionCoordinator:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            occurrence_trace(
+                "terminal_outcome", outcome="unknown",
+                category="wait_persist_failed", exception=type(exc).__name__,
+            )
             logger.warning(
                 "TASK_CHAIN_WAIT_PERSIST_FAILED task_id=%s occurrence_key=%s "
                 "exception=%s",
@@ -1234,6 +1397,11 @@ class TaskExecutionCoordinator:
             return TaskExecutionResult(
                 False, "unknown", len(calls), successful, "wait_persist_failed", record
             )
+        occurrence_trace(
+            "terminal_outcome", outcome="waiting",
+            waiting_action=outcome.paused_at,
+            not_before=boundary.isoformat(),
+        )
         return TaskExecutionResult(False, "waiting", len(calls), successful, metadata=record)
 
     async def _park_at_question(
@@ -1323,6 +1491,10 @@ class TaskExecutionCoordinator:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            occurrence_trace(
+                "terminal_outcome", outcome="unknown",
+                category="question_park_failed", exception=type(exc).__name__,
+            )
             logger.warning(
                 "TASK_CHAIN_QUESTION_PERSIST_FAILED task_id=%s occurrence_key=%s "
                 "exception=%s",
@@ -1333,6 +1505,10 @@ class TaskExecutionCoordinator:
             return TaskExecutionResult(
                 False, "unknown", len(calls), successful, "question_park_failed", record
             )
+        occurrence_trace(
+            "terminal_outcome", outcome="waiting_answer",
+            asking_action=position,
+        )
         logger.info(
             "TASK_CHAIN_WAITING_ANSWER task_id=%s occurrence_key=%s action=%s "
             "question_message=%s:%s already_succeeded=%s",
@@ -1751,6 +1927,12 @@ class TaskExecutionCoordinator:
                 attempt=occurrence.attempt + 1,
                 error_metadata=error_metadata,
             )
+            occurrence_trace(
+                "terminal_outcome",
+                outcome="retry_pending" if updated else "unknown",
+                category=decision.reason,
+                next_attempt=occurrence.attempt + 1,
+            )
             return TaskExecutionResult(
                 False,
                 "retry_pending" if updated else "unknown",
@@ -1786,5 +1968,9 @@ class TaskExecutionCoordinator:
         updated = await self.repository.transition_occurrence(
             self.owner_id, occurrence.task_id, occurrence.occurrence_key,
             "failed", error_metadata=error_metadata,
+        )
+        occurrence_trace(
+            "terminal_outcome", outcome="failed" if updated else "unknown",
+            category="terminal_failure",
         )
         return TaskExecutionResult(False, "failed" if updated else "unknown", count, successful, safe_error, metadata or error_metadata)
