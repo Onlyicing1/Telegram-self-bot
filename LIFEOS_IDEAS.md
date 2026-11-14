@@ -1063,434 +1063,691 @@ reference them rather than renaming ideas.
 
 ## 5. Feature Relationships and Dependencies
 
-These are hypotheses validated against the current source, not mandatory design
-decisions.
+Revised 2026-11-14 after a second source inspection. The previous graph treated
+each group's idea list as if every idea in it had the same prerequisite. That
+was wrong in three places: Workspace language, Workspace-aware Task Center
+scope, and Workspace-aware evidence browsing were all scheduled before the
+Workspace foundation existed.
 
-### 5.1 Shared foundations
+### 5.1 Dependency classes
 
-| Foundation | Why it is shared | Current evidence | Ideas enabled |
+These are deliberately separate. They are not interchangeable.
+
+| Class | Meaning | Consequence |
+|---|---|---|
+| **Technical dependency** | The capability cannot be implemented correctly without the foundation. | The dependent stage must not start. |
+| **Product dependency** | The capability is technically possible, but the user workflow would be incomplete or misleading without another feature. | A limited stage may ship, but the dependent deliverable must be labelled incomplete or deferred. |
+| **Validation gate** | Code may exist, but real-world validation must pass before dependent automation or recommendations are enabled. | Build only behind a disabled/default-off path until the gate passes. |
+| **Owner approval** | A product, persistence, privacy or provider choice cannot be made from source inspection. | Stop at the decision boundary; do not invent schema, storage or policy. |
+
+Readiness is reported separately in Section 7. A high product priority does not
+mean a stage is ready.
+
+### 5.2 Corrected dependency graph
+
+```text
+G1-A UI interaction ────────────────┬───────────────┐
+                                     │               │
+G2-A language (global/task/manual) ──┼──> G5-A Task Center
+                                     │               │
+G4-A single-source evidence ─────────┘               │
+        │                                            │
+        ├──> G4-B Workspace evidence integration <── G3-B
+        │                                            │
+G3-A source/Workspace identity ──> G3-B Workspace settings/dashboard/health
+        │                               │
+        │                               └──> G2-B Workspace language
+        │                                            │
+        │                                            └──> G5-B Workspace task scope
+        │
+        ├──> G6-A cross-source query + export <── G4-A
+        │
+        └──> G7-A activity metrics + coverage <── G4-A
+                    │
+                    └──> G7-B schedule recommendations ──[V: Scheduled History Phase 7]
+
+G6-A ──[O: index/store]──> G6-B semantic search/similar discussion
+
+G3-A + G4-A + G5-A + G6-A + G7-A ──[O: advanced approval]──> G8 longitudinal intelligence
+
+G1-A ──> G1-B visual identity/accessibility
+```
+
+`G1-A` and `G2-A` have no dependency on each other. Either may start first; the
+sequence below starts with `G1-A` because its row/selection grammar is consumed
+by `G3-A` and `G5-A`.
+
+### 5.3 Shared foundations
+
+| Foundation | Correct scope | Source-verified evidence | First consuming stage |
 |---|---|---|---|
-| **Language contract** (LANG-001/002/004) | Every generated artifact needs one predictable language decision and an extensible catalog. | Global setting exists but is not wired to AI/History; Taskloom has task choices; `AIRequest` defaults English. | Summaries, extraction, task output, exports, cross-source answers. |
-| **Workspace/source identity** (WS-001, SOURCE-001/002) | Settings, analytics, schedules, tasks and cross-source queries need one owner-approved source identity and scope. | `PeerType`, History picker, `history_schedules` per peer, task rows; no Workspace model. | WS-002/003, ANALYTICS, TASK scope, INTEL-020. |
-| **Evidence/provenance** (INTEL-002, EVID-001) | Claims, follow-ups, extraction, trackers and exports need stable, revalidated source references. | History range metadata and saved-item origin ids exist; no citation ledger or persisted evidence. | Follow-ups, extraction, contradiction, decisions, promises, explorer, cross-source. |
-| **Bounded retrieval** (existing `history_service`) | All intelligence must read through one bounded Telegram layer with provenance filtering. | `MAX_HISTORY_MESSAGES`, scan/peer caps, exclusive cursors, `HistoryError`. | Everything that reads chat content. |
-| **Selection state** (existing `selection_state`) | Bulk actions need exact, expiring, per-owner selection semantics. | Stash-only, 40-item/900-second bound, snapshot-backed labels. | UI-002/003, Workspace source enable/disable, Task bulk actions. |
-| **Task authority** (existing scheduler/coordinator/executor) | Long-running and recurring work must reuse one lifecycle, not a second queue. | `TaskScheduler`, `TaskExecutionCoordinator`, `ToolExecutor`, CAS occurrences. | Task Center, recurring extraction, watchlists, scheduled cross-source analysis. |
-| **Activity data** (ANALYTICS-001) | Schedule recommendations and Workspace dashboards need observable source activity. | No chat activity metrics; only save/provider stats. | ANALYTICS-002/003/004, WS-002, INTEL-031. |
+| **Language base** | Global default, explicit request, task language, manual History output. | `panel_settings.language` exists but no AI/History caller was found; `AIRequest.language` defaults to `"English"` and `ai_unified.py` does not pass it; `summarize_history` has no language argument and defaults to English; `translate_history` accepts one; Taskloom has `en/fa/ar/zh` policy words. | `G2-A` |
+| **Workspace language** | Per-Workspace default and effective-language resolution. | No Workspace model or per-source language storage exists. | `G2-B`, after `G3-B` |
+| **Workspace identity** | Owner-approved source identity, type, access state and source list. | `PeerType`, bounded dialog enumeration, link resolver and `history_schedules(owner_id, peer_id)` exist; there is no Workspace table/model. | `G3-A` |
+| **Workspace settings/dashboard** | Durable per-source settings, dashboard and health. | No Workspace settings, activity dashboard or source-health surface exists. | `G3-B` |
+| **Evidence envelope** | Claim/message references, local validation, bounded follow-up retrieval, coverage. | `HistorySlice`/`HistoryMessage` expose message ids and first/last range; no claim-to-message citation contract or evidence ledger exists. | `G4-A` |
+| **Durable evidence index** | Cross-session/cross-run evidence browsing. | Occurrence `result_metadata`/`error_metadata` exist but are bounded diagnostics; no evidence table. | `G4-B`, owner-gated |
+| **Selection** | Exact, expiring, per-owner selection for bulk actions. | `selection_state.py` is Stash-only, capped at 40, expires after 900s; `retrieve.py` supplies the row/check/confirmation pattern. | `G1-A` |
+| **Task authority** | One scheduler, one coordinator, one tool executor, CAS lifecycle. | `TaskScheduler`, `TaskExecutionCoordinator` and `ToolExecutor` exist; there is no separate `TaskExecutor` class. `TaskManagementService` exposes list/pause/resume/complete/fail/expire/delete, not cancel/retry. | `G5-A` |
+| **Activity data** | Bounded message/activity metrics and coverage. | No chat-activity metrics exist; `database_service` reports saves/provider stats only. | `G7-A` |
+| **Cross-source/export** | Explicit multi-source scope, attribution and portability. | No cross-source retrieval or export endpoint exists. | `G6-A` |
+| **Semantic index** | Embeddings/vector retrieval and similar-discussion search. | No embedding provider, index, vector store or semantic search exists. | `G6-B`, owner-gated |
 
-### 5.2 Dependency observations
+### 5.4 Source-verified dependency findings
 
-1. **Workspace is not a rename of `history_schedules`.** That table owns one
-   cumulative scheduled summary per peer and is intentionally durable-only. A
-   Workspace would cover settings, activity, tasks and non-scheduled sources; it
-   must not become a second task/checkpoint authority.
-2. **Evidence is the largest missing shared foundation.** Summaries currently
-   return text/range metadata; they do not return validated claim-to-message
-   references. Building follow-ups or extraction without that contract would
-   produce plausible but unverifiable answers.
-3. **Language is fragmented.** A setting exists, but global, Workspace and task
-   scopes are not wired into one precedence. Any new feature that generates
-   text needs the language decision resolved first.
-4. **Source resolution is implemented but not productized.** The parser/resolver
-   is reusable; invite links and chat-only links are separate feasibility
-   questions. Smart Search must expose resolution, not duplicate it.
-5. **Task management exists but is not a complete console.** The durable
-   machinery, CAS transitions and occurrence records are reusable; retry/cancel
-   semantics and output inspection need investigation before UI promises.
-6. **Activity analytics needs a sampling contract.** There is no safe basis for
-   an exact "all messages per hour" claim without a bounded strategy; any future
-   dashboard must state its window and coverage.
-7. **Scheduled History is implemented but not fully live-validated.** Any
-   recommendation/automation idea that depends on it inherits Phase 6/7 open
-   work; it must not be presented as production-proven.
+1. **Workspace is absent, not merely undocumented.** No `Workspace` model,
+   table, service or handler was found. `history_schedules` is a per-peer
+   cumulative checkpoint, not a Workspace: it has one row per `(owner_id,
+   peer_id)`, no general settings, no activity data and no task scope. A
+   Workspace may consume it, but must not duplicate its cursor/CAS authority.
+2. **Language cannot be delivered at Workspace scope yet.** `G2-A` can correctly
+   fix global/task/manual-History behavior using existing settings, Taskloom and
+   History services. `G2-B` needs a Workspace settings home. Implementing
+   `G2-B` inside `G2-A` would either invent a Workspace schema or create a
+   second per-source language store.
+3. **Task Center can be split at a real boundary.** `G5-A` can use
+   `TaskManagementService`, `TaskRepository.list_occurrences`, existing
+   Taskloom panels and existing CAS transitions. `G5-B` needs `WS-001/WS-003`
+   and `G2-B` for source scope and inherited language. `G5-A` must not claim
+   Workspace scope.
+4. **Task cancellation/retry is not implementation-ready.** The scheduler has
+   bounded retry and a `cancelled` occurrence status, but no owner-facing
+   service path to cancel a running occurrence or retry a selected failed
+   occurrence. `TASK-002` can deliver the existing pause/resume/complete/delete
+   controls now; cancel/retry remains a documented deferred part until the
+   coordinator contract is proven.
+5. **Task output inspection is partially available.** Occurrence records carry
+   `status`, `attempt`, `error_metadata`, `result_metadata` and timestamps, and
+   `Taskloom` already lists recent occurrences. It does not display output or
+   error detail. `G5-A` can add bounded inspection without a new store.
+6. **Evidence must start single-source.** History returns a bounded
+   `HistorySlice` with message ids, and summaries return first/last id metadata,
+   but no claim-to-message citations. `G4-A` can establish the evidence
+   envelope on one source without a Workspace. `G4-B` only adds durable,
+   Workspace-aware browsing over the same contract; it must not create a second
+   evidence format.
+7. **UI selection does not depend on language.** Stash already proves row
+   toggle, visible check, pagination survival, cap/expiry and confirmation.
+   `G1-A` can establish the reusable interaction contract without `G2-A`.
+   `G1-B` visual polish also has no language prerequisite.
+8. **Scheduled History remains a validation gate.** The durable repository,
+   wizard, registered action and durable-only semantics are implemented, but
+   `ROADMAP.md` still records Phase 6 (shared admission) and Phase 7 (live
+   validation) as deferred. Offline tests are not live validation. Any
+   recommendation that changes schedules must wait for the Phase 7 path it
+   depends on.
+9. **G6 and G7 are siblings, not a chain.** Both need `G3-A` and `G4-A`.
+   `G7-A` metrics do not need cross-source synthesis; `G6-A` cross-source
+   analysis does not need schedule recommendations. `G7-B` has the stronger
+   external gate (Phase 7); `G6-B` has a separate owner gate (index/store).
+10. **LANG-005 was misplaced.** The extraction glossary cannot be delivered by
+    the base language contract because it only has meaning alongside structured
+    extraction. It is assigned to `G4-A`, after `INTEL-010/011`, not to `G2-A`.
+11. **Persistence is owner-controlled.** Workspace settings, durable evidence
+    and semantic indexes each imply a new storage decision. This document does
+    not assume a table, migration or provider; those remain owner approvals.
+12. **No second runtime path is justified.** Every stage reuses
+    `RuntimeSupervisor`, Dispatcher/ProviderManager, `ToolRegistry`/
+    `ToolExecutor`, `TaskScheduler`/`TaskExecutionCoordinator`, existing
+    services and the Telegram API boundary.
+
+### 5.5 Stage prerequisites, gates and independent delivery
+
+| Stage | Technical prerequisites | Product prerequisites | Acceptance validation | Validation gate / owner decision | Independently deliverable | Deferred within the stage |
+|---|---|---|---|---|---|---|
+| **G1-A** | None; existing Glass UI and Stash | None | Toggle/deselect/check, stale callback, pagination, confirmation | Owner direction on ordering/compactness | Yes | Visual identity, non-Stash polish |
+| **G1-B** | G1-A | None | Readability, touch targets, preserved callbacks/Appearance | Owner visual direction (optional) | After G1-A | None |
+| **G2-A** | Existing settings, Taskloom, History | G1-A optional for selector rendering | Precedence tests; Persian/English real output | Owner approval: precedence and global-setting semantics | Yes | Workspace language |
+| **G2-B** | G2-A + G3-B | G3-A | Effective-language tests across scopes | Same precedence decision | No | None |
+| **G3-A** | Existing resolver/dialogs + G1-A selection | None | Resolution/access, empty/failure, scope isolation | Owner approval for durable source registry if added | Yes, with derived read model | SOURCE-003 invite links |
+| **G3-B** | G3-A | G1-A | Settings inheritance, dashboard honesty, health failure states | Owner approval: Workspace persistence/schema | No | Durable features not approved |
+| **G4-A** | G2-A + existing History | None (single source) | Invented ids, insufficient evidence, conflicting evidence, context isolation | Owner approval for durable evidence only; ephemeral MVP can proceed | Yes | Durable index, Workspace glossary, Workspace browsing |
+| **G4-B** | G4-A + G3-B | G3-A | Cross-run evidence, retention, source isolation | Owner approval: evidence retention/index | No | Whole stage if retention refused |
+| **G5-A** | G1-A + existing Taskloom/management | G2-A optional for language display | CAS, stale version, unsupported actions, bounded output | Owner approval: extend Taskloom vs new entry point | Yes | Cancel/retry, Workspace scope, inherited language |
+| **G5-B** | G5-A + G3-B + G2-B | G3-A | Workspace scope isolation, inherited effective language | Owner approval: Workspace persistence | No | None |
+| **G6-A** | G3-A + G4-A + G2-A | G3-B for the portable bundle | Attribution, per-source bounds, gaps, CSV escaping | Owner approval: export destination and notebook persistence | After prerequisites | EXPORT-002 until G3-B; semantic search |
+| **G6-B** | G6-A + approved index/store | None | Relevance, empty/unsupported state, index deletion | Owner approval: embedding provider, retention, cost | No | Whole stage if not approved |
+| **G7-A** | G3-A + G4-A | G3-B optional | Timezone, empty/partial data, coverage wording | Owner approval: sampling window/retention | Yes | Recommendations |
+| **G7-B** | G7-A | G3-A (G3-B optional for Workspace context) | Recommendation explanation, owner-confirmed prefill | **Validation gate: Scheduled History Phase 7** | No | Whole stage until gate passes |
+| **G8** | G3-A + G4-A + G5-A + G6-A + G7-A | G3-B/G4-B helpful, not required | Precision/refusal, privacy, no person judgments | Owner approval per capability | No | Any unapproved capability |
 
 ## 6. Implementation Groups
 
-Groups are chosen for shared foundation and end-to-end user value, not merely
-similar priority. An idea can appear in only one primary group.
+The eight parent groups are preserved for continuity. Where a parent contains
+capabilities with different prerequisites, it is split into stable sub-stages.
+An idea ID has one primary owner; shared IDs are explicitly marked, never
+silently duplicated.
 
 ### G1 — Glass UI Interaction Foundation
 
-- **Goal:** Make every panel predictable, compact and safely selectable before
-  adding new data-heavy surfaces.
-- **Included:** UI-001, UI-002, UI-003, UI-004, UI-005.
-- **Shared foundation:** Existing Glass UI registries, `InlinePanelBuilder`,
-  Stash selection semantics, confirmation panels, symbols/styles and Appearance.
-- **Dependencies:** None for the interaction layer; Workspace/Task groups consume
-  the resulting patterns.
-- **Suggested sequence:** (1) inventory and ordering rules; (2) reusable selection
-  state/row rendering; (3) contextual bulk-action contract; (4) confirmation
-  standardization; (5) visual/accessibility polish.
-- **Definition of Done:** A written UI ordering rule; every main panel follows
-  it; selection works on at least Stash and one new list; selected rows show a
-  check; re-click deselects; bulk actions are hidden without selection; every
-  destructive bulk action has a scope-specific confirmation; no parallel panel
-  or selection system; callback identifiers remain stable; tests cover toggle,
-  stale callback, pagination and confirmation.
-- **Risks:** Telegram keyboard limitations, callback-data compatibility,
-  Appearance's top-level-only contract, and "minimal" hiding needed controls.
-- **Why together:** The selection gesture, row layout, bulk affordance and
-  confirmation are one interaction grammar; shipping them separately creates
-  inconsistent rows and duplicate state.
+#### G1-A — Reusable interaction grammar
+- **Included:** UI-001, UI-002, UI-003, UI-004.
+- **Goal:** Make panels predictable and safely selectable using the proven Stash
+  pattern, without waiting for language or Workspace work.
+- **Shared foundation:** `panels.py`, `panel_registry.py`,
+  `InlinePanelBuilder`, `selection_state.py`, `retrieve.py` confirmation and
+  bulk-result patterns, `styles.py`/`symbols.py`.
+- **Dependencies:** None technical. Owner direction on ordering/compactness.
+- **Deliverables:** documented ordering rule; generalized row toggle with visible
+  check and re-click deselect; contextual bulk actions; scope-specific
+  confirmation; stale-callback and pagination tests.
+- **Definition of Done:** Works on Stash and at least one new list; no second
+  selection system; actions use verified ids/codes; no destructive bulk action
+  without confirmation.
+- **Risks:** Telegram keyboard limits and callback-data compatibility.
+- **Why this stage:** Selection/confirmation is consumed by source search and
+  Task Center and has no language dependency.
+
+#### G1-B — Visual identity and accessibility
+- **Included:** UI-005.
+- **Goal:** Apply the requested compact, polished identity without redesigning
+  the panel engine.
+- **Dependencies:** G1-A. Owner visual direction helpful, not blocking a
+  conservative first pass.
+- **Deliverables:** coordinated colors/typography, larger touch targets,
+  consistent spacing, preserved symbol registry and Appearance contract.
+- **Definition of Done:** Readable on Telegram clients; callbacks unchanged;
+  no per-panel renderer or image pipeline.
+- **Why separate:** Visual polish has no dependency on language/Workspace and
+  should not block functional stages.
 
 ### G2 — Language and Output Contract
 
-- **Goal:** Give every generated artifact one explicit, extensible and testable
-  language decision.
-- **Included:** LANG-001, LANG-002, LANG-003, LANG-004, LANG-005.
-- **Shared foundation:** `panel_settings.language`, Taskloom language policy,
-  `AIRequest.language`, preference rendering, History translate parameter.
-- **Dependencies:** Workspace scope (WS-001) for the Workspace level; owner
-  decision on precedence and UI-vs-content separation.
-- **Suggested sequence:** (1) define scopes/precedence; (2) implement catalog and
-  validation; (3) wire explicit selector into History/task creation; (4) add
-  auto only as a fallback; (5) add glossary to extraction.
-- **Definition of Done:** Persian and English selectable at global/task scope;
-  Workspace scope available when Workspace exists; explicit selection wins over
-  lower scopes; the resolved language is displayed with results; unsupported/
-  unknown language is rejected, not silently defaulted; existing translate
-  behavior remains compatible; tests cover precedence and every scope.
-- **Risks:** Provider non-compliance, inconsistent existing settings, and
-  changing behavior for users who relied on implicit English.
-- **Why together:** A selector without a scope model creates conflicting
-  settings; a catalog without precedence creates silent overrides.
+#### G2-A — Global, request and task language
+- **Included:** LANG-001, LANG-002, LANG-003, LANG-004.
+- **Shared with later stage:** LANG-001/002 are extended by G2-B; their primary
+  ownership stays here.
+- **Goal:** Make global/task/manual-History output language explicit and
+  testable using existing storage and task contracts.
+- **Source boundary:** `panel_settings.language` (`en` default, currently not
+  consumed by AI/History), `AIRequest.language` (defaults English; caller omits
+  it), `summarize_history` (no language argument), `translate_history` (accepts
+  one), Taskloom `en/fa/ar/zh` and `preparation_policy`.
+- **Dependencies:** None technical. G1-A optional for selector rendering.
+  Owner decision on precedence and whether the current global setting is
+  migrated or replaced.
+- **Deliverables:** validated catalog; explicit selector; global/task/request
+  precedence; effective language in result metadata; summary language argument;
+  auto-detect only as fallback.
+- **Definition of Done:** Persian and English selectable; explicit choice wins;
+  unsupported values rejected; UI language remains separate; no Workspace claim.
+- **Deferred:** Workspace scope, durable per-source defaults, glossary.
+- **Why split:** It is implementable now and prevents every later text feature
+  from inventing another language path.
+
+#### G2-B — Workspace language inheritance
+- **Included:** No new IDs; extends LANG-001/002.
+- **Goal:** Add the Workspace scope and one effective-language resolver after a
+  Workspace settings home exists.
+- **Dependencies:** G2-A + G3-B; G3-A for source identity. Same owner precedence
+  decision.
+- **Deliverables:** per-Workspace default language, inheritance display, and
+  effective-language resolution for Workspace tasks.
+- **Definition of Done:** Explicit request > Task > Workspace > global > default;
+  the effective value is shown; no duplicate language store.
+- **Why split:** A Workspace language cannot exist before a Workspace settings
+  model; implementing it earlier would create a parallel store.
 
 ### G3 — Source and Workspace Foundation
 
-- **Goal:** Turn a resolved Telegram source into a durable, owner-approved
-  Workspace without creating a second task or checkpoint authority.
-- **Included:** WS-001, WS-002, WS-003, WS-004, SOURCE-001, SOURCE-002,
-  SOURCE-003 (investigation only).
-- **Shared foundation:** `PeerType`, existing dialog enumeration, link resolver,
-  `history_schedules`, `ai_tasks`, saved-item origin ids.
-- **Dependencies:** Owner-approved persistence model; G1 selection patterns;
-  G2 language scope for Workspace language.
-- **Suggested sequence:** (1) source-resolution service and search UI; (2)
-  Workspace read model from existing data; (3) durable Workspace settings with
-  owner-approved schema; (4) dashboard; (5) source health.
-- **Definition of Done:** Owner can resolve/search/add a source with access
-  validation; one Workspace opens with source type, latest summary/checkpoint,
-  active tasks, language and honest activity/coverage; settings show inheritance;
-  no second task/checkpoint store; unknown/inaccessible sources fail honestly;
-  tests cover resolution, scope isolation and empty states.
-- **Risks:** Data-model duplication, schema approval, Telegram entity
-  resolution limits, invite-link feasibility, and large-account RPC cost.
-- **Why together:** A Workspace is the identity/scope that source search creates
-  and settings/dashboard/tasks consume; building them separately would duplicate
-  source state.
+#### G3-A — Source resolution and Workspace identity
+- **Included:** WS-001, SOURCE-001, SOURCE-002; SOURCE-003 is investigation-only.
+- **Goal:** Resolve an owner-accessible source and open a Workspace identity/read
+  model without assuming a new schema.
+- **Reuse:** `PeerType`, bounded dialog enumeration, `save_service` parser/
+  resolver, `history_schedules`, `ai_tasks`, `saved_items.origin_chat_id`, and
+  G1-A selection rows.
+- **Dependencies:** G1-A. A derived read model can start without persistence;
+  a durable source registry needs owner approval.
+- **Deliverables:** search/resolve/add flow with access validation; one Workspace
+  view showing source type, schedules, tasks, saved-item links and current
+  evidence/coverage; honest unknown/inaccessible states.
+- **Definition of Done:** No guessed identity, no auto-join, no second task or
+  checkpoint store; invite links explicitly unsupported unless investigated.
+- **Deferred:** SOURCE-003 invite links; durable settings (G3-B).
+
+#### G3-B — Workspace settings, dashboard and health
+- **Included:** WS-002, WS-003, WS-004; shares WS-001.
+- **Goal:** Give the Workspace a durable settings/dashboard/health home once the
+  owner approves the persistence model.
+- **Dependencies:** G3-A; owner-approved persistence. It deliberately does NOT
+  require G2-B: it creates the settings framework, and G2-B adds the language
+  field through that same contract.
+- **Deliverables:** validated settings with inheritance display, dashboard with
+  windows/coverage, source health and affected-task links.
+- **Definition of Done:** Settings are owner-scoped; dashboard numbers state
+  their source/window; health is read-only and re-resolves access; G2-B can add
+  language without a second settings system.
+- **Why split:** Identity/read model is useful before persistence; durable
+  settings and dashboards are a separate owner-gated change.
 
 ### G4 — Evidence-Grounded Intelligence
 
-- **Goal:** Make summaries and extraction verifiable, interactive and honest
-  about coverage.
-- **Included:** EVID-001, INTEL-001, INTEL-002, INTEL-003, INTEL-010, INTEL-011,
-  INTEL-012, INTEL-037.
-- **Shared foundation:** History retrieval, `HistoryMessage` ids/range metadata,
-  provider tool/structured output contracts, language contract.
-- **Dependencies:** G2 language; existing P1 History; owner decision on evidence
-  persistence/retention; G3 for Workspace/source display (not for a single-chat
-  MVP).
-- **Suggested sequence:** (1) define a bounded evidence envelope and validate
-  ids locally; (2) expose citations on summaries; (3) add follow-up retrieval;
-  (4) add structured extraction schema; (5) add subjective-confidence rules;
-  (6) add Evidence Explorer.
-- **Definition of Done:** Every claim shown as evidence-backed either has a
-  revalidated source reference or is clearly marked unsupported; follow-ups
-  re-retrieve bounded source text rather than only the summary; extraction
-  output is schema-validated with evidence/coverage; subjective results separate
-  observations from judgments and refuse definitive person judgments below a
-  defined evidence threshold; no second retrieval engine; tests cover invented
-  ids, empty evidence, conflicting evidence and context isolation.
-- **Risks:** Citation hallucination, prompt injection, privacy, cost, evidence
-  retention, and schema evolution with no migration in this planning task.
-- **Why together:** Citations, follow-ups, extraction and subjective rigor all
-  depend on the same evidence envelope; building extraction first would produce
-  ungrounded output that later needs rewriting.
+#### G4-A — Single-source evidence and interactive intelligence
+- **Included:** EVID-001 (ephemeral-first), INTEL-001, INTEL-002, INTEL-003,
+  INTEL-010, INTEL-011, INTEL-012, INTEL-037, LANG-005.
+- **Goal:** Establish one evidence envelope and use it for summaries,
+  follow-ups, extraction, subjective rigor and a basic Evidence Explorer on one
+  source.
+- **Reuse:** `history_service`, `HistoryMessage` ids, `HistorySlice` range,
+  `ToolRegistry`/`ToolExecutor`, provider structured output, G2-A language.
+- **Dependencies:** G2-A. G3-A is optional for source labels. Durable evidence
+  retention is an owner decision; the MVP can keep evidence ephemeral and
+  revalidate it against Telegram.
+- **Deliverables:** locally validated claim-to-message references; citations;
+  bounded follow-up retrieval; structured extraction with coverage; subjective
+  confidence rules; explorer; global glossary.
+- **Definition of Done:** Invented ids rejected; every evidence-backed claim is
+  revalidated; insufficient evidence is explicit; no second retrieval engine;
+  no definitive person judgment below the approved threshold.
+- **Deferred:** durable EVID-001 index, Workspace-scoped glossary, Workspace
+  evidence browsing.
+- **Why split:** Single-source evidence is the shared contract and does not need
+  a Workspace. Delaying it until G3 would block the highest-value trust work.
+
+#### G4-B — Workspace-aware evidence integration
+- **Included:** No new IDs; consumes EVID-001 and INTEL-037.
+- **Goal:** Make evidence durable/cross-run and browsable by Workspace once the
+  owner approves retention and G3-B exists.
+- **Dependencies:** G4-A + G3-B; owner approval on evidence persistence.
+- **Deliverables:** approved evidence index/retention, Workspace evidence
+  navigation and cross-run inspectability using the SAME envelope.
+- **Definition of Done:** No second evidence format; deletion/expiry is honest;
+  source isolation holds.
+- **Deferred:** Whole stage if durable evidence is refused; ephemeral G4-A
+  remains valid.
 
 ### G5 — Unified Task Center
 
-- **Goal:** Make existing durable work visible and controllable without a second
-  task system.
+#### G5-A — Existing-scope Task Center
 - **Included:** TASK-001, TASK-002, TASK-003, TASK-004, TASK-005.
-- **Shared foundation:** `Taskloom`, `TaskManagementService`, `TaskRepository`,
-  `TaskScheduler`, occurrence metadata and traces.
-- **Dependencies:** G1 list/selection; G2 for task language; G3 for Workspace
-  scope; scheduler cancellation/retry semantics must be verified.
-- **Suggested sequence:** (1) unify read views; (2) expose output/occurrence
-  detail; (3) add safe lifecycle controls; (4) add Workspace/language scope;
-  (5) add operational timeline.
-- **Definition of Done:** One owner-only Task Center lists running/scheduled/
-  completed/failed/paused work; each task shows source/scope, effective language
-  and next run; occurrence output is inspectable within bounds; supported
-  cancel/retry operations are CAS-safe and honestly reported; unsupported
-  operations are absent; no direct DB access in handlers; no second executor.
-- **Risks:** Cancellation side effects, stale CAS versions, mixing todos with
-  scheduled work, and exposing sensitive output.
-- **Why together:** List, lifecycle, output and scope are one operational
-  workflow; a list without controls or a control surface without output is
-  incomplete and encourages duplicate solutions.
+- **Shared with later stage:** TASK-004 is extended by G5-B; primary ownership
+  stays here.
+- **Goal:** Extend Taskloom into a unified console over existing task authority.
+- **Reuse:** `Taskloom`, `TaskManagementService.list_tasks/inspect/counts`,
+  `TaskRepository.list_occurrences`, occurrence status/attempt/timestamps,
+  `task_trace.py`, CAS pause/resume/complete/delete.
+- **Dependencies:** G1-A; G2-A optional for consistent language display. No G3.
+- **Deliverables:** unified list/status views; bounded output/error inspection;
+  pause/resume/complete/delete; effective task-language display; bounded
+  operational timeline.
+- **Definition of Done:** Owner-only; CAS-safe; unsupported actions absent; no
+  direct DB access in handlers; no second executor; Workspace scope not claimed.
+- **Deferred:** cancel/retry of a running occurrence (no service path yet);
+  Workspace scope and inherited language (G5-B).
+- **Why split:** The existing task system can deliver a useful console now; only
+  source scope and inherited language need Workspace.
+
+#### G5-B — Workspace task scope and inherited language
+- **Included:** No new IDs; extends TASK-001/TASK-004.
+- **Goal:** Scope tasks to a Workspace and show/apply effective language.
+- **Dependencies:** G5-A + G3-B + G2-B.
+- **Deliverables:** Workspace task list/filter, Workspace-scoped creation and
+  display of inherited/effective language.
+- **Definition of Done:** No cross-Workspace access; explicit task choice wins;
+  source scope cannot be overridden by a model argument.
+- **Why split:** It is impossible before the Workspace settings and language
+  resolver exist.
 
 ### G6 — Cross-Source Research and Portability
 
-- **Goal:** Let the owner investigate multiple selected Workspaces and take the
-  results out of Telegram with attribution preserved.
-- **Included:** INTEL-020, INTEL-022, SEARCH-001, SEARCH-002, EXPORT-001,
-  EXPORT-002, INTEL-040.
-- **Shared foundation:** Workspace scope, evidence contract, bounded per-source
-  retrieval, export serialization.
-- **Dependencies:** G3 (Workspace), G4 (evidence), G2 (language); SEARCH-001
-  additionally needs an approved embedding/index/store decision.
-- **Suggested sequence:** (1) cross-source read-only query with explicit source
-  labels; (2) citation-preserving aggregation; (3) export JSON/CSV/Markdown; (4)
-  portable bundle; (5) research notebook; (6) semantic/similar search only
-  after an approved indexing design.
-- **Definition of Done:** A query selects explicit Workspaces and returns
-  per-source evidence with gaps; no source is silently omitted; export carries
-  source/coverage/evidence schema; search has an honest empty/unsupported state;
-  owner can disable/delete stored indexes; tests cover attribution, per-source
-  bounds and export escaping.
-- **Risks:** Cost, ranking bias, cross-source privacy, vector-store operations,
-  export leakage and format drift.
-- **Why together:** Cross-source answers are only useful if they retain source
-  boundaries and can be exported; semantic search without attribution would
-  undermine the same trust contract.
+#### G6-A — Attributed cross-source query and export
+- **Included:** INTEL-020, INTEL-022, EXPORT-001, EXPORT-002, INTEL-040.
+- **Goal:** Query explicitly selected Workspaces with per-source evidence and
+  export the result.
+- **Dependencies:** G3-A + G4-A + G2-A; G3-B required for the portable Workspace
+  bundle and notebook persistence. Owner decision on export destination.
+- **Deliverables:** cross-source query with source labels/gaps; citation-preserving
+  aggregation; JSON/CSV/Markdown export; portable bundle; research notebook.
+- **Definition of Done:** No source silently omitted; attribution retained;
+  export schema includes source/coverage; CSV escaped; no unauthenticated
+  download.
+- **Deferred:** semantic/similar search (G6-B).
+- **Why split:** Cross-source/export does not need an embedding index. Semantic
+  search does, so it must not hold the whole group hostage.
+
+#### G6-B — Semantic search and similar discussions
+- **Included:** SEARCH-001, SEARCH-002.
+- **Goal:** Add semantic retrieval only after an approved index/store decision.
+- **Dependencies:** G6-A + owner-approved embedding provider/index/store.
+- **Deliverables:** bounded semantic index, semantic search and similar-discussion
+  discovery with source/evidence and index deletion.
+- **Definition of Done:** Honest empty/unsupported state; owner can remove the
+  index; no upload of unrestricted history.
+- **Deferred:** Whole stage if the owner does not approve content retention/cost.
+- **Why split:** It introduces a new data store and provider capability that no
+  other G6 deliverable requires.
 
 ### G7 — Activity Analytics and Schedule Recommendations
 
-- **Goal:** Understand source rhythm and recommend owner-controlled timing.
-- **Included:** ANALYTICS-001, ANALYTICS-002, ANALYTICS-003, ANALYTICS-004,
-  ANALYTICS-005.
-- **Shared foundation:** Workspace, bounded retrieval, Scheduled History,
-  activity coverage metadata.
-- **Dependencies:** G3 Workspace; G4 evidence/coverage; Scheduled History Phase 7
-  live validation for recommendations that affect real schedules.
-- **Suggested sequence:** (1) define sampling windows and coverage; (2) compute
-  metrics; (3) dashboard; (4) recommendations; (5) owner-approved prefill into
-  the existing schedule wizard; (6) comparison/coverage report.
-- **Definition of Done:** Metrics state their window/coverage; peak/active-period
-  logic is timezone-aware; recommendation never creates or changes a task;
-  "use this time" opens the existing owner-only wizard; tests cover empty,
-  partial, timezone and boundary data.
-- **Risks:** RPC cost, sampling bias, misleading precision and schedule
-  over-automation.
-- **Why together:** Metrics, recommendations and schedule application form one
-  user decision loop; separating them produces analytics that cannot be acted on
-  or automation that bypasses the owner.
+#### G7-A — Metrics, comparison and coverage
+- **Included:** ANALYTICS-001, ANALYTICS-004, ANALYTICS-005.
+- **Goal:** Read-only activity metrics and coverage on top of Workspace identity.
+- **Dependencies:** G3-A + G4-A; G3-B optional for dashboard placement. Owner
+  decision on sampling window/retention.
+- **Deliverables:** timezone-aware messages/hour/day, peak/active periods,
+  weekday/weekend comparison, source comparison with coverage caveats, and a
+  per-run coverage report that consumes G4-A's coverage metadata.
+- **Definition of Done:** Every metric states window/coverage; no unbounded
+  history sweep; no schedule mutation.
+- **Deferred:** Recommendations (G7-B).
+- **Why split:** Metrics are read-only and do not need Scheduled History Phase 7.
+
+#### G7-B — Owner-controlled recommendations
+- **Included:** ANALYTICS-002, ANALYTICS-003.
+- **Goal:** Recommend timing and let the owner prefill the existing wizard.
+- **Dependencies:** G7-A; G3-A for the target source. G3-B is a product
+  dependency for Workspace context, not a technical prerequisite.
+  **Validation gate: Scheduled History Phase 7 live validation must pass before
+  recommendations are enabled.**
+- **Deliverables:** explained recommendation; explicit "use this time" that opens
+  the existing owner-only wizard; no auto-create/change.
+- **Definition of Done:** Owner confirms; existing creation boundary executes;
+  no recommendation is presented as validated before Phase 7.
+- **Why split:** The recommendation is only as trustworthy as the unfinished
+  Scheduled History validation it depends on.
 
 ### G8 — Longitudinal and Advanced Intelligence
 
-- **Goal:** Explore higher-order analysis only after evidence, Workspace and
-  analytics foundations are trustworthy.
-- **Included:** INTEL-030, INTEL-031, INTEL-032, INTEL-033, INTEL-034,
-  INTEL-035, INTEL-036, SEARCH-003.
-- **Shared foundation:** Evidence index, entity extraction, Workspace/activity
-  history, task scheduler for opt-in runs.
-- **Dependencies:** G3, G4, G7; owner approval for new persistence/retention and
-  tolerance for false positives.
-- **Suggested sequence:** entity extraction -> decisions/promises -> topic
-  evolution/contradiction -> change detection -> graph -> watchlists, each behind
-  an explicit evaluation.
-- **Definition of Done:** Each capability has a precise evidence contract,
-  confidence display, owner confirmation for consequential claims, and a clear
-  unsupported/insufficient-evidence state; no automated judgment about people;
-  no always-on global scan; tests cover false-positive/refusal paths.
-- **Risks:** High false-positive risk, privacy, cost, entity ambiguity and
-  schema/retention decisions.
-- **Why together:** These are all evidence-derived longitudinal views; they
-  should not ship before the evidence/Workspace/analytics contracts they consume.
+- **Included:** INTEL-030, INTEL-031, INTEL-032, INTEL-033, INTEL-034, INTEL-035,
+  INTEL-036, SEARCH-003.
+- **Goal:** Explore evidence-derived longitudinal capabilities only after the
+  evidence, Workspace and activity foundations are trustworthy.
+- **Dependencies:** G3-A, G4-A, G5-A, G6-A, G7-A; G3-B/G4-B helpful but not
+  mandatory for a first per-source evaluation. Each capability needs owner
+  approval.
+- **Suggested order:** entity extraction → decisions/promises → topic
+  evolution/contradiction → change detection → graph → watchlists.
+- **Definition of Done:** Precise evidence contract, confidence display, owner
+  confirmation, explicit insufficient-evidence state, no automated judgment
+  about people, no always-on global scan.
+- **Risks:** False positives, privacy, entity ambiguity, cost and retention.
+- **Why not split now:** All members are exploratory and individually gated;
+  splitting them would imply a precision the source does not support.
 
 ## 7. Priority Model
 
-Priority is not a single score. **Product priority** asks how much the capability
-matters to the owner's vision. **Implementation priority** asks what should be
-built first because other work depends on it. A high-value idea can have a later
-implementation priority if its prerequisites are missing.
+Product priority, implementation priority and readiness are separate. Readiness
+names the strongest thing standing between the stage and implementation.
 
-Scoring dimensions: user value, strategic importance, dependency impact,
-implementation effort, technical risk, reuse potential and whether it unlocks
-other features. The scores below are comparative judgments from source evidence,
-not precise estimates.
+| Stage | Product priority | Implementation priority | Readiness | Blocking decision / validation gate | Rationale |
+|---|---|---|---|---|---|
+| **G1-A** | P1 | **P0** | Ready with owner direction | Owner ordering/compactness decision | Selection/confirmation is reused by source search and Task Center; no language/Workspace dependency. |
+| **G1-B** | P1 | P2 | Ready after G1-A | Optional visual direction | Polish matters but does not block data features. |
+| **G2-A** | **P0** | **P0** | Owner-gated | Precedence and global-setting semantics | Small, shared, and currently inconsistent; fixes output for every later text feature. |
+| **G2-B** | **P0** | P1 | Blocked by G3-B | Workspace persistence + precedence | Cannot exist before a Workspace settings home. |
+| **G3-A** | P1 | P1 | Ready with G1-A | Durable registry persistence if added | Identity/read model unlocks analytics and cross-source work; can start derived. |
+| **G3-B** | P1 | P1 | Owner-gated | Workspace persistence/schema | Dashboard/settings are valuable but require the persistence decision. |
+| **G4-A** | **P0** | P1 | Ready after G2-A | Durable evidence retention (ephemeral MVP allowed) | Trust foundation; single-source scope avoids waiting for Workspace. |
+| **G4-B** | **P0** | P2 | Blocked by G4-A/G3-B | Evidence retention approval | Adds durability/navigation, not a second evidence contract. |
+| **G5-A** | P1 | **P0/P1** | Owner-gated after G1-A | Task Center shape; cancel/retry investigation | High value, mostly existing machinery, no Workspace needed. |
+| **G5-B** | P1 | P2 | Blocked by G5-A/G3-B/G2-B | Workspace persistence | Only the Workspace-scoped part waits. |
+| **G6-A** | P2 | P2 | Blocked by G3-A/G4-A | Export destination; notebook persistence | Depends on explicit source scope and evidence; no vector store needed. |
+| **G6-B** | P2 | P3 | Owner-gated | Embedding/index/store/cost approval | New store and provider capability; can be withheld indefinitely. |
+| **G7-A** | P2 | P2 | Blocked by G3-A/G4-A | Sampling/retention decision | Read-only metrics; no Phase 7 gate. |
+| **G7-B** | P2 | P3 | **Validation-gated** | **Scheduled History Phase 7** | Recommendations must not outrun real schedule validation; G3-A supplies the source, while G3-B only adds Workspace context. |
+| **G8** | P3 | P3 | Owner-gated | Advanced capability approval | High false-positive/privacy risk; depends on evidence, cross-source context and activity. |
 
-| Group | Product priority | Implementation priority | Why |
-|---|---|---|---|
-| **G2 Language** | **P0** — every generated artifact needs it | **P0** — small shared prerequisite | Existing language behavior is fragmented and defaults to English; fixing the contract prevents inconsistent output in every later group. |
-| **G4 Evidence** | **P0** — trust is the product's differentiator | **P1** — depends on G2 and a bounded evidence design | Without evidence, follow-ups/extraction would produce unverifiable claims. It is foundational but needs a design decision before coding. |
-| **G1 UI** | **P1** — immediate owner pain, broad reach | **P0/P1** — selection grammar is reusable but polish can follow | Selection/confirmation blocks Workspace and Task Center; visual polish can ship incrementally. |
-| **G3 Workspace** | **P1** — the organizing concept | **P1** — needs owner-approved persistence | It unlocks analytics, cross-source and per-source settings but can duplicate existing state if rushed. |
-| **G5 Task Center** | **P1** — operational control | **P1** — existing machinery is reusable | High value with comparatively low new infrastructure, but cancellation/retry semantics need verification. |
-| **G6 Cross-source/export** | **P2** — valuable research workflow | **P2** — requires G3 + G4 | Depends on source scope and evidence; semantic search adds a separate storage/provider decision. |
-| **G7 Analytics/schedules** | **P2** — useful, not blocking | **P2** — needs Workspace and live Scheduled History evidence | Recommendations must not outrun the unfinished Phase 7 validation. |
-| **G8 Advanced intelligence** | **P3** — exploratory | **P3** — high risk/cost | Valuable ideas but unproven quality and significant privacy/schema implications. |
+### Why the priority table changed
 
-### Why this ordering differs from product excitement
-
-- The owner's UI pain is real, but a language contract and selectable rows are
-  smaller shared enablers that prevent rework in every later panel.
-- Workspace is strategically central, but its data model is unresolved; building
-  analytics or cross-source queries before it would invent a second source model.
-- Evidence is product-critical, yet implementation starts with a bounded
-  envelope and validation, not a large graph or vector database.
-- Advanced intelligence is intellectually attractive but has the weakest
-  evidence base and highest risk of unsupported claims.
+- **G2 is no longer one priority.** `G2-A` is a P0 implementation prerequisite;
+  `G2-B` is P1 because Workspace must exist first.
+- **G5 is no longer uniformly P1.** `G5-A` is an early P0/P1 console;
+  `G5-B` is P2 because it waits for Workspace and language inheritance.
+- **G4 is no longer blocked by G3.** `G4-A` is a P1 single-source foundation;
+  `G4-B` is the later durability/Workspace integration.
+- **G6/G7 are no longer a single ordering.** `G7-A` can precede `G6-A`;
+  `G7-B` and `G6-B` are separately gated. The previous plan put all of G7 before
+  all of G6 while ignoring that only the recommendation half needs Phase 7.
+- **G3 is no longer one prerequisite gate.** Identity/read model and durable
+  settings are separate; treating them as one made Workspace look both required
+  and impossible to start.
+- **G1 visual work is separated from interaction work.** The original sequence
+  blocked all UI on language result labels; source shows selection is
+  independent.
 
 ## 8. Proposed Implementation Sequence
 
-This is a proposal for owner review, not permission to start. Each step must
-finish its acceptance tests and owner-visible verification before the next
-dependent step.
+This is a proposal for owner review, not permission to start. Stages marked
+"parallelizable" may be developed concurrently only if their prerequisites are
+complete; the numbering is the recommended order, not a claim that later work
+cannot start.
 
-### Step 1 — G2 Language and Output Contract
-- **Prerequisites:** Owner decision on precedence and UI/content separation.
-- **Implement:** language catalog, scopes, explicit selector, precedence,
-  validation, result metadata; auto only as fallback.
-- **Out of scope:** Workspace persistence, automatic detection of every source,
-  provider capability claims.
-- **Deliverables:** one validated language contract; History/task UI selectors;
-  tests for precedence and unsupported languages.
-- **Validation:** focused tests; a real owner-visible summary in Persian and
-  English; no language change to UI chrome.
-- **Decision needed:** precedence and whether the existing `language` setting is
-  migrated or replaced.
+### Step 1 — G1-A Reusable interaction grammar
+- **Prerequisites:** Owner direction on ordering/compactness.
+- **Implement:** ordering rule, generalized row toggle/check, contextual bulk
+  actions, scope-specific confirmation.
+- **Out of scope:** language selectors, Workspace dashboards, visual overhaul.
+- **Deliverables:** documented standard; Stash plus one new list; tests for
+  toggle, stale callback, pagination, confirmation.
+- **Validation:** offline UI tests and owner panel review.
+- **Gate:** owner approves ordering/compactness.
 
-### Step 2 — G1 Glass UI Interaction Foundation
-- **Prerequisites:** Approved ordering rules; G2 result labels available.
-- **Implement:** shared row/selection grammar, check state, contextual bulk
-  actions, destructive confirmations, visual/accessibility pass.
-- **Out of scope:** data-heavy Workspace dashboards; new panel API.
-- **Deliverables:** documented standards; Stash-compatible selection generalized
-  to one new list; confirmation and stale-callback tests.
-- **Validation:** offline UI tests plus live panel review by the owner.
-- **Decision needed:** how far "compact" may reduce visible actions.
+### Step 2 — G2-A Global, request and task language
+- **Prerequisites:** owner precedence decision; G1-A optional.
+- **Implement:** catalog, selector, global/task/request precedence, summary
+  language argument, effective-language metadata, auto fallback.
+- **Out of scope:** Workspace scope, glossary, durable per-source defaults.
+- **Deliverables:** one validated language contract; manual History and task
+  creation use it; tests for precedence and unsupported values.
+- **Validation:** real Persian and English summary output; UI chrome unchanged.
+- **Gate:** owner confirms precedence and migration of the existing setting.
 
-### Step 3 — G5 Unified Task Center
-- **Prerequisites:** G1 list/selection; verified cancel/retry semantics.
-- **Implement:** unified read views, occurrence output, safe lifecycle controls,
-  Workspace/language scope, bounded timeline.
-- **Out of scope:** new task repository/executor; automatic task repair.
-- **Deliverables:** one owner-only Task Center over `TaskManagementService` and
-  the existing scheduler.
-- **Validation:** focused tests for CAS, stale versions, unsupported actions;
-  real owner inspection of a paused/completed task.
-- **Decision needed:** extend Taskloom in place versus a new navigation layer
-  (recommended: extend Taskloom).
+### Step 3 — G1-B Visual identity and accessibility
+- **Prerequisites:** G1-A. **Parallelizable with G2-A.**
+- **Implement:** colors/typography/spacing/touch targets within Telegram limits.
+- **Out of scope:** new renderer, generated images, panel-engine rewrite.
+- **Deliverables:** visual/accessibility pass over the G1-A surfaces.
+- **Validation:** owner review; callback/Appearance regression checks.
+- **Gate:** owner visual direction.
 
-### Step 4 — G3 Source and Workspace Foundation
-- **Prerequisites:** G1 selection; G2 language; owner-approved persistence model.
-- **Implement:** source resolution/search, Workspace read model, settings,
-  dashboard, source health; invite-link investigation separately.
-- **Out of scope:** analytics/cross-source inference before the model is stable;
-  auto-join; schema changes without approval.
-- **Deliverables:** owner-approved source can be resolved and opened as a
-  Workspace with honest state.
-- **Validation:** source resolution/access tests, empty/failure states, scope
-  isolation; live owner check on one private chat, one group/channel if available.
-- **Decision needed:** where Workspace settings live and whether a new table is
-  justified.
+### Step 4 — G5-A Existing-scope Task Center
+- **Prerequisites:** G1-A; G2-A optional for language display.
+- **Implement:** unified list/status, bounded output/error inspection,
+  pause/resume/complete/delete, effective task language, timeline.
+- **Out of scope:** Workspace scope, inherited language, unverified cancel/retry.
+- **Deliverables:** Taskloom extension over `TaskManagementService` and existing
+  occurrences; no new store/executor.
+- **Validation:** CAS/stale/unsupported-action tests; owner inspects a completed
+  and a paused task.
+- **Gate:** owner chooses extend Taskloom vs a new entry point (recommended:
+  extend Taskloom); cancellation/retry requires a separate scheduler
+  investigation before it is promised.
 
-### Step 5 — G4 Evidence-Grounded Intelligence
-- **Prerequisites:** G2; P1 History; approved evidence retention decision; G3 for
-  Workspace display.
-- **Implement:** evidence envelope/citations, bounded follow-up retrieval,
-  structured extraction, subjective rigor, Evidence Explorer.
-- **Out of scope:** knowledge graph, always-on extraction, unvalidated claim
-  storage.
-- **Deliverables:** verifiable summary/follow-up/extraction flows with coverage.
-- **Validation:** invented-id/citation tests, conflicting evidence, empty/
-  insufficient evidence, context isolation; live owner review of one cited run.
-- **Decision needed:** ephemeral evidence versus durable index; retention.
+### Step 5 — G4-A Single-source evidence and interactive intelligence
+- **Prerequisites:** G2-A; existing P1 History.
+- **Implement:** evidence envelope, citations, bounded follow-ups, structured
+  extraction, subjective rules, basic explorer, global glossary.
+- **Out of scope:** durable evidence index, Workspace evidence browsing,
+  cross-source claims.
+- **Deliverables:** verifiable summary/follow-up/extraction flow with coverage.
+- **Validation:** invented-id, insufficient-evidence, conflicting-evidence and
+  context-isolation tests; owner reviews one cited run.
+- **Gate:** evidence retention only for the durable part; ephemeral MVP may
+  proceed.
 
-### Step 6 — G7 Activity Analytics and Recommendations
-- **Prerequisites:** G3; G4 coverage metadata; Scheduled History Phase 7
-  live validation for any recommendation affecting schedules.
-- **Implement:** bounded activity metrics, dashboard metrics, recommendations,
-  owner-approved prefill, comparison/coverage report.
-- **Out of scope:** auto-changing schedules; full-history exact counts.
-- **Deliverables:** metrics with windows/coverage; recommendation that never
-  auto-creates tasks.
-- **Validation:** timezone/boundary/empty/partial tests; owner compares one
-  recommendation with observed activity.
-- **Decision needed:** sampling window, retention, and whether analytics are
-  cached.
+### Step 6 — G3-A Source resolution and Workspace identity
+- **Prerequisites:** G1-A; existing resolver/dialogs.
+- **Implement:** source search/resolve/add with access validation; Workspace
+  identity/read model from existing state.
+- **Out of scope:** durable settings, dashboard, invite links.
+- **Deliverables:** owner-approved source opens a Workspace with honest state and
+  links to existing schedules/tasks/saves.
+- **Validation:** resolution/access, empty/failure and scope-isolation tests;
+  owner checks one private chat and one group/channel if available.
+- **Gate:** owner approves any durable source-registry persistence.
 
-### Step 7 — G6 Cross-Source Research and Portability
-- **Prerequisites:** G3, G4, G2; approved vector/index decision for semantic
-  search.
-- **Implement:** cross-source queries, similar discussion discovery, export,
-  portable bundle, research notebook.
-- **Out of scope:** global account-wide monitoring; unauthenticated download
-  endpoints.
-- **Deliverables:** attributed multi-source results and bounded exports.
-- **Validation:** per-source attribution, gap reporting, CSV escaping, size/
-  retention tests; owner runs one real multi-source question.
-- **Decision needed:** export destination/retention; semantic index approval.
+### Step 7 — G3-B Workspace settings, dashboard and health
+- **Prerequisites:** G3-A; owner-approved persistence model.
+- **Implement:** settings framework, dashboard, source health; no language field
+  yet.
+- **Out of scope:** Workspace language, analytics recommendations, task scope.
+- **Deliverables:** validated owner-scoped settings, honest dashboard, read-only
+  health.
+- **Validation:** settings inheritance/scope tests; dashboard window/coverage
+  checks; health failure states.
+- **Gate:** owner approves schema/persistence. No SQL is executed by this plan.
 
-### Step 8 — G8 Longitudinal and Advanced Intelligence
-- **Prerequisites:** G3/G4/G7; owner approval for persistence and false-positive
-  tolerance.
-- **Implement:** entity extraction, decision/promise trackers, topic evolution,
-  contradiction/change detection, graph, watchlists — each behind its own
-  evaluation gate.
-- **Out of scope:** autonomous judgments about people, always-on monitoring,
-  speculative graph edges presented as facts.
-- **Deliverables:** evidence-backed candidate views with confidence and explicit
-  refusal states.
-- **Validation:** precision/recall evaluation on owner-approved samples, privacy
-  review, false-positive/refusal tests.
-- **Decision needed:** whether each advanced capability is worth its cost and
-  risk; approval may be withheld.
+### Step 8 — G2-B Workspace language inheritance
+- **Prerequisites:** G2-A + G3-B.
+- **Implement:** Workspace default language, inheritance display, effective
+  resolver.
+- **Out of scope:** new language store; UI-language change.
+- **Deliverables:** explicit request > Task > Workspace > global > default, shown
+  with results.
+- **Validation:** precedence tests across all scopes.
+- **Gate:** same precedence decision as G2-A.
+
+### Step 9 — G5-B Workspace task scope and inherited language
+- **Prerequisites:** G5-A + G3-B + G2-B.
+- **Implement:** Workspace task filter/creation scope and effective-language
+  display.
+- **Out of scope:** cross-Workspace tasks; model-selected scope.
+- **Deliverables:** Workspace-scoped tasks with deterministic provenance.
+- **Validation:** scope isolation and inheritance tests.
+- **Gate:** Workspace persistence already approved.
+
+### Step 10 — G4-B Workspace evidence integration
+- **Prerequisites:** G4-A + G3-B; owner evidence-retention decision.
+- **Implement:** durable/cross-run evidence index and Workspace evidence
+  browsing using the same envelope.
+- **Out of scope:** a second evidence format; full chat archive.
+- **Deliverables:** approved retention/expiry and Workspace evidence navigation.
+- **Validation:** cross-run revalidation, deletion/expiry and source isolation.
+- **Gate:** owner approves durable evidence. If refused, stop at G4-A.
+
+### Step 11 — G7-A Activity metrics, comparison and coverage
+- **Prerequisites:** G3-A + G4-A; owner sampling/retention decision.
+- **Implement:** bounded timezone-aware metrics, source comparison, coverage
+  report.
+- **Out of scope:** recommendations, schedule mutation, full-history totals.
+- **Deliverables:** read-only metrics that state window/coverage.
+- **Validation:** empty/partial/timezone/boundary tests.
+- **Gate:** owner approves sampling/retention.
+
+### Step 12 — G6-A Cross-source query and export
+- **Prerequisites:** G3-A + G4-A + G2-A; G3-B for the portable bundle.
+- **Implement:** explicit multi-source query, attributed aggregation, JSON/CSV/
+  Markdown export, portable bundle, research notebook.
+- **Out of scope:** semantic search, account-wide monitoring, unauthenticated
+  downloads.
+- **Deliverables:** attributed results and bounded exports.
+- **Validation:** per-source attribution, gaps, CSV escaping, size/retention;
+  owner runs one real multi-source question.
+- **Gate:** owner approves export destination and notebook persistence.
+
+### Step 13 — G7-B Owner-controlled recommendations
+- **Prerequisites:** G7-A; G3-A; G3-B optional for Workspace context.
+- **Implement:** explained timing recommendation and owner-confirmed prefill into
+  the existing wizard.
+- **Out of scope:** auto-create/change, recommendation-based task mutation.
+- **Deliverables:** recommendation plus explicit owner action.
+- **Validation:** owner compares one recommendation with observed activity;
+  existing wizard path remains owner-only.
+- **Gate:** **Scheduled History Phase 7 live validation must pass first.** Until
+  then this stage remains disabled/deferred.
+
+### Step 14 — G6-B Semantic search and similar discussions
+- **Prerequisites:** G6-A; approved embedding provider/index/store.
+- **Implement:** bounded index, semantic search, similar-discussion discovery,
+  index deletion.
+- **Out of scope:** unrestricted history upload; an unapproved vector store.
+- **Deliverables:** attributed semantic results with an honest empty state.
+- **Validation:** relevance/empty/index-deletion tests; owner-approved sample.
+- **Gate:** owner approves provider, retention and cost. May be withheld.
+
+### Step 15 — G8 Longitudinal and advanced intelligence
+- **Prerequisites:** G3-A + G4-A + G5-A + G6-A + G7-A; owner approval per capability.
+- **Implement:** entity extraction, decisions/promises, topic evolution,
+  contradiction/change detection, graph, watchlists, each behind evaluation.
+- **Out of scope:** autonomous judgments about people, always-on global
+  monitoring, speculative graph facts.
+- **Deliverables:** evidence-backed candidate views with confidence/refusal.
+- **Validation:** precision/refusal/privacy evaluation on owner-approved samples.
+- **Gate:** owner approval; may be withheld indefinitely.
+
+### Sequence notes
+
+- **Why G7-A precedes G6-A:** `G7-A` is a smaller read-only consumer of
+  Workspace identity and coverage; it validates activity sampling without
+  cross-source synthesis. `G6-A` then builds attribution/export on the already
+  tested evidence envelope. Neither requires the other.
+- **Why G5-A precedes G3:** The existing Task Center can be improved without
+  Workspace. Only `G5-B` waits.
+- **Why G4-A precedes G3:** Single-source evidence is the shared trust contract;
+  delaying it for Workspace would block the highest-value intelligence work.
+- **Why G1-B is early but not blocking:** It is scheduled after `G1-A` and may
+  run alongside `G2-A`; it does not gate data features.
+- **No stage may enable `G7-B` before Phase 7,** and no stage may start `G6-B`
+  without the owner's index decision.
 
 ## 9. Deferred and Exploratory Ideas
 
-| Idea | Blocker / unanswered question |
+| Idea / capability | Blocker or unanswered question |
 |---|---|
-| SOURCE-003 invite links | Current parser does not support them; Telegram invite preview/join semantics and side effects are unverified. |
-| INTEL-030 Knowledge Graph | No entity/evidence foundation; high false-relation risk; graph storage decision missing. |
-| INTEL-031 Topic Evolution | Requires reliable time-bucketed evidence and a baseline; missing-message bias unresolved. |
-| INTEL-032 Contradiction Detection | Context and subjectivity can create false contradictions; needs an evidence/evaluation design. |
-| INTEL-033 Decision Tracker | A proposal is not a decision; owner confirmation flow and schema are undefined. |
-| INTEL-034 Promise Tracker | Sarcasm/hypotheticals, misattribution and privacy risks need policy. |
-| INTEL-035 Change Detection | Edited/deleted messages are not re-readable without an archive; snapshots are incomplete. |
-| INTEL-036 Entity Extraction | Entity resolution and duplicate merging need an evidence-backed policy. |
-| SEARCH-001 Semantic Search | No embedding provider/index/store exists; content-retention and cost are owner decisions. |
-| SEARCH-002 Similar Discussion | Depends on semantic retrieval; relevance evaluation is undefined. |
-| INTEL-040 Research Notebook | Needs a persistence model and must not duplicate Saved Items. |
-| EXPORT-002 Portable Bundle | Import semantics and sensitive-data boundaries are unresolved. |
-| ANALYTICS-002/003 Recommendations | Depends on bounded analytics and Scheduled History Phase 7 live validation. |
-| Chat-only links | Existing parser refuses them; extending it is a separate product decision. |
-| Automated per-chat digest | P3 in the active History roadmap; Phase 6 admission and Phase 7 live checks remain deferred. |
+| **TASK-002 cancel/retry** | The service exposes pause/resume/complete/fail/expire/delete, not cancellation of a running occurrence or retry of a selected failed occurrence. The scheduler has a `cancelled` status and bounded retries, but no owner-facing path. Cancel/retry is deferred until the coordinator/claim boundary is proven; the rest of TASK-002 belongs to G5-A. |
+| **G3-B durable Workspace settings** | No Workspace table/model exists. A derived identity/read model can start in G3-A, but durable settings/dashboard/health need owner-approved persistence. |
+| **G4-B durable evidence index** | EVID-001 can start ephemeral in G4-A; cross-session/cross-run browsing needs an owner-approved retention/index model. If refused, G4-A remains the stopping point. |
+| **SOURCE-003 invite links** | Current parser does not support them; Telegram invite preview/join semantics and side effects are unverified. |
+| **SEARCH-001 Semantic Search** | No embedding provider/index/store exists; content-retention and cost are owner decisions. Delivered only in G6-B. |
+| **SEARCH-002 Similar Discussion** | Depends on semantic retrieval; relevance evaluation and index ownership are undefined. Delivered only in G6-B. |
+| **ANALYTICS-002/003 Recommendations** | Depends on G7-A and on Scheduled History Phase 7 live validation. The recommendation/prefill stage remains disabled until that gate passes. |
+| **INTEL-030 Knowledge Graph** | No entity/evidence foundation; high false-relation risk; graph storage decision missing. |
+| **INTEL-031 Topic Evolution** | Requires reliable time-bucketed evidence and a baseline; missing-message bias unresolved. |
+| **INTEL-032 Contradiction Detection** | Context and subjectivity can create false contradictions; needs an evidence/evaluation design. |
+| **INTEL-033 Decision Tracker** | A proposal is not a decision; owner confirmation flow and schema are undefined. |
+| **INTEL-034 Promise Tracker** | Sarcasm/hypotheticals, misattribution and privacy risks need policy. |
+| **INTEL-035 Change Detection** | Edited/deleted messages are not re-readable without an archive; snapshots are incomplete. |
+| **INTEL-036 Entity Extraction** | Entity resolution and duplicate merging need an evidence-backed policy. |
+| **INTEL-040 Research Notebook** | Needs a persistence model and must not duplicate Saved Items. |
+| **EXPORT-002 Portable Bundle** | Import semantics and sensitive-data boundaries are unresolved; the complete bundle also needs G3-B Workspace settings. |
+| **Chat-only links** | Existing parser refuses them; extending it is a separate product decision. |
+| **Automated per-chat digest** | P3 in the active History roadmap; Phase 6 admission and Phase 7 live checks remain deferred. |
+
+LANG-005 is **not** deferred: it moves from the base language stage to G4-A,
+where structured extraction exists. Workspace language is not deferred either;
+it is a distinct stage (G2-B) blocked by G3-B.
 
 ## 10. Open Questions and Owner Decisions
 
 Only decisions that genuinely need the owner are listed; source-inspectable
 facts are not questions.
 
-1. **Workspace persistence:** Should Workspace settings be a new owner-scoped
-   model, an extension of existing task/history rows, or an initially derived
-   read model with no new persistence? If new persistence is approved, the owner
-   controls the schema and migration.
+1. **Workspace persistence:** Should G3-A start with a derived read model and no
+   new table, or should a durable source/Workspace registry be approved? If
+   durable, should G3-B use a new owner-scoped model or extend existing rows?
+   The owner controls any schema/migration.
 2. **Language precedence:** Confirm the intended order (explicit request > Task >
-   Workspace > global > default) and whether Glass UI language is a separate
+   Workspace > global > default), whether the existing `panel_settings.language`
+   value is migrated or replaced, and whether Glass UI language is a separate
    setting from generated-content language.
-3. **Evidence retention:** Is bounded evidence allowed to persist across sessions
-   (for follow-ups/exports), or must it remain ephemeral and be re-fetched from
-   Telegram? This determines whether a new index/table is justified.
+3. **Evidence retention:** Is G4-A allowed to start with ephemeral, revalidated
+   evidence, or must evidence persist across sessions immediately? Durable
+   cross-run browsing (G4-B) requires this decision.
 4. **Cross-source scope:** May a query read only explicitly selected Workspaces,
    or does the owner want broader account-level discovery? The former is the
    safer proposed default.
-5. **Activity data:** What sampling window/retention is acceptable for analytics,
-   and should metrics be cached durably or recomputed on demand?
-6. **Advanced intelligence:** Which of the graph/trackers/contradiction features
-   are worth the false-positive and privacy risk? Approval can be withheld
-   indefinitely.
-7. **Task Center shape:** Extend Taskloom in place or introduce a new top-level
+5. **Activity data:** What sampling window/retention is acceptable for G7-A, and
+   should metrics be cached durably or recomputed on demand?
+6. **Task Center shape:** Extend Taskloom in place or introduce a new top-level
    navigation entry? The source already has Taskloom under AI.
+7. **Cancel/retry:** Is owner-triggered cancellation/retry required for the first
+   Task Center release, or may G5-A ship the existing pause/resume/complete/
+   delete controls while cancel/retry remains deferred pending a coordinator
+   contract?
 8. **Export destination:** Telegram file delivery, dashboard download, or durable
    object storage? Each has different retention/security implications.
-9. **UI scope:** Approve the ordering/selection rules and how much visual
-   customization is worth pursuing within Telegram's panel constraints.
+9. **Semantic index:** Approve or reject an embedding provider/index/store,
+   including content retention, cost and deletion. G6-B cannot start without it.
+10. **Advanced intelligence:** Which graph/tracker/contradiction features are
+    worth the false-positive and privacy risk? Approval can be withheld
+    indefinitely.
+11. **UI scope:** Approve the ordering/selection rules and how much visual
+    customization is worth pursuing within Telegram's panel constraints.
 
 ## 11. Change Log
 
 | Date | Change |
 |---|---|
 | 2026-11-14 | Created this document at `main`/`origin/main` `f61e12e`. Recorded the owner-provided UI, language, interactive summary, extraction, Workspace, analytics, source search, cross-source, Task Center and advanced intelligence ideas; added clearly labeled assistant suggestions; mapped existing History/Scheduled History/Taskloom/language/search capabilities; proposed eight implementation groups, separate product/implementation priorities, a dependency-aware sequence, deferred items and owner decisions. No implementation, schema, Supabase, Telegram, deployment or test change was made. |
+| 2026-11-14 | Corrected dependency graph and sequence after source re-verification of the committed document (`63fdd5c`). Split G1, G2, G3, G4, G5, G6 and G7 into A/B sub-stages; moved G2-B after G3-B; moved G5-B after G3-B/G2-B; made G4-A single-source and G4-B Workspace-aware; separated G7-A metrics from Phase-7-gated G7-B recommendations; moved semantic search to owner-gated G6-B; reassigned LANG-005 to G4-A; recorded that task cancel/retry has no service path yet. No idea was removed, no runtime/test/schema/Supabase/Telegram/Render change was made. |
