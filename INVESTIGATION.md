@@ -259,8 +259,11 @@ merge residue, corrected in the follow-up commit:
    them and no code or test references them. They were removed; the upstream
    Appearance implementation and its three replacement suites are unchanged.
 
-The roadmap and this document now describe Phase 3B as implemented, audited and
-not live-verified.
+Phase 3B is implemented and audited. The migration is applied to the connected
+Supabase project; live schema/access checks and the transactional CAS probe
+were performed. The CAS probe was rolled back and left no test row behind.
+Full production Scheduled History execution and live Telegram retrieval remain
+unimplemented and unverified.
 
 ### Migration version reconciliation (2026-11-14)
 

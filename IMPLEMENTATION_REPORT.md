@@ -35,7 +35,7 @@ Files changed:
 | File | Change |
 |---|---|
 | `supabase/migrations/20261114180758_create_history_schedules.sql` | New table, index, RLS/grants, comments, verification and rollback note (applied; remote version matches the filename) |
-| `backend/ai/database/task_repository.py` | Record model, validation, in-memory fallback, Supabase CAS methods, task cascade |
+| `backend/ai/database/task_repository.py` | Record model and validation; production `SupabaseTaskRepository` CAS methods and task cascade; `InMemoryTaskRepository` is an explicitly injected test fake only — production History state has no in-memory fallback and fails closed |
 | `backend/services/history_service.py` | `HistoryBatch` and bounded oldest-first retrieval |
 | `backend/services/history_ai_service.py` | Identifier-free scheduled payload |
 | `backend/telegram_api/messages.py` | Optional `reverse` forwarding to Telethon |
