@@ -45,7 +45,7 @@ def _required(functions, name):
 
 def test_every_registered_tool_reaches_the_provider_exactly_once():
     registry, functions = _functions()
-    assert len(registry.list_names()) == 55
+    assert len(registry.list_names()) == 56
     assert set(functions) == set(registry.list_names())
 
 

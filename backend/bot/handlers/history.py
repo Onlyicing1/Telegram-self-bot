@@ -9,9 +9,10 @@ No second summarizer, client, listener, scheduler or provider path exists here.
 The panel only chooses a chat, a bounded count and an optional focus, then calls
 ``summarize_history`` through deterministic application code.
 
-P1 is deliberately manual: there are no checkpoints, no incremental runs, no
-automatic/cadence processing and no persistence. The selected chat, count and
-focus live in this process's UI state only.
+Manual runs are one-time. The separate owner-only Scheduled History wizard
+creates one durable checkpoint task through the existing TaskCreationService;
+the model cannot create or mutate that schedule. The manual selection, count and
+focus still live in this process's UI state only.
 """
 from __future__ import annotations
 
@@ -20,6 +21,7 @@ import logging
 import re
 import time
 import uuid
+from datetime import datetime, timezone
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
@@ -59,7 +61,14 @@ from backend.services import (
 logger = logging.getLogger(__name__)
 
 PANEL_ID = "history"
+SCHEDULE_PANEL_ID = "history_schedule"
 TITLE = "History & Intelligence"
+SCHEDULE_TITLE = "Scheduled History"
+
+#: Set by ``register`` from the trusted runtime configuration. The History
+#: wizard never learns an owner id from a callback or task text.
+_OWNER_ID = 0
+_DEFAULT_TZ = "UTC"
 
 #: The largest set the panel can offer (a private user's choices). A selected
 #: peer's OWN choices come from ``history_policy`` and may be narrower — a bot
@@ -132,7 +141,21 @@ class _Chat:
     kind: str
 
 
+@dataclass
+class _ScheduleState:
+    """Ephemeral owner wizard state; never authoritative after creation."""
+
+    peer_id: int = 0
+    peer_name: str = ""
+    peer_type: PeerType | None = None
+    cadence: str = "hourly"
+    baseline_mode: str = "new"
+    notice: str = ""
+    created_task_id: int = 0
+
+
 _STATE = _State()
+_SCHEDULE = _ScheduleState()
 
 
 def _short(value: Any, limit: int = 32) -> str:
@@ -259,13 +282,15 @@ def _panel_buttons() -> list:
             )
     builder.add_row("Set Focus Instruction", f"input:{PANEL_ID}:focus")
     builder.add_row("Run Summary", "action:history_run")
+    builder.add_row(sym.label(sym.OP_CREATE, "Schedule History"), f"panel:{SCHEDULE_PANEL_ID}")
     builder.add_row("Summarize Message Link", f"input:{PANEL_ID}:link")
     return builder.build()
 
 
 def _panel_body(notice: str = "") -> str:
     lines = [
-        "Summarize a chat with the existing AI engine. Each run is one-time; nothing is stored.",
+        "Summarize a chat with the existing AI engine. Manual runs are one-time; "
+        "scheduled checkpoints are separate and durable.",
         "",
         f"Chat: {_STATE.chat_name or 'not selected'}",
         f"Messages: {_STATE.count}",
@@ -283,6 +308,238 @@ def _panel_body(notice: str = "") -> str:
 
 def _panel_view(notice: str = "") -> tuple[str, str, list]:
     return TITLE, _panel_body(notice), _panel_buttons()
+
+
+def _sync_schedule_peer() -> None:
+    """Snapshot the History selection into the wizard's own ephemeral state."""
+    global _SCHEDULE
+    if not _STATE.chat_id:
+        # No current selection means no honest peer to schedule: never keep a
+        # stale peer from the wizard's previous visit.
+        if _SCHEDULE.peer_id or _SCHEDULE.created_task_id:
+            _SCHEDULE = _ScheduleState()
+        return
+    if _SCHEDULE.peer_id != _STATE.chat_id:
+        _SCHEDULE = _ScheduleState(
+            peer_id=_STATE.chat_id,
+            peer_name=_STATE.chat_name,
+            peer_type=_STATE.peer_type,
+        )
+
+
+def _schedule_cadence() -> tuple[str, dict[str, Any], str]:
+    if _SCHEDULE.cadence == "daily":
+        return "daily", {"hour": 9, "minute": 0, "timezone": _DEFAULT_TZ}, "Daily at 09:00"
+    if _SCHEDULE.cadence == "weekly":
+        return "weekly", {
+            "weekday": 0, "hour": 9, "minute": 0, "timezone": _DEFAULT_TZ,
+        }, "Weekly on Monday at 09:00"
+    return "interval", {"seconds": 60 * 60}, "Every hour"
+
+
+def _schedule_body(notice: str = "") -> str:
+    lines = [
+        "Create one durable, cumulative History checkpoint for a classified chat.",
+        "The model is never called to create or change this schedule.",
+        "",
+        f"Chat: {_SCHEDULE.peer_name or 'not selected'}",
+        f"Type: {_SCHEDULE.peer_type.value if _SCHEDULE.peer_type else 'unknown'}",
+    ]
+    if _SCHEDULE.peer_id:
+        _kind, _schedule, cadence_label = _schedule_cadence()
+        lines.extend([
+            f"Cadence: {cadence_label}",
+            "Baseline: "
+            + (
+                "existing backlog (all available history)"
+                if _SCHEDULE.baseline_mode == "backlog"
+                else "new messages only"
+            ),
+            f"Focus: {_STATE.focus or 'none'}",
+            f"Timezone: {_DEFAULT_TZ}",
+        ])
+    if _SCHEDULE.created_task_id:
+        lines.extend([
+            "",
+            f"{sym.STATE_COMPLETED} Task #{_SCHEDULE.created_task_id} is scheduled.",
+            "The checkpoint is updated by the existing scheduler.",
+        ])
+    if notice:
+        lines.extend(["", notice])
+    return "\n".join(lines)
+
+
+def _schedule_buttons() -> list:
+    builder = InlinePanelBuilder()
+    if _SCHEDULE.peer_id and not _SCHEDULE.created_task_id:
+        builder.add_row(
+            sym.label(sym.SCHEDULE_INTERVAL, "Every hour"),
+            "action:history_schedule:cadence:hourly",
+        )
+        builder.add_row(
+            sym.label(sym.SCHEDULE_DAILY, "Daily at 09:00"),
+            "action:history_schedule:cadence:daily",
+        )
+        builder.add_row(
+            sym.label(sym.SCHEDULE_WEEKLY, "Weekly Monday 09:00"),
+            "action:history_schedule:cadence:weekly",
+        )
+        builder.add_row(
+            "Baseline: "
+            + ("existing backlog" if _SCHEDULE.baseline_mode == "new" else "new messages only"),
+            "action:history_schedule:baseline:"
+            + ("backlog" if _SCHEDULE.baseline_mode == "new" else "new"),
+        )
+        builder.add_row(
+            sym.label(sym.OP_CREATE, "Create schedule"),
+            "action:history_schedule:create",
+        )
+    if _SCHEDULE.created_task_id:
+        builder.add_row(
+            sym.label(sym.OP_REFRESH, "Create another"),
+            "action:history_schedule:reset",
+        )
+    builder.add_row(sym.label(sym.OP_BACK, "Back to History"), f"panel:{PANEL_ID}")
+    return builder.build()
+
+
+def _schedule_view(notice: str = "") -> tuple[str, str, list]:
+    return SCHEDULE_TITLE, _schedule_body(notice), _schedule_buttons()
+
+
+async def _schedule_panel(event, extra: str) -> tuple[str, str, list] | None:
+    _sync_schedule_peer()
+    if not _SCHEDULE.peer_id:
+        return _schedule_view(f"{sym.STATE_FAILED} Select a chat in History first.")
+    return _schedule_view()
+
+
+async def _create_scheduled_history() -> tuple[str, str, list]:
+    """The owner-only creation boundary; no model is involved."""
+    from backend.ai.database.manager import get_repository_manager
+    from backend.ai.task_candidate import TaskCandidate
+    from backend.ai.task_contract import SCHEDULED_HISTORY_ACTION
+    from backend.ai.task_creation import (
+        HistoryScheduleCreationError,
+        TaskCreationService,
+    )
+
+    if _OWNER_ID <= 0:
+        return _schedule_view(f"{sym.STATE_FAILED} The owner id is unavailable.")
+    if not _SCHEDULE.peer_id:
+        return _schedule_view(f"{sym.STATE_FAILED} Select a chat in History first.")
+
+    manager = get_repository_manager()
+    repository = getattr(manager, "task", None)
+    if not (
+        getattr(manager, "supabase_available", False)
+        and getattr(repository, "supports_durable_history", False)
+    ):
+        return _schedule_view(
+            f"{sym.STATE_FAILED} Durable History storage is unavailable; nothing was created."
+        )
+
+    client = get_self_client()
+    if client is None:
+        return _schedule_view(f"{sym.STATE_FAILED} Telegram is not connected right now.")
+    try:
+        peer_type = await history_service.classify_chat(client, _SCHEDULE.peer_id)
+    except history_service.HistoryError as exc:
+        return _schedule_view(f"{sym.STATE_FAILED} {exc}")
+    if peer_type is PeerType.UNKNOWN or history_policy.maximum_for(peer_type) <= 0:
+        return _schedule_view(f"{sym.STATE_FAILED} {history_policy.UNKNOWN_REFUSAL}")
+    _SCHEDULE.peer_type = peer_type
+
+    try:
+        baseline = (
+            0
+            if _SCHEDULE.baseline_mode == "backlog"
+            else await history_service.latest_message_id(client, _SCHEDULE.peer_id)
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - no task may exist without a baseline
+        logger.warning("HISTORY_SCHEDULE_BASELINE_FAILED error=%s", type(exc).__name__)
+        return _schedule_view(
+            f"{sym.STATE_FAILED} Could not capture the chat baseline ({type(exc).__name__}); "
+            "nothing was created."
+        )
+
+    schedule_type, schedule, cadence_label = _schedule_cadence()
+    arguments: dict[str, Any] = {}
+    focus = _normalize_focus(_STATE.focus)
+    if focus:
+        arguments["instruction"] = focus
+    candidate = {
+        "label": f"History · {_SCHEDULE.peer_name or _SCHEDULE.peer_id}"[:256],
+        "schedule_type": schedule_type,
+        "schedule": schedule,
+        "timezone": _DEFAULT_TZ,
+        "actions": [{"name": SCHEDULED_HISTORY_ACTION, "arguments": arguments}],
+        "notification_destination": {
+            "chat_id": int(_OWNER_ID),
+            "deliver_result": True,
+        },
+    }
+    try:
+        validated = TaskCandidate.from_untrusted(candidate)
+        service = TaskCreationService(repository, _OWNER_ID)
+        task, _state = await service.create_history_schedule_task(
+            validated,
+            datetime.now(timezone.utc),
+            peer_id=_SCHEDULE.peer_id,
+            baseline_cursor=baseline,
+        )
+    except HistoryScheduleCreationError as exc:
+        if exc.task_id:
+            notice = (
+                f"{sym.STATE_FAILED} The checkpoint could not be saved; task "
+                f"#{exc.task_id} may remain and should be removed from Taskloom. "
+                f"{exc}"
+            )
+        else:
+            notice = f"{sym.STATE_FAILED} {exc} Nothing durable was created."
+        return _schedule_view(notice)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - honest failure, never a fake task
+        logger.warning("HISTORY_SCHEDULE_CREATE_FAILED error=%s", type(exc).__name__)
+        return _schedule_view(
+            f"{sym.STATE_FAILED} Could not create the schedule "
+            f"({type(exc).__name__}); nothing durable was reported as created."
+        )
+
+    _SCHEDULE.created_task_id = int(task.id)
+    return _schedule_view(
+        f"{sym.STATE_COMPLETED} Task #{task.id} created · {cadence_label} · "
+        f"baseline {baseline}."
+    )
+
+
+async def _schedule_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    global _SCHEDULE
+    _sync_schedule_peer()
+    parts = str(extra or "").split(":")
+    command = parts[0] if parts else ""
+    value = parts[1] if len(parts) > 1 else ""
+    if command == "cadence" and value in {"hourly", "daily", "weekly"}:
+        _SCHEDULE.cadence = value
+        _SCHEDULE.notice = ""
+        return _schedule_view()
+    if command == "baseline" and value in {"new", "backlog"}:
+        _SCHEDULE.baseline_mode = value
+        _SCHEDULE.notice = ""
+        return _schedule_view()
+    if command == "reset":
+        _SCHEDULE = _ScheduleState(
+            peer_id=_STATE.chat_id,
+            peer_name=_STATE.chat_name,
+            peer_type=_STATE.peer_type,
+        )
+        return _schedule_view()
+    if command == "create":
+        return await _create_scheduled_history()
+    return _schedule_view()
 
 
 async def _chats_view(page_text: str) -> tuple[str, str, list]:
@@ -1268,13 +1525,27 @@ async def _inline_builder(event, extra: str) -> list:
     return [render(title, body, buttons)]
 
 
-def register(client=None, owner_id: int = 0) -> None:
+def register(client=None, owner_id: int = 0, tz_str: str = "UTC") -> None:
     """Register the History & Intelligence panel. No listener is added."""
+    global _OWNER_ID, _DEFAULT_TZ, _SCHEDULE
+    _OWNER_ID = int(owner_id or 0)
+    try:
+        from zoneinfo import ZoneInfo
+
+        _DEFAULT_TZ = str(tz_str).strip() if tz_str and str(tz_str).strip() else "UTC"
+        ZoneInfo(_DEFAULT_TZ)
+    except Exception:  # noqa: BLE001 - a bad configured zone falls back safely
+        _DEFAULT_TZ = "UTC"
+    _SCHEDULE = _ScheduleState()
     register_panel(PANEL_ID, _panel_handler, parent="menu", title=TITLE)
+    register_panel(
+        SCHEDULE_PANEL_ID, _schedule_panel, parent=PANEL_ID, title=SCHEDULE_TITLE,
+    )
     register_inline_builder(PANEL_ID, _inline_builder)
     register_action("history_count", _count_action)
     register_action("history_run", _run_action)
     register_action("history_page", _page_action)
+    register_action("history_schedule", _schedule_action)
     register_input(
         PANEL_ID,
         "focus",

@@ -21,6 +21,21 @@ MAX_TOOL_NAME_CHARS = 128
 #: from a scheduled occurrence rather than from an interactive owner request.
 SCHEDULED_OCCURRENCE_EXTRA = "scheduled_occurrence"
 
+#: ``ToolContext.extra`` key carrying the owning ``ai_tasks.id`` of a CLAIMED
+#: scheduled occurrence. Like the origin marker above, it is written only by
+#: ``TaskExecutionCoordinator`` from the occurrence's own durable record. A
+#: scheduled action may use it to load server-owned state (for example the
+#: History checkpoint); no model or candidate can set it.
+SCHEDULED_TASK_ID_EXTRA = "scheduled_task_id"
+
+#: The registered action of a scheduled History task. It is deliberately
+#: OWNER-WIZARD-ONLY at task creation: the action needs a durable
+#: ``history_schedules`` row and a classified peer, neither of which a model
+#: candidate may supply. The executor still requires the action to be
+#: registered for the scheduler to run it.
+SCHEDULED_HISTORY_ACTION = "scheduled_history"
+OWNER_ONLY_TASK_ACTIONS = frozenset({SCHEDULED_HISTORY_ACTION})
+
 #: Registered actions whose arguments address a literal Telegram message.
 #: Telegram message IDs are only meaningful together with their chat, so the
 #: value must be grounded in trusted context — a numeric shape alone proves

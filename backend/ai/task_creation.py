@@ -27,6 +27,8 @@ from backend.ai.task_candidate import TaskCandidate
 from backend.ai.task_contract import (
     CONDITION_KEY,
     AIInstruction,
+    OWNER_ONLY_TASK_ACTIONS,
+    SCHEDULED_HISTORY_ACTION,
     action_reference_error,
     is_action_reference,
     question_chain_error,
@@ -57,6 +59,17 @@ class TaskCreationError(ValueError):
 
 class TaskSemanticCompletenessError(TaskCreationError):
     """A schema-valid candidate lacks grounded user task semantics."""
+
+
+class HistoryScheduleCreationError(TaskCreationError):
+    """The History task/state pair could not be created as one structure."""
+
+    def __init__(
+        self, message: str, *, task_id: int = 0, rollback_durable: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.task_id = task_id
+        self.rollback_durable = rollback_durable
 
 
 _PROFILE_CONTENT_ACTIONS = frozenset({"bio_set_text", "username_set_text"})
@@ -351,7 +364,13 @@ class TaskCreationService:
             ) from exc
         return task
 
-    async def create(self, candidate: dict[str, Any], reference: datetime) -> TaskRecord:
+    async def create(
+        self,
+        candidate: dict[str, Any],
+        reference: datetime,
+        *,
+        trusted_owner_actions: frozenset[str] = frozenset(),
+    ) -> TaskRecord:
         started = time.perf_counter()
 
         def _invalid(reason: str) -> TaskCreationError:
@@ -392,6 +411,19 @@ class TaskCreationService:
             instruction = candidate.get("ai_instruction")
             generation_authorized = isinstance(instruction, str) and bool(instruction.strip())
             for action in actions:
+                action_name = (
+                    action.get("name") or action.get("tool")
+                    if isinstance(action, dict) else None
+                )
+                if (
+                    isinstance(action_name, str)
+                    and action_name in OWNER_ONLY_TASK_ACTIONS
+                    and action_name not in trusted_owner_actions
+                ):
+                    raise _invalid(
+                        f"action '{action_name}' is owner-wizard-only and cannot be "
+                        "created from an untrusted task candidate"
+                    )
                 eligibility_error = _action_eligibility_error(
                     action, registry, generation_authorized=generation_authorized
                 )
@@ -512,3 +544,107 @@ class TaskCreationService:
             elapsed_s=round(time.perf_counter() - started, 2),
         )
         return task
+
+    async def _delete_created_history_task(self, task: TaskRecord) -> bool:
+        """Compensate exactly the task this call created, under its CAS version.
+
+        ``shield`` keeps the deletion running if the owner's callback is
+        cancelled after the task was persisted; the caller still propagates the
+        cancellation. The returned boolean is durable deletion only, never a
+        memory-only fallback claim.
+        """
+        try:
+            result = await asyncio.shield(
+                self.repository.delete_task(
+                    self.owner_id, task.id, task.version,
+                )
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - compensation is best effort
+            return False
+        return bool(getattr(result, "durable", False))
+
+    async def create_history_schedule_task(
+        self,
+        candidate: TaskCandidate,
+        reference: datetime,
+        *,
+        peer_id: int,
+        baseline_cursor: int,
+    ) -> tuple[TaskRecord, Any]:
+        """Create ONE owner-created History task and its durable state row.
+
+        This is the only History creation boundary. The peer and baseline are
+        supplied by the owner wizard, not by the task candidate; the action is
+        accepted only through ``trusted_owner_actions``. The task is persisted
+        first because ``history_schedules.task_id`` is its child, and any state
+        failure removes that exact task under CAS.
+        """
+        if not isinstance(candidate, TaskCandidate):
+            raise TypeError("a History schedule needs a validated TaskCandidate")
+        actions = candidate.actions
+        if (
+            len(actions) != 1
+            or not isinstance(actions[0], dict)
+            or actions[0].get("name") != SCHEDULED_HISTORY_ACTION
+        ):
+            raise HistoryScheduleCreationError(
+                "a History schedule must contain exactly one scheduled_history action"
+            )
+        if isinstance(peer_id, bool) or not isinstance(peer_id, int) or peer_id == 0:
+            raise HistoryScheduleCreationError("a History schedule needs a real peer")
+        if isinstance(baseline_cursor, bool) or not isinstance(baseline_cursor, int) or baseline_cursor < 0:
+            raise HistoryScheduleCreationError("the History baseline must be a nonnegative message id")
+
+        existing = await self.repository.get_history_schedule_by_peer(
+            self.owner_id, peer_id,
+        )
+        if existing is not None and existing.status != "deleted":
+            raise HistoryScheduleCreationError(
+                "this chat already has a durable History checkpoint; delete its "
+                "task before creating another schedule"
+            )
+
+        task = await self.create(
+            candidate, reference,
+            trusted_owner_actions=OWNER_ONLY_TASK_ACTIONS,
+        )
+        fallback = str(getattr(task, "fallback_backend", "") or "")
+        if fallback:
+            rolled_back = await self._delete_created_history_task(task)
+            raise HistoryScheduleCreationError(
+                "History schedules require durable storage; the task was not kept",
+                task_id=0 if rolled_back else int(task.id),
+                rollback_durable=rolled_back,
+            )
+
+        state = None
+        try:
+            state = await self.repository.create_history_schedule(
+                self.owner_id,
+                task.id,
+                peer_id,
+                baseline_cursor=baseline_cursor,
+            )
+            if state is None:
+                raise HistoryScheduleCreationError(
+                    "this chat already has a durable History checkpoint"
+                )
+            return task, state
+        except asyncio.CancelledError:
+            await self._delete_created_history_task(task)
+            raise
+        except Exception as exc:
+            rolled_back = await self._delete_created_history_task(task)
+            if isinstance(exc, HistoryScheduleCreationError):
+                raise HistoryScheduleCreationError(
+                    str(exc),
+                    task_id=0 if rolled_back else int(task.id),
+                    rollback_durable=rolled_back,
+                ) from exc
+            raise HistoryScheduleCreationError(
+                "the History task was created but its checkpoint could not be saved",
+                task_id=0 if rolled_back else int(task.id),
+                rollback_durable=rolled_back,
+            ) from exc

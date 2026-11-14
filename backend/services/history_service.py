@@ -323,6 +323,27 @@ async def _collect(
     return list(reversed(collected)), scanned, truncated
 
 
+async def latest_message_id(source: Any, chat_id: Any) -> int:
+    """The newest raw Telegram message id in ``chat_id``, or ``0`` when empty.
+
+    This is the ONE bounded read a schedule uses to capture its stable upper
+    boundary. It intentionally uses the raw newest-first page (not the
+    provenance-filtered eligible view): a boundary is an id, not content, and
+    skipping an AI-provenance message must not move the boundary backwards.
+    """
+    chat = _require_chat_id(chat_id)
+    client = _resolve_client(source)
+    raw = await _fetch_page(
+        client, chat, limit=1, before_id=None, after_id=None, reverse=False,
+    )
+    ids = [
+        _coerce_int(record.get("id"))
+        for record in (raw or [])
+        if isinstance(record, dict)
+    ]
+    return max((value for value in ids if value > 0), default=0)
+
+
 async def classify_chat(source: Any, chat_id: Any) -> PeerType:
     """Resolve the chat's CURRENT entity and classify it.
 

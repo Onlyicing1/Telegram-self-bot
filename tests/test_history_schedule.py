@@ -1,0 +1,403 @@
+"""Phase 4/5 boundary: owner History schedule creation and bounded execution."""
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from types import SimpleNamespace
+
+import pytest
+
+from backend.ai.database.task_repository import InMemoryTaskRepository
+from backend.ai.task_candidate import TaskCandidate
+from backend.ai.task_contract import (
+    OWNER_ONLY_TASK_ACTIONS,
+    SCHEDULED_HISTORY_ACTION,
+    SCHEDULED_TASK_ID_EXTRA,
+)
+from backend.ai.task_creation import (
+    HistoryScheduleCreationError,
+    TaskCreationError,
+    TaskCreationService,
+)
+from backend.ai.task_execution import TaskExecutionCoordinator
+from backend.ai.tools.base import PermissionLevel, ToolResult
+from backend.ai.tools.context import ToolContext
+from backend.ai.tools.executor import ToolExecutor
+from backend.ai.tools.history_schedule import ScheduledHistoryTool
+from backend.ai.tools.registry import ToolRegistry, create_default_registry
+from backend.services import history_ai_service, history_schedule_service, history_service
+from backend.services.history_service import HistoryBatch, HistoryMessage
+from backend.telegram_api.peers import PeerType
+
+OWNER = 7001
+PEER = -1007001
+REF = datetime(2026, 11, 14, 12, 0, tzinfo=timezone.utc)
+
+
+def _message(message_id: int, text: str = "hello") -> HistoryMessage:
+    return HistoryMessage(
+        message_id=message_id,
+        chat_id=PEER,
+        sender_id=1,
+        out=False,
+        date=REF,
+        text=text,
+        reply_to_msg_id=None,
+        has_media=False,
+        ai_provenance=False,
+    )
+
+
+def _candidate() -> dict:
+    return {
+        "label": "History checkpoint",
+        "schedule_type": "interval",
+        "schedule": {"seconds": 3600},
+        "timezone": "UTC",
+        "actions": [{"name": SCHEDULED_HISTORY_ACTION, "arguments": {}}],
+        "notification_destination": {},
+    }
+
+
+def _validated() -> TaskCandidate:
+    return TaskCandidate.from_untrusted(_candidate())
+
+
+async def _task_with_state(repo: InMemoryTaskRepository, *, baseline: int = 10):
+    task = await repo.create_task(OWNER, _candidate())
+    state = await repo.create_history_schedule(
+        OWNER, task.id, PEER, baseline_cursor=baseline,
+    )
+    return task, state
+
+
+def test_the_scheduled_history_action_is_registered_once():
+    registry = create_default_registry(ToolContext(None, OWNER, "UTC"))
+    assert registry.has(SCHEDULED_HISTORY_ACTION)
+    assert isinstance(registry.get(SCHEDULED_HISTORY_ACTION), ScheduledHistoryTool)
+
+
+@pytest.mark.asyncio
+async def test_untrusted_creation_rejects_the_owner_only_action():
+    repo = InMemoryTaskRepository()
+    service = TaskCreationService(repo, OWNER)
+
+    with pytest.raises(TaskCreationError, match="owner-wizard-only"):
+        await service.create(_validated(), REF)
+    assert await repo.list_tasks(OWNER) == []
+
+    task = await service.create(
+        _validated(), REF, trusted_owner_actions=OWNER_ONLY_TASK_ACTIONS,
+    )
+    assert task.actions[0]["name"] == SCHEDULED_HISTORY_ACTION
+
+
+@pytest.mark.asyncio
+async def test_owner_creation_writes_the_task_and_one_state_row():
+    repo = InMemoryTaskRepository()
+    service = TaskCreationService(repo, OWNER)
+
+    task, state = await service.create_history_schedule_task(
+        _validated(), REF, peer_id=PEER, baseline_cursor=55,
+    )
+
+    assert task.id > 0
+    assert task.actions == [{"name": SCHEDULED_HISTORY_ACTION, "arguments": {}}]
+    assert state.task_id == task.id
+    assert state.peer_id == PEER
+    assert state.baseline_cursor == state.scanned_cursor == state.summarized_cursor == 55
+    assert (await repo.get_history_schedule_by_peer(OWNER, PEER)).task_id == task.id
+
+
+@pytest.mark.asyncio
+async def test_a_live_owner_peer_state_is_refused_before_a_second_task():
+    repo = InMemoryTaskRepository()
+    service = TaskCreationService(repo, OWNER)
+    await service.create_history_schedule_task(
+        _validated(), REF, peer_id=PEER, baseline_cursor=1,
+    )
+
+    with pytest.raises(HistoryScheduleCreationError, match="already has"):
+        await service.create_history_schedule_task(
+            _validated(), REF, peer_id=PEER, baseline_cursor=2,
+        )
+    assert len(await repo.list_tasks(OWNER)) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_fallback_task_is_removed_and_never_gets_state(monkeypatch):
+    repo = InMemoryTaskRepository()
+    service = TaskCreationService(repo, OWNER)
+    original_create = repo.create_task
+
+    async def _fallback_create(owner_id, data):
+        task = await original_create(owner_id, data)
+        task.fallback_backend = "InMemoryTaskRepository"
+        return task
+
+    monkeypatch.setattr(repo, "create_task", _fallback_create)
+    with pytest.raises(HistoryScheduleCreationError) as raised:
+        await service.create_history_schedule_task(
+            _validated(), REF, peer_id=PEER, baseline_cursor=1,
+        )
+    assert raised.value.rollback_durable is True
+    assert await repo.list_tasks(OWNER) == []
+    assert await repo.get_history_schedule_by_peer(OWNER, PEER) is None
+
+
+@pytest.mark.asyncio
+async def test_state_failure_compensates_the_exact_created_task(monkeypatch):
+    repo = InMemoryTaskRepository()
+    service = TaskCreationService(repo, OWNER)
+
+    async def _fail(*args, **kwargs):
+        raise RuntimeError("state write failed")
+
+    monkeypatch.setattr(repo, "create_history_schedule", _fail)
+    with pytest.raises(HistoryScheduleCreationError) as raised:
+        await service.create_history_schedule_task(
+            _validated(), REF, peer_id=PEER, baseline_cursor=1,
+        )
+    assert raised.value.rollback_durable is True
+    assert raised.value.task_id == 0
+    assert await repo.list_tasks(OWNER) == []
+    assert await repo.get_history_schedule_by_peer(OWNER, PEER) is None
+
+
+@pytest.mark.asyncio
+async def test_one_run_extends_the_summary_and_commits_both_cursors(monkeypatch):
+    repo = InMemoryTaskRepository()
+    task, _state = await _task_with_state(repo, baseline=10)
+    calls: list[dict] = []
+
+    async def _classify(*args, **kwargs):
+        return PeerType.PRIVATE_USER
+
+    async def _latest(*args, **kwargs):
+        return 13
+
+    async def _fetch(*args, **kwargs):
+        calls.append(dict(kwargs))
+        return HistoryBatch(
+            chat_id=PEER,
+            messages=(_message(11), _message(12, "newer")),
+            scanned=2,
+            next_cursor=13,
+            has_more=False,
+        )
+
+    async def _summarize(messages, **kwargs):
+        calls.append({"summary_messages": [m.message_id for m in messages], **kwargs})
+        return True, "cumulative summary", {"processed": 2}
+
+    monkeypatch.setattr(history_service, "classify_chat", _classify)
+    monkeypatch.setattr(history_service, "latest_message_id", _latest)
+    monkeypatch.setattr(history_service, "fetch_oldest_history", _fetch)
+    monkeypatch.setattr(
+        history_schedule_service.history_ai_service,
+        "summarize_incremental",
+        _summarize,
+    )
+
+    ok, message, data = await history_schedule_service.run_scheduled_history(
+        object(), owner_id=OWNER, task_id=task.id, repository=repo,
+    )
+
+    assert ok is True
+    assert message == "cumulative summary"
+    state = await repo.get_history_schedule(OWNER, task.id)
+    assert state.summary == "cumulative summary"
+    assert state.scanned_cursor == 13
+    assert state.summarized_cursor == 12
+    assert state.version == 2 and state.revision == 1
+    assert calls[0]["after_cursor"] == 10
+    assert calls[0]["upper_cursor"] == 14
+    assert calls[1]["summary_messages"] == [11, 12]
+
+
+@pytest.mark.asyncio
+async def test_a_no_new_messages_run_does_not_touch_the_checkpoint(monkeypatch):
+    repo = InMemoryTaskRepository()
+    task, state = await _task_with_state(repo, baseline=10)
+
+    async def _classify(*args, **kwargs):
+        return PeerType.PRIVATE_USER
+
+    async def _latest(*args, **kwargs):
+        return state.scanned_cursor
+
+    monkeypatch.setattr(history_service, "classify_chat", _classify)
+    monkeypatch.setattr(history_service, "latest_message_id", _latest)
+
+    ok, message, _data = await history_schedule_service.run_scheduled_history(
+        object(), owner_id=OWNER, task_id=task.id, repository=repo,
+    )
+
+    assert ok is True and message == ""
+    current = await repo.get_history_schedule(OWNER, task.id)
+    assert current.version == state.version
+    assert current.scanned_cursor == current.summarized_cursor == 10
+
+
+@pytest.mark.asyncio
+async def test_ai_failure_records_error_without_advancing_the_summary(monkeypatch):
+    repo = InMemoryTaskRepository()
+    task, _state = await _task_with_state(repo, baseline=10)
+    await repo.commit_history_success(
+        OWNER, PEER, expected_version=1, summary="old summary",
+        scanned_cursor=10, summarized_cursor=10,
+    )
+
+    async def _classify(*args, **kwargs):
+        return PeerType.PRIVATE_USER
+
+    async def _latest(*args, **kwargs):
+        return 11
+
+    async def _fetch(*args, **kwargs):
+        return HistoryBatch(
+            chat_id=PEER, messages=(_message(11),), scanned=1,
+            next_cursor=11, has_more=False,
+        )
+
+    async def _summarize(*args, **kwargs):
+        return False, "provider failed", {"error": "ai_provider_failed"}
+
+    monkeypatch.setattr(history_service, "classify_chat", _classify)
+    monkeypatch.setattr(history_service, "latest_message_id", _latest)
+    monkeypatch.setattr(history_service, "fetch_oldest_history", _fetch)
+    monkeypatch.setattr(
+        history_schedule_service.history_ai_service,
+        "summarize_incremental",
+        _summarize,
+    )
+
+    ok, message_text, data = await history_schedule_service.run_scheduled_history(
+        object(), owner_id=OWNER, task_id=task.id, repository=repo,
+    )
+
+    assert ok is False
+    current = await repo.get_history_schedule(OWNER, task.id)
+    assert current.summary == "old summary"
+    assert current.scanned_cursor == current.summarized_cursor == 10
+    assert current.last_error
+    assert data["error"] == "scheduled_history_ai_failed", message_text
+
+
+@pytest.mark.asyncio
+async def test_the_tool_requires_the_trusted_task_id_and_uses_it(monkeypatch):
+    tool = ScheduledHistoryTool(ToolContext(None, OWNER, "UTC"))
+    missing = await tool.execute(tool._context, {})
+    assert missing.success is False
+
+    seen: list[int] = []
+
+    async def _run(source, **kwargs):
+        seen.append(kwargs["task_id"])
+        return True, "ok", {}
+
+    monkeypatch.setattr(
+        history_schedule_service, "run_scheduled_history", _run,
+    )
+    context = ToolContext(
+        None, OWNER, "UTC", extra={SCHEDULED_TASK_ID_EXTRA: 77},
+    )
+    result = await ScheduledHistoryTool(context).execute(context, {})
+    assert result.success is True
+    assert seen == [77]
+
+
+class _FakeProviderManager:
+    def __init__(self) -> None:
+        self.messages: list[list[dict]] = []
+
+    async def chat(self, messages, **kwargs):
+        self.messages.append(messages)
+        return SimpleNamespace(success=True, text="cumulative summary")
+
+
+@pytest.mark.asyncio
+async def test_incremental_summary_sends_only_text_and_owner_focus(monkeypatch):
+    monkeypatch.setattr(history_ai_service, "call_spacing", lambda calls, budget: 0.0)
+    manager = _FakeProviderManager()
+
+    ok, summary, data = await history_ai_service.summarize_incremental(
+        (_message(11, "first body"), _message(12, "second body")),
+        previous_summary="prior summary",
+        instruction="owner focus",
+        provider_manager=manager,
+        timeout_s=30,
+    )
+
+    assert ok is True
+    assert summary == "cumulative summary"
+    assert data["text_messages"] == 2
+    assert len(manager.messages) == 2
+    for messages in manager.messages:
+        prompt = "\n".join(message["content"] for message in messages)
+        assert str(PEER) not in prompt
+        assert str(OWNER) not in prompt
+        assert "[11]" not in prompt and "[12]" not in prompt
+        assert "owner focus" in prompt
+    assert "first body" in manager.messages[0][1]["content"]
+    assert "prior summary" in manager.messages[1][1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_incremental_summary_is_a_no_op_for_non_text_messages():
+    manager = _FakeProviderManager()
+    ok, summary, data = await history_ai_service.summarize_incremental(
+        (HistoryMessage(11, PEER, 1, False, REF, "", None, True, False),),
+        provider_manager=manager,
+    )
+    assert ok is True and summary == ""
+    assert data["text_messages"] == 0
+    assert manager.messages == []
+
+
+class _ProbeTool:
+    name = SCHEDULED_HISTORY_ACTION
+    description = "probe"
+    parameters = {}
+    permission_level = PermissionLevel.READ_WRITE
+    safe = True
+    return_type = "object"
+
+    def __init__(self) -> None:
+        self.extra: dict | None = None
+
+    async def execute(self, context, arguments):
+        self.extra = dict(context.extra or {})
+        return ToolResult(True, "ok")
+
+
+@pytest.mark.asyncio
+async def test_the_coordinator_injects_the_occurrence_task_id():
+    repo = InMemoryTaskRepository()
+    task = await repo.create_task(OWNER, {
+        "label": "probe", "schedule_type": "once",
+        "schedule": {"at": "2026-11-14T12:00:00", "timezone": "UTC"},
+        "timezone": "UTC",
+        "actions": [{"name": SCHEDULED_HISTORY_ACTION, "arguments": {}}],
+        "notification_destination": {},
+    })
+    await repo.create_occurrence(OWNER, {
+        "task_id": task.id, "occurrence_key": "k", "definition_version": task.version,
+        "action_snapshot": [
+            {"name": SCHEDULED_HISTORY_ACTION, "arguments": {}}
+        ],
+        "scheduled_for": REF,
+    })
+    await repo.claim_occurrence(OWNER, task.id, "k")
+    probe = _ProbeTool()
+    registry = ToolRegistry()
+    registry.register(probe)
+    context = ToolContext(None, OWNER, "UTC")
+    coordinator = TaskExecutionCoordinator(
+        repo, ToolExecutor(registry, context), OWNER, context,
+    )
+    result = await coordinator.execute(
+        await repo.get_occurrence(OWNER, task.id, "k"),
+    )
+    assert result.success
+    assert probe.extra is not None
+    assert probe.extra[SCHEDULED_TASK_ID_EXTRA] == task.id

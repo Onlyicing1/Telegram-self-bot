@@ -1,28 +1,58 @@
 # ROADMAP
 
-## Latest delivery: History Phase 3B — durable state and oldest-first retrieval (audited)
+## Latest delivery: History Phase 4 + prerequisite Phase 5 action — owner creation and scheduled checkpoint
 
-Status: **Phase 3B implemented, independently audited and corrected. The
-migration is APPLIED to the connected Supabase project (remote version
-`20261114180758`); the repository filename now matches it. Live schema/access
-checks and a transactional CAS probe passed. Full production History execution
-and live Telegram behavior remain unverified, and Phase 4 is still deferred.**
-Audited delivery commit: `a12c20779bc634cb4511fb0e79443b882e8a1a85`
-(Phase 3B implementation `417a6b8`, upstream parent `e2f1619`).
-Phase 3A base: `62a18de`.
+Status: **Phase 4's owner wizard/task+state creation and the prerequisite
+registered Phase 5 action are implemented and focused-tested. The Phase 3B
+migration remains APPLIED to the connected Supabase project (remote version
+`20261114180758`). Live Telegram execution, restart/catch-up validation and
+provider-failure validation remain unverified; Phase 6/7 stay deferred.**
+The owner chose to move the registered action and trusted task-id plumbing ahead
+of Phase 4 as a prerequisite; no phase was renumbered. Phase 3B audited commit:
+`a12c20779bc634cb4511fb0e79443b882e8a1a85` (implementation `417a6b8`, upstream
+parent `e2f1619`). Phase 3A base: `62a18de`.
 
 ### Phase map
 
 | Phase | Scope | Status |
 |---|---|---|
 | **3A** | Durable History state investigation and design | **Complete** |
-| **3B** | Durable schema/repository, oldest-first retrieval, identifier-free payload boundary | **Implemented and audited** — migration applied (remote `20261114180758`); scheduled execution unverified |
-| **4** | Deterministic schedule UI | **Deferred**; migration applied, execution path not built |
-| **5** | Scheduled History action | Deferred; numbering unchanged |
+| **3B** | Durable schema/repository, oldest-first retrieval, identifier-free payload boundary | **Implemented and audited** — migration applied (remote `20261114180758`) |
+| **4** | Deterministic schedule UI | **Implemented** — owner wizard, trusted creation path and compensating deletion |
+| **5** | Scheduled History action | **Prerequisite implemented** — registered action, trusted task id, bounded catch-up, CAS commit; live validation deferred |
 | **6** | Shared History admission | Deferred; numbering unchanged |
 | **7** | Live validation | Deferred; numbering unchanged |
 
-Phase 3 remains the umbrella durable-state phase. No phase was renumbered.
+Phase 3 remains the umbrella durable-state phase. The owner changed only the
+delivery order: the Phase 5 action/trusted task-id plumbing was required before
+Phase 4 creation, then Phase 4 completed. No phase was renumbered.
+
+### What this delivery adds
+
+- **Registered action:** `scheduled_history` is one `ToolExecutor` action in the
+  existing registry. It uses the coordinator-injected trusted task id from
+  `ToolContext.extra`; peer, baseline, cursors and prior summary come only from
+  the durable `history_schedules` row. It accepts no peer/task/message id from
+  arguments and never creates or mutates a schedule.
+- **Owner-only creation gate:** `TaskCreationService.create()` rejects
+  `scheduled_history` unless the trusted owner-wizard action set is explicitly
+  passed. The model/natural-language candidate path cannot create the action.
+- **Phase 4 creation:** the History panel opens a deterministic wizard for the
+  selected, re-classified peer. The owner chooses hourly/daily/weekly cadence,
+  new-only vs explicit backlog baseline, and optional focus. Creation uses the
+  existing `TaskCandidate → TaskCreationService → TaskRepository` path, writes
+  exactly one task and one peer state row, refuses a live duplicate, refuses
+  before any Telegram work when the manager reports durable storage unavailable,
+  and compensates by deleting the exact created task when state creation fails.
+- **Bounded execution:** one stable upper boundary per run, oldest-first batches
+  of at most the peer policy cap, cumulative summary through the existing
+  identifier-free History AI boundary, and one CAS commit for summary plus both
+  cursors. Media/AI-provenance-only batches may advance the scanned cursor but
+  never replace the summary; failures record bounded metadata without moving the
+  summary or cursors.
+- **No new scheduler, executor, repository, Telegram client, listener, update
+  loop or persistence path.** The existing scheduler/coordinator/executor and
+  durable-only repository remain the only execution and state paths.
 
 ### What Phase 3B actually delivers (source-verified)
 
@@ -77,8 +107,18 @@ Phase 3 remains the umbrella durable-state phase. No phase was renumbered.
 
 - Phase 3A source-verified design and approved ownership/lifecycle contract.
 - Phase 3B migration, repository, retrieval, payload boundary and focused tests.
-- Independent audit: repository/CAS/cursor review, durable-only enforcement,
-  merge-integrity comparison against both parents, migration/§31.3 reconciliation.
+- Phase 5 prerequisite: trusted task-id injection, registered
+  `scheduled_history` action, bounded incremental checkpoint service, stable
+  upper boundary and CAS commit.
+- Phase 4: owner-only schedule wizard, deterministic cadences/baseline, task
+  and state creation through the existing service, duplicate refusal and
+  compensating deletion.
+- Focused tests cover owner gating, creation/compensation, cursor/CAS behavior,
+  safe-skip, provider failure metadata, trusted task-id injection and the UI
+  creation path.
+- Independent audit of Phase 3B: repository/CAS/cursor review, durable-only
+  enforcement, merge-integrity comparison against both parents,
+  migration/§31.3 reconciliation.
 - `IMPLEMENTATION_REPORT.md` and `INVESTIGATION.md` record the audited state.
 
 ### Applied migration and verification (2026-11-14)
@@ -96,14 +136,17 @@ Phase 3 remains the umbrella durable-state phase. No phase was renumbered.
 
 ### Not verified / blockers
 
-- **Full production History execution is not implemented or verified**: no
-  scheduler/executor calls the repository or the payload yet; Phase 3B remains
-  foundation only.
-- **No live Telegram behavior was tested**: no real oldest-first run, no restart
-  mid-run, no deleted-message gap run.
-- **Phase 4 is deferred** until the owner accepts Phase 3B and the scheduled
-  execution path is designed; applying the migration was the blocking
-  prerequisite and is now complete.
+- **Live scheduled execution is not verified**: no real scheduled occurrence has
+  run against a live Telegram chat; the action and UI are covered by focused
+  tests with injected retrieval/provider doubles.
+- **No live restart/catch-up run, deleted-message gap run, provider-failure run
+  or capped-peer refusal was exercised.** These remain Phase 7 work.
+- **Task and state are two durable writes**: state failure is compensated by
+  deleting the exact created task, but this is not a single cross-table
+  transaction. A crash between the two writes can leave an owner-created task
+  without its state; the action then fails closed and reports the missing state.
+- The pre-existing scheduler recovery test failure recorded below remains
+  unrelated and untouched.
 
 ### Deferred evidence-backed constraints (unchanged)
 
@@ -143,20 +186,16 @@ second renderer/settings table/listener/client/update loop.
 
 ## Later phases (deferred, in order)
 
-1. **Phase 4 — deterministic schedule UI**: owner wizard resolves/classifies the
-   peer, captures the baseline, creates the History task and its state row through
-   the existing TaskCreationService path, with a compensating delete on failure.
-   The model never creates or mutates these schedules.
-2. **Phase 5 — scheduled History action**: one new registered ToolExecutor action
-   with no model-supplied identifiers, trusted task id, stable upper boundary,
-   oldest-first catch-up, cumulative bounded summary, and one atomic CAS commit.
-   Not shippable before the owner applies the migration and Phase 4 exists.
-3. **Phase 6 — shared History admission**: one process-wide in-flight/start gate
+1. **Phase 6 — shared History admission**: one process-wide in-flight/start gate
    inside `history_ai_service`, because per-operation pacing does not coordinate
    bounded concurrent occurrences.
-4. **Phase 7 — live validation** of a real schedule, a restart mid-run, a deletion
+2. **Phase 7 — live validation** of a real schedule, a restart mid-run, a deletion
    of a previously processed source message, a provider failure, and a capped-peer
    refusal.
+
+Completed sequencing note: Phase 5's action and trusted task-id plumbing were
+moved ahead as prerequisites, then Phase 4's owner wizard and task/state creation
+were completed. No phase was renumbered.
 
 ---
 
@@ -193,5 +232,5 @@ ProviderManager ownership were unchanged.
 - `tests/test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`
   (“interval advancement exceeded bound”) — the only full-suite failure at
   `a12c207`, reproduced identically at both parents; not caused by Phase 3B.
-- Full production History execution and live Telegram behavior remain
-  unverified (the migration itself is applied).
+- Live scheduled History execution and live Telegram behavior remain unverified
+  (the migration itself is applied).

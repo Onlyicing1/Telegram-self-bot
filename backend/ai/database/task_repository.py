@@ -535,6 +535,11 @@ class HistoryStorageUnavailable(RuntimeError):
 
 
 class TaskRepository:
+    #: True only for a store whose History rows survive process restart. The
+    #: owner wizard checks this capability before creating a History schedule;
+    #: an in-memory test fake must opt in explicitly, and a production fallback
+    #: can never claim a durable checkpoint.
+    supports_durable_history = False
     async def create_task(self, owner_id, data): raise NotImplementedError
     async def get_task(self, owner_id, task_id): raise NotImplementedError
     async def list_tasks(self, owner_id): raise NotImplementedError
@@ -808,6 +813,7 @@ class InMemoryTaskRepository(TaskRepository):
         del self._steps[step_id];return True
 
 class SupabaseTaskRepository(TaskRepository):
+    supports_durable_history = True
     def __init__(self, client, fallback=None, timeout=DB_TIMEOUT):
         self._client=client;self._fallback=fallback or InMemoryTaskRepository();self._timeout=timeout;self._fallback_active=False;self._fallback_reason=""
         # Bounded local-resource cooldown (monotonic deadline; 0.0 = inactive)

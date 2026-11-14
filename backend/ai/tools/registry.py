@@ -149,6 +149,7 @@ tool receives the same ``ToolContext`` (telegram, owner_id, tz_str).
     )
     from backend.ai.tools.account import AccountShowTool
     from backend.ai.tools.history_ai import TranslateHistoryTool, SummarizeHistoryTool
+    from backend.ai.tools.history_schedule import ScheduledHistoryTool
     from backend.ai.tools.retrieve import SearchTool, ListSavesTool
     from backend.ai.tools.database import DatabaseStatsTool
     from backend.ai.tools.settings import SettingsGetTool, SettingsSetTool
@@ -247,6 +248,7 @@ tool receives the same ``ToolContext`` (telegram, owner_id, tz_str).
     registry.register(UpdateSaveTagsTool(context))
     registry.register(TranslateHistoryTool(context))
     registry.register(SummarizeHistoryTool(context))
+    registry.register(ScheduledHistoryTool(context))
     registry.register(SendMessageTool(context))
     registry.register(AskOwnerTool(context))
     registry.register(SpeakTool(context))

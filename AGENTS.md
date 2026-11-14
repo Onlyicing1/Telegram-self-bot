@@ -664,7 +664,11 @@ error.
   runtime in-memory History fallback — a checkpoint is never reported committed
   from process memory. The migration is applied to the connected project
   (recorded remote version `20261114180758`); the repository filename matches
-  that version.
+  that version. The Phase 4 owner wizard creates the History task and its state
+  row through the existing TaskCreationService (with compensating task deletion
+  on state failure), and the registered `scheduled_history` action advances the
+  row using only the coordinator-injected trusted task id. The model task-creation
+  path must never create or mutate a History schedule.
 
 ---
 

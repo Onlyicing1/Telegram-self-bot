@@ -3789,7 +3789,7 @@ The exact status of every table is in [§19](#19-known-inconsistencies),
 | `private_message_config`, `private_message_senders` | `20260929000001` + `20261016000001` + `20261020144423` | `private_message_service`, `db/client.py` | **MANUAL-ONLY** — §31.3 parts 10/11/13; see §33. |
 | `aed_config`, `aed_archive_entries` | `20261017000001` | `anti_edit_delete_service`, `db/client.py` | **MANUAL-ONLY** — §31.3 part 12; see §34. |
 | `api_credentials` | `20260919000001` + `20260919000002` | credential-vault code (§29); secrets live in Supabase Vault, never in this table | **MANUAL-ONLY** — §31.3 parts 2/3; see §29. |
-| `history_schedules` | `20261114180758` | `TaskRepository` history-schedule primitives (Phase 3B) | **APPLIED** (remote version `20261114180758`, 2026-11-14) — §31.3 part 18; see §16.1. The repository filename now matches the recorded remote version. Live structure, constraints, RLS/grants, sequence privileges and a transactional CAS probe were verified; the probe was rolled back with no row left behind. Scheduled History execution is still unimplemented. |
+| `history_schedules` | `20261114180758` | `TaskRepository` history-schedule primitives (Phase 3B) | **APPLIED** (remote version `20261114180758`, 2026-11-14) — §31.3 part 18; see §16.1. The repository filename now matches the recorded remote version. Live structure, constraints, RLS/grants, sequence privileges and a transactional CAS probe were verified; the probe was rolled back with no row left behind. The owner wizard and registered `scheduled_history` action are implemented; live scheduled execution remains unverified. |
 | `ai_preferences` | none | repository interface + in-memory only | Specified (§14), **no producer, no migration**. |
 
 ### Emoji & Reaction Tables (MANUAL-ONLY migration)
@@ -5575,7 +5575,9 @@ owner; the live migration history records version `20261114180758`, name
 version. The live table structure, constraints, RLS posture, grants, sequence
 privileges and a transactional CAS probe were checked; the probe was rolled
 back and left no test row behind. No coding agent executed SQL or modified the
-migration history, and scheduled History execution is still unimplemented.
+migration history. The Phase 4 owner wizard and the registered Phase 5
+`scheduled_history` action use this state through the existing task path; live
+scheduled execution remains unverified.
 
 The table is owned by one `ai_tasks` row and is never a second task system:
 
@@ -6294,8 +6296,9 @@ migration filenames.
   `20261114180758` (name `create_history_schedules`), and the repository
   filename matches that version. Live structure, constraints, RLS/grants,
   sequence privileges and a transactional CAS probe were verified; the probe
-  was rolled back with no row left behind. Scheduled History execution is still
-  not implemented.
+  was rolled back with no row left behind. The owner wizard and registered
+  `scheduled_history` action are implemented; live scheduled execution remains
+  unverified.
 - Supabase migration history contains **4 records**, not 42. The live schema
   was evidently established through a mixture of canonical/manual setup and
   later tracked migrations. Do not invent the missing history rows.

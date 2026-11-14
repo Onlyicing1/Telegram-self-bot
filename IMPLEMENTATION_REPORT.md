@@ -1,9 +1,70 @@
-# IMPLEMENTATION REPORT — Phase 3B: Durable History State and Oldest-First Retrieval
+# IMPLEMENTATION REPORT — History Phase 3B foundation and Phase 4/5 delivery
 
-## 1. Implemented
+## 0. Current delivery (Phase 4 creation + prerequisite Phase 5 action)
 
-Phase 3B adds the durable persistence and retrieval foundation for scheduled
-History summarization. It does **not** add execution.
+This branch now implements the owner-approved Option A order: the registered
+History action and trusted task-ID plumbing were built first as prerequisites,
+then Phase 4's owner wizard and task/state creation were implemented through the
+existing `TaskCreationService` with compensating task deletion. Phase 3B remains
+the durable-state foundation and migration record below.
+
+Key files in this delivery:
+
+| File | Change |
+|---|---|
+| `backend/ai/task_contract.py` | `SCHEDULED_HISTORY_ACTION`, `SCHEDULED_TASK_ID_EXTRA`, owner-only action set |
+| `backend/ai/tools/history_schedule.py` | New registered `scheduled_history` action tool |
+| `backend/services/history_schedule_service.py` | Bounded incremental checkpoint: trusted task state, policy re-check, stable upper bound, oldest-first batch, cumulative summary, one CAS commit |
+| `backend/ai/task_creation.py` | Owner-only creation gate; task+state creation with duplicate refusal and compensating delete; durable-store requirement |
+| `backend/ai/task_execution.py` | Scoped trusted task-ID injection for History chains and a 240s execution backstop |
+| `backend/ai/database/task_repository.py` | Durable-history capability marker used by the wizard |
+| `backend/bot/handlers/history.py` | Owner-only schedule wizard: re-classification, cadence, baseline, focus, creation result |
+| `backend/bot/router.py` | Passes the configured timezone to History registration |
+| `backend/services/history_service.py` | `latest_message_id()` stable newest-message boundary |
+| `backend/services/history_ai_service.py` | `summarize_incremental()` cumulative, identifier-free summary extension |
+| `backend/ai/tools/registry.py` | Registers the action exactly once |
+| `tests/test_history_schedule.py` | Action, owner gate, creation/compensation, cursor/CAS, safe-skip, provider failure, trusted task-ID tests |
+| `tests/test_history_schedule_ui.py` | Wizard registration, refusal, baseline and creation-path tests |
+| Registry tripwire tests | Updated from 55 to 56 registered tools for the new action |
+
+No model path can create or mutate the History schedule: `TaskCreationService`
+rejects the action unless the trusted owner-wizard set is explicitly passed; the
+action reads only the coordinator-injected task ID and the durable state row. No
+new scheduler, executor, repository, Telegram client, listener, update loop or
+persistence path was added. The action receives no peer, task, message or cursor
+identifier from its arguments.
+
+### 0.1 Verification actually run in this delivery (self-checks, not an audit)
+
+- Command:
+  `.venv/bin/python -m pytest -q tests/test_task_*.py tests/test_history_*.py tests/test_tool_schema_contract.py tests/test_tool_health_audit.py tests/test_memory_tools.py tests/test_capability_exposure_tools.py tests/test_database_architecture_doc.py`
+- Result: **1343 passed, 1 failed**.
+- The one failure is the pre-existing
+  `tests/test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`
+  (“interval advancement exceeded bound”), reproduced unchanged on the prior
+  history and unrelated to this delivery.
+- `.venv/bin/python -m compileall -q backend tests`: exit 0.
+- `git diff --check`: exit 0.
+- The full 7,800+ test suite was **not** rerun for this delivery; the full-suite
+  record in §6.2 is the earlier Phase 3B historical run, not a current result.
+- No live Telegram scheduled execution, restart/catch-up run, deleted-message
+  gap run, provider-failure run or capped-peer refusal was exercised.
+
+### 0.2 Current limitations
+
+- Task and state are two durable writes; state failure is compensated by
+  deleting the exact created task, but this is not one cross-table transaction.
+  A crash between the writes can leave a task without state; the action then
+  fails closed.
+- Live scheduled execution and live Telegram retrieval remain unverified.
+- Phase 6 shared admission and Phase 7 live validation remain deferred.
+- No independent audit has been performed; this report records implementation
+  and self-checks only.
+
+## 1. Phase 3B foundation (historical section)
+
+Phase 3B added the durable persistence and retrieval foundation for scheduled
+History summarization. Phase 4/5 above now use that foundation.
 
 - One additive migration:
   `supabase/migrations/20261114180758_create_history_schedules.sql`.
@@ -330,12 +391,15 @@ semantically redacted metadata. There is no production caller in Phase 3B.
 These are unit/repository tests against fake clients and an explicitly injected
 in-memory fake. They do not contact live Supabase or live Telegram.
 
-### 6.2 Full suite
+### 6.2 Full suite (Phase 3B historical record)
+
+This full-suite run belongs to the earlier Phase 3B delivery; it was **not**
+rerun for the Phase 4/5 delivery documented in §0.
 
 Command: `.venv/bin/python -m pytest -q`
 
-Result: **7788 passed, 27 skipped, 1 failed** in 163.08 s (after the audit
-corrections).
+Result: **7788 passed, 27 skipped, 1 failed** in 163.08 s (after the Phase 3B
+audit corrections).
 
 The single failure is
 `tests/test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`
@@ -370,11 +434,13 @@ test row was left behind**.
 No coding agent executed SQL, applied or reapplied the migration, ran
 `supabase migration repair`, or modified `supabase_migrations.schema_migrations`
 or any live object. These live checks verify the schema/access contract and one
-CAS transaction; they do **not** verify production scheduled History execution
-(no scheduler or executor calls the repository yet) and they do not verify live
-Telegram retrieval. The durable-only fail-closed behavior (an
-`HistoryStorageUnavailable` when the store is unavailable) remains the
-repository contract.
+CAS transaction; they do **not** verify live scheduled History execution or live
+Telegram retrieval. The Phase 4 owner wizard and the registered Phase 5
+`scheduled_history` action now call the repository through the existing
+scheduler/executor path, but their aggregate behavior is covered only by focused
+tests with injected retrieval/provider doubles. The durable-only fail-closed
+behavior (an `HistoryStorageUnavailable` when the store is unavailable) remains
+the repository contract.
 
 ## 7.1 Merge integration with the latest upstream
 
@@ -428,20 +494,29 @@ blocker instead of claiming success.
 ## 9. Remaining limitations
 
 - The migration is applied (remote `20261114180758`); the live schema/access
-  checks and one transactional CAS probe passed, but full production History
-  execution and live Telegram retrieval remain unimplemented and unverified.
-- No scheduler/executor calls the repository or payload yet.
+  checks and one transactional CAS probe passed. Live scheduled History
+  execution and live Telegram retrieval remain unverified.
+- The owner wizard and registered action now call the existing
+  scheduler/coordinator/executor and durable repository; their aggregate
+  behavior is covered by focused tests with injected retrieval/provider
+  doubles, not by a live run.
+- Task and state are two durable writes with compensating task deletion on
+  state failure, not one cross-table transaction.
 - Summary compaction is an explicit reset, not automatic.
 - Deleted Telegram content cannot be recovered; the prior summary is retained.
 - `history_schedules` has no owner FK because there is no owner table; owner
   scoping relies on the repository plus `UNIQUE (owner_id, peer_id)`.
 - A completed state is terminal; no reopen path is implemented.
 - The pre-existing scheduler test failure remains.
+- Phase 6 shared History admission and Phase 7 live validation remain deferred.
 
-## 10. Explicit Phase 4+ status
+## 10. Explicit Phase 4/5 implementation status
 
-Phase 4 and all later phases were **not implemented**. There is no scheduled
-History execution, no scheduler/lifecycle integration, no schedule UI, no
-natural-language schedule parsing, no notification, no catch-up/missed-run
-policy, no second scheduler/worker/executor, no second Telegram client and no
-second update loop in this change.
+Phase 4 and the prerequisite Phase 5 action are **implemented**. The owner
+History wizard creates the task and peer state through the existing
+`TaskCreationService` with compensating task deletion, and the registered
+`scheduled_history` action advances that state through the existing
+scheduler/coordinator/executor path. There is still no natural-language schedule
+parsing, no shared Phase 6 admission gate and no live Phase 7 validation. This
+change adds no second scheduler/worker/executor, no second Telegram client and no
+second update loop.

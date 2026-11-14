@@ -23,7 +23,9 @@ from backend.ai.task_contract import (
     QUESTION_MESSAGE_ID_KEY,
     QUESTION_TEXT_KEY,
     QUESTION_TOOL,
+    SCHEDULED_HISTORY_ACTION,
     SCHEDULED_OCCURRENCE_EXTRA,
+    SCHEDULED_TASK_ID_EXTRA,
     WAITING_ANSWER_STATUS,
     BranchLayout,
     PreparedAction,
@@ -63,6 +65,9 @@ from backend.ai.retry import FailureClass, classify_failure, retry_delay, can_re
 
 logger = logging.getLogger(__name__)
 MAX_EXECUTION_SECONDS = 60.0
+# A scheduled History occurrence performs a bounded history read and provider
+# work; its own service timeout is smaller than this outer backstop.
+MAX_SCHEDULED_HISTORY_EXECUTION_SECONDS = 240.0
 MAX_METADATA_BYTES = 8192
 MAX_RESULT_DELIVERY_CHARS = 4000
 RESULT_DELIVERY_TIMEOUT_SECONDS = 10.0
@@ -586,6 +591,17 @@ class TaskExecutionCoordinator:
         # from this context (see backend.ai.task_contract).
         occurrence_extra = dict(execution_context.extra) if execution_context.extra else {}
         occurrence_extra[SCHEDULED_OCCURRENCE_EXTRA] = True
+        # The task id is runtime state, not a task argument: it lets an
+        # owner-created History action load its own durable child row without
+        # trusting anything the model or candidate supplied. Keep it scoped to
+        # chains that actually carry that action; ordinary scheduled tools keep
+        # exactly the context they had before.
+        if any(
+            isinstance(action, dict)
+            and (action.get("name") or action.get("tool")) == SCHEDULED_HISTORY_ACTION
+            for action in (occurrence.action_snapshot or [])
+        ):
+            occurrence_extra[SCHEDULED_TASK_ID_EXTRA] = occurrence.task_id
         task = await self.repository.get_task(self.owner_id, occurrence.task_id)
         if task is not None:
             dest = task.notification_destination or {}
@@ -763,13 +779,20 @@ class TaskExecutionCoordinator:
         # path even when the chain is cut short by a timeout or an exception.
         state: dict[int, dict[str, Any]] = {run["position"]: run for run in prior_runs}
         started = time.perf_counter()
+        execution_timeout = MAX_EXECUTION_SECONDS
+        if any(
+            isinstance(action, dict)
+            and (action.get("name") or action.get("tool")) == SCHEDULED_HISTORY_ACTION
+            for action in actions
+        ):
+            execution_timeout = MAX_SCHEDULED_HISTORY_EXECUTION_SECONDS
         try:
             outcome = await asyncio.wait_for(
                 self._execute_chain(
                     occurrence, calls, execution_calls, state, execution_context,
                     waits, reference, layout,
                 ),
-                timeout=MAX_EXECUTION_SECONDS,
+                timeout=execution_timeout,
             )
         except asyncio.CancelledError:
             raise

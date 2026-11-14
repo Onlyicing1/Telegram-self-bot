@@ -963,6 +963,102 @@ async def translate_history(
     return _finish(plan, "\n".join(lines), language=plan.language)
 
 
+async def summarize_incremental(
+    messages: Sequence[HistoryMessage],
+    *,
+    previous_summary: Any = "",
+    instruction: Any = "",
+    provider_manager: Any = None,
+    request_id: str = "",
+    timeout_s: Any = None,
+) -> tuple[bool, str, dict[str, Any]]:
+    """Extend ONE cumulative summary with an already-fetched message batch.
+
+    This is the scheduled-History boundary: the caller owns retrieval, cursor
+    selection and the durable commit. The provider receives only message bodies
+    and the owner-authored instruction (no ids, attribution, peer or task
+    metadata), reusing the same chunking, pacing and bounded provider calls as
+    the manual summarizer. An empty batch is a successful no-op; an over-limit
+    result is an honest failure, never a truncation.
+    """
+    manager = _resolve_manager(provider_manager)
+    if manager is None:
+        return False, f"{sym.STATE_FAILED} Summarization unavailable — the AI engine is not running.", {
+            "error": ERROR_ENGINE,
+        }
+
+    text_messages = tuple(message for message in messages if message.text.strip())
+    if not text_messages:
+        return True, "", {"processed": len(messages), "text_messages": 0}
+
+    chunks = _chunk_history(
+        text_messages,
+        with_attribution=False,
+        token_budget=SUMMARIZE_CHUNK_TOKEN_BUDGET,
+        with_ids=False,
+    )
+    budget = llm_budget(timeout_s)
+    deadline = llm_deadline(budget)
+    map_budget = budget - ASSUMED_CALL_LATENCY_S if len(chunks) > 1 else budget
+    map_deadline = min(deadline, llm_deadline(map_budget))
+    capacity = map_call_capacity(map_budget)
+    if len(chunks) > capacity:
+        return False, (
+            f"{sym.STATE_FAILED} This batch needs {len(chunks)} AI calls, more "
+            f"than the {capacity} one scheduled run can finish inside its "
+            f"{map_budget:.0f}s budget."
+        ), {"error": ERROR_TOO_LARGE, "processed": len(messages), "chunks": len(chunks)}
+
+    system = _with_instruction(
+        _SUMMARIZE_SYSTEM, _clamp_instruction(instruction),
+    )
+
+    async def _summarize_chunk(chunk: _Chunk) -> str:
+        return await _call(
+            manager, system=system, payload="\n".join(chunk.lines),
+            request_id=request_id, deadline=map_deadline,
+        )
+
+    try:
+        partials = await _map(
+            manager, chunks, _summarize_chunk,
+            budget_s=map_budget, request_id=request_id,
+        )
+        prior = str(previous_summary or "").strip()
+        if prior and len(prior.encode("utf-8")) > 32768:
+            return False, f"{sym.STATE_FAILED} The previous summary is over the durable size limit.", {
+                "error": ERROR_TOO_LARGE,
+            }
+        if prior or len(partials) > 1:
+            reduce_inputs = ([prior] if prior else []) + partials
+            final = await _call(
+                manager,
+                system=_with_instruction(_REDUCE_SYSTEM, _clamp_instruction(instruction)),
+                payload=_summarize_payload(reduce_inputs, _clamp_instruction(instruction)),
+                request_id=request_id,
+                deadline=deadline,
+            )
+        else:
+            final = partials[0]
+    except asyncio.CancelledError:
+        raise
+    except HistoryAIError as exc:
+        return False, f"{sym.STATE_FAILED} Summary failed: {exc}", {
+            "error": exc.code, "processed": len(messages), "chunks": len(chunks),
+        }
+
+    final = final.strip()
+    if not final:
+        return False, f"{sym.STATE_FAILED} The AI provider returned an empty summary.", {
+            "error": ERROR_PROVIDER, "processed": len(messages), "chunks": len(chunks),
+        }
+    return True, final, {
+        "processed": len(messages),
+        "text_messages": len(text_messages),
+        "chunks": len(chunks),
+    }
+
+
 async def summarize_history(
     source: Any,
     chat_id: Any,
