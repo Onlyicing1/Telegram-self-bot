@@ -59,7 +59,7 @@ from backend.helper import (
 )
 from backend.helper import callback_gate
 from backend.helper.client import get_client
-from backend.helper.styles import PRIMARY
+from backend.helper.styles import DANGER, PRIMARY
 from backend.helper import selection_state
 from backend.helper import symbols as sym
 from backend.helper.input_state import set_pending
@@ -320,6 +320,10 @@ async def _render_selection(owner_id: int, page: int | None = None,
                 else sym.SELECT_EMPTY)
         builder.add_row(f"{mark} {label} · {code}", f"action:retrieve_toggle:{code}")
 
+    builder.add_row(sym.label(sym.ICON_SEND, "Send selected"), "panel:retrieve_saved:bulk:send")
+    builder.add_row(sym.label(sym.OP_DELETE, "Delete selected"), "panel:retrieve_saved:bulk:delete")
+    builder.add_row(sym.label(sym.OP_CLOSE, "Cancel selection"), "panel:retrieve_saved:cancel")
+
     nav_row = []
     if page > 1:
         nav_row.append(
@@ -331,10 +335,6 @@ async def _render_selection(owner_id: int, page: int | None = None,
             (f"Next {sym.OP_NEXT}", f"panel:retrieve_saved:select:page:{page + 1}")
         )
     builder.add_buttons(*nav_row)
-
-    builder.add_row(sym.label(sym.ICON_SEND, "Send selected"), "panel:retrieve_saved:bulk:send")
-    builder.add_row(sym.label(sym.OP_DELETE, "Delete selected"), "panel:retrieve_saved:bulk:delete")
-    builder.add_row(sym.label(sym.OP_CLOSE, "Cancel selection"), "panel:retrieve_saved:cancel")
 
     return "Saved Items", "\n".join(body_lines), builder.build()
 
@@ -407,7 +407,11 @@ def _bulk_review(owner_id: int, action: str) -> tuple[str, str, list]:
             f"{sym.STATE_WARNING} This deletes every selected item and its saved "
             "Telegram message. This cannot be undone.",
         ]
-        builder.add_row(sym.label(sym.OP_DELETE, "Delete these items"), "action:retrieve_bulk_delete:confirm")
+        builder.add_row(
+            sym.label(sym.OP_DELETE, "Delete these items"),
+            "action:retrieve_bulk_delete:confirm",
+            DANGER,
+        )
     else:
         title = "Send Selected"
         lines += ["", f"{sym.ICON_SEND} Every selected item is sent to this chat as its own message."]

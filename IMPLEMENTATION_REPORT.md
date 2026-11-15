@@ -1,8 +1,113 @@
-# IMPLEMENTATION REPORT — Scheduled History diagnostics tracing
+# IMPLEMENTATION REPORT
 
-## 0. Current delivery
+## G1-A — Reusable interaction grammar (current delivery)
 
-This delivery adds observability only. It does not change Scheduled History
+### Implemented
+
+- **UI-001 ordering rule:** documented in `AGENTS.md`. Panels order primary
+  action, related controls, item-specific controls, contextual bulk actions,
+  then navigation/pagination. Stash and Taskloom follow it; the existing panel
+  engine, registry, callback namespaces, symbol/style registries and Appearance
+  render boundary are unchanged.
+- **UI-002 reusable selection:**
+  `backend/helper/selection_state.py` now stores sessions by `(owner, scope)`
+  while preserving the original Stash API as the default scope. Each scope keeps
+  the existing 40-item cap, 900-second expiry, insertion order and exact
+  identity. Taskloom stores exact task ids plus the version rendered on the
+  page; display labels remain presentation only.
+- **Taskloom selection:** the existing Taskloom list keeps its detail and
+  pagination paths and adds a "Select tasks" view. A row toggles
+  `action:taskloom_toggle:<task_id>:<version>`, selected rows show
+  `sym.SELECT_MARKED`, selection survives pagination, and "Clear selection"
+  drops it and returns to the list.
+- **UI-003 contextual bulk actions:** Pause / Resume / Complete / Delete rows
+  appear only when the current selected set has at least one applicable task.
+  Every target is re-read through `TaskManagementService.inspect`, owner-scoped,
+  and checked against the version stored at selection time before the existing
+  CAS `pause`/`resume`/`complete`/`delete` service operation is called. Missing,
+  foreign, stale and status-inapplicable targets are refused individually; the
+  result view reports each item and never turns partial success into full
+  success.
+- **UI-004 destructive confirmation:** Taskloom bulk Delete has a dedicated
+  review that names the exact operation, count and selected tasks, explains the
+  irreversible consequence, provides Cancel, and puts the final confirmation in
+  `styles.DANGER`. Confirmation re-runs the same full revalidation before any
+  deletion. Stash's bulk delete confirm now uses `DANGER` too.
+- **No second system:** no new selection store, panel renderer, task repository,
+  scheduler, executor, Telegram client, listener or persistence model. No schema
+  or Supabase/SQL change.
+
+### Changed files
+
+| File | Behavior |
+|---|---|
+| `backend/helper/selection_state.py` | Owner + feature-scoped sessions; Stash default preserved; cap/expiry and exact identity retained; optional selected version metadata. |
+| `backend/bot/handlers/taskloom.py` | Taskloom select view, exact id/version toggles, pagination, contextual bulk actions, CAS revalidation, per-item results and delete confirmation. |
+| `backend/bot/handlers/retrieve.py` | Stash bulk ordering follows the interaction rule; destructive bulk delete confirm uses `DANGER`. Existing callbacks and flows unchanged. |
+| `backend/helper/styles.py` | Documents red as cancellation or a destructive final confirmation. |
+| `tests/test_taskloom_selection.py` | New focused G1-A coverage. |
+| `tests/test_colored_buttons.py` | Updates the style contract wording for destructive confirmations. |
+| `AGENTS.md` | Documents the panel ordering rule and Taskloom selection contract. |
+| `LIFEOS_IDEAS.md` | Marks UI-001/002/003/004 and G1-A only to the implemented extent. |
+| `ROADMAP.md` | Adds a separated G1-A delivery entry while preserving Scheduled History history. |
+| `IMPLEMENTATION_REPORT.md` | This report. |
+
+### Tested offline
+
+- The new `tests/test_taskloom_selection.py` covers scoped selection, cap and
+  expiry, Stash default compatibility, visible marks, select/deselect,
+  pagination survival, clear, foreign/missing/stale targets, stale callback
+  refusal, contextual action availability, partial bulk outcomes, service
+  refusal handling, confirmation scope, cancel, DANGER styling and confirmation
+  revalidation.
+- Existing Stash multi-select, Taskloom UI, callback latency/burst and
+  colored-button suites are included in the focused regression run.
+
+### Test results
+
+Focused command:
+
+```bash
+.venv/bin/python -m pytest -q \
+  tests/test_taskloom_selection.py tests/test_taskloom_ui.py \
+  tests/test_retrieve_multi_select.py tests/test_callback_latency_burst.py \
+  tests/test_colored_buttons.py
+```
+
+Result: **146 passed**.
+
+Full suite:
+
+```bash
+.venv/bin/python -m pytest -q
+```
+
+Result: **7876 passed, 1 failed, 27 skipped** (`FULL_PYTEST_EXIT=1`).
+
+The only failure is the known pre-existing
+`tests/test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`
+(`assert 0 == 1`, log `interval advancement exceeded bound`). It is documented
+in the repository as failing identically on earlier base commits; no scheduler
+file is part of this delivery.
+
+### Not live-verified
+
+- No live Telegram callback/render, task transition, Supabase read/write,
+  deployment or Render operation was performed. The tests use the in-memory task
+  repository, the in-memory saved-items fallback and fake callback contexts.
+
+### Deferred
+
+- G1-B visual identity/accessibility, G2-A language behavior, G5-A Task Center
+  beyond this narrow Taskloom selection/bulk work, Workspace features, and
+  Scheduled History Phase 6/7 remain deferred. No G1-B or later stage is marked
+  complete.
+
+## Previous delivery — Scheduled History diagnostics tracing
+
+### 0. Previous delivery scope
+
+This previous delivery added observability only. It does not change Scheduled History
 execution, scheduling, occurrence recovery/retry, cursor or CAS semantics,
 retrieval limits, AI/provider behavior, task creation or compensation.
 

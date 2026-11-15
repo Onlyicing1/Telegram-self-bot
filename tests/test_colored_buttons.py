@@ -9,7 +9,8 @@ semantic contract:
   * ``success`` (green) — reserved for explicit confirmation actions
     (**Confirm**, **Approve**, or an equivalent final confirmation step).
   * ``danger`` (red) — reserved for explicit cancellation actions
-    (**Cancel**, **Abort**, **Discard changes**).
+    (**Cancel**, **Abort**, **Discard changes**) and the final confirmation of
+    a destructive bulk operation (**Delete selected**).
 
 Specifics verified here:
 

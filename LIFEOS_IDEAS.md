@@ -246,7 +246,8 @@ reference them rather than renaming ideas.
 
 #### UI-001 — Panel information architecture and visual consistency
 - **Origin:** Owner-provided.
-- **Status:** Partial foundation (Glass UI exists; organization is not standardized).
+- **Status:** Partial — the ordering rule is documented in `AGENTS.md` and applied
+  to Stash/Taskloom; broader panel normalization remains.
 - **Problem:** Buttons and categories are inconsistently grouped, ordered and
   sized; the owner cannot predict where an action lives.
 - **Expected behavior:** A documented ordering rule across panels (primary
@@ -264,7 +265,8 @@ reference them rather than renaming ideas.
 
 #### UI-002 — Click-to-select rows with visible state
 - **Origin:** Owner-provided.
-- **Status:** Partial (Stash only).
+- **Status:** Partial — Stash and Taskloom use the same owner/feature-scoped
+  bounded selection store.
 - **Problem:** Multi-item operations require opening items or remembering codes;
   there is no common selection gesture across chats, sources and tasks.
 - **Expected behavior:** Clicking the item/chat row selects it; clicking again
@@ -282,7 +284,8 @@ reference them rather than renaming ideas.
 
 #### UI-003 — Contextual bulk actions
 - **Origin:** Owner-provided.
-- **Status:** Partial (Stash has bulk send/delete).
+- **Status:** Partial — Stash has bulk send/delete; Taskloom has contextual
+  Pause/Resume/Complete/Delete over CAS-revalidated task ids.
 - **Problem:** Enabling/disabling or acting on several sources requires repeated
   navigation; bulk actions are not available consistently.
 - **Expected behavior:** Bulk actions appear only when at least one relevant
@@ -300,7 +303,8 @@ reference them rather than renaming ideas.
 
 #### UI-004 — Destructive-action confirmation
 - **Origin:** Owner-provided.
-- **Status:** Existing pattern (Stash delete confirmation; other panels vary).
+- **Status:** Partial — Stash and Taskloom destructive bulk operations have
+  dedicated confirmation views with red confirm buttons; other panels vary.
 - **Problem:** Destructive operations are not uniformly confirmed, and a
   mis-tap can affect many rows.
 - **Expected behavior:** A dedicated confirmation view with the exact scope,
@@ -1127,7 +1131,7 @@ by `G3-A` and `G5-A`.
 | **Workspace settings/dashboard** | Durable per-source settings, dashboard and health. | No Workspace settings, activity dashboard or source-health surface exists. | `G3-B` |
 | **Evidence envelope** | Claim/message references, local validation, bounded follow-up retrieval, coverage. | `HistorySlice`/`HistoryMessage` expose message ids and first/last range; no claim-to-message citation contract or evidence ledger exists. | `G4-A` |
 | **Durable evidence index** | Cross-session/cross-run evidence browsing. | Occurrence `result_metadata`/`error_metadata` exist but are bounded diagnostics; no evidence table. | `G4-B`, owner-gated |
-| **Selection** | Exact, expiring, per-owner selection for bulk actions. | `selection_state.py` is Stash-only, capped at 40, expires after 900s; `retrieve.py` supplies the row/check/confirmation pattern. | `G1-A` |
+| **Selection** | Exact, expiring, per-owner/per-feature selection for bulk actions. | `selection_state.py` now has owner + feature scopes (Stash default, Taskloom second), capped at 40 per scope, expiring after 900s; `retrieve.py` supplies the row/check/confirmation pattern and Taskloom adds CAS-revalidated bulk actions. | `G1-A` |
 | **Task authority** | One scheduler, one coordinator, one tool executor, CAS lifecycle. | `TaskScheduler`, `TaskExecutionCoordinator` and `ToolExecutor` exist; there is no separate `TaskExecutor` class. `TaskManagementService` exposes list/pause/resume/complete/fail/expire/delete, not cancel/retry. | `G5-A` |
 | **Activity data** | Bounded message/activity metrics and coverage. | No chat-activity metrics exist; `database_service` reports saves/provider stats only. | `G7-A` |
 | **Cross-source/export** | Explicit multi-source scope, attribution and portability. | No cross-source retrieval or export endpoint exists. | `G6-A` |
@@ -1222,6 +1226,9 @@ silently duplicated.
 
 #### G1-A — Reusable interaction grammar
 - **Included:** UI-001, UI-002, UI-003, UI-004.
+- **Status:** Implemented for Stash and Taskloom, with focused offline tests.
+  Broader panel normalization, live Telegram validation and G1-B remain
+  deferred.
 - **Goal:** Make panels predictable and safely selectable using the proven Stash
   pattern, without waiting for language or Workspace work.
 - **Shared foundation:** `panels.py`, `panel_registry.py`,
@@ -1751,3 +1758,4 @@ facts are not questions.
 |---|---|
 | 2026-11-14 | Created this document at `main`/`origin/main` `f61e12e`. Recorded the owner-provided UI, language, interactive summary, extraction, Workspace, analytics, source search, cross-source, Task Center and advanced intelligence ideas; added clearly labeled assistant suggestions; mapped existing History/Scheduled History/Taskloom/language/search capabilities; proposed eight implementation groups, separate product/implementation priorities, a dependency-aware sequence, deferred items and owner decisions. No implementation, schema, Supabase, Telegram, deployment or test change was made. |
 | 2026-11-14 | Corrected dependency graph and sequence after source re-verification of the committed document (`63fdd5c`). Split G1, G2, G3, G4, G5, G6 and G7 into A/B sub-stages; moved G2-B after G3-B; moved G5-B after G3-B/G2-B; made G4-A single-source and G4-B Workspace-aware; separated G7-A metrics from Phase-7-gated G7-B recommendations; moved semantic search to owner-gated G6-B; reassigned LANG-005 to G4-A; recorded that task cancel/retry has no service path yet. No idea was removed, no runtime/test/schema/Supabase/Telegram/Render change was made. |
+| 2026-11-15 | Recorded G1-A as implemented for Stash and Taskloom: documented panel ordering, owner/feature-scoped selection, visible toggles, Taskloom bulk CAS actions and destructive confirmation. G1-B, G2-A, G5-A beyond this narrow UI work, Workspace and Scheduled History Phase 6/7 remain deferred. No schema, Supabase, Telegram, Render or live-operation change was made. |

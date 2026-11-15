@@ -1,6 +1,48 @@
 # ROADMAP
 
-## Latest delivery: Scheduled History diagnostics tracing — Phase 7 prerequisite
+## Current delivery: G1-A — Reusable interaction grammar
+
+Status: **Implemented offline for Stash and Taskloom. This is a UI interaction
+delivery only; G1-B, G2-A, G5-A beyond this narrow Taskloom work, Workspace and
+Scheduled History Phase 6/7 remain deferred.** No schema, migration, Supabase,
+Telegram, Render or live-operation change was made.
+
+### What G1-A adds
+
+- **Panel ordering rule:** documented in `AGENTS.md` — primary action, grouped
+  controls, item-specific controls, contextual bulk actions, then navigation
+  and pagination. The existing `InlinePanelBuilder`, registry, callback
+  namespaces, symbols/styles and Appearance boundary are unchanged.
+- **Reusable selection:** `backend/helper/selection_state.py` now keys sessions
+  by owner + feature scope, preserving the Stash default API, 40-item cap,
+  900-second expiry, exact identity and visible mark behavior. Stash remains on
+  its existing scope; Taskloom gets its own scope.
+- **Taskloom multi-select:** a select mode over the existing task list, exact
+  `task_id:version` row callbacks, pagination survival, explicit clear, and
+  contextual Pause / Resume / Complete / Delete actions only for applicable
+  selected tasks.
+- **CAS-revalidated bulk work:** every selected task is re-read through
+  `TaskManagementService`; missing, foreign-owner, changed-version and
+  status-inapplicable targets are refused individually and reported per item.
+- **Destructive confirmation:** Taskloom bulk Delete has a dedicated review
+  showing the exact count/targets/consequence, a cancel action, DANGER styling
+  on the final confirm, and revalidation at confirmation time. Stash's bulk
+  delete confirm uses the same DANGER style.
+- **No new scheduler, executor, task repository, selection store, renderer,
+  Telegram client, listener or persistence path.**
+
+### Validation and limits
+
+- Focused offline tests cover Stash compatibility, Taskloom selection, scope
+  isolation, cap/expiry, pagination, stale/missing/foreign targets, partial
+  bulk results, confirmation cancel and destructive confirm styling.
+- No live Telegram callback/render, Supabase, Render or live task execution was
+  tested.
+- G1-B visual identity/accessibility, G2-A language, G5-A Task Center beyond
+  selection/bulk, Workspace features and Scheduled History Phase 6/7 are not
+  part of this delivery.
+
+## Previous delivery: Scheduled History diagnostics tracing — Phase 7 prerequisite
 
 Status: **An observability-only, occurrence-scoped diagnostic trace layer is
 implemented for the existing Scheduled History lifecycle. It changes no

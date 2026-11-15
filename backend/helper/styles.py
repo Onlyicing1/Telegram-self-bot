@@ -13,12 +13,15 @@ the mapping stays consistent and restrained:
 * :data:`SUCCESS` — green; reserved for explicit confirmation actions
   (**Confirm**, **Approve**, or an equivalent final confirmation step).
 * :data:`DANGER` — red; reserved for explicit cancellation actions
-  (**Cancel**, **Abort**, **Discard changes**).
+  (**Cancel**, **Abort**, **Discard changes**) and the final confirm action of
+  a destructive bulk operation (**Delete selected**), where the red marks the
+  irreversible consequence rather than the action category.
 
-Assignment rule: colour encodes *intent to confirm or cancel*, not the
-category of the underlying operation. Only confirmation actions receive green
-and only cancellation actions receive red; every other button — Save, Delete,
-Clear, Reset, Apply, Complete, and all navigation — is blue (``PRIMARY``).
+Assignment rule: colour encodes *intent to confirm, cancel, or accept an
+irreversible consequence*, not the category of the underlying operation. An
+ordinary confirmation receives green, and cancellation or a destructive final
+confirmation receives red; every other button — Save, Delete, Clear, Reset,
+Apply, Complete, and all navigation — is blue (``PRIMARY``).
 """
 
 PRIMARY = "primary"

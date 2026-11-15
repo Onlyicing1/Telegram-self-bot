@@ -239,6 +239,15 @@ layer — an execution interface, never just a text response.
 - **List** (`📋`) and **Find** (`🔍`) — browse/search saved items.
 - **Database** (`🗄`) — DB maintenance.
 - **AI** (`🧠`) — provider/model/settings/status/diagnostics + trigger-word config.
+- **Taskloom** (under AI) — the task list keeps its detail view and adds a
+  bounded multi-select view: each row toggles the exact task id at the version
+  rendered on that page, selection survives pagination, and Pause / Resume /
+  Complete / Delete appear only when at least one selected task can accept that
+  operation. Every bulk action re-reads each target through
+  `TaskManagementService` and uses its CAS version; Delete has a dedicated
+  confirmation and reports per-item outcomes. The same
+  `backend/helper/selection_state.py` store serves Stash and Taskloom with
+  separate owner/feature scopes.
 - **Profile** → **Bio** (`🧬`) and **Username** (`👤`).
 - **Cipher** — *Private Communications*: **Private Messages**, **Ghost Seen**, and
   **Anti-Edit / Anti-Delete**. Each keeps its own `panel:*` callback family and is
@@ -267,6 +276,21 @@ layer — an execution interface, never just a text response.
 
 Actions (`action:*`), panels (`panel:*`), and inputs (`input:*`) are registered
 through `backend/helper` registries and dispatched by `panels._callback_router`.
+
+**Panel ordering rule (G1-A).** Every panel composes in this order:
+
+1. Its primary action first.
+2. Related controls grouped together.
+3. Item-specific controls next to their item where Telegram's keyboard layout
+   permits (a separate control row when it does not).
+4. Contextual bulk actions after the items they affect and before navigation.
+5. Navigation and pagination last, using the shared registry glyphs.
+6. No competing or redundant buttons; stay compact without hiding a necessary
+   operation.
+
+This is an ordering rule, not a second panel API: `InlinePanelBuilder`,
+`panel_registry`, callback namespaces and the Appearance render boundary stay
+unchanged.
 
 **Callback admission contract** (`backend/helper/callback_gate.py`):
 

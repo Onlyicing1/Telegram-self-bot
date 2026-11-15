@@ -24,6 +24,7 @@ persistence path.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 
@@ -55,12 +56,18 @@ from backend.ai.task_wizard import (
     TaskWizardError,
 )
 from backend.helper.styles import DANGER
+from backend.helper import selection_state
 from backend.helper import symbols as sym
 
 logger = logging.getLogger(__name__)
 
 _MAX_LIST_ROWS = 4
 _MAX_INSPECT_OCC = 8
+
+# Taskloom's selection is isolated from Stash's in the SAME bounded store.
+_TASK_SELECTION_SCOPE = "taskloom"
+_TASK_BULK_ACTIONS = ("pause", "resume", "complete", "delete")
+_TERMINAL_TASK_STATUSES = frozenset({"completed", "deleted", "expired"})
 
 # In-progress wizard drafts, keyed by owner. Per-owner UI state only — the
 # draft carries no execution authority and is persisted nowhere until the
@@ -91,9 +98,55 @@ def _fmt_dt(value) -> str:
     return value.astimezone(ZoneInfo("Asia/Tehran")).strftime("%m-%d %H:%M")
 
 
+def _task_title(task, limit: int = 38) -> str:
+    label = " ".join(str(task.label or "").split())
+    return label[:limit] + ("…" if len(label) > limit else "")
+
+
 def _task_row(task) -> tuple[str, str]:
-    label = task.label[:38] + ("…" if len(task.label) > 38 else "")
-    return f"Task {task.id}: {label}", f"panel:taskloom_task:{task.id}"
+    return f"Task {task.id}: {_task_title(task)}", f"panel:taskloom_task:{task.id}"
+
+
+def _task_selection_label(task) -> str:
+    """Presentation only. The callback and selection use the task id."""
+    return f"Task {task.id}: {_task_title(task)}"
+
+
+def _is_todo(task) -> bool:
+    from backend.ai.database.task_repository import is_todo_schedule_type
+
+    return is_todo_schedule_type(task.schedule_type)
+
+
+def _task_icon(task) -> str:
+    return _STATUS_ICON.get(task.status, sym.STATE_FAILED)
+
+
+def _parse_task_toggle_extra(extra: str) -> tuple[int, int] | None:
+    parts = (extra or "").split(":")
+    if len(parts) != 2:
+        return None
+    try:
+        task_id, version = int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
+    if task_id <= 0 or version <= 0:
+        return None
+    return task_id, version
+
+
+def _selection_page(extra: str) -> int:
+    tail = (extra or "").rsplit("page:", 1)[-1]
+    return max(1, int(tail)) if tail.isdigit() else 1
+
+
+def _selected_task_ids(owner_id: int) -> set[str]:
+    return {
+        selection_state.normalize_code(code)
+        for code, _label, _version in selection_state.entries(
+            owner_id, _TASK_SELECTION_SCOPE
+        )
+    }
 
 
 def _nav(builder: InlinePanelBuilder) -> None:
@@ -124,12 +177,337 @@ def _wizard_footer(builder: InlinePanelBuilder, *, editing: bool = False) -> Non
     builder.add_row(sym.label(sym.OP_CLOSE, "Close"), "panel:_nav:close")
 
 
+def _summary_line(counts) -> str:
+    active = counts.get("active", 0)
+    paused = counts.get("paused", 0)
+    done = counts.get("completed", 0) + counts.get("failed", 0) + counts.get("expired", 0)
+    return (
+        f"{sym.STATE_ACTIVE} {active} active {sym.SEPARATOR} "
+        f"{sym.STATE_PAUSED} {paused} paused {sym.SEPARATOR} "
+        f"{sym.STATE_COMPLETED} {done} closed"
+    )
+
+
+def _add_selection_bulk_rows(builder: InlinePanelBuilder, owner_id: int, tasks) -> None:
+    """Only offer actions that the CURRENT selected task set can accept.
+
+    Availability is derived from an authoritative snapshot, but the values
+    here are presentation only: every action re-reads each selected task and
+    uses its CAS version before mutating anything.
+    """
+    selected_ids = _selected_task_ids(owner_id)
+    chosen = [task for task in tasks if selection_state.normalize_code(task.id) in selected_ids]
+    if not chosen:
+        return
+    if any(task.status == "active" and not _is_todo(task) for task in chosen):
+        builder.add_row(sym.label(sym.OP_PAUSE, "Pause selected"), "action:taskloom_bulk:pause")
+    if any(task.status == "paused" and not _is_todo(task) for task in chosen):
+        builder.add_row(sym.label(sym.OP_RESUME, "Resume selected"), "action:taskloom_bulk:resume")
+    if any(task.status in ("active", "paused") for task in chosen):
+        builder.add_row(sym.label(sym.OP_SAVE, "Complete selected"), "action:taskloom_bulk:complete")
+    builder.add_row(sym.label(sym.OP_DELETE, "Delete selected"), "action:taskloom_bulk:delete")
+
+
+async def _render_taskloom_selection(
+    owner_id: int, page: int | None = None, notice: str = ""
+) -> tuple[str, str, list]:
+    """The Taskloom multi-select view over the SAME authoritative task read."""
+    page = selection_state.set_page(
+        owner_id,
+        page if page is not None else selection_state.current_page(
+            owner_id, _TASK_SELECTION_SCOPE
+        ),
+        _TASK_SELECTION_SCOPE,
+    )
+    service = _service(owner_id)
+    snapshot = await service.snapshot()
+    tasks = snapshot.tasks
+    counts = snapshot.counts()
+    page_count = max(1, (len(tasks) + _MAX_LIST_ROWS - 1) // _MAX_LIST_ROWS)
+    page = min(page, page_count)
+    selection_state.set_page(owner_id, page, _TASK_SELECTION_SCOPE)
+    visible = tasks[(page - 1) * _MAX_LIST_ROWS:page * _MAX_LIST_ROWS]
+    chosen = selection_state.count(owner_id, _TASK_SELECTION_SCOPE)
+
+    lines = [
+        f"{sym.PANEL_HEADING} **Taskloom**",
+        _summary_line(counts),
+        "",
+        f"_{len(tasks)} tasks {sym.SEPARATOR} page {page}/{page_count} {sym.SEPARATOR} "
+        f"{chosen} selected_",
+    ]
+    if notice:
+        lines += ["", notice]
+    if not tasks:
+        lines += ["", "_No tasks yet._"]
+        if snapshot.fallback_active:
+            from backend.ai.task_management_interface import fallback_note
+
+            lines += ["", fallback_note(snapshot.fallback_reason)]
+    else:
+        lines += [
+            "",
+            f"_{sym.SELECT_EMPTY} tap a task to select it {sym.SEPARATOR} "
+            f"{sym.SELECT_MARKED} selected_",
+        ]
+
+    builder = InlinePanelBuilder()
+    for task in visible:
+        mark = (
+            sym.SELECT_MARKED
+            if selection_state.is_selected(
+                owner_id, str(task.id), _TASK_SELECTION_SCOPE
+            )
+            else sym.SELECT_EMPTY
+        )
+        builder.add_row(
+            f"{mark} {_task_icon(task)} {_task_selection_label(task)}",
+            f"action:taskloom_toggle:{task.id}:{task.version}",
+        )
+
+    _add_selection_bulk_rows(builder, owner_id, tasks)
+    if chosen:
+        builder.add_row(
+            sym.label(sym.OP_CLOSE, "Clear selection"), "panel:taskloom:select:cancel"
+        )
+
+    if page_count > 1:
+        page_row = []
+        if page > 1:
+            page_row.append(
+                (sym.label(sym.OP_PREV, "Prev"), f"panel:taskloom:select:page:{page - 1}")
+            )
+        page_row.append(
+            (f"{page}/{page_count}", "panel:taskloom:select:back")
+        )
+        if page < page_count:
+            page_row.append(
+                (f"Next {sym.OP_NEXT}", f"panel:taskloom:select:page:{page + 1}")
+            )
+        builder.add_buttons(*page_row)
+    if snapshot.fallback_active and tasks:
+        from backend.ai.task_management_interface import fallback_note
+
+        lines += ["", fallback_note(snapshot.fallback_reason)]
+    _nav(builder)
+    return "Taskloom", "\n".join(lines), builder.build()
+
+
+def _taskloom_delete_review(owner_id: int) -> tuple[str, str, list]:
+    """Dedicated destructive confirmation: exact operation, scope and count."""
+    entries = selection_state.entries(owner_id, _TASK_SELECTION_SCOPE)
+    builder = InlinePanelBuilder()
+    if not entries:
+        builder.add_row(sym.label(sym.OP_BACK, "Back to selection"), "panel:taskloom:select:back")
+        return (
+            "Delete Tasks",
+            f"{sym.STATE_WARNING} No tasks are selected — select at least one first.",
+            builder.build(),
+        )
+    noun = "task" if len(entries) == 1 else "tasks"
+    lines = [f"_{len(entries)} selected {noun}_", ""]
+    for _code, label, _version in entries:
+        lines.append(f"{sym.SELECT_MARKED} {label}")
+    lines += [
+        "",
+        f"{sym.STATE_WARNING} This permanently deletes the selected {noun}, "
+        "their schedule and their occurrence history. This cannot be undone.",
+        "",
+        "_Every target is re-read and version-checked before deletion._",
+    ]
+    builder.add_row(
+        sym.label(sym.OP_DELETE, f"Delete {len(entries)} {noun}"),
+        "action:taskloom_bulk_delete:confirm",
+        DANGER,
+    )
+    builder.add_row(sym.label(sym.OP_BACK, "Cancel"), "panel:taskloom:select:back")
+    return "Delete Tasks", "\n".join(lines), builder.build()
+
+
+def _task_bulk_result(
+    action: str, outcomes: list[tuple[str, bool, str]]
+) -> tuple[str, str, list]:
+    title = f"{action.title()} Selected"
+    total = len(outcomes)
+    succeeded = sum(1 for _label, ok, _message in outcomes if ok)
+    past = {
+        "pause": "Paused",
+        "resume": "Resumed",
+        "complete": "Completed",
+        "delete": "Deleted",
+    }.get(action, action.title())
+    icon = sym.OP_SAVE if succeeded == total and total else sym.STATE_FAILED
+    lines = [f"{icon} {past} {succeeded} of {total} selected tasks."]
+    for label, ok, message in outcomes:
+        mark = sym.STATE_COMPLETED if ok else sym.STATE_FAILED
+        lines.append(f"{mark} {label} — {message}")
+    builder = InlinePanelBuilder()
+    builder.add_row(sym.label(sym.OP_BACK, "Back to tasks"), "panel:taskloom")
+    builder.add_row(sym.label(sym.ICON_SELECT, "Select tasks"), "panel:taskloom:select")
+    return title, "\n".join(lines), builder.build()
+
+
+async def _taskloom_apply_bulk(
+    owner_id: int, action: str
+) -> tuple[str, str, list]:
+    """Apply one bulk action through the existing owner-scoped CAS service.
+
+    Every target is re-read by id and checked against the version rendered
+    when it was selected. A missing, foreign, changed or status-inapplicable
+    target is refused individually; valid targets are still processed, and
+    the result reports exactly what happened to each item.
+    """
+    entries = selection_state.entries(owner_id, _TASK_SELECTION_SCOPE)
+    if not entries:
+        builder = InlinePanelBuilder()
+        builder.add_row(sym.label(sym.OP_BACK, "Back to tasks"), "panel:taskloom")
+        return (
+            f"{action.title()} Selected",
+            f"{sym.STATE_WARNING} No tasks are selected — nothing was changed.",
+            builder.build(),
+        )
+
+    service = _service(owner_id)
+    outcomes: list[tuple[str, bool, str]] = []
+    for code, label, selected_version in entries:
+        try:
+            task_id = int(code)
+        except (TypeError, ValueError):
+            outcomes.append((label, False, "invalid task id; not applied"))
+            continue
+        try:
+            view = await service.inspect(task_id, occurrence_limit=0)
+            if view is None:
+                outcomes.append((label, False, "not found for this owner; not applied"))
+                continue
+            task = view.task
+            if selected_version is None or int(task.version) != int(selected_version):
+                outcomes.append(
+                    (label, False, f"changed since selection (now v{task.version}); not applied")
+                )
+                continue
+            status = str(task.status)
+            if action == "pause" and status != "active":
+                outcomes.append((label, False, f"status is {status}; not paused"))
+                continue
+            if action == "resume" and status != "paused":
+                outcomes.append((label, False, f"status is {status}; not resumed"))
+                continue
+            if action == "complete" and status in _TERMINAL_TASK_STATUSES:
+                outcomes.append((label, False, f"status is {status}; not completed"))
+                continue
+            if action in ("pause", "resume") and _is_todo(task):
+                outcomes.append((label, False, "a todo cannot be paused or resumed"))
+                continue
+            if action == "delete":
+                result = await service.delete(task_id, int(selected_version))
+                if result.deleted:
+                    note = "deleted" if result.durable else "deleted in memory only — not durable"
+                    outcomes.append((label, True, note))
+                elif result.outcome == "stale":
+                    outcomes.append((label, False, "version is stale; not deleted"))
+                else:
+                    outcomes.append((label, False, "not found for this owner; not deleted"))
+                continue
+            try:
+                updated = await getattr(service, action)(task_id, int(selected_version))
+            except ValueError as exc:
+                outcomes.append((label, False, str(exc)))
+                continue
+            if updated is None:
+                outcomes.append((label, False, "service did not confirm the change; not applied"))
+            else:
+                outcomes.append((label, True, f"{action}d {sym.SEPARATOR} v{updated.version}"))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Taskloom bulk %s failed for task %s", action, code)
+            outcomes.append((label, False, "operation failed; no change was confirmed"))
+
+    selection_state.clear(owner_id, _TASK_SELECTION_SCOPE)
+    return _task_bulk_result(action, outcomes)
+
+
+async def _taskloom_toggle_action(event, extra: str, chat_id: int):
+    """Tick/untick ONE exact task id rendered at ONE exact version."""
+    from backend.helper.inline_engine import _owner_id
+
+    owner_id = _owner_id
+    parsed = _parse_task_toggle_extra(extra)
+    if parsed is None:
+        return await _render_taskloom_selection(
+            owner_id, notice=f"{sym.STATE_FAILED} Invalid task selection."
+        )
+    task_id, version = parsed
+    view = await _service(owner_id).inspect(task_id, occurrence_limit=0)
+    if view is None:
+        return await _render_taskloom_selection(
+            owner_id,
+            notice=f"{sym.STATE_FAILED} Task #{task_id} is not one of your tasks — nothing was selected.",
+        )
+    if int(view.task.version) != version:
+        return await _render_taskloom_selection(
+            owner_id,
+            notice=(
+                f"{sym.STATE_WARNING} Task #{task_id} changed since this page was shown "
+                "— nothing was selected."
+            ),
+        )
+    label = _task_selection_label(view.task)
+    _selected, reason = selection_state.toggle(
+        owner_id, str(task_id), label, _TASK_SELECTION_SCOPE, version=version
+    )
+    notice = (
+        f"{sym.STATE_WARNING} Task #{task_id} was not selected: {reason}."
+        if reason else ""
+    )
+    return await _render_taskloom_selection(owner_id, notice=notice)
+
+
+async def _taskloom_bulk_action(event, extra: str, chat_id: int):
+    from backend.helper.inline_engine import _owner_id
+
+    action = (extra or "").strip()
+    if action == "delete":
+        return _taskloom_delete_review(_owner_id)
+    if action not in _TASK_BULK_ACTIONS:
+        return "Taskloom", f"{sym.STATE_FAILED} Unknown bulk action.", []
+    return await _taskloom_apply_bulk(_owner_id, action)
+
+
+async def _taskloom_bulk_delete_confirm(event, extra: str, chat_id: int):
+    from backend.helper.inline_engine import _owner_id
+
+    if (extra or "").strip() != "confirm":
+        return (
+            "Delete Tasks",
+            f"{sym.STATE_WARNING} Confirmation is required — nothing was deleted.",
+            [],
+        )
+    return await _taskloom_apply_bulk(_owner_id, "delete")
+
+
 async def _taskloom_panel(event, extra: str) -> tuple[str, str, list] | None:
-    """LEVEL 1 — compact paginated task list."""
+    """LEVEL 1 — compact paginated task list, plus its multi-select view."""
     from backend.ai.task_management_interface import fallback_note
     from backend.helper.inline_engine import _owner_id
 
-    service = _service(_owner_id)
+    owner_id = _owner_id
+    extra = (extra or "").strip()
+    if extra == "select":
+        selection_state.clear(owner_id, _TASK_SELECTION_SCOPE)
+        return await _render_taskloom_selection(owner_id, 1)
+    if extra == "select:cancel":
+        selection_state.clear(owner_id, _TASK_SELECTION_SCOPE)
+        extra = "0"
+    elif extra == "select:back":
+        return await _render_taskloom_selection(owner_id)
+    elif extra.startswith("select:page:"):
+        return await _render_taskloom_selection(owner_id, _selection_page(extra))
+    elif extra.startswith("select"):
+        return await _render_taskloom_selection(owner_id)
+
+    service = _service(owner_id)
     # ONE authoritative read. The rows, the status counters and the degraded
     # marker below all describe the same repository call: two independent reads
     # could observe different states (the bounded local-resource cooldown
@@ -177,6 +555,9 @@ async def _taskloom_panel(event, extra: str) -> tuple[str, str, list] | None:
         for task in visible:
             text, cb = _task_row(task)
             builder.add_row(text, cb)
+        builder.add_row(
+            sym.label(sym.ICON_SELECT, "Select tasks"), "panel:taskloom:select"
+        )
         if page_count > 1:
             builder.add_row(
                 sym.OP_PREV if page > 0 else sym.SEPARATOR,
@@ -1057,6 +1438,9 @@ def register(client, owner_id: int, tz_str: str) -> None:
         register_action("taskloom_resume", _resume_action)
         register_action("taskloom_complete", _complete_action)
         register_action("taskloom_delete", _delete_action)
+        register_action("taskloom_toggle", _taskloom_toggle_action)
+        register_action("taskloom_bulk", _taskloom_bulk_action)
+        register_action("taskloom_bulk_delete", _taskloom_bulk_delete_confirm)
         register_panel(_WIZARD_PANEL, _wizard_panel, parent="taskloom", title=sym.label(sym.OP_CREATE, "New task"))
         register_inline_builder(_WIZARD_PANEL, _wizard_inline_builder)
         register_action("taskloom_wizard", _wizard_action)
