@@ -4,7 +4,9 @@
 
 Status: **Implemented offline. G2-B (Workspace language), G4-A (extraction and
 glossary), G5-A and Scheduled History Phase 4+ remain deferred.** No schema,
-migration, Supabase, Telegram, Render or live-operation change was made.
+migration, Supabase, Telegram, Render or live-operation change was made by
+G2-A. A G4-A evidence-persistence **design record** follows below; nothing in
+it is implemented.
 
 ### What G2-A adds
 
@@ -63,6 +65,177 @@ migration, Supabase, Telegram, Render or live-operation change was made.
   Auto keeps its honest detected/fallback wording.
 - Catalog, aliases, precedence, the single preference snapshot and the
   one-resolution-per-request design are unchanged. No schema or live operation.
+
+## Design record (NOT IMPLEMENTED): G4-A evidence persistence and bounded storage
+
+Status: **Design and documentation only, 2026-11-15.** No production code,
+migration, SQL, Supabase object, Telegram operation or deployment was made.
+G4-A remains unimplemented, no stage below is complete, and **no evidence table
+exists**. This section records the owner-approved product direction and the
+storage model that must be approved before Stage 1 starts.
+
+### Approved owner decisions (2026-11-15)
+
+| # | Decision | Effect on G4-A |
+|---|---|---|
+| 1 | Working evidence is temporary. Nothing is archived automatically; selected evidence may be archived only through an owner-confirmed workflow. | Two retention classes, never one unlimited table. |
+| 2 | Ordinary summaries stay plain. Cited Summary is an explicit, owner-selected mode. | The existing summary default does not change. |
+| 3 | Follow-ups must remain usable after an application restart. | The active run and the context it needs must be durable. |
+| 4 | Conditional subjective assessments are allowed only after explicit evidence thresholds and assessment policies are approved. | No threshold, default or confidence rule may be invented. |
+| 5 | Person-level judgments require explicitly approved policies and thresholds. | Gated; no provider may assign a definitive person label. |
+| 6 | The Workspace Glossary is persistent, owner-editable and extensible, and distinct from AI memory and source evidence. | Its own bounded store; no automatic learning from conversations. |
+| 7 | Direct Telegram links are allowed in the owner-facing Evidence Explorer, but identifiers and URLs are resolved and constructed locally. | Provider output is never authoritative for ids, counts, links or existence. |
+| 8 | Strict JSON is the initial structured-output contract. A tagged-text fallback may be specified later. | No fallback now, and no silent downgrade of a JSON operation. |
+| 9 | Evidence Envelopes never enter ToolResult history, tool arguments, generic audit records, conversation history or provider continuation. Tool results may carry only opaque run ids and bounded counts/coverage. A dedicated access-controlled evidence store is permitted. | A new storage path, never the generic tool path. |
+| 10 | Scheduled History is unchanged: body-only and citation-free. | `scheduled_summary_payload` and its callers are untouched. |
+| 11 | Archive is hybrid: the system may suggest candidates, the owner approves each archival, and archived evidence remains until manually deleted. | No automatic archival and no automatic archive expiry. |
+
+### Retention classes (must remain distinct)
+
+| Class | Lifetime | Automatic expiry | Authority |
+|---|---|---|---|
+| **Active Evidence Run** | Short, explicit TTL | Yes (lazy/database-time, no scheduler) | Supports Cited Summary, the Explorer and restart-safe follow-ups. |
+| **Archived Evidence Source** | Indefinite until manual deletion | No | Owner-approved long-term source; the only indefinite-retention class. |
+| **Derived Workspace Knowledge** | Derived record, later stage | Follows its source's deletion | References an archived source id; never a second copy of the source text. |
+| **Workspace Glossary** | Persistent | No (owner CRUD only) | Owner definitions; not evidence and not AI memory. |
+
+An Active Run is **not** an archive. An archive row is **not** a chat export. A
+derived record is **not** a source. The glossary is **not** evidence.
+
+### Proposed storage model (conceptual only — no schema exists)
+
+No table, migration file, SQL statement or Supabase object was created. The
+concepts below follow the existing `history_schedules` conventions
+(`supabase/migrations/20261114180758_create_history_schedules.sql`): additive,
+service-role-only, RLS enabled with zero policies, and no owner foreign key
+(there is no owner table).
+
+| Concept | Lifetime | Essential contents | Deletion |
+|---|---|---|---|
+| `ai_evidence_runs` | TTL | server-generated opaque `run_id`, `owner_id`, `peer_id`, mode, status, `created_at`, `expires_at`, bounded message range, bounded summary text, reference/text counters, `version` | Expired rows are deleted with their refs; an expired lookup fails honestly. |
+| `ai_evidence_run_refs` | TTL (child of the run) | `run_id`, ordinal, Telegram `message_id`, sender/user attribution flag, source date, bounded excerpt, content hash, captured-at, last-validation state | `ON DELETE CASCADE` from the run. |
+| `ai_evidence_archive` | Indefinite until manual deletion | opaque `archive_id`, `owner_id`, `peer_id`, `message_id`, bounded source text/excerpt, hash, sender attribution flag, source date, `archived_at`, `origin_run_id` (provenance only, not a blocking FK), revision | Explicit owner-confirmed delete; dependent derived records cascade; no time-based delete. |
+| `ai_workspace_glossary` | Persistent | `owner_id`, workspace key, normalized term, term, definition, `version`, timestamps | Owner-confirmed delete; later operations only. |
+| `ai_workspace_knowledge` (later) | Derived | archived-source id, claim/summary, run/analysis provenance, revision | Cascades from its source; never outlives a deleted archive row silently. |
+
+Storage rules:
+
+- **Owner and Workspace isolation first.** Every read/write is filtered by
+  `owner_id`; the Workspace key is validated against the owner's own scope. An
+  opaque id alone is never authorization.
+- **Runs are bounded and temporary.** Expiry is evaluated on read and on write
+  (lazy), so no background scheduler or second worker is required. An expired
+  run is reported as expired; its evidence is never reconstructed from
+  conversation history or a later chat read.
+- **Archive is deduped.** One row per `(owner_id, peer_id, message_id)`. A
+  re-archival of the same message proposes a refresh of the snapshot instead of
+  a second copy. An excerpt/content hash detects an edited source.
+- **Text is stored once per class.** A run stores only the bounded excerpts it
+  needs; the archive stores the one long-term copy; derived records reference
+  the archive id instead of copying text.
+- **No media binaries, no full chats, no sender names.** Only bounded text,
+  media presence flags and local attribution.
+- **Revalidation is local.** Before presenting evidence as current, the source
+  message is re-read through the existing Telegram boundary; deleted/edited or
+  inaccessible messages are labelled from the captured snapshot + hash instead
+  of being silently refreshed.
+
+### Bounds and quotas — AWAITING OWNER APPROVAL
+
+Every value below is a **proposal**. None is approved, and implementation must
+not hard-code one before the owner accepts it.
+
+| Parameter | Proposed value | Rationale |
+|---|---|---|
+| Maximum stored excerpt per source | 1,000 characters (no full-message copy) | Enough to verify a claim; bounds every row. |
+| Maximum refs per run | 50 (follow-up reads at most 20 of them) | Matches the bounded History request shape. |
+| Maximum stored text per run | 32 KiB UTF-8 | Same order as the existing 32 KiB summary bound. |
+| Maximum active runs per owner | 20 | Bounds steady-state temporary storage. |
+| Active-run TTL | **7 days** recommended (options: 24 h, 72 h, 7 d, 30 d) | Keeps a follow-up usable for a week without becoming an archive. |
+| Archived records per owner | 5,000 | Bounded indefinite growth. |
+| Archived bytes per owner | 50 MiB of text | Same bound expressed in bytes; whichever is reached first refuses new archival. |
+| Glossary entries per workspace | 200 | Bounds prompt injection size. |
+| Glossary characters per workspace | 50,000 | Bounds the injected block. |
+| Duplicate strategy | `(owner_id, peer_id, message_id)` unique + content hash | Prevents repeats; detects edits. |
+| At-limit behavior | Refuse honestly after sweeping expired runs; never delete archived evidence | The owner's approved retention is not silently violated. |
+
+### Supabase growth scenarios (estimates, not measurements)
+
+Assumptions: an average excerpt of 400 characters at 2 bytes/character
+(Persian/Arabic UTF-8) ≈ 800 B of text, ≈ 250 B of row metadata/index entry, so
+≈ 1.1–1.4 KB per archived row; a maximum-length excerpt ≈ 2.9 KB per row. A run
+with 25 refs and a short summary ≈ 36 KB. These are planning assumptions, not
+measured database facts. No Supabase billing figure or plan limit is asserted.
+
+| Scenario | Archived rows/month | Archive growth/month | Archive growth/year | Live active runs (7-day TTL) | Active-run footprint |
+|---|---|---|---|---|---|
+| Small personal | 20 | ≈ 25 KB | ≈ 0.3 MB | 3/day → ≈ 21 | ≈ 0.8 MB |
+| Moderate regular | 200 | ≈ 250 KB | ≈ 3 MB | 10/day, capped at 20 | ≈ 0.8 MB |
+| Heavy collection | 2,000 | ≈ 2.5 MB | ≈ 30 MB | 50/day, capped at 20 | ≈ 0.8 MB |
+
+At the proposed 50 MiB archive quota, the heavy scenario reaches the bound in
+roughly 18–20 months (≈ 37,000 average rows); the owner then archives only what
+still matters or raises the quota explicitly. For comparison, the existing
+conversation tables already store up to 8,000 characters per message
+(`backend/ai/persistence.py`) with no cleanup, so evidence storage is a small
+addition, not the dominant growth source.
+
+### Privacy, authorization and provider isolation (revalidated against `416918e`)
+
+The earlier leak-path findings still hold in the current source:
+
+- `backend/ai/tools/executor.py:380` records every execution, and
+  `:501`/`:504` persist `arguments` and `result_data=result.data` into
+  `ToolHistoryRecord`.
+- `backend/ai/engine/dispatcher.py:2341` places the full `ToolResult.data` into
+  the tool message of the provider continuation.
+- `backend/ai/engine/dispatcher.py:975`, `:1238` and `:1740` send the tool
+  result message into conversation history, which
+  `backend/ai/runtime/manager.py` persists via `persistence.add_message` into
+  `ai_messages` (`backend/ai/persistence.py:167-171`, 8,000-character cap).
+- `backend/ai/persistence.py:359-366` writes `arguments` and
+  `result_message[:2000]` into `ai_tool_history`; `dispatcher.py:989`/`:1266`/
+  `:1303`/`:1736` expose `tool_results` through `EngineResult.metadata`, and
+  `backend/ai/prompt/builder.py:355` renders tool history into the prompt.
+- `backend/services/history_ai_service.py:646-686` calls the provider with
+  `tools=[]` and no `response_format`; strict JSON therefore needs an explicit
+  new contract, not an assumption about the current call.
+
+Consequences for the design: the evidence envelope (source ids, excerpts,
+hashes, links) must never be placed in `ToolResult.data`, `message`,
+`arguments`, metadata or conversation history. An evidence tool returns only an
+opaque `run_id` plus bounded counts/coverage; the owner-facing rendered summary
+is produced by dedicated code from the durable run. Links are constructed
+locally from a validated record (`https://t.me/c/<internal_id>/<message_id>` or
+the app URI) and are never taken from provider output.
+
+### Revised G4 stage plan
+
+| Stage | Scope | Gate |
+|---|---|---|
+| **Stage 1 = G4-A** | Evidence storage foundation; durable Active Runs with TTL; owner-approved Archive foundation; Cited Summary (opt-in); basic Explorer with locally built links. No extraction, glossary UI, follow-up tools or assessments. | Owner approves the storage model, TTL, quotas and excerpt cap. |
+| **Stage 2 = G4-B** | Restart-safe follow-ups over the same run/contract; no second retrieval engine, no second evidence format. | Stage 1 accepted and the TTL proves usable in practice. |
+| **Stage 3 = G4-C** | Strict-JSON extraction and the persistent Workspace Glossary (owner CRUD, bounded). A tagged-text fallback may be specified separately, never as a silent downgrade. | Extraction schema approved; glossary limits approved. |
+| **Stage 4 = G4-D** | Descriptive, then threshold-gated subjective assessments. | Explicit thresholds and person-level policy approved; no invented numbers. |
+
+Scheduled History stays outside all four stages: it remains body-only and
+citation-free, and no evidence run, citation or archive path may be attached to
+it.
+
+### Remaining owner decisions (Stage 1 is blocked on these)
+
+1. Active-run TTL duration (7 days recommended; alternatives 24 h, 72 h, 30 d).
+2. Maximum excerpt size, refs per run, text per run and active runs per owner.
+3. Archive quota (records and bytes) and the honest at-limit behavior.
+4. Whether the archive stores one row per message (proposed) or per run.
+5. Glossary scope until a Workspace model exists, plus entry/character limits.
+6. Whether Cited Summary is panel-only, AI-trigger-only, or both.
+7. Whether the system may suggest candidates from any run, or only from
+   owner-flagged evidence.
+8. Subjective-assessment thresholds and the person-level judgment policy.
+9. When (or whether) a tagged-text fallback is specified.
+10. Whether an expired run leaves any tombstone or is deleted outright
+    (outright deletion proposed).
 
 ## Previous delivery: G1-A — Reusable interaction grammar
 

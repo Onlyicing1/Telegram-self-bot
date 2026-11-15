@@ -5,12 +5,14 @@
 > of active phases and verified delivery.
 >
 > **Source baseline:** `main` at
-> `f61e12ea0bd87fda874ef072e5bf15f42c34e898` (`origin/main` verified equal).
-> The working tree was clean before this document was created.
+> `416918e93584456044a2fa0ac4d4bc18a3c65dba` (`origin/main`, re-verified
+> 2026-11-15). The working tree was clean before this revision.
 >
 > **Investigated:** 2026-11-14, from the repository source, tests and existing
-> architecture documents. No SQL was executed, no Supabase object was touched,
-> no Telegram operation was performed, and no application deployment occurred.
+> architecture documents; **revised 2026-11-15** for the owner-approved
+> evidence-persistence direction (§4.5.1, G4 stages, §10). No SQL was executed,
+> no Supabase object was touched, no Telegram operation was performed, and no
+> application deployment occurred.
 
 ## 1. Purpose and Scope
 
@@ -453,20 +455,27 @@ reference them rather than renaming ideas.
   a capability guarantee.
 - **Do not:** Advertise a language as verified without evidence.
 
-#### LANG-005 — Extraction terminology glossary
-- **Origin:** Assistant-discovered.
-- **Status:** Proposed.
+#### LANG-005 — Extraction terminology glossary (persistent Workspace Glossary)
+- **Origin:** Assistant-discovered; persistence and scope approved by the owner
+  (decision 6, 2026-11-15).
+- **Status:** Approved direction, **design only** (Stage 3 / G4-C). No glossary
+  table, UI or injection exists.
 - **Problem:** Names, course titles, project terms and transliterations are
   inconsistently translated or extracted.
-- **Expected behavior:** An owner-maintained, bounded glossary per global or
-  Workspace scope, injected only into extraction/summarization instructions,
-  with the exact terms visible to the owner.
+- **Expected behavior:** A **persistent, Workspace-scoped, owner-editable and
+  extensible** glossary, bounded in entries and characters, injected only into
+  the explicitly supported G4-C evidence operations. Conflict handling is
+  explicit (refuse, show the existing entry, require an owner-confirmed
+  replace); there is no automatic learning from conversations.
 - **Value:** Better entity consistency in Persian/English research.
-- **Reuse:** Prompt preference/instruction composition and validation bounds.
-- **Depends on:** LANG-001; extraction (INTEL-010).
-- **Risks/unknowns:** Prompt growth, glossary conflicts and privacy. Bounded,
-  explicit and opt-in.
-- **Do not:** Turn the glossary into an unrestricted memory store.
+- **Reuse:** Prompt preference/instruction composition and validation bounds;
+  G2-A language precedence stays authoritative.
+- **Depends on:** LANG-001; extraction (INTEL-010); an owner-approved Workspace
+  key while no Workspace model exists.
+- **Risks/unknowns:** Prompt growth, conflicts, scope ambiguity before G3, and
+  privacy. Bounded, explicit and opt-in.
+- **Do not:** Turn the glossary into an unrestricted memory store, inject it into
+  Scheduled History, or let it silently override evidence.
 
 ### 4.3 Workspace and sources
 
@@ -688,20 +697,25 @@ reference them rather than renaming ideas.
 
 #### INTEL-002 — Evidence references and source-message linking
 - **Origin:** Owner-provided.
-- **Status:** Proposed (range metadata exists; citations do not).
+- **Status:** Approved direction — **design only** (EVID-001/002/003). Range
+  metadata exists; citations do not.
 - **Problem:** A summary cannot be verified or opened at the supporting message.
 - **Expected behavior:** Each conclusion/claim can carry bounded evidence
   references (source, message id/range, short excerpt), rendered as tappable
-  links where Telegram permits. Evidence is attributed to the exact source.
+  links in the owner-facing Explorer. Links are **constructed locally** from a
+  validated record; provider-supplied URLs/ids are never trusted. Cited Summary
+  is an explicit owner-selected mode; ordinary summaries stay plain.
 - **Value:** Trust, auditability and a foundation for every advanced feature.
 - **Reuse:** `HistoryMessage.message_id`, `HistorySlice` first/last ids,
   `saved_items.origin_chat_id/origin_msg_id`, message-link formats.
 - **Depends on:** A provider output contract that requests structured claims and
-  application-side validation of every id.
-- **Risks/unknowns:** Message links can expose identifiers; evidence persistence
-  and retention are undecided. The provider must never be trusted to invent ids.
+  application-side validation of every key/id; EVID-002 storage.
+- **Risks/unknowns:** Links expose identifiers to the owner's own client only;
+  edited/deleted sources need captured snapshots; an expired run must fail
+  honestly instead of re-reading unrelated history.
 - **Do not:** Present model-generated citations as verified without re-checking
-  the source message.
+  the source record, or put an evidence envelope into generic tool/audit/
+  conversation history.
 
 #### INTEL-003 — Bounded evidence retrieval and context isolation
 - **Origin:** Owner-provided.
@@ -771,37 +785,147 @@ reference them rather than renaming ideas.
 
 #### INTEL-037 — Evidence Explorer
 - **Origin:** Owner-provided.
-- **Status:** Proposed.
+- **Status:** Proposed (Stage 1 of G4-A).
 - **Problem:** Even a cited answer is hard to inspect in context.
-- **Expected behavior:** Open a result's evidence list, inspect the exact source
-  message/range and surrounding bounded context, and see why it was included.
-  Read-only; no model call required.
+- **Expected behavior:** Open a run's evidence list, inspect the exact source
+  message/range and bounded surrounding context, and see why it was included.
+  Read-only; no model call required. Direct Telegram deep links are permitted
+  here (decision 7), built locally from the validated record; a link is never
+  copied from provider output.
 - **Value:** Verification and trust.
-- **Reuse:** INTEL-002 references, Telegram message links, `list_recent_messages`
-  bounded window.
-- **Depends on:** INTEL-002; Workspace/source identity.
-- **Risks/unknowns:** Access changes, deleted messages and identifier exposure in
-  links.
-- **Do not:** Make the explorer a new Telegram client or archive subsystem.
+- **Reuse:** INTEL-002 references, the existing Telegram message facade,
+  `list_recent_messages` bounded window.
+- **Depends on:** INTEL-002; the EVID-002 durable run; a validated source
+  identity for the link (the owner's own chat, re-checked on read).
+- **Risks/unknowns:** Access changes, deleted messages, expired runs and
+  identifier exposure in links.
+- **Do not:** Make the explorer a new Telegram client or archive subsystem, or
+  resolve a link from an unvalidated id.
 
 #### EVID-001 — Durable evidence index
 - **Origin:** Assistant-discovered.
-- **Status:** Needs research.
+- **Status:** **Owner-approved direction, design only** (2026-11-15). No table,
+  migration, repository or SQL exists.
 - **Problem:** Cross-session follow-ups, trackers and exports need stable
   references; current summaries carry only a range and scheduled summaries carry
   none.
-- **Expected behavior:** A bounded, owner-scoped index of evidence references
-  (source, message id/range, excerpt/hash, run, created time) that can be
-  revalidated against Telegram. Deletion/expiry semantics are explicit.
+- **Expected behavior:** One bounded evidence contract over **two distinct
+  retention classes** — a temporary Active Evidence Run with an explicit TTL,
+  and an owner-approved indefinite Evidence Archive — revalidated against
+  Telegram and never substituted from conversation history.
 - **Value:** Shared foundation for citations, follow-ups, extraction, trackers
   and export.
-- **Reuse:** Existing run/result metadata and message links; a repository-style
-  service if approved.
-- **Depends on:** Owner decision on persistence/privacy; INTEL-002.
-- **Risks/unknowns:** New schema, retention, sensitive content and stale
-  references. An ephemeral-first design may be sufficient for MVP.
-- **Do not:** Create a second message archive or copy full chats into the
-  database.
+- **Reuse:** Existing run/result metadata and message links; the
+  `history_schedules` migration is the durable service-role-only precedent.
+- **Depends on:** EVID-002/003; owner approval of the TTL, quotas and excerpt
+  size (§4.5.1, §10).
+- **Risks/unknowns:** New schema, sensitive content, stale references and quota
+  growth. The owner has approved indefinite retention but not unlimited
+  consumption.
+- **Do not:** Create a second message archive, copy full chats, or attach
+  evidence to Scheduled History (which stays body-only and citation-free).
+
+#### EVID-002 — Durable Active Evidence Run
+- **Origin:** Owner-provided (decisions 1, 3, 9, 11).
+- **Status:** **Approved direction, design only.**
+- **Problem:** A follow-up must still work after the process restarts, while the
+  working evidence must not become a permanent archive.
+- **Expected behavior:** One server-generated opaque run per Cited Summary or
+  follow-up, owned by the owner and scoped to one source. It stores a bounded
+  message range, bounded excerpts, hashes, captured-at and validation state, an
+  optional bounded summary, and an `expires_at`. Reads and writes evaluate
+  expiry lazily (no new scheduler); an expired run fails honestly.
+- **Value:** Makes follow-ups restart-safe without keeping everything forever.
+- **Reuse:** `HistoryMessage`/`HistorySlice`, the existing Telegram re-read
+  boundary, the `history_schedules` service-role-only migration pattern.
+- **Depends on:** G2-A (language) and the existing History service.
+- **Risks/unknowns:** TTL duration, excerpt size and run caps need approval;
+  source edits/deletes must be labelled, not silently refreshed.
+- **Do not:** Store media binaries, full chats, provider URLs, or reuse a run
+  across owners/sources. An opaque run id alone is never authorization.
+
+#### EVID-003 — Owner-approved Evidence Archive
+- **Origin:** Owner-provided (decisions 1, 11).
+- **Status:** **Approved direction, design only.**
+- **Problem:** Some evidence must still be inspectable months later, even after
+  the original Telegram message changes or disappears.
+- **Expected behavior:** The system may suggest candidates with a reason; the
+  owner explicitly approves each archival. One deduped row per
+  `(owner, source, message id)` keeps a bounded text snapshot and hash. Rows are
+  retained indefinitely until the owner deletes them, and deletion reports its
+  dependent records.
+- **Value:** A durable, trustworthy source for future analysis without an
+  unrestricted chat archive.
+- **Reuse:** EVID-002 capture path, the same evidence contract.
+- **Depends on:** EVID-002; owner approval of archive quotas and duplicate
+  behavior.
+- **Risks/unknowns:** Storage growth, quota exhaustion, and dependent-record
+  semantics on deletion. No automatic archival or expiry is permitted.
+- **Do not:** Archive a whole chat, duplicate the same source, or discard
+  archived evidence to make room for a new row.
+
+#### EVID-004 — Derived Workspace Knowledge record
+- **Origin:** Assistant-discovered.
+- **Status:** Proposed for a later stage (design only).
+- **Problem:** Repeated analysis should be able to cite a stable archived source
+  instead of copying text again.
+- **Expected behavior:** A derived record (claim/summary/entity) references an
+  archived source id plus its analysis provenance and revision. It never stores
+  a second copy of the source text.
+- **Value:** Keeps archive storage normalized and deletion coherent.
+- **Reuse:** EVID-003 ids, structured extraction (INTEL-011).
+- **Depends on:** EVID-003 and Stage 3 extraction.
+- **Risks/unknowns:** Evidence-to-claim linkage and revision semantics.
+- **Do not:** Treat a derived claim as the source, or let it outlive a deleted
+  archive row silently.
+
+### 4.5.1 Evidence persistence model (design record — AWAITING OWNER APPROVAL)
+
+No schema, migration or Supabase object exists. This is the approved direction
+plus the bounds that still need approval; `ROADMAP.md` carries the delivery
+record.
+
+**Retention classes (never conflated):**
+
+| Class | Lifetime | Automatic expiry | Purpose |
+|---|---|---|---|
+| Active Evidence Run | Short, explicit TTL | Yes, lazy/database-time | Cited Summary, Explorer, restart-safe follow-ups. |
+| Archived Evidence Source | Until manual deletion | No | Owner-approved long-term source. |
+| Derived Workspace Knowledge | Derived | Follows its source | References an archive id; no second text copy. |
+| Workspace Glossary | Persistent | No (owner CRUD) | Owner terminology, not evidence and not AI memory. |
+
+**Conceptual objects (names only; no SQL is proposed here):**
+`ai_evidence_runs` (temporary parent), `ai_evidence_run_refs` (temporary child,
+`ON DELETE CASCADE`), `ai_evidence_archive` (indefinite, deduped on owner +
+source + message id), `ai_workspace_glossary` (persistent, bounded), and a later
+`ai_workspace_knowledge` (derived, referencing the archive). A run stores the
+bounded excerpts it needs; the archive is the one long-term copy; derived rows
+reference the archive instead of copying text. Expiry deletes runs and their
+refs; archive rows are never time-deleted.
+
+**Proposed bounds (all awaiting owner approval):** excerpt ≤ 1,000 characters;
+refs per run ≤ 50; stored text per run ≤ 32 KiB; active runs per owner ≤ 20;
+TTL **7 days recommended** (24 h / 72 h / 7 d / 30 d to choose from); archive
+≤ 5,000 records or 50 MiB of text per owner; glossary ≤ 200 entries or 50,000
+characters per workspace. At a limit the system sweeps expired runs and then
+refuses honestly; it never deletes archived evidence.
+
+**Growth scenarios (estimates, not measurements):** at ≈ 1.1–1.4 KB per archived
+row (400-character average excerpt, 2 bytes/character, metadata and index
+overhead), 20 rows/month ≈ 0.3 MB/year, 200/month ≈ 3 MB/year, 2,000/month ≈
+30 MB/year. Active runs with a 7-day TTL and the proposed 20-run cap stay under
+≈ 0.8 MB per owner in every scenario. These are planning assumptions; no
+Supabase billing figure or plan limit is claimed.
+
+**Isolation and provider projection:** every row is owner-scoped and the
+Workspace key is validated against that owner; an opaque id is never
+authorization. Runs and archive rows are service-role-only (RLS enabled, zero
+policies, `SELECT/INSERT/UPDATE/DELETE` granted to `service_role`) following
+`history_schedules`. A provider sees only the minimum bounded excerpt plus
+opaque local keys; it never decides ids, counts, links, existence, archival,
+deletion or retention. The envelope (ids, excerpts, hashes, links) must not enter
+`ToolResult.data`/`message`, tool arguments, `ai_tool_history`, `ai_messages`,
+the prompt or the provider continuation.
 
 ### 4.6 Cross-source and cross-chat intelligence
 
@@ -1138,29 +1262,27 @@ mean a stage is ready.
 ### 5.2 Corrected dependency graph
 
 ```text
-G1-A UI interaction ────────────────┬───────────────┐
-                                     │               │
-G2-A language (global/task/manual) ──┼──> G5-A Task Center
-                                     │               │
-G4-A single-source evidence ─────────┘               │
-        │                                            │
-        ├──> G4-B Workspace evidence integration <── G3-B
-        │                                            │
+G1-A UI interaction ────────────────────────────┬──> G5-A Task Center
+                                                │
+G2-A language (global/task/manual) ─────────────┘
+                                                │
+G4-A evidence storage + Cited Summary + Explorer│
+        │                                       │
+        ├──> G4-B restart-safe follow-ups       │
+        │        └──> G4-C extraction + Workspace Glossary
+        │                 └──> G4-D threshold-gated assessments
+        │
 G3-A source/Workspace identity ──> G3-B Workspace settings/dashboard/health
-        │                               │
-        │                               └──> G2-B Workspace language
-        │                                            │
-        │                                            └──> G5-B Workspace task scope
+        │                               ├──> G2-B Workspace language
+        │                               └──> G5-B Workspace task scope
         │
         ├──> G6-A cross-source query + export <── G4-A
-        │
         └──> G7-A activity metrics + coverage <── G4-A
-                    │
                     └──> G7-B schedule recommendations ──[V: Scheduled History Phase 7]
 
 G6-A ──[O: index/store]──> G6-B semantic search/similar discussion
 
-G3-A + G4-A + G5-A + G6-A + G7-A ──[O: advanced approval]──> G8 longitudinal intelligence
+G3-A + G4-A + G4-C + G5-A + G6-A + G7-A ──[O: advanced approval]──> G8 longitudinal intelligence
 
 G1-A ──> G1-B visual identity/accessibility
 ```
@@ -1178,7 +1300,10 @@ by `G3-A` and `G5-A`.
 | **Workspace identity** | Owner-approved source identity, type, access state and source list. | `PeerType`, bounded dialog enumeration, link resolver and `history_schedules(owner_id, peer_id)` exist; there is no Workspace table/model. | `G3-A` |
 | **Workspace settings/dashboard** | Durable per-source settings, dashboard and health. | No Workspace settings, activity dashboard or source-health surface exists. | `G3-B` |
 | **Evidence envelope** | Claim/message references, local validation, bounded follow-up retrieval, coverage. | `HistorySlice`/`HistoryMessage` expose message ids and first/last range; no claim-to-message citation contract or evidence ledger exists. | `G4-A` |
-| **Durable evidence index** | Cross-session/cross-run evidence browsing. | Occurrence `result_metadata`/`error_metadata` exist but are bounded diagnostics; no evidence table. | `G4-B`, owner-gated |
+| **Active evidence run** | Restart-safe Cited Summary, Explorer and follow-ups under an explicit TTL. | `HistorySlice`/`HistoryMessage` expose ids and dates; **no evidence table, repository or `workspace` model exists anywhere in `backend/`**. | `G4-A` (Stage 1) |
+| **Evidence archive** | Owner-approved indefinite retention of selected sources. | No archive, dedupe, hash or deletion contract exists; `history_schedules` proves only the service-role-only durable pattern. | `G4-A` foundation, owner-gated |
+| **Workspace glossary** | Persistent, bounded, owner-editable terminology. | No glossary table/model; G2-A owns the language contract. | `G4-C`, owner-gated |
+| **Durable evidence index** | Cross-session/cross-run evidence browsing. | Occurrence `result_metadata`/`error_metadata` are bounded diagnostics, not evidence. | `G4-B`, on the Stage 1 contract |
 | **Selection** | Exact, expiring, per-owner/per-feature selection for bulk actions. | `selection_state.py` now has owner + feature scopes (Stash default, Taskloom second), capped at 40 per scope, expiring after 900s; `retrieve.py` supplies the row/check/confirmation pattern and Taskloom adds CAS-revalidated bulk actions. | `G1-A` |
 | **Task authority** | One scheduler, one coordinator, one tool executor, CAS lifecycle. | `TaskScheduler`, `TaskExecutionCoordinator` and `ToolExecutor` exist; there is no separate `TaskExecutor` class. `TaskManagementService` exposes list/pause/resume/complete/fail/expire/delete, not cancel/retry. | `G5-A` |
 | **Activity data** | Bounded message/activity metrics and coverage. | No chat-activity metrics exist; `database_service` reports saves/provider stats only. | `G7-A` |
@@ -1212,12 +1337,14 @@ by `G3-A` and `G5-A`.
    `status`, `attempt`, `error_metadata`, `result_metadata` and timestamps, and
    `Taskloom` already lists recent occurrences. It does not display output or
    error detail. `G5-A` can add bounded inspection without a new store.
-6. **Evidence must start single-source.** History returns a bounded
-   `HistorySlice` with message ids, and summaries return first/last id metadata,
-   but no claim-to-message citations. `G4-A` can establish the evidence
-   envelope on one source without a Workspace. `G4-B` only adds durable,
-   Workspace-aware browsing over the same contract; it must not create a second
-   evidence format.
+6. **Evidence must start single-source, but it is no longer ephemeral-only.**
+   History returns a bounded `HistorySlice` with message ids, and summaries
+   return first/last id metadata, but no claim-to-message citations. The owner
+   approved durable Active Runs (TTL), an owner-approved indefinite Archive and
+   a persistent Glossary, so `G4-A` now establishes storage **and** the
+   envelope on one source without a Workspace. `G4-B` adds restart-safe
+   follow-ups over the same contract; it must not create a second evidence
+   format.
 7. **UI selection does not depend on language.** Stash already proves row
    toggle, visible check, pagination survival, cap/expiry and confirmation.
    `G1-A` can establish the reusable interaction contract without `G2-A`.
@@ -1234,14 +1361,38 @@ by `G3-A` and `G5-A`.
    external gate (Phase 7); `G6-B` has a separate owner gate (index/store).
 10. **LANG-005 was misplaced.** The extraction glossary cannot be delivered by
     the base language contract because it only has meaning alongside structured
-    extraction. It is assigned to `G4-A`, after `INTEL-010/011`, not to `G2-A`.
-11. **Persistence is owner-controlled.** Workspace settings, durable evidence
-    and semantic indexes each imply a new storage decision. This document does
-    not assume a table, migration or provider; those remain owner approvals.
+    extraction. It is assigned to `G4-C`, after `INTEL-010/011` and after the
+    approved persistent-glossary store, not to `G2-A`.
+11. **Evidence persistence is owner-decided; other persistence is not.**
+    Temporary runs, an indefinite owner-approved archive and a persistent
+    glossary are approved **in principle**, with TTL/quotas still open
+    (§4.5.1, §10). Workspace settings, semantic indexes and broader analytics
+    caching remain unapproved. This document still proposes no SQL, migration
+    or provider object.
 12. **No second runtime path is justified.** Every stage reuses
     `RuntimeSupervisor`, Dispatcher/ProviderManager, `ToolRegistry`/
     `ToolExecutor`, `TaskScheduler`/`TaskExecutionCoordinator`, existing
     services and the Telegram API boundary.
+13. **The generic tool path cannot carry evidence.** `ToolExecutor` persists
+    `arguments` and `result_data` (`backend/ai/tools/executor.py:380`, `:501`,
+    `:504`), the dispatcher puts the full `data` into provider continuation
+    (`dispatcher.py:2341`), tool messages enter `ai_messages`
+    (`dispatcher.py:975` → `persistence.py:167-171`), and `ai_tool_history`
+    stores arguments plus the result message (`persistence.py:359-366`). An
+    Evidence Envelope therefore needs a dedicated store and must never travel
+    as `ToolResult.data`/`message`.
+14. **A Workspace still does not exist.** No `workspace` table, model, service
+    or handler is present in `backend/`. The Glossary must therefore be keyed
+    by an owner-scoped workspace key until G3-A/G3-B define the real model, and
+    Stage 1 evidence is scoped to the owner plus the Telegram source.
+15. **Strict JSON has no existing precedent in the History path.**
+    `history_ai_service._call` uses `manager.chat(messages, tools=[])` with no
+    `response_format` (`history_ai_service.py:646-686`), so the JSON contract is
+    new work with its own validation and failure states — never an assumed
+    provider behavior.
+16. **Archive retention and storage cost are separate decisions.** Indefinite
+    retention is approved; unlimited consumption is not. Quotas must refuse new
+    archival honestly and must never evict previously archived evidence.
 
 ### 5.5 Stage prerequisites, gates and independent delivery
 
@@ -1253,15 +1404,17 @@ by `G3-A` and `G5-A`.
 | **G2-B** | G2-A + G3-B | G3-A | Effective-language tests across scopes | Same precedence decision | No | None |
 | **G3-A** | Existing resolver/dialogs + G1-A selection | None | Resolution/access, empty/failure, scope isolation | Owner approval for durable source registry if added | Yes, with derived read model | SOURCE-003 invite links |
 | **G3-B** | G3-A | G1-A | Settings inheritance, dashboard honesty, health failure states | Owner approval: Workspace persistence/schema | No | Durable features not approved |
-| **G4-A** | G2-A + existing History | None (single source) | Invented ids, insufficient evidence, conflicting evidence, context isolation | Owner approval for durable evidence only; ephemeral MVP can proceed | Yes | Durable index, Workspace glossary, Workspace browsing |
-| **G4-B** | G4-A + G3-B | G3-A | Cross-run evidence, retention, source isolation | Owner approval: evidence retention/index | No | Whole stage if retention refused |
+| **G4-A** (Stage 1) | G2-A + existing History + approved evidence storage | None (single source) | Invented ids/keys, insufficient evidence, conflicting evidence, context isolation, expiry honesty, owner isolation | Owner approval: TTL, quotas, excerpt cap, storage model | Yes | Extraction, glossary UI, follow-up tools, assessments |
+| **G4-B** (Stage 2) | G4-A | None | Restart-safe follow-up, stale/expired run, source isolation | TTL proven usable in practice | After G4-A | A second retrieval engine or evidence format |
+| **G4-C** (Stage 3) | G4-B + approved extraction schema | G3-A/G3-B helpful for glossary scope | Malformed JSON rejection, glossary conflict, prompt bound | Owner approval: extraction schema, glossary scope/limits | After G4-B | Tagged-text fallback unless separately approved |
+| **G4-D** (Stage 4) | G4-C + approved thresholds/policies | Owner policy | Insufficient-evidence refusal, no definitive person label | Owner approval: thresholds and person-level policy (never invented) | No | Whole stage until policy exists |
 | **G5-A** | G1-A + existing Taskloom/management | G2-A optional for language display | CAS, stale version, unsupported actions, bounded output | Owner approval: extend Taskloom vs new entry point | Yes | Cancel/retry, Workspace scope, inherited language |
 | **G5-B** | G5-A + G3-B + G2-B | G3-A | Workspace scope isolation, inherited effective language | Owner approval: Workspace persistence | No | None |
 | **G6-A** | G3-A + G4-A + G2-A | G3-B for the portable bundle | Attribution, per-source bounds, gaps, CSV escaping | Owner approval: export destination and notebook persistence | After prerequisites | EXPORT-002 until G3-B; semantic search |
 | **G6-B** | G6-A + approved index/store | None | Relevance, empty/unsupported state, index deletion | Owner approval: embedding provider, retention, cost | No | Whole stage if not approved |
 | **G7-A** | G3-A + G4-A | G3-B optional | Timezone, empty/partial data, coverage wording | Owner approval: sampling window/retention | Yes | Recommendations |
 | **G7-B** | G7-A | G3-A (G3-B optional for Workspace context) | Recommendation explanation, owner-confirmed prefill | **Validation gate: Scheduled History Phase 7** | No | Whole stage until gate passes |
-| **G8** | G3-A + G4-A + G5-A + G6-A + G7-A | G3-B/G4-B helpful, not required | Precision/refusal, privacy, no person judgments | Owner approval per capability | No | Any unapproved capability |
+| **G8** | G3-A + G4-A + G4-C + G5-A + G6-A + G7-A | G3-B helpful, not required | Precision/refusal, privacy, no person judgments | Owner approval per capability | No | Any unapproved capability |
 
 ## 6. Implementation Groups
 
@@ -1385,53 +1538,93 @@ silently duplicated.
 
 ### G4 — Evidence-Grounded Intelligence
 
-#### G4-A — Single-source evidence and interactive intelligence
-- **Included:** EVID-001 (ephemeral-first), INTEL-001, INTEL-002, INTEL-003,
-  INTEL-010, INTEL-011, INTEL-012, INTEL-037, LANG-005.
-- **Goal:** Establish one evidence envelope and use it for summaries,
-  follow-ups, extraction, subjective rigor and a basic Evidence Explorer on one
-  source.
-- **User Agency First (§2):** this principle should shape the eventual design of
-  evidence-backed summaries and citation visibility, the Evidence Explorer and
-  source inspection, follow-up questions and evidence retrieval, structured
-  extraction and output presentation, glossary configuration, and subjective
-  assessment modes and their stated limitations. The owner should have
-  meaningful control over how these capabilities are used and presented,
-  without compromising evidence integrity or deterministic validation.
-- **Unresolved owner decisions:** this principle does not choose citation
-  defaults or opt-in, evidence retention across restarts, follow-up lifetime,
-  subjective-assessment thresholds and whether definitive person-level
-  judgments are permitted, glossary persistence or scope, whether Telegram deep
-  links may expose private identifiers, or structured-output failure/fallback
-  behavior. These remain open (§10; item 3 covers evidence retention) and need
-  explicit owner approval before implementation.
-- **Reuse:** `history_service`, `HistoryMessage` ids, `HistorySlice` range,
-  `ToolRegistry`/`ToolExecutor`, provider structured output, G2-A language.
-- **Dependencies:** G2-A. G3-A is optional for source labels. Durable evidence
-  retention is an owner decision; the MVP can keep evidence ephemeral and
-  revalidate it against Telegram.
-- **Deliverables:** locally validated claim-to-message references; citations;
-  bounded follow-up retrieval; structured extraction with coverage; subjective
-  confidence rules; explorer; global glossary.
-- **Definition of Done:** Invented ids rejected; every evidence-backed claim is
-  revalidated; insufficient evidence is explicit; no second retrieval engine;
-  no definitive person judgment below the approved threshold.
-- **Deferred:** durable EVID-001 index, Workspace-scoped glossary, Workspace
-  evidence browsing.
-- **Why split:** Single-source evidence is the shared contract and does not need
-  a Workspace. Delaying it until G3 would block the highest-value trust work.
+Revised 2026-11-15 after the owner approved durable evidence retention. The old
+G4-A (ephemeral envelope) and G4-B (durable/Workspace browsing) split no longer
+matches the approved product: durability is required from Stage 1 for
+restart-safe follow-ups, and the Archive and Glossary are separate retention
+classes. The stage IDs are preserved (G4-A/G4-B) so every dependent stage keeps
+its reference; G4-C and G4-D are new. Implementation has not started.
 
-#### G4-B — Workspace-aware evidence integration
-- **Included:** No new IDs; consumes EVID-001 and INTEL-037.
-- **Goal:** Make evidence durable/cross-run and browsable by Workspace once the
-  owner approves retention and G3-B exists.
-- **Dependencies:** G4-A + G3-B; owner approval on evidence persistence.
-- **Deliverables:** approved evidence index/retention, Workspace evidence
-  navigation and cross-run inspectability using the SAME envelope.
-- **Definition of Done:** No second evidence format; deletion/expiry is honest;
-  source isolation holds.
-- **Deferred:** Whole stage if durable evidence is refused; ephemeral G4-A
-  remains valid.
+#### G4-A — Evidence storage foundation, Cited Summary and Explorer (Stage 1)
+- **Included:** EVID-001, EVID-002, EVID-003 (foundation), INTEL-002, INTEL-003,
+  INTEL-037.
+- **Goal:** Establish one bounded evidence contract backed by a temporary Active
+  Evidence Run, an owner-approved archive foundation, an **opt-in** Cited
+  Summary and a basic read-only Explorer with locally built Telegram links.
+- **Approved decisions recorded:** working evidence is temporary with an
+  explicit TTL; nothing is archived automatically; Archived Evidence is retained
+  until manual deletion; ordinary summaries stay plain and Cited Summary is an
+  explicit mode; Scheduled History stays body-only and citation-free; the
+  Evidence Envelope never enters generic tool/audit/conversation history;
+  provider output is never authoritative for ids, counts, links or existence.
+- **User Agency First (§2):** the owner chooses whether to cite, whether to
+  archive a suggested candidate, and which evidence to inspect. These choices
+  are explicit, reversible where possible, and never inferred by the model.
+- **Reuse:** `history_service`, `HistoryMessage` ids, `HistorySlice` range,
+  `ToolRegistry`/`ToolExecutor`, the Telegram message facade, G2-A language.
+- **Dependencies:** G2-A + existing History. **Owner approval of the storage
+  model, TTL, quotas and excerpt cap is a hard gate** (§4.5.1, §10). G3-A is
+  optional for source labels; Stage 1 is scoped to the owner plus one source.
+- **Deliverables:** conceptual `ai_evidence_runs`/`ai_evidence_run_refs` and
+  `ai_evidence_archive`; lazy TTL expiry; owner/workspace isolation; bounded
+  excerpts with hashes and captured-at; revalidation states; owner-confirmed
+  archival; deletion with dependent-record reporting; Cited Summary; Explorer
+  with locally constructed links.
+- **Definition of Done:** Invented ids/keys rejected; no cross-owner or
+  cross-run read; expired runs fail honestly; no media binaries or full chats;
+  no evidence in tool/audit/conversation history; archived evidence never
+  auto-deleted; no extraction, glossary UI, follow-up tool or assessment.
+- **Deferred:** Stage 2 follow-ups, Stage 3 extraction/glossary, Stage 4
+  assessments, Workspace browser.
+- **Why this is Stage 1:** the storage contract is the shared foundation every
+  later stage consumes; building it after extraction would require reworking
+  stored data.
+
+#### G4-B — Restart-safe follow-up questions (Stage 2)
+- **Included:** INTEL-001, EVID-002 (reuse), INTEL-003.
+- **Goal:** Answer a follow-up from the SAME durable run after an application
+  restart, with citations and an explicit insufficient-evidence state.
+- **Dependencies:** G4-A accepted, and the chosen TTL proving usable in
+  practice. No Workspace is required.
+- **Deliverables:** one follow-up tool that resolves an opaque run id locally,
+  revalidates the stored refs/snapshots, retrieves at most the bounded
+  surrounding context and answers with local keys.
+- **Definition of Done:** Same evidence contract; no second retrieval engine; no
+  reconstruction from unrelated conversation history; expired/missing run
+  reported honestly; provider never receives ids, links or unrelated context.
+- **Deferred:** cross-run/cross-source questions (G6-A).
+
+#### G4-C — Strict-JSON extraction and persistent Workspace Glossary (Stage 3)
+- **Included:** INTEL-010, INTEL-011, LANG-005 (persistent glossary).
+- **Goal:** Extract structured, evidence-backed records under a locally validated
+  strict-JSON contract, and let the owner maintain a bounded persistent glossary
+  that is injected only into these operations.
+- **Dependencies:** G4-B; owner-approved extraction schema and glossary
+  scope/limits. A Workspace model (G3-A/G3-B) is helpful but not required if the
+  owner approves an owner-scoped workspace key.
+- **Deliverables:** JSON schema + validator with explicit rejection; typed
+  records referencing evidence keys; glossary add/edit/delete with conflict
+  handling and caps; no automatic learning.
+- **Definition of Done:** Malformed/unsupported JSON rejected (never silently
+  repaired or downgraded); glossary never enters general memory or Scheduled
+  History; G2-A language precedence unchanged; prompt size bounded.
+- **Deferred:** Tagged-text fallback (a separately specified later contract),
+  cross-source extraction.
+
+#### G4-D — Descriptive and threshold-gated subjective assessments (Stage 4)
+- **Included:** INTEL-012.
+- **Goal:** Separate observed statements, repeated patterns, evidence counts,
+  conflicting opinions, missing perspectives and confidence — and refuse a
+  definitive judgment from insufficient evidence.
+- **Dependencies:** G4-C; **explicitly approved** evidence thresholds and
+  assessment policies, including the person-level policy.
+- **Deliverables:** descriptive assessment mode; refusal on insufficient
+  evidence; no numeric threshold or default may be introduced without approval.
+- **Definition of Done:** No provider-assigned final "good/bad" person label;
+  conflicting evidence shown; confidence tied to the approved policy; refusal
+  is a valid, reported outcome.
+- **Deferred:** Whole stage until the policy exists; no threshold may be
+  invented as a placeholder.
 
 ### G5 — Unified Task Center
 
@@ -1529,7 +1722,7 @@ silently duplicated.
   INTEL-036, SEARCH-003.
 - **Goal:** Explore evidence-derived longitudinal capabilities only after the
   evidence, Workspace and activity foundations are trustworthy.
-- **Dependencies:** G3-A, G4-A, G5-A, G6-A, G7-A; G3-B/G4-B helpful but not
+- **Dependencies:** G3-A, G4-A, G4-C, G5-A, G6-A, G7-A; G3-B is helpful but not
   mandatory for a first per-source evaluation. Each capability needs owner
   approval.
 - **Suggested order:** entity extraction → decisions/promises → topic
@@ -1554,8 +1747,10 @@ names the strongest thing standing between the stage and implementation.
 | **G2-B** | **P0** | P1 | Blocked by G3-B | Workspace persistence + precedence | Cannot exist before a Workspace settings home. |
 | **G3-A** | P1 | P1 | Ready with G1-A | Durable registry persistence if added | Identity/read model unlocks analytics and cross-source work; can start derived. |
 | **G3-B** | P1 | P1 | Owner-gated | Workspace persistence/schema | Dashboard/settings are valuable but require the persistence decision. |
-| **G4-A** | **P0** | P1 | Ready after G2-A | Durable evidence retention (ephemeral MVP allowed) | Trust foundation; single-source scope avoids waiting for Workspace. |
-| **G4-B** | **P0** | P2 | Blocked by G4-A/G3-B | Evidence retention approval | Adds durability/navigation, not a second evidence contract. |
+| **G4-A** (Stage 1) | **P0** | P1 | Design complete; **implementation blocked** | Owner approval: storage model, TTL, quotas, excerpt cap | Trust foundation; single-source scope avoids waiting for Workspace. |
+| **G4-B** (Stage 2) | **P0** | P1 | Blocked by G4-A | TTL must prove follow-up usefulness | Restart-safe follow-ups on the same contract, not a second engine. |
+| **G4-C** (Stage 3) | P1 | P2 | Blocked by G4-B | Extraction schema + glossary scope/limits | Strict JSON extraction and the persistent glossary. |
+| **G4-D** (Stage 4) | P1 | P3 | **Policy-gated** | Explicit thresholds + person-level policy | No number may be invented; refusal is a valid outcome. |
 | **G5-A** | P1 | **P0/P1** | Owner-gated after G1-A | Task Center shape; cancel/retry investigation | High value, mostly existing machinery, no Workspace needed. |
 | **G5-B** | P1 | P2 | Blocked by G5-A/G3-B/G2-B | Workspace persistence | Only the Workspace-scoped part waits. |
 | **G6-A** | P2 | P2 | Blocked by G3-A/G4-A | Export destination; notebook persistence | Depends on explicit source scope and evidence; no vector store needed. |
@@ -1570,8 +1765,10 @@ names the strongest thing standing between the stage and implementation.
   `G2-B` is P1 because Workspace must exist first.
 - **G5 is no longer uniformly P1.** `G5-A` is an early P0/P1 console;
   `G5-B` is P2 because it waits for Workspace and language inheritance.
-- **G4 is no longer blocked by G3.** `G4-A` is a P1 single-source foundation;
-  `G4-B` is the later durability/Workspace integration.
+- **G4 is now one storage contract in four stages.** `G4-A` (storage + Cited
+  Summary + Explorer) is a P1 single-source foundation; `G4-B` adds restart-safe
+  follow-ups, `G4-C` extraction/glossary and `G4-D` policy-gated assessments.
+  Durability is no longer a later stage.
 - **G6/G7 are no longer a single ordering.** `G7-A` can precede `G6-A`;
   `G7-B` and `G6-B` are separately gated. The previous plan put all of G7 before
   all of G6 while ignoring that only the recommendation half needs Phase 7.
@@ -1630,17 +1827,22 @@ cannot start.
   extend Taskloom); cancellation/retry requires a separate scheduler
   investigation before it is promised.
 
-### Step 5 — G4-A Single-source evidence and interactive intelligence
-- **Prerequisites:** G2-A; existing P1 History.
-- **Implement:** evidence envelope, citations, bounded follow-ups, structured
-  extraction, subjective rules, basic explorer, global glossary.
-- **Out of scope:** durable evidence index, Workspace evidence browsing,
-  cross-source claims.
-- **Deliverables:** verifiable summary/follow-up/extraction flow with coverage.
-- **Validation:** invented-id, insufficient-evidence, conflicting-evidence and
-  context-isolation tests; owner reviews one cited run.
-- **Gate:** evidence retention only for the durable part; ephemeral MVP may
-  proceed.
+### Step 5 — G4-A Evidence storage foundation, Cited Summary and Explorer (Stage 1)
+- **Prerequisites:** G2-A; existing P1 History; **owner-approved storage model,
+  TTL, quotas and excerpt cap**.
+- **Implement:** temporary Active Evidence Runs with lazy TTL expiry; the
+  owner-approved archive foundation; opt-in Cited Summary; basic read-only
+  Explorer with locally constructed Telegram links; owner-confirmed archival and
+  deletion.
+- **Out of scope:** follow-up tools, structured extraction, glossary UI,
+  subjective assessments, Workspace browsing, scheduled citations.
+- **Deliverables:** one bounded evidence contract with honest expiry and owner
+  isolation; a cited summary the owner can inspect source by source.
+- **Validation:** invented-id/key rejection, expired-run honesty, cross-owner
+  and cross-run isolation, excerpt/quota bounds, archive dedupe and deletion,
+  plus evidence-absence from tool/audit/conversation history.
+- **Gate:** the owner must approve the storage model, TTL and quotas before any
+  implementation; none of these numbers is approved yet.
 
 ### Step 6 — G3-A Source resolution and Workspace identity
 - **Prerequisites:** G1-A; existing resolver/dialogs.
@@ -1683,14 +1885,34 @@ cannot start.
 - **Validation:** scope isolation and inheritance tests.
 - **Gate:** Workspace persistence already approved.
 
-### Step 10 — G4-B Workspace evidence integration
-- **Prerequisites:** G4-A + G3-B; owner evidence-retention decision.
-- **Implement:** durable/cross-run evidence index and Workspace evidence
-  browsing using the same envelope.
-- **Out of scope:** a second evidence format; full chat archive.
-- **Deliverables:** approved retention/expiry and Workspace evidence navigation.
-- **Validation:** cross-run revalidation, deletion/expiry and source isolation.
-- **Gate:** owner approves durable evidence. If refused, stop at G4-A.
+### Step 10 — G4-B Restart-safe follow-ups (Stage 2)
+- **Prerequisites:** G4-A; the approved TTL proven usable in practice. G3-B is
+  not required.
+- **Implement:** a follow-up question over the SAME durable run, bounded
+  surrounding-context retrieval and local citation keys.
+- **Out of scope:** a second evidence format, a second retrieval engine,
+  cross-source follow-ups.
+- **Deliverables:** a follow-up that still works after a restart and fails
+  honestly when its run expired or its source is unavailable.
+- **Validation:** restart recovery, expired/missing run, stale source,
+  cross-owner/cross-run isolation and provider-projection review.
+- **Gate:** Stage 1 accepted; no new storage decision.
+
+### Step 10b — G4-C Extraction and persistent glossary (Stage 3)
+- **Prerequisites:** G4-B; owner-approved extraction schema and glossary
+  scope/limits.
+- **Implement:** strict-JSON extraction with local validation; the persistent,
+  owner-editable Workspace Glossary with explicit conflicts and caps.
+- **Out of scope:** tagged-text fallback (separate future contract), automatic
+  glossary learning, Workspace browsing.
+- **Gate:** schema and glossary decisions approved; Scheduled History untouched.
+
+### Step 10c — G4-D Threshold-gated assessments (Stage 4)
+- **Prerequisites:** G4-C; explicitly approved evidence thresholds and
+  person-level policy.
+- **Implement:** descriptive assessment with confidence, conflicts and refusal.
+- **Out of scope:** any invented numeric threshold or definitive person label.
+- **Gate:** policy approval only; the stage may stay closed indefinitely.
 
 ### Step 11 — G7-A Activity metrics, comparison and coverage
 - **Prerequisites:** G3-A + G4-A; owner sampling/retention decision.
@@ -1763,7 +1985,7 @@ cannot start.
 |---|---|
 | **TASK-002 cancel/retry** | The service exposes pause/resume/complete/fail/expire/delete, not cancellation of a running occurrence or retry of a selected failed occurrence. The scheduler has a `cancelled` status and bounded retries, but no owner-facing path. Cancel/retry is deferred until the coordinator/claim boundary is proven; the rest of TASK-002 belongs to G5-A. |
 | **G3-B durable Workspace settings** | No Workspace table/model exists. A derived identity/read model can start in G3-A, but durable settings/dashboard/health need owner-approved persistence. |
-| **G4-B durable evidence index** | EVID-001 can start ephemeral in G4-A; cross-session/cross-run browsing needs an owner-approved retention/index model. If refused, G4-A remains the stopping point. |
+| **G4-B durable evidence index** | The retention direction is approved, but Stage 1 cannot start until the owner approves the TTL, quotas and excerpt cap. Cross-run/cross-source browsing still needs G3-A/G3-B; archive quotas decide how long it remains useful. |
 | **SOURCE-003 invite links** | Current parser does not support them; Telegram invite preview/join semantics and side effects are unverified. |
 | **SEARCH-001 Semantic Search** | No embedding provider/index/store exists; content-retention and cost are owner decisions. Delivered only in G6-B. |
 | **SEARCH-002 Similar Discussion** | Depends on semantic retrieval; relevance evaluation and index ownership are undefined. Delivered only in G6-B. |
@@ -1780,9 +2002,10 @@ cannot start.
 | **Chat-only links** | Existing parser refuses them; extending it is a separate product decision. |
 | **Automated per-chat digest** | P3 in the active History roadmap; Phase 6 admission and Phase 7 live checks remain deferred. |
 
-LANG-005 is **not** deferred: it moves from the base language stage to G4-A,
-where structured extraction exists. Workspace language is not deferred either;
-it is a distinct stage (G2-B) blocked by G3-B.
+LANG-005 is **not** deferred: it moves from the base language stage to G4-C,
+where structured extraction exists and the persistent glossary can be injected.
+Workspace language is not deferred either; it is a distinct stage (G2-B) blocked
+by G3-B.
 
 ## 10. Open Questions and Owner Decisions
 
@@ -1797,9 +2020,12 @@ facts are not questions.
    Workspace > global > default), whether the existing `panel_settings.language`
    value is migrated or replaced, and whether Glass UI language is a separate
    setting from generated-content language.
-3. **Evidence retention:** Is G4-A allowed to start with ephemeral, revalidated
-   evidence, or must evidence persist across sessions immediately? Durable
-   cross-run browsing (G4-B) requires this decision.
+3. **Evidence retention (direction decided; numbers open):** the owner approved
+   temporary working evidence, restart-safe follow-ups, an owner-approved
+   indefinite archive with manual deletion, and a persistent glossary. Still
+   open: the active-run TTL, excerpt/ref/run caps, archive record and byte
+   quotas, and whether expiry deletes a run outright (proposed) or leaves a
+   tombstone. See §4.5.1.
 4. **Cross-source scope:** May a query read only explicitly selected Workspaces,
    or does the owner want broader account-level discovery? The former is the
    safer proposed default.
@@ -1820,6 +2046,19 @@ facts are not questions.
     indefinitely.
 11. **UI scope:** Approve the ordering/selection rules and how much visual
     customization is worth pursuing within Telegram's panel constraints.
+12. **Cited Summary surface:** panel-only, AI-trigger-only, or both, and whether
+    it is remembered per source or chosen per request (recommended: per request).
+13. **Archive suggestions:** may the system suggest candidates from any cited
+    run, or only from evidence the owner explicitly flagged? How many
+    suggestions may one surface show?
+14. **Glossary scope before Workspace exists:** an owner-scoped default key
+    (recommended) or wait for G3-A/G3-B. Entry and character limits also need
+    approval.
+15. **Person-level policy:** which thresholds, evidence counts and refusal rules
+    are acceptable for Stage 4, and whether any definitive person-level
+    judgment is permitted at all.
+16. **Tagged-text fallback:** whether to specify it at all, and if so, which
+    failure classes may use it without weakening strict-JSON validation.
 
 ## 11. Change Log
 
@@ -1829,3 +2068,4 @@ facts are not questions.
 | 2026-11-14 | Corrected dependency graph and sequence after source re-verification of the committed document (`63fdd5c`). Split G1, G2, G3, G4, G5, G6 and G7 into A/B sub-stages; moved G2-B after G3-B; moved G5-B after G3-B/G2-B; made G4-A single-source and G4-B Workspace-aware; separated G7-A metrics from Phase-7-gated G7-B recommendations; moved semantic search to owner-gated G6-B; reassigned LANG-005 to G4-A; recorded that task cancel/retry has no service path yet. No idea was removed, no runtime/test/schema/Supabase/Telegram/Render change was made. |
 | 2026-11-15 | Recorded G1-A as implemented for Stash and Taskloom: documented panel ordering, owner/feature-scoped selection, visible toggles, Taskloom bulk CAS actions and destructive confirmation. G1-B, G2-A, G5-A beyond this narrow UI work, Workspace and Scheduled History Phase 6/7 remain deferred. No schema, Supabase, Telegram, Render or live-operation change was made. |
 | 2026-11-15 | Added **User Agency First** as an owner-approved cross-cutting product principle in §2: meaningful owner choice over unnecessary assumptions, configurable behavior, safe predictable defaults, progressive disclosure, honest boundaries and no unnecessary paternalism. Added a concise G4-A reference naming the capabilities it should influence. G4-A owner decisions (citation defaults, evidence retention, follow-up lifetime, subjective-assessment thresholds/person judgments, glossary persistence/scope, deep-link privacy and structured-output failure behavior) remain unresolved. Documentation only; no code, test, config, schema, Supabase, Telegram, Render or deployment change. |
+| 2026-11-15 | Recorded the owner-approved evidence-persistence direction: temporary Active Evidence Runs with an explicit TTL, restart-safe follow-ups, an owner-approved indefinite Evidence Archive with manual deletion, a persistent bounded Workspace Glossary, opt-in Cited Summary, locally built Telegram links, strict-JSON-only initial extraction and unchanged citation-free Scheduled History. Added EVID-002/003/004 and §4.5.1 (retention classes, conceptual objects, proposed TTL/quotas, growth estimates, provider isolation), revalidated the leak paths against `416918e`, and split G4 into four stages (G4-A storage/Explorer, G4-B follow-ups, G4-C extraction/glossary, G4-D assessments). No schema, SQL, Supabase, Telegram, deployment or code change; no quota or TTL is approved yet. |
