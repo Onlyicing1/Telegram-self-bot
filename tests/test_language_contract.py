@@ -603,6 +603,63 @@ async def test_a_valid_explicit_language_is_not_blocked_by_broken_stored_data():
     assert "Language: Persian (effective for this response)" in _payload_text(payloads)
 
 
+@pytest.mark.asyncio
+async def test_a_failed_preference_read_is_not_repeated(monkeypatch):
+    """One read per request: a failure must not be retried behind dispatch's back.
+
+    The stored language is Persian. If dispatch read the repository a second
+    time inside ``_load_preferences`` (the bug), the prompt would show Persian
+    even though the decision came from the FAILED first read. The documented
+    English default must apply to both, and the repository must be read once.
+    """
+    get_repository_manager().preferences.update(OWNER, {"language": "fa"})
+    from backend.ai.database import preferences_repository as prefs_module
+
+    real = prefs_module.InMemoryPreferencesRepository.get_or_create
+    calls = {"count": 0}
+
+    def _flaky(self, owner_id):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise RuntimeError("preferences store unavailable")
+        return real(self, owner_id)
+
+    monkeypatch.setattr(
+        prefs_module.InMemoryPreferencesRepository, "get_or_create", _flaky,
+    )
+    payloads: list[list[dict[str, str]]] = []
+    result = await _dispatch(_engine(payloads), session_id="lang-single-read")
+
+    assert calls["count"] == 1
+    assert result.success is True
+    text = _payload_text(payloads)
+    assert "Language: English (effective for this response)" in text
+    assert "Global default language: English" in text
+    # "Persian" also appears in the static capability guidance; the LANGUAGE
+    # instructions must not pick it up from the would-be second read.
+    assert "Language: Persian" not in text
+    assert "Global default language: Persian" not in text
+
+
+@pytest.mark.asyncio
+async def test_invalid_stored_language_never_reaches_the_prompt():
+    """A malformed stored value must not be rendered into the model payload."""
+    sentinel = "invalid-language-sentinel-7f31"
+    get_repository_manager().preferences.update(OWNER, {"language": sentinel})
+    payloads: list[list[dict[str, str]]] = []
+    result = await _dispatch(
+        _engine(payloads), language="Persian", session_id="lang-safe-global",
+    )
+
+    assert result.success is True
+    text = _payload_text(payloads)
+    assert "Language: Persian (effective for this response)" in text
+    assert sentinel not in text
+    assert (
+        "Global default language: Unavailable (invalid stored preference)" in text
+    )
+
+
 def test_review_reports_explicit_and_effective_language():
     assert task_wizard.language_label("fa") == "Persian"
     get_repository_manager().preferences.update(OWNER, {"language": "fa"})

@@ -45,17 +45,21 @@
   resolver/catalog is the documented interface G4-A will consume.
 - No schema, migration, SQL, Supabase or live Telegram change was made.
 
-### Tests
+### Tests — original G2-A delivery (`730cb4b`)
 
-- `tests/test_language_contract.py` (28 tests): catalog/validation, precedence,
-  Auto contract and detection, AIRequest/dispatcher snapshot flow, History
-  summary/translation prompts + metadata + UI rendering, task freeze/explicit
-  precedence/preparation-policy rejection, and review labels.
+Results actually observed at that commit:
+
+- `tests/test_language_contract.py`: **28 passed** — catalog/validation,
+  precedence, Auto contract and detection, AIRequest/dispatcher snapshot flow,
+  History summary/translation prompts + metadata + UI rendering, task
+  freeze/explicit precedence/preparation-policy rejection, and review labels.
 - Updated `tests/test_task_wizard.py`'s review assertion from "Any" to the
   effective "Global default" it now reports.
-- Full suite under Python 3.11.16 (isolated `uv` environment): **7899 passed,
-  27 skipped, 1 failed** — the failure is the pre-existing
-  `tests/test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`.
+- Full suite under Python 3.11.16 (isolated `uv` environment): **7,899 passed,
+  27 skipped, 1 failed**. The failure was
+  `tests/test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`
+  ("interval advancement exceeded bound"); it also failed in later runs,
+  including this pass's full suite. Its root cause was not investigated.
 
 ### Limitations
 
@@ -86,7 +90,7 @@ precedence or persistence:
   is substituted and no `language` metadata is emitted for that request.
 - **Invalid stored preferences fail explicitly.** `_load_preference_record` is
   the ONE preferences read; `_load_preferences` no longer converts an
-  unreadable stored language into English (it preserves the raw value), and a
+  unreadable stored language into English, and a
   request that would actually use that invalid preference is refused with
   `language_rejected == "global"` and a separate, safe configuration message.
   A valid explicit request language still wins and does not consult the broken
@@ -104,6 +108,42 @@ precedence or persistence:
   valid global alone, explicit Auto fallback, invalid stored preference refused,
   and a valid explicit language unaffected by broken stored data. Existing
   prompt/context tests continue to pass with the new labels.
+
+### G2-A final corrective pass — snapshot integrity and safe prompt data
+
+Three residual issues from independent review were corrected:
+
+- **Exactly one preference snapshot on failure paths.** `_load_preferences` now
+  defaults `record` to a private `_PREFERENCE_RECORD_UNSET` sentinel, so an
+  omitted argument triggers the (single) repository read while an explicitly
+  supplied `None` — the failed read — does not read again. `dispatch()` passes
+  its one captured result, so the language decision and prompt preferences
+  always derive from the same read. With preferences unavailable, both use the
+  documented English default; no new fallback policy was added.
+- **Invalid stored values never reach the model prompt.** When the stored
+  language cannot be resolved, `PreferencesContext.language` receives the fixed
+  bounded label `Unavailable (invalid stored preference)` instead of the raw
+  value. A valid explicit request stays authoritative; an invalid stored
+  preference without an explicit request is still rejected before any provider
+  call. The builder needed no change.
+- **Report reconciled with executed results** (below); stale counts and the
+  unsupported “pre-existing” characterisation of the scheduler failure were
+  removed.
+
+Verification for this pass, all executed under Python 3.11.16:
+
+- `tests/test_language_contract.py`: **36 passed** (28 original + 8 dispatched
+  regression tests, including the one-read failure test and the full-payload
+  sentinel test).
+- Focused affected set (language, context architecture, History tools/panel, AI
+  state/presentation, prompt budget, task wizard): **308 passed**.
+- Full suite: **7,912 passed, 27 skipped, 1 failed** — only
+  `tests/test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`,
+  the same scheduler test that failed in the earlier G2-A runs. The exit status
+  was 1; the failure is not claimed as fixed or as pre-existing G2-A work.
+- Earlier corrective commit `85d6d04` reported 34 language tests, 306 focused
+  and 7,910/27/1 full; those were that commit's results, superseded by the
+  counts above.
 
 ## G1-A — Reusable interaction grammar (previous delivery)
 

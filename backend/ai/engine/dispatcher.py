@@ -82,6 +82,15 @@ LANGUAGE_INVALID_PREFERENCE = (
     "The stored AI content language is not valid. Set a supported output "
     "language in AI Settings."
 )
+#: Safe prompt representation of a stored language the catalog cannot read.
+#: The raw value never reaches the model.
+LANGUAGE_INVALID_PREFERENCE_LABEL = "Unavailable (invalid stored preference)"
+
+#: Distinguishes an omitted ``record=`` argument from a supplied ``None`` (the
+#: first read failed). Without this sentinel a failed read would trigger a
+#: SECOND repository read, letting the language decision and the prompt use
+#: different snapshots.
+_PREFERENCE_RECORD_UNSET = object()
 
 # Deterministic READ tools whose successful results are authoritative: they
 # are delivered EXACTLY as the tool produced them, never re-interpreted or
@@ -2486,16 +2495,22 @@ class Dispatcher:
             logger.warning("Preferences load failed for owner %s: %r", owner_id, exc)
             return None
 
-    def _load_preferences(self, owner_id: int, *, record: Any = None) -> Any:
+    def _load_preferences(
+        self, owner_id: int, *, record: Any = _PREFERENCE_RECORD_UNSET,
+    ) -> Any:
         """Build the prompt preference snapshot from the ONE read record.
 
-        An invalid stored language is NOT translated into English here: the raw
-        value is preserved so ``dispatch`` can reject the request explicitly.
+        ``record=_PREFERENCE_RECORD_UNSET`` (the default) means the caller did
+        not perform the read, so this method reads once. A deliberately
+        supplied ``None`` means that read FAILED: no second read is performed and
+        the documented English defaults apply. An invalid stored language is
+        never rendered raw — a fixed safe label is used instead, so the explicit
+        request language remains authoritative.
         """
         from backend.ai.conversation.context_builder import PreferencesContext
 
         try:
-            if record is None:
+            if record is _PREFERENCE_RECORD_UNSET:
                 record = self._load_preference_record(owner_id)
             if record is None:
                 return PreferencesContext()
@@ -2505,7 +2520,7 @@ class Dispatcher:
                     global_value=raw_language,
                 ).prompt_label
             except language_ai.LanguageError:
-                language_text = str(raw_language)
+                language_text = LANGUAGE_INVALID_PREFERENCE_LABEL
             return PreferencesContext(
                 language=language_text,
                 personality=record.personality,
