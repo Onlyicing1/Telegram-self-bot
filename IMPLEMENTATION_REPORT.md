@@ -72,6 +72,39 @@
 - G2-B (Workspace language), G4-A (extraction/glossary), G5-A and Scheduled
   History Phase 4+ are not implemented.
 
+### G2-A corrective pass — rejection and prompt clarity
+
+Two confirmed defects were corrected without changing the catalog, aliases,
+precedence or persistence:
+
+- **Invalid values are rejected, not coerced.** `Dispatcher.dispatch` now
+  resolves the content language through `_resolve_content_language` and returns
+  the existing `EngineResult(success=False, errors=[...], metadata={...})`
+  convention. An unsupported explicit `AIRequest.language` fails before any
+  provider call, with a safe bounded message listing the supported languages and
+  `metadata["language_rejected"] == "request"`. No English/Auto fallback decision
+  is substituted and no `language` metadata is emitted for that request.
+- **Invalid stored preferences fail explicitly.** `_load_preference_record` is
+  the ONE preferences read; `_load_preferences` no longer converts an
+  unreadable stored language into English (it preserves the raw value), and a
+  request that would actually use that invalid preference is refused with
+  `language_rejected == "global"` and a separate, safe configuration message.
+  A valid explicit request language still wins and does not consult the broken
+  lower-priority value.
+- **Prompt language is unambiguous.** `PromptBuilder._render_preferences` now
+  renders `Global default language: <value>`, while the runtime context renders
+  `Language: <effective> (effective for this response)`. Only the runtime line is
+  an output-language instruction; the global default is explicitly labelled as a
+  lower-priority default. Auto keeps its existing honest wording
+  (auto-detected vs. fallback). Personality, response style, auto-memory,
+  auto-tools and custom instructions are unchanged, and the single
+  preference-snapshot/one-resolution design is preserved.
+- Added real-dispatch tests (`tests/test_language_contract.py`): invalid explicit
+  request rejected with the provider never called, valid explicit over global,
+  valid global alone, explicit Auto fallback, invalid stored preference refused,
+  and a valid explicit language unaffected by broken stored data. Existing
+  prompt/context tests continue to pass with the new labels.
+
 ## G1-A — Reusable interaction grammar (previous delivery)
 
 ### Implemented

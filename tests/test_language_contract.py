@@ -25,6 +25,12 @@ from backend.ai.conversation.context_builder import PreferencesContext
 from backend.ai.database.manager import get_repository_manager
 from backend.ai.database.task_repository import InMemoryTaskRepository
 from backend.ai.engine.dispatcher import Dispatcher
+from backend.ai.engine.engine import Engine
+from backend.ai.providers.base.capabilities import ProviderCapabilities
+from backend.ai.providers.base.config import ProviderConfig
+from backend.ai.providers.base.contract import BaseProvider, ProviderResponse
+from backend.ai.providers.manager.manager import ProviderManager
+from backend.ai.providers.registry.registry import ProviderRegistry
 from backend.ai.preparation_policy import (
     PreparationPolicyError,
     derive_policy,
@@ -456,6 +462,145 @@ def test_a_verbatim_natural_language_instruction_is_never_rewritten():
     instruction = "summarize the last 100 messages of the university chat"
     frozen = _service()._freeze_language({"ai_instruction": instruction})
     assert frozen["ai_instruction"] == instruction
+
+
+# ── 7. Real dispatch behavior ──────────────────────────────────────────────
+
+
+class _ScriptedProvider(BaseProvider):
+    """Records every payload; never calls the network."""
+
+    def __init__(self, payloads: list[list[dict[str, str]]]) -> None:
+        super().__init__(
+            ProviderConfig(provider_name="scripted", enabled=True, default_model="m1")
+        )
+        self._payloads = payloads
+
+    @property
+    def name(self) -> str:
+        return "scripted"
+
+    @property
+    def capabilities(self) -> ProviderCapabilities:
+        return ProviderCapabilities(supports_tools=True)
+
+    async def chat(self, messages, **kwargs):
+        self._payloads.append([dict(m) for m in messages])
+        return ProviderResponse(text="ok", provider_name="scripted", success=True)
+
+    def initialize(self) -> None:
+        return None
+
+    def shutdown(self) -> None:
+        return None
+
+    def count_tokens(self, text: str) -> int:
+        return max(1, len(text) // 4)
+
+    def health(self) -> dict[str, bool]:
+        return {"healthy": True, "ready": True}
+
+
+def _engine(payloads: list[list[dict[str, str]]]) -> Engine:
+    registry = ProviderRegistry()
+    registry.register(_ScriptedProvider(payloads))
+    return Engine(providers=ProviderManager(registry))
+
+
+async def _dispatch(engine: Engine, **overrides):
+    base = {
+        "session_id": "lang-session",
+        "user_message": "hello",
+        "owner_id": OWNER,
+        "chat_id": -100555000,
+        "message_id": 11,
+    }
+    base.update(overrides)
+    return await engine.execute(AIRequest(**base))
+
+
+def _payload_text(payloads: list[list[dict[str, str]]]) -> str:
+    return "\n".join(str(m.get("content", "")) for m in payloads[0])
+
+
+@pytest.mark.asyncio
+async def test_invalid_explicit_request_language_is_rejected_before_the_provider():
+    payloads: list[list[dict[str, str]]] = []
+    result = await _dispatch(_engine(payloads), language="klingon")
+
+    assert result.success is False
+    assert result.errors and "Unsupported output language" in result.errors[0]
+    assert result.metadata["language_rejected"] == "request"
+    # No English fallback decision was substituted.
+    assert "language" not in result.metadata
+    # The provider was never called.
+    assert payloads == []
+
+
+@pytest.mark.asyncio
+async def test_valid_request_language_wins_in_the_rendered_prompt():
+    payloads: list[list[dict[str, str]]] = []
+    result = await _dispatch(
+        _engine(payloads), language="Persian", session_id="lang-explicit",
+    )
+
+    assert result.success is True
+    text = _payload_text(payloads)
+    assert "Language: Persian (effective for this response)" in text
+    # The global default stays visible but is explicitly labelled lower-priority
+    # and can never be read as this request's language instruction.
+    assert "Global default language: English" in text
+    assert "Language: English" not in text
+
+
+@pytest.mark.asyncio
+async def test_valid_global_preference_applies_without_an_explicit_value():
+    get_repository_manager().preferences.update(OWNER, {"language": "fa"})
+    payloads: list[list[dict[str, str]]] = []
+    result = await _dispatch(_engine(payloads), session_id="lang-global")
+
+    assert result.success is True
+    text = _payload_text(payloads)
+    assert "Language: Persian (effective for this response)" in text
+    assert "Global default language: Persian" in text
+
+
+@pytest.mark.asyncio
+async def test_explicit_auto_keeps_its_honest_fallback():
+    payloads: list[list[dict[str, str]]] = []
+    result = await _dispatch(
+        _engine(payloads), language="auto", session_id="lang-auto",
+    )
+
+    assert result.success is True
+    text = _payload_text(payloads)
+    assert "auto fallback" in text
+    assert "auto-detected" not in text
+
+
+@pytest.mark.asyncio
+async def test_invalid_stored_preference_is_rejected_not_read_as_english():
+    get_repository_manager().preferences.update(OWNER, {"language": "klingon"})
+    payloads: list[list[dict[str, str]]] = []
+    result = await _dispatch(_engine(payloads), session_id="lang-bad-global")
+
+    assert result.success is False
+    assert result.errors and "stored AI content language" in result.errors[0]
+    assert result.metadata["language_rejected"] == "global"
+    assert "English" not in result.errors[0]
+    assert payloads == []
+
+
+@pytest.mark.asyncio
+async def test_a_valid_explicit_language_is_not_blocked_by_broken_stored_data():
+    get_repository_manager().preferences.update(OWNER, {"language": "klingon"})
+    payloads: list[list[dict[str, str]]] = []
+    result = await _dispatch(
+        _engine(payloads), language="Persian", session_id="lang-explicit-bad-global",
+    )
+
+    assert result.success is True
+    assert "Language: Persian (effective for this response)" in _payload_text(payloads)
 
 
 def test_review_reports_explicit_and_effective_language():

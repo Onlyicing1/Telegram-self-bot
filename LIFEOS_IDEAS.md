@@ -1272,7 +1272,10 @@ silently duplicated.
 #### G2-A — Global, request and task language
 - **Status:** Implemented offline (2026-11-15). Global default, request-level
   selection, Taskloom task language, shared catalog/resolver, History summary
-  language and effective-language reporting. Auto is summary-only. G2-B
+  language and effective-language reporting. Auto is summary-only. Unsupported
+  explicit values are rejected before any provider call, and an invalid stored
+  preference fails explicitly instead of becoming English; the prompt labels
+  the global default separately from the effective request language. G2-B
   (Workspace) remains deferred; no schema change was made.
 - **Included:** LANG-001, LANG-002, LANG-003, LANG-004.
 - **Shared with later stage:** LANG-001/002 are extended by G2-B; their primary

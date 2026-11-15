@@ -50,6 +50,20 @@ migration, Supabase, Telegram, Render or live-operation change was made.
 - No extraction surface exists yet; G4-A must consume the same resolver.
 - No live Telegram or provider compliance test was performed.
 
+### G2-A corrective pass (2026-11-15)
+
+- **Invalid language values are rejected.** The dispatcher refuses an
+  unsupported explicit request language (or an invalid stored global
+  preference it would actually use) through the existing `EngineResult` failure
+  convention, before any provider call. No English fallback is substituted and
+  no fallback decision is recorded.
+- **Prompt language is unambiguous.** The preferences block renders the global
+  default as `Global default language`; the runtime context renders the
+  effective request language as `Language: … (effective for this response)`.
+  Auto keeps its honest detected/fallback wording.
+- Catalog, aliases, precedence, the single preference snapshot and the
+  one-resolution-per-request design are unchanged. No schema or live operation.
+
 ## Previous delivery: G1-A — Reusable interaction grammar
 
 Status: **Implemented offline for Stash and Taskloom. This is a UI interaction

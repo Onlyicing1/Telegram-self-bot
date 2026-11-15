@@ -71,6 +71,18 @@ logger = logging.getLogger(__name__)
 
 MAX_TOOL_ROUNDS = 3
 
+#: Safe, bounded rejection messages. They name the supported catalog, never the
+#: rejected value or any internal detail.
+LANGUAGE_INVALID_REQUEST = (
+    "Unsupported output language requested. Choose one of: "
+    + ", ".join(entry.label for entry in language_ai.CATALOG)
+    + "."
+)
+LANGUAGE_INVALID_PREFERENCE = (
+    "The stored AI content language is not valid. Set a supported output "
+    "language in AI Settings."
+)
+
 # Deterministic READ tools whose successful results are authoritative: they
 # are delivered EXACTLY as the tool produced them, never re-interpreted or
 # replaced by a continuation provider round, which would let the model
@@ -459,19 +471,30 @@ class Dispatcher:
         # The explicit request value beats the stored global preference, which
         # beats the English default. The resolved decision travels with the
         # request so the prompt and every tool read the SAME snapshot instead of
-        # re-reading preferences. The Glass UI language is not involved.
-        preferences = self._load_preferences(request.owner_id)
-        try:
-            language_decision = language_ai.resolve(
-                request=request.language,
-                global_value=getattr(preferences, "language", None),
-            )
-        except language_ai.LanguageError as exc:
+        # re-reading preferences. An unsupported value is REJECTED here — it is
+        # never silently substituted with English. The Glass UI language is not
+        # involved.
+        preference_record = self._load_preference_record(request.owner_id)
+        preferences = self._load_preferences(
+            request.owner_id, record=preference_record,
+        )
+        language_decision, rejection = self._resolve_content_language(
+            request, getattr(preference_record, "language", None),
+        )
+        if rejection is not None:
+            message, scope = rejection
             logger.warning(
-                "AI_EXEC_TRACE request_id=%s stage=language_rejected error=%s",
-                rid or "-", exc,
+                "AI_EXEC_TRACE request_id=%s stage=language_rejected source=%s",
+                rid or "-", scope,
             )
-            language_decision = language_ai.resolve()
+            metadata.setdefault("stages", []).append("language")
+            metadata["language_rejected"] = scope
+            metadata["token_source"] = "unavailable"
+            return EngineResult(
+                success=False,
+                errors=[message],
+                metadata=metadata,
+            )
         request.metadata["prompt_preferences"] = preferences
         request.metadata["language_decision"] = language_decision
         request.metadata["global_language"] = (
@@ -2431,29 +2454,65 @@ class Dispatcher:
             ),
         )
 
-    def _load_preferences(self, owner_id: int) -> Any:
-        """Load the owner's AI preferences from the repository manager.
+    @staticmethod
+    def _resolve_content_language(
+        request: AIRequest, global_value: Any,
+    ) -> tuple[language_ai.LanguageDecision | None, tuple[str, str] | None]:
+        """Resolve the request language, refusing unsupported values.
 
-        Uses ``RepositoryManager.preferences.get_or_create()`` which
-        returns an in-memory ``PreferencesRecord`` with defaults when
-        the ``ai_preferences`` table does not exist yet.
+        A valid explicit request value is authoritative and the stored global
+        preference is not consulted (so broken lower-priority data can never
+        replace it). Without an explicit value, an unreadable stored preference
+        is a configuration error, not a silent English selection.
+        """
+        explicit = getattr(request, "language", "")
+        if isinstance(explicit, str) and explicit.strip():
+            try:
+                return language_ai.resolve(request=explicit), None
+            except language_ai.LanguageError:
+                return None, (LANGUAGE_INVALID_REQUEST, "request")
+        try:
+            return language_ai.resolve(global_value=global_value), None
+        except language_ai.LanguageError:
+            return None, (LANGUAGE_INVALID_PREFERENCE, "global")
+
+    def _load_preference_record(self, owner_id: int) -> Any:
+        """The ONE preferences record read for a request (``None`` on failure)."""
+        try:
+            from backend.ai.database.manager import get_repository_manager
+
+            return get_repository_manager().preferences.get_or_create(owner_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Preferences load failed for owner %s: %r", owner_id, exc)
+            return None
+
+    def _load_preferences(self, owner_id: int, *, record: Any = None) -> Any:
+        """Build the prompt preference snapshot from the ONE read record.
+
+        An invalid stored language is NOT translated into English here: the raw
+        value is preserved so ``dispatch`` can reject the request explicitly.
         """
         from backend.ai.conversation.context_builder import PreferencesContext
 
         try:
-            from backend.ai.database.manager import get_repository_manager
-
-            repo = get_repository_manager().preferences
-            rec = repo.get_or_create(owner_id)
+            if record is None:
+                record = self._load_preference_record(owner_id)
+            if record is None:
+                return PreferencesContext()
+            raw_language = getattr(record, "language", "")
+            try:
+                language_text = language_ai.resolve(
+                    global_value=raw_language,
+                ).prompt_label
+            except language_ai.LanguageError:
+                language_text = str(raw_language)
             return PreferencesContext(
-                language=language_ai.resolve(
-                    request=None, global_value=rec.language,
-                ).prompt_label,
-                personality=rec.personality,
-                response_style=rec.response_style,
-                custom_instructions=rec.custom_instructions,
-                auto_memory=rec.auto_memory,
-                auto_tools=rec.auto_tools,
+                language=language_text,
+                personality=record.personality,
+                response_style=record.response_style,
+                custom_instructions=record.custom_instructions,
+                auto_memory=record.auto_memory,
+                auto_tools=record.auto_tools,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Preferences load failed for owner %s: %r", owner_id, exc)

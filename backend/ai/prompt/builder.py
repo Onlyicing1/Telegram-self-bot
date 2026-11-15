@@ -196,7 +196,10 @@ class PromptBuilder:
         """Render the preferences block from PreferencesContext."""
         p = ctx.preferences
         lines: list[str] = ["[Preferences]"]
-        lines.append(f"Language: {p.language}")
+        # This is the owner's GLOBAL default, not this request's effective
+        # language. The authoritative instruction is rendered in the runtime
+        # context block; labelling both prevents competing instructions.
+        lines.append(f"Global default language: {p.language}")
         lines.append(f"Personality: {p.personality}")
         lines.append(f"Response Style: {p.response_style}")
         lines.append(f"Auto-memory: {'enabled' if p.auto_memory else 'disabled'}")
@@ -245,7 +248,7 @@ class PromptBuilder:
         lines.append(f"Category: {ctx.current_category}")
         lines.append(f"Pending Action: {ctx.pending_action or 'None'}")
         lines.append(f"Timezone: {ctx.timezone}")
-        lines.append(f"Language: {ctx.language}")
+        lines.append(f"Language: {ctx.language} (effective for this response)")
         lines.append(f"Current Time: {ctx.current_time}")
 
         if ctx.settings.settings:
