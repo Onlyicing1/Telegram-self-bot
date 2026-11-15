@@ -1,6 +1,78 @@
 # IMPLEMENTATION REPORT
 
-## G1-A — Reusable interaction grammar (current delivery)
+## G2-A — Global, request and task language (current delivery)
+
+### Implemented
+
+- **One catalog/resolver** (`backend/ai/language.py`): `en`, `fa`, `ar`, `zh`
+  with stable codes, labels, directionality and a provider hint, plus an
+  explicit `auto` mode. All externally supplied values are validated; unknown
+  values raise `LanguageError` instead of silently becoming English. The
+  resolver returns the selected value, the effective code, the decision source
+  (`request`/`task`/`global`/`default`/`source`/`auto_fallback`) and whether
+  detection was used.
+- **Precedence:** request > task > global `ai_preferences.language` > English.
+  `panel_settings.language` is NOT read and remains the Glass UI language.
+- **Auto:** explicit selection only; source-based summaries use the dominant
+  source script when it resolves, otherwise the documented English fallback.
+  Auto is not offered for translation (a no-op there) and never overrides an
+  explicit task language.
+- **One preference snapshot:** `Dispatcher.dispatch` reads preferences once,
+  resolves the language, stores the decision on the request metadata, and uses
+  it for the prompt, the session view and `ToolContext.extra["global_language"]`.
+  `AIRequest.language` now defaults to empty ("not specified") and still accepts
+  explicit values from direct callers.
+- **History:** `summarize_history` accepts `language` + `global_language`, the
+  same decision drives every map call AND the reduce call, and the result data
+  carries `language`, `language_code`, `language_mode`, `language_source` and
+  `language_detected`. `translate_history` validates through the same catalog
+  and keeps its existing explicit-language behavior. Chunking, pacing,
+  concurrency, timeouts and provider-manager use are unchanged.
+- **History UI:** the panel has a request-level language selector
+  (`action:history_language`, ephemeral panel state) and the result renders the
+  effective language with its source (global default / auto detected / auto
+  fallback). No other chrome changed.
+- **Tasks:** Taskloom's language names/policy words come from the catalog. The
+  wizard's generated-content instruction freezes the owner's global default at
+  creation (inserted before a named source so source parsing is unchanged) and
+  an explicit task language is never rewritten. `preparation_policy` is
+  untouched and still rejects language mismatches; review/editor lines show the
+  explicit or effective language.
+- **Global setting UI:** AI → Settings shows and cycles the AI content language
+  through the existing `PreferencesRepository`, and states honestly that the
+  value is held in memory because `ai_preferences` has no deployed table.
+- **No extraction surface exists**, so none was integrated; the shared
+  resolver/catalog is the documented interface G4-A will consume.
+- No schema, migration, SQL, Supabase or live Telegram change was made.
+
+### Tests
+
+- `tests/test_language_contract.py` (28 tests): catalog/validation, precedence,
+  Auto contract and detection, AIRequest/dispatcher snapshot flow, History
+  summary/translation prompts + metadata + UI rendering, task freeze/explicit
+  precedence/preparation-policy rejection, and review labels.
+- Updated `tests/test_task_wizard.py`'s review assertion from "Any" to the
+  effective "Global default" it now reports.
+- Full suite under Python 3.11.16 (isolated `uv` environment): **7899 passed,
+  27 skipped, 1 failed** — the failure is the pre-existing
+  `tests/test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`.
+
+### Limitations
+
+- The global content language is process-memory only until an `ai_preferences`
+  table is deployed; the UI and this report say so, and no durable write is
+  claimed.
+- Natural-language task instructions stay verbatim (source-fidelity contract),
+  so the global default is frozen only for wizard-generated content. Freezing it
+  for NL tasks needs a durable task-language field (schema change), which this
+  phase must not add.
+- Provider compliance with a requested language is never verified; only the
+  requested/effective language is reported.
+- No live Telegram panel, Supabase or deployment operation was performed.
+- G2-B (Workspace language), G4-A (extraction/glossary), G5-A and Scheduled
+  History Phase 4+ are not implemented.
+
+## G1-A — Reusable interaction grammar (previous delivery)
 
 ### Implemented
 

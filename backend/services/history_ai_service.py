@@ -51,6 +51,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Sequence
 
+from backend.ai import language as language_ai
 from backend.ai.prompt.budget import (
     DEFAULT_MAX_CONTEXT_TOKENS,
     estimate_tokens_script_aware,
@@ -308,6 +309,9 @@ ERROR_ENGINE = "ai_engine_unavailable"
 #: The requested count is not permitted for this chat's peer type. This is a
 #: PRODUCT policy refusal, distinct from retrieval and AI-capacity failures.
 ERROR_POLICY = "history_peer_policy"
+#: An externally supplied output language is not in the shared catalog (or Auto
+#: was requested for an operation where it has no documented meaning).
+ERROR_LANGUAGE = "language_unsupported"
 
 
 class HistoryAIError(Exception):
@@ -868,13 +872,24 @@ _REDUCE_SYSTEM = (
 )
 
 
-def _language_clause(language: str) -> str:
-    if language:
-        return f"Write the result in {language}."
-    return (
-        "If no target language was requested, use English. Never leave a message "
-        "in a different script than the target."
-    )
+def _language_clause(decision: language_ai.LanguageDecision) -> str:
+    """The ONE language line every map/reduce call receives.
+
+    Auto reports its documented behavior honestly: a resolved source language is
+    named, and an unresolved source is stated as the English fallback instead of
+    claiming detection succeeded.
+    """
+    if decision.mode == "auto" and decision.detected:
+        return (
+            f"Write the result in {decision.label}, the dominant language of the "
+            "source messages."
+        )
+    if decision.mode == "auto":
+        return (
+            "Write the result in English: the source language could not be "
+            "resolved, so this is the documented Auto fallback."
+        )
+    return f"Write the result in {decision.label}."
 
 
 def _with_instruction(system: str, instruction: str) -> str:
@@ -928,11 +943,16 @@ def _resolve_manager(provider_manager: Any) -> Any:
     return getattr(engine, "provider_manager", None) if engine is not None else None
 
 
-def _result_data(plan: HistoryPlan, *, language: str = "") -> dict[str, Any]:
+def _result_data(
+    plan: HistoryPlan,
+    *,
+    language: str = "",
+    decision: language_ai.LanguageDecision | None = None,
+) -> dict[str, Any]:
     """Small structured payload. Never carries message bodies or internals."""
     first = plan.messages[0].message_id if plan.messages else None
     last = plan.messages[-1].message_id if plan.messages else None
-    return {
+    payload = {
         "operation": plan.operation,
         "requested": plan.requested,
         "processed": len(plan.messages),
@@ -946,6 +966,11 @@ def _result_data(plan: HistoryPlan, *, language: str = "") -> dict[str, Any]:
         "first_message_id": first,
         "last_message_id": last,
     }
+    if decision is not None:
+        # The effective language and WHY it was chosen travel with the result;
+        # the provider is never reported as having complied.
+        payload.update(decision.as_metadata())
+    return payload
 
 
 def _prepare_failure(exc: HistoryAIError) -> tuple[bool, str, dict[str, Any]]:
@@ -961,12 +986,38 @@ def _prepare_failure(exc: HistoryAIError) -> tuple[bool, str, dict[str, Any]]:
     }
 
 
-def _finish(plan: HistoryPlan, body: str, language: str = "") -> tuple[bool, str, dict[str, Any]]:
+def _finish(
+    plan: HistoryPlan,
+    body: str,
+    language: str = "",
+    decision: language_ai.LanguageDecision | None = None,
+) -> tuple[bool, str, dict[str, Any]]:
     notes = plan.notes()
     text = body.strip()
     if notes:
         text = f"{text}\n\n" + "\n".join(notes) if text else "\n".join(notes)
-    return True, text, _result_data(plan, language=language)
+    return True, text, _result_data(plan, language=language, decision=decision)
+
+
+def _decision_for(
+    messages: Sequence[HistoryMessage],
+    *,
+    language: Any,
+    global_language: Any,
+) -> language_ai.LanguageDecision:
+    """Resolve request > global > default for an already-fetched history.
+
+    Raises ``HistoryAIError`` for an unsupported value so the operation refuses
+    deterministically instead of quietly using a different language.
+    """
+    try:
+        return language_ai.resolve(
+            request=language,
+            global_value=global_language,
+            source_texts=[m.text for m in messages],
+        )
+    except language_ai.LanguageError as exc:
+        raise HistoryAIError(str(exc), code=ERROR_LANGUAGE) from exc
 
 
 # ── public API ────────────────────────────────────────────────────────────
@@ -978,6 +1029,7 @@ async def translate_history(
     *,
     count: Any = DEFAULT_COUNT,
     language: Any = None,
+    global_language: Any = None,
     instruction: Any = None,
     provider_manager: Any = None,
     current_message_id: Any = None,
@@ -1008,8 +1060,24 @@ async def translate_history(
     except HistoryAIError as exc:
         return _prepare_failure(exc)
 
+    try:
+        decision = _decision_for(
+            plan.text_messages, language=language, global_language=global_language,
+        )
+    except HistoryAIError as exc:
+        return False, f"{sym.STATE_FAILED} Translation failed: {exc}", {
+            "error": exc.code,
+        }
+    if decision.is_auto:
+        return False, (
+            f"{sym.STATE_FAILED} Translation needs a concrete target language; "
+            "Auto is available for summaries."
+        ), {"error": ERROR_LANGUAGE}
+
     if not plan.messages:
-        return True, "There are no messages to translate in this chat.", _result_data(plan)
+        return True, "There are no messages to translate in this chat.", _result_data(
+            plan, decision=decision,
+        )
 
     chunks = _chunk_history(
         plan.messages, with_attribution=False,
@@ -1023,15 +1091,15 @@ async def translate_history(
             plan, chunks=len(chunks), reduce_calls=0, capacity=capacity,
             budget_s=budget, with_attribution=False,
             token_budget=TRANSLATE_CHUNK_TOKEN_BUDGET, with_ids=True,
-        ), {"error": ERROR_TOO_LARGE, **_result_data(plan)}
+        ), {"error": ERROR_TOO_LARGE, **_result_data(plan, decision=decision)}
 
     if not chunks:
         # Messages exist but none has text: keep identity, translate nothing.
         body = "\n".join(f"[{m.message_id}] {_visible_body(m)}" for m in plan.messages)
-        return _finish(plan, body)
+        return _finish(plan, body, decision=decision)
 
     system = _with_instruction(
-        f"{_TRANSLATE_SYSTEM}\n- {_language_clause(plan.language)}", plan.instruction,
+        f"{_TRANSLATE_SYSTEM}\n- {_language_clause(decision)}", plan.instruction,
     )
 
     async def _translate_chunk(chunk: _Chunk) -> str:
@@ -1050,14 +1118,16 @@ async def translate_history(
             translated.update(_parse_translation(raw, chunk.message_ids))
     except HistoryAIError as exc:
         return False, f"{sym.STATE_FAILED} Translation failed: {exc}", {
-            "error": exc.code, **_result_data(plan),
+            "error": exc.code, **_result_data(plan, decision=decision),
         }
 
     lines = [
         f"[{m.message_id}] {translated.get(m.message_id) or _visible_body(m)}"
         for m in plan.messages
     ]
-    return _finish(plan, "\n".join(lines), language=plan.language)
+    return _finish(
+        plan, "\n".join(lines), language=decision.label, decision=decision,
+    )
 
 
 async def summarize_incremental(
@@ -1065,6 +1135,8 @@ async def summarize_incremental(
     *,
     previous_summary: Any = "",
     instruction: Any = "",
+    language: Any = None,
+    global_language: Any = None,
     provider_manager: Any = None,
     request_id: str = "",
     timeout_s: Any = None,
@@ -1089,6 +1161,12 @@ async def summarize_incremental(
         }
 
     text_messages = tuple(message for message in messages if message.text.strip())
+    try:
+        decision = _decision_for(
+            text_messages, language=language, global_language=global_language,
+        )
+    except HistoryAIError as exc:
+        return False, f"{sym.STATE_FAILED} Summary failed: {exc}", {"error": exc.code}
     if not text_messages:
         occurrence_trace(
             "ai_summarization_result", outcome="no_text_messages",
@@ -1126,7 +1204,8 @@ async def summarize_incremental(
         capacity=capacity,
     )
     system = _with_instruction(
-        _SUMMARIZE_SYSTEM, _clamp_instruction(instruction),
+        f"{_SUMMARIZE_SYSTEM}\n- {_language_clause(decision)}",
+        _clamp_instruction(instruction),
     )
 
     async def _summarize_chunk(chunk: _Chunk) -> str:
@@ -1149,7 +1228,10 @@ async def summarize_incremental(
             reduce_inputs = ([prior] if prior else []) + partials
             final = await _call(
                 manager,
-                system=_with_instruction(_REDUCE_SYSTEM, _clamp_instruction(instruction)),
+                system=_with_instruction(
+                    f"{_REDUCE_SYSTEM}\n- {_language_clause(decision)}",
+                    _clamp_instruction(instruction),
+                ),
                 payload=_summarize_payload(reduce_inputs, _clamp_instruction(instruction)),
                 request_id=request_id,
                 deadline=deadline,
@@ -1184,6 +1266,7 @@ async def summarize_incremental(
         "processed": len(messages),
         "text_messages": len(text_messages),
         "chunks": len(chunks),
+        **decision.as_metadata(),
     }
 
 
@@ -1192,6 +1275,8 @@ async def summarize_history(
     chat_id: Any,
     *,
     count: Any = DEFAULT_COUNT,
+    language: Any = None,
+    global_language: Any = None,
     instruction: Any = None,
     provider_manager: Any = None,
     current_message_id: Any = None,
@@ -1210,6 +1295,11 @@ async def summarize_history(
     ``with_identifiers=False`` is the deterministic UI mode: the provider gets
     only message text and the owner's instruction, never message ids or sender
     ids. The default ``True`` preserves every existing caller's prompt.
+
+    ``language`` is the explicit request-level selection (a catalog code, label
+    or ``auto``); ``global_language`` is the owner's stored default. The shared
+    resolver applies request > global > English exactly once, and the SAME
+    decision drives the map and reduce prompts.
     """
     manager = _resolve_manager(provider_manager)
     if manager is None:
@@ -1226,10 +1316,21 @@ async def summarize_history(
     except HistoryAIError as exc:
         return _prepare_failure(exc)
 
+    try:
+        decision = _decision_for(
+            plan.text_messages, language=language, global_language=global_language,
+        )
+    except HistoryAIError as exc:
+        return False, f"{sym.STATE_FAILED} Summary failed: {exc}", {"error": exc.code}
+
     if not plan.text_messages:
         if plan.messages:
-            return True, "None of these messages contains text to summarize.", _result_data(plan)
-        return True, "There are no messages to summarize in this chat.", _result_data(plan)
+            return True, "None of these messages contains text to summarize.", _result_data(
+                plan, decision=decision,
+            )
+        return True, "There are no messages to summarize in this chat.", _result_data(
+            plan, decision=decision,
+        )
 
     chunks = _chunk_history(
         plan.messages, with_attribution=with_identifiers,
@@ -1256,9 +1357,11 @@ async def summarize_history(
             plan, chunks=len(chunks), reduce_calls=reduce_calls, capacity=capacity,
             budget_s=map_budget, with_attribution=with_identifiers,
             token_budget=SUMMARIZE_CHUNK_TOKEN_BUDGET, with_ids=with_identifiers,
-        ), {"error": ERROR_TOO_LARGE, **_result_data(plan)}
+        ), {"error": ERROR_TOO_LARGE, **_result_data(plan, decision=decision)}
 
-    system = _with_instruction(_SUMMARIZE_SYSTEM, plan.instruction)
+    system = _with_instruction(
+        f"{_SUMMARIZE_SYSTEM}\n- {_language_clause(decision)}", plan.instruction,
+    )
 
     async def _summarize_chunk(chunk: _Chunk) -> str:
         return await _call(
@@ -1278,7 +1381,10 @@ async def summarize_history(
             # safety ceiling) — not by one call's assumed latency.
             final = await _call(
                 manager,
-                system=_with_instruction(_REDUCE_SYSTEM, plan.instruction),
+                system=_with_instruction(
+                    f"{_REDUCE_SYSTEM}\n- {_language_clause(decision)}",
+                    plan.instruction,
+                ),
                 payload=_summarize_payload(partials, plan.instruction),
                 request_id=request_id,
                 deadline=deadline,
@@ -1287,7 +1393,7 @@ async def summarize_history(
         raise
     except HistoryAIError as exc:
         return False, f"{sym.STATE_FAILED} Summary failed: {exc}", {
-            "error": exc.code, **_result_data(plan),
+            "error": exc.code, **_result_data(plan, decision=decision),
         }
 
-    return _finish(plan, final)
+    return _finish(plan, final, language=decision.label, decision=decision)

@@ -574,6 +574,15 @@ async def _ai_settings_panel_handler(event, extra: str) -> tuple[str, str, list]
     else:
         lines.append("! No wake word yet — set one to start chatting.")
     lines.append("")
+    content_language = _content_language_state(owner_id)
+    lines.append(
+        f"AI content language · {content_language['label']}"
+        + (" (global default)" if content_language["code"] == "" else "")
+    )
+    lines.append(
+        "Content language is separate from the Glass UI language. "
+        + content_language["storage_note"]
+    )
     lines.append(f"Reply stats · {'On' if reply_stats else 'Off'}")
     if read_failed:
         lines.append("My message in replies · unavailable (database read failed)")
@@ -591,9 +600,70 @@ async def _ai_settings_panel_handler(event, extra: str) -> tuple[str, str, list]
         f"Turn my message in replies {'off' if show_question else 'on'}",
         "action:ai_toggle_show_question",
     )
+    builder.add_row(
+        f"Output language: {content_language['label']} → next",
+        "action:ai_content_language",
+    )
     builder.add_row("Advanced", "panel:ai_settings_adv")
     _nav_buttons(builder)
     return "Settings", "\n".join(lines), builder.build()
+
+
+def _content_language_state(owner_id: int) -> dict[str, str]:
+    """The stored global content language, honestly labelled.
+
+    ``ai_preferences`` is not deployed as a table in this build, so the ONE
+    preferences repository is in-process memory. The panel says so instead of
+    presenting the value as durably stored.
+    """
+    from backend.ai import language as language_ai
+    from backend.ai.database.manager import get_repository_manager
+
+    try:
+        record = get_repository_manager().preferences.get_or_create(int(owner_id))
+        code = language_ai.normalize(getattr(record, "language", ""))
+    except Exception:  # noqa: BLE001 — a preferences read never breaks the panel
+        code = ""
+    durable = False
+    try:
+        repo = get_repository_manager().preferences
+        durable = type(repo).__name__.startswith("Supabase")
+    except Exception:  # noqa: BLE001
+        durable = False
+    return {
+        "code": code if code != language_ai.AUTO else language_ai.AUTO,
+        "label": (
+            "Auto" if code == language_ai.AUTO
+            else language_ai.label(code or language_ai.DEFAULT_CODE)
+        ),
+        "storage_note": (
+            "Saved durably." if durable
+            else "Held in memory for this process: the ai_preferences table is "
+            "not deployed, so this resets on restart."
+        ),
+    }
+
+
+async def _ai_content_language_action(event, extra: str, chat_id: int):
+    """Cycle the global content language through the ONE preferences record."""
+    from backend.ai import language as language_ai
+    from backend.ai.database.manager import get_repository_manager
+
+    owner_id = await _get_owner_id()
+    repo = get_repository_manager().preferences
+    record = repo.get_or_create(owner_id)
+    try:
+        current = language_ai.normalize(getattr(record, "language", ""))
+    except language_ai.LanguageError:
+        current = ""
+    choices = ["", *language_ai.TASK_CODES, language_ai.AUTO]
+    try:
+        index = choices.index(current)
+    except ValueError:
+        index = 0
+    next_code = choices[(index + 1) % len(choices)]
+    repo.update(owner_id, {"language": next_code or language_ai.DEFAULT_CODE})
+    return await _ai_settings_panel_handler(event, "")
 
 
 async def _ai_settings_inline_builder(event, extra: str) -> list:
@@ -2069,6 +2139,7 @@ def register(client, owner_id: int) -> None:
         register_action("ai_health_refresh", _ai_health_refresh_action)
         register_action("ai_toggle_telemetry", _ai_toggle_telemetry_action)
         register_action("ai_toggle_show_question", _ai_toggle_show_question_action)
+        register_action("ai_content_language", _ai_content_language_action)
         register_input("ai_settings", "trigger_en", {
             "handler": _ai_trigger_en_input,
             "prompt": "**English wake word**\n\nOne word, said before your message.\nSend 'clear' to remove.\n\n_Reply below._",

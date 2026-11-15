@@ -39,6 +39,7 @@ from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from backend.ai import language as language_ai
 from backend.ai.preparation_policy import derive_policy
 from backend.helper.symbols import (
     SCHEDULE_ONCE,
@@ -69,14 +70,28 @@ WEEKDAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", 
 
 # Wizard language choice -> the word the deterministic policy recognizes.
 # ("" = no language constraint; the existing "no language named" semantics.)
-LANGUAGE_NAMES = (
-    ("en", "English"),
-    ("fa", "Persian"),
-    ("ar", "Arabic"),
-    ("zh", "Chinese"),
-)
-LANGUAGE_POLICY = {"en": "english", "fa": "persian", "ar": "arabic", "zh": "chinese"}
+# Both come from the ONE shared catalog, so there is no second language list.
+LANGUAGE_NAMES = language_ai.TASK_LANGUAGE_NAMES
+LANGUAGE_POLICY = {
+    code: word.casefold() for code, word in LANGUAGE_NAMES
+}
 LANGUAGE_WORDS = dict(LANGUAGE_NAMES)
+
+
+def language_label(code: str = "", *, global_language: Any = None) -> str:
+    """The review label for a task's language contract.
+
+    An explicit choice is shown by name. No explicit choice means the task
+    freezes the owner's global default at creation, so the review reports that
+    effective default instead of an empty "Any".
+    """
+    if code:
+        entry = language_ai.get(code)
+        return entry.label if entry is not None else LANGUAGE_WORDS.get(code, code)
+    if global_language is None:
+        return "Global default"
+    decision = language_ai.resolve(global_value=global_language)
+    return f"{decision.label} (global default)"
 
 # The durable clause that turns the opt-in source display ON. The
 # deterministic policy recognizes it, so the flag cannot drift from what is
@@ -569,7 +584,11 @@ def first_run_summary(schedule_type: str, schedule: dict[str, Any]) -> str:
 
 
 def review_lines(
-    draft: TaskDraft, chat_id: int = 0, reference: datetime | None = None,
+    draft: TaskDraft,
+    chat_id: int = 0,
+    reference: datetime | None = None,
+    *,
+    global_language: Any = None,
 ) -> list[tuple[str, str]]:
     """The review screen: every row derived from the ACTUAL candidate."""
     candidate = build_candidate(draft, chat_id, reference)
@@ -580,7 +599,14 @@ def review_lines(
         policy = derive_policy(instruction)
         lines.append(("Content", f"Random generated {definition.ai_noun} (fresh each run)"))
         lines.append(("Source", policy.source or "Any"))
-        lines.append(("Language", policy.language.title() if policy.language else "Any"))
+        explicit = next(
+            (code for code, word in LANGUAGE_POLICY.items() if word == policy.language),
+            "",
+        )
+        lines.append((
+            "Language",
+            language_label(explicit, global_language=global_language),
+        ))
         lines.append((
             "Maximum length",
             f"at most {policy.max_length} characters" if policy.max_length else "Any",

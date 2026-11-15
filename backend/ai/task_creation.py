@@ -16,7 +16,8 @@ from backend.ai.database.task_repository import (
     TODO_SCHEDULE_TYPE,
     normalize_step_title,
 )
-from backend.ai.preparation_policy import CONTENT_FIELDS
+from backend.ai import language as language_ai
+from backend.ai.preparation_policy import CONTENT_FIELDS, derive_policy
 from backend.ai.scheduling import (
     ScheduleError,
     advance_interval,
@@ -50,6 +51,10 @@ from backend.ai.tools.base import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: The wizard's own AI-content marker. Only instructions it composes are
+#: extended with the frozen global language.
+WIZARD_GENERATION_CLAUSE = "randomly generated"
 
 
 def _creation_trace(stage: str, **fields: Any) -> None:
@@ -369,6 +374,49 @@ class TaskCreationService:
             ) from exc
         return task
 
+    def _freeze_language(self, candidate: dict[str, Any]) -> dict[str, Any]:
+        """Freeze the effective generated-content language into the instruction.
+
+        An explicit language already in the instruction is authoritative and is
+        left untouched. When the instruction names none, the owner's CURRENT
+        global content language is written INTO the instruction, so the task's
+        meaning cannot be rewritten by a later preference change and no second
+        task-language store exists. Read-only/static actions have no
+        instruction and are unaffected.
+        """
+        instruction = candidate.get("ai_instruction")
+        if not isinstance(instruction, str) or not instruction.strip():
+            return candidate
+        if derive_policy(instruction).language is not None:
+            return candidate
+        # Only the wizard's OWN composed generation instruction is extended.
+        # A natural-language task carries the owner's/model's instruction as the
+        # source-fidelity contract requires it, verbatim; rewriting it here
+        # would silently change the owner's words. Freezing the language for
+        # those tasks needs a durable task-language field, which G2-A must not
+        # add — so it is left as written and reported as a limitation.
+        if WIZARD_GENERATION_CLAUSE not in instruction.casefold():
+            return candidate
+        decision = language_ai.resolve(
+            global_value=language_ai.global_preference(self.owner_id)
+        )
+        clause = f", in {decision.label}"
+        # Keep any named source at the END of the instruction: the deterministic
+        # policy reads the words right after "from", so a clause appended after
+        # it would corrupt the source name.
+        marker = ", from "
+        if marker in instruction:
+            index = instruction.index(marker)
+            composed = instruction[:index] + clause + instruction[index:]
+        else:
+            composed = f"{instruction.rstrip(' ,.')}{clause}"
+        frozen = dict(candidate)
+        frozen["ai_instruction"] = composed
+        _creation_trace(
+            "language_frozen", language=decision.code, source=decision.source,
+        )
+        return frozen
+
     async def create(
         self,
         candidate: dict[str, Any],
@@ -401,6 +449,7 @@ class TaskCreationService:
             raise _invalid(f"unsupported task fields: {sorted(set(candidate) - allowed)}")
         if required - set(candidate):
             raise _invalid(f"missing required task fields: {sorted(required - set(candidate))}")
+        candidate = self._freeze_language(candidate)
         semantic_error = _semantic_completeness_error(candidate)
         if semantic_error:
             _creation_trace("semantic_incomplete", reason=semantic_error)

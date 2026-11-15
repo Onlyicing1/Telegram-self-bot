@@ -234,7 +234,9 @@ def test_review_lists_nothing_that_is_not_in_the_candidate():
     candidate = task_wizard.build_candidate(_draft(), 0, NOW)
     policy = derive_policy(candidate["ai_instruction"])
     assert rows["Source"] == "Any" and policy.source == ""
-    assert rows["Language"] == "Any" and policy.language is None
+    # The draft names no language; the review reports the effective global
+    # default that creation will freeze, not an empty "Any".
+    assert rows["Language"] == "Global default" and policy.language is None
     assert rows["Maximum length"] == "Any" and policy.max_length is None
     assert rows["Schedule"] == task_wizard.schedule_summary(
         candidate["schedule_type"], candidate["schedule"]

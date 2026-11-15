@@ -1,6 +1,56 @@
 # ROADMAP
 
-## Current delivery: G1-A — Reusable interaction grammar
+## Current delivery: G2-A — Global, request and task language
+
+Status: **Implemented offline. G2-B (Workspace language), G4-A (extraction and
+glossary), G5-A and Scheduled History Phase 4+ remain deferred.** No schema,
+migration, Supabase, Telegram, Render or live-operation change was made.
+
+### What G2-A adds
+
+- **One catalog and resolver** (`backend/ai/language.py`): stable codes with
+  labels and directionality for `en`, `fa`, `ar`, `zh` (Persian and English
+  required; Taskloom's existing four preserved). External values are validated;
+  unsupported values are refused, never coerced.
+- **Deterministic precedence:** explicit request > explicit task > global
+  `ai_preferences.language` > English. The Glass UI language
+  (`panel_settings.language`) is untouched and remains UI-only.
+- **Explicit Auto:** available for source-based summaries, never inferred, and
+  never able to override an explicit task language. A source's dominant script
+  is used when it can be resolved; otherwise the documented English fallback is
+  reported honestly. Translation exposes concrete languages only (Auto there
+  would be a no-op).
+- **One preference snapshot per request:** the dispatcher loads preferences
+  once, resolves the language, and passes the same decision to the prompt and to
+  every tool. `AIRequest.language` now means "explicit only" (empty otherwise).
+- **History:** `summarize_history` accepts a validated language; the same
+  decision drives every map call and the reduce call; translation routes its
+  language through the same catalog. Result metadata carries the effective
+  language, its source and Auto detection. The panel gains a request-level
+  language selector and renders the effective language honestly.
+- **Tasks:** Taskloom's language choices come from the catalog; the wizard's
+  generated-content instruction freezes the owner's global default at creation
+  (an explicit task language always wins), so a later preference change cannot
+  rewrite an existing task. `preparation_policy` is unchanged and still
+  fail-closed.
+- **UI:** AI → Settings exposes the global content language (with an honest
+  in-memory note while `ai_preferences` has no deployed table). Taskloom keeps
+  its task-level selector and shows the effective language in review.
+
+### Limitations reported for G2-A
+
+- The global content language lives in the existing in-memory
+  `ai_preferences` repository: there is no deployed `ai_preferences` table, so
+  the setting resets on restart. The UI says so instead of claiming a durable
+  write.
+- Natural-language task instructions are preserved verbatim (source-fidelity
+  contract), so the global default is frozen only for wizard-generated content.
+  Freezing it for NL tasks needs a durable task-language field (schema change),
+  which G2-A does not add.
+- No extraction surface exists yet; G4-A must consume the same resolver.
+- No live Telegram or provider compliance test was performed.
+
+## Previous delivery: G1-A — Reusable interaction grammar
 
 Status: **Implemented offline for Stash and Taskloom. This is a UI interaction
 delivery only; G1-B, G2-A, G5-A beyond this narrow Taskloom work, Workspace and

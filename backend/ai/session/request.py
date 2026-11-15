@@ -21,7 +21,10 @@ Fields (from AI_MASTER_DESIGN.md §25):
                     activation handler). Never the runtime AI history.
   tool_request:  Optional tool request name (future, empty for now).
   timestamp:     UTC datetime when this request was created.
-  language:      Owner's language (e.g. ``"English"``).
+  language:      An EXPLICIT request-level content language (a catalog code or
+                 label), or empty when the caller named none. The dispatcher
+                 resolves it against the global ``ai_preferences.language`` and
+                 the English default through ``backend.ai.language``.
   timezone:      Owner's timezone string (e.g. ``"Asia/Tehran"``).
   metadata:      Arbitrary extra metadata (future use).
   allow_tools:   Whether this request may expose or execute AI tools.
@@ -59,7 +62,9 @@ class AIRequest:
                           triggering message, or None when unavailable/disabled.
         tool_request:   Tool name to invoke (future — empty for now).
         timestamp:      UTC datetime when this request was created.
-        language:       Owner's language.
+        language:       Explicit request-level content language (catalog code
+                        or label), or empty when unnamed. Resolved by the
+                        dispatcher against the global preference.
         timezone:       Owner's timezone string.
         metadata:       Arbitrary extra metadata for future use.
         allow_tools:    Whether this request may expose or execute AI tools.
@@ -79,7 +84,7 @@ class AIRequest:
     telegram_context: TelegramChatContext | None = None
     tool_request: str = ""
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    language: str = "English"
+    language: str = ""
     timezone: str = "UTC"
     metadata: dict[str, Any] = field(default_factory=dict)
     request_id: str = ""

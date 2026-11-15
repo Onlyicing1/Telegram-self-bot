@@ -53,6 +53,7 @@ from backend.ai.engine.hooks import NOOP_HOOKS, EngineHooks, safe_call
 from backend.ai.engine.metrics import EngineMetrics
 from backend.ai.engine.result import EngineResult
 from backend.ai.engine.telemetry import telemetry
+from backend.ai import language as language_ai
 from backend.ai.memory.limits import MEMORY_READ_TIMEOUT_S
 from backend.ai.prompt.builder import PromptBuilder
 from backend.ai.proactive import PROACTIVE_AUTHORIZED_RULES, has_proactive_authorization
@@ -453,6 +454,30 @@ class Dispatcher:
             metadata["stages"].append("conversation_runtime")
         except Exception as exc:  # noqa: BLE001
             return self._fail(exc, "conversation_runtime", start, errors, metadata)
+
+        # ── Effective content language (ONE resolution per request) ──
+        # The explicit request value beats the stored global preference, which
+        # beats the English default. The resolved decision travels with the
+        # request so the prompt and every tool read the SAME snapshot instead of
+        # re-reading preferences. The Glass UI language is not involved.
+        preferences = self._load_preferences(request.owner_id)
+        try:
+            language_decision = language_ai.resolve(
+                request=request.language,
+                global_value=getattr(preferences, "language", None),
+            )
+        except language_ai.LanguageError as exc:
+            logger.warning(
+                "AI_EXEC_TRACE request_id=%s stage=language_rejected error=%s",
+                rid or "-", exc,
+            )
+            language_decision = language_ai.resolve()
+        request.metadata["prompt_preferences"] = preferences
+        request.metadata["language_decision"] = language_decision
+        request.metadata["global_language"] = (
+            getattr(preferences, "language", "") or language_ai.DEFAULT_CODE
+        )
+        metadata["language"] = language_decision.as_metadata()
 
         # ── Pending owner confirmation (deterministic, BEFORE any provider ──
         # ── round) ──
@@ -1509,6 +1534,12 @@ class Dispatcher:
         extra["request_id"] = request.request_id
         extra["provider_name"] = provider
         extra["model_name"] = model
+        # The SAME language snapshot the prompt used: raw global preference for
+        # the History tools' own precedence, plus the resolved decision.
+        extra["global_language"] = (
+            request.metadata.get("global_language") or language_ai.DEFAULT_CODE
+        )
+        extra["language_decision"] = request.metadata.get("language_decision")
         # Per-request proactive consent, proved from the OWNER'S message by the
         # ONE shared detector. Tools (create_task) read this instead of
         # re-deciding authorization — never stored, never a global mode.
@@ -2298,6 +2329,10 @@ class Dispatcher:
     async def _build_context(self, request: AIRequest, session: Any) -> Any:
         """Build a ConversationContext from the runtime session + request.
 
+        The preferences snapshot resolved by ``dispatch`` travels on the
+        request, so the prompt and every tool use ONE snapshot instead of
+        reading preferences twice.
+
         Uses the Conversation Layer's ContextBuilder so the Prompt
         Builder receives the exact object type it expects.
 
@@ -2390,7 +2425,10 @@ class Dispatcher:
             ),
             history=history_entries,
             memory=memory_data,
-            preferences=self._load_preferences(request.owner_id),
+            preferences=(
+                request.metadata.get("prompt_preferences")
+                or self._load_preferences(request.owner_id)
+            ),
         )
 
     def _load_preferences(self, owner_id: int) -> Any:
@@ -2408,7 +2446,9 @@ class Dispatcher:
             repo = get_repository_manager().preferences
             rec = repo.get_or_create(owner_id)
             return PreferencesContext(
-                language=rec.language,
+                language=language_ai.resolve(
+                    request=None, global_value=rec.language,
+                ).prompt_label,
                 personality=rec.personality,
                 response_style=rec.response_style,
                 custom_instructions=rec.custom_instructions,
@@ -2442,7 +2482,14 @@ class Dispatcher:
                 self.current_category = ""
                 self.current_flow = ""
                 self.pending_action = ""
-                self.language = req.language if req else "English"
+                decision = (
+                    req.metadata.get("language_decision")
+                    if req is not None else None
+                )
+                self.language = (
+                    decision.prompt_label if decision is not None
+                    else language_ai.resolve(request=req.language if req else None).prompt_label
+                )
                 self.timezone = req.timezone if req else "UTC"
                 # The runtime session records every completed tool call
                 # (ConversationManager.add_tool_result -> add_tool_call), so

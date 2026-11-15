@@ -75,6 +75,10 @@ _TERMINAL_TASK_STATUSES = frozenset({"completed", "deleted", "expired"})
 # candidate contract the natural-language path produces.
 _drafts: dict[int, TaskDraft] = {}
 _DEFAULT_TZ = "UTC"
+
+#: Set by ``register`` from trusted runtime configuration; used only to render
+#: the owner's global content language in review/editor lines.
+_OWNER_ID = 0
 _WIZARD_PANEL = "taskloom_new"
 
 _STATUS_ICON = {k: v.glyph for k, v in sym.TASK_STATE_SYMBOLS.items()}
@@ -846,7 +850,7 @@ def _wizard_render(draft: TaskDraft, owner_id: int | None = None) -> tuple[str, 
             lines.append(
                 f"**Content:** {sym.CONTENT_AI} AI-generated {sym.SEPARATOR} source "
                 f"{draft.source or 'Any'} {sym.SEPARATOR} language "
-                f"{task_wizard.LANGUAGE_WORDS.get(draft.language) or 'Any'}"
+                f"{task_wizard.language_label(draft.language, global_language=_global_language())}"
                 + (
                     f" {sym.SEPARATOR} show source {'Yes' if draft.show_source else 'No'}"
                     if draft.action == "bio" and draft.source
@@ -890,7 +894,10 @@ def _wizard_render(draft: TaskDraft, owner_id: int | None = None) -> tuple[str, 
             lines.append("anything left unset imposes no constraint.")
             lines.append("")
             lines.append(f"Source: {draft.source or 'Any'}")
-            lines.append(f"Language: {task_wizard.LANGUAGE_WORDS.get(draft.language) or 'Any'}")
+            lines.append(
+                "Language: "
+                f"{task_wizard.language_label(draft.language, global_language=_global_language())}"
+            )
             lines.append(
                 f"Maximum length: {f'at most {draft.max_length}' if draft.max_length else 'Any'}"
             )
@@ -962,7 +969,11 @@ def _wizard_render(draft: TaskDraft, owner_id: int | None = None) -> tuple[str, 
         lines.append("Save these changes?" if draft.editing_task_id else "Create this task?")
         lines.append("")
         try:
-            rows = task_wizard.review_lines(draft, reference=datetime.now(timezone.utc))
+            rows = task_wizard.review_lines(
+                draft,
+                reference=datetime.now(timezone.utc),
+                global_language=_global_language(),
+            )
         except TaskWizardError as exc:
             lines.append(f"_Incomplete: {exc}_")
             rows = []
@@ -1426,9 +1437,17 @@ _INPUT_PROMPTS = {
 }
 
 
+def _global_language() -> str:
+    """The owner's global content language, for honest review rendering only."""
+    from backend.ai import language as language_ai
+
+    return language_ai.global_preference(_OWNER_ID)
+
+
 def register(client, owner_id: int, tz_str: str) -> None:
-    global _DEFAULT_TZ
+    global _DEFAULT_TZ, _OWNER_ID
     _DEFAULT_TZ = tz_str if task_wizard.valid_timezone(tz_str or "") else "UTC"
+    _OWNER_ID = int(owner_id or 0)
     try:
         register_panel("taskloom", _taskloom_panel, parent="ai", title=sym.label(sym.ICON_LIBRARY, "Taskloom"))
         register_inline_builder("taskloom", _taskloom_inline_builder)

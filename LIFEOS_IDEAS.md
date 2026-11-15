@@ -339,8 +339,10 @@ reference them rather than renaming ideas.
 
 #### LANG-001 — Global, Workspace and Task language scopes
 - **Origin:** Owner-provided.
-- **Status:** Partial (global setting, task wizard choice and AI preferences exist
-  in fragments; no Workspace scope).
+- **Status:** Partial — global, request and task scopes are implemented
+  (`G2-A`: `backend/ai/language.py`, global `ai_preferences.language`, Taskloom
+  task language). The Workspace scope is deferred to `G2-B`; the Glass UI
+  language remains separate and unchanged.
 - **Problem:** There is no predictable place to choose the language of generated
   output, and UI language is mixed with content language.
 - **Expected behavior:** Separate settings for the Glass UI language and the
@@ -360,7 +362,9 @@ reference them rather than renaming ideas.
 
 #### LANG-002 — Explicit output-language selector and precedence
 - **Origin:** Owner-provided.
-- **Status:** Proposed.
+- **Status:** Implemented for History, AI requests and Taskloom (`G2-A`):
+  request > task > global > English, with the effective language in result
+  metadata and the History panel/result surface.
 - **Problem:** A summary or extraction may come back in an unintended language;
   the owner cannot select Persian/English up front.
 - **Expected behavior:** A first-class output-language selector (at minimum
@@ -377,7 +381,10 @@ reference them rather than renaming ideas.
 
 #### LANG-003 — Auto-detect as fallback, never a replacement
 - **Origin:** Owner-provided.
-- **Status:** Proposed.
+- **Status:** Implemented as an explicit mode for source-based History summaries
+  (`G2-A`). Detection is a conservative script heuristic; an unresolved source
+  uses the documented English fallback and says so. Auto is never inferred and
+  never overrides an explicit task language.
 - **Problem:** The owner may want the source language preserved or automatically
   matched without choosing a language every time.
 - **Expected behavior:** An explicit "Auto" option that detects from source or
@@ -392,7 +399,9 @@ reference them rather than renaming ideas.
 
 #### LANG-004 — Extensible language catalog
 - **Origin:** Owner-provided.
-- **Status:** Proposed.
+- **Status:** Implemented (`G2-A`) in `backend/ai/language.py`: one validated
+  catalog (code, label, direction, provider hint) used by the resolver, Taskloom
+  and the History tools. Adding a language is a data change.
 - **Problem:** Adding a language currently means editing scattered choices.
 - **Expected behavior:** One validated catalog of language codes, labels,
   directionality and provider hints; Persian and English are the required
@@ -1261,6 +1270,10 @@ silently duplicated.
 ### G2 — Language and Output Contract
 
 #### G2-A — Global, request and task language
+- **Status:** Implemented offline (2026-11-15). Global default, request-level
+  selection, Taskloom task language, shared catalog/resolver, History summary
+  language and effective-language reporting. Auto is summary-only. G2-B
+  (Workspace) remains deferred; no schema change was made.
 - **Included:** LANG-001, LANG-002, LANG-003, LANG-004.
 - **Shared with later stage:** LANG-001/002 are extended by G2-B; their primary
   ownership stays here.

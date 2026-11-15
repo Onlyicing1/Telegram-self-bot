@@ -1,0 +1,466 @@
+"""G2-A — the ONE language catalog, resolver and its integrations.
+
+Contract pinned here:
+
+  1. One catalog (en/fa/ar/zh) with stable codes, labels and directionality.
+  2. Deterministic precedence: request > task > global preference > English.
+  3. ``auto`` is explicit only, never inferred, and its fallback is honest.
+  4. The dispatcher resolves ONCE per request and every downstream reader uses
+     that same snapshot.
+  5. History summaries and translations receive the resolved language, both map
+     and reduce prompts, and report the effective language in their metadata.
+  6. A task freezes the global default at creation; an explicit task language
+     always wins and preparation_policy still rejects mismatches.
+"""
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from types import SimpleNamespace
+
+import pytest
+
+from backend.ai import language as language_ai
+from backend.ai import task_wizard
+from backend.ai.conversation.context_builder import PreferencesContext
+from backend.ai.database.manager import get_repository_manager
+from backend.ai.database.task_repository import InMemoryTaskRepository
+from backend.ai.engine.dispatcher import Dispatcher
+from backend.ai.preparation_policy import (
+    PreparationPolicyError,
+    derive_policy,
+    validate_content,
+)
+from backend.ai.session.request import AIRequest
+from backend.ai.task_creation import TaskCreationService
+from backend.ai.tools.context import ToolContext
+from backend.bot.handlers import history as history_panel
+from backend.services import history_ai_service, history_service
+
+OWNER = 424242
+
+
+@pytest.fixture(autouse=True)
+def _reset_global_language():
+    """Keep the process-wide preferences record deterministic per test."""
+    repo = get_repository_manager().preferences
+    repo.update(OWNER, {"language": "English"})
+    yield
+    repo.update(OWNER, {"language": "English"})
+
+
+# ── 1. Catalog ────────────────────────────────────────────────────────────
+
+
+def test_catalog_has_the_required_and_existing_languages():
+    assert "en" in language_ai.BY_CODE and "fa" in language_ai.BY_CODE
+    assert language_ai.TASK_CODES == ("en", "fa", "ar", "zh")
+    assert language_ai.get("fa").direction == "rtl"
+    assert language_ai.get("en").direction == "ltr"
+    assert language_ai.get("fa").label == "Persian"
+    assert language_ai.provider_hint("fa")
+
+
+def test_external_values_validate_against_the_catalog():
+    assert language_ai.normalize("English") == "en"
+    assert language_ai.normalize("fa") == "fa"
+    assert language_ai.normalize("Persian") == "fa"
+    assert language_ai.normalize("farsi") == "fa"
+    assert language_ai.normalize("Arabic") == "ar"
+    assert language_ai.normalize("Chinese") == "zh"
+    assert language_ai.normalize("") == ""
+    assert language_ai.normalize(None) == ""
+    assert language_ai.normalize("auto") == language_ai.AUTO
+    with pytest.raises(language_ai.LanguageError):
+        language_ai.normalize("klingon")
+    with pytest.raises(language_ai.LanguageError):
+        language_ai.normalize(42)
+
+
+# ── 2. Resolver precedence ────────────────────────────────────────────────
+
+
+def test_request_beats_task_beats_global_beats_default():
+    decision = language_ai.resolve(
+        request="fa", task="ar", global_value="zh"
+    )
+    assert (decision.code, decision.source) == ("fa", "request")
+
+    decision = language_ai.resolve(task="ar", global_value="zh")
+    assert (decision.code, decision.source) == ("ar", "task")
+
+    decision = language_ai.resolve(global_value="zh")
+    assert (decision.code, decision.source) == ("zh", "global")
+
+    decision = language_ai.resolve()
+    assert (decision.code, decision.source) == ("en", "default")
+
+
+def test_an_explicit_task_language_cannot_be_overridden_by_the_global_default():
+    decision = language_ai.resolve(task="fa", global_value="en")
+    assert decision.mode == "fixed"
+    assert decision.code == "fa"
+    assert decision.source == "task"
+
+
+def test_unsupported_values_are_rejected_not_coerced():
+    with pytest.raises(language_ai.LanguageError):
+        language_ai.resolve(request="klingon")
+
+
+# ── 3. Auto contract ──────────────────────────────────────────────────────
+
+
+def test_auto_is_explicit_and_reportable():
+    decision = language_ai.resolve(request="auto", source_texts=["چطوری گلم"])
+    assert decision.mode == "auto"
+    assert decision.source == "source"
+    assert decision.detected is True
+    assert decision.code == "fa"
+    assert "auto-detected" in decision.prompt_label
+
+
+def test_auto_is_never_selected_implicitly():
+    decision = language_ai.resolve(global_value="en", source_texts=["چطوری گلم"])
+    assert decision.mode == "fixed"
+    assert decision.source == "global"
+    assert decision.detected is False
+
+
+def test_auto_without_a_resolvable_source_uses_the_documented_fallback():
+    decision = language_ai.resolve(request="auto", source_texts=[])
+    assert decision.mode == "auto"
+    assert decision.source == "auto_fallback"
+    assert decision.code == "en"
+    assert decision.detected is False
+    assert "fallback" in decision.prompt_label
+
+
+def test_auto_never_overrides_an_explicit_task_language():
+    decision = language_ai.resolve(
+        request=None, task="fa", global_value="auto", source_texts=["Hello"]
+    )
+    assert decision.code == "fa"
+    assert decision.source == "task"
+
+
+def test_source_detection_supports_arabic_and_chinese():
+    assert language_ai.detect_source_language(["مرحبا بالعالم"]) == "ar"
+    assert language_ai.detect_source_language(["你好世界"]) == "zh"
+    assert language_ai.detect_source_language(["hello world"]) == "en"
+    assert language_ai.detect_source_language(["abcde", "你好世界"]) == ""
+
+
+def test_decision_metadata_is_bounded_and_never_user_text():
+    decision = language_ai.resolve(request="fa")
+    metadata = decision.as_metadata()
+    assert metadata["language"] == "Persian"
+    assert metadata["language_code"] == "fa"
+    assert metadata["language_source"] == "request"
+    assert metadata["language_mode"] == "fixed"
+
+
+# ── 4. AIRequest and dispatcher integration ───────────────────────────────
+
+
+def test_ai_request_language_is_empty_unless_explicitly_set():
+    request = AIRequest(
+        session_id="s", user_message="hi", owner_id=OWNER, chat_id=1, message_id=2
+    )
+    assert request.language == ""
+    explicit = AIRequest(
+        session_id="s", user_message="hi", owner_id=OWNER, chat_id=1, message_id=2,
+        language="Persian",
+    )
+    assert explicit.language == "Persian"
+
+
+def test_global_preference_reaches_the_dispatcher_prompt_preferences():
+    get_repository_manager().preferences.update(OWNER, {"language": "fa"})
+    dispatcher = Dispatcher.__new__(Dispatcher)
+    preferences = dispatcher._load_preferences(OWNER)
+    assert isinstance(preferences, PreferencesContext)
+    assert preferences.language == "Persian"
+
+
+def test_explicit_request_language_wins_in_the_session_view():
+    dispatcher = Dispatcher.__new__(Dispatcher)
+    decision = language_ai.resolve(request="fa", global_value="en")
+    request = AIRequest(
+        session_id="s", user_message="hi", owner_id=OWNER, chat_id=1, message_id=2,
+        language="Persian",
+        metadata={"language_decision": decision, "global_language": "en"},
+    )
+    session = SimpleNamespace(
+        session_id="s", owner_id=OWNER, tool_history=[], pending_tool=None,
+    )
+    view = dispatcher._adapt_session(session, request)
+    assert view.language == "Persian"
+
+
+def test_tool_context_carries_the_same_language_snapshot():
+    dispatcher = Dispatcher.__new__(Dispatcher)
+    dispatcher._provider_manager = None
+    dispatcher._tool_executor = SimpleNamespace(
+        _context=ToolContext(telegram=None, owner_id=OWNER, tz_str="UTC", client=None),
+    )
+    decision = language_ai.resolve(global_value="fa")
+    request = AIRequest(
+        session_id="s", user_message="hi", owner_id=OWNER, chat_id=1, message_id=2,
+        metadata={"language_decision": decision, "global_language": "fa"},
+    )
+    context = dispatcher._build_tool_context(request)
+    assert context.extra["global_language"] == "fa"
+    assert context.extra["language_decision"] is decision
+
+
+# ── 5. History ────────────────────────────────────────────────────────────
+
+
+def _message(mid: int, text: str) -> history_service.HistoryMessage:
+    return history_service.HistoryMessage(
+        message_id=mid, chat_id=-100, sender_id=1, out=False,
+        date=datetime(2026, 1, 1, tzinfo=timezone.utc), text=text,
+        reply_to_msg_id=None, has_media=False, ai_provenance=False,
+    )
+
+
+def _plan(*messages: history_service.HistoryMessage) -> history_ai_service.HistoryPlan:
+    return history_ai_service.HistoryPlan(
+        operation=history_ai_service.SUMMARIZE,
+        requested=len(messages),
+        count=len(messages),
+        capped=False,
+        language="",
+        instruction="",
+        messages=tuple(messages),
+        truncated=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_summary_receives_the_resolved_language(monkeypatch):
+    plan = _plan(_message(1, "hello"))
+
+    async def _prepare(*_args, **_kwargs):
+        return plan
+
+    prompts: list[str] = []
+
+    async def _call(_manager, *, system, payload, request_id, deadline):
+        prompts.append(system)
+        return "summary"
+
+    monkeypatch.setattr(history_ai_service, "_prepare", _prepare)
+    monkeypatch.setattr(history_ai_service, "_resolve_manager", lambda _m: object())
+    monkeypatch.setattr(history_ai_service, "_call", _call)
+
+    ok, _text, data = await history_ai_service.summarize_history(
+        None, -100, count=1, language="fa", global_language="en",
+    )
+
+    assert ok is True
+    assert "Write the result in Persian." in prompts[0]
+    assert data["language"] == "Persian"
+    assert data["language_code"] == "fa"
+    assert data["language_source"] == "request"
+
+
+@pytest.mark.asyncio
+async def test_every_map_and_reduce_stage_uses_the_same_language(monkeypatch):
+    plan = _plan(_message(1, "one"), _message(2, "two"))
+
+    async def _prepare(*_args, **_kwargs):
+        return plan
+
+    def _chunks(_messages, **_kwargs):
+        first = SimpleNamespace(lines=["one"], message_ids=[1])
+        second = SimpleNamespace(lines=["two"], message_ids=[2])
+        return [first, second]
+
+    prompts: list[str] = []
+
+    async def _call(_manager, *, system, payload, request_id, deadline):
+        prompts.append(system)
+        return "part"
+
+    monkeypatch.setattr(history_ai_service, "_prepare", _prepare)
+    monkeypatch.setattr(history_ai_service, "_resolve_manager", lambda _m: object())
+    monkeypatch.setattr(history_ai_service, "_chunk_history", _chunks)
+    monkeypatch.setattr(history_ai_service, "map_call_capacity", lambda _b: 10)
+    monkeypatch.setattr(history_ai_service, "_call", _call)
+
+    ok, _text, data = await history_ai_service.summarize_history(
+        None, -100, count=2, language="Persian",
+    )
+
+    assert ok is True
+    assert len(prompts) == 3  # map, map, reduce
+    assert all("Write the result in Persian." in prompt for prompt in prompts)
+    assert data["language"] == "Persian"
+
+
+@pytest.mark.asyncio
+async def test_summary_auto_uses_the_source_dominant_language(monkeypatch):
+    plan = _plan(_message(1, "چطوری گلم"))
+
+    async def _prepare(*_args, **_kwargs):
+        return plan
+
+    prompts: list[str] = []
+
+    async def _call(_manager, *, system, payload, request_id, deadline):
+        prompts.append(system)
+        return "خلاصه"
+
+    monkeypatch.setattr(history_ai_service, "_prepare", _prepare)
+    monkeypatch.setattr(history_ai_service, "_resolve_manager", lambda _m: object())
+    monkeypatch.setattr(history_ai_service, "_call", _call)
+
+    ok, _text, data = await history_ai_service.summarize_history(
+        None, -100, count=1, language="auto",
+    )
+
+    assert ok is True
+    assert data["language"] == "Persian"
+    assert data["language_mode"] == "auto"
+    assert data["language_detected"] is True
+    assert "Persian" in prompts[0]
+
+
+@pytest.mark.asyncio
+async def test_translation_honors_an_explicit_language(monkeypatch):
+    plan = _plan(_message(1, "hello"))
+
+    async def _prepare(*_args, **_kwargs):
+        return plan
+
+    prompts: list[str] = []
+
+    async def _call(_manager, *, system, payload, request_id, deadline):
+        prompts.append(system)
+        return "[1] سلام"
+
+    monkeypatch.setattr(history_ai_service, "_prepare", _prepare)
+    monkeypatch.setattr(history_ai_service, "_resolve_manager", lambda _m: object())
+    monkeypatch.setattr(history_ai_service, "_call", _call)
+
+    ok, _text, data = await history_ai_service.translate_history(
+        None, -100, count=1, language="fa",
+    )
+
+    assert ok is True
+    assert "Write the result in Persian." in prompts[0]
+    assert data["language"] == "Persian"
+
+
+@pytest.mark.asyncio
+async def test_unsupported_history_language_is_rejected(monkeypatch):
+    plan = _plan(_message(1, "hello"))
+
+    async def _prepare(*_args, **_kwargs):
+        return plan
+
+    monkeypatch.setattr(history_ai_service, "_prepare", _prepare)
+    monkeypatch.setattr(history_ai_service, "_resolve_manager", lambda _m: object())
+
+    ok, message, data = await history_ai_service.summarize_history(
+        None, -100, count=1, language="klingon",
+    )
+    assert ok is False
+    assert data["error"] == history_ai_service.ERROR_LANGUAGE
+
+    ok, message, data = await history_ai_service.translate_history(
+        None, -100, count=1, language="klingon",
+    )
+    assert ok is False
+    assert data["error"] == history_ai_service.ERROR_LANGUAGE
+
+
+@pytest.mark.asyncio
+async def test_auto_is_not_a_translation_target(monkeypatch):
+    plan = _plan(_message(1, "hello"))
+
+    async def _prepare(*_args, **_kwargs):
+        return plan
+
+    monkeypatch.setattr(history_ai_service, "_prepare", _prepare)
+    monkeypatch.setattr(history_ai_service, "_resolve_manager", lambda _m: object())
+
+    ok, _message_text, data = await history_ai_service.translate_history(
+        None, -100, count=1, language="auto",
+    )
+    assert ok is False
+    assert data["error"] == history_ai_service.ERROR_LANGUAGE
+
+
+def test_history_result_renders_the_effective_language():
+    body = history_panel._summary_body(
+        "fake summary",
+        {
+            "processed": 2,
+            "requested": 2,
+            "language": "Persian",
+            "language_mode": "auto",
+            "language_detected": True,
+        },
+        chat_name="Chat",
+    )
+    assert "Language: Persian (auto, detected from source)" in body
+
+
+# ── 6. Tasks ──────────────────────────────────────────────────────────────
+
+
+def _service() -> TaskCreationService:
+    return TaskCreationService(InMemoryTaskRepository(), OWNER)
+
+
+def test_task_freezes_the_global_default_at_creation():
+    get_repository_manager().preferences.update(OWNER, {"language": "fa"})
+    frozen = _service()._freeze_language(
+        {"ai_instruction": "write a message with a randomly generated line"}
+    )
+    assert frozen["ai_instruction"].endswith("in Persian")
+    assert derive_policy(frozen["ai_instruction"]).language == "persian"
+
+
+def test_task_explicit_language_is_never_rewritten():
+    get_repository_manager().preferences.update(OWNER, {"language": "fa"})
+    instruction = "write a message with a randomly generated line, in English"
+    frozen = _service()._freeze_language({"ai_instruction": instruction})
+    assert frozen["ai_instruction"] == instruction
+
+
+def test_a_later_global_change_does_not_alter_the_frozen_task():
+    get_repository_manager().preferences.update(OWNER, {"language": "fa"})
+    frozen = _service()._freeze_language(
+        {"ai_instruction": "write a message with a randomly generated line"}
+    )
+    get_repository_manager().preferences.update(OWNER, {"language": "en"})
+    assert frozen["ai_instruction"].endswith("in Persian")
+
+
+def test_preparation_policy_still_rejects_a_task_language_mismatch():
+    policy = derive_policy("write a message with a randomly generated line, in Persian")
+    assert policy.language == "persian"
+    with pytest.raises(PreparationPolicyError):
+        validate_content("this is English", policy)
+    assert validate_content("این یک پیام فارسی است", policy)
+
+
+def test_a_verbatim_natural_language_instruction_is_never_rewritten():
+    """The source-fidelity contract owns NL instructions; freezing must not
+    change the owner's/model's words. That path needs a durable task-language
+    field, which G2-A does not add (reported as a limitation)."""
+    get_repository_manager().preferences.update(OWNER, {"language": "fa"})
+    instruction = "summarize the last 100 messages of the university chat"
+    frozen = _service()._freeze_language({"ai_instruction": instruction})
+    assert frozen["ai_instruction"] == instruction
+
+
+def test_review_reports_explicit_and_effective_language():
+    assert task_wizard.language_label("fa") == "Persian"
+    get_repository_manager().preferences.update(OWNER, {"language": "fa"})
+    assert task_wizard.language_label("", global_language="fa") == (
+        "Persian (global default)"
+    )

@@ -21,6 +21,7 @@ from backend.helper import symbols as sym
 import logging
 from typing import Any
 
+from backend.ai import language as language_ai
 from backend.ai.tools.base import PermissionLevel, Tool, ToolResult
 from backend.ai.tools.context import ToolContext
 from backend.services import history_ai_service
@@ -80,6 +81,21 @@ def _request_id(context: ToolContext) -> str:
     return str(value) if value else ""
 
 
+def _global_language(context: ToolContext) -> str:
+    """The owner's global content language, read ONCE by the dispatcher.
+
+    ``extra["global_language"]`` is set from the same preference snapshot the
+    prompt used, so a tool never reads a conflicting snapshot. A direct caller
+    without that extra falls back to the ONE preferences repository.
+    """
+    extra = context.extra if context is not None else None
+    value = extra.get("global_language") if extra else None
+    if isinstance(value, str) and value:
+        return value
+    owner_id = getattr(context, "owner_id", 0) if context is not None else 0
+    return language_ai.global_preference(int(owner_id or 0))
+
+
 def _request_timeout(context: ToolContext) -> Any:
     """The caller's wall-clock envelope for this request.
 
@@ -137,9 +153,11 @@ class TranslateHistoryTool(Tool):
             },
             "language": {
                 "type": "string",
+                "enum": list(language_ai.TASK_CODES),
                 "description": (
-                    "Target language, e.g. 'English' or 'Persian'. Pass it when "
-                    "the owner named one; otherwise omit it."
+                    "Target language code: 'en', 'fa', 'ar' or 'zh'. Pass it when "
+                    "the owner named one; otherwise omit it and the owner's "
+                    "global content language applies."
                 ),
             },
             "instruction": {
@@ -184,6 +202,7 @@ class TranslateHistoryTool(Tool):
                 chat_id,
                 count=_count(arguments),
                 language=arguments.get("language"),
+                global_language=_global_language(context),
                 instruction=arguments.get("instruction"),
                 provider_manager=_provider_manager(context),
                 current_message_id=_current_message_id(context),
@@ -221,8 +240,11 @@ class SummarizeHistoryTool(Tool):
         return (
             "Summarize the most recent Telegram messages of this chat (default "
             "100, up to 1000) with the AI model. Long histories are summarized "
-            "in parts and then merged into one coherent summary. Use this for "
-            "requests like 'summarize the last 500 messages'."
+            "in parts and then merged into one coherent summary. The summary is "
+            "written in the owner's configured content language. Pass 'language' "
+            "when the owner named a different one, or 'auto' to preserve the "
+            "source's dominant language. Use this for requests like 'summarize "
+            "the last 500 messages'."
         )
 
     @property
@@ -234,6 +256,15 @@ class SummarizeHistoryTool(Tool):
                 "maximum": _MAX_COUNT,
                 "default": history_ai_service.DEFAULT_COUNT,
                 "description": "How many of the most recent messages to summarize.",
+            },
+            "language": {
+                "type": "string",
+                "enum": [*language_ai.TASK_CODES, language_ai.AUTO],
+                "description": (
+                    "Output language: 'en', 'fa', 'ar', 'zh', or 'auto' to "
+                    "match the source's dominant language. Omit it to use the "
+                    "owner's global content language."
+                ),
             },
             "instruction": {
                 "type": "string",
@@ -261,7 +292,8 @@ class SummarizeHistoryTool(Tool):
     def return_type(self) -> str:
         return (
             "ToolResult whose message is the generated summary text; data "
-            "carries operation/requested/processed/truncated/capped."
+            "carries operation/requested/processed/truncated/capped plus the "
+            "effective language, its source and whether Auto detected it."
         )
 
     async def execute(self, context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
@@ -275,6 +307,8 @@ class SummarizeHistoryTool(Tool):
                 _source(context),
                 chat_id,
                 count=_count(arguments),
+                language=arguments.get("language"),
+                global_language=_global_language(context),
                 instruction=arguments.get("instruction"),
                 provider_manager=_provider_manager(context),
                 current_message_id=_current_message_id(context),

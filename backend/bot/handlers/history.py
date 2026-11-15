@@ -133,6 +133,9 @@ class _State:
     peer_type: PeerType | None = None
     count: int = DEFAULT_COUNT
     focus: str = ""
+    #: "" = the owner's global content language; otherwise a catalog code or
+    #: ``auto``. Ephemeral panel state only.
+    language: str = ""
 
 
 @dataclass(frozen=True)
@@ -261,6 +264,35 @@ def _clear_selection() -> None:
     _STATE.chat_name = ""
     _STATE.peer_type = None
     _STATE.count = DEFAULT_COUNT
+    _STATE.language = ""
+
+
+def _global_language() -> str:
+    """The owner's global content language, for this panel's honest display."""
+    from backend.ai import language as language_ai
+
+    return language_ai.global_preference(_OWNER_ID)
+
+
+def _language_text() -> str:
+    from backend.ai import language as language_ai
+
+    if _STATE.language == language_ai.AUTO:
+        return "Auto (match the chat's dominant language)"
+    if _STATE.language:
+        return language_ai.label(_STATE.language)
+    return f"Global default ({language_ai.label(_global_language())})"
+
+
+def _next_language() -> str:
+    from backend.ai import language as language_ai
+
+    choices = ["", *language_ai.TASK_CODES, language_ai.AUTO]
+    try:
+        index = choices.index(_STATE.language)
+    except ValueError:
+        index = 0
+    return choices[(index + 1) % len(choices)]
 
 
 def _panel_buttons() -> list:
@@ -282,6 +314,7 @@ def _panel_buttons() -> list:
                 *[(str(value), f"action:history_count:{value}") for value in choices[2:]]
             )
     builder.add_row("Set Focus Instruction", f"input:{PANEL_ID}:focus")
+    builder.add_row(f"Language: {_language_text()}", "action:history_language")
     builder.add_row("Run Summary", "action:history_run")
     builder.add_row(sym.label(sym.OP_CREATE, "Schedule History"), f"panel:{SCHEDULE_PANEL_ID}")
     builder.add_row("Summarize Message Link", f"input:{PANEL_ID}:link")
@@ -295,6 +328,7 @@ def _panel_body(notice: str = "") -> str:
         "",
         f"Chat: {_STATE.chat_name or 'not selected'}",
         f"Messages: {_STATE.count}",
+        f"Language: {_language_text()}",
         f"Focus: {_STATE.focus or 'none'}",
     ]
     if _STATE.peer_type is not None:
@@ -1221,6 +1255,19 @@ def _summary_body(
     ]
     if ending_at is not None:
         lines.append(f"Ending at: #{ending_at}")
+    if data.get("language"):
+        # The requested/effective language, never a claim that the provider
+        # complied. Auto states whether it detected the source or fell back.
+        detail = f"Language: {data['language']}"
+        if data.get("language_mode") == "auto":
+            detail += (
+                " (auto, detected from source)"
+                if data.get("language_detected")
+                else " (auto fallback: source language unresolved)"
+            )
+        elif data.get("language_source") == "global":
+            detail += " (global default)"
+        lines.append(detail)
     lines.append(_history_line(data))
     body = "\n".join(lines)
     summary = str(text or "").strip()
@@ -1253,6 +1300,7 @@ async def _run_summary(
     generation: int,
     current_message_id: int | None = None,
     ending_at: int | None = None,
+    language: str = "",
 ) -> None:
     editor = _editor(panel_chat_id, panel_msg_id, inline_id, generation)
     # A new run invalidates the previous run's page buttons IMMEDIATELY, so a
@@ -1270,6 +1318,8 @@ async def _run_summary(
                     client,
                     chat_id,
                     count=count,
+                    language=language or None,
+                    global_language=_global_language(),
                     instruction=focus or None,
                     provider_manager=manager,
                     current_message_id=current_message_id,
@@ -1375,6 +1425,7 @@ async def _run_action(event, extra: str, chat_id: int) -> tuple[str, str, list] 
         peer_type=_STATE.peer_type,
         count=_STATE.count,
         focus=_STATE.focus,
+        language=_STATE.language,
     )
     try:
         guarded_create_task(
@@ -1385,6 +1436,7 @@ async def _run_action(event, extra: str, chat_id: int) -> tuple[str, str, list] 
                 chat_name=snapshot.chat_name,
                 count=snapshot.count,
                 focus=snapshot.focus,
+                language=snapshot.language,
                 panel_chat_id=chat_id,
                 panel_msg_id=panel_msg_id,
                 inline_id=inline_message_id_from_event(event),
@@ -1397,6 +1449,12 @@ async def _run_action(event, extra: str, chat_id: int) -> tuple[str, str, list] 
         logger.warning("HISTORY_LAUNCH_FAILED error=%s", type(exc).__name__)
         return _panel_view(f"{sym.STATE_FAILED} Could not start the summary.")
     return None
+
+
+async def _language_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    """Cycle the request-level summary language; the panel is not trusted."""
+    _STATE.language = _next_language()
+    return _panel_view(f"Summary language set to {_language_text()}.")
 
 
 def _normalize_focus(value: Any) -> str | None:
@@ -1618,6 +1676,7 @@ def register(client=None, owner_id: int = 0, tz_str: str = "UTC") -> None:
     )
     register_inline_builder(PANEL_ID, _inline_builder)
     register_action("history_count", _count_action)
+    register_action("history_language", _language_action)
     register_action("history_run", _run_action)
     register_action("history_page", _page_action)
     register_action("history_schedule", _schedule_action)
