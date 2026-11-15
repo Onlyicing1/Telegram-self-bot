@@ -75,7 +75,8 @@ made. G4-A remains unimplemented, no stage below is complete, and **no evidence
 table exists**. This section records the owner-approved product direction, the
 corrected immutable-archive model, the real Workspace dependency and the
 storage methodology. Implementation is blocked until the owner approves the
-storage model, TTL and quotas.
+storage model, TTL, quotas and the proposed deletion/active-run retention policy
+(below).
 
 ### Approved owner decisions (unchanged)
 
@@ -101,12 +102,13 @@ storage model, TTL and quotas.
 | 2 | A temporary owner-scoped "workspace key" substituted for the missing Workspace model. | **No substitute.** The Glossary depends on the real G3-B Workspace ownership/authorization model and stays design-only until it exists. |
 | 3 | G4-B was reassigned to restart-safe follow-ups. | **G4-B keeps its original meaning: Workspace-aware durable evidence.** Follow-ups are a G4-A delivery phase (G4-A/F2), not a new stage. G4-C/G4-D are new IDs, documented below. |
 | 4 | Point row-size estimates and quota-looking numbers were presented too confidently. | Measured facts, estimates, assumptions and proposals are separated. Every numeric limit is marked **PENDING OWNER APPROVAL** and cannot enter an implementation contract. |
+| 5 | Revision deletion blocked on dependents, but source deletion cascaded after one confirmation; active runs were described only as untouched despite holding excerpt copies. | Both archive levels use the same proposed block/second-confirmation rule; active-run excerpts are explicitly TTL snapshots retained by default and separately purgeable only with explicit owner approval. |
 
 ### Retention classes (must remain distinct)
 
 | Class | Lifetime | Automatic expiry | Authority |
 |---|---|---|---|
-| **Active Evidence Run** | Short, explicit TTL | Yes (lazy/database-time, no scheduler) | Supports Cited Summary, the Explorer and restart-safe follow-ups. |
+| **Active Evidence Run + refs** | Short, explicit TTL | Yes (lazy/database-time, no scheduler) | Supports Cited Summary, the Explorer and restart-safe follow-ups; each ref holds its own bounded excerpt copy, not an archive pointer. |
 | **Archived Evidence Source + revisions** | Indefinite until manual deletion | No | Owner-approved long-term source; one or more immutable revisions. |
 | **Derived Workspace Knowledge** | Derived record, later stage | Follows its source revision | References an archived revision id; never a second copy of the text. |
 | **Workspace Glossary** | Persistent | No (owner CRUD only) | Owner definitions; depends on the real Workspace model. |
@@ -146,26 +148,78 @@ Rules:
 8. **No whole-chat and no media-binary archival.** Only bounded text snapshots
    of selected messages.
 
-### Deletion, unavailability and dependent records
+### Deletion, unavailability and dependent records (PROPOSED — PENDING OWNER APPROVAL)
 
-- **Delete one revision:** explicit owner action. The confirmation reports how
-  many derived knowledge records reference that exact revision. Deleting is
-  blocked by default while dependents exist; a second, explicit
-  "delete dependents too" confirmation is required to cascade. No silent
-  cascade.
-- **Delete an archived source:** deletes every revision of that source plus
-  its dependent records, after one confirmation that lists the revision and
-  dependent counts.
-- **Manual deletion is permanent** for the selected revision(s). Deletion never
-  touches a different revision, a different source, or any active run.
-- **No automatic eviction.** Reaching a future approved quota refuses the new
-  operation; it never deletes archived evidence.
-- **Source unavailability** does not delete or rewrite anything. The Explorer
-  labels the original message as edited/deleted/inaccessible while still
-  showing the stored revision and its hash.
-- **Derived Workspace Knowledge** is created only in a later stage, references
-  `revision_id`, and follows the deletion rules above. It never silently
-  outlives a deleted revision and is never presented as the source itself.
+Manual deletion is the approved direction. The dependent-record and active-run
+rules below are a **proposal** and remain blocked on the owner's decision; they
+are not approved behavior. They define one rule for both revision-level and
+source-level deletion.
+
+**The data classes remain distinct:**
+
+| Data class | What it holds | Revision-level delete (proposed) | Source-level delete (proposed) |
+|---|---|---|---|
+| Archived source identity | Opaque `source_id` and Telegram provenance; no text | Unchanged, except that deleting the last revision uses the source-level rule | Removed together with every revision |
+| Archived revision text | Immutable bounded text, hash, approval reference and observed state | The selected revision is permanently removed; every other revision is untouched | Every revision of the source is permanently removed |
+| Active Evidence Run refs | Bounded excerpt copy, hash, `message_id`, optional `revision_id`, validation state; short TTL | Unchanged by default; the excerpt remains until the run's normal TTL expiry and `revision_id` becomes a historical, unresolved archive reference | Same for refs to every revision of the source |
+| Derived Workspace Knowledge | Claim/summary/entity referencing `revision_id`; no second text copy | A dependent record: blocks the default delete and is removed only by the explicit cascade confirmation | Same for dependents of every revision of the source |
+
+Rules:
+
+1. **Both operations are explicit owner actions.** Preflight reports the number
+   of revisions (source-level), dependent derived records, and matching
+   active-run refs/excerpts. It never deletes while reporting.
+2. **Dependent derived records block by default.** The preflight covers every
+   registered dependent derived record (currently `ai_workspace_knowledge`; any
+   future dependent table must join the preflight) and each record's
+   `revision_id` reference. If any derived record references a selected revision
+   (or any revision of a selected source), the first confirmation refuses and
+   lists the dependent count. A separate,
+   explicit "delete dependents too" confirmation is required. Only that second
+   confirmation may remove the selected revision(s) together with the dependent
+   derived records; no derived record is silently orphaned. The same rule
+   applies at source level, where the second confirmation lists the revision
+   count and every dependent record across those revisions.
+3. **No dependents means one explicit confirmation.** It lists all target
+   revisions and the active-run excerpt count. Source-level deletion never
+   hides that it removes multiple revisions.
+4. **Revision-level deletion is not source-level deletion.** It leaves the
+   source identity and every other revision intact. If the selected revision is
+   the source's last revision, the operation becomes source-level deletion so
+   an empty source is not left behind, and the source-level confirmation and
+   dependent rules apply.
+5. **Active-run refs are not dependent derived records.** They are bounded
+   snapshot copies with their own TTL, not references that keep an archived
+   revision alive. Archive deletion does **not** cascade to them by default:
+   their excerpts, hashes and historical `revision_id` remain until the run
+   expires. An unresolved `revision_id` is labelled as an archive revision
+   deleted from the archive; the excerpt is never presented as the archive
+   record, never revalidated as one, and never used to reconstruct deleted
+   archive text. This archive-only default is proposed and pending owner
+   approval.
+6. **"Permanent deletion" is scoped.** It means the selected archive rows are
+   permanently removed and, with the explicit cascade, their dependent derived
+   records are removed too. It does not mean every copy of the source text
+   disappears immediately while active-run excerpts remain. The confirmation
+   must say that matching excerpts remain until the configured TTL unless the
+   owner separately chooses the proposed purge.
+7. **Optional explicit purge (proposed — pending owner approval).** After
+   selecting a revision or source, the owner may separately choose to purge
+   matching excerpts from active runs; a source-level deletion may offer one
+   purge covering all its revisions. Purge removes the matching refs/excerpts
+   but does not delete the runs. It must never run automatically. An active
+   run's optional bounded summary may also contain derived content; until a
+   rule covering it is approved, a purge must either clear it or disclose that
+   it remains until TTL, and the UI must not claim a complete text purge.
+8. **No automatic eviction.** Reaching a future approved quota refuses the new
+   operation; it never deletes archived evidence. No cleanup scheduler, silent
+   eviction or TTL-based archive deletion is introduced.
+9. **Source unavailability** does not delete or rewrite anything. The Explorer
+   labels the original message as edited/deleted/inaccessible while still
+   showing the stored revision and its hash.
+10. **Derived Workspace Knowledge** is created only in a later stage, references
+    `revision_id`, and follows the rules above. It never silently outlives a
+    deleted revision and is never presented as the source itself.
 
 ### Proposed storage model (conceptual only — no schema exists)
 
@@ -178,11 +232,11 @@ service-role-only, RLS enabled with zero policies, and no owner foreign key
 | Concept | Lifetime | Essential contents | Deletion |
 |---|---|---|---|
 | `ai_evidence_runs` | TTL | server-generated opaque `run_id`, `owner_id`, `peer_id`, mode, status, `created_at`, `expires_at`, message range, optional bounded summary, counters, `version` | Expired rows are deleted with their refs; an expired lookup fails honestly. |
-| `ai_evidence_run_refs` | TTL | `run_id`, ordinal, `message_id`, optional `revision_id` (when the ref came from an archived revision), bounded excerpt, hash, captured-at, validation state | `ON DELETE CASCADE` from the run. |
-| `ai_evidence_sources` | Indefinite | `source_id`, `owner_id`, `peer_id`, `message_id`, first-seen time, last observed source state/check time | Explicit owner delete only; revisions follow the rule above. |
-| `ai_evidence_revisions` | Indefinite, immutable | `revision_id`, `source_id`, `revision_no`, `content_hash`, bounded text, captured-at, approval reference, observed state | Explicit owner delete only; never time-based; never updated. |
+| `ai_evidence_run_refs` | TTL | `run_id`, ordinal, `message_id`, optional `revision_id` (when the ref came from an archived revision), bounded excerpt, hash, captured-at, validation state | `ON DELETE CASCADE` from the run only. Archive deletion never cascades to it; the excerpt remains until TTL and `revision_id` becomes historical if its archive row is deleted. |
+| `ai_evidence_sources` | Indefinite | `source_id`, `owner_id`, `peer_id`, `message_id`, first-seen time, last observed source state/check time | Explicit owner delete only; follows the proposed source-level rule; no active-run cascade. |
+| `ai_evidence_revisions` | Indefinite, immutable | `revision_id`, `source_id`, `revision_no`, `content_hash`, bounded text, captured-at, approval reference, observed state | Explicit owner delete only; never time-based; never updated; no active-run cascade. |
 | `ai_workspace_glossary` | Persistent (G4-C, after G3-B) | real Workspace identity, normalized term, term, definition, `version`, timestamps | Owner-confirmed delete; no placeholder scope exists before G3-B. |
-| `ai_workspace_knowledge` (later) | Derived | `revision_id`, claim/summary/entity, analysis provenance, revision | Cascades only through the explicit deletion workflow. |
+| `ai_workspace_knowledge` (later) | Derived | `revision_id`, claim/summary/entity, analysis provenance, revision | A dependent record: blocks default deletion and is removed only by the explicit cascade workflow; never orphaned. |
 
 Storage rules:
 
@@ -328,7 +382,7 @@ authorization.
 
 | Stage | Scope | Depends on | Gate |
 |---|---|---|---|
-| **G4-A / F1** | Single-source evidence foundation: durable Active Runs with TTL, immutable owner-approved archive revisions, opt-in Cited Summary, basic Explorer with locally built links. | G2-A + existing History | Owner approves the storage model, TTL, excerpt cap and quotas. |
+| **G4-A / F1** | Single-source evidence foundation: durable Active Runs with TTL, immutable owner-approved archive revisions, opt-in Cited Summary, basic Explorer with locally built links. | G2-A + existing History | Owner approves the storage model, TTL, excerpt cap, quotas and the deletion/active-run retention policy. |
 | **G4-A / F2** | Restart-safe follow-ups on the same run and contract. A delivery phase of G4-A, **not** a new stage. | G4-A / F1 | The approved TTL proves usable in practice. |
 | **G4-B** *(original meaning preserved)* | **Workspace-aware durable Evidence:** Workspace-scoped browsing/consumption of the same evidence contract, cross-run within the Workspace. No second evidence format. | G4-A + G3-A + G3-B | Owner approves Workspace persistence and evidence retention scope. |
 | **G4-C** *(new ID, documented)* | Strict-JSON extraction and the persistent Workspace Glossary. Glossary storage **blocked until G3-B**. | G4-A + G3-B + approved extraction schema/glossary limits | G3-B complete; extraction schema and glossary limits approved. |
@@ -352,8 +406,20 @@ no evidence run, citation or archive path attached to it.
    owner.
 3. Archive quota (revisions and bytes) and the configuration surface that holds
    the approved values.
-4. Deletion policy for a revision that has dependent derived records: block by
-   default (recommended) or allow one-step cascade with an explicit warning.
+4. **Deletion and active-run retention (all pending owner approval):**
+   - Revision-level deletion with dependent derived records: block by default
+     and require a separate explicit cascade confirmation (recommended), or
+     allow one-step cascade with an explicit warning.
+   - Source-level deletion when any revision has dependent records: apply the
+     same block/second-confirmation rule as revision-level deletion
+     (recommended), or allow a single source confirmation to cascade.
+   - Default active-run excerpt handling on archive deletion: retain the
+     excerpts until normal TTL expiry without touching the runs (recommended),
+     or require/offer an explicit purge.
+   - Optional purge of matching active-run excerpts: whether it is offered at
+     revision level, at source level as a separate option, or neither
+     (recommended: offer it separately at both levels), and whether it must
+     clear an active run's bounded summary as well as its matching refs.
 5. Whether every edited-message re-archive needs its own approval (recommended
    yes) or a bounded pre-approval policy.
 6. Glossary entry/character limits (only after G3-B defines the Workspace).

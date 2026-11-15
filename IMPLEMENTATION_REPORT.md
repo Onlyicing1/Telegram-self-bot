@@ -1,145 +1,149 @@
 # IMPLEMENTATION REPORT
 
-## G4-A evidence-persistence design correction (current — documentation only)
+## G4-A archive deletion and active-run retention correction (current — documentation only)
 
 ### Status
 
-**Documentation and architecture correction only. G4-A implementation has not
-started, no stage is complete, and no evidence/archive/glossary table exists.**
-No production Python, test, migration, SQL, Supabase object, Telegram operation,
-deployment or `DATABASE_ARCHITECTURE.md` change was made.
+**Documentation correction only. G4-A implementation has not started, no stage is
+complete, and no evidence/archive/glossary table exists.** No production Python,
+test, migration, SQL, Supabase object, Telegram operation, runtime behavior or
+deployment change was made.
 
-Base: `origin/main` `05424016f4f84d320ccde2af3ad8da5bfde5fc51` (verified before
-editing). This delivery corrects the design record committed there.
+Base: `origin/main` `76aacc851483dc2ade1d2dab46cd7e2e5a714743` (the verified
+reference commit). The local checkout was clean and was fast-forwarded to that
+commit before editing; it had no divergent work.
 
-### What was corrected
+This delivery corrects two defects in the G4-A evidence-persistence design:
 
-| Issue | Previous record | Corrected record |
-|---|---|---|
-| **1. Mutable archive snapshots** | One archive row per `(owner, peer, message id)`; re-archiving could refresh/overwrite the stored snapshot. | Archived **sources** hold identity only; **immutable revisions** hold text. Identical hash = no write. An edited message creates a new owner-approved revision; no overwrite, merge or "replace revision" path exists. References identify `revision_id`, so earlier analyses stay traceable. |
-| **2. Fake Workspace scope** | The persistent Glossary used a temporary owner-scoped "workspace key". | The substitute is removed. The Glossary must use the real Workspace identity/ownership/authorization from **G3-B**; no owner-level key, temporary table or parallel scope is permitted. Glossary persistence/UI/injection is **blocked until G3-B**. |
-| **3. G4-B overwritten** | G4-B was reassigned to restart-safe follow-ups. | **G4-B keeps its original meaning: Workspace-aware durable Evidence.** Follow-ups are G4-A's second delivery phase (G4-A/F2). G4-C (extraction + persistent Glossary) and G4-D (assessments) are new IDs, explicitly documented, not renamings of G4-B. |
-| **4. Unapproved numbers as facts** | Point row-size estimates and quota-looking numbers (5,000 records, 50 MiB, 20 runs, 7-day TTL, 1,000 chars, 50 refs, 32 KiB, 200 entries, 50,000 chars). | Measured facts, assumptions, estimates and proposals are separated. PostgreSQL overhead (tuple/page/TOAST/index/fillfactor/bloat/revision multiplier) is explained. Every numeric limit is marked **PENDING OWNER APPROVAL**, and no value may be hard-coded into an implementation contract. |
+1. Revision-level and source-level archive deletion used different
+   dependent-record and confirmation rules.
+2. The design said archive deletion never touches active runs, without
+   explaining that active-run refs may hold their own bounded excerpt copies of
+   the same source text.
 
-### Corrected archive revision model (design only)
+No deletion or retention behavior is implemented or live-verified. The
+deletion/purge rules below are a **proposal awaiting owner approval**; only the
+existing directions of manual deletion and no automatic archive expiry are
+already approved.
 
-- `ai_evidence_sources`: stable identity per `(owner_id, peer_id, message_id)`;
-  stores no text.
-- `ai_evidence_revisions`: append-only immutable rows — `revision_id`,
-  `source_id`, `revision_no`, `content_hash`, bounded text snapshot,
-  captured-at, owner-approval reference, last observed source state.
-- Same hash → no write (idempotent). New hash → candidate revision requiring
-  explicit owner approval. No update/merge/replacement of stored text.
-- Runs, citations and derived knowledge reference a specific revision. Nothing
-  means "latest".
-- Telegram edits/deletes never mutate stored text; revalidation records
-  `live`/`edited`/`deleted`/`inaccessible` and a check time only.
-- Deletion is owner-confirmed per revision or source; dependent derived records
-  are reported and block deletion by default until an explicit cascade. No
-  automatic expiry and no eviction at a future quota.
+### Deletion reconciliation
 
-### Corrected Workspace and stage dependencies
+The design now gives revision-level and source-level deletion the same proposed
+rule.
 
-| Stage | Scope | Dependency |
-|---|---|---|
-| G4-A / F1 | Single-source durable runs (TTL), immutable archive revisions, opt-in Cited Summary, Explorer with local links | G2-A + History; owner approval of model/TTL/quotas |
-| G4-A / F2 | Restart-safe follow-ups on the same contract (not a new stage) | G4-A / F1 |
-| G4-B *(original)* | Workspace-aware durable evidence | G4-A + G3-A + G3-B |
-| G4-C *(new)* | Strict-JSON extraction + persistent Workspace Glossary | G4-A + **G3-B for the Glossary** + approved schema/limits |
-| G4-D *(new)* | Threshold-gated subjective assessments | G4-C + approved thresholds/person policy |
+| Operation | Proposed behavior |
+|---|---|
+| Delete one archived revision | Explicit owner action. Preflight counts every registered dependent derived record (currently `ai_workspace_knowledge`; future dependent tables must join it), each `revision_id` reference, and matching active-run refs/excerpts. If derived records depend on the revision, deletion is blocked by default; a separate, explicit "delete dependents too" confirmation is required. Without dependents, one explicit confirmation proceeds. The source identity and sibling revisions are untouched. If it is the source's last revision, the source-level rule applies so no empty source is left behind. |
+| Delete an archived source | Explicit owner action. Preflight counts all revisions, every registered dependent derived record across them, each reference, and matching active-run refs/excerpts. If any derived record depends on any revision, deletion is blocked by default; a separate explicit confirmation must list the full revision and dependent counts and then remove the source, all revisions and all dependent records together. Without dependents, one explicit confirmation lists the revisions and proceeds. |
+| Dependent Workspace Knowledge | Never silently cascaded or orphaned. It blocks the default delete at either level and is removed only by the second explicit cascade confirmation. |
+| Active Evidence Run refs | Not dependent records and not cascade-deleted by archive deletion. By default their bounded excerpts, hashes and historical `revision_id` remain until the run's normal TTL expiry, even if the archive revision or source is gone. The unresolved archive reference is labelled as deleted and is never presented as a live archive record. |
+| Optional purge | Proposed only. After selecting a revision or source, the owner may separately choose to purge matching excerpts from active runs; source-level deletion may offer one purge covering all revisions. Purge removes matching refs/excerpts without deleting the runs and must never run automatically. An active run's bounded summary can also contain derived content; until a rule is approved, a purge must clear it or disclose that it remains until TTL. |
 
-### Approved decisions preserved (not weakened)
+The proposal preserves these existing requirements: immutable archived
+revisions, manual deletion, no automatic archive expiry, no eviction to satisfy
+a quota, owner/Workspace isolation, bounded excerpts, local link construction,
+and the Evidence Envelope's exclusion from generic tool/audit/conversation
+history. No cleanup scheduler, silent eviction, automatic purge or background
+deletion is introduced.
 
-1. Active Evidence Runs are durable and expire on an explicit TTL.
-2. Archival is opt-in; the system may suggest, the owner approves.
-3. Archived evidence remains until manual deletion.
-4. No automatic archival.
-5. No whole-chat archival.
-6. No media-binary archival.
-7. Workspace Knowledge is derived, structured, persistent and linked to source
-   evidence.
-8. Cited Summary is explicitly selected, never automatic.
-9. Follow-ups survive application restart.
-10. The Evidence Envelope never enters `ToolResult.data`, tool arguments, tool
-    history, audit records, conversation history, provider continuation or
-    fallback tool-result rendering.
-11. Generic tool results expose only opaque run/revision ids and bounded
-    non-sensitive counts/coverage.
-12. Scheduled History remains unchanged, body-only and citation-free.
-13. This task authorizes no Supabase schema change; the owner applies schema
-    changes manually.
+### Active-run copies and permanent deletion
+
+The four relevant data classes are explicitly separate:
+
+- **Archived source identity** — owner/source/message provenance only; no text.
+- **Immutable archived revision** — the bounded archived text, hash and
+  approval/provenance record.
+- **Active Evidence Run refs** — a short-TTL bounded excerpt copy per ref, with
+  a hash, message id, validation state and optional historical `revision_id`.
+- **Derived Workspace Knowledge** — a claim/summary/entity record that
+  references `revision_id` and stores no second copy of the source text.
+
+Consequently, deleting an archived revision or source is **not** a global erase
+of every copy of the text. It permanently removes the selected archive rows and,
+with explicit cascade, dependent derived knowledge. Matching active-run excerpts
+remain until their configured TTL unless the owner separately chooses a purge.
+The confirmation must disclose that distinction. The design makes no claim of
+immediate deletion from a run's optional summary, provider-side logs or any
+other copy not covered by the approved purge scope.
 
 ### Decisions still pending owner approval
 
-1. Active-run TTL duration.
-2. Excerpt/snapshot size, refs per run, active runs per owner.
-3. Archive revision/byte quotas and the configuration surface holding limits.
-4. Revision deletion policy with dependent derived knowledge (block vs explicit
-   cascade).
-5. Whether every edited-message re-archive needs a fresh approval.
-6. Glossary entry/character limits (after G3-B).
-7. Cited Summary surface (panel / AI trigger / both).
-8. Archive-suggestion source.
-9. Assessment thresholds and person-level policy.
-10. Tagged-text fallback timing.
-11. Expired-run tombstone vs outright deletion.
-12. Global vs per-Workspace limit configuration.
+1. **Revision-level dependent deletion:** block by default and require a
+   separate explicit cascade confirmation (recommended), or allow one-step
+   cascade with an explicit warning.
+2. **Source-level dependent deletion:** apply the same block and
+   second-confirmation rule as revision-level deletion (recommended), or allow
+   one source confirmation to cascade all revisions and dependents.
+3. **Default active-run excerpt handling:** keep matching excerpts intact until
+   normal TTL expiry without touching the runs (recommended), or require/offer
+   an explicit purge as part of archive deletion.
+4. **Optional purge:** whether it is offered at revision level, at source level
+   as a separate option, or neither (recommended: offer it separately at both
+   levels), and whether it must clear an active run's bounded summary as well
+   as matching refs.
+
+These are additions to the previously open G4-A decisions: storage model, TTL,
+excerpt/ref/run caps, archive quotas, the re-archive approval policy,
+expired-run tombstone versus deletion, and the configuration surface. None of
+the numeric limits is approved.
 
 ### Files changed
 
 | File | Change |
 |---|---|
-| `ROADMAP.md` | Design record replaced: correction record, immutable revision model, deletion/unavailability rules, real Workspace dependency, quota-status table, storage methodology, corrected stage plan, roadmap-change record, open decisions. |
-| `LIFEOS_IDEAS.md` | EVID-001/002/003/004 revised; §4.5.1 rewritten; LANG-005 blocked on G3-B; dependency graph, §5.3–§5.5, G4 stages, priorities, sequence, deferred items, open decisions and change log corrected. |
-| `IMPLEMENTATION_REPORT.md` | This report replaces the previous document with the latest verified state; prior deliveries are summarized below. |
+| `ROADMAP.md` | Corrected the retention description, replaced the deletion section with the proposed revision/source rule and active-run retention/purge boundary, updated the conceptual storage table, stage gate and owner-decision list. |
+| `LIFEOS_IDEAS.md` | Clarified EVID-002 refs as excerpt snapshots, revised EVID-003 deletion, added §4.5.1 deletion semantics, recorded the new finding, updated G4-A and Step 5 gates/deliverables, expanded the owner-decision list and appended the change-log entry. |
+| `IMPLEMENTATION_REPORT.md` | Replaced with this latest documentation-only delivery record; prior delivery records are preserved below. |
 
 ### Files intentionally untouched
 
 - All `backend/` production code and `tests/`.
-- `supabase/` migrations, `sql/`, and `DATABASE_ARCHITECTURE.md` (this task
-  forbids modifying it).
+- `supabase/` migrations, `sql/`, `DATABASE_ARCHITECTURE.md` and any database
+  object.
 - `AGENTS.md`, `AI_MASTER_DESIGN.md`, `INVESTIGATION.md`, `README.md`,
-  `docs/`, `guide/` (no G4 stage definitions requiring correction; checked by
-  search).
+  `docs/`, `guide/` and deployment configuration.
+- No G4-A implementation, schema, migration, service, UI, scheduler or runtime
+  path was created.
 
 ### Validation performed
 
-- Re-verified `origin/main` before editing: `0542401`; worktree clean.
-- Re-checked the source references cited by the design (executor/dispatcher/
-  persistence/prompt paths, History bounds, `history_schedules` migration and
-  service-role-only RLS posture). No implementation was added.
-- Repository-wide search for `G4-A|G4-B|G4-C|G4-D|Workspace-aware|restart-safe|
-  Evidence Archive|Workspace Glossary`; all active occurrences now agree.
-- Confirmed `G4-B` no longer appears as follow-ups; follow-ups are G4-A/F2.
-- Confirmed no active design instruction uses a temporary workspace key or
-  substitute scope; only the correction record names the removed proposal.
-- Confirmed every numeric limit is labelled pending/unapproved.
-- Markdown table column-consistency check over both edited documents: 0
-  inconsistent tables.
-- `git diff --check`: clean.
+- Verified branch/HEAD/worktree and fetched `origin/main` before editing:
+  remote was `76aacc8`; local HEAD was a clean ancestor and was fast-forwarded
+  with no merge, rebase or history rewrite.
+- Repository-wide search for deletion, cascade, purge, archive, revision,
+  active-run, retention and TTL wording across the repository, including
+  Markdown, code and SQL; no competing G4-A implementation or deletion policy
+  was found.
+- Cross-document review of `ROADMAP.md`, `LIFEOS_IDEAS.md` and
+  `IMPLEMENTATION_REPORT.md`; the old one-confirmation source cascade and the
+  unqualified "never touches an active run" wording are gone.
+- Markdown table column-consistency check over the edited documents.
+- `git diff --check`.
+- Reviewed the final diff and file list to confirm only the three scoped
+  documentation files changed.
 
 ### Validation not performed
 
-- No production test suite was run; no production code changed, so it would not
-  validate this delivery. No application behavior is claimed tested.
-- No live PostgreSQL storage measurement, `pg_total_relation_size`, TOAST
-  inspection, Supabase read/write, SQL execution, Telegram operation or
-  deployment was performed. All size figures are explicitly estimates.
-- No schema/RLS verification was possible because no schema exists.
+- **No production test suite was run**, because no application code changed and
+  tests would not validate this documentation delivery. No application behavior
+  is claimed tested.
+- No SQL, Supabase connection, schema/RLS/FK check, migration, Telegram
+  operation, live deletion, TTL expiry, purge or deployment was performed.
+- No G4-A table or runtime behavior exists, so active-run retention and archive
+  deletion could not be exercised live.
 
 ### Delivery record
 
-- Commit SHA: the single documentation commit containing this report; its SHA
-  and the post-push remote-main verification are stated in the delivery
-  response (a file cannot contain the hash of the commit that introduces it).
-- Remote main verification: `git fetch` → compare remote `FETCH_HEAD` with
-  local `HEAD` → `git merge-base --is-ancestor <sha> FETCH_HEAD` → clean
-  worktree. Results are reported in the delivery response.
+- Commit: the single documentation commit containing this report. Its SHA and
+  the independent post-push remote-main verification are stated in the delivery
+  response; a file cannot contain the hash of the commit that introduces it.
+- Verification: `git fetch` → compare remote `FETCH_HEAD` with local `HEAD` →
+  `git merge-base --is-ancestor <sha> FETCH_HEAD` → clean final worktree.
 
 ### Remaining blockers before G4-A implementation
 
-1. Owner approval of the storage model (sources + immutable revisions + run
-   refs) and the deletion/dependent-record policy.
+1. Owner approval of the storage model (sources, immutable revisions, run refs)
+   and the proposed deletion/active-run retention and purge rules.
 2. Owner approval of the TTL, excerpt size, refs/run, runs/owner, archive
    quotas, and the configuration surface that holds them.
 3. A decision on whether every revised archive needs fresh approval.
@@ -151,6 +155,22 @@ editing). This delivery corrects the design record committed there.
    the model and applies it manually.
 
 ---
+
+## Previous delivery — G4-A evidence-persistence design correction
+
+Status: documentation only; base `origin/main`
+`05424016f4f84d320ccde2af3ad8da5bfde5fc51`. No implementation or schema exists.
+
+| Issue | Correction |
+|---|---|
+| Mutable archive snapshots | Archived sources hold identity only; immutable revisions hold text. Same-hash capture is a no-op; an edit creates a new owner-approved revision; references identify `revision_id`. |
+| Temporary Workspace key | Removed. The persistent Glossary must use real G3-B Workspace identity/authorization; no substitute scope is permitted. |
+| G4-B reassigned | G4-B keeps its original meaning (**Workspace-aware durable Evidence**). Restart-safe follow-ups are G4-A/F2; G4-C/G4-D are new documented IDs. |
+| Unapproved numbers as facts | Measured facts, assumptions, estimates and proposals are separated; every numeric limit is **PENDING OWNER APPROVAL** and may not enter an implementation contract. |
+
+That correction committed the design record at `76aacc8`. It did not create an
+evidence, archive, revision, Workspace or Glossary table, and did not change
+code, tests, SQL, Supabase, Telegram, deployment or `DATABASE_ARCHITECTURE.md`.
 
 ## Previous delivery — G2-A: global, request and task language
 
