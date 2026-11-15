@@ -84,6 +84,45 @@ Task Center.
 The vision must not be described as current capability. The value of this
 document is the gap between the two, made explicit.
 
+### Cross-cutting product principle — User Agency First (owner-approved)
+
+LifeOS should give the owner meaningful control and freedom to decide what they
+want, how they want to use a capability, and how much assistance or automation
+they want. It should not make decisions on the owner's behalf when meaningful
+choice is possible, and it should not force one rigid interaction model. The
+goal is to maximize meaningful agency **while preserving security, privacy,
+reliability and predictable system behavior**.
+
+1. **User choice over unnecessary assumptions** — where multiple legitimate
+   modes exist, let the owner choose; do not silently infer a preference that
+   materially changes the result; an assistant's preferred workflow is not a
+   mandatory product rule.
+2. **Configurable behavior** — where appropriate, offer meaningful choices for
+   feature behavior, interaction style, evidence visibility, automation,
+   retention and other user-facing policies. Choices stay changeable, and each
+   setting respects its own scope and lifetime.
+3. **Safe and predictable defaults** — a feature stays usable without
+   configuring every detail; defaults are conservative, transparent and
+   predictable; the absence of a preference is never permission for a more
+   invasive or less safe behavior.
+4. **Progressive disclosure** — present essential choices when they matter,
+   keep ordinary interaction free of a large configuration surface, and make
+   advanced controls discoverable instead of forcing them into every
+   interaction while preserving access for owners who want more control.
+5. **Honest boundaries** — freedom is not unrestricted execution: security,
+   privacy, authorization, deterministic validation and architectural
+   boundaries remain mandatory, and unavailable or restricted capabilities are
+   explained honestly.
+6. **No unnecessary paternalism** — do not restrict a legitimate choice merely
+   because the system prefers another workflow; explain meaningful
+   consequences and let the owner decide where policy and safety permit,
+   without confusing protection with taking control away.
+
+This is a product-direction principle, not an implementation decision: it does
+not authorize new capabilities, settings, schema or automation, and it does not
+settle any question in §10. The scope rules in §1 and the existing authority
+boundaries continue to govern every design.
+
 ## 3. Existing Capabilities and Reuse
 
 ### 3.1 Runtime and authority boundaries
@@ -1352,6 +1391,20 @@ silently duplicated.
 - **Goal:** Establish one evidence envelope and use it for summaries,
   follow-ups, extraction, subjective rigor and a basic Evidence Explorer on one
   source.
+- **User Agency First (§2):** this principle should shape the eventual design of
+  evidence-backed summaries and citation visibility, the Evidence Explorer and
+  source inspection, follow-up questions and evidence retrieval, structured
+  extraction and output presentation, glossary configuration, and subjective
+  assessment modes and their stated limitations. The owner should have
+  meaningful control over how these capabilities are used and presented,
+  without compromising evidence integrity or deterministic validation.
+- **Unresolved owner decisions:** this principle does not choose citation
+  defaults or opt-in, evidence retention across restarts, follow-up lifetime,
+  subjective-assessment thresholds and whether definitive person-level
+  judgments are permitted, glossary persistence or scope, whether Telegram deep
+  links may expose private identifiers, or structured-output failure/fallback
+  behavior. These remain open (§10; item 3 covers evidence retention) and need
+  explicit owner approval before implementation.
 - **Reuse:** `history_service`, `HistoryMessage` ids, `HistorySlice` range,
   `ToolRegistry`/`ToolExecutor`, provider structured output, G2-A language.
 - **Dependencies:** G2-A. G3-A is optional for source labels. Durable evidence
@@ -1775,3 +1828,4 @@ facts are not questions.
 | 2026-11-14 | Created this document at `main`/`origin/main` `f61e12e`. Recorded the owner-provided UI, language, interactive summary, extraction, Workspace, analytics, source search, cross-source, Task Center and advanced intelligence ideas; added clearly labeled assistant suggestions; mapped existing History/Scheduled History/Taskloom/language/search capabilities; proposed eight implementation groups, separate product/implementation priorities, a dependency-aware sequence, deferred items and owner decisions. No implementation, schema, Supabase, Telegram, deployment or test change was made. |
 | 2026-11-14 | Corrected dependency graph and sequence after source re-verification of the committed document (`63fdd5c`). Split G1, G2, G3, G4, G5, G6 and G7 into A/B sub-stages; moved G2-B after G3-B; moved G5-B after G3-B/G2-B; made G4-A single-source and G4-B Workspace-aware; separated G7-A metrics from Phase-7-gated G7-B recommendations; moved semantic search to owner-gated G6-B; reassigned LANG-005 to G4-A; recorded that task cancel/retry has no service path yet. No idea was removed, no runtime/test/schema/Supabase/Telegram/Render change was made. |
 | 2026-11-15 | Recorded G1-A as implemented for Stash and Taskloom: documented panel ordering, owner/feature-scoped selection, visible toggles, Taskloom bulk CAS actions and destructive confirmation. G1-B, G2-A, G5-A beyond this narrow UI work, Workspace and Scheduled History Phase 6/7 remain deferred. No schema, Supabase, Telegram, Render or live-operation change was made. |
+| 2026-11-15 | Added **User Agency First** as an owner-approved cross-cutting product principle in §2: meaningful owner choice over unnecessary assumptions, configurable behavior, safe predictable defaults, progressive disclosure, honest boundaries and no unnecessary paternalism. Added a concise G4-A reference naming the capabilities it should influence. G4-A owner decisions (citation defaults, evidence retention, follow-up lifetime, subjective-assessment thresholds/person judgments, glossary persistence/scope, deep-link privacy and structured-output failure behavior) remain unresolved. Documentation only; no code, test, config, schema, Supabase, Telegram, Render or deployment change. |
