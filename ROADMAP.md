@@ -69,14 +69,15 @@ it is implemented.
 
 ## Design record (NOT IMPLEMENTED): G4-A evidence persistence and bounded storage
 
-Status: **Design and documentation only — corrected 2026-11-16.** No production
+Status: **Design approved; documentation only — 2026-11-16.** No production
 code, migration, SQL, Supabase object, Telegram operation or deployment was
 made. G4-A remains unimplemented, no stage below is complete, and **no evidence
-table exists**. This section records the owner-approved product direction, the
-corrected immutable-archive model, the real Workspace dependency, the storage
-methodology and the proposed expiry/deletion semantics. Implementation is
-blocked until the owner approves the storage model, TTL, quotas, deletion
-policy and expired-run physical policy (below).
+table exists**. The owner approved the data classes, TTL, limits, archive
+quotas, immutable-revision model, deletion rules and expired-run physical
+policy on 2026-11-16; the canonical policy is `LIFEOS_IDEAS.md` §4.5.1.
+Implementation remains blocked until the owner explicitly authorizes the
+schema/migration; Supabase schema changes remain manual and are not authorized
+by the design approval.
 
 ### Approved owner decisions (unchanged)
 
@@ -92,7 +93,7 @@ policy and expired-run physical policy (below).
 | 8 | Strict JSON is the initial structured-output contract. A tagged-text fallback may be specified later. | No fallback now, and no silent downgrade of a JSON operation. |
 | 9 | Evidence Envelopes never enter ToolResult history, tool arguments, generic audit records, conversation history or provider continuation. Tool results may carry only opaque run ids and bounded counts/coverage. A dedicated access-controlled evidence store is permitted. | A new storage path, never the generic tool path. |
 | 10 | Scheduled History is unchanged: body-only and citation-free. | `scheduled_summary_payload` and its callers are untouched. |
-| 11 | Archive is hybrid: the system may suggest candidates, the owner approves each archival, and archived evidence remains until manually deleted. | No automatic archival and no automatic archive expiry. |
+| 11 | Archive is hybrid: the system may suggest candidates and explain why, the owner approves each archival, and archived evidence remains until manually deleted. | No automatic archival and no automatic archive expiry. |
 
 ### Correction record (2026-11-15, documentation only)
 
@@ -101,71 +102,56 @@ policy and expired-run physical policy (below).
 | 1 | One archive row per `(owner, peer, message id)`, and a re-archive could refresh/overwrite the snapshot. | Append-only immutable revisions. An edit produces a **new** owner-approved revision; no operation overwrites historical text. |
 | 2 | A temporary owner-scoped "workspace key" substituted for the missing Workspace model. | **No substitute.** The Glossary depends on the real G3-B Workspace ownership/authorization model and stays design-only until it exists. |
 | 3 | G4-B was reassigned to restart-safe follow-ups. | **G4-B keeps its original meaning: Workspace-aware durable evidence.** Follow-ups are a G4-A delivery phase (G4-A/F2), not a new stage. G4-C/G4-D are new IDs, documented below. |
-| 4 | Point row-size estimates and quota-looking numbers were presented too confidently. | Measured facts, estimates, assumptions and proposals are separated. Every numeric limit is marked **PENDING OWNER APPROVAL** and cannot enter an implementation contract. |
-| 5 | Revision deletion blocked on dependents, but source deletion cascaded after one confirmation; active runs were described only as untouched despite holding excerpt copies. | Both archive levels use the same proposed block/second-confirmation rule; active-run excerpts are explicitly TTL snapshots retained by default and separately purgeable only with explicit owner approval. |
-| 6 | Expiry was described as if physical deletion or a lazy "sweep" always followed logical TTL expiry, and the unresolved physical policy was reduced to "tombstone versus deletion". | Logical expiry is authoritative-database-time and immediately blocks use. Physical deletion is not automatic; no cleanup scheduler is approved, never-read expired rows can remain indefinitely, and Options 1–3 remain an explicit owner decision. |
+| 4 | Point row-size estimates and quota-looking numbers were presented too confidently. | Measured facts, estimates, assumptions and proposals are separated. At the time, every numeric limit was marked **PENDING OWNER APPROVAL**; the 2026-11-16 approval now supplies the limits below and in `LIFEOS_IDEAS.md` §4.5.1. |
+| 5 | Revision deletion blocked on dependents, but source deletion cascaded after one confirmation; active runs were described only as untouched despite holding excerpt copies. | Both archive levels use the same approved block/second-confirmation rule; active-run excerpts are explicitly TTL snapshots retained by default. No purge is approved or specified. |
+| 6 | Expiry was described as if physical deletion or a lazy "sweep" always followed logical TTL expiry, and the unresolved physical policy was reduced to "tombstone versus deletion". | Logical expiry is authoritative-database-time and immediately blocks use. Physical deletion is not automatic; no cleanup scheduler is approved, never-read expired rows can remain indefinitely, and the owner subsequently resolved this as Option 1 (2026-11-16). |
 
 ### Retention classes (must remain distinct)
 
 | Class | Lifetime | Logical expiry | Physical deletion | Authority |
 |---|---|---|---|---|
-| **Active Evidence Run + refs** | Short, explicit TTL | Yes — authoritative database time; lazy check, no scheduler | Not automatic; owner policy pending; no guaranteed period | Supports Cited Summary, the Explorer and restart-safe follow-ups; each ref holds its own bounded excerpt copy, not an archive pointer. |
+| **Active Evidence Run + refs** | 7-day default; owner-selected 1–30 days, stored per run | Yes — authoritative database time; immediate denial; no scheduler | Option 1: opportunistic physical deletion inside an existing authorized operation; no tombstone; no guaranteed deadline | Supports Cited Summary, the Explorer and restart-safe follow-ups; each ref holds its own bounded excerpt copy, not an archive pointer. |
 | **Archived Evidence Source + revisions** | Indefinite until manual deletion | No | Manual owner deletion only | Owner-approved long-term source; one or more immutable revisions. |
-| **Derived Workspace Knowledge** | Derived record, later stage | No | Explicit archive-deletion cascade only (pending approval) | References an archived revision id; never a second copy of the text. |
+| **Derived Workspace Knowledge** | Derived record, later stage | No | Explicit, owner-confirmed archive-deletion cascade only | References an archived revision id; never a second copy of the text. |
 | **Workspace Glossary** | Persistent | No | Owner CRUD only | Owner definitions; depends on the real Workspace model. |
 
 An Active Run is **not** an archive. An archived source is **not** a chat
 export. A derived record is **not** a source. The glossary is **not** evidence.
 
-### Active Evidence Run expiry (PROPOSED — PENDING OWNER APPROVAL)
+### Active Evidence Run expiry (APPROVED 2026-11-16)
 
-The TTL duration is pending. This section fixes the distinction between logical
-expiry and physical deletion; it is a proposal, not approved behavior.
+**TTL and logical expiry**
 
-**Logical expiry**
-
+- The TTL is selected when the run is created and persisted for that run:
+  default **7 days**, owner-selectable range **1–30 days**. It is never silently
+  extended.
 - `expires_at` is compared with authoritative database time. A client clock is
   never the authority.
-- Once `expires_at` has passed, the run is unusable for Cited Summary, Explorer
-  reads and follow-ups. It is not valid evidence.
+- Once `expires_at` has passed, the run is immediately unusable for Cited
+  Summary, Explorer reads and follow-ups. It is not valid evidence.
 - A follow-up fails honestly. The system must not reconstruct the expired run,
   or its evidence, from Telegram history, archive revisions, the run's summary,
   inferred conversation or any other source.
 - Expiry of an Active Run does not expire or modify immutable Archive revisions
   or derived Workspace Knowledge.
 
-**Physical deletion**
+**Physical deletion — Option 1 approved**
 
-- Logical expiry does not delete rows and must not be described as physical
-  deletion. No cleanup scheduler, background worker, cron job or independent
-  cleanup loop is approved or introduced.
-- If the owner approves Option 1 or 2 below, reclamation can only run
-  opportunistically inside an existing authorized operation that already
-  touches the run or admits a new run. It is never a new periodic process.
+- Logical expiry immediately denies access. Physical deletion of expired run
+  data and its refs may occur only opportunistically inside an existing
+  authorized operation that already touches the run or admits a new run.
+- No scheduler, worker, cron job, background cleanup loop or second lifecycle
+  authority is introduced. No tombstone is created.
 - An expired run that is never touched again may remain physically stored
-  indefinitely. No fixed deletion period is guaranteed.
-- Expired and inaccessible therefore does not mean physically deleted.
+  indefinitely; no fixed deletion period is promised. Expired and inaccessible
+  therefore does not mean physically deleted.
+- At the active-run quota, an authorized operation may first remove expired
+  runs; if capacity is still unavailable, the new run is rejected with an
+  explicit reason. A valid, unexpired run is never evicted.
 - No live run, archive revision or dependent Knowledge is evicted to make room.
 
-**Physical outcomes (owner decision pending)**
-
-| Option | Proposed behavior | Consequences |
-|---|---|---|
-| **1. Physical deletion** (recommended, unapproved) | Delete expired run rows and their refs, with no tombstone. The trigger is opportunistic on an existing operation, never a scheduler. | Strongest data minimization. A never-read expired run can remain indefinitely. After deletion, an old run id is indistinguishable from an absent run. |
-| **2. Tombstone retention** (unapproved) | Delete evidence text, excerpts and summaries, then retain a minimal non-content tombstone: opaque `run_id`, `owner_id`, lifecycle status, `created_at`, `expires_at` and a deletion timestamp. No message ids/ranges, source text, excerpts, summaries, provider payloads or recoverable evidence. | Keeps a bounded existence/expiry record without evidence content. Still needs the same opportunistic cleanup, so never-read rows can persist; the tombstone adds a small metadata-retention footprint. |
-| **3. Deferred physical deletion** (unapproved) | Logical expiry applies immediately; physical deletion waits for a separately approved cleanup mechanism. | No new scheduler. Storage and privacy exposure grow until such a mechanism is approved; no fixed deletion period. |
-
-**Recommendation (unapproved):** Option 1, outright physical deletion, is
-recommended because Active Runs are temporary and the project currently has no
-approved cleanup mechanism or need for an evidence tombstone. This is not an
-owner decision. If the owner requires bounded physical retention, that needs a
-separately approved mechanism and cannot be claimed by this design.
-
-Under Option 2, `run_id` and `owner_id` are retained solely for owner-scoped lookup; lifecycle status and timestamps only record that the run existed and expired. No peer/message identifier or evidence content is retained.
-
-The three concerns must stay separate: (1) expiry enforcement, (2) physical
-removal of expired data, and (3) any optional minimal tombstone left after
-removal.
+The three concerns remain separate: expiry enforcement, opportunistic physical
+removal, and the absence of any tombstone.
 
 ### Immutable archive revision model
 
@@ -195,22 +181,22 @@ Rules:
    the observed state (`live`, `edited`, `deleted`, `inaccessible`) and the
    check time only; the archived text and hash stay as captured.
 7. **Owner approval is per archived revision.** Suggestions may be generated
-   automatically; the write requires the owner's explicit approval.
+   automatically with a short reason; the write requires the owner's explicit
+   approval.
 8. **No whole-chat and no media-binary archival.** Only bounded text snapshots
    of selected messages.
 
-### Deletion, unavailability and dependent records (PROPOSED — PENDING OWNER APPROVAL)
+### Deletion, unavailability and dependent records (APPROVED 2026-11-16)
 
-Manual deletion is the approved direction. The dependent-record and active-run
-rules below are a **proposal** and remain blocked on the owner's decision; they
-are not approved behavior. They define one rule for both revision-level and
-source-level deletion.
+Manual deletion is owner-triggered. The dependent-record and active-run rules
+below are approved for both revision-level and source-level deletion; there is
+no hidden or silent cascade.
 
 **The data classes remain distinct:**
 
-| Data class | What it holds | Revision-level delete (proposed) | Source-level delete (proposed) |
+| Data class | What it holds | Revision-level delete | Source-level delete |
 |---|---|---|---|
-| Archived source identity | Opaque `source_id` and Telegram provenance; no text | Unchanged, except that deleting the last revision uses the source-level rule | Removed together with every revision |
+| Archived source identity | Opaque `source_id` and Telegram provenance; no text | Unchanged; removing a now-empty source is a separate explicit action | Removed together with every revision |
 | Archived revision text | Immutable bounded text, hash, approval reference and observed state | The selected revision is permanently removed; every other revision is untouched | Every revision of the source is permanently removed |
 | Active Evidence Run refs | Bounded excerpt copy, hash, `message_id`, optional `revision_id`, validation state; short TTL | Unchanged by default; the excerpt remains until the run's normal TTL expiry and `revision_id` becomes a historical, unresolved archive reference | Same for refs to every revision of the source |
 | Derived Workspace Knowledge | Claim/summary/entity referencing `revision_id`; no second text copy | A dependent record: blocks the default delete and is removed only by the explicit cascade confirmation | Same for dependents of every revision of the source |
@@ -236,9 +222,9 @@ Rules:
    hides that it removes multiple revisions.
 4. **Revision-level deletion is not source-level deletion.** It leaves the
    source identity and every other revision intact. If the selected revision is
-   the source's last revision, the operation becomes source-level deletion so
-   an empty source is not left behind, and the source-level confirmation and
-   dependent rules apply.
+   the source's last revision, removing the now-empty source identity requires
+   a separate explicit source-level confirmation and its dependent rules; it is
+   never an automatic cascade.
 5. **Active-run refs are not dependent derived records.** They are bounded
    snapshot copies with their own TTL, not references that keep an archived
    revision alive. Archive deletion does **not** cascade to them by default:
@@ -246,25 +232,22 @@ Rules:
    expires. An unresolved `revision_id` is labelled as an archive revision
    deleted from the archive; the excerpt is never presented as the archive
    record, never revalidated as one, and never used to reconstruct deleted
-   archive text. This archive-only default is proposed and pending owner
-   approval.
+   archive text. This archive-only default is approved.
 6. **"Permanent deletion" is scoped.** It means the selected archive rows are
    permanently removed and, with the explicit cascade, their dependent derived
    records are removed too. It does not mean every copy of the source text
    disappears immediately while active-run excerpts remain. The confirmation
-   must say that matching excerpts remain until the configured TTL unless the
-   owner separately chooses the proposed purge.
-7. **Optional explicit purge (proposed — pending owner approval).** After
-   selecting a revision or source, the owner may separately choose to purge
-   matching excerpts from active runs; a source-level deletion may offer one
-   purge covering all its revisions. Purge removes the matching refs/excerpts
-   but does not delete the runs. It must never run automatically. An active
-   run's optional bounded summary may also contain derived content; until a
-   rule covering it is approved, a purge must either clear it or disclose that
-   it remains until TTL, and the UI must not claim a complete text purge.
-8. **No automatic eviction.** Reaching a future approved quota refuses the new
-   operation; it never deletes archived evidence. No cleanup scheduler, silent
-   eviction or TTL-based archive deletion is introduced.
+   must say that matching excerpts remain until the configured TTL. No purge is
+   approved or specified.
+7. **No purge is approved or specified.** A separate owner-requested purge of
+   matching excerpts may be considered later, but this design does not define
+   one and implementation must not invent it. Until a purge policy is approved,
+   archive deletion leaves matching active-run refs and excerpts untouched until
+   their own TTL, and the UI must disclose that retention rather than claim that
+   every copy disappeared.
+8. **No automatic eviction.** Reaching the approved archive quota refuses the
+   new operation; it never deletes archived evidence. No cleanup scheduler,
+   silent eviction or TTL-based archive deletion is introduced.
 9. **Source unavailability** does not delete or rewrite anything. The Explorer
    labels the original message as edited/deleted/inaccessible while still
    showing the stored revision and its hash.
@@ -272,7 +255,7 @@ Rules:
     `revision_id`, and follows the rules above. It never silently outlives a
     deleted revision and is never presented as the source itself.
 
-### Proposed storage model (conceptual only — no schema exists)
+### Conceptual storage model (approved design; no schema exists)
 
 No table, migration file, SQL statement or Supabase object was created. The
 concepts follow the existing `history_schedules` conventions
@@ -282,9 +265,9 @@ service-role-only, RLS enabled with zero policies, and no owner foreign key
 
 | Concept | Lifetime | Essential contents | Deletion |
 |---|---|---|---|
-| `ai_evidence_runs` | TTL | server-generated opaque `run_id`, `owner_id`, `peer_id`, mode, status, `created_at`, `expires_at`, message range, optional bounded summary, counters, `version` | Logical expiry blocks all normal use. Physical deletion follows only an owner-approved policy, is opportunistic (never a scheduler), and is not guaranteed. |
+| `ai_evidence_runs` | TTL | server-generated opaque `run_id`, `owner_id`, `peer_id`, mode, status, `created_at`, `expires_at`, message range, optional bounded summary, counters, `version` | Logical expiry blocks all normal use. Approved Option 1 physical deletion is opportunistic (never a scheduler) and is not guaranteed. |
 | `ai_evidence_run_refs` | TTL | `run_id`, ordinal, `message_id`, optional `revision_id` (when the ref came from an archived revision), bounded excerpt, hash, captured-at, validation state | `ON DELETE CASCADE` only when/if the parent run is physically deleted; logical expiry blocks reads; no guaranteed physical removal. Archive deletion never cascades to it. |
-| `ai_evidence_sources` | Indefinite | `source_id`, `owner_id`, `peer_id`, `message_id`, first-seen time, last observed source state/check time | Explicit owner delete only; follows the proposed source-level rule; no active-run cascade. |
+| `ai_evidence_sources` | Indefinite | `source_id`, `owner_id`, `peer_id`, `message_id`, first-seen time, last observed source state/check time | Explicit owner delete only; follows the approved source-level rule; no active-run cascade. |
 | `ai_evidence_revisions` | Indefinite, immutable | `revision_id`, `source_id`, `revision_no`, `content_hash`, bounded text, captured-at, approval reference, observed state | Explicit owner delete only; never time-based; never updated; no active-run cascade. |
 | `ai_workspace_glossary` | Persistent (G4-C, after G3-B) | real Workspace identity, normalized term, term, definition, `version`, timestamps | Owner-confirmed delete; no placeholder scope exists before G3-B. |
 | `ai_workspace_knowledge` (later) | Derived | `revision_id`, claim/summary/entity, analysis provenance, revision | A dependent record: blocks default deletion and is removed only by the explicit cascade workflow; never orphaned. |
@@ -297,9 +280,9 @@ Storage rules:
 - **Runs are logically temporary; physical cleanup is not automatic.** Expiry
   is evaluated on read/write against authoritative database time, so no
   background scheduler is needed. Logical expiry makes the run unusable and
-  cannot be reversed by a later chat read. Physical deletion remains pending
-  the owner's expired-run policy; if approved, it is opportunistic and a
-  never-read run may remain stored indefinitely. Expired does not mean deleted.
+  cannot be reversed by a later chat read. Approved Option 1 physical deletion
+  is opportunistic and a never-read run may remain stored indefinitely.
+  Expired does not mean deleted.
 - **Archive text is stored once per revision.** Identical content is deduped by
   `(source_id, content_hash)`; an edit appends a revision instead of replacing
   text; derived records reference a revision id instead of copying text.
@@ -326,41 +309,40 @@ Storage rules:
   persistent knowledge linked to source evidence, scoped by the real Workspace
   model. This correction does not widen or narrow it.
 
-### Bounds and quotas — ALL PENDING OWNER APPROVAL
+### Bounds and quotas — APPROVED 2026-11-16
 
-Every value below is illustrative only. **None is approved.** Implementation
-must obtain limits from an owner-approved policy/configuration; no numeric
-value may be hard-coded into a service, schema default, or test contract. The
-configuration surface itself is still an open decision.
+The owner approved these values. They are application planning limits, not
+exact PostgreSQL billing or physical-storage measurements. They must come from
+the approved policy/configuration and must not be hard-coded. **The
+configuration surface remains an open decision**; glossary quotas are deferred
+until G3-B and no glossary number is approved.
 
-| Parameter | Illustrative value (NOT approved) | Status |
-|---|---|---|
-| Maximum stored excerpt/snapshot per revision | 1,000 characters | PENDING OWNER APPROVAL |
-| Maximum refs per run | 50 | PENDING OWNER APPROVAL |
-| Maximum stored text per run | 32 KiB UTF-8 | PENDING OWNER APPROVAL |
-| Maximum active runs per owner | 20 | PENDING OWNER APPROVAL |
-| Active-run TTL | 7 days (alternatives 24 h / 72 h / 30 d) | PENDING OWNER APPROVAL |
-| Archived revisions per owner | 5,000 | PENDING OWNER APPROVAL |
-| Archived text bytes per owner | 50 MiB | PENDING OWNER APPROVAL |
-| Glossary entries per Workspace | 200 (after G3-B) | PENDING OWNER APPROVAL |
-| Glossary characters per Workspace | 50,000 (after G3-B) | PENDING OWNER APPROVAL |
-| Duplicate strategy | `(source_id, content_hash)` unique; same hash = no write | Design proposal, pending approval |
+| Parameter | Approved value |
+|---|---|
+| Maximum stored excerpt/snapshot per revision | 1,000 characters |
+| Maximum refs per run | 50 |
+| Maximum refs per follow-up | 20 |
+| Maximum stored normalized text per run | 32 KiB UTF-8 |
+| Maximum active runs per owner | 20 |
+| Active-run TTL | 7 days default; owner-selectable 1–30 days, persisted per run |
+| Archived records per owner | 5,000 |
+| Archived data per owner | 50 MiB |
+| Archive limit precedence | whichever of 5,000 records or 50 MiB is reached first |
+| Duplicate strategy | `(source_id, content_hash)` unique; same hash = no-op |
+| Glossary quotas | deferred until the real G3-B Workspace; no value approved |
 
-### Quota-reached behavior (defined without selecting a quota)
+### Quota-reached behavior (approved)
 
-- **New active run:** apply only the owner-approved expired-run physical policy.
-  If that policy permits opportunistic reclamation, it can happen in this
-  existing admission path; no scheduler is added. Expired runs remain physically
-  stored until then. The active-run cap counts logically active runs, not expired
-  rows, while expired physical storage remains a separate storage cost until
-  removed. If the cap is still reached, refuse with an honest message stating
-  the configured cap and current usage, and let the owner inspect/close runs. A
-  live run is never expired to make space.
-- **New archival revision:** refuse with the configured usage and limit. Offer
-  only explicit owner choices (delete a selected archived revision, or raise the
-  limit through an explicit approval workflow). Never evict archived evidence.
-- **Glossary:** refuse the add/edit and report current usage against the
-  approved cap. No entry is silently removed.
+- **New active run:** opportunistically delete expired runs inside this existing
+  admission path; no scheduler is added. If capacity is still unavailable,
+  refuse with an honest message stating the approved cap and current usage, and
+  let the owner inspect/close runs. A live run is never expired to make space.
+- **New archival revision:** refuse with the usage and the approved limit
+  (5,000 records or 50 MiB, whichever is reached first). Offer only explicit
+  owner choices (delete a selected archived revision, or raise the limit through
+  an explicit approval workflow). Never evict or overwrite archived evidence.
+- **Glossary:** quotas are deferred until G3-B; no add/edit limit is enforced or
+  invented before the real Workspace exists.
 - Every refusal reports the actual configured value; the system never invents a
   limit at runtime.
 
@@ -439,10 +421,10 @@ authorization.
 
 | Stage | Scope | Depends on | Gate |
 |---|---|---|---|
-| **G4-A / F1** | Single-source evidence foundation: durable Active Runs with TTL, immutable owner-approved archive revisions, opt-in Cited Summary, basic Explorer with locally built links. | G2-A + existing History | Owner approves the storage model, TTL, excerpt cap, quotas, the deletion/active-run retention policy and the expired-run physical policy. |
+| **G4-A / F1** | Single-source evidence foundation: durable Active Runs with approved TTL, immutable owner-approved archive revisions, opt-in Cited Summary, basic Explorer with locally built links. | G2-A + existing History | Evidence policy approved 2026-11-16; explicit owner authorization of the schema/migration. |
 | **G4-A / F2** | Restart-safe follow-ups on the same run and contract. A delivery phase of G4-A, **not** a new stage. | G4-A / F1 | The approved TTL proves usable in practice. |
 | **G4-B** *(original meaning preserved)* | **Workspace-aware durable Evidence:** Workspace-scoped browsing/consumption of the same evidence contract, cross-run within the Workspace. No second evidence format. | G4-A + G3-A + G3-B | Owner approves Workspace persistence and evidence retention scope. |
-| **G4-C** *(new ID, documented)* | Strict-JSON extraction and the persistent Workspace Glossary. Glossary storage **blocked until G3-B**. | G4-A + G3-B + approved extraction schema/glossary limits | G3-B complete; extraction schema and glossary limits approved. |
+| **G4-C** *(new ID, documented)* | Strict-JSON extraction and the persistent Workspace Glossary. Glossary storage **blocked until G3-B**. | G4-A + G3-B + approved extraction schema | G3-B complete; extraction schema approved; glossary quotas defined after G3-B. |
 | **G4-D** *(new ID, documented)* | Descriptive, then threshold-gated subjective assessments. | G4-C + approved thresholds/person policy | Policy approved; no invented numbers. |
 
 **Why the identifiers changed this way:** G4-B is an existing roadmap identity
@@ -456,44 +438,36 @@ a documented reason, and neither renames or replaces G4-B.
 Scheduled History stays outside all stages: body-only and citation-free, with
 no evidence run, citation or archive path attached to it.
 
-### Remaining owner decisions (implementation is blocked on these)
+### Remaining owner decisions
 
-1. Active-run TTL duration (7 days recommended; alternatives 24 h, 72 h, 30 d).
-2. Maximum excerpt/snapshot size, refs per run, text per run, active runs per
-   owner.
-3. Archive quota (revisions and bytes) and the configuration surface that holds
-   the approved values.
-4. **Deletion and active-run retention (all pending owner approval):**
-   - Revision-level deletion with dependent derived records: block by default
-     and require a separate explicit cascade confirmation (recommended), or
-     allow one-step cascade with an explicit warning.
-   - Source-level deletion when any revision has dependent records: apply the
-     same block/second-confirmation rule as revision-level deletion
-     (recommended), or allow a single source confirmation to cascade.
-   - Default active-run excerpt handling on archive deletion: retain the
-     excerpts until normal TTL expiry without touching the runs (recommended),
-     or require/offer an explicit purge.
-   - Optional purge of matching active-run excerpts: whether it is offered at
-     revision level, at source level as a separate option, or neither
-     (recommended: offer it separately at both levels), and whether it must
-     clear an active run's bounded summary as well as its matching refs.
-5. Whether every edited-message re-archive needs its own approval (recommended
-   yes) or a bounded pre-approval policy.
-6. Glossary entry/character limits (only after G3-B defines the Workspace).
-7. Whether Cited Summary is panel-only, AI-trigger-only, or both.
-8. Whether archive suggestions may come from any run or only owner-flagged
-   evidence.
-9. Subjective-assessment thresholds and the person-level judgment policy.
-10. When (or whether) a tagged-text fallback is specified.
-11. **Expired-run physical policy (pending owner approval):** choose
-    **Option 1** physical deletion, **Option 2** deletion plus a minimal
-    non-content tombstone, or **Option 3** deferred physical deletion after a
-    separately approved mechanism. Also decide the trigger (opportunistic inside
-    existing operations only, versus a future separately approved cleanup) and,
-    for Option 2, the exact minimal tombstone fields. Outright deletion is
-    recommended but **not approved**. No cleanup scheduler is authorized.
-12. Whether the owner wants a single global limit configuration or per-Workspace
-    limits after G3-B.
+The 2026-11-16 approval closed the active-run TTL, all active limits, archive
+quotas, deletion/active-run retention, per-edit approval and the expired-run
+physical policy (Option 1). Those are no longer open. Implementation is still
+blocked on explicit owner authorization of the schema/migration, not on these
+product decisions.
+
+1. **Limit configuration surface:** where the approved TTL/quotas live (owner
+   settings row, environment, per-Workspace policy) and who may change them.
+2. **Glossary quotas:** entry/character limits, only after G3-B defines the real
+   Workspace. No glossary number is approved.
+3. **Cited Summary surface:** panel-only, AI-trigger-only, or both, and whether
+   it is remembered per source or chosen per request.
+4. **Archive suggestions:** whether candidates may come from any run or only
+   owner-flagged evidence, and how many suggestions one surface shows.
+5. **Subjective-assessment thresholds** and the person-level judgment policy for
+   G4-D.
+6. **Tagged-text fallback:** whether to specify one, and which failure classes
+   may use it without weakening strict-JSON validation.
+7. **Global versus per-Workspace limit configuration** after G3-B.
+
+**No longer open:** active-run TTL (7-day default, 1–30 days), active limits
+(1,000-character excerpt, 50 refs per run, 20 per follow-up, 32 KiB text per
+run, 20 runs per owner), archive quotas (5,000 records or 50 MiB per owner,
+whichever first), dependent-record blocking with a separate explicit cascade,
+active-run excerpt retention until TTL, immutable revisions and per-edit owner
+approval, and Option 1 opportunistic physical deletion with no scheduler,
+tombstone or fixed deadline. A separate purge remains unspecified and is not
+approved.
 
 ## Previous delivery: G1-A — Reusable interaction grammar
 

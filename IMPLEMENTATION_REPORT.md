@@ -1,25 +1,26 @@
 # IMPLEMENTATION REPORT
 
 **Reporting date:** 2026-11-16
-**Latest delivery:** G4-A active-run expiry correction and report consolidation
-**Base inspected:** `origin/main` `4faf695e842cdc6487788d78cf24fe44122ebe2a`
-**Status:** G4-A is documented but **not implemented**; implementation remains
-blocked pending owner approval.
+**Latest delivery:** G4-A evidence policy approval recorded (documentation only)
+**Base inspected:** `origin/main` `b7836043027d869de261587de61c52cebab5d1d1`
+**Status:** The G4-A evidence design decisions are owner-approved. G4-A is
+**not implemented**; no evidence table, migration, SQL, Supabase object or
+runtime path exists. Implementation remains gated on explicit owner
+authorization of the schema/migration.
 
 This report describes only the latest documentation delivery and the current
 project status. It is not an append-only changelog. Decisions that still matter
 are summarized as current context, not as separate delivery histories.
 
-## Latest delivery — G4-A expiry semantics (documentation only)
+## Latest delivery — G4-A evidence policies (documentation only)
 
 ### Scope
 
-This delivery corrected two documentation defects:
-
-1. Active Evidence Run expiry was written as though logical expiry always led
-   to physical deletion or a lazy sweep.
-2. `IMPLEMENTATION_REPORT.md` had accumulated delivery sections instead of
-   describing only the current delivery.
+The owner approved the complete G4-A evidence policy: retention classes, TTL,
+active-run limits, archive quotas, immutable revisions, deletion rules,
+re-archival behavior and the expired-run physical policy. This delivery records
+those decisions in the canonical documentation so future sessions do not
+re-open them or mistake them for implementation.
 
 No application code, test, migration, SQL, Supabase object, scheduler, Telegram
 operation, runtime behavior or deployment changed. No G4-A table or runtime
@@ -29,159 +30,112 @@ path exists.
 
 | File | Change |
 |---|---|
-| `ROADMAP.md` | Added the dated correction record; split retention into logical expiry and physical deletion; added the active-run expiry section and pending Options 1–3; corrected storage and quota wording; added the expired-run physical policy to the G4-A/F1 gate and owner decisions. |
-| `LIFEOS_IDEAS.md` | Clarified EVID-002 expiry and risks; split the retention table; added the logical-versus-physical expiry subsection with Options 1–3; corrected deletion and limit wording; updated G4-A, Stage 5, findings and open decisions; appended the dated change-log row. |
-| `IMPLEMENTATION_REPORT.md` | Replaced with this current-only report; no other delivery narratives are retained. |
+| `LIFEOS_IDEAS.md` | Replaced the pending §4.5.1 status and numeric placeholders with the approved data classes, TTL, limits, archive quotas, physical-deletion policy, deletion/dependency rules and immutable-revision rules. Updated EVID-001/002/003 dependencies and wording, G4-A/G4-C boundaries, stage/readiness gates, §10 decisions 3/17/19 and the change log. |
+| `ROADMAP.md` | Recorded the approved policy in the design record; replaced pending TTL/limits/quota/deletion sections with approved values and Option 1; updated retention, quota, staging and readiness text; reduced the owner-decision list to the remaining open questions. |
+| `IMPLEMENTATION_REPORT.md` | Replaced with this current-only report. No historical delivery sections are appended. |
 
-### Logical expiry
+### Approved evidence policy
 
-- `expires_at` is evaluated against authoritative database time, never an
-  untrusted client clock.
-- Once expired, the run is unusable for normal retrieval, Explorer, Cited
-  Summary and follow-ups, and is not valid evidence.
-- A follow-up fails honestly. The expired run and its evidence are never
-  reconstructed from Telegram history, archived evidence, a stored summary,
-  inferred conversation or another source.
-- Active-run expiry does not expire or modify immutable Archive revisions or
-  derived Workspace Knowledge.
+The canonical detailed record is `LIFEOS_IDEAS.md` §4.5.1; `ROADMAP.md` holds
+the implementation-facing summary. In brief:
 
-### Physical deletion
+- **Active Evidence Runs** are durable across application restarts, temporary
+  and TTL-bound. The default TTL is 7 days; the owner selects 1–30 days at
+  creation and the value is persisted for that run. Expiry uses authoritative
+  database time, immediately denies retrieval/Explorer/Cited Summary/follow-up,
+  and is never silently extended. Expired runs are never reconstructed from
+  Telegram, the Archive, summaries or conversation history.
+- **Expired physical deletion** is Option 1: opportunistic deletion of the run
+  and its refs only inside an existing authorized operation. There is no
+  scheduler, worker, cleanup loop, tombstone or promised physical-deletion
+  deadline. An untouched expired run may remain physically stored indefinitely.
+- **Approved active limits:** excerpt 1,000 characters; 50 references per run;
+  20 references per follow-up; 32 KiB normalized text per run; 20 active runs
+  per owner. At the cap, expired runs may be removed opportunistically; if
+  capacity is still unavailable the new run is rejected explicitly. A valid,
+  unexpired run is never evicted.
+- **Evidence Archive** is manual and owner-approved. Revisions are immutable and
+  append-only; the same content hash is a no-op; changed content requires a new
+  owner-approved revision with no automatic refresh or replacement; references
+  identify the exact revision and there is no mutable “latest” pointer.
+  Telegram edits/deletes update observed source status only and never rewrite
+  the snapshot.
+- **Archive quotas:** 5,000 records or 50 MiB per owner, whichever is reached
+  first. A reached quota rejects new archival and reports the reason; archived
+  evidence is never automatically deleted, evicted or overwritten. These are
+  application planning limits, not exact PostgreSQL billing or physical-storage
+  measurements.
+- **Archive deletion:** dependent records block deletion by default at both
+  revision and source level. A separate explicit owner confirmation with a
+  clear impact explanation is required for a cascade; no silent cascade exists.
+  Archive deletion does not delete active-run excerpt snapshots, which remain
+  governed by their own TTL. No purge is approved or specified; one may be
+  considered separately, but implementation must not invent it.
+- **Workspace Glossary:** scoped to the real G3-B Workspace. No fake or
+  temporary workspace key is permitted. Glossary quotas and implementation are
+  deferred until G3-B establishes real Workspace identity, persistence and
+  authorization.
 
-- Logical expiry does not delete rows and is not evidence of physical deletion.
-- No cleanup scheduler, background worker, cron job or independent cleanup loop
-  is approved or introduced.
-- Any approved physical removal is opportunistic inside an existing authorized
-  operation that touches the run or admits a new run. It is never a new periodic
-  process.
-- A never-read expired run may remain physically stored indefinitely. The design
-  guarantees no fixed deletion period, and does not describe "expired and
-  inaccessible" as "physically deleted".
-- No live run, Archive revision or dependent Knowledge record is evicted to make
-  room.
+### Privacy and architecture invariants preserved
 
-Expiry enforcement, physical removal, and any optional minimal tombstone remain
-separate concerns.
+- Evidence Envelopes never enter generic `ToolResult` data, tool arguments, tool
+  history, audit records, conversation history, continuation prompts or fallback
+  rendering. Generic results expose only an opaque run id and bounded
+  non-sensitive counts/coverage.
+- Provider inputs receive only minimum bounded excerpts and opaque local keys.
+  Telegram message ids, sender ids, owner ids, Workspace ids, URLs and hashes are
+  never exposed to the provider, and no Telegram conversation context is passed
+  into isolated media/evidence analysis.
+- There is no second scheduler, executor, Telegram client, listener or update
+  loop; `ToolExecutor` remains the sole AI tool execution authority. AI gains no
+  arbitrary Telegram RPC, SQL, shell, filesystem or unrestricted HTTP execution.
+- Scheduled History remains body-only, citation-free and outside the evidence
+  system.
 
-### Expired-run physical options (all pending owner approval)
+### Boundaries and dependencies
 
-| Option | Proposed behavior | Consequences |
-|---|---|---|
-| **1. Physical deletion** (recommended, unapproved) | Delete expired run rows and their refs, with no tombstone, only through an existing authorized operation. | Strongest data minimization. Never-read rows can remain indefinitely. An old run id later looks like an absent run. |
-| **2. Tombstone retention** (unapproved) | Delete evidence text, excerpts and summaries; retain only opaque `run_id`, `owner_id`, lifecycle status, `created_at`, `expires_at` and a deletion timestamp. | Records existence and expiry without evidence. `run_id` and `owner_id` exist solely for owner-scoped lookup; the status and timestamps prove only that the run existed and expired. No peer/message ids, ranges, content, summaries, provider payloads or recoverable evidence. It needs the same opportunistic cleanup, and adds a small metadata-retention footprint. |
-| **3. Deferred physical deletion** (unapproved) | Logical expiry applies immediately; physical deletion waits for a separately approved mechanism. | No new scheduler. Storage and privacy exposure grow until such a mechanism is approved; no fixed deletion period. |
+- **G4-A / F1** is the single-source evidence foundation (EVID-001/002/003,
+  INTEL-001/002/003/037). Its policy is approved; it is not implemented.
+- **G4-A / F2** is restart-safe follow-ups on the same contract, not a new
+  stage. It remains blocked by F1 and needs the approved TTL to prove usable in
+  practice.
+- **G4-B** keeps its original meaning: Workspace-aware durable evidence, blocked
+  by G3-A/G3-B and the real Workspace model.
+- **G4-C** is strict-JSON extraction plus the persistent Workspace Glossary.
+  Glossary storage is blocked until G3-B; glossary quotas are deferred.
+- **G4-D** is threshold-gated subjective assessment and remains blocked on
+  explicit assessment and person-level policies.
 
-**Recommendation, not approved:** Option 1, outright physical deletion, because
-Active Runs are temporary and no cleanup mechanism or evidence tombstone is
-currently required. This is not an owner decision. Bounded physical retention
-would require a separately approved mechanism.
+### Current state and blockers
 
-### Current G4-A context preserved
-
-- Active Evidence Runs remain durable across application restarts, temporary,
-  TTL-bound and separate from permanent archive storage. Their storage backend,
-  TTL and limits are not approved and no table exists.
-- Archiving is system-suggested but requires explicit owner approval; there is
-  no automatic archival. Archived evidence remains until manual deletion.
-- Archive revisions are immutable and append-only. Capture is idempotent for the
-  same content hash; changed content requires a newly approved revision; no
-  earlier revision is overwritten. References identify the exact `revision_id`,
-  and there is no mutable "latest revision" pointer.
-- Source identity is separate from revision content. Telegram edits and deletes
-  may update observed source status but never rewrite stored revision content.
-- Derived Workspace Knowledge keeps provenance to its source revision. Dependent
-  records block default archive deletion and require a separate explicit
-  cascade; these rules remain pending approval.
-- The Workspace Glossary depends on the real G3-B Workspace model; no temporary
-  or substitute workspace key is permitted.
-- G4-B retains its original meaning: Workspace-aware durable Evidence, not
-  follow-up support. Follow-ups are G4-A/F2.
-- Evidence envelopes, excerpts and evidence text remain outside generic
-  ToolResult data, tool arguments, audit records, conversation history, provider
-  continuation messages and fallback rendering. Generic results expose only the
-  opaque run id and bounded non-sensitive counts or coverage.
-- Archive deletion is not global erasure while active-run excerpt copies remain.
-  Active-run excerpt retention or purge, and dependent Knowledge cascade, remain
-  subject to explicit owner approval. No automatic cleanup or unapproved
-  cascade is introduced.
-- All TTLs, quotas, excerpt/reference/run limits and storage estimates remain
-  proposals or estimates, not approved facts.
+- No `ai_evidence_runs`, `ai_evidence_run_refs`, `ai_evidence_sources`,
+  `ai_evidence_revisions`, `ai_workspace_glossary` or
+  `ai_workspace_knowledge` table exists.
+- `DATABASE_ARCHITECTURE.md` was inspected read-only and was not modified.
+- The remaining implementation gate is explicit owner authorization of the
+  schema/migration. Supabase schema changes remain manual and are not authorized
+  by the design approval or by this documentation task.
+- Remaining open product decisions are the limit configuration surface, Cited
+  Summary surface, archive suggestions, glossary quotas after G3-B,
+  assessment/person policy thresholds, an optional tagged-text fallback, and
+  global versus per-Workspace limit configuration. They do not reopen the
+  approved numeric policy.
 
 ### Verification performed
 
-- Inspected the live branch, local HEAD, worktree, remote `origin/main`, ancestry
-  and divergence before editing. The checkout was clean and matched the verified
-  remote base `4faf695e842cdc6487788d78cf24fe44122ebe2a`; no synchronization
-  operation was needed.
-- Read the complete current contents of `ROADMAP.md`, `LIFEOS_IDEAS.md` and
-  `IMPLEMENTATION_REPORT.md` before editing.
-- Searched the repository for conflicting wording about active-run expiry,
-  physical deletion, tombstones, cleanup schedulers, archive retention,
-  revision immutability, deletion cascades, G4-B and the G3-B dependency.
-- Checked Markdown structure and table column consistency across the edited
+- Inspected the freshly fetched `origin/main` at `b783604`.
+- Inspected `AGENTS.md`, `LIFEOS_IDEAS.md`, `ROADMAP.md`,
+  `IMPLEMENTATION_REPORT.md` and `DATABASE_ARCHITECTURE.md` (read-only).
+- Checked that the approved values, Option 1 policy, immutable revisions,
+  deletion/dependency rules and G3-B deferral are consistent across the edited
   documents.
-- Ran `git diff --check` and reviewed the complete diff and changed-file list.
-
-No application test suite was run. This delivery changes documentation only;
-no application behavior is claimed as tested.
+- Ran documentation whitespace and diff checks; no code, test, SQL, Supabase,
+  migration, Telegram or deployment artifact was produced.
 
 ### Not implemented or live-verified
 
-- No G4-A application implementation, service, UI, repository, table, index,
-  RLS policy or runtime path was created.
-- No code or tests were changed.
-- No SQL was written or executed; no migration, Supabase object, schema or
-  `DATABASE_ARCHITECTURE.md` change was made.
-- No scheduler, worker, cron job or cleanup loop was added.
-- No Telegram operation, live expiry, deletion, purge, archive operation,
-  storage measurement or deployment was performed.
-- No claim is made that G4-A is ready to implement.
-
-### Pending owner approval
-
-1. The G4-A storage model for runs, refs, archive sources and immutable
-   revisions.
-2. Active-run TTL duration.
-3. Maximum excerpt/snapshot size, refs per run, text per run and active runs per
-   owner.
-4. Archive revision/byte quotas and the configuration surface that holds all
-   approved limits.
-5. Revision-level deletion: block dependent derived records and require a
-   separate cascade confirmation (recommended), or allow one-step cascade with a
-   warning.
-6. Source-level deletion: use the same block/second-confirmation rule
-   (recommended), or allow one source confirmation to cascade all revisions.
-7. Default active-run excerpt handling on archive deletion: retain until TTL
-   (recommended), or require/offer a purge.
-8. Optional purge scope: revision level, source level or neither; and whether it
-   must clear a run's bounded summary as well as matching refs.
-9. Whether every edited-message re-archive needs fresh owner approval or may use
-   a bounded pre-approval policy.
-10. Expired-run physical policy: Option 1 physical deletion (recommended,
-    unapproved), Option 2 deletion plus a minimal non-content tombstone, or
-    Option 3 deferred physical deletion. The trigger and, for Option 2, exact
-    fields must also be approved. No cleanup scheduler is authorized.
-11. G3-B Workspace persistence, identity and authorization model before the
-    Glossary or G4-B can proceed.
-12. The extraction schema and limits for G4-C.
-13. G4-D assessment thresholds and the person-level judgment policy.
-14. Cited Summary surface: panel-only, AI-trigger-only, or both.
-15. Archive suggestion sources and how many suggestions may be shown.
-16. Tagged-text fallback, if any, without weakening strict JSON validation.
-
-No item above is approved by this documentation delivery.
-
-### Remaining blocker
-
-G4-A implementation is blocked on explicit owner approval of the storage model,
-TTL, quotas, excerpt limits, archive deletion/active-run retention rules and the
-expired-run physical policy. No schema or code may be authored before those
-decisions.
-
-### Delivery record
-
-- Commit: the single documentation commit containing this report. Its SHA and
-  the independent post-push remote-main verification are stated in the delivery
-  response, because a file cannot contain the hash of the commit that introduces
-  it.
-- Push verification: fetch remote, compare remote `main` with local `HEAD`,
-  confirm ancestry, inspect the pushed file list and confirm a clean worktree.
+- No G4-A feature, evidence table, migration, SQL, Supabase object, scheduler,
+  Explorer, Cited Summary, follow-up path, archive workflow, extraction,
+  glossary or assessment exists.
+- No tests were added or run because this delivery changes documentation only.
+- No Telegram, Render or live provider operation was performed.
