@@ -45,6 +45,7 @@ from backend.evidence.models import (
     EvidenceRun,
     EvidenceRunBundle,
     EvidenceSource,
+    EvidenceStorageError,
     EvidenceStructuredOutputError,
     EvidenceValidationError,
 )
@@ -242,16 +243,6 @@ class EvidenceService:
         run_id = str(uuid.uuid4())
         refs = build_refs(messages, run_id=run_id, owner_id=owner)
         now = await self.repository.database_now()
-        # Opportunistic deletion only: an authorized admission already touches
-        # the store.  A still-valid run is NEVER evicted.
-        await self.repository.delete_expired_runs(owner, now)
-        active = await self.repository.count_active_runs(owner, now)
-        if active >= constants.MAX_ACTIVE_RUNS_PER_OWNER:
-            raise EvidenceQuotaError(
-                f"active evidence run limit reached ({constants.MAX_ACTIVE_RUNS_PER_OWNER}); "
-                "expired runs may be removed by an existing operation, but a valid run "
-                "is never evicted"
-            )
 
         text_bytes = sum(ref.excerpt_bytes for ref in refs)
         run = EvidenceRun(
@@ -268,7 +259,22 @@ class EvidenceService:
             created_at=now,
             expires_at=now + timedelta(days=ttl),
         )
-        stored = await self.repository.create_run(run)
+        try:
+            # Admission is atomic: the expired sweep, the owner quota and the
+            # insert are one serialized operation, so concurrent requests can
+            # never both pass the check and exceed the approved cap. A valid
+            # run is still never evicted.
+            stored = await self.repository.create_run(
+                run,
+                max_active=constants.MAX_ACTIVE_RUNS_PER_OWNER,
+                now=now,
+            )
+        except EvidenceQuotaError as exc:
+            raise EvidenceQuotaError(
+                f"active evidence run limit reached ({constants.MAX_ACTIVE_RUNS_PER_OWNER}); "
+                "expired runs may be removed by an existing operation, but a valid run "
+                "is never evicted"
+            ) from exc
         try:
             await self.repository.add_refs(stored, list(refs))
         except Exception:
@@ -321,9 +327,14 @@ class EvidenceService:
         timeout_s: float | None = None,
         request_id: str = "",
         peer_type: Any = None,
+        opt_in: bool = False,
     ) -> CitedSummaryResult:
         owner = int(owner_id or 0)
         peer = int(peer_id or 0)
+        if not opt_in:
+            raise EvidenceValidationError(
+                "Cited Summary requires explicit opt-in for this request"
+            )
         ttl = _validate_ttl(ttl_days)
         try:
             requested = int(count)
@@ -564,6 +575,9 @@ class EvidenceService:
             else None
         )
         if existing is not None:
+            await self.repository.link_ref_revision(
+                owner, bundle.run.id, ref.ordinal, existing.id,
+            )
             return ArchiveResult(
                 status="unchanged",
                 source_id=existing.source_id,
@@ -580,41 +594,45 @@ class EvidenceService:
             )
 
         now = await self.repository.database_now()
-        usage = await self.repository.archive_usage(owner)
-        if usage.records >= constants.MAX_ARCHIVE_RECORDS_PER_OWNER:
-            raise EvidenceQuotaError(
-                f"archive record limit reached ({constants.MAX_ARCHIVE_RECORDS_PER_OWNER}); "
-                "no archived revision was overwritten or evicted"
-            )
-        if usage.bytes + ref.excerpt_bytes > constants.MAX_ARCHIVE_BYTES_PER_OWNER:
-            raise EvidenceQuotaError(
-                f"archive byte limit reached ({constants.MAX_ARCHIVE_BYTES_PER_OWNER} bytes); "
-                "no archived revision was overwritten or evicted"
-            )
-        if source is None:
-            source = await self.repository.create_source(
-                owner, bundle.run.peer_id, ref.message_id, now=now,
-            )
-        revisions = await self.repository.list_revisions(owner, source.id)
-        next_no = max((item.revision_no for item in revisions), default=0) + 1
-        revision = await self.repository.add_revision(
+        write = await self.repository.archive_atomic(
             owner_id=owner,
-            source_id=source.id,
-            revision_no=next_no,
+            peer_id=bundle.run.peer_id,
+            message_id=ref.message_id,
+            source_id=str(uuid.uuid4()),
+            revision_id=str(uuid.uuid4()),
             content_hash=ref.content_hash,
             text=ref.excerpt,
             approval_reference="owner-confirmed",
             now=now,
+            max_records=constants.MAX_ARCHIVE_RECORDS_PER_OWNER,
+            max_bytes=constants.MAX_ARCHIVE_BYTES_PER_OWNER,
         )
-        await self.repository.update_source_observation(
-            owner,
-            source.id,
-            "live" if next_no == 1 else "edited",
-            now=now,
-        )
+        if write.status == "quota":
+            raise EvidenceQuotaError(
+                "archive storage limit reached "
+                f"({constants.MAX_ARCHIVE_RECORDS_PER_OWNER} records or "
+                f"{constants.MAX_ARCHIVE_BYTES_PER_OWNER} bytes); "
+                "no archived revision was overwritten or evicted"
+            )
+        revision = await self.repository.get_revision(owner, write.revision_id)
+        if revision is None:
+            raise EvidenceStorageError(
+                "archive revision disappeared before the reference was linked"
+            )
+        await self._link_ref(bundle.run, ref, revision)
+        if write.status == "unchanged":
+            return ArchiveResult(
+                status="unchanged",
+                source_id=revision.source_id,
+                revision_id=revision.id,
+                revision_no=revision.revision_no,
+                content_hash=revision.content_hash,
+                reason="the exact excerpt is already archived; no new revision was written",
+                citation=_citation(bundle.run, ref),
+            )
         return ArchiveResult(
             status="created",
-            source_id=source.id,
+            source_id=revision.source_id,
             revision_id=revision.id,
             revision_no=revision.revision_no,
             content_hash=revision.content_hash,
@@ -623,6 +641,26 @@ class EvidenceService:
                 "remain unchanged"
             ),
             citation=_citation(bundle.run, ref),
+        )
+
+    async def _link_ref(
+        self,
+        run: EvidenceRun,
+        ref: EvidenceRef,
+        revision: EvidenceRevision,
+    ) -> None:
+        """Bind this reference to the exact revision, after validating scope."""
+        source = await self.repository.get_source(run.owner_id, revision.source_id)
+        if (
+            source is None
+            or source.peer_id != run.peer_id
+            or source.message_id != ref.message_id
+        ):
+            raise EvidenceValidationError(
+                "archived revision does not belong to this evidence reference"
+            )
+        await self.repository.link_ref_revision(
+            run.owner_id, run.id, ref.ordinal, revision.id,
         )
 
     async def archive_usage(self, owner_id: int) -> ArchiveUsage:
@@ -728,5 +766,7 @@ def reset_evidence_service_for_tests(
 ) -> EvidenceService:
     """Replace the process-wide service with an explicit test repository."""
     global _SERVICE
-    _SERVICE = EvidenceService(repository or EvidenceRepository(db=None))
+    _SERVICE = EvidenceService(
+        repository or EvidenceRepository(allow_memory=True)
+    )
     return _SERVICE

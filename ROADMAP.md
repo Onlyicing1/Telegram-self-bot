@@ -6,9 +6,11 @@ Status: **Implemented offline, with an additive migration artifact that is NOT
 applied.** G2-B (Workspace language), G4-A/F2 (follow-ups), G4-B (Workspace
 awareness), G4-C (extraction/Glossary), G4-D, G5-A and later Scheduled History
 phases remain deferred. No SQL, Supabase, Telegram, Render, provider or
-deployment operation was performed. The policy record follows below; the
-implementation is in `backend/evidence/`, the owner-only Explorer and the
-unapplied migration.
+deployment operation was performed. An adversarial review of the first
+delivery found six issues; five were fixed in the 2026-11-17 remediation sprint
+and one is an explicit blocker (see "F1 remediation record"). The policy record
+follows below; the implementation is in `backend/evidence/`, the owner-only
+Explorer and the unapplied migration.
 
 ### What G2-A adds
 
@@ -79,6 +81,28 @@ The owner must review and manually apply
 `supabase/migrations/20261116120000_create_evidence_foundation.sql` before the
 runtime can use the tables; until then the service fails honestly rather than
 falling back to a second evidence format. G4-A/F2 remains deferred.
+
+### F1 remediation record (2026-11-17)
+
+The audit of `7f02e88` reported six issues. Each was re-checked against source
+before changing anything:
+
+| # | Finding | Result |
+|---|---|---|
+| M1 | A ref never identified the revision it produced | **FIXED.** Archiving now writes a write-once `revision_id` onto the ref after validating owner/chat/message; a database trigger and a column-level grant enforce the same rule, so no other ref update is possible and no "latest" pointer exists. |
+| M2 | Silent in-memory fallback could report a durable success | **FIXED.** `EvidenceRepository()` is durable-only; an unavailable Supabase raises `EvidenceStorageUnavailable` instead of storing in process memory. Memory is reachable only through the explicit test double. |
+| M3 | Quota checks were check-then-act | **FIXED at the application and SQL boundary.** Run admission and archive writes are one serialized operation (`pg_advisory_xact_lock` in `ai_evidence_create_run` / `ai_evidence_archive_revision`; one lock in the test double). PostgreSQL concurrency remains unverified until the migration is applied. |
+| M4 | Cited Summary could run without per-request opt-in | **FIXED.** The service refuses without `opt_in=True`; the AI tool is confirmation-required and cannot auto-execute; the panel toggle is cleared after every run, including the link path. Consent is never remembered. |
+| M5 | Dependency check was not part of the deletion operation | **DEFERRED WITH BLOCKER.** F1 has no dependent record class; the durable `count_*_dependents` methods are explicit zero stubs. Before any dependent table exists (G4-C), the preflight and the delete must move into one database transaction and return the dependent list. |
+| M6 | Explorer held owner results in module globals | **FIXED.** Every global result cache was removed; views receive the data their own handler loaded, and each opaque id is re-resolved through an owner-filtered service call. |
+
+Verification in that sprint: 35 Evidence tests (including 17 new regression
+tests), a 288-test registry/schema/confirmation/document group, and a full run
+of **7947 passed, 27 skipped, 1 pre-existing time-dependent scheduler failure**
+(`test_recovered_interrupted_occurrence_is_picked_up_by_run_once`, which fails
+because its fixed 2026-09-10 schedule is advanced to the current wall clock).
+The migration was edited in place and **not applied**; no SQL, Supabase,
+Telegram, Render or provider operation was performed.
 
 ### Approved owner decisions (unchanged)
 
@@ -423,7 +447,7 @@ authorization.
 
 | Stage | Scope | Depends on | Gate |
 |---|---|---|---|
-| **G4-A / F1** | Single-source evidence foundation: durable Active Runs with approved TTL, immutable owner-approved archive revisions, opt-in Cited Summary, basic Explorer with locally built links. | G2-A + existing History | **Implemented offline 2026-11-16**; additive migration artifact created but **manual owner application still required**. |
+| **G4-A / F1** | Single-source evidence foundation: durable Active Runs with approved TTL, immutable owner-approved archive revisions, opt-in Cited Summary, basic Explorer with locally built links. | G2-A + existing History | **Implemented offline 2026-11-16; remediated 2026-11-17** (M1–M4, M6 fixed; M5 blocked until dependent records exist). Additive migration artifact edited but **manual owner application still required**. |
 | **G4-A / F2** | Restart-safe follow-ups on the same run and contract. A delivery phase of G4-A, **not** a new stage. | G4-A / F1 | The approved TTL proves usable in practice. |
 | **G4-B** *(original meaning preserved)* | **Workspace-aware durable Evidence:** Workspace-scoped browsing/consumption of the same evidence contract, cross-run within the Workspace. No second evidence format. | G4-A + G3-A + G3-B | Owner approves Workspace persistence and evidence retention scope. |
 | **G4-C** *(new ID, documented)* | Strict-JSON extraction and the persistent Workspace Glossary. Glossary storage **blocked until G3-B**. | G4-A + G3-B + approved extraction schema | G3-B complete; extraction schema approved; glossary quotas defined after G3-B. |

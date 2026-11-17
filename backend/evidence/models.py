@@ -63,6 +63,12 @@ class EvidenceStorageError(EvidenceError):
     code = "storage"
 
 
+class EvidenceStorageUnavailable(EvidenceStorageError):
+    """Durable Evidence persistence is required but unavailable."""
+
+    code = "storage_unavailable"
+
+
 class EvidenceProviderError(EvidenceError):
     code = "provider"
 
@@ -186,3 +192,14 @@ class CitedSummaryResult:
 class ArchiveUsage:
     records: int
     bytes: int
+
+
+@dataclass(frozen=True)
+class ArchiveWrite:
+    """Outcome of one atomic archive write (created, unchanged or quota)."""
+
+    status: str
+    source_id: str = ""
+    revision_id: str = ""
+    revision_no: int = 0
+    content_hash: str = ""

@@ -1360,6 +1360,7 @@ async def _run_summary(
                         timeout_s=OPERATION_TIMEOUT_S,
                         request_id="glass-history-cited",
                         peer_type=peer_type,
+                        opt_in=bool(cited),
                     ),
                     timeout=OPERATION_TIMEOUT_S,
                 )
@@ -1794,6 +1795,9 @@ async def _link_input_handler(
             except Exception as exc:  # noqa: BLE001
                 finish_panel_operation(panel_chat_id, panel_msg_id, generation)
                 logger.warning("HISTORY_LINK_LAUNCH_FAILED error=%s", type(exc).__name__)
+        # The link run captured the toggle above; consent is never carried into
+        # a later request, exactly like the main Run action.
+        _STATE.cited = False
     if client is not None and msg_id:
         try:
             await client.delete_messages(chat_id, [msg_id])

@@ -112,7 +112,7 @@ class _FakeManager:
 
 
 def _repo(clock: _Clock | None = None) -> EvidenceRepository:
-    return EvidenceRepository(db=None, clock=clock or _Clock())
+    return EvidenceRepository(clock=clock or _Clock(), allow_memory=True)
 
 
 def _service(clock: _Clock | None = None) -> tuple[EvidenceService, EvidenceRepository, _Clock]:
@@ -187,6 +187,7 @@ async def test_database_time_expiry_denies_access_and_never_reconstructs():
         ttl_days=1,
         provider_manager=manager,
         peer_type=PeerType.PRIVATE_USER,
+        opt_in=True,
     )
     clock.advance(days=1, seconds=1)
     with pytest.raises(EvidenceExpired):
@@ -362,6 +363,7 @@ async def test_provider_receives_only_opaque_keys_and_bounded_excerpts():
         provider_manager=manager,
         current_message_id=103,
         peer_type=PeerType.PRIVATE_USER,
+        opt_in=True,
     )
     prompt = "\n".join(
         str(message["content"]) for message in manager.calls[0]["messages"]
@@ -401,6 +403,7 @@ async def test_invalid_structured_output_fails_closed_and_cleans_up_the_run():
                 count=2,
                 provider_manager=_FakeManager(bad),
                 peer_type=PeerType.PRIVATE_USER,
+                opt_in=True,
             )
     assert await service.list_active_runs(OWNER) == []
 
@@ -418,6 +421,7 @@ async def test_provider_failure_is_honest_and_leaves_no_partial_run():
             count=2,
             provider_manager=_FakeManager("", success=False),
             peer_type=PeerType.PRIVATE_USER,
+            opt_in=True,
         )
     assert "provider" in str(raised.value).lower()
     assert await service.list_active_runs(OWNER) == []

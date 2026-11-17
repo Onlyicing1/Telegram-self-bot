@@ -112,16 +112,7 @@ async def _overview() -> tuple[str, str, list]:
     return TITLE, "\n".join(lines), builder.build()
 
 
-_runs_sync_cache: list = []
-
-
-def _runs_view(notice: str = "") -> tuple[str, str, list]:
-    try:
-        # The panel handler is async; this function is only called from an
-        # async wrapper below.  Kept separate for testability.
-        runs = _runs_sync_cache
-    except Exception as exc:  # pragma: no cover - defensive
-        return TITLE, _failure(exc), _back_buttons()
+def _runs_view(runs: list, notice: str = "") -> tuple[str, str, list]:
     builder = InlinePanelBuilder()
     lines = [
         f"Active Evidence Runs ({len(runs)}/{constants.MAX_ACTIVE_RUNS_PER_OWNER})",
@@ -152,12 +143,8 @@ def _back_buttons() -> list:
 
 
 def _run_view(
-    run_id: str, page: int = 0, notice: str = "",
+    bundle: Any, page: int = 0, notice: str = "",
 ) -> tuple[str, str, list]:
-    try:
-        bundle = _run_bundle_cache
-    except NameError:
-        bundle = None
     if bundle is None:
         return TITLE, f"{sym.STATE_FAILED} That evidence run is unavailable.", _back_buttons()
     run = bundle.run
@@ -199,14 +186,9 @@ def _run_view(
     return TITLE, "\n".join(lines), builder.build()
 
 
-_run_bundle_cache: Any = None
-
-
-def _suggest_view(run_id: str, notice: str = "") -> tuple[str, str, list]:
-    try:
-        suggestions = _suggestions_cache
-    except NameError:
-        suggestions = []
+def _suggest_view(
+    run_id: str, suggestions: list, notice: str = "",
+) -> tuple[str, str, list]:
     lines = [
         "Archive suggestions are limited to evidence explicitly reviewed in this "
         "run. Nothing is archived automatically; every revision needs confirmation.",
@@ -231,11 +213,9 @@ def _suggest_view(run_id: str, notice: str = "") -> tuple[str, str, list]:
     return TITLE, "\n".join(lines), builder.build()
 
 
-def _confirm_view(run_id: str, key: str, notice: str = "") -> tuple[str, str, list]:
-    try:
-        candidate = _candidate_cache
-    except NameError:
-        candidate = None
+def _confirm_view(
+    run_id: str, candidate: Any, notice: str = "",
+) -> tuple[str, str, list]:
     if candidate is None:
         return TITLE, f"{sym.STATE_FAILED} That suggestion is no longer available.", _back_buttons()
     lines = [
@@ -257,12 +237,9 @@ def _confirm_view(run_id: str, key: str, notice: str = "") -> tuple[str, str, li
     return TITLE, "\n".join(lines), builder.build()
 
 
-def _archive_view(notice: str = "") -> tuple[str, str, list]:
-    try:
-        sources = _sources_cache
-        usage = _usage_cache
-    except NameError:
-        sources, usage = [], None
+def _archive_view(
+    sources: list, usage: Any, notice: str = "",
+) -> tuple[str, str, list]:
     builder = InlinePanelBuilder()
     lines = ["Archive is owner-approved, immutable and never expires automatically."]
     if usage is not None:
@@ -286,12 +263,9 @@ def _archive_view(notice: str = "") -> tuple[str, str, list]:
     return TITLE, "\n".join(lines), builder.build()
 
 
-def _source_view(source_id: str, notice: str = "") -> tuple[str, str, list]:
-    try:
-        source = _source_cache
-        revisions = _revisions_cache
-    except NameError:
-        source, revisions = None, []
+def _source_view(
+    source: Any, revisions: list, notice: str = "",
+) -> tuple[str, str, list]:
     if source is None:
         return TITLE, f"{sym.STATE_FAILED} That archived source is unavailable.", _back_buttons()
     link = telegram_message_link(source.peer_id, source.message_id)
@@ -400,8 +374,6 @@ async def _load_source(source_id: str):
 
 
 async def _panel_handler(event, extra: str) -> tuple[str, str, list] | None:
-    global _run_bundle_cache
-    global _sources_cache, _usage_cache, _source_cache, _revisions_cache
     if not _owner_ok(event):
         return TITLE, "This panel is owner-only.", []
     try:
@@ -409,74 +381,64 @@ async def _panel_handler(event, extra: str) -> tuple[str, str, list] | None:
             parts = extra.split(":")
             run_id = parts[1] if len(parts) > 1 else ""
             page = int(parts[2]) if len(parts) > 2 else 0
-            _run_bundle_cache = await _load_run(run_id)
-            return _run_view(run_id, page)
+            return _run_view(await _load_run(run_id), page)
         if extra == "archive":
-            _sources_cache, _usage_cache = await _load_archive()
-            return _archive_view()
+            sources, usage = await _load_archive()
+            return _archive_view(sources, usage)
         if extra.startswith("source:"):
             source_id = extra.split(":", 1)[1]
-            _source_cache, _revisions_cache = await _load_source(source_id)
-            return _source_view(source_id)
+            source, revisions = await _load_source(source_id)
+            return _source_view(source, revisions)
         return await _overview()
     except Exception as exc:  # noqa: BLE001 — panel boundary
         return TITLE, _failure(exc), _back_buttons()
 
 
 async def _runs_action(event, extra: str, chat_id: int):
-    global _runs_sync_cache
     if not _owner_ok(event):
         return TITLE, "This panel is owner-only.", []
     try:
-        _runs_sync_cache = await _load_runs()
-        return _runs_view()
+        return _runs_view(await _load_runs())
     except Exception as exc:  # noqa: BLE001
         return TITLE, _failure(exc), _back_buttons()
 
 
 async def _open_action(event, extra: str, chat_id: int):
-    global _run_bundle_cache
     if not _owner_ok(event):
         return TITLE, "This panel is owner-only.", []
     try:
-        _run_bundle_cache = await _load_run(extra)
-        return _run_view(extra)
+        return _run_view(await _load_run(extra))
     except Exception as exc:  # noqa: BLE001
         return TITLE, _failure(exc), _back_buttons()
 
 
 async def _page_action(event, extra: str, chat_id: int):
-    global _run_bundle_cache
     if not _owner_ok(event):
         return TITLE, "This panel is owner-only.", []
     try:
         run_id, raw_page = extra.rsplit(":", 1)
-        _run_bundle_cache = await _load_run(run_id)
-        return _run_view(run_id, int(raw_page))
+        return _run_view(await _load_run(run_id), int(raw_page))
     except Exception as exc:  # noqa: BLE001
         return TITLE, _failure(exc), _back_buttons()
 
 
 async def _suggest_action(event, extra: str, chat_id: int):
-    global _suggestions_cache
     if not _owner_ok(event):
         return TITLE, "This panel is owner-only.", []
     try:
-        _suggestions_cache = await _load_suggestions(extra)
-        return _suggest_view(extra)
+        return _suggest_view(extra, await _load_suggestions(extra))
     except Exception as exc:  # noqa: BLE001
         return TITLE, _failure(exc), _back_buttons()
 
 
 async def _confirm_action(event, extra: str, chat_id: int):
-    global _candidate_cache
     if not _owner_ok(event):
         return TITLE, "This panel is owner-only.", []
     try:
         run_id, key = extra.rsplit(":", 1)
         suggestions = await _load_suggestions(run_id)
-        _candidate_cache = next((item for item in suggestions if item.key == key), None)
-        return _confirm_view(run_id, key)
+        candidate = next((item for item in suggestions if item.key == key), None)
+        return _confirm_view(run_id, candidate)
     except Exception as exc:  # noqa: BLE001
         return TITLE, _failure(exc), _back_buttons()
 
@@ -490,36 +452,33 @@ async def _commit_action(event, extra: str, chat_id: int):
             _OWNER_ID, run_id, key, approved=True,
         )
         bundle = await _load_run(run_id)
-        globals()["_run_bundle_cache"] = bundle
         notice = (
             f"{sym.STATE_SUCCESS} Archived {key} as immutable revision "
             f"{result.revision_no}."
             if result.status == "created"
             else f"{sym.STATE_SUCCESS} {key} was already archived (no new revision)."
         )
-        return _run_view(run_id, 0, notice)
+        return _run_view(bundle, 0, notice)
     except Exception as exc:  # noqa: BLE001
         return TITLE, _failure(exc), _back_buttons()
 
 
 async def _archive_action(event, extra: str, chat_id: int):
-    global _sources_cache, _usage_cache
     if not _owner_ok(event):
         return TITLE, "This panel is owner-only.", []
     try:
-        _sources_cache, _usage_cache = await _load_archive()
-        return _archive_view()
+        sources, usage = await _load_archive()
+        return _archive_view(sources, usage)
     except Exception as exc:  # noqa: BLE001
         return TITLE, _failure(exc), _back_buttons()
 
 
 async def _source_action(event, extra: str, chat_id: int):
-    global _source_cache, _revisions_cache
     if not _owner_ok(event):
         return TITLE, "This panel is owner-only.", []
     try:
-        _source_cache, _revisions_cache = await _load_source(extra)
-        return _source_view(extra)
+        source, revisions = await _load_source(extra)
+        return _source_view(source, revisions)
     except Exception as exc:  # noqa: BLE001
         return TITLE, _failure(exc), _back_buttons()
 
@@ -548,9 +507,10 @@ async def _delete_source_commit(event, extra: str, chat_id: int, *, cascade: boo
             _OWNER_ID, extra, confirm=True, cascade_confirmed=cascade,
         )
         sources, usage = await _load_archive()
-        globals()["_sources_cache"] = sources
-        globals()["_usage_cache"] = usage
-        return _archive_view(f"{sym.STATE_SUCCESS} The archived source was deleted.")
+        return _archive_view(
+            sources, usage,
+            f"{sym.STATE_SUCCESS} The archived source was deleted.",
+        )
     except Exception as exc:  # noqa: BLE001
         return TITLE, _failure(exc), _back_buttons()
 
@@ -564,9 +524,10 @@ async def _delete_revision_commit(event, extra: str, chat_id: int, *, cascade: b
             _OWNER_ID, revision_id, confirm=True, cascade_confirmed=cascade,
         )
         source, revisions = await _load_source(source_id)
-        globals()["_source_cache"] = source
-        globals()["_revisions_cache"] = revisions
-        return _source_view(source_id, f"{sym.STATE_SUCCESS} The archive revision was deleted.")
+        return _source_view(
+            source, revisions,
+            f"{sym.STATE_SUCCESS} The archive revision was deleted.",
+        )
     except Exception as exc:  # noqa: BLE001
         return TITLE, _failure(exc), _back_buttons()
 

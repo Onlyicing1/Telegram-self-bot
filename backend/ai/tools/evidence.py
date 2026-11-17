@@ -1,9 +1,11 @@
 """Owner-facing Evidence AI tools (G4-A/F1).
 
 ``cited_summary`` is the explicit AI entry point for an opt-in Cited Summary.
-``archive_evidence`` is a confirmation-required archive operation.  Both are
-thin shims over ``backend.evidence.service``; neither retrieves Telegram history
-itself, builds links, or decides authorization.
+Like ``archive_evidence`` it is CONFIRMATION_REQUIRED, so the executor never
+auto-runs it: a citation request is opted into by the owner for that one
+request and is never remembered.  Both tools are thin shims over
+``backend.evidence.service``; neither retrieves Telegram history itself, builds
+links, or decides authorization.
 
 The generic ToolResult boundary is intentionally narrow: it may carry the
 generated summary (not the Evidence Envelope) and bounded run metadata.  It
@@ -98,12 +100,13 @@ class CitedSummaryTool(Tool):
     def description(self) -> str:
         return (
             "Create an explicit Cited Summary of the most recent messages in this "
-            "chat. This is opt-in: ordinary summarization must use "
-            "summarize_history. The result is backed by a temporary active "
-            "evidence run (default 7 days, 1–30 selectable), stores bounded "
-            "excerpts, and returns a summary plus opaque run metadata. Citations "
-            "are resolved locally in History → Evidence Explorer; this tool never "
-            "returns source ids, message ids, links or hashes."
+            "chat. This is opt-in and requires the owner's explicit confirmation "
+            "for this request; ordinary summarization must use summarize_history. "
+            "The result is backed by a temporary active evidence run (default 7 "
+            "days, 1–30 selectable), stores bounded excerpts, and returns a summary "
+            "plus opaque run metadata. Citations are resolved locally in History → "
+            "Evidence Explorer; this tool never returns source ids, message ids, "
+            "links or hashes."
         )
 
     @property
@@ -136,11 +139,11 @@ class CitedSummaryTool(Tool):
 
     @property
     def permission_level(self) -> PermissionLevel:
-        return PermissionLevel.READ_WRITE
+        return PermissionLevel.CONFIRMATION_REQUIRED
 
     @property
     def safe(self) -> bool:
-        return True
+        return False
 
     @property
     def long_running(self) -> bool:
@@ -185,6 +188,9 @@ class CitedSummaryTool(Tool):
                 current_message_id=_current_message_id(context),
                 timeout_s=_request_timeout(context),
                 request_id=_request_id(context),
+                # The executor only reaches this method after the owner
+                # confirmed THIS call; consent is never carried forward.
+                opt_in=True,
             )
         except EvidenceError as exc:
             logger.info(

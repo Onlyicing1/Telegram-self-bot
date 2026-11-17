@@ -152,7 +152,7 @@ EXPECTED_TOOLS = {
     "update_save_tags": PermissionLevel.READ_WRITE,
     "translate_history": PermissionLevel.READ_ONLY,
     "summarize_history": PermissionLevel.READ_ONLY,
-    "cited_summary": PermissionLevel.READ_WRITE,
+    "cited_summary": PermissionLevel.CONFIRMATION_REQUIRED,
     "archive_evidence": PermissionLevel.CONFIRMATION_REQUIRED,
     "scheduled_history": PermissionLevel.READ_WRITE,
     "send_message": PermissionLevel.READ_WRITE,

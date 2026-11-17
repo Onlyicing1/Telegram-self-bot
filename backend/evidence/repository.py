@@ -11,6 +11,7 @@ that value instead of a process-local clock.
 """
 from __future__ import annotations
 
+import asyncio
 import uuid
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
@@ -18,11 +19,14 @@ from typing import Any
 
 from backend.evidence.models import (
     ArchiveUsage,
+    ArchiveWrite,
+    EvidenceQuotaError,
     EvidenceRef,
     EvidenceRevision,
     EvidenceRun,
     EvidenceSource,
     EvidenceStorageError,
+    EvidenceStorageUnavailable,
 )
 
 
@@ -50,6 +54,14 @@ def _parse_int(value: Any, default: int = 0) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _payload(data: Any) -> dict[str, Any]:
+    if isinstance(data, list):
+        data = data[0] if data else None
+    if isinstance(data, dict):
+        return data
+    return {}
 
 
 def _run_from_row(row: dict[str, Any]) -> EvidenceRun:
@@ -108,6 +120,22 @@ def _revision_from_row(row: dict[str, Any]) -> EvidenceRevision:
     )
 
 
+class _UnavailableClient:
+    """Durable Evidence is required but Supabase never became available.
+
+    It occupies the database slot so no method can silently fall through to the
+    in-memory store: every durable call fails closed with one bounded error.
+    """
+
+    _MESSAGE = "durable evidence storage is unavailable"
+
+    def table(self, *_args: Any, **_kwargs: Any):
+        raise EvidenceStorageUnavailable(self._MESSAGE)
+
+    def rpc(self, *_args: Any, **_kwargs: Any):
+        raise EvidenceStorageUnavailable(self._MESSAGE)
+
+
 @dataclass
 class _MemoryData:
     runs: dict[str, EvidenceRun]
@@ -121,23 +149,36 @@ class _MemoryData:
 class EvidenceRepository:
     """Supabase-backed repository, with a deterministic in-memory fallback."""
 
-    def __init__(self, db: Any | None = None, *, clock=None) -> None:
+    def __init__(
+        self,
+        db: Any | None = None,
+        *,
+        clock=None,
+        allow_memory: bool = False,
+    ) -> None:
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._memory = _MemoryData({}, {}, {}, {}, {}, {})
+        self._lock = asyncio.Lock()
+        if allow_memory:
+            # Explicit test/reporting double only: never a production fallback.
+            self._memory_enabled = True
+            self._db = None
+            return
         if db is None:
             from backend.db.client import get_db
 
             db = get_db()
-        self._db = db
-        self._clock = clock or (lambda: datetime.now(timezone.utc))
-        self._memory = _MemoryData({}, {}, {}, {}, {}, {})
+        self._memory_enabled = False
+        self._db = db if db is not None else _UnavailableClient()
 
     @property
     def is_memory(self) -> bool:
-        return self._db is None
+        return self._memory_enabled
 
     # ── time and low-level transport ────────────────────────────────────────
 
     async def database_now(self) -> datetime:
-        if self._db is None:
+        if self._memory_enabled:
             return _utc(self._clock())
         try:
             from backend.db.client import run_sync_db
@@ -162,6 +203,8 @@ class EvidenceRepository:
 
         try:
             return await run_sync_db(fn)
+        except EvidenceStorageError:
+            raise
         except Exception as exc:  # noqa: BLE001 — persistence boundary
             raise EvidenceStorageError(
                 f"evidence storage operation failed: {type(exc).__name__}"
@@ -169,34 +212,80 @@ class EvidenceRepository:
 
     # ── active runs ─────────────────────────────────────────────────────────
 
-    async def create_run(self, run: EvidenceRun) -> EvidenceRun:
-        if self._db is None:
-            now = _utc(self._clock())
-            stored = replace(run, created_at=now, expires_at=now + timedelta(days=run.ttl_days))
-            self._memory.runs[stored.id] = stored
-            self._memory.refs[stored.id] = []
-            return stored
-        row = {
-            "id": run.id,
-            "owner_id": run.owner_id,
-            "peer_id": run.peer_id,
-            "peer_name": run.peer_name,
-            "ttl_days": run.ttl_days,
-            "first_message_id": run.first_message_id,
-            "last_message_id": run.last_message_id,
-            "ref_count": run.ref_count,
-            "text_bytes": run.text_bytes,
-            "summary": run.summary,
-        }
+    async def create_run(
+        self,
+        run: EvidenceRun,
+        *,
+        max_active: int,
+        now: datetime,
+    ) -> EvidenceRun:
+        """Atomically admit one Active Run.
+
+        The expired-run sweep, the quota check and the insert are one
+        serialized operation in both modes: an in-memory lock for the explicit
+        test double and one SQL function with an advisory lock for Supabase.
+        A valid, unexpired run is never evicted.
+        """
+        if self._memory_enabled:
+            async with self._lock:
+                return self._admit_memory(run, max_active=max_active, now=now)
+        # Opportunistic physical sweep inside this already-authorized admission.
+        # It cannot evict a valid run and needs no scheduler; the quota decision
+        # itself is the atomic function below.
+        await self.delete_expired_runs(int(run.owner_id), now)
         data = await self._call(
-            lambda: self._db.table("ai_evidence_runs").insert(row).execute().data
+            lambda: self._db.rpc(
+                "ai_evidence_create_run",
+                {
+                    "p_id": run.id,
+                    "p_owner_id": int(run.owner_id),
+                    "p_peer_id": int(run.peer_id),
+                    "p_peer_name": run.peer_name,
+                    "p_ttl_days": int(run.ttl_days),
+                    "p_first_message_id": int(run.first_message_id),
+                    "p_last_message_id": int(run.last_message_id),
+                    "p_ref_count": int(run.ref_count),
+                    "p_text_bytes": int(run.text_bytes),
+                    "p_summary": run.summary,
+                    "p_max_active": int(max_active),
+                },
+            ).execute().data
         )
-        if not data:
-            raise EvidenceStorageError("active run insert returned no row")
-        return _run_from_row(data[0])
+        payload = _payload(data)
+        if payload.get("status") == "quota":
+            raise EvidenceQuotaError("active evidence run limit reached")
+        row = payload.get("run")
+        if not isinstance(row, dict):
+            raise EvidenceStorageError("active run admission returned no row")
+        return _run_from_row(row)
+
+    def _admit_memory(
+        self, run: EvidenceRun, *, max_active: int, now: datetime,
+    ) -> EvidenceRun:
+        expired = [
+            run_id for run_id, item in self._memory.runs.items()
+            if item.owner_id == run.owner_id and item.expires_at <= now
+        ]
+        for run_id in expired:
+            self._memory.runs.pop(run_id, None)
+            self._memory.refs.pop(run_id, None)
+        active = sum(
+            1 for item in self._memory.runs.values()
+            if item.owner_id == run.owner_id and item.expires_at > now
+        )
+        if active >= max_active:
+            raise EvidenceQuotaError("active evidence run limit reached")
+        stored = replace(
+            run,
+            created_at=now,
+            expires_at=now + timedelta(days=run.ttl_days),
+        )
+        self._memory.runs[stored.id] = stored
+        self._memory.refs[stored.id] = []
+        return stored
 
     async def get_run(self, owner_id: int, run_id: str) -> EvidenceRun | None:
-        if self._db is None:
+        if self._memory_enabled:
             run = self._memory.runs.get(str(run_id))
             return run if run is not None and run.owner_id == int(owner_id) else None
         data = await self._call(
@@ -213,7 +302,7 @@ class EvidenceRepository:
     async def list_runs(
         self, owner_id: int, now: datetime, *, limit: int | None = None,
     ) -> list[EvidenceRun]:
-        if self._db is None:
+        if self._memory_enabled:
             runs = [
                 run for run in self._memory.runs.values()
                 if run.owner_id == int(owner_id) and run.expires_at > now
@@ -233,7 +322,7 @@ class EvidenceRepository:
         return [_run_from_row(row) for row in data]
 
     async def count_active_runs(self, owner_id: int, now: datetime) -> int:
-        if self._db is None:
+        if self._memory_enabled:
             return sum(
                 1 for run in self._memory.runs.values()
                 if run.owner_id == int(owner_id) and run.expires_at > now
@@ -250,7 +339,7 @@ class EvidenceRepository:
         return len(data)
 
     async def add_refs(self, run: EvidenceRun, refs: list[EvidenceRef]) -> None:
-        if self._db is None:
+        if self._memory_enabled:
             if run.id not in self._memory.runs:
                 raise EvidenceStorageError("active run disappeared before refs were stored")
             for ref in refs:
@@ -278,7 +367,7 @@ class EvidenceRepository:
             )
 
     async def list_refs(self, owner_id: int, run_id: str) -> list[EvidenceRef]:
-        if self._db is None:
+        if self._memory_enabled:
             return [
                 ref for ref in self._memory.refs.get(str(run_id), [])
                 if ref.owner_id == int(owner_id)
@@ -297,7 +386,7 @@ class EvidenceRepository:
     async def update_run_summary(
         self, owner_id: int, run_id: str, summary: str,
     ) -> EvidenceRun:
-        if self._db is None:
+        if self._memory_enabled:
             run = self._memory.runs.get(str(run_id))
             if run is None or run.owner_id != int(owner_id):
                 raise EvidenceStorageError("active run disappeared before summary was stored")
@@ -317,7 +406,7 @@ class EvidenceRepository:
         return _run_from_row(data[0])
 
     async def delete_run(self, owner_id: int, run_id: str) -> bool:
-        if self._db is None:
+        if self._memory_enabled:
             run = self._memory.runs.get(str(run_id))
             if run is None or run.owner_id != int(owner_id):
                 return False
@@ -340,7 +429,7 @@ class EvidenceRepository:
         Logical expiry has already denied access; this only reclaims rows while
         an existing authorized operation is already touching the store.
         """
-        if self._db is None:
+        if self._memory_enabled:
             expired = [
                 run.id for run in self._memory.runs.values()
                 if run.owner_id == int(owner_id) and run.expires_at <= now
@@ -364,7 +453,7 @@ class EvidenceRepository:
     async def find_source(
         self, owner_id: int, peer_id: int, message_id: int,
     ) -> EvidenceSource | None:
-        if self._db is None:
+        if self._memory_enabled:
             for source in self._memory.sources.values():
                 if (
                     source.owner_id == int(owner_id)
@@ -397,7 +486,7 @@ class EvidenceRepository:
             first_seen_at=now,
             last_observed_at=now,
         )
-        if self._db is None:
+        if self._memory_enabled:
             self._memory.sources[source.id] = source
             return source
         row = {
@@ -415,7 +504,7 @@ class EvidenceRepository:
         return _source_from_row(data[0])
 
     async def get_source(self, owner_id: int, source_id: str) -> EvidenceSource | None:
-        if self._db is None:
+        if self._memory_enabled:
             source = self._memory.sources.get(str(source_id))
             return source if source is not None and source.owner_id == int(owner_id) else None
         data = await self._call(
@@ -432,7 +521,7 @@ class EvidenceRepository:
     async def list_sources(
         self, owner_id: int, *, limit: int = 20,
     ) -> list[EvidenceSource]:
-        if self._db is None:
+        if self._memory_enabled:
             sources = [
                 item for item in self._memory.sources.values()
                 if item.owner_id == int(owner_id)
@@ -453,7 +542,7 @@ class EvidenceRepository:
     async def find_revision_by_hash(
         self, owner_id: int, source_id: str, content_hash: str,
     ) -> EvidenceRevision | None:
-        if self._db is None:
+        if self._memory_enabled:
             for revision in self._memory.revisions.values():
                 if (
                     revision.owner_id == int(owner_id)
@@ -477,7 +566,7 @@ class EvidenceRepository:
     async def list_revisions(
         self, owner_id: int, source_id: str,
     ) -> list[EvidenceRevision]:
-        if self._db is None:
+        if self._memory_enabled:
             revisions = [
                 item for item in self._memory.revisions.values()
                 if item.owner_id == int(owner_id) and item.source_id == str(source_id)
@@ -516,7 +605,7 @@ class EvidenceRepository:
             approval_reference=approval_reference,
             captured_at=now,
         )
-        if self._db is None:
+        if self._memory_enabled:
             for existing in self._memory.revisions.values():
                 if (
                     existing.owner_id == revision.owner_id
@@ -548,7 +637,7 @@ class EvidenceRepository:
     async def get_revision(
         self, owner_id: int, revision_id: str,
     ) -> EvidenceRevision | None:
-        if self._db is None:
+        if self._memory_enabled:
             revision = self._memory.revisions.get(str(revision_id))
             return revision if revision is not None and revision.owner_id == int(owner_id) else None
         data = await self._call(
@@ -565,7 +654,7 @@ class EvidenceRepository:
     async def update_source_observation(
         self, owner_id: int, source_id: str, state: str, *, now: datetime,
     ) -> None:
-        if self._db is None:
+        if self._memory_enabled:
             source = self._memory.sources.get(str(source_id))
             if source is not None and source.owner_id == int(owner_id):
                 self._memory.sources[source.id] = replace(
@@ -581,7 +670,7 @@ class EvidenceRepository:
         )
 
     async def archive_usage(self, owner_id: int) -> ArchiveUsage:
-        if self._db is None:
+        if self._memory_enabled:
             revisions = [
                 item for item in self._memory.revisions.values()
                 if item.owner_id == int(owner_id)
@@ -595,16 +684,257 @@ class EvidenceRepository:
                 "ai_evidence_archive_usage", {"p_owner_id": int(owner_id)}
             ).execute().data
         )
-        row = data[0] if isinstance(data, list) and data else (data or {})
-        if isinstance(row, dict):
-            return ArchiveUsage(
-                records=_parse_int(row.get("record_count")),
-                bytes=_parse_int(row.get("byte_count")),
+        payload = _payload(data)
+        if "record_count" not in payload or "byte_count" not in payload:
+            raise EvidenceStorageError("archive usage returned an unexpected shape")
+        return ArchiveUsage(
+            records=_parse_int(payload.get("record_count")),
+            bytes=_parse_int(payload.get("byte_count")),
+        )
+
+    async def archive_atomic(
+        self,
+        *,
+        owner_id: int,
+        peer_id: int,
+        message_id: int,
+        source_id: str,
+        revision_id: str,
+        content_hash: str,
+        text: str,
+        approval_reference: str,
+        now: datetime,
+        max_records: int,
+        max_bytes: int,
+    ) -> ArchiveWrite:
+        """Create or deduplicate one immutable revision in one operation.
+
+        The source upsert, same-hash lookup, quota check, revision numbering and
+        insert are serialized by the same owner lock as run admission, so two
+        concurrent approvals cannot both pass the quota or write two revisions
+        for one hash.
+        """
+        if self._memory_enabled:
+            async with self._lock:
+                return self._archive_memory(
+                    owner_id=int(owner_id),
+                    peer_id=int(peer_id),
+                    message_id=int(message_id),
+                    source_id=str(source_id),
+                    revision_id=str(revision_id),
+                    content_hash=content_hash,
+                    text=text,
+                    approval_reference=approval_reference,
+                    now=now,
+                    max_records=int(max_records),
+                    max_bytes=int(max_bytes),
+                )
+        data = await self._call(
+            lambda: self._db.rpc(
+                "ai_evidence_archive_revision",
+                {
+                    "p_id": str(revision_id),
+                    "p_source_id": str(source_id),
+                    "p_owner_id": int(owner_id),
+                    "p_peer_id": int(peer_id),
+                    "p_message_id": int(message_id),
+                    "p_content_hash": content_hash,
+                    "p_text": text,
+                    "p_approval_reference": approval_reference,
+                    "p_max_records": int(max_records),
+                    "p_max_bytes": int(max_bytes),
+                },
+            ).execute().data
+        )
+        payload = _payload(data)
+        status = str(payload.get("status") or "")
+        if status == "quota":
+            return ArchiveWrite(status="quota")
+        if status not in {"created", "unchanged"}:
+            raise EvidenceStorageError("archive write returned an unknown status")
+        revision = str(payload.get("revision_id") or "")
+        if not revision:
+            raise EvidenceStorageError("archive write returned no revision")
+        return ArchiveWrite(
+            status=status,
+            source_id=str(payload.get("source_id") or ""),
+            revision_id=revision,
+            revision_no=_parse_int(payload.get("revision_no")),
+            content_hash=str(payload.get("content_hash") or content_hash),
+        )
+
+    def _archive_memory(
+        self,
+        *,
+        owner_id: int,
+        peer_id: int,
+        message_id: int,
+        source_id: str,
+        revision_id: str,
+        content_hash: str,
+        text: str,
+        approval_reference: str,
+        now: datetime,
+        max_records: int,
+        max_bytes: int,
+    ) -> ArchiveWrite:
+        source = next(
+            (
+                item for item in self._memory.sources.values()
+                if item.owner_id == owner_id
+                and item.peer_id == peer_id
+                and item.message_id == message_id
+            ),
+            None,
+        )
+        if source is not None:
+            existing = next(
+                (
+                    item for item in self._memory.revisions.values()
+                    if item.owner_id == owner_id
+                    and item.source_id == source.id
+                    and item.content_hash == content_hash
+                ),
+                None,
             )
-        return ArchiveUsage(records=0, bytes=0)
+            if existing is not None:
+                return ArchiveWrite(
+                    status="unchanged",
+                    source_id=source.id,
+                    revision_id=existing.id,
+                    revision_no=existing.revision_no,
+                    content_hash=existing.content_hash,
+                )
+        owned = [
+            item for item in self._memory.revisions.values()
+            if item.owner_id == owner_id
+        ]
+        incoming = len(str(text).encode("utf-8"))
+        if len(owned) >= max_records or sum(
+            item.text_bytes for item in owned
+        ) + incoming > max_bytes:
+            return ArchiveWrite(status="quota")
+        if source is None:
+            source = EvidenceSource(
+                id=str(source_id),
+                owner_id=owner_id,
+                peer_id=peer_id,
+                message_id=message_id,
+                observed_state="live",
+                first_seen_at=now,
+                last_observed_at=now,
+            )
+            self._memory.sources[source.id] = source
+        next_no = max(
+            (
+                item.revision_no for item in owned
+                if item.source_id == source.id
+            ),
+            default=0,
+        ) + 1
+        revision = EvidenceRevision(
+            id=str(revision_id),
+            source_id=source.id,
+            owner_id=owner_id,
+            revision_no=next_no,
+            content_hash=content_hash,
+            text=text,
+            approval_reference=approval_reference,
+            captured_at=now,
+        )
+        self._memory.revisions[revision.id] = revision
+        self._memory.sources[source.id] = replace(
+            source,
+            observed_state="live" if next_no == 1 else "edited",
+            last_observed_at=now,
+        )
+        return ArchiveWrite(
+            status="created",
+            source_id=source.id,
+            revision_id=revision.id,
+            revision_no=next_no,
+            content_hash=content_hash,
+        )
+
+    async def link_ref_revision(
+        self,
+        owner_id: int,
+        run_id: str,
+        ordinal: int,
+        revision_id: str,
+    ) -> None:
+        """Attach the exact immutable revision to a reference exactly once.
+
+        A reference never points at a "latest" row: the link is written once,
+        for the revision created from (or deduplicated for) that reference's own
+        content hash, and a later link can never repoint it.
+        """
+        if self._memory_enabled:
+            async with self._lock:
+                refs = self._memory.refs.get(str(run_id), [])
+                ref = next(
+                    (
+                        item for item in refs
+                        if item.ordinal == int(ordinal)
+                        and item.owner_id == int(owner_id)
+                    ),
+                    None,
+                )
+                if ref is None:
+                    raise EvidenceStorageError("evidence reference no longer exists")
+                if ref.revision_id is not None:
+                    if ref.revision_id != str(revision_id):
+                        raise EvidenceStorageError(
+                            "evidence ref revision link is write-once"
+                        )
+                    return
+                revision = self._memory.revisions.get(str(revision_id))
+                if revision is None or revision.owner_id != int(owner_id):
+                    raise EvidenceStorageError(
+                        "archive revision does not exist for this owner"
+                    )
+                run = self._memory.runs.get(str(run_id))
+                source = self._memory.sources.get(revision.source_id)
+                if (
+                    run is None
+                    or source is None
+                    or source.peer_id != run.peer_id
+                    or source.message_id != ref.message_id
+                ):
+                    raise EvidenceStorageError(
+                        "archive revision does not belong to this evidence reference"
+                    )
+                refs[refs.index(ref)] = replace(ref, revision_id=revision.id)
+                return
+        data = await self._call(
+            lambda: self._db.table("ai_evidence_refs")
+            .update({"revision_id": str(revision_id)})
+            .eq("owner_id", int(owner_id))
+            .eq("run_id", str(run_id))
+            .eq("ordinal", int(ordinal))
+            .is_("revision_id", "null")
+            .execute()
+            .data
+        )
+        if data:
+            return
+        row = await self._call(
+            lambda: self._db.table("ai_evidence_refs")
+            .select("revision_id")
+            .eq("owner_id", int(owner_id))
+            .eq("run_id", str(run_id))
+            .eq("ordinal", int(ordinal))
+            .limit(1)
+            .execute()
+            .data
+        )
+        current = str(row[0].get("revision_id") or "") if row else ""
+        if current == str(revision_id):
+            return
+        raise EvidenceStorageError("evidence reference revision link was rejected")
 
     async def delete_source(self, owner_id: int, source_id: str) -> bool:
-        if self._db is None:
+        if self._memory_enabled:
             source = self._memory.sources.get(str(source_id))
             if source is None or source.owner_id != int(owner_id):
                 return False
@@ -629,7 +959,7 @@ class EvidenceRepository:
         return bool(data)
 
     async def delete_revision(self, owner_id: int, revision_id: str) -> bool:
-        if self._db is None:
+        if self._memory_enabled:
             revision = self._memory.revisions.get(str(revision_id))
             if revision is None or revision.owner_id != int(owner_id):
                 return False
@@ -650,7 +980,7 @@ class EvidenceRepository:
         # G4-C/G4-D dependent records do not exist in F1.  The method is the
         # stable extension point; tests can inject a non-zero count on the
         # in-memory repository to pin the deletion contract.
-        if self._db is None:
+        if self._memory_enabled:
             revision = self._memory.revisions.get(str(revision_id))
             if revision is None or revision.owner_id != int(owner_id):
                 return 0
@@ -658,7 +988,7 @@ class EvidenceRepository:
         return 0
 
     async def count_source_dependents(self, owner_id: int, source_id: str) -> int:
-        if self._db is None:
+        if self._memory_enabled:
             source = self._memory.sources.get(str(source_id))
             if source is None or source.owner_id != int(owner_id):
                 return 0
@@ -668,16 +998,16 @@ class EvidenceRepository:
     # ── test seams (in-memory only) ─────────────────────────────────────────
 
     def set_revision_dependents_for_tests(self, revision_id: str, count: int) -> None:
-        if self._db is not None:
+        if not self._memory_enabled:
             raise RuntimeError("test seams are only available on the memory repository")
         self._memory.revision_dependents[str(revision_id)] = max(0, int(count))
 
     def set_source_dependents_for_tests(self, source_id: str, count: int) -> None:
-        if self._db is not None:
+        if not self._memory_enabled:
             raise RuntimeError("test seams are only available on the memory repository")
         self._memory.source_dependents[str(source_id)] = max(0, int(count))
 
 
 def in_memory_repository(clock=None) -> EvidenceRepository:
     """Construct an explicitly memory-backed repository (test/reporting)."""
-    return EvidenceRepository(db=None, clock=clock)
+    return EvidenceRepository(clock=clock, allow_memory=True)
