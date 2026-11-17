@@ -731,7 +731,7 @@ def test_the_audited_order_is_recorded_in_the_audit_table():
     assert "all 41 migrations" in _flat(audit) or "42 files" in audit, (
         "the audit must state that every repository migration was classified"
     )
-    assert len(list(MIGRATIONS_DIR.glob("*.sql"))) == 42, (
+    assert len(list(MIGRATIONS_DIR.glob("*.sql"))) == 43, (
         "the audited count must equal the migrations actually in the repository"
     )
     embedded_table = audit[audit.index("| Order | Migration") :]

@@ -701,8 +701,9 @@ reference them rather than renaming ideas.
 
 #### INTEL-002 — Evidence references and source-message linking
 - **Origin:** Owner-provided.
-- **Status:** Approved direction — **design only** (EVID-001/002/003). Range
-  metadata exists; citations do not.
+- **Status:** G4-A/F1 implements bounded evidence refs, locally constructed
+  links and opt-in Cited Summary offline (migration artifact unapplied).
+  Restart-safe follow-up citations remain G4-A/F2.
 - **Problem:** A summary cannot be verified or opened at the supporting message.
 - **Expected behavior:** Each conclusion/claim can carry bounded evidence
   references (source, message id/range, short excerpt), rendered as tappable
@@ -808,8 +809,9 @@ reference them rather than renaming ideas.
 
 #### EVID-001 — Durable evidence index
 - **Origin:** Assistant-discovered.
-- **Status:** **Owner-approved direction, design only** (2026-11-15). No table,
-  migration, repository or SQL exists.
+- **Status:** **G4-A/F1 implemented offline** (2026-11-16). Service,
+  repository, tests and an additive migration artifact exist; the migration has
+  **not** been applied and no live table is claimed.
 - **Problem:** Cross-session follow-ups, trackers and exports need stable
   references; current summaries carry only a range and scheduled summaries carry
   none.
@@ -833,7 +835,9 @@ reference them rather than renaming ideas.
 
 #### EVID-002 — Durable Active Evidence Run
 - **Origin:** Owner-provided (decisions 1, 3, 9, 11).
-- **Status:** **Approved direction, design only.**
+- **Status:** **G4-A/F1 implemented offline.** Durable runs, refs, TTL and
+  opportunistic expiry cleanup are covered by focused tests; the migration
+  artifact remains unapplied. Restart-safe follow-up interaction is F2.
 - **Problem:** A follow-up must still work after the process restarts, while the
   working evidence must not become a permanent archive.
 - **Expected behavior:** One server-generated opaque run per Cited Summary or
@@ -868,7 +872,10 @@ reference them rather than renaming ideas.
 
 #### EVID-003 — Owner-approved Evidence Archive (immutable revisions)
 - **Origin:** Owner-provided (decisions 1, 11).
-- **Status:** **Approved direction, design only.**
+- **Status:** **G4-A/F1 implemented offline.** Owner-confirmed archive
+  suggestions, immutable revisions, hash idempotency, quota rejection and
+  dependent-aware deletion are covered by focused tests; the migration artifact
+  remains unapplied.
 - **Problem:** Some evidence must stay inspectable months later, even after the
   original Telegram message is edited or deleted.
 - **Expected behavior:** A stable archived **source** per
@@ -1492,8 +1499,8 @@ G1-A ──> G1-B visual identity/accessibility
 | **Workspace identity** | Owner-approved source identity, type, access state and source list. | `PeerType`, bounded dialog enumeration, link resolver and `history_schedules(owner_id, peer_id)` exist; there is no Workspace table/model. | `G3-A` |
 | **Workspace settings/dashboard** | Durable per-source settings, dashboard and health. | No Workspace settings, activity dashboard or source-health surface exists. | `G3-B` |
 | **Evidence envelope** | Claim/message references, local validation, bounded follow-up retrieval, coverage. | `HistorySlice`/`HistoryMessage` expose message ids and first/last range; no claim-to-message citation contract or evidence ledger exists. | `G4-A` |
-| **Active evidence run** | Restart-safe Cited Summary, Explorer and follow-ups under an explicit TTL. | `HistorySlice`/`HistoryMessage` expose ids and dates; **no evidence table, repository or `workspace` model exists anywhere in `backend/`**. | `G4-A` / F1 |
-| **Evidence archive** | Owner-approved indefinite retention of selected sources as immutable revisions. | No archive, revision, hash or deletion contract exists; `history_schedules` proves only the service-role-only durable pattern. | `G4-A` foundation, owner-gated |
+| **Active evidence run** | Restart-safe Cited Summary, Explorer and follow-ups under an explicit TTL. | `HistorySlice`/`HistoryMessage` expose ids and dates; **G4-A/F1 adds `backend/evidence/` and an unapplied migration**, while no `workspace` model exists. | `G4-A` / F1 |
+| **Evidence archive** | Owner-approved indefinite retention of selected sources as immutable revisions. | G4-A/F1 provides the archive service and unapplied tables. | `G4-A` foundation, owner-gated |
 | **Workspace glossary** | Persistent, bounded, owner-editable terminology in the **real** Workspace scope. | No Workspace and no glossary table/model exist; G2-A owns the language contract. | `G4-C`, **blocked on G3-B** |
 | **Durable evidence index** | Workspace-aware, cross-session/cross-run evidence browsing. | Occurrence `result_metadata`/`error_metadata` are bounded diagnostics, not evidence; no Workspace model exists. | `G4-B` (original meaning), on the G4-A contract |
 | **Selection** | Exact, expiring, per-owner/per-feature selection for bulk actions. | `selection_state.py` now has owner + feature scopes (Stash default, Taskloom second), capped at 40 per scope, expiring after 900s; `retrieve.py` supplies the row/check/confirmation pattern and Taskloom adds CAS-revalidated bulk actions. | `G1-A` |
@@ -1620,7 +1627,7 @@ G1-A ──> G1-B visual identity/accessibility
 | **G2-B** | G2-A + G3-B | G3-A | Effective-language tests across scopes | Same precedence decision | No | None |
 | **G3-A** | Existing resolver/dialogs + G1-A selection | None | Resolution/access, empty/failure, scope isolation | Owner approval for durable source registry if added | Yes, with derived read model | SOURCE-003 invite links |
 | **G3-B** | G3-A | G1-A | Settings inheritance, dashboard honesty, health failure states | Owner approval: Workspace persistence/schema | No | Durable features not approved |
-| **G4-A / F1** | G2-A + existing History + approved evidence storage | None (single source) | Invented ids/keys, insufficient evidence, expired-run honesty, owner isolation, immutable revisions | Evidence policy approved 2026-11-16; implementation gate: explicit owner authorization of the migration | Yes | Follow-ups, extraction, glossary, assessments |
+| **G4-A / F1** | G2-A + existing History + approved evidence storage | None (single source) | Invented ids/keys, insufficient evidence, expired-run honesty, owner isolation, immutable revisions | **Implemented offline; owner must apply the migration manually** | Yes | Follow-ups, extraction, glossary, assessments |
 | **G4-A / F2** | G4-A / F1 | None | Restart-safe follow-up, stale/expired run, source isolation | Approved TTL proven usable in practice | After F1 | A second retrieval engine |
 | **G4-B** *(original)* | G4-A + G3-A + G3-B | G3-A | Workspace-scoped evidence, attribution, cross-run isolation, deletion honesty | Owner approval: Workspace persistence + evidence retention scope | No | Whole stage until G3-B and its approval exist |
 | **G4-C** *(new)* | G4-A + G3-B + approved extraction schema | G3-B | Malformed JSON rejection, Glossary conflict/bounds, prompt growth | G3-B complete; extraction schema approved; glossary quotas defined after G3-B | No | Glossary until G3-B; tagged-text fallback unless separately approved |
@@ -1759,7 +1766,8 @@ Corrected 2026-11-15. G4-B keeps its original identity (**Workspace-aware
 durable Evidence**) and is not renamed. Restart-safe follow-ups are a G4-A
 delivery phase, not a stage. G4-C and G4-D are new, explicitly documented IDs
 for work that the original broad G4-A bundled once durable storage and a real
-Workspace dependency split it. Implementation has not started.
+Workspace dependency split it. G4-A/F1 is implemented offline; its additive
+migration artifact is not applied.
 
 #### G4-A — Single-source evidence and interactive intelligence
 - **Included:** EVID-001, EVID-002, EVID-003 (foundation), INTEL-001,
@@ -1798,9 +1806,9 @@ Workspace dependency split it. Implementation has not started.
   `ToolRegistry`/`ToolExecutor`, the Telegram message facade, G2-A language.
 - **Dependencies:** G2-A + existing History. The storage model, TTL, limits,
   archive quotas, deletion rules and expired-run physical policy were approved
-  on 2026-11-16 (§4.5.1). **Implementation is still gated on explicit owner
-  authorization of the migration; Supabase schema changes remain manual and
-  are not authorized by the approval itself.** No Workspace is required.
+  on 2026-11-16 (§4.5.1). **G4-A/F1 is implemented offline; the additive
+  migration artifact is not applied and Supabase schema changes remain manual.**
+  No Workspace is required.
 - **Deliverables:** conceptual `ai_evidence_runs`/`_run_refs`,
   `ai_evidence_sources` and immutable `ai_evidence_revisions`; logical TTL
   expiry against database time and approved Option 1 opportunistic physical
@@ -1995,7 +2003,7 @@ names the strongest thing standing between the stage and implementation.
 | **G2-B** | **P0** | P1 | Blocked by G3-B | Workspace persistence + precedence | Cannot exist before a Workspace settings home. |
 | **G3-A** | P1 | P1 | Ready with G1-A | Durable registry persistence if added | Identity/read model unlocks analytics and cross-source work; can start derived. |
 | **G3-B** | P1 | P1 | Owner-gated | Workspace persistence/schema | Dashboard/settings are valuable but require the persistence decision. |
-| **G4-A / F1** | **P0** | P1 | Design approved; **not implemented** | Explicit owner authorization of the migration (schema changes are manual) | Trust foundation; single-source scope avoids waiting for Workspace. |
+| **G4-A / F1** | **P0** | P1 | **Implemented offline; migration unapplied** | Owner manually applies the additive migration | Trust foundation; single-source scope avoids waiting for Workspace. |
 | **G4-A / F2** | **P0** | P1 | Blocked by F1 | Approved TTL must prove follow-up usefulness | Restart-safe follow-ups on the same contract; not a new stage. |
 | **G4-B** *(original)* | **P0** | P2 | **Blocked by G3-B** | Workspace persistence + retention scope | Workspace-aware browsing, not a second evidence contract. |
 | **G4-C** *(new)* | P1 | P2 | **Blocked by G3-B** (Glossary) | Extraction schema; glossary quotas defined after G3-B | Extraction can be designed first, but glossary storage may not start. |
@@ -2252,7 +2260,7 @@ cannot start.
 |---|---|
 | **TASK-002 cancel/retry** | The service exposes pause/resume/complete/fail/expire/delete, not cancellation of a running occurrence or retry of a selected failed occurrence. The scheduler has a `cancelled` status and bounded retries, but no owner-facing path. Cancel/retry is deferred until the coordinator/claim boundary is proven; the rest of TASK-002 belongs to G5-A. |
 | **G3-B durable Workspace settings** | No Workspace table/model exists. A derived identity/read model can start in G3-A, but durable settings/dashboard/health need owner-approved persistence. |
-| **G4-B Workspace-aware durable evidence** | The retention direction is approved, but G4-A/F1 cannot start until the owner approves the TTL, quotas and excerpt cap. Workspace-aware browsing requires G3-A/G3-B; archive quotas decide how long it remains useful. |
+| **G4-B Workspace-aware durable evidence** | G4-A/F1 is implemented offline; Workspace-aware browsing requires G3-A/G3-B and the owner-applied migration. Archive quotas decide how long it remains useful. |
 | **SOURCE-003 invite links** | Current parser does not support them; Telegram invite preview/join semantics and side effects are unverified. |
 | **SEARCH-001 Semantic Search** | No embedding provider/index/store exists; content-retention and cost are owner decisions. Delivered only in G6-B. |
 | **SEARCH-002 Similar Discussion** | Depends on semantic retrieval; relevance evaluation and index ownership are undefined. Delivered only in G6-B. |
@@ -2319,11 +2327,12 @@ traceability and are marked closed rather than deleted.
     indefinitely.
 11. **UI scope:** Approve the ordering/selection rules and how much visual
     customization is worth pursuing within Telegram's panel constraints.
-12. **Cited Summary surface:** panel-only, AI-trigger-only, or both, and whether
-    it is remembered per source or chosen per request (recommended: per request).
-13. **Archive suggestions:** may the system suggest candidates from any cited
-    run, or only from evidence the owner explicitly flagged? How many
-    suggestions may one surface show?
+12. **Cited Summary surface (RESOLVED 2026-11-16):** both the History panel and
+    an explicit AI-triggered request; chosen per request, never remembered per
+    source and never the ordinary summary default.
+13. **Archive suggestions (RESOLVED 2026-11-16):** only evidence explicitly
+    selected/reviewed in the current Evidence workflow; maximum 10 per surface,
+    each with a reason, and every archival needs owner confirmation.
 14. **Glossary Workspace dependency:** the Glossary is **blocked until G3-B**
     establishes the real Workspace identity, ownership and authorization. No
     owner-level key or temporary Workspace is acceptable. Entry and character
@@ -2340,10 +2349,10 @@ traceability and are marked closed rather than deleted.
     excerpts; they remain until their own TTL. No purge is approved or
     specified; a separate owner-requested purge may be considered later, but
     implementation must not invent it.
-18. **Limit configuration surface:** where the owner-approved TTL/quotas live
-    (owner settings row, environment, per-Workspace policy) and who may change
-    them. No value may be hard-coded before this is decided. The approved
-    numeric values themselves are no longer open (§4.5.1).
+18. **Limit configuration surface (RESOLVED for F1 2026-11-16):** one
+    centralized owner-level policy; no per-Workspace configuration or settings
+    UI before G3-B. Workspace-specific overrides may be considered after G3-B,
+    inheriting global defaults. TTL remains owner-selectable at creation.
 19. **Expired-run physical policy (RESOLVED 2026-11-16):** approved Option 1,
     opportunistic physical deletion inside an existing authorized operation,
     with no tombstone, scheduler, worker or fixed deadline. Expired data may
@@ -2363,3 +2372,4 @@ traceability and are marked closed rather than deleted.
 | 2026-11-15 | Reconciled archive deletion and active-run retention (documentation only). Revision- and source-level deletion now use the same proposed rule: dependent derived records block by default and require a separate explicit cascade confirmation; active-run refs/excerpts are TTL snapshots, not cascade dependents, and remain until expiry unless the owner separately chooses a purge. Clarified that permanent archive deletion is scoped, that source-level deletion may offer a separate purge, and that every deletion/purge rule remains PENDING OWNER APPROVAL. No code, SQL, schema, Supabase, Telegram, runtime or deployment change. |
 | 2026-11-16 | Separated Active Evidence Run logical expiry from physical deletion (documentation only). Expiry is authoritative-database-time and immediately blocks retrieval, Explorer, Cited Summary and follow-ups; expired runs fail honestly and are never reconstructed from Telegram, archive, summaries or conversation. Physical deletion is not automatic, no cleanup scheduler or worker is approved, and never-read expired rows may remain indefinitely. Documented physical deletion, minimal non-content tombstone, and deferred deletion as pending owner Options 1–3, with outright deletion recommended but NOT approved. No code, SQL, schema, Supabase, Telegram, runtime or deployment change. |
 | 2026-11-16 | Recorded the owner-approved G4-A evidence policies (documentation only). Approved Active Evidence Runs with a default 7-day TTL (owner range 1–30 days, selected at creation, database-time expiry, no silent extension), Option 1 opportunistic physical deletion with no scheduler/tombstone/fixed deadline, approved limits (1,000-character excerpt, 50 refs per run, 20 refs per follow-up, 32 KiB normalized text per run, 20 active runs per owner), archive quotas (5,000 records or 50 MiB per owner, rejection rather than eviction), immutable revisions, dependency-blocked archive deletion with a separate explicit cascade, retention of active-run snapshots until TTL with no purge specified, and Glossary quotas/implementation deferred until the real G3-B Workspace. Closed §10 decisions 3, 17 and 19; implementation and schema remain unauthorized. No code, test, SQL, Supabase, migration, Telegram, Render or deployment change. |
+| 2026-11-16 | Implemented G4-A/F1 offline and closed the remaining F1 product decisions: one centralized owner-level policy, opt-in Cited Summary from both the History panel and an explicit AI tool (per request), archive suggestions limited to evidence reviewed in the current run (max 10, reason + confirmation), and no Workspace Glossary or assessment in F1. Added the owner-only Explorer, local links, strict-JSON failure behavior, focused tests and an additive migration artifact that has NOT been applied. `DATABASE_ARCHITECTURE.md` was not modified; no SQL, Supabase, Telegram, Render, live provider or deployment operation was performed. |

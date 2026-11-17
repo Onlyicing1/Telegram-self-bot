@@ -73,6 +73,8 @@ _STATUS_LABELS: dict[str, str] = {
     "list_recent_messages": sym.label(sym.CONTENT_STATIC, "Reading messages..."),
     "translate_history": sym.label(sym.ICON_TRANSLATE, "Translating messages..."),
     "summarize_history": sym.label(sym.ICON_SUMMARIZE, "Summarizing messages..."),
+    "cited_summary": sym.label(sym.ICON_SUMMARIZE, "Building cited summary..."),
+    "archive_evidence": sym.label(sym.OP_MANAGE, "Archiving evidence..."),
     "settings_get": sym.label(sym.OP_MANAGE, "Checking settings..."),
     "settings_set": sym.label(sym.OP_MANAGE, "Updating settings..."),
     "create_task": sym.label(sym.SCHEDULE_EVENT, "Creating task..."),

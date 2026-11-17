@@ -1,13 +1,14 @@
 # ROADMAP
 
-## Current delivery: G2-A — Global, request and task language
+## Current delivery: G4-A / F1 — Single-source evidence foundation
 
-Status: **Implemented offline. G2-B (Workspace language), G4-A/G4-C (evidence,
-extraction and glossary), G5-A and Scheduled History Phase 4+ remain
-deferred.** No schema,
-migration, Supabase, Telegram, Render or live-operation change was made by
-G2-A. A G4-A evidence-persistence **design record** follows below; nothing in
-it is implemented.
+Status: **Implemented offline, with an additive migration artifact that is NOT
+applied.** G2-B (Workspace language), G4-A/F2 (follow-ups), G4-B (Workspace
+awareness), G4-C (extraction/Glossary), G4-D, G5-A and later Scheduled History
+phases remain deferred. No SQL, Supabase, Telegram, Render, provider or
+deployment operation was performed. The policy record follows below; the
+implementation is in `backend/evidence/`, the owner-only Explorer and the
+unapplied migration.
 
 ### What G2-A adds
 
@@ -67,17 +68,17 @@ it is implemented.
 - Catalog, aliases, precedence, the single preference snapshot and the
   one-resolution-per-request design are unchanged. No schema or live operation.
 
-## Design record (NOT IMPLEMENTED): G4-A evidence persistence and bounded storage
+## Implementation record: G4-A / F1 evidence persistence and bounded storage
 
-Status: **Design approved; documentation only — 2026-11-16.** No production
-code, migration, SQL, Supabase object, Telegram operation or deployment was
-made. G4-A remains unimplemented, no stage below is complete, and **no evidence
-table exists**. The owner approved the data classes, TTL, limits, archive
-quotas, immutable-revision model, deletion rules and expired-run physical
-policy on 2026-11-16; the canonical policy is `LIFEOS_IDEAS.md` §4.5.1.
-Implementation remains blocked until the owner explicitly authorizes the
-schema/migration; Supabase schema changes remain manual and are not authorized
-by the design approval.
+Status: **G4-A / F1 implemented offline — 2026-11-16; migration artifact created
+but NOT applied.** Production code, focused tests, an owner-only Explorer and
+an unapplied additive migration now exist in the repository. No SQL was
+executed, no Supabase object was created and no Telegram/Render/provider live
+operation was performed. The canonical policy remains `LIFEOS_IDEAS.md` §4.5.1.
+The owner must review and manually apply
+`supabase/migrations/20261116120000_create_evidence_foundation.sql` before the
+runtime can use the tables; until then the service fails honestly rather than
+falling back to a second evidence format. G4-A/F2 remains deferred.
 
 ### Approved owner decisions (unchanged)
 
@@ -350,7 +351,8 @@ until G3-B and no glossary number is approved.
 
 **Measured facts (code/schema, not storage measurements):**
 
-- No evidence, archive, revision or glossary table exists in the repository.
+- The F1 migration artifact defines evidence/archive/revision tables; none has
+  been applied to the live schema, and no glossary table exists.
 - `history_schedules.summary` is bounded at 32 KiB of UTF-8.
 - `ai_messages` truncates content at 8,000 characters.
 - Existing tables are accessed only through the service-role key with RLS
@@ -421,7 +423,7 @@ authorization.
 
 | Stage | Scope | Depends on | Gate |
 |---|---|---|---|
-| **G4-A / F1** | Single-source evidence foundation: durable Active Runs with approved TTL, immutable owner-approved archive revisions, opt-in Cited Summary, basic Explorer with locally built links. | G2-A + existing History | Evidence policy approved 2026-11-16; explicit owner authorization of the schema/migration. |
+| **G4-A / F1** | Single-source evidence foundation: durable Active Runs with approved TTL, immutable owner-approved archive revisions, opt-in Cited Summary, basic Explorer with locally built links. | G2-A + existing History | **Implemented offline 2026-11-16**; additive migration artifact created but **manual owner application still required**. |
 | **G4-A / F2** | Restart-safe follow-ups on the same run and contract. A delivery phase of G4-A, **not** a new stage. | G4-A / F1 | The approved TTL proves usable in practice. |
 | **G4-B** *(original meaning preserved)* | **Workspace-aware durable Evidence:** Workspace-scoped browsing/consumption of the same evidence contract, cross-run within the Workspace. No second evidence format. | G4-A + G3-A + G3-B | Owner approves Workspace persistence and evidence retention scope. |
 | **G4-C** *(new ID, documented)* | Strict-JSON extraction and the persistent Workspace Glossary. Glossary storage **blocked until G3-B**. | G4-A + G3-B + approved extraction schema | G3-B complete; extraction schema approved; glossary quotas defined after G3-B. |
@@ -438,27 +440,32 @@ a documented reason, and neither renames or replaces G4-B.
 Scheduled History stays outside all stages: body-only and citation-free, with
 no evidence run, citation or archive path attached to it.
 
-### Remaining owner decisions
+### Closed F1 product decisions
 
 The 2026-11-16 approval closed the active-run TTL, all active limits, archive
 quotas, deletion/active-run retention, per-edit approval and the expired-run
-physical policy (Option 1). Those are no longer open. Implementation is still
-blocked on explicit owner authorization of the schema/migration, not on these
-product decisions.
+physical policy (Option 1). The F1 implementation also applies the following
+closed decisions:
 
-1. **Limit configuration surface:** where the approved TTL/quotas live (owner
-   settings row, environment, per-Workspace policy) and who may change them.
-2. **Glossary quotas:** entry/character limits, only after G3-B defines the real
+- one centralized owner-level policy, with no per-Workspace configuration
+  before G3-B;
+- Cited Summary is opt-in from both the History panel and an explicit AI tool,
+  chosen per request and never the default;
+- archive suggestions come only from evidence reviewed in the current run,
+  max 10, each with a reason and owner confirmation;
+- no Workspace Glossary, subjective assessment, extraction or cross-source
+  intelligence in F1.
+
+### Remaining owner decisions after F1
+
+1. **Glossary quotas:** entry/character limits, only after G3-B defines the real
    Workspace. No glossary number is approved.
-3. **Cited Summary surface:** panel-only, AI-trigger-only, or both, and whether
-   it is remembered per source or chosen per request.
-4. **Archive suggestions:** whether candidates may come from any run or only
-   owner-flagged evidence, and how many suggestions one surface shows.
-5. **Subjective-assessment thresholds** and the person-level judgment policy for
+2. **Subjective-assessment thresholds** and the person-level judgment policy for
    G4-D.
-6. **Tagged-text fallback:** whether to specify one, and which failure classes
-   may use it without weakening strict-JSON validation.
-7. **Global versus per-Workspace limit configuration** after G3-B.
+3. **Tagged-text fallback:** whether to specify one for future non-F1 structured
+   operations; F1 has no fallback and fails closed.
+4. **Global versus per-Workspace limit overrides** after G3-B. Global policy is
+   the F1 default.
 
 **No longer open:** active-run TTL (7-day default, 1–30 days), active limits
 (1,000-character excerpt, 50 refs per run, 20 per follow-up, 32 KiB text per

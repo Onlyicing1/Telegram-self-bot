@@ -73,6 +73,17 @@ NON_CANONICAL_TABLES = ("ai_preferences",)
 #: parts after part 1; §15 for todo_steps, §32 for the Emoji & Reaction tables)
 #: but are deliberately NOT in the canonical snapshot and must never be folded
 #: back into it.
+#: G4-A/F1 schema is authorized by the owner while DATABASE_ARCHITECTURE.md is
+#: explicitly READ ONLY for this delivery.  It is still classified here so the
+#: "no undocumented table" audit covers every migration; unlike a SUCCESSOR
+#: table it is deliberately exempt from the frozen document inventory check.
+AUTHORIZED_F1_TABLES = (
+    "ai_evidence_runs",
+    "ai_evidence_refs",
+    "ai_evidence_sources",
+    "ai_evidence_revisions",
+)
+
 SUCCESSOR_TABLES = (
     "todo_steps",
     "emoji_library",
@@ -1200,7 +1211,12 @@ def test_no_migration_creates_a_table_that_the_documentation_does_not_classify()
     created: set[str] = set()
     for path in MIGRATIONS_DIR.glob("*.sql"):
         created |= set(declared_column_sets(path.read_text(encoding="utf-8")))
-    known = set(CANONICAL_TABLES) | set(NON_CANONICAL_TABLES) | set(SUCCESSOR_TABLES)
+    known = (
+        set(CANONICAL_TABLES)
+        | set(NON_CANONICAL_TABLES)
+        | set(SUCCESSOR_TABLES)
+        | set(AUTHORIZED_F1_TABLES)
+    )
     assert created <= known, f"undocumented tables created by migrations: {sorted(created - known)}"
     # A successor table must stay OUT of the frozen snapshot: it belongs to its
     # own additive migration and its own §31.3 part, never to part 1.

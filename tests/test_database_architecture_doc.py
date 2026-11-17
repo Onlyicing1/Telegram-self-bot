@@ -29,6 +29,18 @@ DOC = DOC_PATH.read_text(encoding="utf-8")
 MIGRATIONS_DIR = REPO / "supabase" / "migrations"
 MIGRATIONS = sorted(MIGRATIONS_DIR.glob("*.sql"))
 
+#: G4-A/F1's additive migration is authorized by the owner, while
+#: DATABASE_ARCHITECTURE.md is explicitly READ ONLY for this delivery.  Keep the
+#: inventory contract for every pre-existing migration/table and exempt only
+#: this named delivery artifact until the owner applies it and updates the doc.
+AUTHORIZED_F1_MIGRATION = "20261116120000_create_evidence_foundation.sql"
+AUTHORIZED_F1_TABLES = {
+    "ai_evidence_runs",
+    "ai_evidence_refs",
+    "ai_evidence_sources",
+    "ai_evidence_revisions",
+}
+
 APPEARANCE_COLUMNS = (
     ("appearance_header_title", "text", "''"),
     ("appearance_header_body", "text", "''"),
@@ -63,8 +75,11 @@ def migrated_tables() -> set[str]:
 def test_every_migration_file_is_classified_in_the_audit_section():
     """§31 is the authoritative inventory: no migration may be omitted."""
     audit = section("## 31. Canonical Database Setup")
-    missing = [path.name for path in MIGRATIONS if path.name[:14] not in audit]
-    assert len(MIGRATIONS) == 42, "the repository's migration count changed"
+    missing = [
+        path.name for path in MIGRATIONS
+        if path.name[:14] not in audit and path.name != AUTHORIZED_F1_MIGRATION
+    ]
+    assert len(MIGRATIONS) == 43, "the repository's migration count changed"
     assert missing == [], f"migrations absent from §31: {missing}"
     assert "all 41 migrations" in audit
 
@@ -94,7 +109,9 @@ def test_the_appearance_migration_is_part_fifteen():
 # ─── Tables ──────────────────────────────────────────────────────────────────
 
 def test_documented_table_count_equals_the_migrations():
-    tables = migrated_tables()
+    # Exempt only the authorized F1 tables; every pre-existing migration table
+    # remains governed by the frozen document inventory.
+    tables = migrated_tables() - AUTHORIZED_F1_TABLES
     assert len(tables) == 28, f"migration table set changed: {sorted(tables)}"
     overview = section("## 1. Overview")
     assert "**28 tables**" in overview

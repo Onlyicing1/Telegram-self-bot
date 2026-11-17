@@ -58,6 +58,9 @@ from backend.services import (
     history_service,
     save_service,
 )
+from backend.evidence import constants as evidence_constants
+from backend.evidence.models import EvidenceError
+from backend.evidence.service import get_evidence_service
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +139,9 @@ class _State:
     #: "" = the owner's global content language; otherwise a catalog code or
     #: ``auto``. Ephemeral panel state only.
     language: str = ""
+    #: Cited Summary is opt-in and never remembered outside this panel session.
+    cited: bool = False
+    ttl_days: int = evidence_constants.DEFAULT_TTL_DAYS
 
 
 @dataclass(frozen=True)
@@ -315,7 +321,16 @@ def _panel_buttons() -> list:
             )
     builder.add_row("Set Focus Instruction", f"input:{PANEL_ID}:focus")
     builder.add_row(f"Language: {_language_text()}", "action:history_language")
+    builder.add_row(
+        f"Cited Summary: {'On' if _STATE.cited else 'Off'}",
+        "action:history_citations",
+    )
+    builder.add_row(
+        f"Run TTL: {_STATE.ttl_days} days", "action:history_ttl",
+    )
+    builder.add_row("Set Run TTL", f"input:{PANEL_ID}:ttl")
     builder.add_row("Run Summary", "action:history_run")
+    builder.add_row("Evidence Explorer", "panel:evidence")
     builder.add_row(sym.label(sym.OP_CREATE, "Schedule History"), f"panel:{SCHEDULE_PANEL_ID}")
     builder.add_row("Summarize Message Link", f"input:{PANEL_ID}:link")
     return builder.build()
@@ -330,7 +345,14 @@ def _panel_body(notice: str = "") -> str:
         f"Messages: {_STATE.count}",
         f"Language: {_language_text()}",
         f"Focus: {_STATE.focus or 'none'}",
+        f"Summary mode: {'Cited Summary (opt-in)' if _STATE.cited else 'Plain summary'}",
+        f"Active-run TTL: {_STATE.ttl_days} days (1–30)",
     ]
+    if _STATE.cited:
+        lines.append(
+            f"Cited Summary uses at most {evidence_constants.MAX_CITED_COUNT} "
+            "most recent references."
+        )
     if _STATE.peer_type is not None:
         lines.append(
             "Limit for this chat: "
@@ -720,6 +742,8 @@ async def _pick_chat(raw: str) -> tuple[str, str, list]:
     _STATE.chat_id = chat.peer_id
     _STATE.chat_name = chat.name
     _STATE.peer_type = peer_type
+    # Cited Summary is a per-request choice, never a source-level preference.
+    _STATE.cited = False
     if _STATE.count not in history_policy.choices_for(peer_type):
         # A NEW selection starts from the shared default; this is not a clamp of
         # a request the owner made for this peer.
@@ -1281,6 +1305,7 @@ def _summary_body(
 def _result_buttons() -> list:
     builder = InlinePanelBuilder()
     builder.add_row("New Summary", f"panel:{PANEL_ID}")
+    builder.add_row("Evidence Explorer", "panel:evidence")
     builder.add_row(sym.label(sym.OP_HOME, "Home"), "panel:_nav:home")
     builder.add_row(sym.label(sym.OP_CLOSE, "Close"), "panel:_nav:close")
     return builder.build()
@@ -1301,6 +1326,9 @@ async def _run_summary(
     current_message_id: int | None = None,
     ending_at: int | None = None,
     language: str = "",
+    cited: bool = False,
+    ttl_days: int = evidence_constants.DEFAULT_TTL_DAYS,
+    peer_type: Any = None,
 ) -> None:
     editor = _editor(panel_chat_id, panel_msg_id, inline_id, generation)
     # A new run invalidates the previous run's page buttons IMMEDIATELY, so a
@@ -1313,22 +1341,59 @@ async def _run_summary(
             _progress_buttons(),
         )
         try:
-            ok, text, data = await asyncio.wait_for(
-                history_ai_service.summarize_history(
-                    client,
-                    chat_id,
-                    count=count,
-                    language=language or None,
-                    global_language=_global_language(),
-                    instruction=focus or None,
-                    provider_manager=manager,
-                    current_message_id=current_message_id,
-                    request_id="glass-history",
-                    timeout_s=OPERATION_TIMEOUT_S,
-                    with_identifiers=False,
-                ),
-                timeout=OPERATION_TIMEOUT_S,
-            )
+            if cited:
+                # Cited Summary is opt-in and bounded to 50 refs. The owner sees
+                # the truncation note below; no valid active run is evicted.
+                effective_count = min(max(1, int(count)), evidence_constants.MAX_CITED_COUNT)
+                result = await asyncio.wait_for(
+                    get_evidence_service().run_cited_summary(
+                        client,
+                        owner_id=_OWNER_ID,
+                        peer_id=chat_id,
+                        peer_name=chat_name,
+                        count=effective_count,
+                        ttl_days=ttl_days,
+                        instruction=focus or "",
+                        language=language or _global_language(),
+                        provider_manager=manager,
+                        current_message_id=current_message_id,
+                        timeout_s=OPERATION_TIMEOUT_S,
+                        request_id="glass-history-cited",
+                        peer_type=peer_type,
+                    ),
+                    timeout=OPERATION_TIMEOUT_S,
+                )
+                ok = True
+                text = result.summary
+                data = dict(result.data)
+                data["citations"] = len(result.citations)
+                data["citation_lines"] = [
+                    f"{citation.key}: {citation.link}"
+                    for citation in result.citations
+                ]
+                if int(count) > evidence_constants.MAX_CITED_COUNT:
+                    data["cited_window_note"] = (
+                        f"Cited Summary used the most recent "
+                        f"{evidence_constants.MAX_CITED_COUNT} of {int(count)} "
+                        "requested messages."
+                    )
+            else:
+                ok, text, data = await asyncio.wait_for(
+                    history_ai_service.summarize_history(
+                        client,
+                        chat_id,
+                        count=count,
+                        language=language or None,
+                        global_language=_global_language(),
+                        instruction=focus or None,
+                        provider_manager=manager,
+                        current_message_id=current_message_id,
+                        request_id="glass-history",
+                        timeout_s=OPERATION_TIMEOUT_S,
+                        with_identifiers=False,
+                    ),
+                    timeout=OPERATION_TIMEOUT_S,
+                )
         except asyncio.CancelledError:
             raise
         except asyncio.TimeoutError:
@@ -1336,6 +1401,12 @@ async def _run_summary(
                 False,
                 f"{sym.STATE_FAILED} Summarization timed out after {OPERATION_TIMEOUT_S:.0f}s.",
                 {"error": "operation_timeout"},
+            )
+        except EvidenceError as exc:
+            ok, text, data = (
+                False,
+                f"{sym.STATE_FAILED} Cited Summary failed: {exc}",
+                {"error": getattr(exc, "code", "evidence_error")},
             )
         except Exception as exc:  # noqa: BLE001 — never fabricate a result
             logger.warning("HISTORY_SUMMARY_FAILED error=%s", type(exc).__name__)
@@ -1349,6 +1420,15 @@ async def _run_summary(
             body = _summary_body(
                 text, data, chat_name=chat_name, ending_at=ending_at,
             )
+            if cited:
+                note = str(data.pop("cited_window_note", "") or "")
+                citation_lines = data.pop("citation_lines", [])
+                if note:
+                    body += f"\n\n{sym.STATE_WARNING} {note}"
+                if citation_lines:
+                    body += "\n\nLocally constructed citations:\n" + "\n".join(
+                        citation_lines
+                    )
         else:
             body = (
                 f"Chat: {chat_name}\n{text or (sym.STATE_FAILED + ' Summarization failed.')}"
@@ -1426,6 +1506,8 @@ async def _run_action(event, extra: str, chat_id: int) -> tuple[str, str, list] 
         count=_STATE.count,
         focus=_STATE.focus,
         language=_STATE.language,
+        cited=_STATE.cited,
+        ttl_days=_STATE.ttl_days,
     )
     try:
         guarded_create_task(
@@ -1437,6 +1519,9 @@ async def _run_action(event, extra: str, chat_id: int) -> tuple[str, str, list] 
                 count=snapshot.count,
                 focus=snapshot.focus,
                 language=snapshot.language,
+                cited=snapshot.cited,
+                ttl_days=snapshot.ttl_days,
+                peer_type=snapshot.peer_type,
                 panel_chat_id=chat_id,
                 panel_msg_id=panel_msg_id,
                 inline_id=inline_message_id_from_event(event),
@@ -1448,6 +1533,9 @@ async def _run_action(event, extra: str, chat_id: int) -> tuple[str, str, list] 
         finish_panel_operation(chat_id, panel_msg_id, generation)
         logger.warning("HISTORY_LAUNCH_FAILED error=%s", type(exc).__name__)
         return _panel_view(f"{sym.STATE_FAILED} Could not start the summary.")
+    # The decision was captured in the snapshot above; do not silently carry an
+    # opt-in citation mode into a later, separate request.
+    _STATE.cited = False
     return None
 
 
@@ -1455,6 +1543,60 @@ async def _language_action(event, extra: str, chat_id: int) -> tuple[str, str, l
     """Cycle the request-level summary language; the panel is not trusted."""
     _STATE.language = _next_language()
     return _panel_view(f"Summary language set to {_language_text()}.")
+
+
+async def _citations_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    """Toggle Cited Summary for THIS request; it is never persisted per source."""
+    _STATE.cited = not _STATE.cited
+    return _panel_view(
+        "Cited Summary is ON for the next run; ordinary summaries remain plain."
+        if _STATE.cited else
+        "Cited Summary is OFF; the next run uses the ordinary plain summary."
+    )
+
+
+def _ttl_choices() -> tuple[int, ...]:
+    return (1, 3, 7, 14, 30)
+
+
+async def _ttl_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    """Cycle the creation-time TTL; no run TTL is ever extended later."""
+    choices = _ttl_choices()
+    try:
+        index = choices.index(int(_STATE.ttl_days))
+    except (TypeError, ValueError):
+        index = choices.index(evidence_constants.DEFAULT_TTL_DAYS)
+    _STATE.ttl_days = choices[(index + 1) % len(choices)]
+    return _panel_view(
+        f"New active runs will use a {_STATE.ttl_days}-day TTL. "
+        "An existing run's TTL is immutable."
+    )
+
+
+async def _ttl_input_handler(
+    text, chat_id, msg_id, inline_chat_id, inline_msg_id, inline_id=None,
+):
+    try:
+        value = int(str(text or "").strip())
+    except (TypeError, ValueError):
+        value = 0
+    if value < evidence_constants.MIN_TTL_DAYS or value > evidence_constants.MAX_TTL_DAYS:
+        notice = (
+            f"{sym.STATE_FAILED} TTL must be between "
+            f"{evidence_constants.MIN_TTL_DAYS} and {evidence_constants.MAX_TTL_DAYS} days. "
+            f"Still: {_STATE.ttl_days} days."
+        )
+    else:
+        _STATE.ttl_days = value
+        notice = f"New active runs will use a {value}-day TTL."
+    client = get_self_client()
+    editor = _editor(inline_chat_id or chat_id, inline_msg_id or msg_id, inline_id)
+    await _paint(editor, _panel_body(notice), _panel_buttons())
+    if client is not None and msg_id:
+        try:
+            await client.delete_messages(chat_id, [msg_id])
+        except Exception:
+            pass
 
 
 def _normalize_focus(value: Any) -> str | None:
@@ -1522,6 +1664,9 @@ async def _run_link(
     panel_msg_id: int,
     inline_id: Any,
     generation: int,
+    cited: bool = False,
+    ttl_days: int = evidence_constants.DEFAULT_TTL_DAYS,
+    peer_type: Any = None,
 ) -> None:
     editor = _editor(panel_chat_id, panel_msg_id, inline_id, generation)
     try:
@@ -1590,6 +1735,8 @@ async def _run_link(
             generation=generation,
             current_message_id=target.message_id + 1,
             ending_at=target.message_id,
+            cited=cited,
+            ttl_days=ttl_days,
         )
     finally:
         finish_panel_operation(panel_chat_id, panel_msg_id, generation)
@@ -1639,6 +1786,8 @@ async def _link_input_handler(
                         panel_msg_id=panel_msg_id,
                         inline_id=inline_id,
                         generation=generation,
+                        cited=_STATE.cited,
+                        ttl_days=_STATE.ttl_days,
                     ),
                     name="history:link-summarize",
                 )
@@ -1677,6 +1826,8 @@ def register(client=None, owner_id: int = 0, tz_str: str = "UTC") -> None:
     register_inline_builder(PANEL_ID, _inline_builder)
     register_action("history_count", _count_action)
     register_action("history_language", _language_action)
+    register_action("history_citations", _citations_action)
+    register_action("history_ttl", _ttl_action)
     register_action("history_run", _run_action)
     register_action("history_page", _page_action)
     register_action("history_schedule", _schedule_action)
@@ -1689,6 +1840,21 @@ def register(client=None, owner_id: int = 0, tz_str: str = "UTC") -> None:
                 "**Focus Instruction**\n\n"
                 f"Optional. Up to {history_ai_service.MAX_INSTRUCTION_CHARS} characters. "
                 "Send an empty message to clear.\n\n_Reply below._"
+            ),
+            "back": f"panel:{PANEL_ID}",
+        },
+    )
+    register_input(
+        PANEL_ID,
+        "ttl",
+        {
+            "handler": _ttl_input_handler,
+            "prompt": (
+                "**Active-run TTL**\n\n"
+                f"Send a whole number of days from {evidence_constants.MIN_TTL_DAYS} "
+                f"to {evidence_constants.MAX_TTL_DAYS}. The default is "
+                f"{evidence_constants.DEFAULT_TTL_DAYS}. TTL applies to new runs "
+                "only and cannot be extended.\n\n_Reply below._"
             ),
             "back": f"panel:{PANEL_ID}",
         },
