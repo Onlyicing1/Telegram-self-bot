@@ -18,7 +18,7 @@ operation was performed by the database setup.
 |---|---|---|---|
 | M1 | A ref did not unambiguously identify the immutable revision it produced | **FIXED** | `ai_evidence_refs.revision_id` was written by no code path. `archive_ref` now links the ref to the exact revision (created or deduplicated), validated against owner/chat/message and write-once, at both the application and database boundary. |
 | M2 | Persistence failure could silently degrade to process memory | **FIXED** | `EvidenceRepository()` no longer falls back to memory when Supabase is unavailable; it holds an explicit unavailable client that raises `EvidenceStorageUnavailable`. Memory is only reachable through `allow_memory=True`/`in_memory_repository()`. |
-| M3 | Quota checks could race and exceed owner limits | **FIXED (application + SQL functions)** | Run admission and archive writes are one serialized operation: an in-memory lock for the explicit test double and `pg_advisory_xact_lock` inside `ai_evidence_create_run` / `ai_evidence_archive_revision` for Supabase. PostgreSQL concurrency itself remains unverified (no database was available). |
+| M3 | Quota checks could race and exceed owner limits | **FIXED (application + SQL functions)** | Run admission and archive writes are one serialized operation: an in-memory lock for the explicit test double and `pg_advisory_xact_lock` inside `ai_evidence_create_run` / `ai_evidence_archive_revision` for Supabase. Sequential live PostgreSQL quota/archive RPC probes passed; production concurrency and lock-contention stress testing remain unverified. |
 | M4 | Cited Summary could be produced without explicit per-request opt-in | **FIXED** | `run_cited_summary(..., opt_in=False)` now refuses to run without explicit opt-in; both call sites assert it. The `cited_summary` AI tool is `CONFIRMATION_REQUIRED`, so the executor cannot auto-run it and a confirmation is never remembered. The History link path now clears the toggle like the Run path. |
 | M5 | Dependency checks were not atomic at the deletion operation | **DEFERRED WITH BLOCKER** | F1 has no dependent table. `count_revision_dependents`/`count_source_dependents` are still explicit zero stubs on the durable repository, so the approved dependent preflight cannot exist yet. See the blocker below. |
 | M6 | Explorer used global mutable state for owner-specific results | **FIXED** | All module-level result caches were removed; every view receives the data its own handler loaded, and every opaque id is re-resolved through an owner-filtered repository call. |
@@ -254,9 +254,14 @@ Applied migration history:
 - `20261117123943 / create_evidence_foundation`
 - `20261117124032 / harden_evidence_privileges`
 
-The Supabase MCP generated server-side migration timestamps. The repository
-migration filenames were synchronized to those exact remote versions so
-`supabase migration list` can compare local and remote histories by timestamp.
+The Supabase MCP generated server-side migration timestamps. The two new
+Evidence migration filenames were synchronized to those exact remote versions.
+This does not reconcile the broader pre-existing migration-history drift:
+the repository has 44 SQL migration files, while remote Supabase history has
+8 rows; 39 local timestamps are absent remotely and 3 remote versions have no
+matching local filename. This was not repaired because the older migration
+states require a separate audit. Do not run bulk `supabase db push` until that
+history drift is reconciled.
 
 **Live catalog verification passed:**
 

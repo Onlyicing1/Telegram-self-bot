@@ -2,15 +2,16 @@
 
 ## Current delivery: G4-A / F1 — Single-source evidence foundation
 
-Status: **Implemented offline, with an additive migration artifact that is NOT
-applied.** G2-B (Workspace language), G4-A/F2 (follow-ups), G4-B (Workspace
-awareness), G4-C (extraction/Glossary), G4-D, G5-A and later Scheduled History
-phases remain deferred. No SQL, Supabase, Telegram, Render, provider or
-deployment operation was performed. An adversarial review of the first
-delivery found six issues; five were fixed in the 2026-11-17 remediation sprint
-and one is an explicit blocker (see "F1 remediation record"). The policy record
-follows below; the implementation is in `backend/evidence/`, the owner-only
-Explorer and the unapplied migration.
+Status: **G4-A/F1 database schema and privilege hardening are applied to the
+live Supabase project and verified (2026-11-17).** G2-B (Workspace language),
+G4-A/F2 (follow-ups), G4-B (Workspace awareness), G4-C (extraction/Glossary),
+G4-D, G5-A and later Scheduled History phases remain deferred. Live PostgreSQL
+catalog, grants, triggers and sequential RPC smoke tests passed. Telegram,
+provider, Explorer UI and Render runtime flows remain unverified; Evidence is
+not live-enabled until the application is deployed and those flows pass.
+The first delivery's six findings were remediated (M5 remains deferred until
+dependent records exist). The implementation is in `backend/evidence/`, the
+owner-only Explorer and the two applied Evidence migrations.
 
 ### What G2-A adds
 
@@ -72,15 +73,15 @@ Explorer and the unapplied migration.
 
 ## Implementation record: G4-A / F1 evidence persistence and bounded storage
 
-Status: **G4-A / F1 implemented offline — 2026-11-16; migration artifact created
-but NOT applied.** Production code, focused tests, an owner-only Explorer and
-an unapplied additive migration now exist in the repository. No SQL was
-executed, no Supabase object was created and no Telegram/Render/provider live
-operation was performed. The canonical policy remains `LIFEOS_IDEAS.md` §4.5.1.
-The owner must review and manually apply
-`supabase/migrations/20261116120000_create_evidence_foundation.sql` before the
-runtime can use the tables; until then the service fails honestly rather than
-falling back to a second evidence format. G4-A/F2 remains deferred.
+Status: **G4-A / F1 code implemented offline — 2026-11-16 and remediated
+2026-11-17; database migrations applied to live Supabase — 2026-11-17.**
+Production code, focused tests, an owner-only Explorer, the durable Evidence
+schema and the privilege-hardening migration exist in the repository and live
+database. The canonical policy remains `LIFEOS_IDEAS.md` §4.5.1. Live database
+triggers, grants and sequential quota/archive RPC probes passed. The bot's
+actual service-role client, Telegram retrieval, provider round-trip, Explorer
+callbacks and Render deployment have not been verified; the runtime remains
+not live-enabled until those checks pass. G4-A/F2 remains deferred.
 
 ### F1 remediation record (2026-11-17)
 
@@ -91,7 +92,7 @@ before changing anything:
 |---|---|---|
 | M1 | A ref never identified the revision it produced | **FIXED.** Archiving now writes a write-once `revision_id` onto the ref after validating owner/chat/message; a database trigger and a column-level grant enforce the same rule, so no other ref update is possible and no "latest" pointer exists. |
 | M2 | Silent in-memory fallback could report a durable success | **FIXED.** `EvidenceRepository()` is durable-only; an unavailable Supabase raises `EvidenceStorageUnavailable` instead of storing in process memory. Memory is reachable only through the explicit test double. |
-| M3 | Quota checks were check-then-act | **FIXED at the application and SQL boundary.** Run admission and archive writes are one serialized operation (`pg_advisory_xact_lock` in `ai_evidence_create_run` / `ai_evidence_archive_revision`; one lock in the test double). PostgreSQL concurrency remains unverified until the migration is applied. |
+| M3 | Quota checks were check-then-act | **FIXED at the application and SQL boundary.** Run admission and archive writes are one serialized operation (`pg_advisory_xact_lock` in `ai_evidence_create_run` / `ai_evidence_archive_revision`; one lock in the test double). Sequential live PostgreSQL quota/archive RPC probes passed; production concurrency and lock-contention stress testing remain unverified. |
 | M4 | Cited Summary could run without per-request opt-in | **FIXED.** The service refuses without `opt_in=True`; the AI tool is confirmation-required and cannot auto-execute; the panel toggle is cleared after every run, including the link path. Consent is never remembered. |
 | M5 | Dependency check was not part of the deletion operation | **DEFERRED WITH BLOCKER.** F1 has no dependent record class; the durable `count_*_dependents` methods are explicit zero stubs. Before any dependent table exists (G4-C), the preflight and the delete must move into one database transaction and return the dependent list. |
 | M6 | Explorer held owner results in module globals | **FIXED.** Every global result cache was removed; views receive the data their own handler loaded, and each opaque id is re-resolved through an owner-filtered service call. |
@@ -101,8 +102,51 @@ tests), a 288-test registry/schema/confirmation/document group, and a full run
 of **7947 passed, 27 skipped, 1 pre-existing time-dependent scheduler failure**
 (`test_recovered_interrupted_occurrence_is_picked_up_by_run_once`, which fails
 because its fixed 2026-09-10 schedule is advanced to the current wall clock).
-The migration was edited in place and **not applied**; no SQL, Supabase,
-Telegram, Render or provider operation was performed.
+At the end of the offline remediation sprint the migration was still unapplied.
+The owner subsequently authorized live application and verification on
+2026-11-17; see "Live Supabase setup and verification" below. No Telegram,
+Render or provider operation was performed.
+
+### Live Supabase setup and verification (2026-11-17)
+
+Project `telegram-self-bot` (`burfebhahuowywyfgcsc`), PostgreSQL 17.6,
+region `ca-central-1`.
+
+Applied remote migrations and matching repository filenames:
+
+- `20261117123943_create_evidence_foundation.sql`
+- `20261117124032_harden_evidence_privileges.sql`
+
+Live checks passed:
+
+- Four Evidence tables exist, all with RLS enabled and zero policies.
+- Run-expiry, Ref INSERT/UPDATE ownership/revision guard, and revision
+  immutability triggers exist and are enabled.
+- A live PostgreSQL probe rejected a mismatched Ref/Run owner, accepted a valid
+  same-owner ref, allowed one exact revision link, rejected repointing and
+  excerpt/revision mutation, and confirmed database-time TTL calculation.
+- RPC probes confirmed active-run quota refusal, archive creation, same-hash
+  deduplication and changed-content revision numbering. All probe rows were
+  cleaned up.
+- Exact grants are enforced: refs have UPDATE on `revision_id` only;
+  revisions have no UPDATE; client roles have no Evidence table access.
+  All seven Evidence functions are executable by `service_role` only and
+  have fixed `search_path = pg_catalog, public`.
+- The first live ACL inspection found inherited project defaults giving
+  `service_role` broader table-level privileges than intended. The second
+  migration revoked those defaults on the four Evidence tables and reapplied
+  the exact approved grants.
+
+**Pre-existing migration-history drift remains unresolved.** The repository has
+44 SQL migration files, while the remote Supabase history has 8 rows. Of those,
+39 local timestamps are absent remotely and 3 remote versions have no matching
+local filename. The two new Evidence migration versions match exactly. This
+historical mismatch was not repaired because doing so safely requires auditing
+the state represented by every older migration. **Do not run a bulk
+`supabase db push` until that history drift is separately reconciled.**
+
+The Evidence database layer is applied and verified, but the runtime is still
+not live-enabled pending actual bot-client, Telegram, provider and UI checks.
 
 ### Approved owner decisions (unchanged)
 
@@ -375,8 +419,8 @@ until G3-B and no glossary number is approved.
 
 **Measured facts (code/schema, not storage measurements):**
 
-- The F1 migration artifact defines evidence/archive/revision tables; none has
-  been applied to the live schema, and no glossary table exists.
+- The F1 migrations define four Evidence tables and their triggers/functions;
+  they are applied to the live schema. No Glossary table exists.
 - `history_schedules.summary` is bounded at 32 KiB of UTF-8.
 - `ai_messages` truncates content at 8,000 characters.
 - Existing tables are accessed only through the service-role key with RLS
@@ -447,7 +491,7 @@ authorization.
 
 | Stage | Scope | Depends on | Gate |
 |---|---|---|---|
-| **G4-A / F1** | Single-source evidence foundation: durable Active Runs with approved TTL, immutable owner-approved archive revisions, opt-in Cited Summary, basic Explorer with locally built links. | G2-A + existing History | **Implemented offline 2026-11-16; remediated 2026-11-17** (M1–M4, M6 fixed; M5 blocked until dependent records exist). Additive migration artifact edited but **manual owner application still required**. |
+| **G4-A / F1** | Single-source evidence foundation: durable Active Runs with approved TTL, immutable owner-approved archive revisions, opt-in Cited Summary, basic Explorer with locally built links. | G2-A + existing History | **Code implemented/remediated; database migrations applied and verified 2026-11-17.** Runtime end-to-end checks remain; M5 is deferred until dependent records exist. |
 | **G4-A / F2** | Restart-safe follow-ups on the same run and contract. A delivery phase of G4-A, **not** a new stage. | G4-A / F1 | The approved TTL proves usable in practice. |
 | **G4-B** *(original meaning preserved)* | **Workspace-aware durable Evidence:** Workspace-scoped browsing/consumption of the same evidence contract, cross-run within the Workspace. No second evidence format. | G4-A + G3-A + G3-B | Owner approves Workspace persistence and evidence retention scope. |
 | **G4-C** *(new ID, documented)* | Strict-JSON extraction and the persistent Workspace Glossary. Glossary storage **blocked until G3-B**. | G4-A + G3-B + approved extraction schema | G3-B complete; extraction schema approved; glossary quotas defined after G3-B. |
