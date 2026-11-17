@@ -23,6 +23,7 @@ from backend.evidence import constants
 from backend.evidence.models import (
     EvidenceQuotaError,
     EvidenceNotFound,
+    EvidenceRef,
     EvidenceRun,
     EvidenceStorageError,
     EvidenceStorageUnavailable,
@@ -105,6 +106,56 @@ class _FakeManager:
 
 class _Event:
     sender_id = OWNER
+
+
+class _ExplodingDB:
+    """Fails the test if the durable path is reached at all."""
+
+    def __init__(self) -> None:
+        self.used = False
+
+    def table(self, _name: str):
+        self.used = True
+        raise AssertionError("mismatched refs must not reach the database")
+
+    def rpc(self, _name: str, _params=None):
+        self.used = True
+        raise AssertionError("mismatched refs must not reach the database")
+
+
+class _RecordingDB:
+    """Minimal insert-only Supabase stand-in that records the payload."""
+
+    def __init__(self) -> None:
+        self.inserted: list[dict[str, Any]] = []
+
+    def table(self, _name: str):
+        outer = self
+
+        class _Table:
+            def insert(self, rows):
+                outer.inserted = list(rows)
+                return self
+
+            def execute(self):
+                from types import SimpleNamespace
+
+                return SimpleNamespace(data=outer.inserted)
+
+        return _Table()
+
+
+def _ref(run: EvidenceRun, *, owner: int | None = None, ordinal: int = 1) -> EvidenceRef:
+    return EvidenceRef(
+        run_id=run.id,
+        owner_id=run.owner_id if owner is None else owner,
+        ordinal=ordinal,
+        message_id=ordinal,
+        excerpt="excerpt",
+        content_hash="a" * 64,
+        has_media=False,
+        excerpt_truncated=False,
+    )
 
 
 def _repo(clock: _Clock | None = None) -> EvidenceRepository:
@@ -454,3 +505,64 @@ async def test_stale_explorer_callback_fails_closed_after_run_deletion():
 
     _title, body, _buttons = await explorer._open_action(_Event(), bundle.run.id, 1)
     assert "no longer exists" in body
+
+
+# ── Ref/Run ownership integrity (migration guard + insert path) ────────────
+
+
+@pytest.mark.asyncio
+async def test_ref_whose_owner_differs_from_its_run_is_rejected():
+    repository = _repo()
+    run = _run_stub()
+    repository._memory.runs[run.id] = run
+    repository._memory.refs[run.id] = []
+
+    with pytest.raises(EvidenceStorageError):
+        await repository.add_refs(run, [_ref(run, owner=OTHER_OWNER)])
+    assert repository._memory.refs[run.id] == []
+
+
+@pytest.mark.asyncio
+async def test_durable_add_refs_rejects_mismatched_owner_before_writing():
+    db = _ExplodingDB()
+    repository = EvidenceRepository(db=db)
+    run = _run_stub()
+
+    with pytest.raises(EvidenceStorageError):
+        await repository.add_refs(run, [_ref(run, owner=OTHER_OWNER)])
+    assert db.used is False
+
+
+@pytest.mark.asyncio
+async def test_durable_add_refs_accepts_a_same_owner_ref():
+    db = _RecordingDB()
+    repository = EvidenceRepository(db=db)
+    run = _run_stub()
+
+    await repository.add_refs(run, [_ref(run)])
+
+    assert len(db.inserted) == 1
+    assert db.inserted[0]["owner_id"] == OWNER
+    assert db.inserted[0]["run_id"] == run.id
+
+
+def test_migration_guard_covers_insert_and_checks_the_run_owner():
+    from pathlib import Path
+
+    sql = Path(
+        "supabase/migrations/20261116120000_create_evidence_foundation.sql"
+    ).read_text(encoding="utf-8")
+
+    assert "BEFORE INSERT OR UPDATE ON ai_evidence_refs" in sql
+    assert "FROM ai_evidence_runs run" in sql
+    assert "SELECT run.owner_id, run.peer_id" in sql
+    assert "run_owner <> NEW.owner_id" in sql
+    assert "evidence ref owner does not match its run owner" in sql
+    # Existing approved guarantees stay in the same guard.
+    assert "an evidence ref revision link is write-once" in sql
+    assert "revision_owner <> NEW.owner_id" in sql
+    assert "revision_peer IS DISTINCT FROM run_peer" in sql
+    assert "revision_message <> NEW.message_id" in sql
+    # The deliberate no-FK policy for a historical unresolved reference.
+    assert "revision_id         uuid," in sql
+    assert "revision_id uuid REFERENCES" not in sql

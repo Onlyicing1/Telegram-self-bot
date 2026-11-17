@@ -140,48 +140,63 @@ CREATE TABLE IF NOT EXISTS ai_evidence_refs (
 CREATE INDEX IF NOT EXISTS idx_ai_evidence_refs_owner_run
     ON ai_evidence_refs (owner_id, run_id);
 
--- A live reference may gain its revision id exactly once, and only for the
--- revision of its own owner/chat/message. Every other column stays immutable,
--- so an excerpt can never be rewritten and a link can never be repointed.
+-- A reference belongs to exactly one owner and one run of that same owner.
+-- On INSERT it cannot point at another owner's run; on UPDATE every column is
+-- immutable except a single NULL -> revision_id link, and that revision must
+-- belong to the same owner/chat/message. No row can ever be repointed.
 CREATE OR REPLACE FUNCTION ai_evidence_ref_revision_guard()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $$
 DECLARE
+    run_owner        bigint;
+    run_peer         bigint;
     revision_owner   bigint;
     revision_peer    bigint;
     revision_message bigint;
-    run_peer         bigint;
 BEGIN
-    IF NEW.run_id IS DISTINCT FROM OLD.run_id
-       OR NEW.owner_id IS DISTINCT FROM OLD.owner_id
-       OR NEW.ordinal IS DISTINCT FROM OLD.ordinal
-       OR NEW.message_id IS DISTINCT FROM OLD.message_id
-       OR NEW.excerpt IS DISTINCT FROM OLD.excerpt
-       OR NEW.content_hash IS DISTINCT FROM OLD.content_hash
-       OR NEW.has_media IS DISTINCT FROM OLD.has_media
-       OR NEW.excerpt_truncated IS DISTINCT FROM OLD.excerpt_truncated THEN
-        RAISE EXCEPTION 'evidence refs are append-only except revision linkage';
+    IF TG_OP = 'UPDATE' THEN
+        IF NEW.run_id IS DISTINCT FROM OLD.run_id
+           OR NEW.owner_id IS DISTINCT FROM OLD.owner_id
+           OR NEW.ordinal IS DISTINCT FROM OLD.ordinal
+           OR NEW.message_id IS DISTINCT FROM OLD.message_id
+           OR NEW.excerpt IS DISTINCT FROM OLD.excerpt
+           OR NEW.content_hash IS DISTINCT FROM OLD.content_hash
+           OR NEW.has_media IS DISTINCT FROM OLD.has_media
+           OR NEW.excerpt_truncated IS DISTINCT FROM OLD.excerpt_truncated THEN
+            RAISE EXCEPTION 'evidence refs are append-only except revision linkage';
+        END IF;
+        IF OLD.revision_id IS NOT NULL
+           AND NEW.revision_id IS DISTINCT FROM OLD.revision_id THEN
+            RAISE EXCEPTION 'an evidence ref revision link is write-once';
+        END IF;
     END IF;
-    IF OLD.revision_id IS NOT NULL
-       AND NEW.revision_id IS DISTINCT FROM OLD.revision_id THEN
-        RAISE EXCEPTION 'an evidence ref revision link is write-once';
+
+    SELECT run.owner_id, run.peer_id
+      INTO run_owner, run_peer
+      FROM ai_evidence_runs run
+     WHERE run.id = NEW.run_id;
+    IF run_owner IS NULL THEN
+        RAISE EXCEPTION 'evidence ref run does not exist';
     END IF;
+    IF run_owner <> NEW.owner_id THEN
+        RAISE EXCEPTION 'evidence ref owner does not match its run owner';
+    END IF;
+
     IF NEW.revision_id IS NULL THEN
         RETURN NEW;
     END IF;
-    SELECT rev.owner_id, src.peer_id, src.message_id, run.peer_id
-      INTO revision_owner, revision_peer, revision_message, run_peer
+
+    SELECT rev.owner_id, src.peer_id, src.message_id
+      INTO revision_owner, revision_peer, revision_message
       FROM ai_evidence_revisions rev
       JOIN ai_evidence_sources src ON src.id = rev.source_id
-      JOIN ai_evidence_runs run ON run.id = NEW.run_id
      WHERE rev.id = NEW.revision_id;
     IF revision_owner IS NULL THEN
         RAISE EXCEPTION 'evidence ref revision does not exist';
     END IF;
     IF revision_owner <> NEW.owner_id
-       OR run_peer IS NULL
-       OR revision_peer <> run_peer
+       OR revision_peer IS DISTINCT FROM run_peer
        OR revision_message <> NEW.message_id THEN
         RAISE EXCEPTION 'evidence ref revision does not match this owner/source';
     END IF;
@@ -191,7 +206,7 @@ $$;
 
 DROP TRIGGER IF EXISTS ai_evidence_refs_revision_guard ON ai_evidence_refs;
 CREATE TRIGGER ai_evidence_refs_revision_guard
-    BEFORE UPDATE ON ai_evidence_refs
+    BEFORE INSERT OR UPDATE ON ai_evidence_refs
     FOR EACH ROW EXECUTE FUNCTION ai_evidence_ref_revision_guard();
 
 -- ── archive: stable source identity + append-only revisions ─────────────────

@@ -3,11 +3,14 @@
 **Reporting date:** 2026-11-17
 **Latest delivery:** G4-A / F1 — Single-Source Evidence Foundation, remediation sprint
 **Base commit:** `7f02e88c469dfd569eaa43c5005964dc20021a89` (`origin/main`, parent `c8741935dd10f09face8367b9eaa5810c0df34c0`)
+**Follow-up base:** `625bcf053fdb0faf8bc95e239302e9bc4d18aa11` (the first remediation commit; the Ref/Run ownership fix is committed on top of it)
 **Starting HEAD:** `76aacc851483dc2ade1d2dab46cd7e2e5a714743` (docs branch, an ancestor of the target)
 **Final commit:** recorded in the delivery response; this report is committed in the same commit it describes.
 **Status:** remediation implemented offline and focused-tested. The additive migration
-has been edited in place but **remains unapplied**. No SQL, Supabase, Telegram,
-Render, provider or deployment operation was performed by this delivery.
+has been edited in place but **remains unapplied**. A follow-up ownership-integrity
+fix is included in the same unapplied migration and durable insert path. No SQL,
+Supabase, Telegram, Render, provider or deployment operation was performed by this
+delivery.
 
 ## Disposition of the six findings
 
@@ -45,6 +48,40 @@ Render, provider or deployment operation was performed by this delivery.
   - No foreign key on `revision_id` by design: the approved deletion policy
     keeps a historical unresolved reference in the ref after an explicitly
     confirmed archive deletion, instead of nulling or cascading it.
+
+### Ref/Run ownership integrity (follow-up, 2026-11-17)
+
+**Confirmed gap.** `ai_evidence_ref_revision_guard` ran `BEFORE UPDATE` only and
+selected the run's `peer_id` without ever comparing `run.owner_id` to
+`NEW.owner_id`; it also returned early when `revision_id IS NULL`, so an
+unlinked ref was never checked against its run at all. On the application side
+the explicit memory double checked `ref.run_id`/`ref.owner_id`, but the durable
+`add_refs()` built insert rows and called Supabase with no equivalent check. A
+ref could therefore name an owner different from its run's owner — from a
+service-role write directly, or from any future durable caller that did not
+reuse `archive_ref`'s construction path. The trigger's revision branch required
+the revision owner to equal `NEW.owner_id`, so a foreign ref could still only
+link a revision owned by that foreign ref owner; the inconsistency was the
+ref/run pair itself, not the revision.
+
+**Database fix.** The guard is now `BEFORE INSERT OR UPDATE ON ai_evidence_refs`.
+For both operations it selects `run.owner_id, run.peer_id` by `NEW.run_id`,
+raises `evidence ref run does not exist` when absent, and raises
+`evidence ref owner does not match its run owner` when the owners differ,
+*before* the `NULL → revision` early return. All previous checks remain in the
+same guard: the UPDATE-only append-only column set, the write-once rule
+(`OLD.revision_id IS NOT NULL` and any different value), revision existence,
+`revision_owner = NEW.owner_id`, `revision_peer = run.peer_id`, and
+`revision_message = NEW.message_id`. No foreign key was added; the approved
+deletion policy (a historical unresolved ref may remain after archive deletion)
+is unchanged, and the revision ordering/immutability triggers are untouched.
+
+**Repository fix.** `_validate_refs_for_run(run, refs)` rejects any ref whose
+`run_id` differs from the run or whose `owner_id` differs from the run owner.
+`add_refs()` calls it before either branch, so the durable path raises
+`EvidenceStorageError` before issuing an insert, and the memory path applies the
+same invariant. The database trigger remains the authority for direct
+authorized writes.
 
 ### M2 — fail closed without durable storage
 
@@ -125,8 +162,8 @@ dependent deletion feature may be introduced.
 `supabase/migrations/20261116120000_create_evidence_foundation.sql` (still
 **unapplied**, additive, no destructive statements):
 
-- `ai_evidence_ref_revision_guard` trigger + the column-level
-  `GRANT UPDATE (revision_id)` (M1).
+- `ai_evidence_ref_revision_guard` trigger (`BEFORE INSERT OR UPDATE`) + the
+  column-level `GRANT UPDATE (revision_id)` (M1 and the Ref/Run ownership fix).
 - `ai_evidence_create_run(...)` and `ai_evidence_archive_revision(...)`, with
   `REVOKE`/`GRANT` to `service_role` (M3).
 - Rollback block and table comments updated.
@@ -134,7 +171,7 @@ dependent deletion feature may be introduced.
 
 ## Tests
 
-New file `tests/test_evidence_remediation.py` (17 tests):
+New file `tests/test_evidence_remediation.py` (21 tests):
 
 - M1: exact link on create; changed content links a new revision without
   repointing old refs; missing/foreign/mismatched revision rejected; write-once.
@@ -148,6 +185,13 @@ New file `tests/test_evidence_remediation.py` (17 tests):
 - M6: no module-level result caches exist; views render only their own bundle;
   a foreign owner's run id and a missing source id are rejected; a stale
   callback after run deletion fails closed.
+- Ref/Run ownership: a ref whose owner differs from its run owner is rejected
+  by the memory repository; the durable insert path raises before touching the
+  database (an exploding client proves no call); a valid same-owner ref is
+  inserted with the correct `owner_id`/`run_id`; a static check of the migration
+  asserts the guard runs on `INSERT OR UPDATE`, compares the run owner, keeps
+  the write-once/revision/source-message checks, and adds no FK on
+  `revision_id`.
 
 `tests/test_evidence_foundation.py` updated only where the new boundary applies
 (`opt_in=True` on the four existing cited-summary tests, explicit memory
@@ -156,7 +200,8 @@ confirmation level for `cited_summary`.
 
 | Check | Result |
 |---|---|
-| `tests/test_evidence_foundation.py` + `tests/test_evidence_remediation.py` | **35 passed** |
+| `tests/test_evidence_foundation.py` + `tests/test_evidence_remediation.py` (first remediation) | **35 passed** |
+| Same two files after the ownership fix | **39 passed** |
 | Registry/schema/confirmation/document group (9 files) | **288 passed** |
 | Full suite (once, after all fixes) | **7947 passed, 27 skipped, 1 failed** |
 
@@ -194,6 +239,10 @@ skipped, suppressed or weakened; the nine-file group above is green.
 - PostgreSQL concurrency, advisory locks, transaction isolation and the
   `jsonb` function results were not exercised; the concurrency tests prove the
   application-level serialization of the explicit memory double only.
+- The ref INSERT/UPDATE guard was checked as SQL text and through the
+  repository boundary only. Its actual PL/pgSQL execution, trigger ordering and
+  behavior under a real service-role insert are **not verified**; a foreign-owner
+  ref row was never written to and rejected by a live database.
 - No live Telegram retrieval, Explorer render/callback, link opening, provider
   Cited Summary or Render/deployment operation was performed.
 - `DATABASE_ARCHITECTURE.md` was not modified and still describes the pre-F1
@@ -205,8 +254,10 @@ skipped, suppressed or weakened; the nine-file group above is green.
    column grant) and apply it manually through the normal Supabase process.
 2. After application verify: the four tables and zero policies; the four
    functions executable by `service_role` only; the run-expiry and revision
-   immutability triggers; the ref revision guard; `GRANT UPDATE (revision_id)`
-   and no other `ai_evidence_refs` update privilege.
+   immutability triggers; the ref guard on both INSERT and UPDATE (including a
+   probe insert of a ref whose owner differs from its run owner, which must be
+   rejected); `GRANT UPDATE (revision_id)` and no other `ai_evidence_refs`
+   update privilege.
 3. Run one controlled Cited Summary (with the confirmation), one archive
    confirmation, one re-archive of changed content, and one revision deletion.
 4. Treat the runtime as **not live-enabled** until step 2 is complete.

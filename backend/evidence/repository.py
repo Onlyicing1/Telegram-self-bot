@@ -56,6 +56,19 @@ def _parse_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def _validate_refs_for_run(run: EvidenceRun, refs: list[EvidenceRef]) -> None:
+    """Every ref must belong to this run and to the run's owner.
+
+    The database trigger enforces the same invariant for authorized direct
+    writes; this check keeps the durable path from ever attempting one.
+    """
+    for ref in refs:
+        if str(ref.run_id) != str(run.id):
+            raise EvidenceStorageError("ref does not belong to this run")
+        if int(ref.owner_id) != int(run.owner_id):
+            raise EvidenceStorageError("ref owner does not match its run owner")
+
+
 def _payload(data: Any) -> dict[str, Any]:
     if isinstance(data, list):
         data = data[0] if data else None
@@ -339,12 +352,10 @@ class EvidenceRepository:
         return len(data)
 
     async def add_refs(self, run: EvidenceRun, refs: list[EvidenceRef]) -> None:
+        _validate_refs_for_run(run, refs)
         if self._memory_enabled:
             if run.id not in self._memory.runs:
                 raise EvidenceStorageError("active run disappeared before refs were stored")
-            for ref in refs:
-                if ref.run_id != run.id or ref.owner_id != run.owner_id:
-                    raise EvidenceStorageError("ref does not belong to this run")
             self._memory.refs[run.id].extend(refs)
             return
         rows = [
