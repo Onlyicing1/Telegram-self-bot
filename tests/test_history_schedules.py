@@ -9,6 +9,7 @@ Telegram behaviour.
 """
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any
@@ -849,3 +850,40 @@ def test_scheduled_summary_payload_has_no_metadata_when_no_body_exists():
         instruction="Summarize.",
     )
     assert payload == "Owner instruction: Summarize."
+
+
+@pytest.mark.asyncio
+async def test_every_history_write_payload_is_json_serializable():
+    """The real PostgREST transport encodes the update body with ``json.dumps``.
+
+    The fake table stores dicts directly, so a raw ``datetime`` in a History
+    write payload only failed against the live client
+    (``HISTORY_SCHEDULE_FAILURE_RECORD_FAILED ... error=TypeError``). Every
+    History write must therefore hand the transport JSON-safe values.
+    """
+    client = _FakeClient([_row()])
+    repo = SupabaseTaskRepository(client, InMemoryTaskRepository())
+    failed = await repo.record_history_failure(
+        OWNER, PEER, expected_version=3, error="all providers exhausted",
+    )
+    assert failed is not None and failed.last_error_at is not None
+    committed = await repo.commit_history_success(
+        OWNER, PEER, expected_version=failed.version,
+        summary="# Summary\nnext", scanned_cursor=21, summarized_cursor=21,
+    )
+    advanced = await repo.advance_history_scan(
+        OWNER, PEER, expected_version=committed.version, scanned_cursor=25,
+    )
+    reset = await repo.reset_history_summary(
+        OWNER, PEER, expected_version=advanced.version,
+    )
+    assert reset is not None and reset.summary == ""
+
+    writes = [query for query in client.queries if query.operation == "update"]
+    assert len(writes) == 4
+    for query in writes:
+        # Exactly what httpx's ``json=`` does for postgrest-py.
+        payload = json.loads(json.dumps(query.payload))
+        for key in ("updated_at", "last_error_at", "last_committed_at"):
+            if key in payload:
+                assert payload[key] is None or isinstance(payload[key], str)

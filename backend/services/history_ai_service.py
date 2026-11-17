@@ -317,9 +317,17 @@ ERROR_LANGUAGE = "language_unsupported"
 class HistoryAIError(Exception):
     """Raised inside this module when the operation cannot be completed."""
 
-    def __init__(self, message: str, *, code: str = ERROR_PROVIDER) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = ERROR_PROVIDER,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
+        #: Bounded, provider-side scalars only (never prompt/body/identifiers).
+        self.metadata = dict(metadata or {})
 
 
 # ── planning ──────────────────────────────────────────────────────────────
@@ -634,6 +642,46 @@ def _safe_fallback_exhausted(metadata: Any) -> bool | str:
     return value if isinstance(value, bool) else "unknown"
 
 
+#: Bounds for the routing diagnostics copied out of the manager's matrix.
+_MAX_DIAGNOSTIC_CANDIDATES = 32
+_MAX_DIAGNOSTIC_CATEGORIES = 8
+
+
+def _provider_diagnostics(metadata: Any) -> dict[str, Any]:
+    """Bounded provider-side failure counts from the manager's matrix.
+
+    Keeps only scalar counts and normalized failure categories. The matrix's
+    free-text ``reason`` (provider response text), prompts, message bodies,
+    Telegram identifiers and credentials are never copied.
+    """
+    if not isinstance(metadata, dict):
+        return {}
+    matrix = metadata.get("provider_matrix")
+    if not isinstance(matrix, list) or not matrix:
+        return {}
+    failed = skipped = 0
+    categories: list[str] = []
+    for entry in matrix[:_MAX_DIAGNOSTIC_CANDIDATES]:
+        if not isinstance(entry, dict):
+            continue
+        outcome = str(entry.get("outcome") or "")
+        if outcome == "failed":
+            failed += 1
+        elif outcome == "skipped":
+            skipped += 1
+        category = str(entry.get("category") or "").strip()
+        if category and category not in categories:
+            categories.append(category[:40])
+    diagnostics: dict[str, Any] = {"candidates_failed": failed}
+    if skipped:
+        diagnostics["candidates_skipped"] = skipped
+    if categories:
+        diagnostics["failure_categories"] = ",".join(
+            categories[:_MAX_DIAGNOSTIC_CATEGORIES]
+        )
+    return diagnostics
+
+
 def _failure_reason(response: Any) -> str:
     metadata = getattr(response, "metadata", None) or {}
     category = str(metadata.get("failure_type") or "").strip()
@@ -721,15 +769,17 @@ async def _call(
             "AI_EXEC_TRACE request_id=%s stage=provider_call_failed error=%s",
             request_id or "-", _failure_reason(response),
         )
+        diagnostics = _provider_diagnostics(metadata)
         occurrence_trace(
             "provider_call_result", outcome="provider_failed",
             provider=provider, failure_origin=_safe_failure_origin(metadata),
             fallback_exhausted=_safe_fallback_exhausted(metadata),
-            category="provider_response_failure",
+            category="provider_response_failure", **diagnostics,
         )
         raise HistoryAIError(
             f"the AI provider failed ({_failure_reason(response)})",
             code=ERROR_PROVIDER,
+            metadata=diagnostics,
         )
     text = str(getattr(response, "text", "") or "").strip()
     if not text:
@@ -1247,6 +1297,7 @@ async def summarize_incremental(
         )
         return False, f"{sym.STATE_FAILED} Summary failed: {exc}", {
             "error": exc.code, "processed": len(messages), "chunks": len(chunks),
+            **exc.metadata,
         }
 
     final = final.strip()

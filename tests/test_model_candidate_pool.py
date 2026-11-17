@@ -336,3 +336,58 @@ def test_the_supervisor_restores_candidates_at_boot(monkeypatch):
     _run(RuntimeSupervisor._restore_ai_model_candidates(object()))
 
     assert calls == [manager]
+
+
+def test_a_proven_dead_configured_model_falls_back_to_the_curated_catalog(monkeypatch):
+    """A 404 on the selected model must not end the provider's eligibility.
+
+    Without a discovery feed the pool held only the configured model, so a
+    retired id skipped the whole provider (the live Groq/SambaNova/Cohere
+    failures). The curated catalog is consulted only AFTER that proof.
+    """
+    monkeypatch.setattr("backend.ai.providers.manager.manager._RETRY_BACKOFF_SECONDS", 0.0)
+    monkeypatch.setattr(
+        "backend.ai.model_discovery.fallback_catalog",
+        lambda: {"p": ["catalog-1", "catalog-2"]},
+    )
+    pm = ProviderManager()
+    provider = _StubProvider(
+        "p", model="retired",
+        responses=[
+            ProviderResponse(text="model not found", provider_name="p", success=False,
+                             metadata={"http_status": 404}),
+            ProviderResponse(text="ok from catalog", provider_name="p", success=True),
+        ],
+    )
+    pm.register_provider(provider)
+    pm.switch_provider("p")
+
+    first = _run(pm.chat([{"role": "user", "content": "summarize"}]))
+    assert first.success is False
+
+    second = _run(pm.chat([{"role": "user", "content": "summarize"}]))
+    assert second.success is True
+    assert provider.calls == ["retired", "catalog-1"]
+
+
+def test_rate_limited_is_not_retried_on_the_same_model_and_fails_over(monkeypatch):
+    """The live ``retryable=False`` line is intentional: no same-model retry."""
+    monkeypatch.setattr("backend.ai.providers.manager.manager._RETRY_BACKOFF_SECONDS", 0.0)
+    pm = ProviderManager()
+    limited = _StubProvider(
+        "limited", model="primary",
+        responses=[ProviderResponse(
+            text="rate limited", provider_name="limited", success=False,
+            metadata={"http_status": 429},
+        )],
+    )
+    backup = _StubProvider("backup", model="other")
+    pm.register_provider(limited)
+    pm.register_provider(backup)
+    pm.switch_provider("limited")
+
+    response = _run(pm.chat([{"role": "user", "content": "summarize"}]))
+
+    assert response.success is True and response.provider_name == "backup"
+    assert limited.calls == ["primary"], "a 429 without Retry-After is not retried"
+    assert backup.calls == ["other"]

@@ -81,9 +81,13 @@ async def _record_failure(
             failure_category=category,
             exception=type(record_exc).__name__,
         )
+        # Bounded, single-line transport/database detail: the class alone made
+        # the live serialization TypeError unactionable. This text contains no
+        # message body, summary, prompt or identifier.
+        detail = " ".join(str(record_exc).split())[:200]
         logger.warning(
-            "HISTORY_SCHEDULE_FAILURE_RECORD_FAILED task_id=%s error=%s",
-            state.task_id, type(record_exc).__name__,
+            "HISTORY_SCHEDULE_FAILURE_RECORD_FAILED task_id=%s error=%s detail=%s",
+            state.task_id, type(record_exc).__name__, detail or "-",
         )
         return
     occurrence_trace(
@@ -439,6 +443,8 @@ async def _run_scheduled_history(
         error_code=(ai_data or {}).get("error", "-"),
         chunks=(ai_data or {}).get("chunks", "-"),
         text_messages=(ai_data or {}).get("text_messages", "-"),
+        candidates_failed=(ai_data or {}).get("candidates_failed", "-"),
+        failure_categories=(ai_data or {}).get("failure_categories", "-"),
     )
     if not ok:
         await _record_failure(repo, state, RuntimeError(summary), category="ai_provider")

@@ -1601,7 +1601,7 @@ class SupabaseTaskRepository(TaskRepository):
     async def _repair_deleted_history_schedule(self, current, task_id, baseline):
         """Explicitly reuse a legacy ``deleted`` row for a new owning task."""
         now=_now()
-        outgoing={"task_id":int(task_id),"status":"active","baseline_cursor":baseline,"scanned_cursor":baseline,"summarized_cursor":baseline,"summary":"","revision":current.revision+1,"version":current.version+1,"last_error":"","last_error_at":None,"last_committed_at":None,"updated_at":now}
+        outgoing={"task_id":int(task_id),"status":"active","baseline_cursor":baseline,"scanned_cursor":baseline,"summarized_cursor":baseline,"summary":"","revision":current.revision+1,"version":current.version+1,"last_error":"","last_error_at":None,"last_committed_at":None,"updated_at":_serialize(now)}
         try:
             result=await self._run(lambda:self._client.table("history_schedules").update(outgoing).eq("id",current.id).eq("owner_id",current.owner_id).eq("version",current.version).execute());row=getattr(result,"data",None)
         except asyncio.CancelledError: raise
@@ -1661,6 +1661,12 @@ class SupabaseTaskRepository(TaskRepository):
         now=_now()
         outgoing={"summary":summary,"scanned_cursor":scanned,"summarized_cursor":summarized,"status":target,"revision":current.revision+1,"version":expected_version+1,"last_error":"","last_error_at":None,"last_committed_at":now,"updated_at":now}
         _validate_history_schedule_input({**current.as_dict(),**outgoing})
+        # PostgREST/httpx encodes the payload with ``json.dumps``: a raw
+        # ``datetime`` raises TypeError before the request is sent. Validation
+        # accepts both shapes (rows are parsed back to datetimes), so the wire
+        # payload is serialized explicitly here, exactly like every ai_tasks
+        # write does with ``_serialize``.
+        outgoing={key:_serialize(value) for key,value in outgoing.items()}
         try:
             result=await self._run(lambda:self._client.table("history_schedules").update(outgoing).eq("owner_id",owner_id).eq("peer_id",int(peer_id)).eq("version",expected_version).execute());row=getattr(result,"data",None);self._mark_supabase_ok()
             committed=_history_schedule_from_row(row[0] if isinstance(row,list) else row) if row else None
@@ -1707,6 +1713,12 @@ class SupabaseTaskRepository(TaskRepository):
         if not (current.baseline_cursor<=current.summarized_cursor<=scanned): raise ValueError("cursors must satisfy baseline <= summarized <= scanned")
         now=_now(); outgoing={"scanned_cursor":scanned,"version":expected_version+1,"updated_at":now}
         _validate_history_schedule_input({**current.as_dict(),**outgoing})
+        # PostgREST/httpx encodes the payload with ``json.dumps``: a raw
+        # ``datetime`` raises TypeError before the request is sent. Validation
+        # accepts both shapes (rows are parsed back to datetimes), so the wire
+        # payload is serialized explicitly here, exactly like every ai_tasks
+        # write does with ``_serialize``.
+        outgoing={key:_serialize(value) for key,value in outgoing.items()}
         try:
             result=await self._run(lambda:self._client.table("history_schedules").update(outgoing).eq("owner_id",owner_id).eq("peer_id",int(peer_id)).eq("version",expected_version).execute());row=getattr(result,"data",None);self._mark_supabase_ok()
             committed=_history_schedule_from_row(row[0] if isinstance(row,list) else row) if row else None
@@ -1748,6 +1760,12 @@ class SupabaseTaskRepository(TaskRepository):
         if target not in HISTORY_SCHEDULE_WRITABLE_STATUSES: raise ValueError("invalid history schedule status")
         now=_now(); outgoing={"last_error":error,"last_error_at":now,"status":target,"version":expected_version+1,"updated_at":now}
         _validate_history_schedule_input({**current.as_dict(),**outgoing})
+        # PostgREST/httpx encodes the payload with ``json.dumps``: a raw
+        # ``datetime`` raises TypeError before the request is sent. Validation
+        # accepts both shapes (rows are parsed back to datetimes), so the wire
+        # payload is serialized explicitly here, exactly like every ai_tasks
+        # write does with ``_serialize``.
+        outgoing={key:_serialize(value) for key,value in outgoing.items()}
         try:
             result=await self._run(lambda:self._client.table("history_schedules").update(outgoing).eq("owner_id",owner_id).eq("peer_id",int(peer_id)).eq("version",expected_version).execute());row=getattr(result,"data",None);self._mark_supabase_ok()
             recorded=_history_schedule_from_row(row[0] if isinstance(row,list) else row) if row else None
@@ -1785,6 +1803,12 @@ class SupabaseTaskRepository(TaskRepository):
             return None
         now=_now(); outgoing={"summary":"","summarized_cursor":current.scanned_cursor,"revision":current.revision+1,"version":expected_version+1,"last_error":"","last_error_at":None,"last_committed_at":now,"updated_at":now}
         _validate_history_schedule_input({**current.as_dict(),**outgoing})
+        # PostgREST/httpx encodes the payload with ``json.dumps``: a raw
+        # ``datetime`` raises TypeError before the request is sent. Validation
+        # accepts both shapes (rows are parsed back to datetimes), so the wire
+        # payload is serialized explicitly here, exactly like every ai_tasks
+        # write does with ``_serialize``.
+        outgoing={key:_serialize(value) for key,value in outgoing.items()}
         try:
             result=await self._run(lambda:self._client.table("history_schedules").update(outgoing).eq("owner_id",owner_id).eq("peer_id",int(peer_id)).eq("version",expected_version).execute());row=getattr(result,"data",None);self._mark_supabase_ok()
             committed=_history_schedule_from_row(row[0] if isinstance(row,list) else row) if row else None

@@ -944,6 +944,18 @@ class ProviderManager:
                 continue
             seen.add(mid)
             pool.append(mid)
+        # The configured model was proven unusable (404/model_not_found) in this
+        # process and no discovery feed supplied a replacement: the provider's
+        # curated offline catalog keeps it eligible instead of dropping the
+        # provider. Consulted ONLY after that proof, so the user's selected
+        # model is never silently bypassed, and no id is invented here.
+        if configured and self._model_unavailable(name, configured):
+            for mid in self._catalog_models(name):
+                mid = (mid or "").strip()
+                if not mid or mid in seen:
+                    continue
+                seen.add(mid)
+                pool.append(mid)
         # A pair the router already proved dead (or is cooling down) leaves the
         # pool here — never by disabling the provider, whose other models stay
         # eligible. Nothing left to try means the provider contributes nothing.
@@ -951,6 +963,16 @@ class ProviderManager:
         if available:
             return available
         return [] if (configured and self._model_unavailable(name, configured)) else [""]
+
+    @staticmethod
+    def _catalog_models(name: str) -> list[str]:
+        """Curated offline model ids for one provider (never invented)."""
+        try:
+            from backend.ai.model_discovery import fallback_catalog
+
+            return list(fallback_catalog().get(name, []))
+        except Exception:  # noqa: BLE001 — a missing catalog never breaks routing
+            return []
 
     def set_model_candidates(self, provider_name: str, models: list[str]) -> None:
         """Feed discovery-derived candidate models for one provider.

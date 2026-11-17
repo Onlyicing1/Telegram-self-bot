@@ -887,6 +887,171 @@ ProviderManager ownership were unchanged.
 
 ---
 
+## Future roadmap: General AI Execution Orchestrator
+
+**Status: APPROVED DIRECTION / DESIGN REQUIRED / NOT IMPLEMENTED.**
+
+This item is recorded, not started. No checkpoint store, orchestrator module,
+multi-model planner or new execution path exists in the repository. Nothing in
+this section may be cited as implemented.
+
+### Required order
+
+1. Complete Scheduled History summarization reliability.
+2. Verify that fix (offline tests first, then live provider/Render evidence).
+3. Design the general AI Execution Orchestrator.
+4. Implement its checkpoint/recovery foundation.
+5. Add bounded multi-model orchestration and synthesis.
+6. Expand adoption incrementally across the Self-Bot's AI workflows.
+
+Step 1 is implemented and offline-tested as of 2026-11-17 (see
+`IMPLEMENTATION_REPORT.md`); its live verification is still pending, so step 2
+is not complete. Steps 3–6 are not started.
+
+### Problem being solved
+
+A multi-step AI operation today loses all progress when the provider that
+served it fails, rate-limits or disappears: the caller either resends the whole
+input or gives up. Provider session ids and opaque continuation tokens are not
+portable, so they cannot make work resumable across providers. Complex requests
+are also sent to a single model even when decomposing them would be cheaper,
+more reliable and easier to validate. The Self-Bot needs one application-owned
+way to checkpoint progress, validate outputs, resume only what failed and
+combine several bounded model results honestly.
+
+### Intended behaviour
+
+- A multi-stage AI operation records structured progress after every validated
+  stage and can resume from its last valid checkpoint.
+- Any eligible provider can continue the work: the checkpoint, not the model
+  session, carries the state.
+- Independent subtasks may run concurrently when their inputs are complete;
+  dependent subtasks wait for their prerequisites.
+- Results are validated deterministically before they are checkpointed or used.
+- A final synthesis stage merges validated outputs; partial success and partial
+  failure are reported as such, never as full success.
+- When no eligible provider remains, the operation fails honestly with bounded
+  diagnostics — no fabricated result, no silent truncation.
+
+### Checkpoint semantics
+
+A checkpoint is **application-owned, bounded, structured, validated and
+recoverable**. It stores:
+
+- the operation and stage identity, plus a schema version;
+- completed and pending stages, with the exact inputs each pending stage needs;
+- validated outputs of completed stages, with their provenance and validation
+  status;
+- concise, bounded summaries of prior context where a stage needs them;
+- token/time budgets consumed so far and the remaining budget.
+
+It must NOT store hidden chain-of-thought, provider session identifiers or
+opaque continuation state. Passing a previous model's answer to another model is
+**not**, by itself, a durable checkpoint; only the persisted, validated,
+application-owned record is. Retried operations must be idempotent against the
+checkpoint (a stage already completed and validated is never re-run merely
+because its response was lost).
+
+### Multi-model decomposition and synthesis
+
+- Decompose only suitable complex requests into bounded subtasks with explicit
+  contracts and dependencies.
+- Choose an eligible model per subtask from ProviderManager's current candidates
+  using capability fit, availability, quality and cost — never a hard-coded
+  provider choice in the orchestrator.
+- Run independent subtasks concurrently within explicit concurrency and budget
+  limits.
+- Validate each subtask deterministically before checkpointing it.
+- Synthesize validated outputs in a final bounded stage and represent partial
+  results honestly.
+- Recover only the failed or invalid stages when it is safe to do so.
+
+### Cross-Self-Bot scope
+
+This is a general capability for AI-driven workflows across the Self-Bot, not a
+Taskloom-only feature. Candidate adopters include Scheduled History
+summarization, Taskloom step execution, Media Analysis, Evidence workflows and
+future multi-step tools. Each adopter keeps its own business semantics and result
+contracts; the orchestrator supplies checkpointing, stage execution, validation
+and synthesis only.
+
+### Architecture boundaries (non-negotiable)
+
+- `ProviderManager` remains the sole authority for provider/model routing,
+  fallback, retry, cooldown and health. The orchestrator never calls a provider
+  directly and never implements a parallel router.
+- The Dispatcher remains the existing AI orchestration entry point.
+- `ToolRegistry` remains the capability allowlist.
+- `ToolExecutor` remains the sole authority for executing registered AI tools.
+- Existing services remain responsible for their business operations;
+  deterministic operations are not sent to AI unnecessarily.
+- AI may reason and propose; application code validates and executes.
+- No arbitrary Telegram RPC, SQL, shell, filesystem or unrestricted HTTP
+  execution.
+- No second RuntimeSupervisor, scheduler, executor, Telegram client, listener or
+  update loop.
+
+### Cost, concurrency, idempotency, validation and privacy
+
+- Per-operation token, time and model-call budgets; bounded concurrency and
+  bounded stage counts.
+- Idempotent stage execution keyed by operation + stage + input digest.
+- Deterministic validation and explicit result contracts per stage.
+- Provenance retained for every validated stage output.
+- Progress and checkpoint writes owner-scoped and durable; no cross-owner reads.
+- The AI payload boundary stays identifier-free where it already is (no peer
+  ids, message ids, task ids or other Telegram context unless an approved
+  contract explicitly permits it).
+- No prompts, message bodies, summaries, tokens or credentials in traces or
+  diagnostics; bounded scalar metadata only.
+
+### Dependencies on the existing architecture
+
+- Durable, owner-scoped storage and the existing repository pattern (no schema
+  change is approved by this item; a future design must justify any storage it
+  needs).
+- ProviderManager candidate/health APIs and its honest exhaustion response.
+- Dispatcher, ToolRegistry and ToolExecutor boundaries as they exist today.
+- The existing occurrence/task trace contract for bounded diagnostics.
+- Scheduled History reliability (step 1) as the first verified consumer.
+
+### Acceptance criteria (for the future design, not this delivery)
+
+1. A multi-stage operation resumes from its last validated checkpoint after a
+   provider failure, on a different provider, without resending the whole input.
+2. Completed and validated stages are never re-executed by a retry.
+3. A failed stage is recoverable without discarding validated earlier stages.
+4. Partial success is reported distinctly from full success and from failure.
+5. Budgets, concurrency and model-call counts are enforced, not advisory.
+6. Every stage output is validated deterministically before use.
+7. ProviderManager remains the only routing/fallback/retry/health authority;
+   grep-level proof that no second provider path exists.
+8. No new scheduler, executor, Telegram client, listener or update loop exists.
+9. Privacy tests prove no forbidden identifier or private content reaches the
+   provider or the trace.
+10. Exhaustion produces an honest failure with bounded diagnostics.
+
+### Risks and open design questions
+
+- **Checkpoint growth:** structured state can exceed bounds; needs a size
+  contract, compaction and a refusal path.
+- **Validation strength:** deterministic validation is only as good as each
+  stage's contract; weak contracts invite silent corruption.
+- **Cost of decomposition:** planning and synthesis add model calls; measured
+  benefit must justify them.
+- **Concurrency vs rate limits:** parallel subtasks can amplify 429s; ProviderManager
+  cooldowns must bound the fan-out.
+- **Storage:** where checkpoints live (existing durable store vs a new table) is
+  undecided and requires an approved design and migration.
+- **Semantics of "resume":** which stages are safe to replay, and how a
+  non-idempotent business action is fenced, remains open.
+- **Provenance:** how much per-stage provenance is retained without unbounded
+  growth.
+- **Adoption:** which workflow migrates first and what evidence proves the
+  migration is an improvement.
+
+---
+
 ## Open items carried over (untouched by this delivery)
 
 - `tests/test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`

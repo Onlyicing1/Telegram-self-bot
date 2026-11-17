@@ -183,6 +183,18 @@ _FALLBACK_CATALOG: dict[str, list[str]] = {
 }
 
 
+def fallback_catalog() -> dict[str, list[str]]:
+    """Copy of the curated offline model catalog, keyed by provider.
+
+    Used only when the provider's model-list API is unreachable/empty, and by
+    ``ProviderManager`` as the last-resort candidate source for a provider whose
+    configured model the router already proved unavailable. It is curated
+    repository data, never a live-availability claim, and every candidate is
+    still re-proven by a real attempt.
+    """
+    return {name: list(models) for name, models in _FALLBACK_CATALOG.items()}
+
+
 def _get_lock(provider_name: str) -> asyncio.Lock:
     return _locks.setdefault(provider_name, asyncio.Lock())
 

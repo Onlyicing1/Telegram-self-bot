@@ -698,3 +698,54 @@ async def test_the_coordinator_injects_the_occurrence_task_id():
     assert probe.extra is not None
     assert probe.extra[SCHEDULED_TASK_ID_EXTRA] == task.id
     assert probe.extra[SCHEDULED_OCCURRENCE_EXTRA] == key
+
+
+class _ExhaustedProviderManager:
+    """Every candidate failed; the manager returns its own exhaustion response."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def chat(self, messages, **kwargs):
+        self.calls += 1
+        return SimpleNamespace(
+            success=False,
+            text="All AI providers failed. Last error: groq/- : 404",
+            provider_name="",
+            metadata={
+                "fallback": True,
+                "fallback_exhausted": True,
+                "failure_type": "model_not_found",
+                "provider_matrix": [
+                    {"provider": "groq", "model": "retired-model",
+                     "outcome": "failed", "category": "model_not_found",
+                     "reason": "model not found SECRET_PROVIDER_BODY"},
+                    {"provider": "gemini", "model": "gemini-3.5-flash",
+                     "outcome": "failed", "category": "rate_limited"},
+                    {"provider": "cohere", "model": "command-r-plus",
+                     "outcome": "failed", "category": "model_not_found"},
+                    {"provider": "openai", "outcome": "skipped",
+                     "reason": "state=COOLING_DOWN"},
+                ],
+            },
+        )
+
+
+@pytest.mark.asyncio
+async def test_incremental_summary_failure_carries_only_bounded_routing_diagnostics():
+    manager = _ExhaustedProviderManager()
+
+    ok, summary, data = await history_ai_service.summarize_incremental(
+        (_message(11, "a body that must never reach the diagnostics"),),
+        provider_manager=manager,
+        timeout_s=30,
+    )
+
+    assert ok is False
+    assert data["error"] == "ai_provider_failed"
+    assert data["candidates_failed"] == 3
+    assert data["candidates_skipped"] == 1
+    assert data["failure_categories"] == "model_not_found,rate_limited"
+    # Provider response text/quota detail is not copied into the failure data.
+    assert "SECRET_PROVIDER_BODY" not in str(data)
+    assert "a body that must never reach" not in str(data)
