@@ -29,7 +29,7 @@ Security:
 - There is no owner foreign key because the repository has no owner table.
 - The archive has no automatic expiry and no automatic archival.
 
-Applying this to Supabase is a manual owner action. No agent executes SQL.
+Applying this migration requires explicit owner authorization. Do not apply it automatically.
 
 Rollback (dependency-safe, newest first):
 

@@ -6,11 +6,11 @@
 **Follow-up base:** `625bcf053fdb0faf8bc95e239302e9bc4d18aa11` (the first remediation commit; the Ref/Run ownership fix is committed on top of it)
 **Starting HEAD:** `76aacc851483dc2ade1d2dab46cd7e2e5a714743` (docs branch, an ancestor of the target)
 **Final commit:** recorded in the delivery response; this report is committed in the same commit it describes.
-**Status:** remediation implemented offline and focused-tested. The additive migration
-has been edited in place but **remains unapplied**. A follow-up ownership-integrity
-fix is included in the same unapplied migration and durable insert path. No SQL,
-Supabase, Telegram, Render, provider or deployment operation was performed by this
-delivery.
+**Status:** G4-A/F1 database schema and security hardening migrations were applied
+to the live Supabase project on 2026-11-17 and verified against PostgreSQL 17.6.
+The Evidence runtime is still **not live-enabled** until the application deployment
+and end-to-end service-role/provider flow are verified. No Telegram or Render
+operation was performed by the database setup.
 
 ## Disposition of the six findings
 
@@ -39,7 +39,7 @@ delivery.
   - `archive_ref` links the ref on both the `created` and the raced `unchanged`
     path, through `_link_ref`, which re-reads the source and rejects a
     revision that does not belong to the run's peer/message.
-- `supabase/migrations/20261116120000_create_evidence_foundation.sql`
+- `supabase/migrations/20261117123943_create_evidence_foundation.sql`
   - `ai_evidence_ref_revision_guard` trigger: rejects any ref update except one
     `NULL → revision` transition; rejects a second link, a different link, a
     missing revision, a foreign owner, or a source/message mismatch.
@@ -109,7 +109,7 @@ authorized writes.
   - `archive_atomic(...)` is one operation: source lookup, same-hash dedupe,
     quota check, revision number and insert. Memory uses the same lock;
     durable calls `ai_evidence_archive_revision`.
-- `supabase/migrations/20261116120000_create_evidence_foundation.sql`
+- `supabase/migrations/20261117123943_create_evidence_foundation.sql`
   - `ai_evidence_create_run(...) RETURNS jsonb` and
     `ai_evidence_archive_revision(...) RETURNS jsonb`, both serialized with
     `pg_advisory_xact_lock(hashtextextended('ai_evidence:' || owner, 0))`.
@@ -159,15 +159,28 @@ dependent deletion feature may be introduced.
 
 ## Migration changes
 
-`supabase/migrations/20261116120000_create_evidence_foundation.sql` (still
-**unapplied**, additive, no destructive statements):
+`supabase/migrations/20261117123943_create_evidence_foundation.sql` (applied
+to the live project; additive, no destructive statements):
 
-- `ai_evidence_ref_revision_guard` trigger (`BEFORE INSERT OR UPDATE`) + the
-  column-level `GRANT UPDATE (revision_id)` (M1 and the Ref/Run ownership fix).
-- `ai_evidence_create_run(...)` and `ai_evidence_archive_revision(...)`, with
-  `REVOKE`/`GRANT` to `service_role` (M3).
-- Rollback block and table comments updated.
-- No data migration, no drop, no truncate, no `DELETE FROM`.
+- Four Evidence tables, owner/run/source/revision constraints, indexes, RLS enabled
+  with zero policies, expiry and immutability triggers.
+- `ai_evidence_ref_revision_guard` runs on `BEFORE INSERT OR UPDATE` and
+  enforces Ref/Run owner equality plus exact revision/source consistency.
+- `ai_evidence_create_run(...)` and `ai_evidence_archive_revision(...)` use
+  owner-scoped advisory transaction locks for quota admission and archive writes.
+- Initial grants were subsequently tightened by the hardening migration below.
+
+`supabase/migrations/20261117124032_harden_evidence_privileges.sql` (applied):
+
+- Revokes inherited/default table-level privileges from `service_role` on all
+  four Evidence tables, then grants the exact approved table privileges.
+- `ai_evidence_refs`: SELECT/INSERT/DELETE plus UPDATE on `revision_id` only.
+  No table-level UPDATE and no UPDATE on any other ref column.
+- `ai_evidence_revisions`: SELECT/INSERT/DELETE; no UPDATE.
+- Revokes PUBLIC/anon/authenticated execution on trigger functions and grants
+  execution to `service_role`.
+- Pins all seven Evidence functions to `search_path = pg_catalog, public`.
+- No data migration, drop, truncate or destructive row operation.
 
 ## Tests
 
@@ -231,36 +244,78 @@ skipped, suppressed or weakened; the nine-file group above is green.
   this committed file cannot contain the hash of the commit that contains it.
 - Working tree clean after the commit; no rebase, force push or history rewrite.
 
-## Not executed / not verified
+## Live Supabase application and verification (2026-11-17)
 
-- No SQL was executed, applied or rolled back; the live Supabase schema and the
-  new functions, trigger, column grant, RLS and PostgREST RPC shapes are
-  unverified against a real database.
-- PostgreSQL concurrency, advisory locks, transaction isolation and the
-  `jsonb` function results were not exercised; the concurrency tests prove the
-  application-level serialization of the explicit memory double only.
-- The ref INSERT/UPDATE guard was checked as SQL text and through the
-  repository boundary only. Its actual PL/pgSQL execution, trigger ordering and
-  behavior under a real service-role insert are **not verified**; a foreign-owner
-  ref row was never written to and rejected by a live database.
-- No live Telegram retrieval, Explorer render/callback, link opening, provider
-  Cited Summary or Render/deployment operation was performed.
+Project: `telegram-self-bot` (`burfebhahuowywyfgcsc`), PostgreSQL 17.6,
+region `ca-central-1`, status `ACTIVE_HEALTHY`.
+
+Applied migration history:
+
+- `20261117123943 / create_evidence_foundation`
+- `20261117124032 / harden_evidence_privileges`
+
+The Supabase MCP generated server-side migration timestamps. The repository
+migration filenames were synchronized to those exact remote versions so
+`supabase migration list` can compare local and remote histories by timestamp.
+
+**Live catalog verification passed:**
+
+- All four Evidence tables exist and have RLS enabled.
+- There are zero RLS policies on the four Evidence tables, as designed for
+  backend/service-role-only access.
+- All three expected triggers exist and are enabled:
+  run expiry, ref revision guard (INSERT OR UPDATE), and revision immutability.
+- `anon`, `authenticated`, and `PUBLIC` have no Evidence table read access.
+- `service_role` has SELECT/INSERT/UPDATE/DELETE on runs and sources;
+  SELECT/INSERT/DELETE on refs plus UPDATE on `revision_id` only; and
+  SELECT/INSERT/DELETE on revisions with no UPDATE.
+- All seven Evidence functions are executable by `service_role` only;
+  PUBLIC/anon/authenticated execution is revoked. All seven have the fixed
+  `search_path = pg_catalog, public`.
+- The security advisor no longer reports mutable search paths for Evidence
+  functions. The remaining `pg_trgm`-in-public warning predates this work.
+  RLS-enabled/no-policy INFO notices for Evidence are intentional.
+
+**Live PostgreSQL probes passed; all probe rows were cleaned up:**
+
+- Run expiry is derived from database time and the persisted TTL.
+- A ref with a mismatched owner/run pair is rejected by the actual PL/pgSQL
+  INSERT trigger; a same-owner ref is accepted.
+- Exact revision linking succeeds once; repointing is rejected.
+- Ref excerpt mutation and archived revision mutation are rejected.
+- `ai_evidence_create_run` returns `created` and enforces the active-run quota.
+- `ai_evidence_archive_revision` creates the first revision, deduplicates an
+  identical content hash, and creates revision 2 for changed content.
+
+**Hardening discovered during live verification:** the project had broad
+pre-existing default privileges for `service_role`. The original migration's
+positive GRANT statements did not remove those inherited table-level privileges.
+The follow-up hardening migration explicitly revoked all privileges on the four
+Evidence tables from `service_role` before granting the approved exact set.
+This removed table-level UPDATE on refs and revisions; catalog checks confirm
+only `revision_id` remains updatable on refs.
+
+## Remaining unverified / not live-enabled
+
+- The SQL probes ran against the live PostgreSQL database, but they did not
+  exercise the bot's actual Supabase client credentials or PostgREST round-trip.
+- Concurrent production traffic and PostgreSQL lock behavior were not stress-tested;
+  the RPC smoke tests verified quota/dedupe behavior sequentially.
+- No live Telegram retrieval, Evidence Explorer UI/callback, Cited Summary
+  provider round-trip, or Render deployment was performed.
 - `DATABASE_ARCHITECTURE.md` was not modified and still describes the pre-F1
   inventory (43 migrations on disk, 42 documented).
 
-## Owner actions before use
+## Remaining owner/runtime actions
 
-1. Review the migration diff (three new SQL functions, one ref trigger, one
-   column grant) and apply it manually through the normal Supabase process.
-2. After application verify: the four tables and zero policies; the four
-   functions executable by `service_role` only; the run-expiry and revision
-   immutability triggers; the ref guard on both INSERT and UPDATE (including a
-   probe insert of a ref whose owner differs from its run owner, which must be
-   rejected); `GRANT UPDATE (revision_id)` and no other `ai_evidence_refs`
-   update privilege.
-3. Run one controlled Cited Summary (with the confirmation), one archive
-   confirmation, one re-archive of changed content, and one revision deletion.
-4. Treat the runtime as **not live-enabled** until step 2 is complete.
+1. Deploy the code currently on `main` to the runtime environment.
+2. Verify the bot uses the intended Supabase project and service-role credentials
+   without exposing the secret to clients.
+3. Run a controlled Cited Summary with explicit confirmation, one archive
+   approval, a changed-content re-archive, and a revision deletion through the
+   application—not direct SQL.
+4. Keep Evidence marked **not live-enabled** until those application-level
+   checks pass. M5 remains deferred until dependent records are introduced.
 
 ## Deferred work (unchanged)
 
