@@ -3,15 +3,42 @@
 ## Current delivery: G4-A / F1 — Single-source evidence foundation
 
 Status: **G4-A/F1 database schema and privilege hardening are applied to the
-live Supabase project and verified (2026-11-17).** G2-B (Workspace language),
-G4-A/F2 (follow-ups), G4-B (Workspace awareness), G4-C (extraction/Glossary),
-G4-D, G5-A and later Scheduled History phases remain deferred. Live PostgreSQL
-catalog, grants, triggers and sequential RPC smoke tests passed. Telegram,
-provider, Explorer UI and Render runtime flows remain unverified; Evidence is
-not live-enabled until the application is deployed and those flows pass.
-The first delivery's six findings were remediated (M5 remains deferred until
-dependent records exist). The implementation is in `backend/evidence/`, the
-owner-only Explorer and the two applied Evidence migrations.
+live Supabase project and verified (2026-11-17).** The application layer was
+hardened by the G4-A delivery-readiness pass on **2026-11-18** (see below).
+G2-B (Workspace language), G4-A/F2 (follow-ups), G4-B (Workspace awareness),
+G4-C (extraction/Glossary), G4-D, G5-A and later Scheduled History phases
+remain deferred. Live PostgreSQL catalog, grants, triggers and sequential RPC
+smoke tests passed. Telegram, provider, Explorer callback and Render runtime
+flows remain unverified; Evidence is not live-enabled until the application is
+deployed and those flows pass. The first delivery's six findings were remediated
+(M5 remains deferred until dependent records exist). The implementation is in
+`backend/evidence/`, the owner-only Explorer and the two applied Evidence
+migrations.
+
+### Delivery readiness pass — 2026-11-18 (G4-A, application layer)
+
+Verified against `6ac156e` and fixed, without touching the database:
+
+- V1 the archive-confirmation panel raised `NameError` (an undefined `key`), so
+  the Explorer's only revision-creating path never rendered;
+- V2 every success notice used a non-existent `sym.STATE_SUCCESS`, so a
+  completed archive or deletion was reported as a failure after its durable
+  write;
+- V3 source/revision delete callbacks were 66–107 bytes, above Telegram's
+  64-byte limit, and were silently truncated into unresolvable ids;
+- V4 `observed_state` had no writer, so the approved exact-source revalidation
+  (`live`/`edited`/`deleted`/`inaccessible`) was unreachable;
+- V5 an unapproved `archive_ref` could still write the ref's revision link.
+
+Also added: archive and revision pagination (the archive list was silently
+capped at 20 sources), the canonical `is_owner` gate, and durable RPC
+argument/response contract tests. Evidence tests are now 51 (18 foundation + 21
+remediation + 12 delivery); the focused panel/history/tool group is 1430 passed;
+the full suite is 7960 passed, 27 skipped, 4 pre-existing failures (three
+`DATABASE_ARCHITECTURE.md` inventory assertions left untouched by instruction,
+and the known time-dependent scheduler test). No SQL was executed, no migration
+was added and no runtime deployment was attempted. `G4-A/F2` below keeps its
+original meaning (restart-safe follow-ups) and stays deferred.
 
 ### What G2-A adds
 
@@ -491,7 +518,7 @@ authorization.
 
 | Stage | Scope | Depends on | Gate |
 |---|---|---|---|
-| **G4-A / F1** | Single-source evidence foundation: durable Active Runs with approved TTL, immutable owner-approved archive revisions, opt-in Cited Summary, basic Explorer with locally built links. | G2-A + existing History | **Code implemented/remediated; database migrations applied and verified 2026-11-17.** Runtime end-to-end checks remain; M5 is deferred until dependent records exist. |
+| **G4-A / F1** | Single-source evidence foundation: durable Active Runs with approved TTL, immutable owner-approved archive revisions, opt-in Cited Summary, basic Explorer with locally built links. | G2-A + existing History | **Code implemented/remediated; database migrations applied and verified 2026-11-17; application delivery defects fixed 2026-11-18.** Runtime end-to-end checks remain; M5 is deferred until dependent records exist. |
 | **G4-A / F2** | Restart-safe follow-ups on the same run and contract. A delivery phase of G4-A, **not** a new stage. | G4-A / F1 | The approved TTL proves usable in practice. |
 | **G4-B** *(original meaning preserved)* | **Workspace-aware durable Evidence:** Workspace-scoped browsing/consumption of the same evidence contract, cross-run within the Workspace. No second evidence format. | G4-A + G3-A + G3-B | Owner approves Workspace persistence and evidence retention scope. |
 | **G4-C** *(new ID, documented)* | Strict-JSON extraction and the persistent Workspace Glossary. Glossary storage **blocked until G3-B**. | G4-A + G3-B + approved extraction schema | G3-B complete; extraction schema approved; glossary quotas defined after G3-B. |

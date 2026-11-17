@@ -550,7 +550,7 @@ def test_migration_guard_covers_insert_and_checks_the_run_owner():
     from pathlib import Path
 
     sql = Path(
-        "supabase/migrations/20261116120000_create_evidence_foundation.sql"
+        "supabase/migrations/20261117123943_create_evidence_foundation.sql"
     ).read_text(encoding="utf-8")
 
     assert "BEFORE INSERT OR UPDATE ON ai_evidence_refs" in sql

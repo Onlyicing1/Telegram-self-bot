@@ -23,6 +23,8 @@ from backend.evidence.models import (
 )
 from backend.evidence.service import get_evidence_service
 from backend.evidence.links import telegram_message_link
+from backend.bot.handlers.guard import is_owner
+from backend.helper.inline_engine import get_self_client
 from backend.helper.panels import (
     InlinePanelBuilder,
     register_action,
@@ -38,15 +40,12 @@ TITLE = "Evidence Explorer"
 _OWNER_ID = 0
 _PAGE_SIZE_REFS = 5
 _PAGE_SIZE_ARCHIVE = 10
+_PAGE_SIZE_REVISIONS = 10
 
 
 def _owner_ok(event: Any) -> bool:
-    if not _OWNER_ID:
-        return True
-    try:
-        return int(getattr(event, "sender_id", 0) or 0) == _OWNER_ID
-    except (TypeError, ValueError):
-        return False
+    """The canonical owner gate — never an allow-all default."""
+    return is_owner(event, _OWNER_ID)
 
 
 def _failure(exc: Exception) -> str:
@@ -75,6 +74,12 @@ def _truncate(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[: max(1, limit - 1)] + "…"
+
+
+def _split_page(value: str) -> tuple[str, int]:
+    """Split ``<opaque id>[:<page>]``; an opaque id never contains a colon."""
+    head, _, raw = str(value or "").partition(":")
+    return head, int(raw) if raw.isdigit() else 0
 
 
 def _bytes(value: int) -> str:
@@ -230,7 +235,10 @@ def _confirm_view(
         "still be edited or deleted in Telegram; only its observed status changes.",
     ]
     builder = InlinePanelBuilder()
-    builder.add_row("Confirm immutable archive", f"action:evidence_commit:{run_id}:{key}")
+    builder.add_row(
+        "Confirm immutable archive",
+        f"action:evidence_commit:{run_id}:{candidate.key}",
+    )
     builder.add_row("Cancel", f"action:evidence_open:{run_id}")
     if notice:
         lines.extend(["", notice])
@@ -238,18 +246,23 @@ def _confirm_view(
 
 
 def _archive_view(
-    sources: list, usage: Any, notice: str = "",
+    sources: list, usage: Any, offset: int = 0, has_more: bool = False,
+    notice: str = "",
 ) -> tuple[str, str, list]:
     builder = InlinePanelBuilder()
+    page_no = offset // _PAGE_SIZE_ARCHIVE + 1
     lines = ["Archive is owner-approved, immutable and never expires automatically."]
     if usage is not None:
         lines.extend([
             f"Records: {usage.records}/{constants.MAX_ARCHIVE_RECORDS_PER_OWNER}",
             f"Bytes: {_bytes(usage.bytes)}/{_bytes(constants.MAX_ARCHIVE_BYTES_PER_OWNER)}",
         ])
+    lines.append(
+        f"Page {page_no}" + (" (more archived sources available)" if has_more else "")
+    )
     if not sources:
         lines.extend(["", "No archived evidence sources."])
-    for index, source in enumerate(sources, start=1):
+    for index, source in enumerate(sources, start=offset + 1):
         link = telegram_message_link(source.peer_id, source.message_id)
         lines.extend([
             "",
@@ -257,6 +270,15 @@ def _archive_view(
             f"   Observed: {source.observed_state}  ·  Last seen {_dt(source.last_observed_at)}",
         ])
         builder.add_row(f"Inspect source {index}", f"action:evidence_source:{source.id}")
+    if offset > 0:
+        builder.add_row(
+            "Previous",
+            f"action:evidence_archive:{max(0, offset - _PAGE_SIZE_ARCHIVE)}",
+        )
+    if has_more:
+        builder.add_row(
+            "Next", f"action:evidence_archive:{offset + _PAGE_SIZE_ARCHIVE}",
+        )
     builder.add_row("Back to Evidence", "panel:evidence")
     if notice:
         lines.extend(["", notice])
@@ -264,10 +286,14 @@ def _archive_view(
 
 
 def _source_view(
-    source: Any, revisions: list, notice: str = "",
+    source: Any, revisions: list, page: int = 0, notice: str = "",
 ) -> tuple[str, str, list]:
     if source is None:
         return TITLE, f"{sym.STATE_FAILED} That archived source is unavailable.", _back_buttons()
+    pages = max(1, (len(revisions) + _PAGE_SIZE_REVISIONS - 1) // _PAGE_SIZE_REVISIONS)
+    page = max(0, min(int(page), pages - 1))
+    start = page * _PAGE_SIZE_REVISIONS
+    shown = revisions[start:start + _PAGE_SIZE_REVISIONS]
     link = telegram_message_link(source.peer_id, source.message_id)
     lines = [
         f"Source: {link}",
@@ -275,10 +301,11 @@ def _source_view(
         f"First seen: {_dt(source.first_seen_at)}",
         f"Last observed: {_dt(source.last_observed_at)}",
         "",
-        f"Immutable revisions ({len(revisions)}):",
+        f"Immutable revisions ({len(revisions)})  ·  Page {page + 1}/{pages}",
     ]
     builder = InlinePanelBuilder()
-    for revision in revisions[:10]:
+    builder.add_row("Re-check source", f"action:evidence_recheck:{source.id}")
+    for revision in shown:
         lines.extend([
             "",
             f"Revision {revision.revision_no} · {_dt(revision.captured_at)}",
@@ -287,11 +314,17 @@ def _source_view(
         ])
         builder.add_row(
             f"Delete revision {revision.revision_no}",
-            f"action:evidence_delete_revision:{source.id}:{revision.id}",
+            f"action:evidence_delrev:{revision.id}",
         )
-    if len(revisions) > 10:
-        lines.extend(["", f"Showing the first 10 of {len(revisions)} revisions."])
-    builder.add_row("Delete entire source", f"action:evidence_delete_source:{source.id}")
+    if page > 0:
+        builder.add_row(
+            "Previous revisions", f"action:evidence_source:{source.id}:{page - 1}",
+        )
+    if page + 1 < pages:
+        builder.add_row(
+            "Next revisions", f"action:evidence_source:{source.id}:{page + 1}",
+        )
+    builder.add_row("Delete entire source", f"action:evidence_delsrc:{source.id}")
     builder.add_row("Back to Archive", "action:evidence_archive")
     if notice:
         lines.extend(["", notice])
@@ -310,11 +343,11 @@ def _delete_source_confirm(source_id: str) -> tuple[str, str, list]:
     builder = InlinePanelBuilder()
     builder.add_row(
         "Confirm source deletion",
-        f"action:evidence_delete_source_commit:{source_id}",
+        f"action:evidence_delsrc_ok:{source_id}",
     )
     builder.add_row(
         "Confirm cascade deletion",
-        f"action:evidence_delete_source_cascade:{source_id}",
+        f"action:evidence_delsrc_all:{source_id}",
     )
     builder.add_row("Cancel", f"action:evidence_source:{source_id}")
     return TITLE, "\n".join(lines), builder.build()
@@ -331,11 +364,11 @@ def _delete_revision_confirm(source_id: str, revision_id: str) -> tuple[str, str
     builder = InlinePanelBuilder()
     builder.add_row(
         "Confirm revision deletion",
-        f"action:evidence_delete_revision_commit:{source_id}:{revision_id}",
+        f"action:evidence_delrev_ok:{revision_id}",
     )
     builder.add_row(
         "Confirm cascade deletion",
-        f"action:evidence_delete_revision_cascade:{source_id}:{revision_id}",
+        f"action:evidence_delrev_all:{revision_id}",
     )
     builder.add_row("Cancel", f"action:evidence_source:{source_id}")
     return TITLE, "\n".join(lines), builder.build()
@@ -356,11 +389,15 @@ async def _load_suggestions(run_id: str):
     return await get_evidence_service().archive_candidates(_OWNER_ID, run_id)
 
 
-async def _load_archive():
+async def _load_archive(offset: int = 0):
+    """One bounded page plus a look-ahead row; no page state is cached."""
     service = get_evidence_service()
-    sources = await service.list_archive_sources(_OWNER_ID)
+    start = max(0, int(offset))
+    rows = await service.list_archive_sources(
+        _OWNER_ID, limit=_PAGE_SIZE_ARCHIVE + 1, offset=start,
+    )
     usage = await service.archive_usage(_OWNER_ID)
-    return sources, usage
+    return rows[:_PAGE_SIZE_ARCHIVE], usage, len(rows) > _PAGE_SIZE_ARCHIVE
 
 
 async def _load_source(source_id: str):
@@ -383,12 +420,12 @@ async def _panel_handler(event, extra: str) -> tuple[str, str, list] | None:
             page = int(parts[2]) if len(parts) > 2 else 0
             return _run_view(await _load_run(run_id), page)
         if extra == "archive":
-            sources, usage = await _load_archive()
-            return _archive_view(sources, usage)
+            sources, usage, has_more = await _load_archive(0)
+            return _archive_view(sources, usage, 0, has_more)
         if extra.startswith("source:"):
-            source_id = extra.split(":", 1)[1]
+            source_id, page = _split_page(extra.split(":", 1)[1])
             source, revisions = await _load_source(source_id)
-            return _source_view(source, revisions)
+            return _source_view(source, revisions, page)
         return await _overview()
     except Exception as exc:  # noqa: BLE001 — panel boundary
         return TITLE, _failure(exc), _back_buttons()
@@ -453,10 +490,10 @@ async def _commit_action(event, extra: str, chat_id: int):
         )
         bundle = await _load_run(run_id)
         notice = (
-            f"{sym.STATE_SUCCESS} Archived {key} as immutable revision "
+            f"{sym.STATE_COMPLETED} Archived {key} as immutable revision "
             f"{result.revision_no}."
             if result.status == "created"
-            else f"{sym.STATE_SUCCESS} {key} was already archived (no new revision)."
+            else f"{sym.STATE_COMPLETED} {key} was already archived (no new revision)."
         )
         return _run_view(bundle, 0, notice)
     except Exception as exc:  # noqa: BLE001
@@ -467,8 +504,14 @@ async def _archive_action(event, extra: str, chat_id: int):
     if not _owner_ok(event):
         return TITLE, "This panel is owner-only.", []
     try:
-        sources, usage = await _load_archive()
-        return _archive_view(sources, usage)
+        # The callback only carries an offset; the page contents are re-read
+        # through the owner-scoped service every time.
+        offset = max(0, int(extra or 0))
+    except (TypeError, ValueError):
+        offset = 0
+    try:
+        sources, usage, has_more = await _load_archive(offset)
+        return _archive_view(sources, usage, offset, has_more)
     except Exception as exc:  # noqa: BLE001
         return TITLE, _failure(exc), _back_buttons()
 
@@ -477,8 +520,29 @@ async def _source_action(event, extra: str, chat_id: int):
     if not _owner_ok(event):
         return TITLE, "This panel is owner-only.", []
     try:
-        source, revisions = await _load_source(extra)
-        return _source_view(source, revisions)
+        source_id, page = _split_page(extra)
+        source, revisions = await _load_source(source_id)
+        return _source_view(source, revisions, page)
+    except Exception as exc:  # noqa: BLE001
+        return TITLE, _failure(exc), _back_buttons()
+
+
+async def _recheck_action(event, extra: str, chat_id: int):
+    """Re-read the exact Telegram source; archived text is never rewritten."""
+    if not _owner_ok(event):
+        return TITLE, "This panel is owner-only.", []
+    try:
+        source = await get_evidence_service().revalidate_source(
+            _OWNER_ID, extra, source=get_self_client(),
+        )
+        revisions = await get_evidence_service().list_revisions(
+            _OWNER_ID, source.id,
+        )
+        return _source_view(
+            source, revisions, 0,
+            f"{sym.STATE_COMPLETED} Source re-checked: {source.observed_state}. "
+            "The archived text and hash are unchanged.",
+        )
     except Exception as exc:  # noqa: BLE001
         return TITLE, _failure(exc), _back_buttons()
 
@@ -493,10 +557,12 @@ async def _delete_revision_action(event, extra: str, chat_id: int):
     if not _owner_ok(event):
         return TITLE, "This panel is owner-only.", []
     try:
-        source_id, revision_id = extra.split(":", 1)
-    except ValueError:
-        return TITLE, f"{sym.STATE_FAILED} That deletion link is not valid.", _back_buttons()
-    return _delete_revision_confirm(source_id, revision_id)
+        # The callback carries only the opaque revision id; its source is
+        # re-resolved through the owner-scoped service, never from the click.
+        revision = await get_evidence_service().get_revision(_OWNER_ID, extra)
+    except Exception as exc:  # noqa: BLE001
+        return TITLE, _failure(exc), _back_buttons()
+    return _delete_revision_confirm(revision.source_id, revision.id)
 
 
 async def _delete_source_commit(event, extra: str, chat_id: int, *, cascade: bool = False):
@@ -506,10 +572,10 @@ async def _delete_source_commit(event, extra: str, chat_id: int, *, cascade: boo
         await get_evidence_service().delete_source(
             _OWNER_ID, extra, confirm=True, cascade_confirmed=cascade,
         )
-        sources, usage = await _load_archive()
+        sources, usage, has_more = await _load_archive(0)
         return _archive_view(
-            sources, usage,
-            f"{sym.STATE_SUCCESS} The archived source was deleted.",
+            sources, usage, 0, has_more,
+            f"{sym.STATE_COMPLETED} The archived source was deleted.",
         )
     except Exception as exc:  # noqa: BLE001
         return TITLE, _failure(exc), _back_buttons()
@@ -519,14 +585,16 @@ async def _delete_revision_commit(event, extra: str, chat_id: int, *, cascade: b
     if not _owner_ok(event):
         return TITLE, "This panel is owner-only.", []
     try:
-        source_id, revision_id = extra.split(":", 1)
-        await get_evidence_service().delete_revision(
-            _OWNER_ID, revision_id, confirm=True, cascade_confirmed=cascade,
+        service = get_evidence_service()
+        revision = await service.get_revision(_OWNER_ID, extra)
+        source_id = revision.source_id
+        await service.delete_revision(
+            _OWNER_ID, revision.id, confirm=True, cascade_confirmed=cascade,
         )
         source, revisions = await _load_source(source_id)
         return _source_view(
-            source, revisions,
-            f"{sym.STATE_SUCCESS} The archive revision was deleted.",
+            source, revisions, 0,
+            f"{sym.STATE_COMPLETED} The archive revision was deleted.",
         )
     except Exception as exc:  # noqa: BLE001
         return TITLE, _failure(exc), _back_buttons()
@@ -561,9 +629,10 @@ def register(client=None, owner_id: int = 0) -> None:
     register_action("evidence_commit", _commit_action)
     register_action("evidence_archive", _archive_action)
     register_action("evidence_source", _source_action)
-    register_action("evidence_delete_source", _delete_source_action)
-    register_action("evidence_delete_source_commit", _delete_source_commit_action)
-    register_action("evidence_delete_source_cascade", _delete_source_cascade_action)
-    register_action("evidence_delete_revision", _delete_revision_action)
-    register_action("evidence_delete_revision_commit", _delete_revision_commit_action)
-    register_action("evidence_delete_revision_cascade", _delete_revision_cascade_action)
+    register_action("evidence_recheck", _recheck_action)
+    register_action("evidence_delsrc", _delete_source_action)
+    register_action("evidence_delsrc_ok", _delete_source_commit_action)
+    register_action("evidence_delsrc_all", _delete_source_cascade_action)
+    register_action("evidence_delrev", _delete_revision_action)
+    register_action("evidence_delrev_ok", _delete_revision_commit_action)
+    register_action("evidence_delrev_all", _delete_revision_cascade_action)

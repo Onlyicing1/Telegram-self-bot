@@ -558,7 +558,8 @@ class EvidenceService:
         """Create one immutable revision after explicit owner approval.
 
         ``approved=False`` is the safe default: it returns an explanation and
-        writes nothing.  A same-hash request is a no-op even when approved.
+        writes nothing at all — not the revision and not the ref's revision
+        link.  A same-hash request is a no-op even when approved.
         """
         owner = int(owner_id or 0)
         ordinal = _parse_key(key)
@@ -566,6 +567,13 @@ class EvidenceService:
         ref = next((item for item in bundle.refs if item.ordinal == ordinal), None)
         if ref is None:
             raise EvidenceNotFound("that reference is not part of this evidence run")
+        if not approved:
+            # Consent is checked before ANY write, so a refused request cannot
+            # leave a ref linked to an archived revision it never approved.
+            raise EvidenceConfirmationRequired(
+                "archiving creates an immutable owner-approved revision; confirm "
+                "this source explicitly before it is written"
+            )
         source = await self.repository.find_source(
             owner, bundle.run.peer_id, ref.message_id,
         )
@@ -586,11 +594,6 @@ class EvidenceService:
                 content_hash=existing.content_hash,
                 reason="the exact excerpt is already archived; no new revision was written",
                 citation=_citation(bundle.run, ref),
-            )
-        if not approved:
-            raise EvidenceConfirmationRequired(
-                "archiving creates an immutable owner-approved revision; confirm this "
-                "source explicitly before it is written"
             )
 
         now = await self.repository.database_now()
@@ -666,8 +669,12 @@ class EvidenceService:
     async def archive_usage(self, owner_id: int) -> ArchiveUsage:
         return await self.repository.archive_usage(int(owner_id or 0))
 
-    async def list_archive_sources(self, owner_id: int) -> list[EvidenceSource]:
-        return await self.repository.list_sources(int(owner_id or 0))
+    async def list_archive_sources(
+        self, owner_id: int, *, limit: int = 20, offset: int = 0,
+    ) -> list[EvidenceSource]:
+        return await self.repository.list_sources(
+            int(owner_id or 0), limit=limit, offset=offset,
+        )
 
     async def list_revisions(
         self, owner_id: int, source_id: str,
@@ -679,6 +686,61 @@ class EvidenceService:
         if source is None:
             raise EvidenceNotFound("that archived source does not exist for this owner")
         return source
+
+    async def get_revision(
+        self, owner_id: int, revision_id: str,
+    ) -> EvidenceRevision:
+        revision = await self.repository.get_revision(
+            int(owner_id or 0), str(revision_id),
+        )
+        if revision is None:
+            raise EvidenceNotFound("that archive revision does not exist for this owner")
+        return revision
+
+    async def revalidate_source(
+        self, owner_id: int, source_id: str, *, source: Any,
+    ) -> EvidenceSource:
+        """Re-read the exact Telegram source and record only its observed state.
+
+        This is the Explorer's revalidation path.  It never rewrites the archived
+        text, hash or revision number: a Telegram edit, deletion or inaccessible
+        peer only changes ``observed_state``/``last_observed_at``, exactly as the
+        approved archive policy requires.  The read uses the existing Telegram
+        boundary (the self client), never a provider and never a second client.
+        """
+        owner = int(owner_id or 0)
+        record = await self.get_source(owner, source_id)
+        if source is None:
+            raise EvidenceValidationError("Telegram is not available to re-check the source")
+        revisions = await self.repository.list_revisions(owner, record.id)
+        try:
+            from backend.telegram_api import messages as telegram_messages
+
+            payload = await telegram_messages.get_message(
+                source, record.peer_id, record.message_id,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — a refused read is an honest state
+            state = "inaccessible"
+        else:
+            if not payload or not int(payload.get("id") or 0):
+                state = "deleted"
+            else:
+                live_excerpt, _ = normalize_excerpt(payload.get("text") or "")
+                live_hash = content_hash(live_excerpt)
+                # A source with no stored revisions has no archived text that an
+                # edit could contradict; it is simply still present.
+                if not revisions or any(
+                    revision.content_hash == live_hash for revision in revisions
+                ):
+                    state = "live"
+                else:
+                    state = "edited"
+        now = await self.repository.database_now()
+        return await self.repository.update_source_observation(
+            owner, record.id, state, now=now,
+        )
 
     # ── deletion ────────────────────────────────────────────────────────────
 

@@ -530,21 +530,23 @@ class EvidenceRepository:
         return _source_from_row(data[0]) if data else None
 
     async def list_sources(
-        self, owner_id: int, *, limit: int = 20,
+        self, owner_id: int, *, limit: int = 20, offset: int = 0,
     ) -> list[EvidenceSource]:
+        start = max(0, int(offset))
+        size = max(1, int(limit))
         if self._memory_enabled:
             sources = [
                 item for item in self._memory.sources.values()
                 if item.owner_id == int(owner_id)
             ]
             sources.sort(key=lambda item: item.last_observed_at, reverse=True)
-            return sources[:limit]
+            return sources[start:start + size]
         data = await self._call(
             lambda: self._db.table("ai_evidence_sources")
             .select("*")
             .eq("owner_id", int(owner_id))
             .order("last_observed_at", desc=True)
-            .limit(limit)
+            .range(start, start + size - 1)
             .execute()
             .data
         )
@@ -664,21 +666,28 @@ class EvidenceRepository:
 
     async def update_source_observation(
         self, owner_id: int, source_id: str, state: str, *, now: datetime,
-    ) -> None:
+    ) -> EvidenceSource:
+        """Record one observed source state; never touches archived text."""
+        if state not in {"live", "edited", "deleted", "inaccessible"}:
+            raise EvidenceStorageError("unknown archived source state")
         if self._memory_enabled:
             source = self._memory.sources.get(str(source_id))
-            if source is not None and source.owner_id == int(owner_id):
-                self._memory.sources[source.id] = replace(
-                    source, observed_state=state, last_observed_at=now,
-                )
-            return
-        await self._call(
+            if source is None or source.owner_id != int(owner_id):
+                raise EvidenceStorageError("archive source does not exist for this owner")
+            updated = replace(source, observed_state=state, last_observed_at=now)
+            self._memory.sources[updated.id] = updated
+            return updated
+        data = await self._call(
             lambda: self._db.table("ai_evidence_sources")
             .update({"observed_state": state, "last_observed_at": now.isoformat()})
             .eq("owner_id", int(owner_id))
             .eq("id", str(source_id))
             .execute()
+            .data
         )
+        if not data:
+            raise EvidenceStorageError("archive source observation was not stored")
+        return _source_from_row(data[0])
 
     async def archive_usage(self, owner_id: int) -> ArchiveUsage:
         if self._memory_enabled:
