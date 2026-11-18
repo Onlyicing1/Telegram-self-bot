@@ -28,6 +28,7 @@ from typing import Any
 
 from telethon import utils
 
+from backend.ai.database.task_repository import HistoryStorageUnavailable
 from backend.ai.engine.engine import get_engine
 from backend.ai.task_trace import history_creation_scope, history_creation_trace
 from backend.helper import (
@@ -66,8 +67,21 @@ logger = logging.getLogger(__name__)
 
 PANEL_ID = "history"
 SCHEDULE_PANEL_ID = "history_schedule"
+ARCHIVE_PANEL_ID = "history_archive"
+ARCHIVE_ITEM_PANEL_ID = "history_archive_item"
 TITLE = "History & Intelligence"
 SCHEDULE_TITLE = "Scheduled History"
+ARCHIVE_TITLE = "Summary Archive"
+
+#: One bounded archive page. The list is a single Telegram screen of rows, and
+#: every callback stays inside Telegram's 64-byte budget: the detail id, a
+#: 19-digit peer id and a page index together are ~52 bytes.
+ARCHIVE_PAGE_SIZE = 6
+
+#: The durable summary is bounded at 32 KiB, beyond Telegram's 4096-char
+#: message bound. The detail view pages the STORED text deterministically, so
+#: nothing is truncated, nothing is cached, and no provider is ever called.
+ARCHIVE_SUMMARY_CHARS = 2600
 
 #: Set by ``register`` from the trusted runtime configuration. The History
 #: wizard never learns an owner id from a callback or task text.
@@ -330,6 +344,7 @@ def _panel_buttons() -> list:
     )
     builder.add_row("Set Run TTL", f"input:{PANEL_ID}:ttl")
     builder.add_row("Run Summary", "action:history_run")
+    builder.add_row("Summary Archive", f"panel:{ARCHIVE_PANEL_ID}")
     builder.add_row("Evidence Explorer", "panel:evidence")
     builder.add_row(sym.label(sym.OP_CREATE, "Schedule History"), f"panel:{SCHEDULE_PANEL_ID}")
     builder.add_row("Summarize Message Link", f"input:{PANEL_ID}:link")
@@ -585,10 +600,12 @@ async def _create_scheduled_history_impl() -> tuple[str, str, list]:
         "schedule": schedule,
         "timezone": _DEFAULT_TZ,
         "actions": [{"name": SCHEDULED_HISTORY_ACTION, "arguments": arguments}],
-        "notification_destination": {
-            "chat_id": int(_OWNER_ID),
-            "deliver_result": True,
-        },
+        # Scheduled History is a durable checkpoint, never a chat message. The
+        # cumulative summary is read from the Summary Archive, so opting into
+        # ``deliver_result`` here would only duplicate it into the owner's own
+        # chat on every occurrence. ``chat_id`` is unnecessary too: the action
+        # reads its peer from the durable state row.
+        "notification_destination": {},
     }
     history_creation_trace(
         "definition_validation_started", schedule_type=schedule_type,
@@ -1805,6 +1822,296 @@ async def _link_input_handler(
             pass
 
 
+# ── Summary Archive ─────────────────────────────────────────────────────────
+#
+# A READ-ONLY window onto the durable ``history_schedules`` rows: ONE cumulative
+# checkpoint per chat, owned by a Scheduled History task. It is not a per-run
+# archive, it never re-summarizes anything, and it never sends a message.
+
+
+def _archive_store():
+    """Return ``(repository, "")`` or ``(None, honest reason)``.
+
+    Scheduled History is durable-only: when the store cannot be confirmed, the
+    archive says so instead of presenting process memory as durable state.
+    """
+    from backend.ai.database.manager import get_repository_manager
+
+    manager = get_repository_manager()
+    repository = getattr(manager, "task", None)
+    if not (
+        getattr(manager, "supabase_available", False)
+        and getattr(repository, "supports_durable_history", False)
+    ):
+        return None, (
+            f"{sym.STATE_FAILED} Durable History storage is unavailable; "
+            "no stored summary can be shown."
+        )
+    return repository, ""
+
+
+def _archive_page_index(extra: str) -> int | None:
+    raw = str(extra or "")
+    if not raw:
+        return 0
+    if not raw.startswith("page:"):
+        return None
+    try:
+        page = int(raw.split(":", 1)[1])
+    except (TypeError, ValueError):
+        return None
+    return page if page >= 0 else None
+
+
+def _archive_item_target(extra: str) -> tuple[int, int] | None:
+    parts = str(extra or "").split(":")
+    if not parts or not parts[0]:
+        return None
+    try:
+        peer_id = int(parts[0])
+    except (TypeError, ValueError):
+        return None
+    if peer_id == 0:
+        return None
+    page = 0
+    if len(parts) > 1:
+        try:
+            page = int(parts[1])
+        except (TypeError, ValueError):
+            return None
+        if page < 0:
+            return None
+    return peer_id, page
+
+
+def _archive_time(value) -> str:
+    if value is None:
+        return "never"
+    try:
+        return value.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    except (AttributeError, TypeError, ValueError, OSError):
+        return "unknown"
+
+
+def _summary_page_bounds(text: str) -> list[int]:
+    """Contiguous page boundaries over the STORED summary.
+
+    Computed from the text alone (no cached pages), so the same stored text
+    always yields the same pages and no character is lost between two pages.
+    """
+    bounds = [0]
+    length = len(text)
+    while bounds[-1] < length:
+        start = bounds[-1]
+        end = min(start + ARCHIVE_SUMMARY_CHARS, length)
+        if end < length:
+            floor = start + ARCHIVE_SUMMARY_CHARS // 2
+            cut = max(text.rfind("\n", floor, end), text.rfind(" ", floor, end))
+            if cut > start:
+                end = cut
+        bounds.append(end)
+    return bounds
+
+
+def _summary_page(text: str, page: int) -> tuple[str, int, int] | None:
+    bounds = _summary_page_bounds(text)
+    if page >= len(bounds):
+        return None
+    start = bounds[page]
+    end = bounds[page + 1] if page + 1 < len(bounds) else len(text)
+    return text[start:end], page, len(bounds)
+
+
+async def _archive_label(repository, record) -> str:
+    """The owning task's own bounded label, else a label that claims nothing."""
+    fallback = f"Chat {record.peer_id}"
+    try:
+        task = await repository.get_task(_OWNER_ID, record.task_id)
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 - a label is never worth failing the read
+        return fallback
+    if task is None or getattr(task, "owner_id", _OWNER_ID) != _OWNER_ID:
+        return fallback
+    if getattr(task, "fallback_backend", ""):
+        # A degraded task read is process memory, not durable metadata.
+        return fallback
+    return str(getattr(task, "label", "") or "").strip() or fallback
+
+
+async def _archive_panel(event, extra: str) -> tuple[str, str, list] | None:
+    return await _archive_list_view(extra)
+
+
+async def _archive_list_view(extra: str) -> tuple[str, str, list]:
+    page = _archive_page_index(extra)
+    if page is None:
+        return ARCHIVE_TITLE, (
+            f"{sym.STATE_FAILED} That archive page is not valid. "
+            "Open the Summary Archive again."
+        ), []
+    if _OWNER_ID <= 0:
+        return ARCHIVE_TITLE, f"{sym.STATE_FAILED} The owner id is unavailable.", []
+    repository, unavailable = _archive_store()
+    if repository is None:
+        return ARCHIVE_TITLE, unavailable, []
+    try:
+        rows = await repository.list_history_schedules(
+            _OWNER_ID,
+            limit=ARCHIVE_PAGE_SIZE + 1,
+            offset=page * ARCHIVE_PAGE_SIZE,
+        )
+    except asyncio.CancelledError:
+        raise
+    except HistoryStorageUnavailable:
+        return ARCHIVE_TITLE, (
+            f"{sym.STATE_FAILED} Durable History storage is unavailable; "
+            "no stored summary can be shown."
+        ), []
+    except Exception as exc:  # noqa: BLE001 - never show a guess as data
+        logger.warning("HISTORY_ARCHIVE_LIST_FAILED error=%s", type(exc).__name__)
+        return ARCHIVE_TITLE, (
+            f"{sym.STATE_FAILED} The archive could not be read "
+            f"({type(exc).__name__}). Nothing is being shown from memory."
+        ), []
+
+    if not rows:
+        if page > 0:
+            return ARCHIVE_TITLE, (
+                f"{sym.STATE_WARNING} That archive page no longer exists. "
+                "The stored checkpoints may have changed; open the archive again."
+            ), []
+        return ARCHIVE_TITLE, (
+            "No Scheduled History checkpoints exist yet. Create one in "
+            "Scheduled History to start a cumulative summary for a chat."
+        ), []
+
+    builder = InlinePanelBuilder()
+    visible = rows[:ARCHIVE_PAGE_SIZE]
+    committed = 0
+    for record in visible:
+        label = await _archive_label(repository, record)
+        has_summary = bool((record.summary or "").strip())
+        committed += 1 if has_summary else 0
+        marker = f"r{record.revision}" if has_summary else "no summary yet"
+        builder.add_row(
+            f"{_short(label, 32)} · {marker}",
+            f"panel:{ARCHIVE_ITEM_PANEL_ID}:{record.peer_id}",
+        )
+    if page > 0:
+        builder.add_row(
+            sym.label(sym.OP_PREV, "Previous"),
+            f"panel:{ARCHIVE_PANEL_ID}:page:{page - 1}",
+        )
+    if len(rows) > ARCHIVE_PAGE_SIZE:
+        builder.add_row(
+            sym.label(sym.OP_NEXT, "Next"),
+            f"panel:{ARCHIVE_PANEL_ID}:page:{page + 1}",
+        )
+
+    body = (
+        "The latest cumulative Scheduled History checkpoint for each chat. "
+        "This is one durable record per chat, not a per-run archive.\n\n"
+        f"Page {page + 1} · {len(visible)} checkpoint(s) on this page."
+    )
+    if committed == 0:
+        body += " None of these checkpoints has committed a summary yet."
+    return ARCHIVE_TITLE, body, builder.build()
+
+
+async def _archive_item_panel(event, extra: str) -> tuple[str, str, list] | None:
+    return await _archive_item_view(extra)
+
+
+async def _archive_item_view(extra: str) -> tuple[str, str, list]:
+    target = _archive_item_target(extra)
+    if target is None:
+        return ARCHIVE_TITLE, (
+            f"{sym.STATE_FAILED} That archive item is not valid. "
+            "Open the Summary Archive again."
+        ), []
+    peer_id, page = target
+    if _OWNER_ID <= 0:
+        return ARCHIVE_TITLE, f"{sym.STATE_FAILED} The owner id is unavailable.", []
+    repository, unavailable = _archive_store()
+    if repository is None:
+        return ARCHIVE_TITLE, unavailable, []
+    try:
+        record = await repository.get_history_schedule_by_peer(_OWNER_ID, peer_id)
+    except asyncio.CancelledError:
+        raise
+    except HistoryStorageUnavailable:
+        return ARCHIVE_TITLE, (
+            f"{sym.STATE_FAILED} Durable History storage is unavailable; "
+            "no stored summary can be shown."
+        ), []
+    except Exception as exc:  # noqa: BLE001 - never show a guess as data
+        logger.warning("HISTORY_ARCHIVE_ITEM_FAILED error=%s", type(exc).__name__)
+        return ARCHIVE_TITLE, (
+            f"{sym.STATE_FAILED} This checkpoint could not be read "
+            f"({type(exc).__name__}). Nothing is being shown from memory."
+        ), []
+
+    if record is None or record.status == "deleted":
+        return ARCHIVE_TITLE, (
+            f"{sym.STATE_FAILED} That checkpoint no longer exists. "
+            "It may have been removed with its Scheduled History task."
+        ), []
+
+    label = await _archive_label(repository, record)
+    summary = record.summary or ""
+    if not summary.strip():
+        return ARCHIVE_TITLE, "\n".join([
+            f"Chat: {label}",
+            f"Peer: {record.peer_id} · Task: #{record.task_id}",
+            f"Revision: {record.revision} · Status: {record.status}",
+            f"Last committed: {_archive_time(record.last_committed_at)}",
+            "",
+            "No summary has been committed yet for this chat. A scheduled run "
+            "commits one only after it scans new messages.",
+        ]), []
+
+    rendered = _summary_page(summary, page)
+    if rendered is None:
+        builder = InlinePanelBuilder()
+        builder.add_row(
+            sym.label(sym.OP_BACK, "Show from the beginning"),
+            f"panel:{ARCHIVE_ITEM_PANEL_ID}:{record.peer_id}",
+        )
+        return ARCHIVE_TITLE, (
+            f"{sym.STATE_WARNING} That summary page is no longer available. "
+            "The stored summary may have changed; open it from the beginning."
+        ), builder.build()
+
+    chunk, index, total = rendered
+    lines = [
+        f"Chat: {label}",
+        f"Peer: {record.peer_id} · Task: #{record.task_id}",
+        f"Revision: {record.revision} · Status: {record.status}",
+        f"Scanned: {record.scanned_cursor} · Summarized: {record.summarized_cursor}",
+        f"Last committed: {_archive_time(record.last_committed_at)}",
+    ]
+    if (record.last_error or "").strip():
+        lines.append(f"Last error: {_short(record.last_error, 160)}")
+    lines.append("")
+    if total > 1:
+        lines.extend([f"Summary page {index + 1} of {total}", ""])
+    lines.append(chunk)
+
+    builder = InlinePanelBuilder()
+    if index > 0:
+        builder.add_row(
+            sym.label(sym.OP_PREV, "Previous"),
+            f"panel:{ARCHIVE_ITEM_PANEL_ID}:{record.peer_id}:{index - 1}",
+        )
+    if index + 1 < total:
+        builder.add_row(
+            sym.label(sym.OP_NEXT, "Next"),
+            f"panel:{ARCHIVE_ITEM_PANEL_ID}:{record.peer_id}:{index + 1}",
+        )
+    return ARCHIVE_TITLE, "\n".join(lines), builder.build()
+
+
 async def _inline_builder(event, extra: str) -> list:
     result = await _panel_handler(event, extra)
     title, body, buttons = result if result is not None else (TITLE, "", [])
@@ -1826,6 +2133,13 @@ def register(client=None, owner_id: int = 0, tz_str: str = "UTC") -> None:
     register_panel(PANEL_ID, _panel_handler, parent="menu", title=TITLE)
     register_panel(
         SCHEDULE_PANEL_ID, _schedule_panel, parent=PANEL_ID, title=SCHEDULE_TITLE,
+    )
+    register_panel(
+        ARCHIVE_PANEL_ID, _archive_panel, parent=PANEL_ID, title=ARCHIVE_TITLE,
+    )
+    register_panel(
+        ARCHIVE_ITEM_PANEL_ID, _archive_item_panel, parent=ARCHIVE_PANEL_ID,
+        title=ARCHIVE_TITLE,
     )
     register_inline_builder(PANEL_ID, _inline_builder)
     register_action("history_count", _count_action)

@@ -1052,6 +1052,72 @@ and synthesis only.
 
 ---
 
+## Delivered: Scheduled History delivery correction and Summary Archive
+
+Status: **Implemented and offline-tested. Not verified against live Telegram.**
+This is a focused Scheduled History delivery/UI change. It does not implement,
+reorder or redesign the main menu, and it does not change UI-001 below.
+
+### Verified defect
+
+- The owner wizard created the Scheduled History task with
+  `notification_destination = {"chat_id": <owner>, "deliver_result": True}`
+  (`backend/bot/handlers/history.py`, now line 608).
+- `TaskExecutionCoordinator._deliver_result`
+  (`backend/ai/task_execution.py:1820`) honours `deliver_result` by collecting
+  the action messages and calling the Telegram transport's `send_message`.
+- The scheduled action's message IS the cumulative summary, and the configured
+  chat is the owner's own chat — i.e. Telegram Saved Messages. Every successful
+  occurrence therefore posted the summary there.
+
+### Delivered
+
+1. **No result-delivery opt-in.** The wizard now writes
+   `notification_destination = {}`: no `deliver_result`, and no now-unnecessary
+   `chat_id` (the action reads its peer from the durable state row).
+2. **Delivery-boundary guard.** `_deliver_result` refuses any task whose
+   actions include `scheduled_history`, so definitions persisted before this
+   change stop delivering too. Ordinary tasks that explicitly opt into
+   `deliver_result` are unchanged; `notify_on_outcome` is untouched.
+3. **Summary Archive.** A new read-only child of History & Intelligence:
+   `history_archive` (bounded list) and `history_archive_item` (detail), with
+   the History panel exposing exactly one Summary Archive row.
+   It shows the latest committed cumulative checkpoint per chat, not a
+   per-occurrence archive, and never regenerates a summary.
+4. **Bounded read path.** `TaskRepository.list_history_schedules(owner_id,
+   *, limit, offset)` is implemented on both the Supabase and in-memory
+   repositories: owner-scoped, ordered by row id, limited to 1–100 rows,
+   excluding legacy `deleted` repair rows, and failing closed with
+   `HistoryStorageUnavailable`. No schema change, no new table, no second
+   summary store.
+5. **UI states.** Empty archive, no committed summary yet, unavailable durable
+   storage, read failure, missing record, invalid pagination token and stale
+   summary page each render an honest message. Summary text is paged
+   deterministically from the STORED string (32 KiB ceiling vs Telegram's
+   4096-char message), so nothing is truncated, cached or re-summarized.
+
+### Tested offline
+
+- `tests/test_scheduled_history_delivery.py` drives the real
+  Scheduler → coordinator → ToolExecutor → `scheduled_history` boundary and
+  proves no `send_message` on success, no-op, legacy-opted-in and failure runs,
+  while an ordinary opted-in task still delivers.
+- `tests/test_history_archive.py` covers registration, one History entry,
+  owner isolation, cross-owner item rejection, empty/no-summary states,
+  complete multi-page rendering, Persian + English text, deterministic
+  pagination and bounds, invalid/stale tokens, storage errors and the absence
+  of any AI or Telegram call.
+- `tests/test_history_schedule_ui.py` now asserts the created task's
+  `notification_destination` is empty.
+
+### Not verified / deferred
+
+- **Live Telegram behavior is not verified.** No scheduled occurrence was run
+  against the real account, so the absence of Saved Messages delivery is proven
+  at the source/test boundary only.
+- Broader UI-001 menu order, labels, categories and navigation remain deferred
+  and unimplemented.
+
 ## Planned UI maintenance: UI-001 panel information architecture and menu ordering
 
 Status: **Planned and not implemented. No main-menu button, category, label,

@@ -45,6 +45,8 @@ HISTORY_SCHEDULE_STATUSES = frozenset({"active", "paused", "completed", "failed"
 HISTORY_SCHEDULE_WRITABLE_STATUSES = HISTORY_SCHEDULE_STATUSES - {"deleted"}
 MAX_HISTORY_SUMMARY_BYTES = 32768
 MAX_HISTORY_ERROR_BYTES = 2048
+#: One bounded archive page. The repository never returns an unbounded set.
+MAX_HISTORY_LIST_LIMIT = 100
 DB_TIMEOUT = 10.0
 # ── Todo steps (multi-step todos) ────────────────────────────────────────────
 # A step belongs to exactly ONE todo (an ``ai_tasks`` row with
@@ -464,6 +466,17 @@ def _cursor_value(value, field_name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValueError(f"{field_name} must be a nonnegative integer")
     return value
+
+
+def _history_list_bounds(limit, offset) -> tuple[int, int]:
+    """Validate one bounded, deterministic page request."""
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_HISTORY_LIST_LIMIT:
+        raise ValueError(f"limit must be an integer between 1 and {MAX_HISTORY_LIST_LIMIT}")
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        raise ValueError("offset must be a nonnegative integer")
+    return limit, offset
+
+
 def _validate_history_schedule_input(data):
     """Validate one complete row/payload before it can be stored or returned."""
     for key in ("task_id", "owner_id"):
@@ -555,6 +568,7 @@ class TaskRepository:
     async def create_history_schedule(self, owner_id, task_id, peer_id, *, baseline_cursor=0): raise NotImplementedError
     async def get_history_schedule(self, owner_id, task_id): raise NotImplementedError
     async def get_history_schedule_by_peer(self, owner_id, peer_id): raise NotImplementedError
+    async def list_history_schedules(self, owner_id, *, limit=6, offset=0): raise NotImplementedError
     async def commit_history_success(self, owner_id, peer_id, *, expected_version, summary, scanned_cursor, summarized_cursor, status=None): raise NotImplementedError
     async def advance_history_scan(self, owner_id, peer_id, *, expected_version, scanned_cursor): raise NotImplementedError
     async def record_history_failure(self, owner_id, peer_id, *, expected_version, error, status=None): raise NotImplementedError
@@ -695,6 +709,18 @@ class InMemoryTaskRepository(TaskRepository):
     async def get_history_schedule_by_peer(self, owner_id, peer_id):
         r=self._history_schedules.get((owner_id,int(peer_id)))
         return _copy(r) if r else None
+    async def list_history_schedules(self, owner_id, *, limit=6, offset=0):
+        """Deterministic owner-scoped page of live History states.
+
+        A legacy ``deleted`` row is a repair placeholder, not a checkpoint, so
+        it can never appear as an archive entry.
+        """
+        limit,offset=_history_list_bounds(limit,offset)
+        rows=sorted(
+            (r for r in self._history_schedules.values() if r.owner_id==owner_id and r.status!="deleted"),
+            key=lambda r:r.id,
+        )
+        return [_copy(r) for r in rows[offset:offset+limit]]
     async def commit_history_success(self, owner_id, peer_id, *, expected_version, summary, scanned_cursor, summarized_cursor, status=None):
         r=self._history_schedules.get((owner_id,int(peer_id)))
         if r is None:
@@ -1635,6 +1661,23 @@ class SupabaseTaskRepository(TaskRepository):
         except asyncio.CancelledError: raise
         except Exception as exc:
             self._history_unavailable("Supabase history schedule peer read failed: %s",exc)
+    async def list_history_schedules(self, owner_id, *, limit=6, offset=0):
+        """Deterministic owner-scoped page of durable History states.
+
+        Ordered by the row id, limited by an explicit page, and filtered away
+        from the legacy ``deleted`` repair status. No count query and no
+        process-memory substitute: an unavailable store fails closed.
+        """
+        limit,offset=_history_list_bounds(limit,offset)
+        try:
+            result=await self._run(lambda:self._client.table("history_schedules").select("*").eq("owner_id",owner_id).neq("status","deleted").order("id").range(offset,offset+limit-1).execute())
+            self._mark_supabase_ok()
+            rows=getattr(result,"data",None) or []
+            return [_history_schedule_from_row(row) for row in rows]
+        except (ValueError,TypeError): raise
+        except asyncio.CancelledError: raise
+        except Exception as exc:
+            self._history_unavailable("Supabase history schedule list failed: %s",exc)
     async def commit_history_success(self, owner_id, peer_id, *, expected_version, summary, scanned_cursor, summarized_cursor, status=None):
         """Atomically persist summary + cursors + revision under ONE CAS write."""
         current=await self.get_history_schedule_by_peer(owner_id,int(peer_id))

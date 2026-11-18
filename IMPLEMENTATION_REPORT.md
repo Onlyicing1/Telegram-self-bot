@@ -208,3 +208,116 @@ implemented/offline-tested with live verification still pending.
   rate-limited, and a curated catalog cannot manufacture quota.
 - The diagnostics added are counts and normalized categories; they do not
   include provider response text by design.
+
+---
+
+## 11. Follow-up delivery — Scheduled History delivery correction and Summary Archive (2026-11-18)
+
+**Status:** implemented and offline-tested. No SQL, Supabase write, deployment
+or live Telegram call was made from this workspace.
+
+### Starting state
+
+| Item | Verified state |
+|---|---|
+| Local HEAD before editing | `0d1a9ff36506ec53b849aecbc177a041e1503de3` |
+| `origin/main` before editing | `f61e12ea0bd87fda874ef072e5bf15f42c34e898`; HEAD was 21 ahead, 0 behind |
+| Working tree before editing | clean except the pre-existing untracked `tests/test_runtime_session_terminal.py` |
+
+### Root cause
+
+The Scheduled History wizard created its task with
+`notification_destination = {"chat_id": int(_OWNER_ID), "deliver_result": True}`.
+`TaskExecutionCoordinator._deliver_result` (`backend/ai/task_execution.py`)
+delivers action result messages through `telegram.send_message` when that flag
+is `True`. For `scheduled_history` the action message is the cumulative summary
+and the chat id is the owner's own chat, so every committed occurrence posted
+the summary to Telegram Saved Messages.
+
+### Changes
+
+1. `backend/bot/handlers/history.py:608` — the wizard writes
+   `notification_destination = {}`. `chat_id` was unnecessary because the action
+   resolves its peer from the durable `history_schedules` row.
+2. `backend/ai/task_execution.py:1840` — `_deliver_result` returns early for any
+   task whose actions include `scheduled_history` (constant from
+   `backend/ai/task_contract.py`). This also stops delivery for definitions
+   already persisted with the old opt-in. Ordinary `deliver_result` tasks and
+   `notify_on_outcome` behavior are unchanged.
+3. `backend/ai/database/task_repository.py` — new
+   `list_history_schedules(owner_id, *, limit, offset)` on the abstract base,
+   the Supabase repository (ordered by `id`, `.range(offset, offset+limit-1)`,
+   `status != 'deleted'`) and the in-memory repository (same ordering/filter).
+   Bounds: `limit` 1–`MAX_HISTORY_LIST_LIMIT` (100), `offset >= 0`; invalid
+   arguments raise `ValueError`. Supabase failures raise
+   `HistoryStorageUnavailable`; no fallback data is returned.
+4. `backend/bot/handlers/history.py` — `history_archive` (bounded list) and
+   `history_archive_item` (detail) panels registered under `history`, plus one
+   `Summary Archive` row after `Run Summary`. The list pages six rows at a time
+   and labels each with its owning task label and revision (or "no summary
+   yet"). The detail shows chat/task/revision/status/cursors/last-commit time
+   and the stored summary, paged deterministically at 2600 chars with no cached
+   state. No AI call, no Telegram send, no summary regeneration.
+
+### Tests executed
+
+| Command | Result |
+|---|---|
+| `pytest -q tests/test_history_archive.py tests/test_scheduled_history_delivery.py tests/test_history_schedule_ui.py` | **25 passed** |
+| 20 adjacent History / Taskloom / task / panel / Appearance / symbol files | **593 passed, 1 failed** (pre-existing scheduler failure, §12) |
+| `pytest -q --ignore=tests/test_runtime_session_terminal.py` (full suite) | **7984 passed, 27 skipped, 4 failed** (all four pre-existing, §12) |
+| `python -m py_compile` on the three changed modules and three test files | passed |
+| `git diff --check` | clean |
+
+### Scope guarantees
+
+- No scheduler, executor, Telegram client, listener, renderer, summary store,
+  SQL statement, migration or schema change was added.
+- `MAIN_PAGE_IDS`, the 11 main-menu destinations, their labels, callbacks and
+  order, and `AGENTS.md` are untouched.
+- Broader UI-001 navigation work remains deferred (see §13).
+
+## 12. Test evidence — follow-up delivery
+
+### Focused (25 passed)
+
+- `tests/test_history_archive.py` (15 tests) — registration under `history`,
+  exactly one History entry, owner isolation, cross-owner item rejection,
+  empty archive, no-committed-summary state, complete multi-page round-trip,
+  Persian + English preservation, bounded deterministic pagination, invalid /
+  stale tokens, unavailable storage, durable read errors, no AI or Telegram
+  call, 64-byte callback budget, and `deleted` repair rows excluded.
+- `tests/test_scheduled_history_delivery.py` (5 tests) — a real
+  Scheduler → coordinator → ToolExecutor → `scheduled_history` run commits the
+  summary, marks the occurrence succeeded and never calls `send_message`; the
+  same holds for a legacy `deliver_result: true` definition, a no-op run and a
+  failed run; an ordinary opted-in task still delivers.
+- `tests/test_history_schedule_ui.py` (5 tests) — the existing creation test
+  now also asserts `notification_destination == {}`.
+
+### Pre-existing failures (unchanged, reproduced at clean HEAD)
+
+Each was reproduced in a detached `git worktree` at
+`0d1a9ff36506ec53b849aecbc177a041e1503de3` with the same command, so none is
+caused by this delivery:
+
+1. `tests/test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`
+   ("interval advancement exceeded bound").
+2. `tests/test_database_architecture_doc.py::test_every_migration_file_is_classified_in_the_audit_section`.
+3. `tests/test_database_setup_order.py::test_the_audited_order_is_recorded_in_the_audit_table`.
+4. `tests/test_private_message_db_security.py::test_the_documented_counts_match_the_repository`.
+
+### Collection limitation
+
+`tests/test_runtime_session_terminal.py` is a pre-existing untracked file. It
+fails to import (`TERMINAL_SESSION_MESSAGE` is absent from
+`backend/bot/client.py`), so the full suite was run with only that file ignored.
+It was not modified or deleted.
+
+## 13. Deferred after the follow-up delivery
+
+- Broader UI-001 menu/navigation redesign (unchanged, still planned).
+- Live Telegram verification of Scheduled History silence and of the Summary
+  Archive panels on the real account.
+- No per-occurrence summary history exists or is added: the archive shows the
+  one cumulative checkpoint per chat, as the table does.

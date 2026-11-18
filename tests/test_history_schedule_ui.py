@@ -77,7 +77,11 @@ async def test_the_wizard_creates_through_task_creation_service_and_state(monkey
     assert len(tasks) == 1
     task = tasks[0]
     assert task.actions[0]["name"] == "scheduled_history"
-    assert task.notification_destination["chat_id"] == OWNER
+    # A Scheduled History checkpoint must never opt into result delivery: the
+    # cumulative summary is read in the Summary Archive, not sent to the
+    # owner's own chat (Saved Messages).
+    assert task.notification_destination == {}
+    assert "deliver_result" not in task.notification_destination
     state = await repo.get_history_schedule(OWNER, task.id)
     assert state is not None
     assert state.peer_id == PEER

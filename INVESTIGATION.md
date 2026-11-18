@@ -313,3 +313,45 @@ validation diagnosable without a new scheduler or persistence path.
 - No live occurrence or live Supabase operation was exercised by the tracing
   tests. The earlier conclusion remains: only the owner-performed live run can
   validate the real Telegram/provider/deployment behavior.
+
+## 14. Verified root cause — Scheduled History posted its summary to Saved Messages
+
+Source inspection of the delivery chain established a second, independent defect
+from the provider/failure-metadata findings above.
+
+**Exact path that delivered:**
+
+1. The owner wizard built the Scheduled History candidate with a delivery
+   opt-in and the owner's own chat id (`backend/bot/handlers/history.py`,
+   `notification_destination: {"chat_id": int(_OWNER_ID), "deliver_result": True}`).
+2. `TaskExecutionCoordinator` persisted that destination on the `ai_tasks` row
+   and passed it unchanged into execution.
+3. After a successful occurrence, `TaskExecutionCoordinator._deliver_result`
+   (`backend/ai/task_execution.py`) saw `deliver_result is True`, joined the
+   action result messages and called `telegram.send_message(chat_id, text)`.
+4. `scheduled_history` returns the cumulative summary as its result message
+   (`backend/services/history_schedule_service.py`), and the configured chat is
+   the owner's own user id — Telegram Saved Messages. The summary was therefore
+   posted there after every committed occurrence.
+
+The persistence itself was correct: the same run commits summary + cursors +
+revision through one CAS write. Only the post-commit delivery step was wrong.
+
+**Corrected behavior (implemented):**
+
+- The wizard now writes `notification_destination = {}`. No `deliver_result`,
+  and no `chat_id` — the action already reads its peer from the durable
+  `history_schedules` row, so the destination field was unnecessary.
+- `_deliver_result` additionally refuses any task whose actions include
+  `scheduled_history`, which covers definitions already persisted with the old
+  opt-in. Other tasks keep their existing `deliver_result` behavior, and the
+  separate `notify_on_outcome` opt-in is untouched.
+- The cumulative summary is now read through the new **Summary Archive** under
+  History & Intelligence (`history_archive` / `history_archive_item`), backed by
+  a bounded, owner-scoped `TaskRepository.list_history_schedules` page. The
+  archive is read-only: it does not regenerate the summary, call a provider, or
+  send any Telegram message.
+
+**Limitation:** this is verified from source and offline tests. No live
+scheduled occurrence was executed, so the real account's Telegram behavior is
+still owner-verified only.

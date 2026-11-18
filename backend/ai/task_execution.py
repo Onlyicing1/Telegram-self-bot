@@ -1837,6 +1837,16 @@ class TaskExecutionCoordinator:
         destination = task.notification_destination or {}
         if destination.get("deliver_result") is not True:
             return
+        # Scheduled History is a durable checkpoint, never a chat message: its
+        # cumulative summary is read from the Summary Archive, and the owner's
+        # own chat would only duplicate it into Saved Messages. This also covers
+        # definitions persisted before the wizard stopped opting in.
+        if any(
+            isinstance(action, dict)
+            and (action.get("name") or action.get("tool")) == SCHEDULED_HISTORY_ACTION
+            for action in (getattr(task, "actions", None) or [])
+        ):
+            return
         chat_id = destination.get("chat_id")
         if not isinstance(chat_id, int) or chat_id == 0:
             chat_id = self.owner_id
