@@ -1052,6 +1052,89 @@ and synthesis only.
 
 ---
 
+## Planned UI maintenance: UI-001 panel information architecture and menu ordering
+
+Status: **Planned and not implemented. No main-menu button, category, label,
+callback, panel registration or panel order has been changed by this entry.**
+This is an independent UI-maintenance item; it is separate from Scheduled
+History, provider routing, retries/fallback, the task scheduler and AI execution
+work. It references the existing **UI-001 — Panel information architecture and
+visual consistency** idea in `LIFEOS_IDEAS.md`; it does not create a duplicate
+UI initiative.
+
+### Source-observed starting point (not an approved arrangement)
+
+`backend/bot/handlers/misc.py::_build_menu_buttons()` currently renders 11
+top-level buttons: Save, Delete, Profile, Database, General, Settings, Cipher,
+Todo, AI, History & Intelligence, and Appearance. The registry also contains
+surfaces registered with `parent="menu"` that are not on that button list (for
+example List, Find, Emoji, Context Panel and Health Dashboard). This difference
+is exactly why the inventory below is required: the button list is not, by
+itself, a complete map of the navigation tree. The current button order and
+category boundaries are **not approved** by this roadmap entry.
+
+UI-001 already documents the intended direction: a predictable ordering rule,
+related controls grouped together, fewer competing buttons, preserved callback
+data and Appearance contracts, and reuse of the existing Glass UI rather than a
+second renderer. This item covers the menu-wide information architecture review;
+it does not depend on or redefine any other UI delivery.
+
+### Required inventory and investigation
+
+1. **Complete top-level inventory.** For every main-menu button record its exact
+   label, callback data, destination panel, owning feature, current parent and
+   child panels, and the tests that cover it. Separately inventory every panel
+   registered with `parent="menu"` and classify it as directly reachable from
+   the main menu, reachable through another panel, intentionally hidden or
+   orphaned.
+2. **Reachability map.** Trace every registered panel, action and input from a
+   real entry point. Identify duplicate destinations, unreachable surfaces,
+   dead callbacks, confusing aliases and paths that require an avoidable
+   intermediate panel.
+3. **Category boundaries.** Review whether related features are grouped
+   logically — including Save/Stash/List/Find, Profile/Bio/Username,
+   Settings/General/Appearance, AI/Taskloom/Todo/History & Intelligence,
+   Cipher/Private Messages, and Database/Health/Context — without assuming a new
+   grouping is approved.
+4. **Top-level ordering.** Propose and review the order of top-level categories
+   against owner usage and the established ordering rule. Do not implement an
+   order until the owner approves it.
+5. **In-panel ordering.** Review button order inside each affected panel so the
+   primary action is first, related controls are grouped, secondary actions are
+   distinct, and pagination/navigation controls are consistently last.
+6. **Duplicate, misplaced and redundant controls.** Identify competing buttons,
+   duplicated paths, labels that do not describe their destination, unnecessary
+   nesting and steps that can be removed without hiding useful functionality.
+7. **Labels and category names.** Establish consistent, unambiguous naming
+   across the menu, panels and callbacks; preserve callback data unless a
+   separately approved change requires migration.
+8. **Compatibility.** Preserve existing panel IDs, callback namespaces,
+   registered actions and inputs, feature behavior, owner isolation, Appearance
+   eligibility and the one Glass UI renderer/registry. The work must reuse
+   `InlinePanelBuilder`, `panel_registry.py`, `panels.py` and the existing
+   renderer, not replace them.
+9. **Regression coverage.** Add tests for the final approved menu structure:
+   exact top-level entries and order, destination reachability, callback
+   stability, no duplicate/orphaned top-level paths, in-panel action ordering,
+   navigation placement and the Appearance main-page contract.
+10. **Explicit non-goals.** No second renderer or navigation system; no feature
+    business-logic change merely to regroup navigation; no new Telegram client,
+    listener, update loop, scheduler or executor; no database/Supabase/schema
+    change; no Scheduled History change; no claim that a final order is approved
+    before the owner approves it.
+
+### Completion evidence required
+
+- A reviewed inventory and reachability map covering every top-level button and
+  every `parent="menu"` registration.
+- An owner-approved category order, in-panel ordering and label set.
+- A focused implementation diff limited to navigation/registration/labels and
+  their tests, with existing callback compatibility proven.
+- Focused navigation/Appearance/style tests and the applicable full suite
+  passing, plus an owner check of the resulting Telegram panels.
+- Only then may this item be marked implemented; this roadmap entry itself does
+  not mark it complete.
+
 ## Open items carried over (untouched by this delivery)
 
 - `tests/test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`
