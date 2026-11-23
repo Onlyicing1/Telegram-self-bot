@@ -49,6 +49,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from backend.observability import egress_attribution as egress
 from backend.telegram_api.peers import PeerType, classify_entity
 
 
@@ -1632,7 +1633,14 @@ async def store_media_snapshot(client: Any, msg: Any, row: dict[str, Any]) -> bo
             from backend.services import outbound_bandwidth_service as governor
 
             await governor.reserve_outbound_bytes("storage_upload", len(payload))
-            db.storage.from_(bucket).upload(object_name, payload)
+            try:
+                db.storage.from_(bucket).upload(object_name, payload)
+            except BaseException:
+                egress.record_exact(
+                    "supabase_storage", len(payload), label="storage_upload", failed=1
+                )
+                raise
+            egress.record_exact("supabase_storage", len(payload), label="storage_upload")
             row["media_stored"] = True
             row["media_object"] = object_name
             return True

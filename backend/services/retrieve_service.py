@@ -49,6 +49,7 @@ from backend.ai.semantic_delete import normalize_text as _persian_normalize
 from backend.db import client as db_client
 from backend.diagnostics import record_event
 from backend.helper import symbols as sym
+from backend.observability import egress_attribution as egress
 from backend.services import save_service
 
 logger = logging.getLogger(__name__)
@@ -1348,12 +1349,18 @@ async def do_change_file_name(
             # The replacement is a REAL upload of the downloaded bytes, so it
             # is accounted before Telegram receives any of them.
             await _reserve_reupload_bytes(os.path.getsize(tmp_path))
-            sent = await client.send_file(
-                "me",
-                tmp_path,
-                caption=new_caption,
-                **save_service._upload_kwargs_for_media(media, mime, name),
-            )
+            upload_egress = egress.telegram_upload("telegram_self_upload", "rename_reupload")
+            upload_kwargs = save_service._upload_kwargs_for_media(media, mime, name)
+            progress_cb = upload_egress.wrap(None)
+            if progress_cb is not None:
+                upload_kwargs["progress_callback"] = progress_cb
+            with upload_egress:
+                sent = await client.send_file(
+                    "me",
+                    tmp_path,
+                    caption=new_caption,
+                    **upload_kwargs,
+                )
         except Exception as exc:  # noqa: BLE001
             logger.warning("saved file-name re-upload failed for %s: %s", code, exc)
             return f"{sym.STATE_FAILED} Could not re-upload the saved media ({exc}). The saved item is unchanged."

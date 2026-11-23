@@ -17,6 +17,7 @@ import logging
 import os
 from typing import Any
 
+from backend.observability import egress_attribution as egress
 from backend.runtime.operation_watchdog import guarded_await
 from backend.telegram_api._helpers import serialize_message
 from backend.telegram_api.exceptions import (
@@ -147,18 +148,25 @@ async def send_voice(
         raise TelegramAPIError("send_voice needs audio bytes; nothing was sent.")
     await _reserve_voice_bytes(len(audio))
     effective = _effective_upload_timeout(timeout)
+    upload_egress = egress.telegram_upload("telegram_self_upload", "voice")
+    upload_kwargs: dict[str, Any] = {}
+    progress_cb = upload_egress.wrap(None)
+    if progress_cb is not None:
+        upload_kwargs["progress_callback"] = progress_cb
     try:
-        message = await guarded_await(
-            client.send_file(
-                chat_id,
-                io.BytesIO(bytes(audio)),
-                voice_note=True,
-                force_document=False,
-                mime_type=mime_type,
-            ),
-            name="telegram:send_voice",
-            timeout=effective,
-        )
+        with upload_egress:
+            message = await guarded_await(
+                client.send_file(
+                    chat_id,
+                    io.BytesIO(bytes(audio)),
+                    voice_note=True,
+                    force_document=False,
+                    mime_type=mime_type,
+                    **upload_kwargs,
+                ),
+                name="telegram:send_voice",
+                timeout=effective,
+            )
     except asyncio.TimeoutError:
         logger.error(
             "TELEGRAM_VOICE_TIMEOUT timeout=%.1fs — voice note was not sent in time",

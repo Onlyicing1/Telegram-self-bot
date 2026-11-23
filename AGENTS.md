@@ -737,6 +737,7 @@ treated as a disconnect or trigger recovery.
 | `YDC_API_KEY` | `""` | You.com Web Search API key; empty → search capability unregistered |
 | `RENDER_API_KEY` | `""` | Workspace-scoped, read-only Render API key for this service outbound-bandwidth metrics; empty → Render metrics unavailable |
 | `SAVE_TRACE` | `""` | `1/true/yes/on` enables bounded `[SAVE_TRACE]` instrumentation of one Save attempt; empty → tracing fully off |
+| `RENDER_EGRESS_ATTRIBUTION` | `""` | Exactly `1` enables bounded `[RENDER_EGRESS]` outbound payload attribution (process-local counters, a summary at most every 5 minutes); any other value → measurement fully off |
 
 RENDER_SERVICE_ID is injected automatically by Render at runtime. Do not hardcode it or copy it between accounts.
 

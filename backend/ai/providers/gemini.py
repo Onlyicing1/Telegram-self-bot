@@ -15,6 +15,7 @@ from backend.ai.providers.base.config import ProviderConfig
 from backend.ai.providers.base.contract import BaseProvider, ProviderResponse
 from backend.ai.providers.base.defaults import get_provider_default
 from backend.ai.redaction import redact_secrets
+from backend.observability import egress_attribution as egress
 
 logger = logging.getLogger(__name__)
 
@@ -176,7 +177,10 @@ class GeminiProvider(BaseProvider):
             return self._disabled_response()
 
         if self._http_client is None:
-            self._http_client = httpx.AsyncClient(timeout=self._config.timeout)
+            self._http_client = httpx.AsyncClient(
+                timeout=self._config.timeout,
+                **egress.async_client_kwargs("ai_provider", "gemini"),
+            )
 
         # The selected id is sent VERBATIM: the request must be for exactly the
         # model the owner chose. A retired id fails as that id (this provider's
@@ -420,10 +424,15 @@ class GeminiProvider(BaseProvider):
         if not self._config.api_key or not self._config.enabled:
             return []
         if self._http_client is None:
-            self._http_client = httpx.AsyncClient(timeout=self._config.timeout)
+            self._http_client = httpx.AsyncClient(
+                timeout=self._config.timeout,
+                **egress.async_client_kwargs("ai_discovery", "gemini"),
+            )
         url = f"{_GEMINI_BASE}/models?key={self._config.api_key}&pageSize=100"
         try:
-            resp = await self._http_client.get(url)
+            resp = await self._http_client.get(
+                url, **egress.request_category("ai_discovery", "gemini")
+            )
             if resp.status_code != 200:
                 return []
             data = resp.json()

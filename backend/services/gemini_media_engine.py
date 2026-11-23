@@ -104,6 +104,7 @@ from typing import Any, Mapping
 
 import httpx
 
+from backend.observability import egress_attribution as egress
 from backend.services import media_service
 from backend.services.media_service import MediaError
 from backend.services.stt_consensus import reconcile_hypotheses
@@ -1618,7 +1619,10 @@ class GeminiMediaEngine:
         derived from the remaining operation budget, so the client can never carry
         a bound the operation does not know about.
         """
-        return httpx.Client(timeout=timeout)
+        return httpx.Client(
+            timeout=timeout,
+            **egress.sync_client_kwargs("stt_provider", "gemini_media"),
+        )
 
 
 def _raise_for_status(kind: str, response: httpx.Response, api_key: str) -> None:

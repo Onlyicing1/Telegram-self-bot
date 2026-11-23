@@ -50,6 +50,7 @@ from backend.ai.providers.base.contract import (
     ProviderResponse,
 )
 from backend.ai.providers.base.defaults import get_provider_default
+from backend.observability import egress_attribution as egress
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +103,7 @@ class YouSearchProvider(BaseProvider):
                     "X-API-Key": self._config.api_key,
                     "Content-Type": "application/json",
                 },
+                **egress.async_client_kwargs("ai_provider", "you"),
             )
         return self._http_client
 

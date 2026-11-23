@@ -275,3 +275,126 @@ Tests added:
 
 **Verification status at report authoring:** source and tests in this follow-up
 are not yet deployed or live-verified. Test execution is pending.
+
+---
+
+## Follow-up — Outbound egress attribution (2026-11-23)
+
+**Purpose:** measure outbound application payload bytes at the boundaries the
+runtime actually controls, so the owner can compare them with Render's NAT
+metric over the same UTC window. This is MEASUREMENT ONLY: no optimization, no
+enforcement and no behavior change.
+
+**Base commit:** `3e35f085378a3f70b063d6e6609942bb09756103`
+**Enable with:** `RENDER_EGRESS_ATTRIBUTION=1`. Every other value — unset,
+`0`, `true`, `yes`, `" 1"`, `"1 "` — keeps the layer fully off. Disabled means
+no hook, no callback, no counter and no log line: the transfer paths are
+byte-for-byte the ones they were before.
+
+### 1. Exact measurements
+
+| Category (label) | Seam | What the number is |
+|---|---|---|
+| `telegram_self_upload` (`deep_save`, `album_member`, `voice`, `rename_reupload`, `ai_attachment`) | Telethon `progress_callback(current, total)` on the existing single-file `send_file` / `upload_file` calls (pinned Telethon 1.43.0 reports cumulative bytes) | File payload bytes of that logical upload, from positive deltas only. A restarted upload is not counted twice, so this is a LOWER bound on wire bytes. |
+| `ai_provider` (`openai`, `gemini`, `you`, and the other OpenAI-compatible providers) | `httpx` request hook reading the prepared request's `Content-Length` | Exact HTTP request-body bytes (the JSON prompt payload). |
+| `ai_discovery` (`openai`, `gemini`, …) | same hook, plus a per-request category override where a provider reuses its chat client for `/models` | Exact request-body bytes (0 for a GET). |
+| `stt_provider` (`groq`, `speechmatics`, `gemini_media`) | same hook | Exact body bytes. Multipart framing is included because `Content-Length` describes the body httpx actually sends. |
+| `tts_provider` (`gemini`, `openai`, `grok`, `speechmatics`) | same hook | Exact JSON request-body bytes. |
+| `supabase_rest` (`postgrest`) | same hook, installed on the ONE HTTP/1.1 PostgREST session (`backend/db/transport.py`) | Exact PostgREST request-body bytes for every table/RPC call of the shared client. |
+| `supabase_storage` (`storage_upload`) | explicit payload length at the two Storage upload call sites | Exact object payload bytes; the Storage request's multipart framing is not included. |
+| `render_api` (`render`) | `httpx` request hook | Exact request-body bytes (a GET, so 0). |
+
+`Content-Length` is read from the already-prepared request, so the body is
+never consumed, re-serialized or buffered: streaming, retries and connection
+lifecycle are untouched. `exact_payload_bytes` excludes TCP/IP, TLS and HTTP
+headers, and an error response (>= 400) marks the same operation failed.
+
+### 2. Estimated measurements
+
+**None.** Every instrumented path exposes an exact body length, so
+`estimated_payload_bytes` stays 0 and is never summed with an exact total. The
+estimate channel exists only so a future path that can bound but not measure
+its payload cannot silently corrupt an exact figure; a body of unknown length
+(a chunked stream) is reported as unmeasured instead.
+
+### 3. Paths still unmeasured
+
+| Path | Why |
+|---|---|
+| Telegram MTProto traffic (RPC frames, TL/encryption overhead, keepalives, panel edits, reactions, connection setup, updates) | No supported, documented byte seam at the transport layer; a private-internals or global-socket counter would change protocol/lifecycle/retry behavior. |
+| Helper-bot traffic | The helper bot performs no file uploads (panels are inline results and text edits), and its MTProto bytes are unmeasurable for the same reason. `telegram_helper` therefore stays at zero. |
+| Supabase Storage request framing and other Storage/GoTrue HTTP calls | `storage3` builds its own session internally; the two upload payloads are measured explicitly instead, and the rest is reported as unmeasured rather than estimated. |
+| HTTP responses served by this service (`/health`, `/api/*`, the SPA, `/guide`, `/appearance/image/*`) | They are egress, but they are response bodies rather than request payloads; dashboard polling and Telegram fetching the appearance rendition stay outside these counters. |
+| TLS/TCP overhead, DNS, retransmissions | Not visible at the application seam; Render's NAT metric includes them. |
+
+### 4. Log format and collection window
+
+One summary at most once per 300 s, emitted lazily by the next recorded event
+(no timer, no task, no scheduler), with at most one line per (category, label)
+plus one totals line:
+
+```
+[RENDER_EGRESS] window=2026-11-23T10:00:00Z..2026-11-23T10:05:00Z category=telegram_self_upload label=deep_save exact_payload_bytes=1834221 estimated_payload_bytes=0 operation_count=2 failed_operation_count=0 unmeasured_operations=0 scope=process
+[RENDER_EGRESS] window=2026-11-23T10:00:00Z..2026-11-23T10:05:00Z totals exact_payload_bytes=... estimated_payload_bytes=0 operation_count=... failed_operation_count=... unmeasured_operations=... note=application_payload_only_not_render_bandwidth
+```
+
+Only fixed category names, bounded labels, byte counts, operation counts and
+UTC timestamps are emitted — never a URL, query string, id, filename, prompt,
+message content, credential or header. Collect for at least one full UTC day
+(ideally a week) after a restart so the comparison covers complete,
+hour-aligned Render metric points.
+
+**Counters live in this process only**: they reset on every restart/redeploy,
+and a window whose activity never resumes is emitted only when activity next
+arrives (or on an explicit `flush()`). A restart is a hard boundary in the
+data; nothing is persisted.
+
+### 5. Comparing with Render NAT
+
+1. Pick a UTC window that starts AFTER the process started (check the
+   deploy/restart time in the Render log); no data exists before the first
+   `[RENDER_EGRESS]` line.
+2. Sum the `exact_payload_bytes` fields for that window (the totals line
+   repeats the sum).
+3. Read Render's outbound/NAT metric for the SAME UTC window (Bandwidth panel
+   or the Render dashboard). The metric is hourly and published with a delay,
+   so the newest hour may still be incomplete.
+4. Compare and expect `NAT >= measured`:
+   `unexplained = NAT - exact_payload_bytes`. That difference is expected to
+   contain TLS/TCP/IP overhead, HTTP headers, MTProto framing and encryption,
+   all Telegram non-file traffic, HTTP responses served by this service, and
+   every path listed as unmeasured above.
+5. A measured category that is far larger than expected is a finding; these
+   counters do not by themselves identify a root cause, and their sum is NOT
+   Render bandwidth.
+
+### 6. Verification
+
+```
+.venv/bin/python -m pytest -q tests/test_egress_attribution.py --asyncio-mode=auto
+→ 36 passed
+
+.venv/bin/python -m pytest -q --asyncio-mode=auto
+→ 8124 passed, 27 skipped, 4 failed
+
+.venv/bin/python -m compileall -q backend   → exit 0
+git diff --check                            → exit 0
+```
+
+The four failures are the pre-existing, unrelated documentation-inventory and
+time-dependent scheduler tests already recorded in §5 above; they are
+unchanged by this work.
+
+Nothing was deployed, no Render environment variable was changed, no SQL ran,
+no Supabase schema or row was touched, and no live Telegram/provider/Supabase
+request was made from this workspace.
+
+### 7. Unchanged by this change
+
+Governor limits and accounting semantics, ProviderManager fallback/retry/
+cooldown, Telegram RPC behavior, feature availability, OCR/STT/TTS selection
+and retry policy, Supabase schema, `DATABASE_ARCHITECTURE.md`, the one-shot
+Render bandwidth-source diagnostic, and every other Render account. No second
+scheduler, executor, update loop, runtime, socket monkeypatch or HTTP client
+was added: the existing clients gain exactly one observer hook when the flag
+is `1`.

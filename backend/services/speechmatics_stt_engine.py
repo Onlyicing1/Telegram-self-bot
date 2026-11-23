@@ -72,6 +72,7 @@ from typing import Any
 
 import httpx
 
+from backend.observability import egress_attribution as egress
 from backend.services import media_service
 from backend.services.gemini_media_engine import STT_MAX_PASSES
 from backend.services.media_service import MediaError
@@ -795,7 +796,10 @@ class SpeechmaticsBatchEngine:
         would be cross-request mutable state — the ``__slots__`` contract is
         exactly that this engine holds none.
         """
-        return httpx.Client(timeout=timeout)
+        return httpx.Client(
+            timeout=timeout,
+            **egress.sync_client_kwargs("stt_provider", "speechmatics"),
+        )
 
     # ── Observability (bounded, never payload/credential/Telegram metadata) ──
 

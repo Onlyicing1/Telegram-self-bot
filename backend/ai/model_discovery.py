@@ -47,6 +47,8 @@ from typing import Any
 
 import httpx
 
+from backend.observability import egress_attribution as egress
+
 logger = logging.getLogger(__name__)
 
 _CACHE_TTL = int(os.getenv("MODEL_DISCOVERY_CACHE_TTL", "600"))  # seconds
@@ -379,7 +381,10 @@ async def _fetch_openai_compat_models(
     headers = {"Authorization": f"Bearer {api_key}"}
 
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with httpx.AsyncClient(
+            timeout=15,
+            **egress.async_client_kwargs("ai_discovery", provider_name),
+        ) as client:
             resp = await client.get(url, headers=headers)
             if resp.status_code != 200:
                 logger.warning("Model discovery: %s returned %d", provider_name, resp.status_code)
@@ -456,7 +461,10 @@ async def _fetch_gemini_models(api_key: str, base_url: str) -> list[ModelInfo]:
     headers = {"x-goog-api-key": api_key}
 
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with httpx.AsyncClient(
+            timeout=15,
+            **egress.async_client_kwargs("ai_discovery", "gemini"),
+        ) as client:
             for _ in range(_MAX_DISCOVERY_PAGES):
                 params: dict[str, Any] = {"pageSize": 100}
                 if page_token:

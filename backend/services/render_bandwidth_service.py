@@ -14,6 +14,8 @@ from typing import Any
 
 import httpx
 
+from backend.observability import egress_attribution as egress
+
 _API_URL = "https://api.render.com/v1/metrics/bandwidth"
 _TIMEOUT = httpx.Timeout(8.0, connect=3.0)
 _UNIT_BYTES = {
@@ -157,7 +159,10 @@ async def get_render_bandwidth_usage(
     }
 
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        async with httpx.AsyncClient(
+            timeout=_TIMEOUT,
+            **egress.async_client_kwargs("render_api", "render"),
+        ) as client:
             response = await client.get(_API_URL, params=params, headers=headers)
             response.raise_for_status()
             payload = response.json()

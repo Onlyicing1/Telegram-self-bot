@@ -43,6 +43,7 @@ from backend.bio.engine import _get_tz
 from backend.db import client as db_client
 from backend.diagnostics import record_event
 from backend.helper import symbols as sym
+from backend.observability import egress_attribution as egress
 from backend.runtime import save_trace
 from backend.services import settings_service
 
@@ -1653,6 +1654,7 @@ async def _deep_save_one(
             upload_callback = _transfer_progress_callback(
                 progress, "upload", item_index, item_count, actual_size
             )
+            upload_egress = egress.telegram_upload("telegram_self_upload", "deep_save")
             if trace is not None:
                 trace.event(
                     "upload", save_trace.CALL_START, func="send_file",
@@ -1661,15 +1663,17 @@ async def _deep_save_one(
             try:
                 t1 = asyncio.get_event_loop().time()
                 upload_kwargs = _upload_kwargs_for_media(media, mime_type, file_name)
+                upload_callback = upload_egress.wrap(upload_callback)
                 if upload_callback is not None:
                     upload_kwargs["progress_callback"] = upload_callback
                 await _reserve_upload_bytes("telegram_media", actual_size)
-                sent = await client.send_file(
-                    "me",
-                    tmp_path,
-                    caption=caption,
-                    **upload_kwargs,
-                )
+                with upload_egress:
+                    sent = await client.send_file(
+                        "me",
+                        tmp_path,
+                        caption=caption,
+                        **upload_kwargs,
+                    )
                 record_event("save", "send_file", (asyncio.get_event_loop().time() - t1) * 1000, "SUCCESS")
             except asyncio.CancelledError:
                 if trace is not None:
@@ -1927,13 +1931,16 @@ async def _deep_save_album(
             upload_callback = _transfer_progress_callback(
                 progress, "upload", index, total_items, member_size
             )
+            upload_egress = egress.telegram_upload("telegram_self_upload", "album_member")
             try:
                 t1 = asyncio.get_event_loop().time()
-                upload_kwargs = {"progress_callback": upload_callback} if upload_callback else {}
+                progress_cb = upload_egress.wrap(upload_callback)
+                upload_kwargs = {"progress_callback": progress_cb} if progress_cb else {}
                 # Each member is a REAL byte transfer here.  The grouped send
                 # below only attaches these already-uploaded handles.
                 await _reserve_upload_bytes("telegram_media", member_size)
-                handle = await client.upload_file(tmp_path, **upload_kwargs)
+                with upload_egress:
+                    handle = await client.upload_file(tmp_path, **upload_kwargs)
                 record_event(
                     "save", "upload_file",
                     (asyncio.get_event_loop().time() - t1) * 1000, "SUCCESS",

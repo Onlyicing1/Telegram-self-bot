@@ -1147,7 +1147,11 @@ async def test_no_telegram_metadata_reaches_the_transcription_model(stub):
 
 def test_the_engine_module_gains_no_new_import():
     names = {name for name, _ in inspect.getmembers(engine_module, inspect.ismodule)}
-    assert names == {"base64", "logging", "os", "time", "httpx", "media_service"}
+    # ``egress`` is the one first-party measurement import (opt-in outbound
+    # attribution); no OTHER import may be added to this module.
+    assert names == {
+        "base64", "logging", "os", "time", "httpx", "media_service", "egress",
+    }
     source = inspect.getsource(engine_module)
     assert "\nimport re" not in source and "\nfrom re" not in source
 
