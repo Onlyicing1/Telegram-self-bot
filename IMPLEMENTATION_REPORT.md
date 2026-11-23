@@ -1,323 +1,238 @@
 # IMPLEMENTATION REPORT
 
-**Reporting date:** 2026-11-17
-**Delivery:** Scheduled History summarization reliability — provider/model exhaustion
-and failure-metadata persistence
-**Base commit:** `0f3c39a02ef547759a4419686b98e46ba3f69e3e` (verified equal to
-`origin/main` by `git fetch` + `git rev-parse origin/main` before editing)
+**Reporting date:** 2026-11-23
+**Delivery:** Emergency outbound bandwidth containment — fail-closed governor and
+removal of every verified upload bypass
+**Parent commit:** `77e451be69c222bb3a43f7bd3c53a5d44ae775cc` (verified equal to
+`origin/main` by `git fetch origin main:refs/remotes/origin/main` +
+`git rev-parse origin/main`; the local branch was fast-forwarded to it before
+editing)
 **Branch:** `freebuff/f5137e20b1c5761eea04f020`
-**Status:** **Both diagnosed defects are fixed and offline-tested. Nothing was
-deployed, no SQL was executed, and no live provider, Supabase or Render call was
-made from this workspace.**
+**Delivery commit:** the single commit carrying this report (`git log -1`)
+**Status:** **IMPLEMENTED · TESTED OFFLINE · NOT LIVE VERIFIED · NOT DEPLOYED.**
+No SQL was executed, no Supabase schema or row was modified, no Render action
+was taken and no live provider/Telegram call was made from this workspace.
 
 ---
 
-## 1. Starting state (verified against source, not a previous report)
+## 1. Verified root causes
 
-| Item | Verified state |
-|---|---|
-| Local HEAD before editing | `0f3c39a02ef547759a4419686b98e46ba3f69e3e` |
-| `origin/main` | identical to HEAD (fast-forwarded earlier in this task after main was 20 commits ahead) |
-| Working tree before editing | clean; only untracked obsolete P1 drafts, removed before delivery |
-| Scheduled History path | `scheduled_history` tool → `history_schedule_service` → `history_ai_service.summarize_incremental` → `ProviderManager.chat` → durable CAS |
-| History storage | `public.history_schedules` already exists with `summary`, `scanned_cursor`, `summarized_cursor`, `revision`, `version`, `last_error`, `last_error_at`; no schema change was needed |
+All six were read from the source at the parent commit; the previous report was
+not trusted.
 
-The live log entries supplied with this task (2026-11-18) were treated as
-evidence of *behaviour*, and every conclusion below was re-derived from the
-current source.
-
-## 2. Root cause — provider/model exhaustion (no fake success involved)
-
-`ProviderManager` did attempt multiple candidates. The failure is exhaustion, and
-three independent facts explain why every candidate was unusable:
-
-1. **The production candidate pool was effectively empty.** Routing's candidate
-   list for a provider is the configured default model followed by
-   discovery-published models (`ProviderManager._candidate_models`). The durable
-   pool (`backend/ai/candidate_pool.py`, `ai_model_candidates:v1`) is restored
-   once at boot and only from a **complete** Test Modules run no older than 24 h.
-   With no such document the pool is empty, which is exactly the live
-   `models=1` shape: one model per provider was attempted. The live matrix shows
-   precisely one model per provider (Groq, SambaNova, Cohere), so model-level
-   fallback had nothing else to route to.
-2. **Several configured default model ids are stale in the repository itself.**
-   `backend/ai/providers/base/defaults.py` still configures
-   `groq/llama-3.3-70b-versatile`, `sambanova/DeepSeek-V3-0324` and
-   `cohere/command-r-plus`. The live responses for those ids were HTTP 404 /
-   `model_not_found`. This is a repository-owned configuration defect, not a
-   routing defect.
-3. **Three providers were genuinely rate-limited** (Gemini, OpenAI,
-   NaraRouter). A 429 is not retriedable in the same-model sense: `health.py`
-   defines `RETRYABLE_FAILURES = {"network", "timeout", "server"}`. A
-   `rate_limited` failure is retried only when its `Retry-After` is short
-   (`_attempt_with_retry`), otherwise routing fails over immediately; the logged
-   `retryable=False` is therefore **intentional and correct**, not a defect. It
-   means "do not hammer this model again immediately", and `chat()` still moved
-   to the next candidate.
-
-**No model id was changed.** Credentials for a live `/models` query are not
-available in this workspace, so replacing ids would be speculation. Instead the
-router now keeps a provider eligible when its configured model has been *proven*
-dead in-process: `_candidate_models` appends the repository's curated offline
-catalog (`backend/ai/model_discovery.py::_FALLBACK_CATALOG`, exposed as
-`fallback_catalog()`) **only after** `_model_unavailable(name, configured)` is
-true. Every catalog candidate is still re-proven by a real attempt and is
-quarantined by the existing health rules when it fails. This changes no
-provider, adds no dependency and invents no identifier.
-
-The History layer still calls `ProviderManager.chat` and nothing else. It has no
-provider-specific router, and when the manager reports exhaustion the service
-records an honest failure; it never fabricates a summary.
-
-## 3. Root cause — `HISTORY_SCHEDULE_FAILURE_RECORD_FAILED ... error=TypeError`
-
-**Exact expression:** the History CAS write payloads contained raw `datetime`
-objects, and `postgrest-py 0.16.11` (from `supabase==2.4.2`) hands the payload to
-`httpx` with `json=...`, whose encoder calls `json.dumps`. That raises
-`TypeError: Object of type datetime is not JSON serializable` **before any HTTP
-request is sent**.
-
-The failing write was `SupabaseTaskRepository.record_history_failure`, whose
-payload sets `last_error_at=now` and `updated_at=now`. The same latent defect
-existed in `commit_history_success`, `advance_history_scan`,
-`reset_history_summary` and the legacy-row repair path — they were only not
-observed live because the AI stage failed before a success commit. The
-in-memory repository and the test fake table store dicts directly, which is why
-the existing suite passed.
-
-**Proof (offline, no live database):**
-
-- `postgrest/_sync/request_builder.py` passes `json=self.json` to httpx.
-- `json.dumps({"last_error_at": datetime.now(timezone.utc)})` →
-  `TypeError: Object of type datetime is not JSON serializable`.
-- `task_repository._serialize(datetime)` → ISO-8601 string; every `ai_tasks`
-  write already uses it. History writes did not.
-
-**Fix:** every History write payload is passed through `_serialize` after the
-existing validation (validation still accepts datetime-shaped values because
-rows are parsed back to datetimes). The TypeError is no longer swallowed or
-hidden: the repository still re-raises `TypeError`/`ValueError`, and
-`_record_failure` now logs a bounded, single-line `detail=` (message text only,
-truncated to 200 chars) in addition to the exception class, so a future transport
-failure is actionable. No summary, message body, prompt or identifier is logged.
-
-**Invariants preserved and tested:** a failure record leaves `summary`,
-`scanned_cursor`, `summarized_cursor` and `revision` untouched; it increments
-`version` exactly once; the next CAS with the old version is stale and returns
-`None`; a fresh CAS still has to match; owner/peer scoping and the
-one-row-per-owner+peer uniqueness are unchanged.
-
-## 4. Changes
-
-| # | File | Change |
+| # | Root cause | Evidence in source |
 |---|---|---|
-| C1 | `backend/ai/database/task_repository.py` | Serialize every History write payload (`record_history_failure`, `commit_history_success`, `advance_history_scan`, `reset_history_summary`, deleted-row repair) with `_serialize` before the PostgREST update; comment records why validation may keep datetime objects |
-| C2 | `backend/services/history_schedule_service.py` | `_record_failure` warning now carries a bounded `detail=` for the persistence exception; scheduled AI trace carries `candidates_failed` / `failure_categories` from the AI result |
-| C3 | `backend/services/history_ai_service.py` | `HistoryAIError` gained bounded `metadata`; new `_provider_diagnostics` extracts only counts and normalized categories from the manager's matrix (no response text); failed provider calls put those scalars in the occurrence trace and return them in the failure data |
-| C4 | `backend/ai/providers/manager/manager.py` | `_candidate_models` appends curated catalog ids for a provider whose configured model was proven unavailable in-process; new `_catalog_models` helper; no routing authority moved |
-| C5 | `backend/ai/model_discovery.py` | Public `fallback_catalog()` returning a copy of the curated offline catalog |
-| C6 | `tests/test_history_schedules.py` | Regression: every History write payload survives `json.dumps` (the real transport encoding), with correct version/revision behaviour |
-| C7 | `tests/test_history_schedule.py` | Regression: exhaustion failure data carries bounded counts/categories only — provider response text and message body are absent |
-| C8 | `tests/test_model_candidate_pool.py` | Regression: a proven-dead configured model falls back to curated catalog candidates; a 429 without `Retry-After` is not retried on the same model and fails over |
-| C9 | `ROADMAP.md` | New future section: General AI Execution Orchestrator — **APPROVED DIRECTION / DESIGN REQUIRED / NOT IMPLEMENTED**, with ordering, checkpoint semantics, boundaries, budgets, dependencies, acceptance criteria and open questions |
-| C10 | `IMPLEMENTATION_REPORT.md` | This report |
+| A | A reservation could succeed with **no durable accounting** | `outbound_bandwidth_service._read_row_state()` returned `{}` when `_db_configured()` was false, and `reserve_outbound_bytes()` set `ok = True` on the same condition — a success that was never persisted |
+| B | **Malformed persisted state was read as zero usage** | `_normalize_state()` returned `(0, 0)` for non-dict values and swallowed `int(...)` failures per window, resetting the counters |
+| C | Three Telegram uploads treated the governor as **optional** | `telegram_api/media.py::send_voice` and both `save_service.py` sites used `if _outbound_bandwidth_service is not None` + `getattr(... callable ...)` |
+| D | Two Telegram uploads had **no accounting at all** | `ai/tools/delivery.py::_send_text_attachment` (`sender.send_file`) and `retrieve_service.do_change_file_name` (`client.send_file("me", tmp_path)`) |
+| E | The album reserved the **wrong event** and risked double counting | `_deep_save_album` reserved `total_size` before the grouped `send_file`, while the real transfer happens earlier in per-member `client.upload_file` |
+| F | The Gemini helper **swallowed a missing governor** | `_reserve_gemini_bandwidth()` used `except Exception: return` / `if not callable(...): return`, and ran the async entry point with `asyncio.run()` from a worker thread |
+| G | The **lock did not cover worker threads or a second loop** | `_lock` was an `asyncio.Lock`; `reserve_outbound_bytes_sync()` created fresh loops (directly or in a thread pool) |
 
-No schema, migration, `DATABASE_ARCHITECTURE.md`, Evidence, Taskloom UI,
-interpreter, dependency or environment change.
+`rate_limited`/provider behavior and every other subsystem were out of scope and
+untouched.
 
-## 5. Tests actually executed
+## 2. Complete outbound upload audit (production code)
 
-Installed a local virtualenv from `backend/requirements.txt` plus pytest
-(Python 3.12.3, pytest 9.2.0, supabase 2.4.2). No test contacted a live service.
+| Site | Mechanism | Classification | Disposition |
+|---|---|---|---|
+| `telegram_api/media.py::send_voice` | `client.send_file(BytesIO, voice_note=True)` | new byte transfer | reserved once, before the RPC; denial raises `TelegramAPIError` |
+| `save_service.py::_deep_save_one` | `client.send_file("me", tmp_path)` | new byte transfer | reserved once with the downloaded `actual_size` |
+| `save_service.py::_deep_save_album` | `client.upload_file(tmp_path)` per member | new byte transfer | reserved per member with that member's size |
+| `save_service.py::_deep_save_album` | `client.send_file("me", [InputMediaUploaded*])` | reuse of uploaded handles | **no reservation** (no new bytes) |
+| `ai/tools/delivery.py::_send_text_attachment` | `sender.send_file(BytesIO, force_document=True)` | new byte transfer | reserved once with `len(payload)` |
+| `retrieve_service.py::do_change_file_name` | `client.send_file("me", tmp_path, ...)` | new byte transfer | reserved once with the downloaded size |
+| `retrieve_service.py::do_retrieve` / `do_bulk_send` | `forward_messages` | Telegram-side forward, no local upload | unchanged |
+| `retrieve_service.py` caption sync | `edit_message` | metadata only | unchanged |
+| `appearance_service.py::_upload_sync` | Supabase Storage `.upload(key, data)` | external-provider upload | reserved via the sync entry point before transfer |
+| `anti_edit_delete_service.py::store_media_snapshot` | Supabase Storage `.upload(...)` | external-provider upload | reserved before transfer; denial reports "not archived" |
+| `gemini_media_engine.py` (`_run`, `_run_consensus`, `_run_dedicated_transcription`) | Gemini inline base64 / Files API upload | external-provider upload | mandatory sync reservation, conservative bound (base64 + 4096) |
+| `save_service.py` text branch | `client.send_message` | text only | unchanged |
+| `ai/tools/delivery.py` text paths | `edit` / `reply` | text only | unchanged |
+| every `download_media(...)` | Telegram download | download only | unchanged |
 
-| Command | Result |
-|---|---|
-| `pytest tests/test_history_schedules.py tests/test_history_schedule.py tests/test_model_candidate_pool.py tests/test_history_ai_tools.py tests/test_history_schedule_tracing.py -q` | **176 passed** |
-| `pytest tests/ -q` | **7964 passed, 27 skipped, 4 failed** in 168.53 s |
-| `python -m compileall -q backend tests` | exit 0 |
-| `git diff --check` | exit 0 (no whitespace errors) |
+`InputFile` / `InputMediaUploaded*` are constructed only where the album attaches
+handles produced by its own `upload_file` calls.
 
-The four full-suite failures are the same set recorded in the previous report at
-`6ac156e`; none touches this diff:
+## 3. Implemented protections
 
-- `test_database_architecture_doc::test_every_migration_file_is_classified_in_the_audit_section`
-- `test_database_setup_order::test_the_audited_order_is_recorded_in_the_audit_table`
-- `test_private_message_db_security::test_the_documented_counts_match_the_repository`
-  — these three read `DATABASE_ARCHITECTURE.md`, which this task forbids changing.
-- `test_task_scheduler::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`
-  — the known time-dependent test (fixed 2026-09-10 schedule is in the past).
+`backend/services/outbound_bandwidth_service.py`
 
-The new tests are offline. They prove payload serialization, bounded
-diagnostics, catalog fallback selection and rate-limit policy; they do **not**
-prove that any live provider now answers.
+- `_read_row_state()` now raises `OutboundBandwidthUnavailableError` when no
+  database is configured — there is no reservation-without-accounting branch.
+  Repository read exceptions, a missing row and a non-dict row are all normalized
+  to the same typed denial.
+- `_normalize_state()`/`_window_bytes()` are strict: `{}` is a real zero (the
+  migrated column's fresh value); anything else that is not exactly
+  `{"version":1,"daily":{period,bytes},"monthly":{period,bytes}}` is a denial.
+  A previous day/month remains a legitimate rollover.
+- `_reserve_locked()` performs read -> both limit checks -> write -> **confirm by
+  re-reading the stored row**. A refused write, a raised write or an unconfirmed
+  write denies after `_MAX_CONFIRM_ATTEMPTS` (3). Both limits are checked before
+  any write.
+- `_lock` is a `threading.Lock`, serializing the whole sequence across every
+  event loop and worker thread; `reserve_outbound_bytes()` runs it via
+  `asyncio.to_thread`, and `reserve_outbound_bytes_sync()` is now a genuine
+  synchronous entry point (no `asyncio.run`, no new loop, no lock rebinding).
+- `_validate_byte_count` rejects `0`, negatives, booleans and non-integers.
+- `get_outbound_usage()` keeps `available: False` + `state: "unavailable"` +
+  a `detail` for unconfigured, missing, malformed and unreadable state, so a
+  panel never shows a fabricated zero.
+- The dead `_memory_state` fallback was removed; the exact limits
+  (`150_000_000` / `4_000_000_000`) are unchanged; `release_reservation` remains
+  a no-op (reservations are conservative).
 
-## 6. Supabase impact
+Upload boundaries
 
-**None.** No SQL was executed, no migration was created or applied, no table,
-function, grant, trigger or RLS policy was altered, and no private
-summary/message content was read. The `public.history_schedules` contract is
-unchanged; the fix only changes the JSON type sent for timestamp columns the
-table already has.
+- `telegram_api/media.py`: the optional module import is gone. `send_voice`
+  reserves before constructing the upload and converts any governor failure into
+  `TelegramAPIError`, so the RPC is never attempted.
+- `save_service.py`: optional import removed. Single uploads reserve
+  `actual_size`; each album member reserves its own `member_size` before
+  `upload_file`; the grouped send no longer reserves (it attaches existing
+  handles).
+- `ai/tools/delivery.py`: the attachment reserves `len(payload)` before
+  `sender.send_file`. A denial therefore produces no upload; the existing honest
+  fallback still delivers the content as text.
+- `retrieve_service.py`: the rename re-upload reserves the downloaded file size
+  before `send_file`; a denial returns the existing failure message and leaves
+  the row and the old message untouched.
+- `gemini_media_engine.py`: an unimportable governor or a missing sync entry
+  point now raises instead of returning, so a remote payload can never start
+  unaccounted. OCR/STT routing, retries, deadlines and representation choices
+  are unchanged.
+- `appearance_service.py` and `anti_edit_delete_service.py`: the two Supabase
+  Storage uploads reserve their bytes before the object transfer.
 
-## 7. Render / live verification status
+No second client, runtime loop, scheduler, upload manager, table, column,
+migration, accounting store or in-memory production fallback was added.
+`RuntimeSupervisor`, Dispatcher, ToolExecutor, ProviderManager, TelegramAPI and
+service-layer ownership are untouched.
 
-**NOT LIVE VERIFIED.** This workspace has no `RENDER_*`, `SUPABASE*` or provider
-credentials and no Render shell (Render Free has none). Therefore:
+## 4. Upload paths still not governed
 
-- the deployed commit was not compared with `origin/main`;
-- no live provider success was observed;
-- no live failure-metadata write was executed against PostgREST.
+These are genuinely outside the governor and are reported rather than claimed:
 
-Expected live effect: the next scheduled run whose AI stage fails will persist
-failure metadata instead of logging `TypeError`; the run after a
-`model_not_found` on a configured model can now attempt that provider's curated
-catalog models. Whether any candidate answers still depends on the live accounts'
-quotas and on ids that only a live model-list call can confirm.
+1. **HTTP response egress** — `/health`, the dashboard SPA and `/api/*`, the
+   static guide site, and the appearance image renditions Telegram fetches.
+2. **Telegram protocol traffic** — updates, RPC frames, keepalive pings, and the
+   helper bot's own traffic.
+3. **Supabase request/response bytes**, including the accounting write itself.
+4. **Cross-process atomicity** — see §8.
 
-## 8. ROADMAP entry
+No Telegram file-upload path and no Storage upload path remains ungoverned.
 
-`ROADMAP.md` now contains a separated section
-**"Future roadmap: General AI Execution Orchestrator"** with status
-**APPROVED DIRECTION / DESIGN REQUIRED / NOT IMPLEMENTED**. It records the
-problem, intended behaviour, checkpoint semantics (application-owned, bounded,
-validated; not a previous model's answer and no hidden chain-of-thought), bounded
-multi-model decomposition/synthesis, cross-Self-Bot scope, ProviderManager /
-ToolExecutor boundaries, cost/concurrency/idempotency/validation/privacy
-requirements, dependencies, acceptance criteria and risks. It also states the
-required order (reliability fix → verify → design → checkpoint foundation →
-bounded orchestration → incremental adoption) and marks step 1 as
-implemented/offline-tested with live verification still pending.
+## 5. Tests and exact results
 
-## 9. Deferred work
+New suites
 
-- **Live verification** of provider recovery and of failure-metadata persistence
-  on Render/Supabase (owner-operated; no credentials here).
-- **Authoritative model-id refresh** for the retired Groq, SambaNova and Cohere
-  defaults. This needs a live provider model-list call, which was not possible;
-  the catalog fallback is a mitigation, not a replacement for that refresh.
-- **Filling the durable candidate pool in production** by running a complete Test
-  Modules pass within the 24-hour freshness window.
-- The **General AI Execution Orchestrator** itself — design only, not implemented.
-- The four pre-existing test failures listed in §5.
+- `tests/test_outbound_bandwidth_governor.py` — no database, missing row,
+  repository read failure, refused write, raised write, lost/unconfirmed write,
+  daily limit, monthly limit, exact remaining capacity, period rollover, eleven
+  malformed-state shapes, fresh `{}` as a real zero, invalid byte counts, and
+  concurrent reservations against a patched budget.
+- `tests/test_outbound_upload_governance.py` — voice reservation/denial/import
+  failure, AI attachment reservation/denial/import failure, denied attachment
+  falling back to text with zero uploads, ordinary text delivery untouched,
+  Gemini import failure, missing sync entry point, conservative bound, OCR
+  blocked before the provider, OCR unchanged on success.
 
-## 10. Limitations recorded
+Extended suites (real upload fakes record the RPC)
 
-- The TypeError fix is proven against the real transport's encoding rule
-  (`json.dumps`), not against a live PostgREST instance.
-- Provider exhaustion remains possible: three providers were genuinely
-  rate-limited, and a curated catalog cannot manufacture quota.
-- The diagnostics added are counts and normalized categories; they do not
-  include provider response text by design.
+- `tests/test_12_save_engine.py` — single Deep Save reserves exactly the
+  downloaded size; a denied reservation means no `send_file`.
+- `tests/test_save_album_view_once_progress.py` — three members reserve exactly
+  `[1000, 1000, 1000]`, three `upload_file` calls, one grouped `send_file`; a
+  denied reservation means no upload and no send.
+- `tests/test_save_v2_telegram_sync.py` — the rename re-upload reserves the
+  downloaded size; a denial uploads nothing and deletes nothing.
+- `tests/conftest.py` — an autouse fixture supplies a per-test persistence
+  double for the governor (the suite has no Supabase, and production accounting
+  is durable-only). It fakes ONLY `_db_configured` + the repository; the
+  fail-closed contract is exercised against explicit fakes in the new governor
+  suite.
 
----
+Exact commands and results
 
-## 11. Follow-up delivery — Scheduled History delivery correction and Summary Archive (2026-11-18)
+```
+.venv/bin/python -m pytest -q \
+  tests/test_outbound_bandwidth_governor.py tests/test_outbound_upload_governance.py \
+  tests/test_bandwidth_panel.py tests/test_12_save_engine.py \
+  tests/test_save_album_view_once_progress.py tests/test_save_v2_telegram_sync.py \
+  tests/test_save_v2_wiring.py tests/test_save_v2_management.py \
+  tests/test_save_v2_metadata.py tests/test_save_v2_resolution.py \
+  tests/test_save_reply_panel_edit.py tests/test_save_success_panel.py \
+  tests/test_save_live_status_and_private_link.py tests/test_save_trace.py \
+  tests/test_save_view_once_photo_semantics.py tests/test_saved_item_sender_and_retrieve.py \
+  tests/test_tts_service.py tests/test_anti_edit_delete.py tests/test_appearance_*.py \
+  tests/test_gemini_*.py tests/test_media_*.py tests/test_stt_*.py
+→ 1793 passed, 2 skipped, 0 failed (55.28s)
 
-**Status:** implemented and offline-tested. No SQL, Supabase write, deployment
-or live Telegram call was made from this workspace.
+.venv/bin/python -m pytest -q
+→ 8038 passed, 27 skipped, 4 failed (173.84s)
 
-### Starting state
+.venv/bin/python -m compileall -q backend
+→ exit 0
 
-| Item | Verified state |
-|---|---|
-| Local HEAD before editing | `0d1a9ff36506ec53b849aecbc177a041e1503de3` |
-| `origin/main` before editing | `f61e12ea0bd87fda874ef072e5bf15f42c34e898`; HEAD was 21 ahead, 0 behind |
-| Working tree before editing | clean except the pre-existing untracked `tests/test_runtime_session_terminal.py` |
+git diff --check
+→ exit 0
+```
 
-### Root cause
+The four full-suite failures are **pre-existing and unrelated**: they were
+reproduced on a clean `git worktree add .basecheck HEAD` at the parent commit
+(same four, exit 1) and touch documentation inventories and a time-dependent
+scheduler test:
 
-The Scheduled History wizard created its task with
-`notification_destination = {"chat_id": int(_OWNER_ID), "deliver_result": True}`.
-`TaskExecutionCoordinator._deliver_result` (`backend/ai/task_execution.py`)
-delivers action result messages through `telegram.send_message` when that flag
-is `True`. For `scheduled_history` the action message is the cumulative summary
-and the chat id is the owner's own chat, so every committed occurrence posted
-the summary to Telegram Saved Messages.
+- `tests/test_database_architecture_doc.py::test_every_migration_file_is_classified_in_the_audit_section`
+- `tests/test_database_setup_order.py::test_the_audited_order_is_recorded_in_the_audit_table`
+- `tests/test_private_message_db_security.py::test_the_documented_counts_match_the_repository`
+- `tests/test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`
 
-### Changes
+No SQL ran, no live Supabase/Telegram/Gemini call was made, and the Render
+service was not touched, so every statement here is offline evidence.
 
-1. `backend/bot/handlers/history.py:608` — the wizard writes
-   `notification_destination = {}`. `chat_id` was unnecessary because the action
-   resolves its peer from the durable `history_schedules` row.
-2. `backend/ai/task_execution.py:1840` — `_deliver_result` returns early for any
-   task whose actions include `scheduled_history` (constant from
-   `backend/ai/task_contract.py`). This also stops delivery for definitions
-   already persisted with the old opt-in. Ordinary `deliver_result` tasks and
-   `notify_on_outcome` behavior are unchanged.
-3. `backend/ai/database/task_repository.py` — new
-   `list_history_schedules(owner_id, *, limit, offset)` on the abstract base,
-   the Supabase repository (ordered by `id`, `.range(offset, offset+limit-1)`,
-   `status != 'deleted'`) and the in-memory repository (same ordering/filter).
-   Bounds: `limit` 1–`MAX_HISTORY_LIST_LIMIT` (100), `offset >= 0`; invalid
-   arguments raise `ValueError`. Supabase failures raise
-   `HistoryStorageUnavailable`; no fallback data is returned.
-4. `backend/bot/handlers/history.py` — `history_archive` (bounded list) and
-   `history_archive_item` (detail) panels registered under `history`, plus one
-   `Summary Archive` row after `Run Summary`. The list pages six rows at a time
-   and labels each with its owning task label and revision (or "no summary
-   yet"). The detail shows chat/task/revision/status/cursors/last-commit time
-   and the stored summary, paged deterministically at 2600 chars with no cached
-   state. No AI call, no Telegram send, no summary regeneration.
+## 6. Commit and remote verification
 
-### Tests executed
+- Parent `origin/main`: `77e451be69c222bb3a43f7bd3c53a5d44ae775cc`
+  (fast-forwarded, no rebase/reset/force).
+- Delivery: one commit on `freebuff/f5137e20b1c5761eea04f020`, pushed to
+  `origin/main` without force. The SHA and the remote HEAD were verified after
+  the push in the delivery message (`git rev-parse HEAD`, `git rev-parse
+  origin/main`, `git merge-base --is-ancestor`).
+- Working tree: no pre-existing work was discarded; the only untracked paths are
+  the two new test files, which are part of this commit.
 
-| Command | Result |
-|---|---|
-| `pytest -q tests/test_history_archive.py tests/test_scheduled_history_delivery.py tests/test_history_schedule_ui.py` | **25 passed** |
-| 20 adjacent History / Taskloom / task / panel / Appearance / symbol files | **593 passed, 1 failed** (pre-existing scheduler failure, §12) |
-| `pytest -q --ignore=tests/test_runtime_session_terminal.py` (full suite) | **7984 passed, 27 skipped, 4 failed** (all four pre-existing, §12) |
-| `python -m py_compile` on the three changed modules and three test files | passed |
-| `git diff --check` | clean |
+## 7. Deployment status
 
-### Scope guarantees
+**NOT DEPLOYED / NOT LIVE VERIFIED.** Nothing was pushed to Render, no service
+was restarted, no database row was written and no bandwidth panel was read. The
+production guard only becomes effective once this commit is deployed to the
+Render service and the owner confirms, in the live deployment:
 
-- No scheduler, executor, Telegram client, listener, renderer, summary store,
-  SQL statement, migration or schema change was added.
-- `MAIN_PAGE_IDS`, the 11 main-menu destinations, their labels, callbacks and
-  order, and `AGENTS.md` are untouched.
-- Broader UI-001 navigation work remains deferred (see §13).
+1. the Bandwidth Usage panel reads `available` (not "unavailable"),
+2. a small upload increments both counters,
+3. with the `panel_settings` row temporarily unreadable, an upload is REFUSED.
 
-## 12. Test evidence — follow-up delivery
+## 8. Remaining risk against Render's 5 GB meter
 
-### Focused (25 passed)
+The governor is not, and does not claim to be, a measurement of Render egress.
 
-- `tests/test_history_archive.py` (15 tests) — registration under `history`,
-  exactly one History entry, owner isolation, cross-owner item rejection,
-  empty archive, no-committed-summary state, complete multi-page round-trip,
-  Persian + English preservation, bounded deterministic pagination, invalid /
-  stale tokens, unavailable storage, durable read errors, no AI or Telegram
-  call, 64-byte callback budget, and `deleted` repair rows excluded.
-- `tests/test_scheduled_history_delivery.py` (5 tests) — a real
-  Scheduler → coordinator → ToolExecutor → `scheduled_history` run commits the
-  summary, marks the occurrence succeeded and never calls `send_message`; the
-  same holds for a legacy `deliver_result: true` definition, a no-op run and a
-  failed run; an ordinary opted-in task still delivers.
-- `tests/test_history_schedule_ui.py` (5 tests) — the existing creation test
-  now also asserts `notification_destination == {}`.
-
-### Pre-existing failures (unchanged, reproduced at clean HEAD)
-
-Each was reproduced in a detached `git worktree` at
-`0d1a9ff36506ec53b849aecbc177a041e1503de3` with the same command, so none is
-caused by this delivery:
-
-1. `tests/test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`
-   ("interval advancement exceeded bound").
-2. `tests/test_database_architecture_doc.py::test_every_migration_file_is_classified_in_the_audit_section`.
-3. `tests/test_database_setup_order.py::test_the_audited_order_is_recorded_in_the_audit_table`.
-4. `tests/test_private_message_db_security.py::test_the_documented_counts_match_the_repository`.
-
-### Collection limitation
-
-`tests/test_runtime_session_terminal.py` is a pre-existing untracked file. It
-fails to import (`TERMINAL_SESSION_MESSAGE` is absent from
-`backend/bot/client.py`), so the full suite was run with only that file ignored.
-It was not modified or deleted.
-
-## 13. Deferred after the follow-up delivery
-
-- Broader UI-001 menu/navigation redesign (unchanged, still planned).
-- Live Telegram verification of Scheduled History silence and of the Summary
-  Archive panels on the real account.
-- No per-occurrence summary history exists or is added: the archive shows the
-  one cumulative checkpoint per chat, as the table does.
+- **Already-consumed bandwidth is not recovered.** ~3.8 GB is spent; the daily
+  and monthly budgets only bound the GOVERNED payload bytes from now on.
+- **Unmetered egress remains** (§4): HTTP responses, Telegram protocol traffic,
+  helper-bot traffic and Supabase traffic can still consume the Render meter.
+  A 150 MB/day payload budget does not imply 150 MB/day of total egress, and the
+  service can in principle approach suspension from traffic the governor does
+  not see.
+- **Conservative accounting** means failed/timed-out uploads keep their bytes,
+  so real transfer can be lower than the counter but never higher for governed
+  paths.
+- **Cross-process race.** Within one process the serializer is complete. Two
+  concurrent processes could interleave read-modify-write and lose an increment
+  (worst case: two simultaneous uploads counted once). A database-side
+  compare-and-set would be required to close it; no SQL/migration was created.
+  Mitigation available to the owner without code: keep a single Render instance
+  and avoid overlapping deploy windows during large transfers.
+- **Governed paths are enforced** — if accounting is unavailable, the upload is
+  denied. The service prefers refused uploads over unaccounted egress.

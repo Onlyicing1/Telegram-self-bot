@@ -749,28 +749,22 @@ def _safe_detail(response: httpx.Response) -> str:
 def _reserve_gemini_bandwidth(category: str, payload_size: int) -> None:
     """Reserve outbound bandwidth before a Gemini payload transfer.
 
-    Fail-closed: any governor failure propagates to the media boundary.
+    Fail-closed: an unimportable governor, a governor without its synchronous
+    reservation entry point, or a denied reservation all propagate, so no
+    remote upload can begin unaccounted.  This runs on the media boundary's
+    worker thread, so it uses the governor's synchronous entry point and never
+    creates or touches an event loop.
+
     The import is local so this module's public import surface stays unchanged.
     """
-    try:
-        from backend.services import outbound_bandwidth_service as _bw
-    except Exception:  # noqa: BLE001
-        return
+    from backend.services import outbound_bandwidth_service as _bw
+
     reserve = getattr(_bw, "reserve_outbound_bytes_sync", None)
-    if reserve is None:
-        reserve = getattr(_bw, "reserve_outbound_bytes", None)
     if not callable(reserve):
-        return
+        raise RuntimeError("outbound bandwidth accounting is unavailable")
     # Conservative upper bound: base64 expansion + JSON/transport overhead.
     byte_count = max(int(payload_size), ((int(payload_size) + 2) // 3) * 4) + 4096
-    try:
-        import asyncio
-
-        result = reserve(category, byte_count)
-        if asyncio.iscoroutine(result):
-            asyncio.run(result)
-    except Exception:
-        raise
+    reserve(category, byte_count)
 
 
 class GeminiMediaEngine:

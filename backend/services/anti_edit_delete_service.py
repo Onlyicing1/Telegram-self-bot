@@ -1626,7 +1626,13 @@ async def store_media_snapshot(client: Any, msg: Any, row: dict[str, Any]) -> bo
             if db is None:
                 return False
             with open(path, "rb") as handle:
-                db.storage.from_(bucket).upload(object_name, handle.read())
+                payload = handle.read()
+            # The snapshot is real outbound traffic: reserve it before the
+            # upload, and archive nothing when accounting denies it.
+            from backend.services import outbound_bandwidth_service as governor
+
+            await governor.reserve_outbound_bytes("storage_upload", len(payload))
+            db.storage.from_(bucket).upload(object_name, payload)
             row["media_stored"] = True
             row["media_object"] = object_name
             return True

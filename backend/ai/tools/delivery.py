@@ -713,12 +713,24 @@ def _event_entity(event: Any) -> Any:
     return peer if peer is not None else getattr(event, "chat_id", None)
 
 
+async def _reserve_attachment_bytes(byte_count: int) -> None:
+    """Reserve the attachment's bytes BEFORE Telegram receives them.
+
+    Imported lazily and never guarded: an unimportable governor or a denied
+    reservation must refuse the attachment instead of uploading unaccounted.
+    """
+    from backend.services import outbound_bandwidth_service as governor
+
+    await governor.reserve_outbound_bytes("telegram_media", byte_count)
+
+
 async def _send_text_attachment(sender: Any, entity: Any, payload: bytes) -> None:
     """Send the COMPLETE result as ONE attached text document."""
     if sender is None or not hasattr(sender, "send_file"):
         raise RuntimeError("no Telegram client is available to attach the result")
     if entity is None:
         raise RuntimeError("the request has no chat to attach the result to")
+    await _reserve_attachment_bytes(len(payload))
     await sender.send_file(
         entity,
         io.BytesIO(payload),

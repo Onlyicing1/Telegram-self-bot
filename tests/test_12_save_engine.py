@@ -654,3 +654,47 @@ async def test_save_reply_wait_resolves_reply_to_msg_id_and_deep_saves(monkeypat
     assert not any(c[0] == "forward_messages" for c in calls)
     # The trigger reply is cleaned up after saving.
     assert any(c[0] == "delete_messages" and c[1] == 111 for c in calls)
+
+
+# ── outbound bandwidth governance (single-file Deep Save) ──────────────────
+
+
+def _video_message():
+    media = MessageMediaDocument(document=FakeDoc(), ttl_seconds=None)
+    return FakeMessage(media=media)
+
+
+@pytest.mark.asyncio
+async def test_deep_save_reserves_the_uploaded_bytes_once(monkeypatch):
+    from backend.services import outbound_bandwidth_service as bw
+
+    reserved = []
+
+    async def _reserve(category, byte_count):
+        reserved.append((category, byte_count))
+        return {}
+
+    monkeypatch.setattr(bw, "reserve_outbound_bytes", _reserve)
+    client = MockClient()
+
+    result = await save_service.execute_save(client, 42, _video_message(), "UTC")
+
+    assert getattr(result, "saved", False) is True
+    assert reserved == [("telegram_media", len(client.download_bytes))]
+    assert len([c for c in client.calls if c[0] == "send_file"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_deep_save_never_uploads_when_the_reservation_is_denied(monkeypatch):
+    from backend.services import outbound_bandwidth_service as bw
+
+    async def _deny(category, byte_count):
+        raise bw.OutboundBandwidthUnavailableError("accounting unavailable")
+
+    monkeypatch.setattr(bw, "reserve_outbound_bytes", _deny)
+    client = MockClient()
+
+    result = await save_service.execute_save(client, 42, _video_message(), "UTC")
+
+    assert getattr(result, "saved", False) is False
+    assert [c for c in client.calls if c[0] == "send_file"] == []

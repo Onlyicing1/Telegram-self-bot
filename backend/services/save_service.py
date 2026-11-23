@@ -45,12 +45,19 @@ from backend.diagnostics import record_event
 from backend.helper import symbols as sym
 from backend.runtime import save_trace
 from backend.services import settings_service
-try:
-    from backend.services import outbound_bandwidth_service as _outbound_bandwidth_service
-except Exception:  # noqa: BLE001
-    _outbound_bandwidth_service = None
 
 logger = logging.getLogger(__name__)
+
+
+async def _reserve_upload_bytes(category: str, byte_count: int) -> None:
+    """Reserve outbound bytes BEFORE an upload transmits them (fail closed).
+
+    Imported lazily and never guarded: a governor that cannot be imported has
+    to deny the transfer instead of letting the upload proceed unaccounted.
+    """
+    from backend.services import outbound_bandwidth_service as governor
+
+    await governor.reserve_outbound_bytes(category, byte_count)
 
 _LINK_RE = re.compile(
     r"https?://(?:t|telegram)\.me/"
@@ -1656,10 +1663,7 @@ async def _deep_save_one(
                 upload_kwargs = _upload_kwargs_for_media(media, mime_type, file_name)
                 if upload_callback is not None:
                     upload_kwargs["progress_callback"] = upload_callback
-                if _outbound_bandwidth_service is not None:
-                    _reserve = getattr(_outbound_bandwidth_service, "reserve_outbound_bytes", None)
-                    if callable(_reserve):
-                        await _reserve("telegram_media", actual_size)
+                await _reserve_upload_bytes("telegram_media", actual_size)
                 sent = await client.send_file(
                     "me",
                     tmp_path,
@@ -1926,6 +1930,9 @@ async def _deep_save_album(
             try:
                 t1 = asyncio.get_event_loop().time()
                 upload_kwargs = {"progress_callback": upload_callback} if upload_callback else {}
+                # Each member is a REAL byte transfer here.  The grouped send
+                # below only attaches these already-uploaded handles.
+                await _reserve_upload_bytes("telegram_media", member_size)
                 handle = await client.upload_file(tmp_path, **upload_kwargs)
                 record_event(
                     "save", "upload_file",
@@ -1968,10 +1975,8 @@ async def _deep_save_album(
         )
         try:
             t2 = asyncio.get_event_loop().time()
-            if _outbound_bandwidth_service is not None:
-                _reserve = getattr(_outbound_bandwidth_service, "reserve_outbound_bytes", None)
-                if callable(_reserve):
-                    await _reserve("telegram_media", total_size)
+            # No reservation here: every member was uploaded (and reserved)
+            # individually, and this send only attaches existing handles.
             sent = await client.send_file("me", media_items, caption=caption)
             record_event(
                 "save", "send_file",

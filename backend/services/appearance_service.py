@@ -1071,6 +1071,14 @@ def _db():
 
 
 def _upload_sync(key: str, data: bytes, mime: str) -> None:
+    """Upload ONE object to Storage, accounting its bytes BEFORE transfer.
+
+    Fail-closed: a governor that cannot be imported or a denied reservation
+    refuses the upload instead of sending unaccounted bytes.
+    """
+    from backend.services import outbound_bandwidth_service as governor
+
+    governor.reserve_outbound_bytes_sync("storage_upload", len(data))
     response = _db().storage.from_(bucket()).upload(
         key, data, {"content-type": mime, "upsert": "false"}
     )

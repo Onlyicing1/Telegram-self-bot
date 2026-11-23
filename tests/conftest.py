@@ -8,6 +8,7 @@ Telegram, or external AI providers.
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 from pathlib import Path
 from datetime import datetime, timezone
@@ -125,3 +126,39 @@ def tool_registry(owner_id):
 def engine():
     from backend.ai.engine.engine import Engine
     return Engine()
+
+
+@pytest.fixture(autouse=True)
+def _outbound_bandwidth_test_accounting(monkeypatch):
+    """Give the outbound bandwidth governor a per-test persistence double.
+
+    The suite runs without Supabase, and production accounting is deliberately
+    durable-only: with no database the governor DENIES every reservation. A test
+    that merely exercises an upload path would then fail for a reason it is not
+    testing, so this fixture supplies ONLY the persistence boundary
+    (``_db_configured`` and the repository).
+
+    Nothing else is faked: the fail-closed contract itself — no database, an
+    unreadable row, a malformed state, a refused or lost write, an exceeded
+    limit, and concurrent reservation serialization — is exercised against
+    explicit fakes in ``tests/test_outbound_bandwidth_governor.py``.
+    """
+    from backend.services import outbound_bandwidth_service as bw
+
+    store: dict[str, object] = {"state": {}}
+
+    class _Repo:
+        def load(self):
+            return {
+                "outbound_bandwidth_state": json.loads(json.dumps(store["state"]))
+            }
+
+        def update_field(self, field, value):
+            if field != "outbound_bandwidth_state":
+                return False
+            store["state"] = json.loads(json.dumps(value))
+            return True
+
+    monkeypatch.setattr(bw, "_db_configured", lambda: True)
+    monkeypatch.setattr(bw, "repo", _Repo())
+    yield store

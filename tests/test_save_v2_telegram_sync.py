@@ -1005,3 +1005,48 @@ async def test_the_save_code_and_stored_row_identity_survive_both_syncs():
     assert row["id"] == row_id_before
     assert row["origin_chat_id"] == -1009999 and row["origin_msg_id"] == 4321
     assert retrieve_service._owner_tags(row) == ("university", "semester-2")
+
+
+# ── outbound bandwidth governance (file-name re-upload) ────────────────────
+
+
+@pytest.mark.asyncio
+async def test_the_file_name_change_reserves_the_reuploaded_bytes(monkeypatch):
+    from backend.services import outbound_bandwidth_service as bw
+
+    _seed(_row())
+    client = FakeSavedClient(_document_message())
+    reserved = []
+
+    async def _reserve(category, byte_count):
+        reserved.append((category, byte_count))
+        return {}
+
+    monkeypatch.setattr(bw, "reserve_outbound_bytes", _reserve)
+
+    await retrieve_service.do_change_file_name(client, OWNER, "S0001", "New.pdf")
+
+    assert len(reserved) == 1
+    assert reserved[0][0] == "telegram_media"
+    assert reserved[0][1] == len(client.download_bytes)
+
+
+@pytest.mark.asyncio
+async def test_the_file_name_change_never_uploads_when_accounting_denies(monkeypatch):
+    from backend.services import outbound_bandwidth_service as bw
+
+    _seed(_row())
+    client = FakeSavedClient(_document_message())
+
+    async def _deny(category, byte_count):
+        raise bw.OutboundBandwidthUnavailableError("accounting unavailable")
+
+    monkeypatch.setattr(bw, "reserve_outbound_bytes", _deny)
+
+    result = await retrieve_service.do_change_file_name(
+        client, OWNER, "S0001", "Nope.pdf"
+    )
+
+    assert result.startswith("×")
+    assert client.uploads == []
+    assert client.deletes == []

@@ -24,11 +24,6 @@ from backend.telegram_api.exceptions import (
     TelegramTimeoutError,
 )
 
-try:
-    from backend.services import outbound_bandwidth_service as _outbound_bandwidth_service
-except Exception:  # noqa: BLE001
-    _outbound_bandwidth_service = None
-
 logger = logging.getLogger(__name__)
 
 #: Finite ceiling for ONE media download. A media transfer (up to the
@@ -108,6 +103,25 @@ def _effective_timeout(timeout: float | None) -> float:
     return min(value, MEDIA_DOWNLOAD_TIMEOUT_S)
 
 
+async def _reserve_voice_bytes(byte_count: int) -> None:
+    """Reserve a voice upload's bytes BEFORE it is transmitted.
+
+    Fail-closed by construction: an unimportable governor, a denied
+    reservation or a persistence failure all refuse the upload.  There is no
+    optional-import path that could let the transfer run unaccounted.
+    """
+    try:
+        from backend.services import outbound_bandwidth_service as governor
+    except Exception as exc:  # noqa: BLE001 — an unimportable governor denies
+        raise TelegramAPIError(
+            "send_voice refused: outbound bandwidth accounting is unavailable"
+        ) from exc
+    try:
+        await governor.reserve_outbound_bytes("telegram_media", byte_count)
+    except Exception as exc:  # noqa: BLE001 — exceeded/unavailable both deny
+        raise TelegramAPIError(f"send_voice refused: {exc}") from exc
+
+
 async def send_voice(
     client: Any,
     chat_id: int | str,
@@ -131,10 +145,7 @@ async def send_voice(
     """
     if not isinstance(audio, (bytes, bytearray)) or not audio:
         raise TelegramAPIError("send_voice needs audio bytes; nothing was sent.")
-    if _outbound_bandwidth_service is not None:
-        reserve = getattr(_outbound_bandwidth_service, "reserve_outbound_bytes", None)
-        if callable(reserve):
-            await reserve("telegram_media", len(audio))
+    await _reserve_voice_bytes(len(audio))
     effective = _effective_upload_timeout(timeout)
     try:
         message = await guarded_await(

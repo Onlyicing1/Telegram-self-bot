@@ -355,3 +355,136 @@ revision through one CAS write. Only the post-commit delivery step was wrong.
 **Limitation:** this is verified from source and offline tests. No live
 scheduled occurrence was executed, so the real account's Telegram behavior is
 still owner-verified only.
+
+---
+
+## Outbound bandwidth containment (2026-11-23)
+
+Source-verified against `77e451be69c222bb3a43f7bd3c53a5d44ae775cc`. Render's
+bandwidth meter showed ~3.8 GB; the application limits are 150,000,000 bytes/day
+and 4,000,000,000 bytes/month and were NOT changed.
+
+### 1. Verified root causes
+
+**A. A reservation could succeed without any durable accounting.**
+`backend/services/outbound_bandwidth_service.py::_read_row_state()` returned `{}`
+when `_db_configured()` was false, and `reserve_outbound_bytes()` then took the
+`if not _db_configured(): ok = True` branch. A runtime without a readable
+`panel_settings` row therefore received a SUCCESSFUL reservation that was never
+persisted. The limits existed only on paper for that deployment. The read API
+already disagreed with the write API about the same condition:
+`get_outbound_usage()` reported `available: False` while the write path reported
+success.
+
+**B. Malformed persisted state was read as zero usage.**
+`_normalize_state()` returned `(0, 0)` for any non-dict value and tolerated
+`int(...)` conversion failures per window. A corrupted, partial or future-version
+JSONB value therefore RESET both counters instead of denying.
+
+**C. Three Telegram upload paths treated the governor as optional.**
+`backend/telegram_api/media.py::send_voice`, and both
+`backend/services/save_service.py` upload sites, wrapped the reservation in
+`if _outbound_bandwidth_service is not None:` plus
+`getattr(..., "reserve_outbound_bytes", None)`/`callable(...)`. An import failure
+or a renamed function silently skipped accounting while the upload proceeded.
+
+**D. Two Telegram upload paths had no accounting at all.**
+`backend/ai/tools/delivery.py::_send_text_attachment` called
+`sender.send_file(...)` directly, and
+`backend/services/retrieve_service.py::do_change_file_name` re-uploaded the
+downloaded media through `client.send_file("me", tmp_path, ...)`.
+
+**E. The album path reserved the wrong event and risked double counting.**
+`_deep_save_album` reserved the album TOTAL immediately before the grouped
+`send_file("me", media_items, ...)`. The real byte transfer happens earlier, per
+member, in `client.upload_file(tmp_path)`. So the album's bytes were transmitted
+BEFORE any reservation, and a naive per-member reservation would have counted
+the same bytes twice (once at each member upload, again at the grouped send that
+only attaches already-uploaded handles).
+
+**F. The Gemini reservation helper swallowed a missing governor.**
+`_reserve_gemini_bandwidth()` returned silently when the import failed or the
+callable was absent. It also preferred the ASYNC entry point and ran it with
+`asyncio.run()` from the media boundary's worker thread, which cannot share the
+module's `asyncio.Lock` with the main loop.
+
+**G. The process lock did not cover worker threads or a second loop.**
+`_lock` was an `asyncio.Lock`. `reserve_outbound_bytes_sync()` created a fresh
+event loop (directly or in a `ThreadPoolExecutor`), so a reservation from a
+worker thread either bypassed the lock's loop or failed to bind to it.
+
+### 2. Complete outbound upload audit
+
+Every actual byte-transfer mechanism in `backend/` was classified.
+
+| # | Site | Mechanism | Classification | Before | Now |
+|---|---|---|---|---|---|
+| 1 | `telegram_api/media.py::send_voice` | `client.send_file(BytesIO, voice_note=True)` | new transfer | optional governor | mandatory, denies on failure |
+| 2 | `services/save_service.py::_deep_save_one` | `client.send_file("me", tmp_path)` (Telethon uploads inside) | new transfer | optional governor | mandatory, once, with the downloaded `actual_size` |
+| 3 | `services/save_service.py::_deep_save_album` | `client.upload_file(tmp_path)` per member | new transfer | NOT governed | mandatory per member, with that member's own size |
+| 4 | `services/save_service.py::_deep_save_album` | `client.send_file("me", [InputMediaUploaded*])` | reuse of already-uploaded handles | reserved the album total at the wrong point | deliberately NOT reserved (no new bytes) |
+| 5 | `ai/tools/delivery.py::_send_text_attachment` | `sender.send_file(BytesIO, force_document=True)` | new transfer | NOT governed | mandatory, with `len(payload)` |
+| 6 | `services/retrieve_service.py::do_change_file_name` | `client.send_file("me", tmp_path, ...)` | new transfer (Telegram cannot rename in place) | NOT governed | mandatory, with the downloaded file size |
+| 7 | `services/retrieve_service.py::do_retrieve` / `do_bulk_send` | `client.forward_messages(...)` | Telegram-side forward, no bytes uploaded from this host | n/a | unchanged |
+| 8 | `services/retrieve_service.py` caption sync | `client.edit_message(...)` | metadata edit only | n/a | unchanged |
+| 9 | `services/appearance_service.py::_upload_sync` | Supabase Storage `.upload(key, data)` | external-provider upload | NOT governed | mandatory (sync entry point; runs via `to_thread`) |
+| 10 | `services/anti_edit_delete_service.py::store_media_snapshot` | Supabase Storage `.upload(object_name, bytes)` | external-provider upload | NOT governed | mandatory; denial means "not archived", never a silent transfer |
+| 11 | `services/gemini_media_engine.py` (`_run`, `_run_consensus`, `_run_dedicated_transcription`) | Gemini inline base64 / Files API upload | external-provider upload | optional import, async-in-thread | mandatory sync reservation, conservative bound (base64 + 4096) |
+| 12 | `services/save_service.py` text branch | `client.send_message("me", caption)` | text only | n/a | unchanged |
+| 13 | `ai/tools/delivery.py` text paths | `event.edit` / `event.reply` / `send_message` | text only | n/a | unchanged |
+| 14 | every `download_media(...)` (save, rename, anti-edit snapshot, media_service) | Telegram download | download only (ingress) | n/a | unchanged |
+| 15 | `telegram_api/media.py::download_media` | Telegram download | download only | n/a | unchanged |
+
+`InputFile` / `InputMediaUploaded*` appear only as the handles produced by
+(3) and attached by (4); no other module constructs them.
+
+### 3. What the governor now guarantees
+
+- `DAILY_LIMIT_BYTES = 150_000_000` and `MONTHLY_LIMIT_BYTES = 4_000_000_000`
+  are unchanged, and both are checked on every reservation.
+- No database, an unreadable/missing `panel_settings` row, a malformed or
+  unknown-version state, a refused write, a raised write and a write that cannot
+  be confirmed in stored state all raise
+  `OutboundBandwidthUnavailableError` — the caller never receives a successful
+  reservation, and no upload follows.
+- `{}` is the documented fresh-row value and is a REAL zero. Anything else that
+  is not exactly the shape this module writes is a denial.
+- A previous day/month is a legitimate rollover (zero for the new window), not
+  malformed state.
+- A reservation is returned only after re-reading the stored state and matching
+  the expected new totals (bounded to `_MAX_CONFIRM_ATTEMPTS` = 3).
+- `byte_count <= 0`, non-integers and booleans are rejected, so an unmeasurable
+  payload can never be booked as zero bytes.
+- Reservations are conservative and never refunded: a failed or timed-out
+  upload keeps its bytes accounted (`release_reservation` remains a no-op).
+
+### 4. Concurrency: what is proven, and what is not
+
+`_lock` is now a `threading.Lock` held across read -> limit check -> write ->
+confirm. It serializes every reservation in the process across all event loops
+and worker threads, which is the supported deployment model (ONE
+`RuntimeSupervisor`, one self client, one process). The queue test
+(`12 x 100 bytes` against a 1000-byte day) accepts exactly 10 and rejects 2, and
+the stored total is exactly 1000.
+
+It is **not** a distributed lock. Two independent processes could still
+interleave between our read and our write; the confirmation read detects a
+dropped/lost write but cannot detect an overwritten increment whose value
+happens to equal our expected total. Truly atomic cross-process accounting
+needs a database-side compare-and-set (a SQL function or a migration). No SQL
+was executed, no migration was added, `DATABASE_ARCHITECTURE.md` was not
+modified, and no parallel accounting store or in-memory production fallback was
+introduced.
+
+### 5. Egress this governor still does not measure
+
+The governor accounts for explicitly governed PAYLOAD transfers only. It does
+not measure, and must not be described as measuring, Render's total egress:
+
+- HTTP responses: `/health`, the dashboard SPA and `/api/*`, the static guide
+  site, and the appearance image renditions Telegram fetches.
+- Telegram protocol traffic itself (updates, RPC frames, keepalive pings) and
+  helper-bot traffic.
+- Supabase request/response bytes for every read and write, including the
+  accounting write itself.
+- Any second process/deploy overlap (see §4).

@@ -54,6 +54,16 @@ from backend.services import save_service
 logger = logging.getLogger(__name__)
 
 
+async def _reserve_reupload_bytes(byte_count: int) -> None:
+    """Reserve outbound bytes BEFORE a re-upload transmits them (fail closed).
+
+    Imported lazily and never guarded: an unimportable governor or a denied
+    reservation must refuse the re-upload, never let it run unaccounted.
+    """
+    from backend.services import outbound_bandwidth_service as governor
+
+    await governor.reserve_outbound_bytes("telegram_media", byte_count)
+
 
 def _format_size(size_bytes) -> str:
     if not size_bytes:
@@ -1335,6 +1345,9 @@ async def do_change_file_name(
         # video/audio/animation cannot degrade into a generic document.
         mime = getattr(getattr(media, "document", None), "mime_type", None) or row.get("mime_type")
         try:
+            # The replacement is a REAL upload of the downloaded bytes, so it
+            # is accounted before Telegram receives any of them.
+            await _reserve_reupload_bytes(os.path.getsize(tmp_path))
             sent = await client.send_file(
                 "me",
                 tmp_path,

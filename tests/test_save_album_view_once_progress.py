@@ -1442,3 +1442,48 @@ async def test_real_telethon_sends_one_multi_media_request_for_the_album():
         isinstance(request, functions.messages.SendMediaRequest) for request in requests
     )
     assert [message.id for message in sent] == [800, 801, 802]
+
+
+# ── outbound bandwidth governance (album) ──────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_album_reserves_every_member_before_its_upload(monkeypatch):
+    from backend.services import outbound_bandwidth_service as bw
+
+    first, second, third = _album_members(size=1000)
+    client = FakeClient([first, second, third])
+    reserved = []
+
+    async def _reserve(category, byte_count):
+        reserved.append((category, byte_count))
+        return {}
+
+    monkeypatch.setattr(bw, "reserve_outbound_bytes", _reserve)
+
+    result = await save_service.execute_save(client, OWNER, second, "UTC")
+
+    assert getattr(result, "saved", False) is True
+    # One reservation per uploaded member; the grouped send adds none.
+    assert reserved == [("telegram_media", 1000)] * 3
+    assert len(client.upload_calls) == 3
+    assert len(client.send_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_album_uploads_nothing_when_the_member_reservation_is_denied(monkeypatch):
+    from backend.services import outbound_bandwidth_service as bw
+
+    first, second, third = _album_members(size=1000)
+    client = FakeClient([first, second, third])
+
+    async def _deny(category, byte_count):
+        raise bw.OutboundBandwidthUnavailableError("accounting unavailable")
+
+    monkeypatch.setattr(bw, "reserve_outbound_bytes", _deny)
+
+    result = await save_service.execute_save(client, OWNER, second, "UTC")
+
+    assert getattr(result, "saved", False) is False
+    assert client.upload_calls == []
+    assert client.send_calls == []
