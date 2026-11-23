@@ -236,3 +236,42 @@ The governor is not, and does not claim to be, a measurement of Render egress.
   and avoid overlapping deploy windows during large transfers.
 - **Governed paths are enforced** — if accounting is unavailable, the upload is
   denied. The service prefers refused uploads over unaccounted egress.
+
+
+---
+
+## Follow-up — Render platform bandwidth metrics (2026-11-23)
+
+**Purpose:** distinguish the LifeOS upload governor from the actual outbound
+bandwidth metric reported by Render.
+
+- Added backend/services/render_bandwidth_service.py, which calls Render's
+  GET /v1/metrics/bandwidth endpoint with the workspace-scoped RENDER_API_KEY
+  and Render-injected RENDER_SERVICE_ID.
+- The service ID is never accepted from a panel callback or user input. The
+  API key is never logged or returned. A missing key, missing service ID,
+  HTTP failure, malformed payload, unsupported unit, or mismatched resource
+  label produces an explicit unavailable state rather than a fabricated zero.
+- The Settings → Bandwidth Usage panel now displays two independent sections:
+  LifeOS tracked payload reservations (150 MB/day, 4 GB/month) and Render's
+  platform outbound-bandwidth metric. The text explicitly explains why the
+  numbers differ.
+- Render metric values are summed by UTC day and month from the hourly points
+  returned for the current service. The latest datapoint and point count are
+  shown; Render's hourly publication delay is disclosed.
+- Account isolation: the key is scoped to one Render workspace and the
+  resource ID comes from the currently running service's platform-injected
+  RENDER_SERVICE_ID. A key scoped to another account cannot authorize this
+  service's resource lookup. No account-1 service ID is hardcoded in source.
+- No Supabase schema, migration, SQL, second scheduler, or second runtime was
+  added. httpx was already a production dependency.
+
+Tests added:
+- tests/test_render_bandwidth_service.py — UTC aggregation, unit conversion,
+  workspace/service scoping, missing key, mismatched resource, and HTTP error
+  without credential leakage.
+- tests/test_render_bandwidth_panel.py — dual-source rendering and
+  independent failure handling.
+
+**Verification status at report authoring:** source and tests in this follow-up
+are not yet deployed or live-verified. Test execution is pending.
