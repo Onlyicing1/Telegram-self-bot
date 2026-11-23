@@ -735,6 +735,7 @@ treated as a disconnect or trigger recovery.
 | `AI_CLOUDFLARE_ACCOUNT_ID` / `CLOUDFLARE_ACCOUNT_ID` | `""` | Cloudflare account id for the account-scoped Workers AI endpoint. Empty → provider unregistered (or set `AI_CLOUDFLARE_BASE_URL` explicitly) |
 | `AI_CLOUDFLARE_MODEL` | `@cf/meta/llama-3.3-70b-instruct-fp8-fast` | Workers AI model override (full `@cf/...` id) |
 | `YDC_API_KEY` | `""` | You.com Web Search API key; empty → search capability unregistered |
+| `RENDER_API_KEY` | `""` | Workspace-scoped, read-only Render API key for this service outbound-bandwidth metrics; empty → Render metrics unavailable |
 | `SAVE_TRACE` | `""` | `1/true/yes/on` enables bounded `[SAVE_TRACE]` instrumentation of one Save attempt; empty → tracing fully off |
 
 Frontend-only: `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY` (unused by the

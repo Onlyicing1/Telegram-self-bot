@@ -636,8 +636,30 @@ def _bandwidth_body(usage: dict) -> str:
     ])
 
 
+def _render_platform_bandwidth_body(usage: dict) -> str:
+    if usage.get("available") is not True:
+        return "\\n".join([
+            "**Render platform outbound bandwidth**",
+            "**Status:** Unavailable",
+            str(usage.get("detail") or "Render did not return a verifiable metric."),
+            "No Render usage figure is inferred when the API response is unavailable.",
+        ])
+    return "\\n".join([
+        "**Render platform outbound bandwidth**",
+        f"**Today (UTC)** · {usage.get('daily_period') or '—'}",
+        f"Used: {_format_bandwidth_bytes(usage.get('daily_used_bytes'))}",
+        "",
+        f"**This month (UTC)** · {usage.get('monthly_period') or '—'}",
+        f"Used: {_format_bandwidth_bytes(usage.get('monthly_used_bytes'))}",
+        "",
+        f"Latest reported point: {usage.get('latest_data_at') or '—'}",
+        f"Reported hourly data points: {int(usage.get('data_points') or 0)}",
+        "_Render publishes hourly bandwidth points; new points may appear about 60 minutes after their measurement window ends._",
+    ])
+
+
 async def _bandwidth_render(*, notice: str = "") -> tuple[str, str, list]:
-    from backend.services import outbound_bandwidth_service
+    from backend.services import outbound_bandwidth_service, render_bandwidth_service
 
     try:
         usage = await outbound_bandwidth_service.get_outbound_usage()
@@ -647,12 +669,28 @@ async def _bandwidth_render(*, notice: str = "") -> tuple[str, str, list]:
             "detail": f"accounting read failed ({type(exc).__name__})",
         }
 
+    try:
+        render_usage = await render_bandwidth_service.get_render_bandwidth_usage()
+    except Exception as exc:  # noqa: BLE001 — keep the two sources independent
+        render_usage = {
+            "available": False,
+            "detail": f"Render metrics request failed ({type(exc).__name__})",
+        }
+
     if usage.get("available", True) is False:
-        body = _bandwidth_unavailable_body(str(usage.get("detail") or ""))
+        governor_body = _bandwidth_unavailable_body(str(usage.get("detail") or ""))
     else:
-        body = _bandwidth_body(usage)
-        if notice:
-            body = f"{body}\n\n{notice}"
+        governor_body = _bandwidth_body(usage)
+
+    body = "\\n\\n".join([
+        "**LifeOS upload governor — tracked payload reservations**",
+        governor_body,
+        "**Render platform — actual outbound bandwidth metric**",
+        _render_platform_bandwidth_body(render_usage),
+        "_These are different measurements: the governor tracks only guarded application payloads; Render measures service egress._",
+    ])
+    if notice:
+        body = f"{body}\\n\\n{notice}"
 
     builder = InlinePanelBuilder()
     builder.add_row(sym.label(sym.OP_REFRESH, "Refresh"), "action:bandwidth_refresh", PRIMARY)
@@ -665,7 +703,7 @@ async def _bandwidth_panel_handler(event, extra: str) -> tuple[str, str, list] |
 
 async def _bandwidth_refresh_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     """Re-read usage and repaint the SAME panel message (never a second one)."""
-    return await _bandwidth_render(notice=f"{sym.OP_REFRESH} Refreshed from the accounting service.")
+    return await _bandwidth_render(notice=f"{sym.OP_REFRESH} Refreshed both usage sources.")
 
 
 def _register_panels() -> None:
