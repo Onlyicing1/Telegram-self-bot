@@ -132,3 +132,23 @@ async def test_http_error_is_reported_without_leaking_credentials(monkeypatch):
     assert usage["available"] is False
     assert "HTTP 403" in usage["detail"]
     assert "workspace-scoped-secret" not in usage["detail"]
+
+
+@pytest.mark.asyncio
+async def test_31_day_month_uses_the_supported_30_day_window_and_marks_partial(monkeypatch):
+    now = datetime(2026, 12, 31, 18, 0, tzinfo=UTC)
+    monkeypatch.setenv("RENDER_API_KEY", "workspace-scoped-secret")
+    monkeypatch.setenv("RENDER_SERVICE_ID", SERVICE_ID)
+    _Client.response = _Response([{
+        "labels": [{"field": "service", "value": SERVICE_ID}],
+        "unit": "mb",
+        "values": [{"timestamp": "2026-12-31T10:00:00Z", "value": 4.0}],
+    }])
+    monkeypatch.setattr(render_bw.httpx, "AsyncClient", _Client)
+
+    usage = await render_bw.get_render_bandwidth_usage(now=now)
+
+    assert usage["available"] is True
+    assert usage["monthly_is_partial"] is True
+    assert usage["monthly_coverage_start"] == "2026-12-02T18:00:00Z"
+    assert _Client.calls[0][1]["startTime"] == "2026-12-02T18:00:00Z"

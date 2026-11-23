@@ -644,12 +644,16 @@ def _render_platform_bandwidth_body(usage: dict) -> str:
             str(usage.get("detail") or "Render did not return a verifiable metric."),
             "No Render usage figure is inferred when the API response is unavailable.",
         ])
+    monthly_label = str(usage.get("monthly_period") or "—")
+    if usage.get("monthly_is_partial") is True:
+        coverage_start = str(usage.get("monthly_coverage_start") or "").split("T", 1)[0]
+        monthly_label = f"{monthly_label} · partial from {coverage_start or '—'}"
     return "\n".join([
         "**Render platform outbound bandwidth**",
         f"**Today (UTC)** · {usage.get('daily_period') or '—'}",
         f"Used: {_format_bandwidth_bytes(usage.get('daily_used_bytes'))}",
         "",
-        f"**This month (UTC)** · {usage.get('monthly_period') or '—'}",
+        f"**This month (UTC)** · {monthly_label}",
         f"Used: {_format_bandwidth_bytes(usage.get('monthly_used_bytes'))}",
         "",
         f"Latest reported point: {usage.get('latest_data_at') or '—'}",

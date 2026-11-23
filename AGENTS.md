@@ -738,6 +738,8 @@ treated as a disconnect or trigger recovery.
 | `RENDER_API_KEY` | `""` | Workspace-scoped, read-only Render API key for this service outbound-bandwidth metrics; empty → Render metrics unavailable |
 | `SAVE_TRACE` | `""` | `1/true/yes/on` enables bounded `[SAVE_TRACE]` instrumentation of one Save attempt; empty → tracing fully off |
 
+RENDER_SERVICE_ID is injected automatically by Render at runtime. Do not hardcode it or copy it between accounts.
+
 Frontend-only: `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY` (unused by the
 React app; the dashboard reads through the backend API).
 

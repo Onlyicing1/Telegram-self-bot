@@ -8,7 +8,7 @@ service's resource identifier.
 from __future__ import annotations
 
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any
 
@@ -145,8 +145,9 @@ async def get_render_bandwidth_usage(
 
     current = _utc(now)
     month_start = current.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    query_start = max(month_start, current - timedelta(days=29))
     params = {
-        "startTime": _iso(month_start),
+        "startTime": _iso(query_start),
         "endTime": _iso(current),
         "resource": service_id,
     }
@@ -170,11 +171,15 @@ async def get_render_bandwidth_usage(
         return _unavailable("Render API returned invalid JSON.")
 
     try:
-        return _parse_payload(
+        result = _parse_payload(
             payload,
             service_id=service_id,
             now=current,
-            month_start=month_start,
+            month_start=query_start,
         )
+        if result.get("available") is True:
+            result["monthly_is_partial"] = query_start > month_start
+            result["monthly_coverage_start"] = _iso(query_start)
+        return result
     except Exception as exc:  # noqa: BLE001 — external payloads are untrusted
         return _unavailable(f"Render metrics could not be parsed ({type(exc).__name__}).")
