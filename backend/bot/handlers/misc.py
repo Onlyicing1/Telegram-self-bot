@@ -638,13 +638,13 @@ def _bandwidth_body(usage: dict) -> str:
 
 def _render_platform_bandwidth_body(usage: dict) -> str:
     if usage.get("available") is not True:
-        return "\\n".join([
+        return "\n".join([
             "**Render platform outbound bandwidth**",
             "**Status:** Unavailable",
             str(usage.get("detail") or "Render did not return a verifiable metric."),
             "No Render usage figure is inferred when the API response is unavailable.",
         ])
-    return "\\n".join([
+    return "\n".join([
         "**Render platform outbound bandwidth**",
         f"**Today (UTC)** · {usage.get('daily_period') or '—'}",
         f"Used: {_format_bandwidth_bytes(usage.get('daily_used_bytes'))}",
@@ -682,7 +682,7 @@ async def _bandwidth_render(*, notice: str = "") -> tuple[str, str, list]:
     else:
         governor_body = _bandwidth_body(usage)
 
-    body = "\\n\\n".join([
+    body = "\n\n".join([
         "**LifeOS upload governor — tracked payload reservations**",
         governor_body,
         "**Render platform — actual outbound bandwidth metric**",
@@ -690,7 +690,7 @@ async def _bandwidth_render(*, notice: str = "") -> tuple[str, str, list]:
         "_These are different measurements: the governor tracks only guarded application payloads; Render measures service egress._",
     ])
     if notice:
-        body = f"{body}\\n\\n{notice}"
+        body = f"{body}\n\n{notice}"
 
     builder = InlinePanelBuilder()
     builder.add_row(sym.label(sym.OP_REFRESH, "Refresh"), "action:bandwidth_refresh", PRIMARY)
