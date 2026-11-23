@@ -151,7 +151,7 @@ Destinations and directions (confirmed from code):
 | Destination | Protocol | Direction | Render-billed? |
 |---|---|---|---|
 | Telegram DCs (self client) | MTProto/TCP | send + receive | **send is outbound**; receive is inbound/free |
-| Telegram Bot API (helper) | HTTPS | send + receive | **send is outbound**; receive inbound |
+| Telegram DCs (helper bot) | MTProto/TCP | send + receive | **send is outbound**; receive inbound |
 | Supabase PostgREST | HTTPS/1.1 | request + response | **request bytes outbound**; response inbound |
 | Supabase Storage | HTTPS | upload / download | **upload outbound**; download inbound |
 | AI providers (OpenAI-compatible, Gemini, You.com) | HTTPS | request + response | **request outbound**; response inbound |
@@ -521,7 +521,7 @@ Per-message handler fan-out (confirmed registrations):
 | `emoji_replacement.py` (38) | outgoing | cache-first settings; replacement may send/delete a message |
 | `intelligent_reaction.py` (52) | outgoing | one AI request per coalesced batch when enabled (default OFF, probability 25) |
 | `anti_edit_delete.py` (512) | **all messages** | resolves peer, downloads media (inbound), uploads a bounded snapshot to Supabase Storage (governed) |
-| `private_message.py` (register at 1380) | incoming private chats | per-message policy/state; AI reply when enabled (default `ai_response_enabled: False`), one CAS claim per reply |
+| `task_events.py` → `private_message.enforce_incoming` (67) | incoming/private policy | per-message policy/state; AI reply when enabled (default `ai_response_enabled: False`), one CAS claim per reply |
 | `task_events.py` (62) | all | event-task matching, bounded reads |
 | `misc.py` (1136) | outgoing | `Menu` panel |
 | `tasks.py` (95) | outgoing | task panels |
@@ -551,9 +551,10 @@ Direction facts:
 * **Profile cron** wakes at every minute boundary
   (`backend/profile/scheduler.py:149-155`) and issues one `UpdateProfile`
   RPC when Bio/Username is active. Small, but persistent.
-* **Helper bot**: optional; disabled when `BOT_TOKEN` is empty. When enabled,
-  every panel send/edit and callback answer is an HTTPS Bot API call
-  (outbound) — small payloads, higher request count.
+* **Helper bot**: optional; disabled when `BOT_TOKEN` is empty. It is a
+  Telethon client (MTProto), so every panel send/edit and callback answer is a
+  small outbound RPC — a higher request count than the self client, not a
+  separate HTTP Bot API.
 
 There is no evidence in the runtime of a media upload that bypasses
 Telegram's own upload path, no CDN download-and-reupload loop, and no
@@ -620,7 +621,7 @@ Confirmed gaps (the governor's own docstring lists the first four):
    guide assets, and `/appearance/image/*`. Not counted.
 2. **Telegram protocol traffic** — update dispatch, RPC calls, keepalive,
    panel edits, profile updates, reactions. Not counted.
-3. **Helper-bot traffic** — every Bot API call. Not counted.
+3. **Helper-bot traffic** — every helper-bot RPC. Not counted.
 4. **Supabase request/response traffic** — not counted (responses are
    inbound/free, but requests are outbound bytes).
 5. **Groq STT uploads** (`groq_stt_engine.py:676`) and **Speechmatics STT**
@@ -669,7 +670,7 @@ Nov 10 ≈ 759.0 MB, Nov 11 ≈ 380.8 MB, Nov 12 ≈ 410.4 MB, Nov 23 ≈ 199.1 
 * Excluding Nov 7–12 and the partial Nov 23, the remaining ~16 days account
   for ≈ 280 MB, i.e. ≈ 17.5 MB/day. That baseline is consistent with
   control traffic + occasional AI/media use, not with a runaway loop.
-* 338 hourly points cover 551 elapsed hours (23 days 16.5 h). The series is
+* 338 hourly points cover ~545 elapsed hours (22 days 16.5 h). The series is
   therefore incomplete (missing/zero-suppressed points); Render documents
   that points below 1 MB may display as 0. The month total is a sum of the
   returned points, so genuine sub-1 MB hours are absent and interior gaps are
@@ -917,8 +918,9 @@ touching enforcement.
 ### Tier 2 — optional persistence (requires explicit approval)
 
 If counters must survive restarts, write the hourly snapshot into the
-existing `bot_settings` JSON document (the same mechanism `candidate_pool`
-uses, `candidate_pool.py:151-175`) or the existing `panel_settings` JSONB.
+  existing `bot_settings` JSON document (the same `bot_settings` document
+  mechanism `candidate_pool.publish`/`load` uses) or the existing
+  `panel_settings` JSONB.
 That is still no new table/migration. Persist at most once per hour, bounded
 payload, no request bodies. Any schema change is explicitly out of scope for
 this task.
@@ -1172,11 +1174,13 @@ modified; `git diff --check` reports no whitespace errors.
 
 1. The report was written from the exact tree at `65632bf` into
    `INVESTIGATION.md`.
-2. Only that path was staged (`git add INVESTIGATION.md`).
-3. The commit was created with `65632bf` as its parent, so the delivered
-   history remains a normal fast-forward of remote `main` (no rebase, no
-   force, no history rewrite).
-4. The commit was pushed normally to `origin/main`.
+2. Only that path was included: a temporary index was built from `65632bf`
+   plus this file, so no other path could enter the commit.
+3. The first commit was created with `65632bf` as its parent and the
+   wording-correction commit as its child, so the delivered history remains a
+   normal fast-forward of remote `main` (no rebase, no force, no history
+   rewrite).
+4. Both commits were pushed normally to `origin/main`.
 5. Verification: `git fetch origin`; `git rev-parse origin/main`; then
    `git merge-base --is-ancestor <delivered> origin/main` (exit 0) and
    `git ls-remote origin refs/heads/main` equals the delivered SHA.
@@ -1193,8 +1197,10 @@ the delivered SHA and the remote verification are reported in the final
 response. No unrelated file was staged or committed.
 
 This limitation is a property of the pre-existing worktree, not of the
-delivered change: `origin/main` receives exactly one new commit whose only
-difference from `65632bf` is `INVESTIGATION.md`.
+delivered change: `origin/main` receives two documentation commits (the report
+and a follow-up wording correction), each of which touches only
+`INVESTIGATION.md`; the cumulative diff against `65632bf` is still only
+`INVESTIGATION.md`.
 
 ### 19.4 What was not validated
 
