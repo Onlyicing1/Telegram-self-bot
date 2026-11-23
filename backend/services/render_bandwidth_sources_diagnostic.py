@@ -120,16 +120,48 @@ def _parse_value(value: Any) -> float:
     return number
 
 
+def _labels(entry: dict[str, Any]) -> dict[str, Any]:
+    """Read either Render metrics label representation.
+
+    The public schema documents ``{resource, trafficSource}``. The existing
+    metrics client (``/metrics/bandwidth``) reads a list of ``{field, value}``
+    pairs, so both are normalized here. Unknown fields are ignored; duplicate
+    fields are malformed.
+    """
+    raw = entry.get("labels")
+    if isinstance(raw, dict):
+        return dict(raw)
+    if not isinstance(raw, list):
+        raise _PayloadError("malformed_series")
+    labels: dict[str, Any] = {}
+    for label in raw:
+        if not isinstance(label, dict):
+            raise _PayloadError("malformed_series")
+        field = label.get("field")
+        value = label.get("value")
+        if not isinstance(field, str) or not field.strip():
+            raise _PayloadError("malformed_series")
+        if not isinstance(value, str):
+            raise _PayloadError("malformed_series")
+        name = field.strip()
+        if name in labels:
+            raise _PayloadError("malformed_series")
+        labels[name] = value
+    return labels
+
+
 def _parse_series(entry: Any, *, service_id: str) -> tuple[str, dict[str, Any]]:
     if not isinstance(entry, dict):
         raise _PayloadError("malformed_series")
-    labels = entry.get("labels")
-    if not isinstance(labels, dict):
-        raise _PayloadError("malformed_series")
+    labels = _labels(entry)
     resource = labels.get("resource")
-    if not isinstance(resource, str) or not resource.strip():
+    service = labels.get("service")
+    if resource is not None and service is not None and resource != service:
+        raise _PayloadError("resource_mismatch")
+    resource_value = resource if resource is not None else service
+    if not isinstance(resource_value, str) or not resource_value.strip():
         raise _PayloadError("malformed_series")
-    if resource != service_id:
+    if resource_value != service_id:
         raise _PayloadError("resource_mismatch")
     source = labels.get("trafficSource")
     if not isinstance(source, str) or not source.strip():
@@ -208,12 +240,27 @@ def _parse_series(entry: Any, *, service_id: str) -> tuple[str, dict[str, Any]]:
     }
 
 
+def _series_entries(payload: Any) -> list[Any]:
+    """Return the series list from either accepted top-level shape.
+
+    The published schema wraps series in ``{"data": [...]}``. The existing
+    metrics client consumes the bare array form. A 200 response in any other
+    shape is not guessed at.
+    """
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        data = payload.get("data")
+        if isinstance(data, list):
+            return data
+    raise _PayloadError("unexpected_payload")
+
+
 def _parse_payload(payload: Any, *, service_id: str) -> dict[str, Any]:
-    if not isinstance(payload, dict):
-        return _failed("unexpected_payload", service_id=service_id)
-    data = payload.get("data")
-    if not isinstance(data, list):
-        return _failed("unexpected_payload", service_id=service_id)
+    try:
+        data = _series_entries(payload)
+    except _PayloadError as exc:
+        return _failed(exc.reason, service_id=service_id)
     if not data:
         return _failed("no_data", service_id=service_id)
 

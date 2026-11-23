@@ -99,6 +99,43 @@ SPLIT = {
 }
 
 
+def _production_payload(
+    points: dict[str, list[tuple[int, float]]],
+    *,
+    unit: str | None = "mb",
+    service_id: str = SERVICE_ID,
+) -> list[dict]:
+    """The metrics-family shape used by the existing ``/metrics/bandwidth`` client.
+
+    That shape is a bare array whose labels are ``{field, value}`` pairs and
+    whose timestamps are RFC 3339 strings. The deployed diagnostic reported
+    ``unexpected_payload`` for an HTTP 200, which is only raised before series
+    parsing, so the response was not the documented ``{"data": [...]}``
+    envelope.
+    """
+    series = []
+    for source, values in points.items():
+        entry: dict = {
+            "labels": [
+                {"field": "service", "value": service_id},
+                {"field": "trafficSource", "value": source},
+            ],
+            "values": [
+                {
+                    "timestamp": "2026-11-07T00:00:00Z"
+                    if offset == 0
+                    else "2026-11-12T23:00:00Z",
+                    "value": value,
+                }
+                for offset, value in values
+            ],
+        }
+        if unit is not None:
+            entry["unit"] = unit
+        series.append(entry)
+    return series
+
+
 @pytest.mark.asyncio
 async def test_disabled_by_default_makes_no_request(monkeypatch):
     monkeypatch.delenv(diag.ENABLE_ENV, raising=False)
@@ -178,6 +215,80 @@ async def test_aggregates_each_traffic_source_and_reports_completeness(monkeypat
         assert series["unit_assumed_bytes"] is False
 
     assert result["sources"]["total"]["gb_total"] == pytest.approx(0.3)
+
+
+@pytest.mark.asyncio
+async def test_production_bare_array_with_label_pairs_is_accepted(monkeypatch, caplog):
+    caplog.set_level(logging.INFO)
+    _install(monkeypatch, _production_payload(SPLIT))
+
+    result = await diag.run_if_enabled()
+
+    assert result["ok"] is True
+    assert result["http_status"] == 200
+    assert result["declared_series"] == 5
+    assert result["series_count"] == 5
+    assert result["hours_with_any_data"] == 2
+    assert result["total_present"] is True
+    assert result["parts_present"] == ["http", "websocket", "nat", "privatelink"]
+    assert result["parts_match_total"] is True
+    assert result["sources"]["total"]["raw_total"] == pytest.approx(300.0)
+    assert result["sources"]["http"]["raw_total"] == pytest.approx(170.0)
+    assert result["sources"]["http"]["points"] == 2
+    assert "source=http unit=mb" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_production_shape_and_documented_envelope_agree(monkeypatch):
+    _install(monkeypatch, _payload(SPLIT))
+    documented = await diag.run_if_enabled()
+
+    _install(monkeypatch, _production_payload(SPLIT))
+    production = await diag.run_if_enabled()
+
+    for source in SPLIT:
+        assert production["sources"][source]["bytes_total"] == (
+            documented["sources"][source]["bytes_total"]
+        )
+
+
+@pytest.mark.asyncio
+async def test_production_shape_from_another_service_fails_closed(
+    monkeypatch, caplog
+):
+    caplog.set_level(logging.INFO)
+    other = "srv-another-account"
+    _install(monkeypatch, _production_payload({"http": [(0, 5.0)]}, service_id=other))
+
+    result = await diag.run_if_enabled()
+
+    assert result["ok"] is False
+    assert result["reason"] == "resource_mismatch"
+    assert other not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_conflicting_resource_and_service_labels_fail_closed(monkeypatch):
+    payload = _production_payload({"http": [(0, 5.0)]})
+    payload[0]["labels"].append({"field": "resource", "value": "srv-conflict"})
+    _install(monkeypatch, payload)
+
+    result = await diag.run_if_enabled()
+
+    assert result["ok"] is False
+    assert result["reason"] == "resource_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_malformed_label_pairs_fail_closed(monkeypatch):
+    payload = _production_payload({"http": [(0, 5.0)]})
+    payload[0]["labels"].append({"field": "trafficSource", "value": "http"})
+    _install(monkeypatch, payload)
+
+    result = await diag.run_if_enabled()
+
+    assert result["ok"] is False
+    assert result["reason"] == "malformed_series"
 
 
 @pytest.mark.asyncio
