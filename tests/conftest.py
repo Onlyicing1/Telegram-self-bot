@@ -129,6 +129,35 @@ def engine():
 
 
 @pytest.fixture(autouse=True)
+def _policy_snapshot_for_synchronous_tests(monkeypatch):
+    """Give direct synchronous provider tests a fresh, trusted low snapshot.
+
+    Production populates this snapshot through the async media boundary; these
+    tests exercise provider serialization, not the policy's own unavailable
+    path. Policy-focused tests replace or clear it explicitly.
+    """
+    from datetime import datetime, timezone
+
+    from backend.services import outbound_bandwidth_service as bw
+
+    current = datetime.now(timezone.utc).isoformat()
+    monkeypatch.setattr(bw, "_policy_snapshot", {
+        "trusted": True,
+        "state": "available",
+        "detail": "",
+        "tier": 0,
+        "effective_monthly_bytes": 0,
+        "monthly_limit_bytes": bw.MONTHLY_LIMIT_BYTES,
+        "render_monthly_bytes": 0,
+        "governor_monthly_bytes": 0,
+        "policy_floor_bytes": 0,
+        "monthly_period": current[:7],
+        "latest_data_at": current,
+        "checked_at": current,
+    })
+
+
+@pytest.fixture(autouse=True)
 def _outbound_bandwidth_test_accounting(monkeypatch):
     """Give the outbound bandwidth governor a per-test persistence double.
 
@@ -143,9 +172,29 @@ def _outbound_bandwidth_test_accounting(monkeypatch):
     limit, and concurrent reservation serialization — is exercised against
     explicit fakes in ``tests/test_outbound_bandwidth_governor.py``.
     """
+    from datetime import datetime, timezone
+
     from backend.services import outbound_bandwidth_service as bw
 
     store: dict[str, object] = {"state": {}}
+
+    async def _fresh_render_observation(now=None):
+        current = now or datetime.now(timezone.utc)
+        return {
+            "available": True,
+            "state": "available",
+            "daily_period": current.strftime("%Y-%m-%d"),
+            "monthly_period": current.strftime("%Y-%m"),
+            "daily_used_bytes": 0,
+            "monthly_used_bytes": 0,
+            "latest_data_at": current.isoformat(),
+            "data_points": 1,
+            "unit": "bytes",
+            "detail": "",
+        }
+
+    monkeypatch.setattr(bw, "_render_usage_reader", _fresh_render_observation)
+    bw._policy_snapshot = None
 
     class _Repo:
         def load(self):
@@ -162,3 +211,4 @@ def _outbound_bandwidth_test_accounting(monkeypatch):
     monkeypatch.setattr(bw, "_db_configured", lambda: True)
     monkeypatch.setattr(bw, "repo", _Repo())
     yield store
+    bw._policy_snapshot = None

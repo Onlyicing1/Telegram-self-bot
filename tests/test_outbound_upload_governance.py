@@ -60,6 +60,26 @@ def broken_governor_import(monkeypatch):
     monkeypatch.delattr(services_pkg, "outbound_bandwidth_service")
 
 
+def _policy_at(monkeypatch, effective: int) -> None:
+    from datetime import datetime, timezone
+
+    current = datetime.now(timezone.utc)
+    monkeypatch.setattr(bw, "_policy_snapshot", {
+        "trusted": True,
+        "state": "available",
+        "detail": "",
+        "tier": bw._policy_tier(effective),
+        "effective_monthly_bytes": effective,
+        "render_monthly_bytes": effective,
+        "governor_monthly_bytes": 0,
+        "policy_floor_bytes": 0,
+        "monthly_limit_bytes": bw.MONTHLY_TARGET_BYTES,
+        "monthly_period": current.strftime("%Y-%m"),
+        "latest_data_at": current.isoformat(),
+        "checked_at": current.isoformat(),
+    })
+
+
 # ── voice notes (backend/telegram_api/media.py) ────────────────────────────
 
 
@@ -87,6 +107,17 @@ async def test_a_voice_note_is_not_sent_when_the_reservation_is_denied(denied):
 async def test_a_voice_note_is_not_sent_when_the_governor_cannot_be_imported(
     broken_governor_import,
 ):
+    client = RecordingClient()
+
+    with pytest.raises(media_api.TelegramAPIError):
+        await media_api.send_voice(client, 777, b"a" * 4096)
+
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_voice_note_is_denied_in_strict_text_only_mode(monkeypatch):
+    _policy_at(monkeypatch, 3_600_000_000)
     client = RecordingClient()
 
     with pytest.raises(media_api.TelegramAPIError):
@@ -186,6 +217,19 @@ async def test_ordinary_text_delivery_never_touches_accounting_or_upload(
     assert event.edits[0].startswith("a short answer")
 
 
+@pytest.mark.asyncio
+async def test_an_ai_attachment_is_denied_at_eighty_percent(monkeypatch):
+    from backend.ai.tools import delivery
+
+    _policy_at(monkeypatch, 3_200_000_000)
+    sender = RecordingClient()
+
+    with pytest.raises(bw.OutboundBandwidthPolicyError):
+        await delivery._send_text_attachment(sender, 42, b"x" * 5000)
+
+    assert sender.calls == []
+
+
 # ── Gemini media payloads (backend/services/gemini_media_engine.py) ────────
 
 
@@ -247,3 +291,10 @@ def test_ocr_behavior_is_unchanged_when_the_reservation_succeeds(monkeypatch):
 
     assert engine._run(gemini._OCR_KIND, b"payload", "read this", 5.0) == "extracted"
     assert [entry[0] for entry in recorded] == ["gemini_ocr"]
+
+
+def test_the_gemini_provider_upload_is_denied_at_seventy_percent(monkeypatch):
+    _policy_at(monkeypatch, 2_800_000_000)
+
+    with pytest.raises(bw.OutboundBandwidthPolicyError):
+        gemini._reserve_gemini_bandwidth("gemini_ocr", 1000)

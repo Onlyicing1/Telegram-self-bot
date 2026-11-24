@@ -60,6 +60,13 @@ async def _reserve_upload_bytes(category: str, byte_count: int) -> None:
 
     await governor.reserve_outbound_bytes(category, byte_count)
 
+
+async def _ensure_media_policy(action: str, byte_count: int = 1) -> None:
+    """Apply the central staged policy before any download/upload work."""
+    from backend.services import outbound_bandwidth_service as governor
+
+    await governor.ensure_action_allowed(action, max(1, int(byte_count or 1)))
+
 _LINK_RE = re.compile(
     r"https?://(?:t|telegram)\.me/"
     r"(?:c/(\d+)/(\d+)"        # private:  /c/<internal_chat>/<msg_id>
@@ -1506,6 +1513,19 @@ async def _deep_save_one(
         file_name = None
         file_id = None
         file_size = len(original_text.encode("utf-8"))
+    else:
+        from backend.services import outbound_bandwidth_service as _bw
+
+        try:
+            await _ensure_media_policy(
+                _bw.effective_media_action(_bw.ACTION_SINGLE_MEDIA),
+                file_size or 1,
+            )
+        except Exception as exc:  # noqa: BLE001 — policy denial is a save failure
+            return SaveOutcome(
+                f"{sym.STATE_FAILED} Deep Save refused by outbound policy: {exc}",
+                saved=False,
+            )
 
     logger.info(
         "[SAVE] owner=%s media=%s save_code=%s item=%s/%s file_name=%s mime=%s size=%s "
@@ -1850,6 +1870,19 @@ async def _deep_save_album(
                 "per file.",
                 saved=False,
             )
+
+    from backend.services import outbound_bandwidth_service as _bw
+
+    try:
+        await _ensure_media_policy(
+            _bw.effective_media_action(_bw.ACTION_BULK_MEDIA), 1,
+        )
+    except Exception as exc:  # noqa: BLE001 — refuse the WHOLE album before transfer
+        return SaveOutcome(
+            f"{sym.STATE_FAILED} Album not saved: outbound policy refused this "
+            f"multi-item operation ({exc}). Nothing was added to Saved Messages.",
+            saved=False,
+        )
 
     save_code = await db_client.get_next_save_code()
     now = datetime.now(_get_tz(tz_str))

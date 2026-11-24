@@ -586,8 +586,13 @@ class TaskExecutionCoordinator:
                 owner_match=occurrence.owner_id == self.owner_id,
                 action_count=len(occurrence.action_snapshot or []),
             )
+            from backend.services.outbound_bandwidth_service import automatic_media_scope
+
             try:
-                result = await self._execute_occurrence(occurrence, now=now)
+                # A claimed scheduled occurrence is automatic media egress:
+                # the 50% policy tier must never depend on which tool it chose.
+                with automatic_media_scope():
+                    result = await self._execute_occurrence(occurrence, now=now)
             except asyncio.CancelledError:
                 occurrence_trace("execution_cancelled", category="cancelled")
                 raise

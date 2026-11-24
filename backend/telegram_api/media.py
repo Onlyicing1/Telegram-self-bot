@@ -146,6 +146,14 @@ async def send_voice(
     """
     if not isinstance(audio, (bytes, bytearray)) or not audio:
         raise TelegramAPIError("send_voice needs audio bytes; nothing was sent.")
+    try:
+        from backend.services import outbound_bandwidth_service as _bw
+
+        await _bw.ensure_action_allowed(
+            _bw.effective_media_action(_bw.ACTION_SINGLE_MEDIA), len(audio),
+        )
+    except Exception as exc:  # noqa: BLE001 — policy denial refuses the RPC
+        raise TelegramAPIError(f"send_voice refused: {exc}") from exc
     await _reserve_voice_bytes(len(audio))
     effective = _effective_upload_timeout(timeout)
     upload_egress = egress.telegram_upload("telegram_self_upload", "voice")

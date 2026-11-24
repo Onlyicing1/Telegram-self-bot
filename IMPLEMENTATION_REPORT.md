@@ -398,3 +398,125 @@ Render bandwidth-source diagnostic, and every other Render account. No second
 scheduler, executor, update loop, runtime, socket monkeypatch or HTTP client
 was added: the existing clients gain exactly one observer hook when the flag
 is `1`.
+
+## Follow-up — staged monthly outbound-bandwidth restrictions (2026-11-24)
+
+**Purpose:** enforce the 4,000,000,000-byte monthly target with cumulative
+restrictions before any media/file payload leaves the runtime, using Render's
+service-scoped egress metric as the primary observation and the existing local
+reservation ledger only as a lower-bound cross-check.
+
+### Policy thresholds and action classes
+
+The tier is derived from `max(Render monthly service egress, governor monthly
+reserved bytes)` — never their sum. The exact UTC thresholds are:
+
+| Effective monthly usage | Tier | Newly denied classes (all earlier denials remain) |
+|---:|---:|---|
+| 2,000,000,000 (50%) | 50 | automatic / scheduled / background media |
+| 2,400,000,000 (60%) | 60 | bulk, album, batch and multi-item media |
+| 2,800,000,000 (70%) | 70 | provider-bound media: Gemini OCR/STT, Groq and Speechmatics STT uploads |
+| 3,200,000,000 (80%) | 80 | nonessential file uploads, reuploads, rename reuploads, Storage uploads, media forwards |
+| 3,600,000,000 (90%) | 90 | every remaining outbound media/file payload class (strict text-only) |
+| 4,000,000,000 (100%) | 90 + hard limit | the existing governor hard limit still applies; no small-media exception |
+
+Action classes are explicit: `text`, `automatic_media`, `single_media`,
+`bulk_media`, `provider_media`, `file_upload`, `reupload`, `storage_upload`,
+`media_forward`, and `unknown`. Unknown categories are never text; they use the
+conservative 50% floor. A scheduled `TaskExecutionCoordinator` occurrence sets a
+context that converts every non-text media class to `automatic_media`, so the
+50% restriction cannot depend on which tool the task chose.
+
+### Text exemption
+
+Only an explicitly classified text operation is exempt. Telegram text messages,
+text-only AI prompts/responses and small text/control operations remain
+available at every tier, including when the Render observation is unavailable.
+An accounted text payload is bounded to `32 KiB` (`32_768` bytes); larger
+payloads are refused as unclassified, even at tier 0, and never inherit the
+exemption merely because their current size is small.
+
+### Render observation, cache and failure behavior
+
+- Reuses `backend.services.render_bandwidth_service.get_render_bandwidth_usage()`;
+  no service ID is hardcoded and no other Render account is queried.
+- The first media decision in a five-minute window performs one bounded lazy
+  refresh; the result is cached for `300` seconds. There is no new scheduler,
+  worker loop or per-upload Render request.
+- The Render point's `latest_data_at` is required. A point older than three hours,
+  in the future by more than two minutes, malformed, for another UTC month, or
+  unavailable makes the snapshot untrusted. Untrusted means every media/file
+  action is denied; text remains available. The bounded log records only tier,
+  byte counts, trust/partial flags and a content-free reason.
+- Synchronous worker-thread paths consume the same cached snapshot through
+  `ensure_action_allowed_sync()`; they never start an event loop or call Render.
+  If no fresh snapshot exists, they fail closed for media.
+- The highest effective observation in the current UTC month is persisted as
+  `policy_floor` inside the existing `panel_settings.outbound_bandwidth_state`
+  JSONB. No migration or SQL was added. A restart or a lower delayed Render
+  sample therefore cannot lower the tier before the next UTC month; the old
+  month's floor is ignored at rollover.
+
+### Render actual egress vs. local reservations
+
+Render's service metric is the actual platform egress observation. The local
+governor ledger counts only payloads that explicitly call
+`reserve_outbound_bytes()`/`reserve_outbound_bytes_sync()`; it is a subset and is
+not a substitute for Render. Taking the higher value avoids under-counting while
+never adding the two values (which would double-count uploads already present in
+both).
+
+### Covered outbound paths
+
+| Path | Policy/accounting boundary |
+|---|---|
+| Telegram Deep Save single media | policy preflight before download; reservation before `send_file` |
+| Telegram album | bulk preflight before any member transfer; reservation before each `upload_file`; grouped send adds no bytes |
+| Saved-item forward / bulk send | forward/bulk preflight in `retrieve_service`; album is bulk; text rows bypass only as text |
+| File-name reupload | 80% reupload preflight before download; reservation before `send_file` |
+| Voice notes | single/automatic preflight; reservation before `send_file` |
+| AI result attachment | 80% file-upload preflight; reservation before `send_file`; ordinary text delivery does not upload |
+| Gemini OCR/STT | async media-service preflight plus the existing synchronous Gemini reservation |
+| Groq STT | provider-media preflight before any HTTP upload |
+| Speechmatics STT | provider-media preflight before any HTTP upload |
+| Supabase Storage appearance uploads | storage preflight before `_upload_sync`; existing sync reservation |
+| Anti-edit/delete media snapshots | existing Storage reservation now enforces the same policy |
+| Scheduled task media | automatic-media context around the claimed occurrence |
+
+### Still uncovered / deliberate limits
+
+- Helper Bot behavior and Egress Attribution logging were not investigated or
+  modified in this phase.
+- The policy governs application payload boundaries, not arbitrary control-plane
+  database writes or Render's internal management traffic.
+- Render remains hourly and delayed; the policy cannot prevent egress that
+  happens between observations, which is why the local reservation ledger and
+  the fail-closed unavailable state remain in place.
+- Future upload paths must call the central governor/policy boundary; a new
+  direct provider or Telegram upload that bypasses both is not covered.
+- The current live observation (approximately 4.44 GB for November 1–23) would
+  resolve to tier 90 on the first trusted refresh. That value is an observation,
+  not a constant in code.
+
+### Tests executed
+
+- `tests/test_outbound_bandwidth_policy.py` — 41 passed: exact 50/60/70/80/90
+  boundaries, cumulative denials, strict text-only, text bound/oversized text,
+  unknown classes, scheduled-automatic conversion, Render > governor, governor
+  > Render, no summation, unavailable/stale/malformed Render, unavailable
+  governor, 300-second cache, restart persistence, UTC rollover, daily hard limit,
+  sync/async parity and bulk gating.
+- `tests/test_outbound_upload_governance.py` — 16 passed, including voice at 90%,
+  AI attachment at 80% and Gemini provider media at 70%.
+- Save/retrieve/album/provider regression subset — previously 1,015 passed; the
+  new save/album/rename policy integrations were added and run with the full
+  suite.
+- Full suite: **8,171 passed, 27 skipped, 4 failed**. The same four tests fail on
+  the untouched baseline `7842c0a` in this environment: three migration-count
+  audit tests (the repository contains 44 SQL files while the audit expects 43;
+  `DATABASE_ARCHITECTURE.md` was intentionally not changed) and
+  `test_recovered_interrupted_occurrence_is_picked_up_by_run_once` (its fixture
+  is scheduled for 2026-09-10, and the interval-advance bound expires by the
+  current 2026-11-24 clock).
+- `python -m py_compile` on every changed Python file and `git diff --check`
+  completed without errors.

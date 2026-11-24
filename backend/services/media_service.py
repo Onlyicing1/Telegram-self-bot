@@ -1059,6 +1059,9 @@ async def _extract_image_content(
         )
 
     _validate_image_payload(data, mime_type)
+    from backend.services import outbound_bandwidth_service as _bw
+
+    await _bw.ensure_action_allowed(_bw.ACTION_PROVIDER_MEDIA, len(data))
     raw_text = await _run_ocr(engine, data, OCR_TIMEOUT_S)
     text = _normalize_extracted_text(raw_text)
     if not text:
@@ -1469,6 +1472,9 @@ async def _extract_audio_content(
             exc.stage = MEDIA_STAGE_VALIDATION
         raise
 
+    from backend.services import outbound_bandwidth_service as _bw
+
+    await _bw.ensure_action_allowed(_bw.ACTION_PROVIDER_MEDIA, len(data))
     if duration_s > MAX_STT_DURATION_S:
         # Longer than ONE recognition may handle: divided into ordered, bounded
         # chunks and transcribed one at a time through the same engine seam.

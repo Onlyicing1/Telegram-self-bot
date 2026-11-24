@@ -1346,6 +1346,9 @@ async def install_image(data: bytes, declared_mime: str = "") -> tuple[bool, str
 
         key = f"{IMAGES_PREFIX}/{uuid.uuid4().hex}.{_MIME_EXT[mime]}"
         try:
+            from backend.services import outbound_bandwidth_service as _bw
+
+            await _bw.ensure_action_allowed(_bw.ACTION_STORAGE_UPLOAD, len(data))
             await asyncio.to_thread(_upload_sync, key, data, mime)
         except asyncio.CancelledError:
             raise

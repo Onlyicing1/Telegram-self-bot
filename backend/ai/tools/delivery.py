@@ -731,6 +731,12 @@ async def _send_text_attachment(sender: Any, entity: Any, payload: bytes) -> Non
         raise RuntimeError("no Telegram client is available to attach the result")
     if entity is None:
         raise RuntimeError("the request has no chat to attach the result to")
+    from backend.services import outbound_bandwidth_service as governor
+
+    await governor.ensure_action_allowed(
+        governor.effective_media_action(governor.ACTION_FILE_UPLOAD),
+        max(1, len(payload)),
+    )
     await _reserve_attachment_bytes(len(payload))
     upload_egress = egress.telegram_upload("telegram_self_upload", "ai_attachment")
     upload_kwargs: dict[str, Any] = {}

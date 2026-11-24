@@ -1447,6 +1447,58 @@ async def test_real_telethon_sends_one_multi_media_request_for_the_album():
 # ── outbound bandwidth governance (album) ──────────────────────────────────
 
 
+def _policy_at(monkeypatch, effective: int) -> None:
+    from datetime import datetime, timezone
+
+    from backend.services import outbound_bandwidth_service as bw
+
+    current = datetime.now(timezone.utc)
+    monkeypatch.setattr(bw, "_policy_snapshot", {
+        "trusted": True,
+        "state": "available",
+        "detail": "",
+        "tier": bw._policy_tier(effective),
+        "effective_monthly_bytes": effective,
+        "render_monthly_bytes": effective,
+        "governor_monthly_bytes": 0,
+        "policy_floor_bytes": 0,
+        "monthly_limit_bytes": bw.MONTHLY_TARGET_BYTES,
+        "monthly_period": current.strftime("%Y-%m"),
+        "latest_data_at": current.isoformat(),
+        "checked_at": current.isoformat(),
+    })
+
+
+@pytest.mark.asyncio
+async def test_album_is_refused_at_sixty_percent_before_any_transfer(monkeypatch):
+    _policy_at(monkeypatch, 2_400_000_000)
+    first, second, third = _album_members()
+    client = FakeClient([first, second, third])
+
+    result = await save_service.execute_save(client, OWNER, second, "UTC")
+
+    assert getattr(result, "saved", False) is False
+    assert client.download_calls == []
+    assert client.upload_calls == []
+    assert client.send_calls == []
+
+
+@pytest.mark.asyncio
+async def test_single_media_is_refused_at_ninety_percent_before_any_transfer(
+    monkeypatch,
+):
+    _policy_at(monkeypatch, 3_600_000_000)
+    message = photo_message(11, size=1000, grouped_id=None)
+    client = FakeClient([message])
+
+    result = await save_service.execute_save(client, OWNER, message, "UTC")
+
+    assert getattr(result, "saved", False) is False
+    assert client.download_calls == []
+    assert client.upload_calls == []
+    assert client.send_calls == []
+
+
 @pytest.mark.asyncio
 async def test_album_reserves_every_member_before_its_upload(monkeypatch):
     from backend.services import outbound_bandwidth_service as bw

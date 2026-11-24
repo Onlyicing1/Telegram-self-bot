@@ -555,6 +555,17 @@ class GroqWhisperEngine:
         """
         if not audio:
             return ""
+        from backend.services import outbound_bandwidth_service as _bw
+
+        try:
+            _bw.ensure_action_allowed_sync(_bw.ACTION_PROVIDER_MEDIA, len(audio))
+        except Exception as exc:  # noqa: BLE001 — refuse before any provider upload
+            self._last_failure_class = "bandwidth_restricted"
+            self._log_run(len(audio), 0, 0.0, failed=True)
+            raise _error(
+                f"Outbound bandwidth policy refused {PROVIDER_NAME} transcription: {exc}",
+                FAILURE_TRANSPORT,
+            ) from exc
         container = container_for(audio)
         if container is None:
             error = _error(
