@@ -49,6 +49,7 @@ from backend.ai.semantic_delete import normalize_text as _persian_normalize
 from backend.db import client as db_client
 from backend.diagnostics import record_event
 from backend.helper import symbols as sym
+from backend.observability import egress_attribution as egress
 from backend.services import save_service
 
 logger = logging.getLogger(__name__)
@@ -62,7 +63,9 @@ async def _reserve_reupload_bytes(byte_count: int) -> None:
     """
     from backend.services import outbound_bandwidth_service as governor
 
-    await governor.reserve_outbound_bytes("telegram_media", byte_count)
+    await governor.reserve_outbound_bytes(
+        "telegram_media", byte_count, action="reupload"
+    )
 
 
 def _format_size(size_bytes) -> str:
@@ -1336,9 +1339,11 @@ async def do_change_file_name(
             await client.download_media(current, file=tmp_path)
         except Exception as exc:  # noqa: BLE001
             logger.warning("saved file-name download failed for %s: %s", code, exc)
+            egress.record_telegram_download(tmp_path)
             return f"{sym.STATE_FAILED} Could not download the saved media ({exc}). Nothing was renamed."
         if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) == 0:
             return f"{sym.STATE_FAILED} The downloaded saved media is empty. Nothing was renamed."
+        egress.record_telegram_download(tmp_path)
 
         # The SAME media handling Deep Save uses, with the new filename: the
         # document's other attributes and its MIME type are carried over, so a
@@ -1348,6 +1353,7 @@ async def do_change_file_name(
             # The replacement is a REAL upload of the downloaded bytes, so it
             # is accounted before Telegram receives any of them.
             await _reserve_reupload_bytes(os.path.getsize(tmp_path))
+            egress.record("telegram_upload", os.path.getsize(tmp_path))
             sent = await client.send_file(
                 "me",
                 tmp_path,

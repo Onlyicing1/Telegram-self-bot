@@ -175,6 +175,30 @@ async def _heartbeat_loop() -> None:
             **_recovery_state(),
         )
 
+        # ── Bounded bandwidth observability on the EXISTING lifecycle ──
+        # No new scheduler: the aggregate flush is due at most every few
+        # minutes, and the Render metric refresh is its own bounded cadence.
+        try:
+            from backend.services import render_bandwidth_service as render_metric
+
+            await render_metric.maybe_refresh()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — observability never breaks the heartbeat
+            pass
+        try:
+            from backend.observability import egress_attribution as egress
+
+            if egress.flush_due():
+                from backend.services import outbound_bandwidth_service as governor
+
+                policy = await asyncio.to_thread(governor.get_policy_snapshot_sync)
+                egress.flush(policy=policy)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            pass
+
         # ── State-machine invariant check ──
         # READY must never coexist with a disconnected SELF client. The helper
         # bot is optional — when it is disabled, helper_connected=False is a

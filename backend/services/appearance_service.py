@@ -1078,7 +1078,9 @@ def _upload_sync(key: str, data: bytes, mime: str) -> None:
     """
     from backend.services import outbound_bandwidth_service as governor
 
-    governor.reserve_outbound_bytes_sync("storage_upload", len(data))
+    governor.reserve_outbound_bytes_sync(
+        "storage_upload", len(data), action="storage_upload"
+    )
     response = _db().storage.from_(bucket()).upload(
         key, data, {"content-type": mime, "upsert": "false"}
     )

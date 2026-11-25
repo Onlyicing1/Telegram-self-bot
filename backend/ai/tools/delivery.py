@@ -721,7 +721,9 @@ async def _reserve_attachment_bytes(byte_count: int) -> None:
     """
     from backend.services import outbound_bandwidth_service as governor
 
-    await governor.reserve_outbound_bytes("telegram_media", byte_count)
+    await governor.reserve_outbound_bytes(
+        "telegram_media", byte_count, action="media_transfer"
+    )
 
 
 async def _send_text_attachment(sender: Any, entity: Any, payload: bytes) -> None:
@@ -731,6 +733,9 @@ async def _send_text_attachment(sender: Any, entity: Any, payload: bytes) -> Non
     if entity is None:
         raise RuntimeError("the request has no chat to attach the result to")
     await _reserve_attachment_bytes(len(payload))
+    from backend.observability import egress_attribution as egress
+
+    egress.record("telegram_upload", len(payload))
     await sender.send_file(
         entity,
         io.BytesIO(payload),

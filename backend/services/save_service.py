@@ -43,13 +43,16 @@ from backend.bio.engine import _get_tz
 from backend.db import client as db_client
 from backend.diagnostics import record_event
 from backend.helper import symbols as sym
+from backend.observability import egress_attribution as egress
 from backend.runtime import save_trace
 from backend.services import settings_service
 
 logger = logging.getLogger(__name__)
 
 
-async def _reserve_upload_bytes(category: str, byte_count: int) -> None:
+async def _reserve_upload_bytes(
+    category: str, byte_count: int, *, action: str | None = None
+) -> None:
     """Reserve outbound bytes BEFORE an upload transmits them (fail closed).
 
     Imported lazily and never guarded: a governor that cannot be imported has
@@ -57,7 +60,7 @@ async def _reserve_upload_bytes(category: str, byte_count: int) -> None:
     """
     from backend.services import outbound_bandwidth_service as governor
 
-    await governor.reserve_outbound_bytes(category, byte_count)
+    await governor.reserve_outbound_bytes(category, byte_count, action=action)
 
 _LINK_RE = re.compile(
     r"https?://(?:t|telegram)\.me/"
@@ -1601,6 +1604,7 @@ async def _deep_save_one(
                 if trace is not None:
                     trace.failed("download", "download_media", exc)
                     trace.returned("deep_save", "_deep_save_one", save_trace.OUTCOME_FAILED)
+                egress.record_telegram_download(tmp_path)
                 return SaveOutcome(
                     f"{sym.STATE_FAILED} Deep Save failed: unable to download the source message ({exc})",
                     saved=False,
@@ -1632,6 +1636,7 @@ async def _deep_save_one(
                     f"{sym.STATE_FAILED} Deep Save failed: downloaded file is empty.",
                     saved=False,
                 )
+            egress.record_telegram_download(tmp_path)
 
             await _emit_progress(
                 progress,
@@ -1663,7 +1668,10 @@ async def _deep_save_one(
                 upload_kwargs = _upload_kwargs_for_media(media, mime_type, file_name)
                 if upload_callback is not None:
                     upload_kwargs["progress_callback"] = upload_callback
-                await _reserve_upload_bytes("telegram_media", actual_size)
+                await _reserve_upload_bytes(
+                    "telegram_media", actual_size, action="interactive_media"
+                )
+                egress.record("telegram_upload", actual_size)
                 sent = await client.send_file(
                     "me",
                     tmp_path,
@@ -1894,6 +1902,7 @@ async def _deep_save_album(
             except Exception as exc:  # noqa: BLE001 — honest per-file failure
                 logger.error("[SAVE] album download failed item=%d/%d: %s", index, total_items, exc)
                 record_event("save", "download_media", 0, "ERROR", str(exc))
+                egress.record_telegram_download(tmp_path)
                 return _album_failure(index, total_items, f"could not be downloaded ({exc})")
 
             if not os.path.exists(tmp_path):
@@ -1906,6 +1915,7 @@ async def _deep_save_album(
                     index, total_items,
                     f"is {member_size / (1024 * 1024):.1f} MB — over the {limit_mb} MB limit",
                 )
+            egress.record_telegram_download(tmp_path)
 
             await _emit_progress(
                 progress,
@@ -1932,7 +1942,10 @@ async def _deep_save_album(
                 upload_kwargs = {"progress_callback": upload_callback} if upload_callback else {}
                 # Each member is a REAL byte transfer here.  The grouped send
                 # below only attaches these already-uploaded handles.
-                await _reserve_upload_bytes("telegram_media", member_size)
+                await _reserve_upload_bytes(
+                    "telegram_media", member_size, action="album_media"
+                )
+                egress.record("telegram_upload", member_size)
                 handle = await client.upload_file(tmp_path, **upload_kwargs)
                 record_event(
                     "save", "upload_file",

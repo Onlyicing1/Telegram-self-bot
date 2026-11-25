@@ -17,6 +17,7 @@ import logging
 import os
 from typing import Any
 
+from backend.observability import egress_attribution as egress
 from backend.runtime.operation_watchdog import guarded_await
 from backend.telegram_api._helpers import serialize_message
 from backend.telegram_api.exceptions import (
@@ -88,7 +89,9 @@ async def download_media(
     if result is None:
         return None
     if isinstance(result, str) and os.path.exists(result):
+        egress.record_telegram_download(result)
         return result
+    egress.record_telegram_download(result)
     return result
 
 
@@ -117,7 +120,9 @@ async def _reserve_voice_bytes(byte_count: int) -> None:
             "send_voice refused: outbound bandwidth accounting is unavailable"
         ) from exc
     try:
-        await governor.reserve_outbound_bytes("telegram_media", byte_count)
+        await governor.reserve_outbound_bytes(
+            "telegram_media", byte_count, action="voice"
+        )
     except Exception as exc:  # noqa: BLE001 — exceeded/unavailable both deny
         raise TelegramAPIError(f"send_voice refused: {exc}") from exc
 
@@ -146,6 +151,7 @@ async def send_voice(
     if not isinstance(audio, (bytes, bytearray)) or not audio:
         raise TelegramAPIError("send_voice needs audio bytes; nothing was sent.")
     await _reserve_voice_bytes(len(audio))
+    egress.record("telegram_upload", len(audio))
     effective = _effective_upload_timeout(timeout)
     try:
         message = await guarded_await(

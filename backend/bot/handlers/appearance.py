@@ -491,6 +491,12 @@ async def _download_bounded(event) -> tuple[bytes | None, str]:
                 await close()
             except Exception:  # noqa: BLE001 — closing a finished stream is harmless
                 pass
+        try:
+            from backend.observability import egress_attribution as egress
+
+            egress.record_telegram_download(bytes(buffer))
+        except Exception:  # noqa: BLE001 — measurement never changes the transfer
+            pass
     if not buffer:
         return None, f"{sym.STATE_FAILED} That file is empty."
     return bytes(buffer), ""

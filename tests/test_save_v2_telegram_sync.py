@@ -1018,7 +1018,7 @@ async def test_the_file_name_change_reserves_the_reuploaded_bytes(monkeypatch):
     client = FakeSavedClient(_document_message())
     reserved = []
 
-    async def _reserve(category, byte_count):
+    async def _reserve(category, byte_count, **kwargs):
         reserved.append((category, byte_count))
         return {}
 
@@ -1038,7 +1038,7 @@ async def test_the_file_name_change_never_uploads_when_accounting_denies(monkeyp
     _seed(_row())
     client = FakeSavedClient(_document_message())
 
-    async def _deny(category, byte_count):
+    async def _deny(category, byte_count, **kwargs):
         raise bw.OutboundBandwidthUnavailableError("accounting unavailable")
 
     monkeypatch.setattr(bw, "reserve_outbound_bytes", _deny)

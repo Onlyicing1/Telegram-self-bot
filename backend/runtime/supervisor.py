@@ -180,6 +180,16 @@ class RuntimeSupervisor:
         # signal a real timestamp so its all-signals-frozen check can fire.
         mark_started()
 
+        # Bandwidth observability is installed before the first settings read
+        # or provider client.  Both operations are idempotent and never raise.
+        try:
+            from backend.observability import egress_attribution as egress
+
+            egress.log_startup()
+            egress.install_httpx_instrumentation()
+        except Exception:  # noqa: BLE001
+            pass
+
         settings_service.load_all()
         await self._provision_media_engines()
 
@@ -1122,6 +1132,16 @@ class RuntimeSupervisor:
         await stop_failsafe()
         await stop_diagnostics()
         await stop_memory_cleanup()
+
+        # Flush the aggregate attribution record while the DB pool is still
+        # available; the policy snapshot is read-only and never raises.
+        try:
+            from backend.observability import egress_attribution as egress
+            from backend.services import outbound_bandwidth_service as governor
+
+            egress.flush(policy=governor.get_policy_snapshot_sync())
+        except Exception:  # noqa: BLE001
+            pass
 
         # Release the bounded Supabase pool that every DB, task and audit
         # dispatch runs on. A later caller re-creates it lazily, so no

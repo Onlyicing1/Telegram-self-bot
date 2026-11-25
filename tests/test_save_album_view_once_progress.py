@@ -1455,7 +1455,7 @@ async def test_album_reserves_every_member_before_its_upload(monkeypatch):
     client = FakeClient([first, second, third])
     reserved = []
 
-    async def _reserve(category, byte_count):
+    async def _reserve(category, byte_count, **kwargs):
         reserved.append((category, byte_count))
         return {}
 
@@ -1477,7 +1477,7 @@ async def test_album_uploads_nothing_when_the_member_reservation_is_denied(monke
     first, second, third = _album_members(size=1000)
     client = FakeClient([first, second, third])
 
-    async def _deny(category, byte_count):
+    async def _deny(category, byte_count, **kwargs):
         raise bw.OutboundBandwidthUnavailableError("accounting unavailable")
 
     monkeypatch.setattr(bw, "reserve_outbound_bytes", _deny)

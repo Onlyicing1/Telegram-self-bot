@@ -1619,8 +1619,12 @@ async def store_media_snapshot(client: Any, msg: Any, row: dict[str, Any]) -> bo
         tmp_dir = tempfile.mkdtemp(prefix="lifeos_aed_")
         try:
             path = await client.download_media(msg, file=tmp_dir)
+            from backend.observability import egress_attribution as egress
+
             if not path:
+                egress.record_unmeasured("telegram_download")
                 return False
+            egress.record_telegram_download(path)
             object_name = f"{row['owner_id']}/{row['id']}"
             db = db_client.get_db()
             if db is None:
@@ -1631,7 +1635,9 @@ async def store_media_snapshot(client: Any, msg: Any, row: dict[str, Any]) -> bo
             # upload, and archive nothing when accounting denies it.
             from backend.services import outbound_bandwidth_service as governor
 
-            await governor.reserve_outbound_bytes("storage_upload", len(payload))
+            await governor.reserve_outbound_bytes(
+                "storage_upload", len(payload), action="storage_upload"
+            )
             db.storage.from_(bucket).upload(object_name, payload)
             row["media_stored"] = True
             row["media_object"] = object_name

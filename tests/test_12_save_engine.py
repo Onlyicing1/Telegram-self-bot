@@ -670,7 +670,7 @@ async def test_deep_save_reserves_the_uploaded_bytes_once(monkeypatch):
 
     reserved = []
 
-    async def _reserve(category, byte_count):
+    async def _reserve(category, byte_count, **kwargs):
         reserved.append((category, byte_count))
         return {}
 
@@ -688,7 +688,7 @@ async def test_deep_save_reserves_the_uploaded_bytes_once(monkeypatch):
 async def test_deep_save_never_uploads_when_the_reservation_is_denied(monkeypatch):
     from backend.services import outbound_bandwidth_service as bw
 
-    async def _deny(category, byte_count):
+    async def _deny(category, byte_count, **kwargs):
         raise bw.OutboundBandwidthUnavailableError("accounting unavailable")
 
     monkeypatch.setattr(bw, "reserve_outbound_bytes", _deny)

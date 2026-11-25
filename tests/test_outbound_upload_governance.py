@@ -206,7 +206,7 @@ def test_the_gemini_reservation_is_a_conservative_upper_bound(monkeypatch):
     monkeypatch.setattr(
         bw,
         "reserve_outbound_bytes_sync",
-        lambda category, byte_count: recorded.append((category, byte_count)) or {},
+        lambda category, byte_count, **kwargs: recorded.append((category, byte_count)) or {},
     )
 
     gemini._reserve_gemini_bandwidth("gemini_ocr", 1000)
@@ -223,7 +223,7 @@ def test_ocr_never_reaches_the_provider_when_the_reservation_is_denied(monkeypat
         lambda self, *args, **kwargs: provider_calls.append(args) or "text",
     )
 
-    def _deny(category, byte_count):
+    def _deny(category, byte_count, **kwargs):
         raise bw.OutboundBandwidthUnavailableError("accounting unavailable")
 
     monkeypatch.setattr(bw, "reserve_outbound_bytes_sync", _deny)
@@ -240,7 +240,7 @@ def test_ocr_behavior_is_unchanged_when_the_reservation_succeeds(monkeypatch):
     monkeypatch.setattr(
         bw,
         "reserve_outbound_bytes_sync",
-        lambda category, byte_count: recorded.append((category, byte_count)) or {},
+        lambda category, byte_count, **kwargs: recorded.append((category, byte_count)) or {},
     )
     monkeypatch.setattr(gemini, "gemini_mime_type", lambda payload: "image/png")
     monkeypatch.setattr(type(engine), "_generate", lambda self, *a, **k: "extracted")

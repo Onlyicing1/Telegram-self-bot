@@ -764,7 +764,7 @@ def _reserve_gemini_bandwidth(category: str, payload_size: int) -> None:
         raise RuntimeError("outbound bandwidth accounting is unavailable")
     # Conservative upper bound: base64 expansion + JSON/transport overhead.
     byte_count = max(int(payload_size), ((int(payload_size) + 2) // 3) * 4) + 4096
-    reserve(category, byte_count)
+    reserve(category, byte_count, action="ai_media")
 
 
 class GeminiMediaEngine:

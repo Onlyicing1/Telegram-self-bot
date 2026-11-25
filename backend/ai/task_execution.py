@@ -12,6 +12,7 @@ from typing import Any
 import re
 
 from backend.ai.database.task_repository import OccurrenceRecord, TaskRepository
+from backend.services import outbound_bandwidth_service as bandwidth_governor
 from backend.ai.task_contract import (
     ACTION_RUNS_KEY,
     ANSWER_FIELD,
@@ -1175,12 +1176,13 @@ class TaskExecutionCoordinator:
                     "action_started", position=position, action=name,
                     action_kind="question",
                 )
-                result = (await self.executor.execute_calls(
-                    [{"name": name, "arguments": resolved}],
-                    owner_id=self.owner_id,
-                    session_id=f"task:{occurrence.task_id}:{occurrence.occurrence_key}",
-                    context_override=execution_context,
-                ))[0]
+                with bandwidth_governor.scheduled_media_scope():
+                    result = (await self.executor.execute_calls(
+                        [{"name": name, "arguments": resolved}],
+                        owner_id=self.owner_id,
+                        session_id=f"task:{occurrence.task_id}:{occurrence.occurrence_key}",
+                        context_override=execution_context,
+                    ))[0]
                 results.append(result)
                 occurrence_trace(
                     "action_result", position=position, action=name,
@@ -1248,12 +1250,13 @@ class TaskExecutionCoordinator:
             state[position] = build_action_run(position, name, "running")
             await self._persist_runs(occurrence, state)
             occurrence_trace("action_started", position=position, action=name)
-            result = (await self.executor.execute_calls(
-                [{"name": name, "arguments": resolved}],
-                owner_id=self.owner_id,
-                session_id=f"task:{occurrence.task_id}:{occurrence.occurrence_key}",
-                context_override=execution_context,
-            ))[0]
+            with bandwidth_governor.scheduled_media_scope():
+                result = (await self.executor.execute_calls(
+                    [{"name": name, "arguments": resolved}],
+                    owner_id=self.owner_id,
+                    session_id=f"task:{occurrence.task_id}:{occurrence.occurrence_key}",
+                    context_override=execution_context,
+                ))[0]
             results.append(result)
             occurrence_trace(
                 "action_result", position=position, action=name,
