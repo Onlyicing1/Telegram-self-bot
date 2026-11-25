@@ -22,9 +22,9 @@ merged (`merge --no-ff`); the canonical remote implementation is the base and
 this delivery adds the missing correctness work below. The merge preserves both
 parents and does not rebase, reset, force-push, or rewrite either history.
 
-The resulting delta against `origin/main` is 17 files: the attribution module,
+The resulting delta against `origin/main` is 18 files: the attribution module,
 the Render metric/source diagnostic, lifecycle wiring, download call sites, STT
-reservations, and focused tests.
+reservations, focused tests, and this report.
 
 ## 2. Verified gaps fixed
 
