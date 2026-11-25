@@ -34,6 +34,7 @@ contains the API key, request headers, or a response body.
 """
 from __future__ import annotations
 from backend.helper import symbols as sym
+from backend.observability import egress_attribution as egress
 
 import asyncio
 import logging
@@ -399,7 +400,10 @@ async def _validate_provider(status: ProviderStatus) -> ProviderStatus:
         headers = {"Authorization": f"Bearer {api_key}"}
 
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with httpx.AsyncClient(
+            timeout=10,
+            **egress.async_client_kwargs("ai_discovery", status.name),
+        ) as client:
             resp = await client.get(url, headers=headers, params=params)
         return _classify_probe(status, resp.status_code, url)
     except Exception as exc:

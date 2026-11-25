@@ -34,6 +34,8 @@ from postgrest.constants import DEFAULT_POSTGREST_CLIENT_TIMEOUT
 from supabase import Client as SupabaseClient
 from supabase import ClientOptions
 
+from backend.observability import egress_attribution as egress
+
 logger = logging.getLogger(__name__)
 
 __all__ = [
@@ -79,6 +81,7 @@ class HTTP1PostgrestClient(SyncPostgrestClient):
             verify=verify,
             follow_redirects=True,
             http2=False,
+            **egress.sync_client_kwargs("supabase_rest", "postgrest"),
         )
 
 

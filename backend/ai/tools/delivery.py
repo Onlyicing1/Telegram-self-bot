@@ -1,6 +1,7 @@
 """Centralized, language-agnostic AI output normalization and Telegram delivery."""
 from __future__ import annotations
 from backend.helper import symbols as sym
+from backend.observability import egress_attribution as egress
 
 import io
 import logging
@@ -721,9 +722,7 @@ async def _reserve_attachment_bytes(byte_count: int) -> None:
     """
     from backend.services import outbound_bandwidth_service as governor
 
-    await governor.reserve_outbound_bytes(
-        "telegram_media", byte_count, action="media_transfer"
-    )
+    await governor.reserve_outbound_bytes("telegram_media", byte_count)
 
 
 async def _send_text_attachment(sender: Any, entity: Any, payload: bytes) -> None:
@@ -732,16 +731,26 @@ async def _send_text_attachment(sender: Any, entity: Any, payload: bytes) -> Non
         raise RuntimeError("no Telegram client is available to attach the result")
     if entity is None:
         raise RuntimeError("the request has no chat to attach the result to")
-    await _reserve_attachment_bytes(len(payload))
-    from backend.observability import egress_attribution as egress
+    from backend.services import outbound_bandwidth_service as governor
 
-    egress.record("telegram_upload", len(payload))
-    await sender.send_file(
-        entity,
-        io.BytesIO(payload),
-        attributes=[tg_types.DocumentAttributeFilename(file_name=_MEDIA_ATTACHMENT_NAME)],
-        force_document=True,
+    await governor.ensure_action_allowed(
+        governor.effective_media_action(governor.ACTION_FILE_UPLOAD),
+        max(1, len(payload)),
     )
+    await _reserve_attachment_bytes(len(payload))
+    upload_egress = egress.telegram_upload("telegram_self_upload", "ai_attachment")
+    upload_kwargs: dict[str, Any] = {}
+    progress_cb = upload_egress.wrap(None)
+    if progress_cb is not None:
+        upload_kwargs["progress_callback"] = progress_cb
+    with upload_egress:
+        await sender.send_file(
+            entity,
+            io.BytesIO(payload),
+            attributes=[tg_types.DocumentAttributeFilename(file_name=_MEDIA_ATTACHMENT_NAME)],
+            force_document=True,
+            **upload_kwargs,
+        )
 
 
 async def deliver_single_message(

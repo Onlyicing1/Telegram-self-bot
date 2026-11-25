@@ -1,10 +1,12 @@
 """Persistent, fail-closed outbound bandwidth governor.
 
-This module is the single authority for outbound payload accounting.  It does
-not attempt to measure all Render outbound traffic; it accounts only for the
-explicit payload paths that call :func:`reserve_outbound_bytes` before
-transmission (Gemini OCR/STT, Telegram outbound media including Deep Save,
-voice notes, AI result attachments, file-name re-uploads and Storage uploads).
+This module is the single authority for outbound payload accounting AND the
+staged monthly policy. It does not attempt to measure all Render outbound
+traffic; it accounts only for the explicit payload paths that call
+:func:`reserve_outbound_bytes` before transmission (Gemini OCR/STT, Telegram
+outbound media including Deep Save, voice notes, AI result attachments,
+file-name re-uploads and Storage uploads), and evaluates the policy against the
+higher of Render's service-scoped monthly egress and that local ledger.
 
 Accounting state lives in the ``panel_settings.outbound_bandwidth_state``
 JSONB column (one dedicated column on the existing singleton row) and is
@@ -28,12 +30,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import contextvars
+import copy
 import logging
 import threading
-import time
-from datetime import datetime, timezone
-from typing import Any, Dict, Iterator, Optional
+from contextvars import ContextVar
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Optional
 
 from backend.services import panel_settings_repository as repo
 
@@ -47,48 +49,84 @@ logger = logging.getLogger(__name__)
 # Exact operational defaults (decimal bytes).  Do not silently change these.
 DAILY_LIMIT_BYTES: int = 150_000_000
 MONTHLY_LIMIT_BYTES: int = 4_000_000_000
+MONTHLY_TARGET_BYTES: int = 4_000_000_000
 
-# Cumulative staged policy, expressed as a share of the monthly budget.
-# 50% -> 2.0 GB, 60% -> 2.4 GB, 70% -> 2.8 GB, 80% -> 3.2 GB,
-# 90% -> 3.6 GB, 100% -> 4.0 GB.  A tier is active at OR ABOVE its threshold,
-# so higher tiers never re-enable a lower tier's restriction.
-POLICY_TIER_RATIOS: tuple[float, ...] = (0.50, 0.60, 0.70, 0.80, 0.90, 1.00)
-POLICY_TIER_BYTES: tuple[int, ...] = tuple(
-    int(MONTHLY_LIMIT_BYTES * ratio) for ratio in POLICY_TIER_RATIOS
-)
+# Staged monthly policy. These are cumulative: a higher tier never re-enables
+# an action denied by a lower one.
+POLICY_AUTOMATIC_MEDIA_PCT = 50
+POLICY_BULK_MEDIA_PCT = 60
+POLICY_PROVIDER_MEDIA_PCT = 70
+POLICY_NONESSENTIAL_UPLOAD_PCT = 80
+POLICY_STRICT_TEXT_ONLY_PCT = 90
 
-ACTION_SCHEDULED_MEDIA = "scheduled_media"
-ACTION_ALBUM_MEDIA = "album_media"
-ACTION_AI_MEDIA = "ai_media"
-ACTION_STORAGE_UPLOAD = "storage_upload"
+POLICY_THRESHOLD_BYTES = {
+    50: 2_000_000_000,
+    60: 2_400_000_000,
+    70: 2_800_000_000,
+    80: 3_200_000_000,
+    90: 3_600_000_000,
+}
+
+# A 32 KiB explicitly-accounted text operation remains text-only. Anything
+# larger does not inherit the text exemption.
+TEXT_EXEMPT_MAX_BYTES = 32 * 1024
+
+# Render publishes hourly points with a delay. Five minutes is the maximum
+# accepted cache age; a point older than three hours is too stale to trust.
+RENDER_CACHE_TTL_SECONDS = 300
+RENDER_MAX_STALENESS_SECONDS = 3 * 60 * 60
+
+# Action classes are deliberately explicit. An unknown category is NEVER text.
+ACTION_TEXT = "text"
+ACTION_AUTOMATIC_MEDIA = "automatic_media"
+ACTION_SINGLE_MEDIA = "single_media"
+ACTION_BULK_MEDIA = "bulk_media"
+ACTION_PROVIDER_MEDIA = "provider_media"
+ACTION_FILE_UPLOAD = "file_upload"
 ACTION_REUPLOAD = "reupload"
-ACTION_MEDIA_TRANSFER = "media_transfer"
-ACTION_INTERACTIVE_MEDIA = "interactive_media"
-ACTION_VOICE = "voice"
+ACTION_STORAGE_UPLOAD = "storage_upload"
+ACTION_MEDIA_FORWARD = "media_forward"
+ACTION_UNKNOWN = "unknown"
 
-#: The FIRST tier at which each bounded action is denied.  Denial is
-#: cumulative: tier >= this value refuses the operation.
-ACTION_MIN_TIER: Dict[str, int] = {
-    ACTION_SCHEDULED_MEDIA: 1,
-    ACTION_ALBUM_MEDIA: 2,
-    ACTION_AI_MEDIA: 3,
-    ACTION_STORAGE_UPLOAD: 4,
-    ACTION_REUPLOAD: 4,
-    ACTION_MEDIA_TRANSFER: 4,
-    ACTION_INTERACTIVE_MEDIA: 5,
-    ACTION_VOICE: 5,
-}
-#: Unknown categories are classified conservatively, never as interactive.
-_CATEGORY_DEFAULT_ACTION: Dict[str, str] = {
-    "telegram_media": ACTION_INTERACTIVE_MEDIA,
+_CATEGORY_ACTIONS = {
+    "text": ACTION_TEXT,
+    "telegram_media": ACTION_SINGLE_MEDIA,
+    "telegram_voice": ACTION_SINGLE_MEDIA,
+    "voice": ACTION_SINGLE_MEDIA,
+    "bulk_media": ACTION_BULK_MEDIA,
+    "album_media": ACTION_BULK_MEDIA,
+    "ai_attachment": ACTION_FILE_UPLOAD,
+    "file_upload": ACTION_FILE_UPLOAD,
+    "rename_reupload": ACTION_REUPLOAD,
+    "reupload": ACTION_REUPLOAD,
     "storage_upload": ACTION_STORAGE_UPLOAD,
-    "gemini_ocr": ACTION_AI_MEDIA,
-    "gemini_stt": ACTION_AI_MEDIA,
+    "gemini_ocr": ACTION_PROVIDER_MEDIA,
+    "gemini_stt": ACTION_PROVIDER_MEDIA,
+    "provider_media": ACTION_PROVIDER_MEDIA,
+    "stt_upload": ACTION_PROVIDER_MEDIA,
+    "media_forward": ACTION_MEDIA_FORWARD,
+    "automatic_media": ACTION_AUTOMATIC_MEDIA,
 }
 
-#: Render's metric is refreshed by the existing heartbeat; older values are
-#: still a valid LOWER BOUND, only their trust flag changes.
-RENDER_SNAPSHOT_MAX_AGE_S = 2 * 3600
+_ACTION_MIN_TIER = {
+    ACTION_AUTOMATIC_MEDIA: POLICY_AUTOMATIC_MEDIA_PCT,
+    ACTION_BULK_MEDIA: POLICY_BULK_MEDIA_PCT,
+    ACTION_PROVIDER_MEDIA: POLICY_PROVIDER_MEDIA_PCT,
+    ACTION_FILE_UPLOAD: POLICY_NONESSENTIAL_UPLOAD_PCT,
+    ACTION_REUPLOAD: POLICY_NONESSENTIAL_UPLOAD_PCT,
+    ACTION_STORAGE_UPLOAD: POLICY_NONESSENTIAL_UPLOAD_PCT,
+    ACTION_MEDIA_FORWARD: POLICY_NONESSENTIAL_UPLOAD_PCT,
+    ACTION_SINGLE_MEDIA: POLICY_STRICT_TEXT_ONLY_PCT,
+    # Unknown payloads are treated as potentially automatic media: they are
+    # never allowed once any staged restriction is active.
+    ACTION_UNKNOWN: POLICY_AUTOMATIC_MEDIA_PCT,
+}
+
+#: Set only around a claimed scheduled occurrence. Interactive owner actions
+#: are never marked automatic.
+_AUTOMATIC_MEDIA: ContextVar[bool] = ContextVar(
+    "lifeos_automatic_outbound_media", default=False
+)
 
 _STATE_KEY = "outbound_bandwidth_state"
 _STATE_VERSION = 1
@@ -133,26 +171,6 @@ class OutboundBandwidthUnavailableError(
     """Raised when persistent accounting cannot be read, parsed or written."""
 
 
-class OutboundBandwidthPolicyError(OutboundBandwidthError, ValueError, RuntimeError):
-    """Raised when the cumulative staged policy refuses an operation."""
-
-    def __init__(
-        self,
-        action: str,
-        tier: int,
-        effective_bytes: int,
-        min_tier: int,
-    ) -> None:
-        self.action = action
-        self.tier = int(tier)
-        self.effective_bytes = int(effective_bytes)
-        self.min_tier = int(min_tier)
-        super().__init__(
-            f"outbound bandwidth policy tier {tier} refuses {action} "
-            f"(effective={effective_bytes} bytes)"
-        )
-
-
 # Common aliases for callers/tests that use different names.
 BandwidthExceededError = OutboundBandwidthExceededError
 BandwidthLimitExceededError = OutboundBandwidthExceededError
@@ -160,173 +178,39 @@ BandwidthExceeded = OutboundBandwidthExceededError
 BandwidthLimitExceeded = OutboundBandwidthExceededError
 BandwidthUnavailableError = OutboundBandwidthUnavailableError
 BandwidthUnavailable = OutboundBandwidthUnavailableError
-BandwidthPolicyError = OutboundBandwidthPolicyError
-
-#: Scheduled/batch executions run through the SAME executor; this scope is set
-#: by the task coordinator so an automatic save cannot be classified as an
-#: interactive one.  A contextvar is per-task, so concurrent work is unaffected.
-_scheduled_scope: contextvars.ContextVar[bool] = contextvars.ContextVar(
-    "lifeos_scheduled_media", default=False
-)
-
-#: Render's last validated monthly lower bound (published by the metric client).
-_render_metric: Dict[str, Any] = {
-    "month": "",
-    "bytes": None,
-    "trusted": False,
-    "coverage": "unknown",
-    "latest_data_at": None,
-    "updated_monotonic": 0.0,
-}
-_denials: Dict[str, int] = {action: 0 for action in ACTION_MIN_TIER}
-_denials_month = ""
 
 
-def policy_tier(effective_bytes: int) -> int:
-    """The highest cumulative tier reached by ``effective_bytes`` (0 = none)."""
-    tier = 0
-    for index, threshold in enumerate(POLICY_TIER_BYTES, start=1):
-        if effective_bytes >= threshold:
-            tier = index
-    return tier
+class OutboundBandwidthPolicyError(OutboundBandwidthError, RuntimeError):
+    """Raised when a staged monthly policy restricts an outbound action.
 
-
-def set_render_month_metric(
-    month: str,
-    byte_count: Optional[int],
-    *,
-    trusted: bool,
-    coverage: str,
-    latest_data_at: Optional[str],
-) -> None:
-    """Publish Render's validated lower bound; ``None`` means unknown, not zero."""
-    global _render_metric
-    value: Optional[int] = None
-    if isinstance(byte_count, int) and not isinstance(byte_count, bool) and byte_count >= 0:
-        value = int(byte_count)
-    _render_metric = {
-        "month": str(month or ""),
-        "bytes": value,
-        "trusted": bool(trusted),
-        "coverage": str(coverage or "unknown"),
-        "latest_data_at": latest_data_at,
-        "updated_monotonic": time.monotonic(),
-    }
-
-
-def persist_render_floor(
-    month: str,
-    byte_count: int,
-    *,
-    now: Optional[datetime] = None,
-) -> bool:
-    """Persist Render's observed lower bound as the durable policy floor.
-
-    Runs at the metric refresh cadence, not per operation.  The write is
-    confirmed by re-reading the row, and a failed write is reported without
-    changing any transfer decision (the in-memory snapshot still applies).
+    The error is deliberately bounded and content-free: it names the action
+    class, the active tier, the effective monthly bytes and the limit, never a
+    payload, a filename, a chat id or a credential.
     """
-    if isinstance(byte_count, bool) or not isinstance(byte_count, int) or byte_count < 0:
-        return False
-    try:
-        with _lock:
-            moment = _utc_now(now)
-            daily_period, monthly_period = _period_keys(moment)
-            if month != monthly_period:
-                return False
-            raw_state = _read_row_state()
-            daily_used, monthly_used = _normalize_state(
-                raw_state, daily_period, monthly_period
-            )
-            floor_bytes = _normalize_policy(raw_state, monthly_period)
-            new_floor = max(floor_bytes, int(byte_count))
-            if new_floor <= floor_bytes:
-                return False
-            _persist_state(
-                "render_metric",
-                _build_state(
-                    daily_period, daily_used, monthly_period, monthly_used, new_floor
-                ),
-            )
-            confirmed = _normalize_policy(
-                _read_row_state(), monthly_period
-            )
-            if confirmed < new_floor:
-                logger.warning(
-                    "OUTBOUND_BANDWIDTH_FLOOR_UNCONFIRMED month=%s floor_bytes=%d",
-                    monthly_period, new_floor,
-                )
-                return False
-            return True
-    except Exception as exc:  # noqa: BLE001 — a floor write never breaks the caller
-        logger.warning(
-            "OUTBOUND_BANDWIDTH_FLOOR_FAILED month=%s error=%s",
-            month, type(exc).__name__,
+
+    def __init__(
+        self,
+        action: str,
+        tier: int,
+        effective_monthly_bytes: int,
+        reason: str = "",
+    ) -> None:
+        self.action = str(action)
+        self.tier = int(tier)
+        self.effective_monthly_bytes = int(effective_monthly_bytes)
+        self.limit_bytes = MONTHLY_TARGET_BYTES
+        self.reason = " ".join(str(reason or "").split())[:240]
+        detail = self.reason or "the active monthly policy tier denies it"
+        super().__init__(
+            f"outbound bandwidth policy denied {self.action} "
+            f"(tier={self.tier}% effective={self.effective_monthly_bytes} "
+            f"limit={self.limit_bytes}): {detail}"
         )
-        return False
 
 
-def _render_metric_for(month: str) -> tuple[Optional[int], Dict[str, Any]]:
-    snapshot = _render_metric
-    if snapshot.get("month") != month:
-        return None, {
-            "render_trusted": False,
-            "render_coverage": "unknown" if not snapshot.get("month") else "previous_month",
-            "render_latest_data_at": None,
-            "snapshot_age_s": None,
-        }
-    updated = float(snapshot.get("updated_monotonic") or 0.0)
-    age = int(max(0.0, time.monotonic() - updated)) if updated else None
-    value = snapshot.get("bytes")
-    if age is not None and age > RENDER_SNAPSHOT_MAX_AGE_S:
-        # Still a lower bound; trust is what expires, never the bytes.
-        return value, {
-            "render_trusted": False,
-            "render_coverage": "stale",
-            "render_latest_data_at": snapshot.get("latest_data_at"),
-            "snapshot_age_s": age,
-        }
-    return value, {
-        "render_trusted": bool(snapshot.get("trusted")),
-        "render_coverage": str(snapshot.get("coverage") or "unknown"),
-        "render_latest_data_at": snapshot.get("latest_data_at"),
-        "snapshot_age_s": age,
-    }
-
-
-def _note_denial(action: str, month: str) -> None:
-    global _denials, _denials_month
-    if month != _denials_month:
-        _denials = {name: 0 for name in ACTION_MIN_TIER}
-        _denials_month = month
-    _denials[action] = _denials.get(action, 0) + 1
-
-
-@contextlib.contextmanager
-def scheduled_media_scope() -> Iterator[None]:
-    """Mark every outbound payload in this block as scheduled/automatic."""
-    token = _scheduled_scope.set(True)
-    try:
-        yield
-    finally:
-        _scheduled_scope.reset(token)
-
-
-def in_scheduled_media_scope() -> bool:
-    return bool(_scheduled_scope.get())
-
-
-def _resolve_action(category: str, action: Optional[str]) -> str:
-    """Validate the caller's bounded action, conservatively when unspecified."""
-    if action is None:
-        resolved = _CATEGORY_DEFAULT_ACTION.get(category, ACTION_MEDIA_TRANSFER)
-    else:
-        if action not in ACTION_MIN_TIER:
-            raise ValueError("unknown outbound bandwidth action")
-        resolved = action
-    if _scheduled_scope.get():
-        return ACTION_SCHEDULED_MEDIA
-    return resolved
+# Alternate names for callers that classify the failure as a policy refusal.
+BandwidthPolicyError = OutboundBandwidthPolicyError
+OutboundPolicyError = OutboundBandwidthPolicyError
 
 
 def _utc_now(now: Optional[datetime] = None) -> datetime:
@@ -401,50 +285,50 @@ def _normalize_state(raw: Any, daily_period: str, monthly_period: str) -> tuple[
     return daily_used, monthly_used
 
 
+def _policy_floor_bytes(raw: Any, monthly_period: str) -> Optional[int]:
+    """The persisted current-month high-water mark, if one is present.
+
+    This is not a second accounting ledger. It only remembers the highest
+    effective monthly reading already observed in THIS UTC month, so a delayed
+    Render sample or a restart cannot lower an active restriction tier. A new
+    month ignores the old period. A malformed floor is a denial, never zero.
+    """
+    if not isinstance(raw, dict):
+        return None
+    floor = raw.get("policy_floor")
+    if floor is None:
+        return None
+    if not isinstance(floor, dict):
+        raise OutboundBandwidthUnavailableError("stored policy floor is malformed")
+    period = floor.get("period")
+    value = floor.get("bytes")
+    if not isinstance(period, str) or not period:
+        raise OutboundBandwidthUnavailableError("stored policy floor period is malformed")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise OutboundBandwidthUnavailableError("stored policy floor is malformed")
+    if period != monthly_period:
+        return None
+    return int(value)
+
+
 def _build_state(
     daily_period: str,
     daily_used: int,
     monthly_period: str,
     monthly_used: int,
-    policy_floor_bytes: int = 0,
+    *,
+    policy_floor: Any = None,
 ) -> Dict[str, Any]:
-    state: Dict[str, Any] = {
+    state = {
         "version": _STATE_VERSION,
         "daily": {"period": daily_period, "bytes": int(daily_used)},
         "monthly": {"period": monthly_period, "bytes": int(monthly_used)},
     }
-    if policy_floor_bytes > 0:
-        # Same JSONB column, no schema change: the floor is the highest
-        # effective monthly usage this process has ever observed.
-        state["policy"] = {
-            "month": monthly_period,
-            "floor_bytes": int(policy_floor_bytes),
-        }
+    if policy_floor is not None:
+        # The floor is forward-compatible JSONB, not a new column or table.
+        # Preserve it byte-for-byte across ordinary reservations.
+        state["policy_floor"] = copy.deepcopy(policy_floor)
     return state
-
-
-def _normalize_policy(raw: Any, monthly_period: str) -> int:
-    """The durable monthly policy floor, strictly validated.
-
-    A malformed policy block is a DENIAL (the row is written by this module).
-    A previous month's floor is a legitimate rollover and contributes zero.
-    """
-    if not isinstance(raw, dict):
-        raise OutboundBandwidthUnavailableError("stored bandwidth state is malformed")
-    policy = raw.get("policy")
-    if policy is None:
-        return 0
-    if not isinstance(policy, dict):
-        raise OutboundBandwidthUnavailableError("stored policy floor is malformed")
-    month = policy.get("month")
-    floor = policy.get("floor_bytes")
-    if not isinstance(month, str) or not month:
-        raise OutboundBandwidthUnavailableError("stored policy floor period is malformed")
-    if isinstance(floor, bool) or not isinstance(floor, int) or floor < 0:
-        raise OutboundBandwidthUnavailableError("stored policy floor byte count is malformed")
-    if month != monthly_period:
-        return 0
-    return int(floor)
 
 
 def _db_configured() -> bool:
@@ -500,29 +384,388 @@ def _persist_state(category: str, new_state: Dict[str, Any]) -> None:
         )
 
 
+# ── staged monthly outbound policy ─────────────────────────────────────────
+#
+# The reservation ledger is only a subset of service egress. The policy therefore
+# evaluates the HIGHER of the persisted governor month and Render's own
+# service-scoped month. They are never added: an upload counted twice would
+# otherwise look like twice as much traffic.
+
+_policy_snapshot: Optional[Dict[str, Any]] = None
+_policy_refresh_lock = asyncio.Lock()
+
+
+def _policy_untrusted(reason: str, *, tier: int = 0, effective: int = 0) -> Dict[str, Any]:
+    return {
+        "trusted": False,
+        "state": "unavailable",
+        "detail": reason,
+        "tier": int(tier),
+        "effective_monthly_bytes": int(effective),
+        "render_monthly_bytes": None,
+        "governor_monthly_bytes": None,
+        "render_available": False,
+        "render_latest_data_at": None,
+        "render_partial": False,
+        "policy_floor_bytes": None,
+        "checked_at": None,
+        "monthly_period": None,
+    }
+
+
+def _parse_utc(value: Any) -> Optional[datetime]:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
+def _policy_cache_valid(snapshot: Optional[Dict[str, Any]], current: datetime) -> bool:
+    if not isinstance(snapshot, dict) or snapshot.get("checked_at") is None:
+        return False
+    if snapshot.get("monthly_period") != current.strftime("%Y-%m"):
+        return False
+    checked = _parse_utc(snapshot.get("checked_at"))
+    if checked is None:
+        return False
+    age = (current - checked).total_seconds()
+    return 0 <= age <= RENDER_CACHE_TTL_SECONDS
+
+
+def _render_monthly(
+    render: Any, current: datetime,
+) -> tuple[Optional[int], str, bool, bool]:
+    """Validate one Render response: (bytes, reason, trusted, partial)."""
+    if not isinstance(render, dict):
+        return None, "Render returned no policy observation.", False, False
+    if render.get("available") is not True:
+        return None, str(render.get("detail") or "Render metric is unavailable."), False, False
+    if render.get("monthly_period") != current.strftime("%Y-%m"):
+        return None, "Render metric belongs to another UTC month.", False, False
+    monthly = render.get("monthly_used_bytes")
+    if isinstance(monthly, bool) or not isinstance(monthly, int) or monthly < 0:
+        return None, "Render returned a malformed monthly total.", False, False
+    latest = _parse_utc(render.get("latest_data_at"))
+    if latest is None:
+        return None, "Render returned no trustworthy latest_data_at.", False, False
+    age = (current - latest).total_seconds()
+    if age < -120:
+        return None, "Render latest_data_at is in the future.", False, False
+    if age > RENDER_MAX_STALENESS_SECONDS:
+        hours = RENDER_MAX_STALENESS_SECONDS // 3600
+        return None, f"Render metric is older than {hours}h.", False, False
+    return int(monthly), "", True, bool(render.get("monthly_is_partial"))
+
+
+def _policy_tier(effective: int) -> int:
+    tier = 0
+    for pct in (50, 60, 70, 80, 90):
+        if effective >= POLICY_THRESHOLD_BYTES[pct]:
+            tier = pct
+    return tier
+
+
+def _record_policy_floor(
+    monthly_period: str,
+    effective: int,
+    daily_period: str,
+) -> bool:
+    """Persist the monthly high-water mark in the EXISTING JSONB state.
+
+    This is a JSONB field on ``panel_settings.outbound_bandwidth_state``, not a
+    new table/column. It is what stops a restart or a delayed/lower Render
+    reading from lowering the tier before the next UTC month.
+    """
+    with _lock:
+        raw = _read_row_state()
+        existing = _policy_floor_bytes(raw, monthly_period)
+        if existing is not None and existing >= effective:
+            return True
+        # Preserve the CURRENT reservation counters from the same locked read;
+        # the observation that produced ``effective`` may be older than a
+        # reservation completed while Render was being queried. Never rebuild
+        # the ledger from that older snapshot.
+        daily_used, monthly_used = _normalize_state(
+            raw, daily_period, monthly_period
+        )
+        new_state = _build_state(
+            daily_period,
+            daily_used,
+            monthly_period,
+            monthly_used,
+            policy_floor={"period": monthly_period, "bytes": int(effective)},
+        )
+        _persist_state("policy_floor", new_state)
+        confirmed = _policy_floor_bytes(_read_row_state(), monthly_period)
+        return confirmed is not None and confirmed >= effective
+
+
+def _current_governor_monthly(now: datetime) -> Dict[str, Any]:
+    try:
+        return _usage_snapshot(now)
+    except Exception as exc:  # noqa: BLE001 — policy must fail closed, not raise
+        return {
+            "available": False,
+            "detail": f"accounting read failed ({type(exc).__name__})",
+            "monthly_used_bytes": 0,
+            "policy_floor_bytes": None,
+        }
+
+
+async def _default_render_usage_reader(now: Optional[datetime] = None) -> Any:
+    from backend.services import render_bandwidth_service
+
+    return await render_bandwidth_service.get_render_bandwidth_usage(now=now)
+
+
+#: Indirection is the test seam: production always calls the real Render
+#: integration; tests may replace this reader without changing the Render
+#: service's own public behavior.
+_render_usage_reader = _default_render_usage_reader
+
+
+async def refresh_policy_snapshot(
+    now: Optional[datetime] = None,
+    *,
+    force: bool = False,
+) -> Dict[str, Any]:
+    """Refresh the one policy snapshot used by every upload decision.
+
+    Render publishes hourly points with a delay, so the snapshot is cached for
+    five minutes. The async path is the only one that calls the Render API; the
+    synchronous path consumes this same snapshot and never starts an event loop.
+    """
+    global _policy_snapshot
+    current = _utc_now(now)
+    cached = _policy_snapshot
+    if not force and _policy_cache_valid(cached, current):
+        return dict(cached)
+
+    async with _policy_refresh_lock:
+        cached = _policy_snapshot
+        if not force and _policy_cache_valid(cached, current):
+            return dict(cached)
+
+        render: Any = None
+        try:
+            render = await _render_usage_reader(now=current)
+        except Exception as exc:  # noqa: BLE001 — external observation is optional
+            render = {"available": False, "detail": f"Render API failed ({type(exc).__name__})."}
+
+        governor = await asyncio.to_thread(_current_governor_monthly, current)
+        render_bytes, render_reason, render_trusted, partial = _render_monthly(render, current)
+        governor_available = governor.get("available") is True
+        governor_bytes = (
+            int(governor.get("monthly_used_bytes") or 0)
+            if governor_available else None
+        )
+        floor = governor.get("policy_floor_bytes") if governor_available else None
+        if isinstance(floor, bool) or (floor is not None and not isinstance(floor, int)):
+            floor = None
+        floor = int(floor or 0)
+
+        effective = max(
+            value for value in (render_bytes or 0, governor_bytes or 0, floor)
+        )
+        trusted = bool(render_trusted and governor_available)
+        reason = ""
+        if not render_trusted:
+            trusted = False
+            reason = render_reason
+        if not governor_available:
+            trusted = False
+            reason = str(governor.get("detail") or "accounting state is unavailable.")
+
+        # A real reading at or above a tier becomes a durable floor. A failure
+        # to persist that floor is itself a reason to fail closed for media: a
+        # later restart must not be able to re-enable uploads mid-month.
+        if governor_available and effective > floor:
+            try:
+                persisted = await asyncio.to_thread(
+                    _record_policy_floor,
+                    current.strftime("%Y-%m"),
+                    effective,
+                    current.strftime("%Y-%m-%d"),
+                )
+            except Exception as exc:  # noqa: BLE001
+                persisted = False
+                reason = f"policy floor could not be persisted ({type(exc).__name__})."
+            if not persisted:
+                trusted = False
+                reason = reason or "policy floor could not be persisted."
+
+        snapshot = {
+            "trusted": trusted,
+            "state": "available" if trusted else "unavailable",
+            "detail": "" if trusted else reason or "policy observation is unavailable.",
+            "tier": _policy_tier(effective),
+            "effective_monthly_bytes": int(effective),
+            "render_monthly_bytes": render_bytes,
+            "governor_monthly_bytes": governor_bytes,
+            "render_available": bool(render_trusted),
+            "render_latest_data_at": (render or {}).get("latest_data_at") if isinstance(render, dict) else None,
+            "render_partial": bool(partial),
+            "policy_floor_bytes": floor,
+            "checked_at": current.isoformat(),
+            "monthly_period": current.strftime("%Y-%m"),
+            "monthly_limit_bytes": MONTHLY_TARGET_BYTES,
+        }
+        _policy_snapshot = snapshot
+        log = logger.info if trusted else logger.warning
+        log(
+            "OUTBOUND_POLICY_SNAPSHOT tier=%d effective=%d render=%s governor=%s "
+            "trusted=%s partial=%s detail=%s",
+            snapshot["tier"], snapshot["effective_monthly_bytes"],
+            render_bytes if render_bytes is not None else "-",
+            governor_bytes if governor_bytes is not None else "-",
+            str(trusted).lower(), str(partial).lower(), snapshot["detail"] or "-",
+        )
+        return dict(snapshot)
+
+
+def get_policy_snapshot(now: Optional[datetime] = None) -> Dict[str, Any]:
+    """Return the last snapshot without refreshing (safe for worker threads)."""
+    current = _utc_now(now)
+    cached = _policy_snapshot
+    if _policy_cache_valid(cached, current):
+        return dict(cached)
+    if isinstance(cached, dict):
+        stale = dict(cached)
+        stale["trusted"] = False
+        stale["state"] = "unavailable"
+        stale["detail"] = "policy snapshot is stale; waiting for a bounded refresh."
+        return stale
+    return _policy_untrusted("policy snapshot has not been refreshed.")
+
+
+async def get_policy_status(now: Optional[datetime] = None) -> Dict[str, Any]:
+    return await refresh_policy_snapshot(now=now)
+
+
+def classify_outbound_action(category: Any, action: Optional[str] = None) -> str:
+    """Classify an outbound payload explicitly, never by its current size."""
+    if action is not None:
+        action = str(action).strip()
+        if action in _ACTION_MIN_TIER or action == ACTION_TEXT:
+            resolved = action
+        else:
+            resolved = ACTION_UNKNOWN
+    else:
+        key = str(category or "").strip()
+        resolved = _CATEGORY_ACTIONS.get(key, ACTION_UNKNOWN)
+    if (
+        _AUTOMATIC_MEDIA.get()
+        and resolved != ACTION_TEXT
+        and resolved != ACTION_UNKNOWN
+    ):
+        # Any media/file/provider class started by a scheduled occurrence is
+        # automatic egress; the 50% tier must deny it regardless of which tool
+        # or provider wrapper happens to be executing.
+        return ACTION_AUTOMATIC_MEDIA
+    return resolved
+
+
+def automatic_media_scope():
+    """Mark media started by an already-claimed scheduled occurrence.
+
+    This is a context only; it never authorizes an operation by itself. The
+    central policy still evaluates the current usage tier.
+    """
+    @contextlib.contextmanager
+    def _scope():
+        token = _AUTOMATIC_MEDIA.set(True)
+        try:
+            yield
+        finally:
+            _AUTOMATIC_MEDIA.reset(token)
+
+    return _scope()
+
+
+def _assert_policy_allows(
+    snapshot: Dict[str, Any], action: str, byte_count: int,
+) -> None:
+    if action == ACTION_TEXT:
+        if 0 < int(byte_count) <= TEXT_EXEMPT_MAX_BYTES:
+            return
+        # A payload above the strict text bound never inherits the exemption,
+        # even at tier 0: it is an unclassified outbound payload.
+        raise OutboundBandwidthPolicyError(
+            ACTION_UNKNOWN,
+            int(snapshot.get("tier") or 0),
+            int(snapshot.get("effective_monthly_bytes") or 0),
+            f"text payload exceeds the {TEXT_EXEMPT_MAX_BYTES}-byte exemption.",
+        )
+    if snapshot.get("trusted") is not True:
+        raise OutboundBandwidthPolicyError(
+            action, 0, int(snapshot.get("effective_monthly_bytes") or 0),
+            str(snapshot.get("detail") or "the effective monthly metric is unavailable."),
+        )
+    tier = int(snapshot.get("tier") or 0)
+    minimum = _ACTION_MIN_TIER.get(action, POLICY_AUTOMATIC_MEDIA_PCT)
+    if tier >= minimum:
+        raise OutboundBandwidthPolicyError(
+            action, tier, int(snapshot.get("effective_monthly_bytes") or 0),
+            f"the {tier}% tier denies this action class.",
+        )
+
+
+async def ensure_action_allowed(
+    action: str,
+    byte_count: int = 1,
+    *,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """Refresh if needed and enforce the staged policy for one action."""
+    action = classify_outbound_action(action, action)
+    if action == ACTION_TEXT and 0 < int(byte_count) <= TEXT_EXEMPT_MAX_BYTES:
+        return get_policy_snapshot(now=now)
+    snapshot = await refresh_policy_snapshot(now=now)
+    _assert_policy_allows(snapshot, action, int(byte_count))
+    return snapshot
+
+
+def ensure_action_allowed_sync(
+    action: str,
+    byte_count: int = 1,
+    *,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """Enforce the SAME snapshot from a worker thread without starting a loop."""
+    action = classify_outbound_action(action, action)
+    if action == ACTION_TEXT and 0 < int(byte_count) <= TEXT_EXEMPT_MAX_BYTES:
+        return get_policy_snapshot(now=now)
+    snapshot = get_policy_snapshot(now=now)
+    _assert_policy_allows(snapshot, action, int(byte_count))
+    return snapshot
+
+
+def effective_media_action(base: str = ACTION_SINGLE_MEDIA) -> str:
+    """Return the automatic class for a scheduled context, else ``base``."""
+    if _AUTOMATIC_MEDIA.get():
+        return ACTION_AUTOMATIC_MEDIA
+    return base
+
+
 def _reserve_locked(
     category: str,
     byte_count: int,
-    action: str,
     daily_period: str,
     monthly_period: str,
 ) -> Dict[str, Any]:
-    """Reserve under ``_lock``: read -> policy -> limits -> write -> CONFIRM."""
+    """Reserve under ``_lock``: read -> limit check -> write -> CONFIRM."""
     with _lock:
         for attempt in range(1, _MAX_CONFIRM_ATTEMPTS + 1):
             raw_state = _read_row_state()
             daily_used, monthly_used = _normalize_state(
                 raw_state, daily_period, monthly_period
             )
-            floor_bytes = _normalize_policy(raw_state, monthly_period)
-            render_bytes, render_meta = _render_metric_for(monthly_period)
-            effective_bytes = max(monthly_used, floor_bytes, render_bytes or 0)
-            tier = policy_tier(effective_bytes)
-            min_tier = ACTION_MIN_TIER.get(action, ACTION_MIN_TIER[ACTION_MEDIA_TRANSFER])
 
-            # The absolute limits are checked first: a payload that would cross
-            # 100% is ALWAYS refused with the hard-limit error, before the
-            # staged ladder's own (stricter) refusal.
             if daily_used + byte_count > DAILY_LIMIT_BYTES:
                 logger.warning(
                     "OUTBOUND_BANDWIDTH_EXCEEDED category=%s period=daily "
@@ -542,27 +785,17 @@ def _reserve_locked(
                     "monthly", monthly_used, byte_count, MONTHLY_LIMIT_BYTES
                 )
 
-            if tier >= min_tier:
-                _note_denial(action, monthly_period)
-                logger.warning(
-                    "OUTBOUND_BANDWIDTH_POLICY_DENIED action=%s tier=%d min_tier=%d "
-                    "effective_bytes=%d local_month_bytes=%d render_bytes=%s "
-                    "floor_bytes=%d render_trusted=%s render_coverage=%s",
-                    action, tier, min_tier, effective_bytes, monthly_used,
-                    render_bytes if render_bytes is not None else "unknown",
-                    floor_bytes,
-                    "true" if render_meta.get("render_trusted") else "false",
-                    render_meta.get("render_coverage"),
-                )
-                raise OutboundBandwidthPolicyError(
-                    action, tier, effective_bytes, min_tier
-                )
-
             new_daily = daily_used + byte_count
             new_monthly = monthly_used + byte_count
-            new_floor = max(floor_bytes, effective_bytes)
             new_state = _build_state(
-                daily_period, new_daily, monthly_period, new_monthly, new_floor
+                daily_period,
+                new_daily,
+                monthly_period,
+                new_monthly,
+                policy_floor=(
+                    raw_state.get("policy_floor")
+                    if isinstance(raw_state, dict) else None
+                ),
             )
             _persist_state(category, new_state)
 
@@ -584,12 +817,6 @@ def _reserve_locked(
                     "monthly_used_bytes": new_monthly,
                     "daily_limit_bytes": DAILY_LIMIT_BYTES,
                     "monthly_limit_bytes": MONTHLY_LIMIT_BYTES,
-                    "action": action,
-                    "policy_tier": tier,
-                    "policy_floor_bytes": new_floor,
-                    "render_bytes": render_bytes,
-                    "render_trusted": bool(render_meta.get("render_trusted")),
-                    "render_coverage": render_meta.get("render_coverage"),
                 }
             logger.warning(
                 "OUTBOUND_BANDWIDTH_WRITE_UNCONFIRMED category=%s attempt=%d",
@@ -601,28 +828,55 @@ def _reserve_locked(
     )
 
 
+def _precheck_limits(
+    category: str,
+    byte_count: int,
+    daily_period: str,
+    monthly_period: str,
+) -> None:
+    """A read-only hard-limit check before policy evaluation.
+
+    This preserves the existing daily/monthly error contract (and the daily hard
+    limit) even when an unknown action would otherwise be denied by policy.
+    The authoritative check is repeated inside ``_reserve_locked`` before write.
+    """
+    with _lock:
+        raw_state = _read_row_state()
+        daily_used, monthly_used = _normalize_state(
+            raw_state, daily_period, monthly_period
+        )
+        if daily_used + byte_count > DAILY_LIMIT_BYTES:
+            raise OutboundBandwidthExceededError(
+                "daily", daily_used, byte_count, DAILY_LIMIT_BYTES
+            )
+        if monthly_used + byte_count > MONTHLY_LIMIT_BYTES:
+            raise OutboundBandwidthExceededError(
+                "monthly", monthly_used, byte_count, MONTHLY_LIMIT_BYTES
+            )
+
+
 async def reserve_outbound_bytes(
     category: Any,
     byte_count: Any,
     *,
-    action: Optional[str] = None,
     now: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     """Reserve ``byte_count`` outbound bytes before a payload transfer.
 
     Raises :class:`OutboundBandwidthExceededError` when a limit would be
-    exceeded, :class:`OutboundBandwidthPolicyError` when the cumulative staged
-    policy refuses the action, and :class:`OutboundBandwidthUnavailableError`
-    when persistence cannot be read, parsed or written.  Returns only after the
-    reservation is confirmed in the stored state.
+    exceeded and :class:`OutboundBandwidthUnavailableError` when persistence
+    cannot be read, parsed or written.  Returns only after the reservation is
+    confirmed in the stored state.
     """
     category = _validate_category(category)
     byte_count = _validate_byte_count(byte_count)
-    resolved_action = _resolve_action(category, action)
-    daily_period, monthly_period = _period_keys(_utc_now(now))
+    current = _utc_now(now)
+    daily_period, monthly_period = _period_keys(current)
+    _precheck_limits(category, byte_count, daily_period, monthly_period)
+    action = classify_outbound_action(category)
+    await ensure_action_allowed(action, byte_count, now=current)
     return await asyncio.to_thread(
-        _reserve_locked, category, byte_count, resolved_action,
-        daily_period, monthly_period,
+        _reserve_locked, category, byte_count, daily_period, monthly_period
     )
 
 
@@ -630,7 +884,6 @@ def reserve_outbound_bytes_sync(
     category: Any,
     byte_count: Any,
     *,
-    action: Optional[str] = None,
     now: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     """Synchronous entry point for callers already running off the event loop.
@@ -640,11 +893,12 @@ def reserve_outbound_bytes_sync(
     """
     category = _validate_category(category)
     byte_count = _validate_byte_count(byte_count)
-    resolved_action = _resolve_action(category, action)
-    daily_period, monthly_period = _period_keys(_utc_now(now))
-    return _reserve_locked(
-        category, byte_count, resolved_action, daily_period, monthly_period
-    )
+    current = _utc_now(now)
+    daily_period, monthly_period = _period_keys(current)
+    _precheck_limits(category, byte_count, daily_period, monthly_period)
+    action = classify_outbound_action(category)
+    ensure_action_allowed_sync(action, byte_count, now=current)
+    return _reserve_locked(category, byte_count, daily_period, monthly_period)
 
 
 #: At or above this fraction of either budget the usage is "near limit".
@@ -669,16 +923,13 @@ def _usage_snapshot(now: datetime) -> Dict[str, Any]:
     detail = ""
     daily_used = 0
     monthly_used = 0
-    floor_bytes = 0
-    render_bytes: Optional[int] = None
-    render_meta: Dict[str, Any] = {}
+    policy_floor_bytes = None
     try:
         raw_state = _read_row_state()
         daily_used, monthly_used = _normalize_state(
             raw_state, daily_period, monthly_period
         )
-        floor_bytes = _normalize_policy(raw_state, monthly_period)
-        render_bytes, render_meta = _render_metric_for(monthly_period)
+        policy_floor_bytes = _policy_floor_bytes(raw_state, monthly_period)
     except OutboundBandwidthUnavailableError as exc:
         available = False
         detail = str(exc) or "accounting state is unavailable"
@@ -687,14 +938,7 @@ def _usage_snapshot(now: datetime) -> Dict[str, Any]:
         detail = f"accounting read failed ({type(exc).__name__})"
     daily_remaining = max(0, DAILY_LIMIT_BYTES - daily_used)
     monthly_remaining = max(0, MONTHLY_LIMIT_BYTES - monthly_used)
-    effective_bytes = max(monthly_used, floor_bytes, render_bytes or 0)
     return {
-        "policy_tier": policy_tier(effective_bytes) if available else 0,
-        "policy_floor_bytes": floor_bytes,
-        "effective_month_bytes": effective_bytes,
-        "render_bytes": render_bytes,
-        "render_trusted": bool(render_meta.get("render_trusted")),
-        "render_coverage": render_meta.get("render_coverage"),
         "daily_period": daily_period,
         "monthly_period": monthly_period,
         "daily_used_bytes": daily_used,
@@ -706,6 +950,9 @@ def _usage_snapshot(now: datetime) -> Dict[str, Any]:
         "available": available,
         "detail": detail,
         "state": usage_state(daily_used, monthly_used) if available else "unavailable",
+        "policy_floor_bytes": policy_floor_bytes,
+        "policy_tier": _policy_tier(max(monthly_used, policy_floor_bytes or 0))
+        if available else 0,
         # Aliases.
         "daily_used": daily_used,
         "monthly_used": monthly_used,
@@ -730,66 +977,6 @@ async def get_outbound_usage(now: Optional[datetime] = None) -> Dict[str, Any]:
 
 def get_outbound_usage_sync(now: Optional[datetime] = None) -> Dict[str, Any]:
     return _usage_snapshot(_utc_now(now))
-
-
-def get_policy_snapshot_sync(now: Optional[datetime] = None) -> Dict[str, Any]:
-    """One sanitized policy snapshot for the existing lifecycle logs.
-
-    Read-only and never raises: an unavailable accounting row is reported as
-    unavailable, never as a zero-byte month.
-    """
-    moment = _utc_now(now)
-    daily_period, monthly_period = _period_keys(moment)
-    base: Dict[str, Any] = {
-        "month": monthly_period,
-        "daily_period": daily_period,
-        "tier": 0,
-        "effective_bytes": 0,
-        "local_month_bytes": 0,
-        "floor_bytes": 0,
-        "render_bytes": None,
-        "render_trusted": False,
-        "render_coverage": "unknown",
-        "render_latest_data_at": None,
-        "snapshot_age_s": None,
-        "available": False,
-        "detail": "",
-    }
-    try:
-        with _lock:
-            raw_state = _read_row_state()
-            daily_used, monthly_used = _normalize_state(
-                raw_state, daily_period, monthly_period
-            )
-            floor_bytes = _normalize_policy(raw_state, monthly_period)
-            render_bytes, render_meta = _render_metric_for(monthly_period)
-            denials = dict(_denials) if _denials_month == monthly_period else {}
-        effective_bytes = max(monthly_used, floor_bytes, render_bytes or 0)
-        tier = policy_tier(effective_bytes)
-        next_index = min(tier, len(POLICY_TIER_BYTES) - 1)
-        base.update(
-            {
-                "tier": tier,
-                "effective_bytes": effective_bytes,
-                "local_month_bytes": monthly_used,
-                "floor_bytes": floor_bytes,
-                "render_bytes": render_bytes,
-                "render_trusted": bool(render_meta.get("render_trusted")),
-                "render_coverage": render_meta.get("render_coverage"),
-                "render_latest_data_at": render_meta.get("render_latest_data_at"),
-                "snapshot_age_s": render_meta.get("snapshot_age_s"),
-                "next_threshold_bytes": POLICY_TIER_BYTES[next_index],
-                "denials": ",".join(
-                    f"{name}:{count}" for name, count in sorted(denials.items()) if count
-                ) or "none",
-                "available": True,
-            }
-        )
-    except OutboundBandwidthUnavailableError as exc:
-        base["detail"] = str(exc)[:80] or "accounting unavailable"
-    except Exception as exc:  # noqa: BLE001
-        base["detail"] = f"accounting read failed ({type(exc).__name__})"
-    return base
 
 
 async def release_reservation(*args: Any, **kwargs: Any) -> bool:

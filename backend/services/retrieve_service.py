@@ -63,9 +63,23 @@ async def _reserve_reupload_bytes(byte_count: int) -> None:
     """
     from backend.services import outbound_bandwidth_service as governor
 
-    await governor.reserve_outbound_bytes(
-        "telegram_media", byte_count, action="reupload"
-    )
+    await governor.reserve_outbound_bytes("telegram_media", byte_count)
+
+
+def _row_is_text(row: dict | None) -> bool:
+    """A saved row is text-only only when its stored type explicitly says so."""
+    return str((row or {}).get("media_type") or "").strip().casefold() == "text"
+
+
+async def _ensure_retrieve_policy(action: str) -> str:
+    """Return an honest refusal message, or ``""`` when the action is allowed."""
+    from backend.services import outbound_bandwidth_service as governor
+
+    try:
+        await governor.ensure_action_allowed(action, 1)
+    except Exception as exc:  # noqa: BLE001 — deny the transfer, never guess
+        return f"{sym.STATE_FAILED} Outbound policy refused this retrieval: {exc}"
+    return ""
 
 
 def _format_size(size_bytes) -> str:
@@ -226,6 +240,18 @@ async def do_retrieve(self_client, owner_id: int, save_code: str, target_chat: i
     # never distinguishable from a missing one.
     if not row or row.get("owner_id") != owner_id:
         return f"{sym.STATE_FAILED} No item found for `{save_code}`"
+
+    if not _row_is_text(row):
+        from backend.services import outbound_bandwidth_service as _bw
+
+        action = (
+            _bw.ACTION_BULK_MEDIA
+            if save_service.is_album_row(row)
+            else _bw.effective_media_action(_bw.ACTION_MEDIA_FORWARD)
+        )
+        refusal = await _ensure_retrieve_policy(action)
+        if refusal:
+            return refusal
 
     saved_chat_id = row.get("saved_chat_id")
     saved_msg_id = row.get("saved_msg_id")
@@ -542,6 +568,23 @@ async def do_bulk_send(self_client, owner_id: int, save_codes,
                       for code in codes)
         failed.extend(_bulk_overflow(overflow))
         return BulkResult("send", tuple(done), tuple(failed))
+    selected_rows: list[dict] = []
+    for code in codes:
+        row, _reason = await _bulk_precheck(owner_id, code)
+        if row is not None:
+            selected_rows.append(row)
+    if any(not _row_is_text(row) for row in selected_rows):
+        from backend.services import outbound_bandwidth_service as _bw
+
+        refusal = await _ensure_retrieve_policy(
+            _bw.effective_media_action(_bw.ACTION_BULK_MEDIA)
+        )
+        if refusal:
+            failed.extend(
+                BulkItemOutcome(code, False, refusal) for code in codes
+            )
+            failed.extend(_bulk_overflow(overflow))
+            return BulkResult("send", tuple(done), tuple(failed))
     for code in codes:
         row, reason = await _bulk_precheck(owner_id, code)
         if row is None:
@@ -1325,6 +1368,13 @@ async def do_change_file_name(
     if current_name == name:
         return f"{sym.STATE_WARNING} Nothing was renamed: `{code}` is already named `{name}`."
 
+    from backend.services import outbound_bandwidth_service as _bw
+
+    try:
+        await _bw.ensure_action_allowed(_bw.ACTION_REUPLOAD, 1)
+    except Exception as exc:  # noqa: BLE001 — refuse before any download/upload
+        return f"{sym.STATE_FAILED} Outbound policy refused this rename: {exc}. Nothing was renamed."
+
     caption, error = await _caption_base(client, row)
     if error:
         return error
@@ -1337,13 +1387,12 @@ async def do_change_file_name(
     try:
         try:
             await client.download_media(current, file=tmp_path)
+            egress.record_telegram_download(tmp_path, label="rename_download")
         except Exception as exc:  # noqa: BLE001
             logger.warning("saved file-name download failed for %s: %s", code, exc)
-            egress.record_telegram_download(tmp_path)
             return f"{sym.STATE_FAILED} Could not download the saved media ({exc}). Nothing was renamed."
         if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) == 0:
             return f"{sym.STATE_FAILED} The downloaded saved media is empty. Nothing was renamed."
-        egress.record_telegram_download(tmp_path)
 
         # The SAME media handling Deep Save uses, with the new filename: the
         # document's other attributes and its MIME type are carried over, so a
@@ -1353,13 +1402,18 @@ async def do_change_file_name(
             # The replacement is a REAL upload of the downloaded bytes, so it
             # is accounted before Telegram receives any of them.
             await _reserve_reupload_bytes(os.path.getsize(tmp_path))
-            egress.record("telegram_upload", os.path.getsize(tmp_path))
-            sent = await client.send_file(
-                "me",
-                tmp_path,
-                caption=new_caption,
-                **save_service._upload_kwargs_for_media(media, mime, name),
-            )
+            upload_egress = egress.telegram_upload("telegram_self_upload", "rename_reupload")
+            upload_kwargs = save_service._upload_kwargs_for_media(media, mime, name)
+            progress_cb = upload_egress.wrap(None)
+            if progress_cb is not None:
+                upload_kwargs["progress_callback"] = progress_cb
+            with upload_egress:
+                sent = await client.send_file(
+                    "me",
+                    tmp_path,
+                    caption=new_caption,
+                    **upload_kwargs,
+                )
         except Exception as exc:  # noqa: BLE001
             logger.warning("saved file-name re-upload failed for %s: %s", code, exc)
             return f"{sym.STATE_FAILED} Could not re-upload the saved media ({exc}). The saved item is unchanged."

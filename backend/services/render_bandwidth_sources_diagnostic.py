@@ -1,347 +1,547 @@
-"""Bounded validation of Render's bandwidth-by-traffic-source breakdown.
+"""Opt-in read-only diagnostic: Render bandwidth split by traffic source.
 
-Documented endpoint (verified against Render's public API reference):
-``GET /v1/metrics/bandwidth-sources`` returns::
+Disabled unless ``RENDER_BANDWIDTH_SOURCES_DIAGNOSTIC`` is exactly ``1``.  It
+queries ``/v1/metrics/bandwidth-sources`` only for the Render-injected
+``RENDER_SERVICE_ID``: one bounded GET at startup and at most one every six
+hours from the existing heartbeat.  It writes nothing and never logs the API
+key, the Authorization header, raw headers, or the raw response body.
 
-    {"data": [
-      {"labels": {"resource": "srv-...", "trafficSource": "http"},
-       "values": [{"timestamp": 1709856000, "value": 100}]}
-    ]}
-
-The response carries NO unit field, so its values are reported as
-``value_unit=unspecified`` and are never summed with byte measurements from a
-different endpoint.  Only the closed traffic-source vocabulary is accepted in a
-log line; an unknown value is counted, never printed.
-
-This diagnostic exists because the aggregate metric alone cannot show WHICH
-traffic source consumed the bytes.  It is retained (not temporary), runs on the
-same bounded heartbeat cadence as the metric refresh, and is a no-op when the
-Render API is not configured.
+``run_if_enabled()`` without a ``now`` argument keeps the fixed forensic
+window used by the original investigation.  The lifecycle call passes ``now``
+and therefore measures the current UTC month, which is the window that can be
+reconciled with the monthly policy.  Retained because a hardcoded past week
+would silently stop returning source data after Render's 30-day lookback.
 """
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import math
+import os
 import time
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Any
 
 import httpx
 
-from backend.services import render_bandwidth_service as metric
-
 logger = logging.getLogger(__name__)
 
-DIAGNOSE_INTERVAL_S = 6 * 3600.0
-MAX_HOURS = 31 * 24 + 24
-_SOURCE_VOCABULARY = frozenset({"total", "http", "websocket", "nat", "privatelink"})
-_DOCUMENTED_COMPONENTS = ("http", "websocket", "nat", "privatelink")
-_EARLIEST_SOURCES_DATE = datetime(2025, 3, 9, tzinfo=timezone.utc)
+ENABLE_ENV = "RENDER_BANDWIDTH_SOURCES_DIAGNOSTIC"
+_API_URL = "https://api.render.com/v1/metrics/bandwidth-sources"
+_TIMEOUT = httpx.Timeout(8.0, connect=3.0)
+_MAX_RESPONSE_BYTES = 512 * 1024
+_HOURLY_LOG_CHUNK = 24
+_WINDOW_START = datetime(2026, 11, 7, 0, 0, tzinfo=timezone.utc)
+_WINDOW_END = datetime(2026, 11, 13, 0, 0, tzinfo=timezone.utc)
+_EXPECTED_HOURS = int((_WINDOW_END - _WINDOW_START).total_seconds() // 3600)
+_TRAFFIC_SOURCES = ("total", "http", "websocket", "nat", "privatelink")
+_PART_SOURCES = ("http", "websocket", "nat", "privatelink")
+_RUN_INTERVAL_SECONDS = 6 * 60 * 60
+_last_run: float = 0.0
+_UNIT_BYTES = {
+    "b": Decimal(1),
+    "byte": Decimal(1),
+    "bytes": Decimal(1),
+    "kb": Decimal(1_000),
+    "mb": Decimal(1_000_000),
+    "gb": Decimal(1_000_000_000),
+    "tb": Decimal(1_000_000_000_000),
+}
 
-_last_summary: dict[str, Any] | None = None
-_last_monotonic = 0.0
+
+class _PayloadError(ValueError):
+    """A sanitized, fixed-vocabulary parse failure."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
 
 
-def _empty(status: str, month: str, detail: str) -> dict[str, Any]:
+def is_enabled() -> bool:
+    """The diagnostic runs only for the exact opt-in value ``1``."""
+    return os.getenv(ENABLE_ENV) == "1"
+
+
+def _iso(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat(timespec="seconds").replace(
+        "+00:00", "Z"
+    )
+
+
+def _failed(reason: str, *, service_id: str = "", http_status: int | None = None):
     return {
-        "status": status,
-        "month": month,
-        "coverage": "unknown",
-        "hours": 0,
-        "expected_hours": 0,
-        "missing_hours": None,
-        "duplicates": 0,
-        "unknown_source_series": 0,
-        "missing_series": ["total", *_DOCUMENTED_COMPONENTS],
-        "component_series": 0,
-        "sources": {},
-        "total_bytes": None,
-        "source_sum_bytes": None,
-        "difference_bytes": None,
-        "reconciliation": "insufficient",
-        "value_unit": "unspecified",
-        "http_status": None,
-        "detail": detail,
-    }
-
-
-def _parse_sources_payload(payload: Any) -> dict[str, Any]:
-    if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
-        return {"ok": False, "detail": "not_a_data_object"}
-    sources: dict[str, dict[int, float]] = {}
-    duplicates = 0
-    malformed = 0
-    unknown_series = 0
-    for entry in payload["data"]:
-        if not isinstance(entry, dict):
-            return {"ok": False, "detail": "series_not_object"}
-        labels = entry.get("labels")
-        if not isinstance(labels, dict):
-            return {"ok": False, "detail": "labels_malformed"}
-        raw_source = labels.get("trafficSource")
-        if not isinstance(raw_source, str):
-            return {"ok": False, "detail": "traffic_source_missing"}
-        source = raw_source.strip().lower()
-        if source not in _SOURCE_VOCABULARY:
-            unknown_series += 1
-            continue
-        values = entry.get("values")
-        if not isinstance(values, list):
-            return {"ok": False, "detail": "values_not_list"}
-        points = sources.setdefault(source, {})
-        for point in values:
-            if not isinstance(point, dict):
-                malformed += 1
-                continue
-            seconds = metric._timestamp_seconds(point.get("timestamp"))
-            number = metric._number(point.get("value"))
-            if seconds is None or number is None:
-                malformed += 1
-                continue
-            bucket = metric._hour_bucket(seconds)
-            if bucket in points:
-                duplicates += 1
-                continue
-            points[bucket] = number
-    return {
-        "ok": True,
-        "detail": "",
-        "sources": sources,
-        "duplicates": duplicates,
-        "malformed": malformed,
-        "unknown_source_series": unknown_series,
-    }
-
-
-def _merge(
-    target: dict[str, dict[int, float]],
-    source: dict[str, dict[int, float]],
-) -> int:
-    duplicates = 0
-    for name, points in source.items():
-        destination = target.setdefault(name, {})
-        for bucket, value in points.items():
-            if bucket in destination:
-                duplicates += 1
-                continue
-            destination[bucket] = value
-    return duplicates
-
-
-def summarize(
-    payloads: list[Any],
-    *,
-    month: str,
-    start: datetime,
-    now: datetime,
-    http_status: int | None = None,
-    failures: int = 0,
-) -> dict[str, Any]:
-    """Validate all fetched pages and reconcile sources against ``total``."""
-    if not payloads:
-        return _empty("unavailable", month, "no_source_payload")
-    sources: dict[str, dict[int, float]] = {}
-    duplicates = 0
-    malformed = 0
-    unknown_series = 0
-    parsed_pages = 0
-    for payload in payloads:
-        parsed = _parse_sources_payload(payload)
-        if not parsed.get("ok"):
-            return _empty("unexpected_payload", month, str(parsed.get("detail"))[:40])
-        parsed_pages += 1
-        duplicates += int(parsed["duplicates"])
-        malformed += int(parsed["malformed"])
-        unknown_series += int(parsed["unknown_source_series"])
-        duplicates += _merge(sources, parsed["sources"])
-
-    start_epoch = int(start.timestamp())
-    end_epoch = int(now.timestamp())
-    sources = {
-        name: {
-            bucket: value
-            for bucket, value in points.items()
-            if start_epoch <= bucket <= end_epoch
-        }
-        for name, points in sources.items()
-    }
-    all_buckets = {bucket for points in sources.values() for bucket in points}
-    coverage = metric._coverage(all_buckets, start, now, max(all_buckets) if all_buckets else None)
-    if len(all_buckets) > MAX_HOURS:
-        return _empty("too_many_hours", month, "hour_bound_exceeded")
-
-    per_source = {
-        name: int(round(sum(points.values()))) for name, points in sorted(sources.items())
-    }
-    total_points = sources.get("total", {})
-    component_names = sorted(name for name in sources if name != "total")
-    component_sum_by_hour = {
-        bucket: sum(sources[name][bucket] for name in component_names)
-        for bucket in all_buckets
-        if component_names and all(bucket in sources[name] for name in component_names)
-    }
-    # An hour is comparable only when EVERY component series and the total
-    # series carry it.  A missing series is never treated as zero.
-    overlapping = [
-        bucket
-        for bucket in total_points
-        if bucket in component_sum_by_hour
-    ]
-    difference: int | None = None
-    reconciliation = "insufficient"
-    if overlapping and component_names:
-        total_bytes = sum(total_points[bucket] for bucket in overlapping)
-        component_bytes = sum(component_sum_by_hour[bucket] for bucket in overlapping)
-        difference = int(round(component_bytes - total_bytes))
-        denominator = max(1.0, abs(total_bytes))
-        reconciliation = "matches" if abs(difference) / denominator <= 0.01 else "differs"
-
-    missing_series = ["total", *_DOCUMENTED_COMPONENTS]
-    missing_series = [name for name in missing_series if name not in sources]
-    status = "ok"
-    if failures and parsed_pages == 0:
-        status = "error"
-    elif (
-        failures
-        or duplicates
-        or malformed
-        or unknown_series
-        or coverage["missing_hours"]
-        or not coverage["complete"]
-        or "total" not in sources
-    ):
-        status = "partial"
-
-    return {
-        "status": status,
-        "month": month,
-        "coverage": "complete" if coverage["complete"] else ("partial" if all_buckets else "missing"),
-        "hours": len(all_buckets),
-        "expected_hours": coverage["expected_hours"],
-        "missing_hours": coverage["missing_hours"],
-        "duplicates": duplicates,
-        "unknown_source_series": unknown_series,
-        "missing_series": missing_series,
-        "component_series": len(component_names),
-        "sources": per_source,
-        "total_bytes": per_source.get("total"),
-        "source_sum_bytes": int(round(sum(component_sum_by_hour.values()))),
-        "difference_bytes": difference,
-        "reconciliation": reconciliation,
-        "value_unit": "unspecified",
+        "ran": True,
+        "ok": False,
+        "reason": reason,
+        "service_id": service_id,
         "http_status": http_status,
-        "detail": "" if status == "ok" else ("partial_data" if parsed_pages else "no_data"),
     }
 
 
-async def diagnose(
-    now: datetime | None = None,
+def _parse_timestamp(value: Any) -> datetime:
+    if isinstance(value, bool) or value is None:
+        raise ValueError("invalid timestamp")
+    if isinstance(value, (int, float)):
+        seconds = float(value)
+        if not math.isfinite(seconds):
+            raise ValueError("invalid timestamp")
+        try:
+            return datetime.fromtimestamp(seconds, tz=timezone.utc)
+        except (OverflowError, OSError) as exc:
+            raise ValueError("invalid timestamp") from exc
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            raise ValueError("invalid timestamp")
+        try:
+            seconds = float(text)
+        except ValueError:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                raise ValueError("timestamp has no timezone")
+            return parsed.astimezone(timezone.utc)
+        if not math.isfinite(seconds):
+            raise ValueError("invalid timestamp")
+        try:
+            return datetime.fromtimestamp(seconds, tz=timezone.utc)
+        except (OverflowError, OSError) as exc:
+            raise ValueError("invalid timestamp") from exc
+    raise ValueError("invalid timestamp")
+
+
+def _parse_value(value: Any) -> float:
+    if isinstance(value, bool) or value is None:
+        raise ValueError("invalid value")
+    if isinstance(value, (int, float)):
+        number = float(value)
+    elif isinstance(value, str):
+        number = float(value.strip())
+    else:
+        raise ValueError("invalid value")
+    if not math.isfinite(number) or number < 0:
+        raise ValueError("invalid value")
+    return number
+
+
+def _labels(entry: dict[str, Any]) -> dict[str, Any]:
+    """Read either Render metrics label representation.
+
+    The public schema documents ``{resource, trafficSource}``. The existing
+    metrics client (``/metrics/bandwidth``) reads a list of ``{field, value}``
+    pairs, so both are normalized here. Unknown fields are ignored; duplicate
+    fields are malformed.
+    """
+    raw = entry.get("labels")
+    if isinstance(raw, dict):
+        return dict(raw)
+    if not isinstance(raw, list):
+        raise _PayloadError("malformed_series")
+    labels: dict[str, Any] = {}
+    for label in raw:
+        if not isinstance(label, dict):
+            raise _PayloadError("malformed_series")
+        field = label.get("field")
+        value = label.get("value")
+        if not isinstance(field, str) or not field.strip():
+            raise _PayloadError("malformed_series")
+        if not isinstance(value, str):
+            raise _PayloadError("malformed_series")
+        name = field.strip()
+        if name in labels:
+            raise _PayloadError("malformed_series")
+        labels[name] = value
+    return labels
+
+
+def _parse_series(
+    entry: Any,
     *,
-    client: httpx.AsyncClient | None = None,
-) -> dict[str, Any]:
-    """Fetch and validate the current month's traffic-source breakdown."""
-    moment = metric._now(now)
-    start, _ = metric.month_bounds(moment)
-    month = moment.strftime("%Y-%m")
-    if not metric.configured():
-        return _empty("unconfigured", month, "render_metric_not_configured")
-    if start < _EARLIEST_SOURCES_DATE:
-        return _empty("unsupported", month, "source_data_starts_2025_03_09")
+    service_id: str,
+    window_start: datetime = _WINDOW_START,
+    window_end: datetime = _WINDOW_END,
+    expected_hours: int = _EXPECTED_HOURS,
+) -> tuple[str, dict[str, Any]]:
+    if not isinstance(entry, dict):
+        raise _PayloadError("malformed_series")
+    labels = _labels(entry)
+    resource = labels.get("resource")
+    service = labels.get("service")
+    if resource is not None and service is not None and resource != service:
+        raise _PayloadError("resource_mismatch")
+    resource_value = resource if resource is not None else service
+    if not isinstance(resource_value, str) or not resource_value.strip():
+        raise _PayloadError("malformed_series")
+    if resource_value != service_id:
+        raise _PayloadError("resource_mismatch")
+    source = labels.get("trafficSource")
+    if not isinstance(source, str) or not source.strip():
+        raise _PayloadError("malformed_series")
+    source = source.strip()
 
-    own_client = client is None
-    if own_client:
-        client = httpx.AsyncClient(timeout=httpx.Timeout(metric.REQUEST_TIMEOUT_S))
-    payloads: list[Any] = []
-    failures = 0
-    status: int | None = None
-    try:
-        query_start = max(start, moment - timedelta(days=metric.MAX_LOOKBACK_DAYS))
-        for window_start, window_end in metric._windows(query_start, moment):
-            fetched = await metric._get_json_bounded(
-                client,
-                "metrics/bandwidth-sources",
-                params={
-                    "resource": metric._service_id(),
-                    "startTime": window_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    "endTime": window_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                },
-            )
-            status = fetched.get("status")
-            if not fetched.get("ok"):
-                failures += 1
-                continue
-            payloads.append(fetched.get("payload"))
-    finally:
-        if own_client:
-            await client.aclose()
+    values = entry.get("values")
+    if not isinstance(values, list):
+        raise _PayloadError("malformed_series")
 
-    if not payloads:
-        result = _empty("error", month, "no_source_payload")
-        result["http_status"] = status
-        result["window_failures"] = failures
-        return result
-    return summarize(
-        payloads,
-        month=month,
-        start=start,
-        now=moment,
-        http_status=status,
-        failures=failures,
-    )
-
-
-def _log(summary: dict[str, Any]) -> None:
-    sources = ",".join(
-        f"{name}:{value}" for name, value in (summary.get("sources") or {}).items()
-    ) or "none"
-    logger.info(
-        "RENDER_BANDWIDTH_SOURCES status=%s month=%s coverage=%s hours=%s "
-        "expected_hours=%s missing_hours=%s duplicates=%d unknown_source_series=%d "
-        "sources=%s missing_series=%s reconciliation=%s difference_bytes=%s "
-        "value_unit=%s http_status=%s detail=%s",
-        summary.get("status"),
-        summary.get("month"),
-        summary.get("coverage"),
-        summary.get("hours"),
-        summary.get("expected_hours"),
-        summary.get("missing_hours") if summary.get("missing_hours") is not None else "unknown",
-        int(summary.get("duplicates") or 0),
-        int(summary.get("unknown_source_series") or 0),
-        sources,
-        ",".join(summary.get("missing_series") or []) or "none",
-        summary.get("reconciliation"),
-        summary.get("difference_bytes") if summary.get("difference_bytes") is not None else "unknown",
-        summary.get("value_unit"),
-        summary.get("http_status") if summary.get("http_status") is not None else "none",
-        summary.get("detail") or "none",
-    )
-
-
-async def maybe_diagnose(now: datetime | None = None) -> dict[str, Any] | None:
-    """Run at most once per bounded interval; never raises into the heartbeat."""
-    global _last_summary, _last_monotonic
-    if not metric.configured():
-        return None
-    if _last_summary is not None and (time.monotonic() - _last_monotonic) < DIAGNOSE_INTERVAL_S:
-        return None
-    try:
-        summary = await asyncio.wait_for(
-            diagnose(now), timeout=metric.REQUEST_TIMEOUT_S * 2
+    raw_unit = entry.get("unit")
+    if raw_unit is None or (isinstance(raw_unit, str) and not raw_unit.strip()):
+        unit, multiplier, unit_assumed, unit_supported = (
+            "unspecified",
+            Decimal(1),
+            True,
+            True,
         )
+    else:
+        unit = str(raw_unit).strip().casefold()
+        multiplier = _UNIT_BYTES.get(unit)
+        unit_assumed = False
+        unit_supported = multiplier is not None
+
+    hourly: list[tuple[datetime, float]] = []
+    buckets: set[int] = set()
+    seen: set[datetime] = set()
+    outside_window = 0
+    raw_total = Decimal(0)
+    for point in values:
+        if not isinstance(point, dict):
+            raise _PayloadError("malformed_datapoint")
+        try:
+            observed_at = _parse_timestamp(point.get("timestamp"))
+        except (ValueError, TypeError):
+            raise _PayloadError("invalid_timestamp")
+        try:
+            amount = _parse_value(point.get("value"))
+        except (ValueError, TypeError):
+            raise _PayloadError("invalid_value")
+        if observed_at in seen:
+            raise _PayloadError("duplicate_timestamp")
+        seen.add(observed_at)
+        if not (window_start <= observed_at < window_end):
+            outside_window += 1
+            continue
+        buckets.add(int((observed_at - window_start).total_seconds() // 3600))
+        hourly.append((observed_at, amount))
+        raw_total += Decimal(str(amount))
+
+    bytes_total: int | None = None
+    mb_total: float | None = None
+    gb_total: float | None = None
+    if unit_supported and multiplier is not None:
+        bytes_total = int(
+            (raw_total * multiplier).to_integral_value(rounding=ROUND_HALF_UP)
+        )
+        mb_total = round(bytes_total / 1_000_000, 6)
+        gb_total = round(bytes_total / 1_000_000_000, 9)
+
+    hourly.sort(key=lambda item: item[0])
+    return source, {
+        "unit": unit,
+        "unit_assumed_bytes": unit_assumed,
+        "unit_supported": unit_supported,
+        "points": len(hourly),
+        "has_data": bool(hourly),
+        "outside_window_points": outside_window,
+        "missing_hours": max(0, expected_hours - len(buckets)),
+        "raw_total": float(raw_total),
+        "bytes_total": bytes_total,
+        "mb_total": mb_total,
+        "gb_total": gb_total,
+        "hourly": [(item[0], item[1]) for item in hourly],
+        "_buckets": buckets,
+    }
+
+
+def _series_entries(payload: Any) -> list[Any]:
+    """Return the series list from either accepted top-level shape.
+
+    The published schema wraps series in ``{"data": [...]}``. The existing
+    metrics client consumes the bare array form. A 200 response in any other
+    shape is not guessed at.
+    """
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        data = payload.get("data")
+        if isinstance(data, list):
+            return data
+    raise _PayloadError("unexpected_payload")
+
+
+def _parse_payload(
+    payload: Any,
+    *,
+    service_id: str,
+    window_start: datetime = _WINDOW_START,
+    window_end: datetime = _WINDOW_END,
+    expected_hours: int = _EXPECTED_HOURS,
+) -> dict[str, Any]:
+    try:
+        data = _series_entries(payload)
+    except _PayloadError as exc:
+        return _failed(exc.reason, service_id=service_id)
+    if not data:
+        return _failed("no_data", service_id=service_id)
+
+    sources: dict[str, dict[str, Any]] = {}
+    for entry in data:
+        try:
+            source, parsed = _parse_series(
+                entry,
+                service_id=service_id,
+                window_start=window_start,
+                window_end=window_end,
+                expected_hours=expected_hours,
+            )
+        except _PayloadError as exc:
+            return _failed(exc.reason, service_id=service_id)
+        if source in sources:
+            return _failed("duplicate_traffic_source", service_id=service_id)
+        sources[source] = parsed
+
+    if sum(series["points"] for series in sources.values()) == 0:
+        return _failed("no_data", service_id=service_id)
+
+    bucket_union: set[int] = set()
+    for series in sources.values():
+        bucket_union.update(series.pop("_buckets"))
+
+    parts_present = [name for name in _PART_SOURCES if name in sources]
+    total_present = "total" in sources
+    total_raw = sources["total"]["raw_total"] if total_present else None
+    parts_sum_raw = (
+        sum(sources[name]["raw_total"] for name in parts_present)
+        if parts_present
+        else None
+    )
+    mixed_units = len({series["unit"] for series in sources.values()}) > 1
+    if total_raw is None or parts_sum_raw is None or mixed_units:
+        parts_match: bool | None = None
+    else:
+        tolerance = max(1.0, abs(total_raw) * 0.005)
+        parts_match = abs(parts_sum_raw - total_raw) <= tolerance
+
+    hours_with_any_data = len(bucket_union)
+    return {
+        "ran": True,
+        "ok": True,
+        "reason": "",
+        "service_id": service_id,
+        "window_start": _iso(window_start),
+        "window_end": _iso(window_end),
+        "expected_hours": expected_hours,
+        "declared_series": len(data),
+        "series_count": len(sources),
+        "hours_with_any_data": hours_with_any_data,
+        "missing_hours": max(0, expected_hours - hours_with_any_data),
+        "total_present": total_present,
+        "parts_present": parts_present,
+        "parts_sum_raw": parts_sum_raw,
+        "total_raw": total_raw,
+        "parts_match_total": parts_match,
+        "mixed_units": mixed_units,
+        "unexpected_sources": sorted(set(sources) - set(_TRAFFIC_SOURCES)),
+        "sources": sources,
+    }
+
+
+async def _fetch(api_key: str, params: dict[str, str]) -> tuple[int | None, Any, str]:
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Accept": "application/json",
+    }
+    status: int | None = None
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        async with client.stream(
+            "GET", _API_URL, params=params, headers=headers
+        ) as response:
+            status = response.status_code
+            if status != 200:
+                return status, None, "http_status"
+            body = bytearray()
+            async for chunk in response.aiter_bytes():
+                body.extend(chunk)
+                if len(body) > _MAX_RESPONSE_BYTES:
+                    return status, None, "response_too_large"
+    try:
+        return status, json.loads(bytes(body)), ""
+    except (ValueError, TypeError):
+        return status, None, "invalid_json"
+
+
+def _fmt(value: float | None, digits: int) -> str:
+    return "unavailable" if value is None else f"{value:.{digits}f}"
+
+
+def _log_result(result: dict[str, Any]) -> None:
+    window = (
+        f"{result.get('window_start') or _iso(_WINDOW_START)}.."
+        f"{result.get('window_end') or _iso(_WINDOW_END)}"
+    )
+    if not result.get("ok"):
+        logger.warning(
+            "[BANDWIDTH_SOURCES] failed service=%s window=%s reason=%s http_status=%s",
+            result.get("service_id") or "missing",
+            window,
+            result.get("reason") or "unknown",
+            result.get("http_status") if result.get("http_status") is not None else "none",
+        )
+        return
+
+    logger.info(
+        "[BANDWIDTH_SOURCES] response http_status=%s series=%d expected_hours=%d",
+        result.get("http_status"),
+        result["series_count"],
+        result["expected_hours"],
+    )
+    for name, series in result["sources"].items():
+        bytes_total = (
+            "unavailable" if series["bytes_total"] is None else series["bytes_total"]
+        )
+        logger.info(
+            "[BANDWIDTH_SOURCES] source=%s unit=%s unit_assumed_bytes=%s points=%d "
+            "missing_hours=%d outside_window_points=%d raw_total=%.6f "
+            "bytes_total=%s mb=%s gb=%s",
+            name,
+            series["unit"],
+            series["unit_assumed_bytes"],
+            series["points"],
+            series["missing_hours"],
+            series["outside_window_points"],
+            series["raw_total"],
+            bytes_total,
+            _fmt(series["mb_total"], 6),
+            _fmt(series["gb_total"], 9),
+        )
+        hourly = series["hourly"]
+        # A month-to-date window can hold ~720 hourly points; keep the log
+        # bounded to the most recent 24.  The fixed forensic week keeps its
+        # full detail because it is already small.
+        if int(result.get("expected_hours") or 0) > 24 * 7:
+            hourly = hourly[-24:]
+        for start in range(0, len(hourly), _HOURLY_LOG_CHUNK):
+            chunk = hourly[start:start + _HOURLY_LOG_CHUNK]
+            rendered = " ".join(
+                f"{_iso(observed_at)}={amount:g}" for observed_at, amount in chunk
+            )
+            logger.info(
+                "[BANDWIDTH_SOURCES] source=%s hourly %d-%d %s",
+                name,
+                start + 1,
+                start + len(chunk),
+                rendered,
+            )
+
+    logger.info(
+        "[BANDWIDTH_SOURCES] completeness expected_hours=%d series=%d "
+        "hours_with_any_data=%d missing_hours=%d total_present=%s "
+        "parts_present=%s parts_sum_raw=%s total_raw=%s parts_match_total=%s "
+        "mixed_units=%s unexpected_sources=%s",
+        result["expected_hours"],
+        result["series_count"],
+        result["hours_with_any_data"],
+        result["missing_hours"],
+        result["total_present"],
+        ",".join(result["parts_present"]) or "none",
+        _fmt(result["parts_sum_raw"], 6),
+        _fmt(result["total_raw"], 6),
+        result["parts_match_total"],
+        result["mixed_units"],
+        ",".join(result["unexpected_sources"]) or "none",
+    )
+
+
+def _window_for(now: datetime) -> tuple[datetime, datetime, int]:
+    """Current UTC month-to-date, bounded to Render's 30-day lookback."""
+    current = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
+    end = current.astimezone(timezone.utc).replace(
+        minute=0, second=0, microsecond=0
+    )
+    start = end.replace(day=1, hour=0)
+    if end - start > timedelta(days=30):
+        start = end - timedelta(days=30)
+    return start, end, max(1, int((end - start).total_seconds() // 3600))
+
+
+async def run_if_enabled(
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Run at most one bounded read-only request, only when explicitly enabled.
+
+    Without ``now`` the fixed forensic window is used (tests and the original
+    investigation).  The lifecycle passes ``now`` and measures the current UTC
+    month.
+    """
+    if not is_enabled():
+        return {"ran": False, "ok": False, "reason": "disabled"}
+
+    if now is None:
+        window_start, window_end, expected_hours = (
+            _WINDOW_START, _WINDOW_END, _EXPECTED_HOURS
+        )
+    else:
+        window_start, window_end, expected_hours = _window_for(now)
+
+    api_key = os.getenv("RENDER_API_KEY", "").strip()
+    service_id = os.getenv("RENDER_SERVICE_ID", "").strip()
+    if not api_key:
+        result = _failed("missing_api_key", service_id=service_id)
+        _log_result(result)
+        return result
+    if not service_id:
+        result = _failed("missing_service_id")
+        _log_result(result)
+        return result
+
+    params = {
+        "resource": service_id,
+        "startTime": _iso(window_start),
+        "endTime": _iso(window_end),
+    }
+    logger.info(
+        "[BANDWIDTH_SOURCES] start service=%s window=%s..%s endpoint=%s",
+        service_id,
+        _iso(window_start),
+        _iso(window_end),
+        _API_URL,
+    )
+
+    try:
+        status, payload, reason = await _fetch(api_key, params)
     except asyncio.CancelledError:
         raise
-    except Exception as exc:  # noqa: BLE001
-        summary = _empty("error", metric._now(now).strftime("%Y-%m"), type(exc).__name__[:40])
-    _last_summary = dict(summary)
-    _last_monotonic = time.monotonic()
-    try:
-        _log(summary)
-    except Exception:  # noqa: BLE001
-        pass
-    return summary
+    except httpx.TimeoutException:
+        result = _failed("timeout", service_id=service_id)
+    except httpx.RequestError as exc:
+        result = _failed(
+            f"request_failed:{type(exc).__name__}", service_id=service_id
+        )
+    except Exception as exc:  # noqa: BLE001 - external payloads are untrusted
+        result = _failed(
+            f"request_failed:{type(exc).__name__}", service_id=service_id
+        )
+    else:
+        if reason:
+            result = _failed(reason, service_id=service_id, http_status=status)
+        else:
+            result = _parse_payload(
+                payload,
+                service_id=service_id,
+                window_start=window_start,
+                window_end=window_end,
+                expected_hours=expected_hours,
+            )
+            result["http_status"] = status
+    _log_result(result)
+    return result
 
 
-def reset_for_tests() -> None:
-    global _last_summary, _last_monotonic
-    _last_summary = None
-    _last_monotonic = 0.0
+async def maybe_run_if_enabled(now: datetime | None = None) -> dict[str, Any]:
+    """Run at most once per six hours from the existing heartbeat."""
+    global _last_run
+    if not is_enabled():
+        return {"ran": False, "ok": False, "reason": "disabled"}
+    if time.monotonic() - _last_run < _RUN_INTERVAL_SECONDS:
+        return {"ran": False, "ok": False, "reason": "not_due"}
+    _last_run = time.monotonic()
+    return await run_if_enabled(now=now or datetime.now(timezone.utc))

@@ -17,6 +17,7 @@ from backend.ai.providers.base.capabilities import ProviderCapabilities
 from backend.ai.providers.base.config import ProviderConfig
 from backend.ai.providers.base.contract import BaseProvider, ProviderResponse
 from backend.ai.providers.base.defaults import get_provider_default
+from backend.observability import egress_attribution as egress
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +101,7 @@ class OpenAICompatProvider(BaseProvider):
                     "Authorization": f"Bearer {self._config.api_key}",
                     "Content-Type": "application/json",
                 },
+                **egress.async_client_kwargs("ai_provider", self.name),
             )
 
         url = f"{self._config.base_url}/chat/completions"
@@ -319,10 +321,13 @@ class OpenAICompatProvider(BaseProvider):
             self._http_client = httpx.AsyncClient(
                 timeout=self._config.timeout,
                 headers={"Authorization": f"Bearer {self._config.api_key}", "Content-Type": "application/json"},
+                **egress.async_client_kwargs("ai_discovery", self.name),
             )
         url = f"{self._config.base_url}/models"
         try:
-            resp = await self._http_client.get(url)
+            resp = await self._http_client.get(
+                url, **egress.request_category("ai_discovery", self.name)
+            )
             if resp.status_code != 200:
                 return []
             data = resp.json()

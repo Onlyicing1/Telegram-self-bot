@@ -1010,6 +1010,43 @@ async def test_the_save_code_and_stored_row_identity_survive_both_syncs():
 # ── outbound bandwidth governance (file-name re-upload) ────────────────────
 
 
+def _policy_at(monkeypatch, effective: int) -> None:
+    from datetime import datetime, timezone
+
+    from backend.services import outbound_bandwidth_service as bw
+
+    current = datetime.now(timezone.utc)
+    monkeypatch.setattr(bw, "_policy_snapshot", {
+        "trusted": True,
+        "state": "available",
+        "detail": "",
+        "tier": bw._policy_tier(effective),
+        "effective_monthly_bytes": effective,
+        "render_monthly_bytes": effective,
+        "governor_monthly_bytes": 0,
+        "policy_floor_bytes": 0,
+        "monthly_limit_bytes": bw.MONTHLY_TARGET_BYTES,
+        "monthly_period": current.strftime("%Y-%m"),
+        "latest_data_at": current.isoformat(),
+        "checked_at": current.isoformat(),
+    })
+
+
+@pytest.mark.asyncio
+async def test_the_file_name_change_is_refused_at_eighty_percent(monkeypatch):
+    _policy_at(monkeypatch, 3_200_000_000)
+    _seed(_row())
+    client = FakeSavedClient(_document_message())
+
+    result = await retrieve_service.do_change_file_name(
+        client, OWNER, "S0001", "Blocked.pdf"
+    )
+
+    assert result.startswith("×")
+    assert client.uploads == []
+    assert client.deletes == []
+
+
 @pytest.mark.asyncio
 async def test_the_file_name_change_reserves_the_reuploaded_bytes(monkeypatch):
     from backend.services import outbound_bandwidth_service as bw
@@ -1018,7 +1055,7 @@ async def test_the_file_name_change_reserves_the_reuploaded_bytes(monkeypatch):
     client = FakeSavedClient(_document_message())
     reserved = []
 
-    async def _reserve(category, byte_count, **kwargs):
+    async def _reserve(category, byte_count):
         reserved.append((category, byte_count))
         return {}
 
@@ -1038,7 +1075,7 @@ async def test_the_file_name_change_never_uploads_when_accounting_denies(monkeyp
     _seed(_row())
     client = FakeSavedClient(_document_message())
 
-    async def _deny(category, byte_count, **kwargs):
+    async def _deny(category, byte_count):
         raise bw.OutboundBandwidthUnavailableError("accounting unavailable")
 
     monkeypatch.setattr(bw, "reserve_outbound_bytes", _deny)

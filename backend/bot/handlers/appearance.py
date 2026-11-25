@@ -466,6 +466,8 @@ async def _download_bounded(event) -> tuple[bytes | None, str]:
 
     limit = appearance_service.MAX_IMAGE_BYTES
     buffer = bytearray()
+    complete = False
+    failed = 0
     stream = client.iter_download(media, chunk_size=_DOWNLOAD_CHUNK)
     try:
         async for chunk in stream:
@@ -473,15 +475,19 @@ async def _download_bounded(event) -> tuple[bytes | None, str]:
                 continue
             received = len(buffer) + len(chunk)
             if received > limit:
+                failed = 1
                 return None, (
                     f"{sym.STATE_FAILED} That file is larger than "
                     f"{appearance_service.MAX_IMAGE_MB} MB. The upload was stopped "
                     "at the limit and nothing was stored."
                 )
             buffer.extend(chunk)
+        complete = True
     except asyncio.CancelledError:
+        failed = 1
         raise
     except Exception as exc:  # noqa: BLE001 — a failed transfer is reported
+        failed = 1
         logger.warning("[APPEARANCE] bounded media download failed: %s", exc)
         return None, f"{sym.STATE_FAILED} The image could not be downloaded."
     finally:
@@ -494,7 +500,12 @@ async def _download_bounded(event) -> tuple[bytes | None, str]:
         try:
             from backend.observability import egress_attribution as egress
 
-            egress.record_telegram_download(bytes(buffer))
+            egress.record_telegram_download(
+                buffer,
+                label="appearance_download",
+                complete=complete,
+                failed=failed,
+            )
         except Exception:  # noqa: BLE001 — measurement never changes the transfer
             pass
     if not buffer:

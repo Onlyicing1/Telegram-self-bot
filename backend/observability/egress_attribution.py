@@ -1,859 +1,966 @@
-"""Bounded, privacy-safe egress attribution for the LifeOS runtime.
+"""Bounded, opt-in attribution of outbound application payload bytes.
 
-This module answers ONE question for the owner: which bounded subsystem produced
-the payload bytes this process actually moved?  It is deliberately not a second
-bandwidth governor and not a metrics backend:
+This module MEASURES only.  It never enforces a limit, retries, delays, or
+changes a transfer, and it is fully disabled unless
+``RENDER_EGRESS_ATTRIBUTION`` is exactly ``"1"``.
 
-* the category vocabulary is CLOSED — an unknown source is refused, so a URL,
-  filename, chat id, prompt or token can never become a metric label;
-* counters are process-local, bounded and reset at each UTC month boundary;
-* no per-request log line is emitted; a single aggregate summary is flushed on
-  the existing heartbeat/shutdown lifecycle, never by a new scheduler;
-* every public function swallows its own failure, because measurement must
-  never break an application operation.
+Measured seams:
 
-Measurement classes
--------------------
-Telegram payloads are measured at the logical transfer boundary (the exact
-buffer/file size).  Telegram's pinned client exposes only logical progress
-callbacks, not wire bytes, so MTProto framing and automatic retransmissions are
-NOT included; those are reported as unmeasured, never invented.
+* **Telegram uploads** — Telethon's ``progress_callback(current, total)`` is
+  CUMULATIVE bytes for one single-file ``upload_file`` / ``send_file`` (pinned
+  Telethon 1.43.0).  Only positive deltas are added, so a logical transfer is
+  counted once and a restarted upload is not counted twice.  The counter is
+  file payload, NOT MTProto wire bytes: RPC frames, TL/encryption overhead,
+  keepalives, panel edits and connection setup stay unmeasured.  The callback
+  advances only after a part has been accepted, so retransmissions are not
+  represented; this is a payload-level approximation, not a wire meter.
+* **Telegram downloads** — the payload returned by the supported download
+  boundary (a path or bytes), measured once per completed download.  MTProto
+  framing and failed downloads without a payload stay unmeasured.
+* **HTTP request bodies** — an ``httpx`` event hook reading the request's
+  ``Content-Length``.  That is the body httpx actually sends (JSON, raw bytes,
+  form data and multipart framing included), and it excludes TCP/IP, TLS and
+  HTTP headers.  The body is never read, so a streamed body is untouched; a
+  body of unknown length is reported as unmeasured rather than guessed.
+* **HTTP response bodies** — the same response hook measures bytes consumed
+  by the application as INBOUND.  A streamed response is wrapped and counted
+  only as it is consumed; closing it early records the consumed bytes plus an
+  incomplete-stream marker.  Inbound bytes are never added to outbound bytes
+  and never compared with Render's outbound metric as if they were egress.
 
-HTTP payloads are measured by wrapping ``httpx.Client.send`` /
-``httpx.AsyncClient.send`` (public API, installed once at runtime startup).
-Request bodies are read only when httpx has already materialized them; a
-streaming request body is measured from ``Content-Length`` when present and is
-otherwise recorded as unmeasured.  A non-streaming response is measured from
-the body httpx already read.  A streaming response is wrapped with a counting
-proxy that observes the caller's own iteration — it never consumes the stream
-itself.  Bytes are decoded-body bytes, so content encoding can make the figure
-differ from the wire; that is documented, not hidden.
+Reported semantics:
+
+* ``exact_payload_bytes`` and ``estimated_payload_bytes`` are separate
+  channels and are never summed together.  Every path instrumented here
+  exposes an exact body length, so the estimate channel stays at zero.
+* ``exact_inbound_bytes`` is a separate inbound channel.  It is never added
+  to any outbound total.
+* ``unmeasured_operations`` / ``unmeasured_inbound_operations`` count
+  operations whose byte count is unknown.  ``incomplete_inbound_streams``
+  counts streams closed before exhaustion.
+* Window counters are emitted by an existing lifecycle caller (the heartbeat)
+  at most every ``FLUSH_INTERVAL_SECONDS``; an enabled process with no
+  activity emits a bounded status line at most every
+  ``STATUS_INTERVAL_SECONDS``.  Month-to-date counters live beside the window
+  counters so a quiet process can still be reconciled with Render's calendar
+  month.  They are process-scoped and reset on restart: no database, no
+  telemetry store, no scheduler, no background task.
+* Labels come from a closed vocabulary.  A URL, id, filename, prompt, token or
+  any other free text can never become a label or a log field.
+
+This is NOT Render bandwidth.  Render's NAT metric stays authoritative, and
+the sum of these counters is not expected to equal it.
 """
 from __future__ import annotations
 
-import contextlib
-import contextvars
+import inspect
 import logging
 import os
 import threading
 import time
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator, Iterator
-from urllib.parse import urlparse
+from typing import Any, Callable, Dict, Optional
 
 import httpx
 
 logger = logging.getLogger(__name__)
 
+#: The one flag.  Any value other than exactly ``"1"`` keeps measurement off.
 ENV_FLAG = "RENDER_EGRESS_ATTRIBUTION"
-FLUSH_ENV = "RENDER_EGRESS_FLUSH_SECONDS"
 
-SOURCE_TELEGRAM_UPLOAD = "telegram_upload"
-SOURCE_TELEGRAM_DOWNLOAD = "telegram_download"
-SOURCE_TELEGRAM_TRANSPORT = "telegram_transport"
-SOURCE_AI_PROVIDER = "ai_provider"
-SOURCE_AI_SEARCH = "ai_search"
-SOURCE_STT_PROVIDER = "stt_provider"
-SOURCE_TTS_PROVIDER = "tts_provider"
-SOURCE_SUPABASE_REST = "supabase_rest"
-SOURCE_SUPABASE_STORAGE = "supabase_storage"
-SOURCE_RENDER_API = "render_api"
-SOURCE_OTHER_HTTP = "other_http"
+#: Minimum spacing between aggregate log summaries.
+FLUSH_INTERVAL_SECONDS = 300.0
 
-SOURCE_ORDER: tuple[str, ...] = (
-    SOURCE_TELEGRAM_UPLOAD,
-    SOURCE_TELEGRAM_DOWNLOAD,
-    SOURCE_TELEGRAM_TRANSPORT,
-    SOURCE_AI_PROVIDER,
-    SOURCE_AI_SEARCH,
-    SOURCE_STT_PROVIDER,
-    SOURCE_TTS_PROVIDER,
-    SOURCE_SUPABASE_REST,
-    SOURCE_SUPABASE_STORAGE,
-    SOURCE_RENDER_API,
-    SOURCE_OTHER_HTTP,
+# ── closed vocabulary ───────────────────────────────────────────────────────
+
+TELEGRAM_SELF_UPLOAD = "telegram_self_upload"
+TELEGRAM_DOWNLOAD = "telegram_download"
+TELEGRAM_HELPER = "telegram_helper"
+SUPABASE_REST = "supabase_rest"
+SUPABASE_STORAGE = "supabase_storage"
+AI_PROVIDER = "ai_provider"
+AI_DISCOVERY = "ai_discovery"
+STT_PROVIDER = "stt_provider"
+TTS_PROVIDER = "tts_provider"
+RENDER_API = "render_api"
+OTHER_KNOWN_HTTP = "other_known_http"
+
+CATEGORIES = (
+    TELEGRAM_SELF_UPLOAD,
+    TELEGRAM_DOWNLOAD,
+    TELEGRAM_HELPER,
+    SUPABASE_REST,
+    SUPABASE_STORAGE,
+    AI_PROVIDER,
+    AI_DISCOVERY,
+    STT_PROVIDER,
+    TTS_PROVIDER,
+    RENDER_API,
+    OTHER_KNOWN_HTTP,
 )
-_SOURCE_SET = frozenset(SOURCE_ORDER)
+_CATEGORIES = frozenset(CATEGORIES)
+_FALLBACK_CATEGORY = OTHER_KNOWN_HTTP
 
-#: Telegram downloads are INBOUND bytes.  They are measured because they explain
-#: media operations, but they are never added to outbound reconciliation.
-OUTBOUND_SOURCES: tuple[str, ...] = tuple(
-    source for source in SOURCE_ORDER if source != SOURCE_TELEGRAM_DOWNLOAD
+#: Every label this code base may emit.  Anything else becomes ``other``.
+_LABELS = frozenset({
+    # Call-site labels (fixed, never derived from content).
+    "deep_save", "album_member", "voice", "rename_reupload", "ai_attachment",
+    "postgrest", "storage_upload", "gemini_media", "render", "helper", "other",
+    # Download call-site labels (fixed, never derived from content).
+    "download", "save_download", "album_download", "ocr_download",
+    "rename_download", "appearance_download", "voice_download",
+    "storage_download",
+    # Provider labels.
+    "openai", "gemini", "openrouter", "groq", "cerebras", "mistral", "zai",
+    "sambanova", "nvidia", "cohere", "siliconflow", "fireworks", "nararouter",
+    "cloudflare", "you", "speechmatics", "grok", "dummy", "openai_compat",
+})
+
+_FIELDS = (
+    "exact_payload_bytes",
+    "estimated_payload_bytes",
+    "exact_inbound_bytes",
+    "operation_count",
+    "inbound_operation_count",
+    "failed_operation_count",
+    "unmeasured_operations",
+    "unmeasured_inbound_operations",
+    "incomplete_inbound_streams",
 )
-INBOUND_SOURCES: tuple[str, ...] = (SOURCE_TELEGRAM_DOWNLOAD,)
 
-_DEFAULT_FLUSH_S = 300.0
-_MIN_FLUSH_S = 30.0
-_MAX_FLUSH_S = 3600.0
-_MAX_RECORD_BYTES = 1 << 62
+#: Bounded no-activity status cadence.  Activity is still flushed at most every
+#: ``FLUSH_INTERVAL_SECONDS``; this only prevents an idle process from being
+#: indistinguishable from a disabled one.
+STATUS_INTERVAL_SECONDS = 3600.0
 
-_TRUTHY = frozenset({"1", "true", "yes", "on"})
-_lock = threading.Lock()
-_month_key = ""
-_totals: dict[str, int] = {}
-_ops: dict[str, int] = {}
-_unmeasured_ops: dict[str, int] = {}
-_estimated_bytes = 0
-_estimated_ops = 0
-_interval_started = time.monotonic()
-_last_flush = time.monotonic()
-_failures_since_flush = 0
-_startup_logged = False
-
-_source_override: contextvars.ContextVar[str | None] = contextvars.ContextVar(
-    "lifeos_egress_source", default=None
-)
-
-# ── HTTP client instrumentation state ──
-_original_async_send: Any = None
-_original_sync_send: Any = None
-_installed = False
-
-
-def _now(now: datetime | None) -> datetime:
-    if now is None:
-        return datetime.now(timezone.utc)
-    if now.tzinfo is None:
-        return now.replace(tzinfo=timezone.utc)
-    return now.astimezone(timezone.utc)
+_LOCK = threading.Lock()
+_counts: Dict[str, Dict[str, Dict[str, int]]] = {}
+_window_started: datetime = datetime.now(timezone.utc)
+_last_flush: float = time.monotonic()
+_month_period: str = datetime.now(timezone.utc).strftime("%Y-%m")
+_month_counts: Dict[str, Dict[str, Dict[str, int]]] = {}
+_last_status: float = time.monotonic()
+_failures: int = 0
 
 
 def enabled() -> bool:
-    """True when ``RENDER_EGRESS_ATTRIBUTION`` is explicitly enabled."""
+    """True only when the flag is exactly ``"1"``."""
+    return os.environ.get(ENV_FLAG, "") == "1"
+
+
+def _blank() -> Dict[str, int]:
+    return {field: 0 for field in _FIELDS}
+
+
+def _safe_category(value: Any) -> str:
+    return value if isinstance(value, str) and value in _CATEGORIES else _FALLBACK_CATEGORY
+
+
+def _safe_label(value: Any) -> str:
+    if not isinstance(value, str):
+        return "other"
+    label = value.strip().lower()
+    return label if label in _LABELS else "other"
+
+
+def _iso(moment: datetime) -> str:
+    return moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def record_measurement_failure() -> None:
+    """Count a bounded instrumentation failure without touching the transfer."""
+    global _failures
+    if not enabled():
+        return
     try:
-        return (os.getenv(ENV_FLAG, "") or "").strip().lower() in _TRUTHY
-    except Exception:  # noqa: BLE001 — configuration failure means disabled
-        return False
+        with _LOCK:
+            _failures += 1
+    except Exception:  # noqa: BLE001
+        return
 
 
-def flush_interval_seconds() -> float:
-    """Bounded flush cadence; an invalid value falls back to the default."""
+def _roll_month_locked(moment: datetime) -> None:
+    global _month_period, _month_counts
+    period = moment.strftime("%Y-%m")
+    if period != _month_period:
+        _month_period = period
+        _month_counts = {}
+
+
+def _add(
+    category: Any,
+    label: Any,
+    *,
+    exact: int = 0,
+    estimated: int = 0,
+    inbound: int = 0,
+    inbound_unmeasured: int = 0,
+    incomplete: int = 0,
+    unmeasured: int = 0,
+    operations: int = 0,
+    inbound_operations: int = 0,
+    failed: int = 0,
+) -> None:
+    """Add one bounded observation.  Never raises, never touches the network."""
+    if not enabled():
+        return
     try:
-        raw = float(os.getenv(FLUSH_ENV, "") or _DEFAULT_FLUSH_S)
-    except (TypeError, ValueError):
-        return _DEFAULT_FLUSH_S
-    return min(_MAX_FLUSH_S, max(_MIN_FLUSH_S, raw))
+        safe_category = _safe_category(category)
+        safe_label = _safe_label(label)
+        with _LOCK:
+            moment = datetime.now(timezone.utc)
+            _roll_month_locked(moment)
+            bucket = _counts.setdefault(safe_category, {}).setdefault(safe_label, _blank())
+            month = _month_counts.setdefault(safe_category, {}).setdefault(
+                safe_label, _blank()
+            )
+            for target in (bucket, month):
+                target["exact_payload_bytes"] += max(0, int(exact))
+                target["estimated_payload_bytes"] += max(0, int(estimated))
+                target["exact_inbound_bytes"] += max(0, int(inbound))
+                target["operation_count"] += max(0, int(operations))
+                target["inbound_operation_count"] += max(0, int(inbound_operations))
+                target["failed_operation_count"] += max(0, int(failed))
+                target["unmeasured_operations"] += max(0, int(unmeasured))
+                target["unmeasured_inbound_operations"] += max(
+                    0, int(inbound_unmeasured)
+                )
+                target["incomplete_inbound_streams"] += max(0, int(incomplete))
+            _maybe_flush_locked()
+    except Exception:  # noqa: BLE001 — measurement can never break a transfer
+        return
 
 
-def _reset_month_locked(month: str) -> None:
-    global _month_key, _estimated_bytes, _estimated_ops
-    _month_key = month
-    _totals.clear()
-    _ops.clear()
-    _unmeasured_ops.clear()
-    for source in SOURCE_ORDER:
-        _totals[source] = 0
-        _ops[source] = 0
-        _unmeasured_ops[source] = 0
-    _estimated_bytes = 0
-    _estimated_ops = 0
+def record_exact(
+    category: str, byte_count: int, *, label: str = "", failed: int = 0
+) -> None:
+    """Record an exactly measured payload and one operation."""
+    _add(category, label, exact=byte_count, operations=1, failed=failed)
 
 
-def _ensure_month_locked(now: datetime) -> None:
-    month = now.strftime("%Y-%m")
-    if month != _month_key:
-        _reset_month_locked(month)
+def record_estimated(
+    category: str, byte_count: int, *, label: str = "", failed: int = 0
+) -> None:
+    """Record an explicitly estimated payload and one operation."""
+    _add(category, label, estimated=byte_count, operations=1, failed=failed)
 
 
-def _positive_int(value: Any, *, allow_zero: bool) -> int | None:
+def record_unmeasured(category: str, *, label: str = "", failed: int = 0) -> None:
+    """Record one operation whose byte count is unknown."""
+    _add(category, label, unmeasured=1, operations=1, failed=failed)
+
+
+def record_inbound(
+    category: str,
+    byte_count: int,
+    *,
+    label: str = "",
+    complete: bool = True,
+    failed: int = 0,
+) -> None:
+    """Record bytes received by the application; never outbound traffic."""
+    _add(
+        category,
+        label,
+        inbound=byte_count,
+        inbound_operations=1,
+        incomplete=0 if complete else 1,
+        failed=failed,
+    )
+
+
+def record_inbound_unmeasured(
+    category: str,
+    *,
+    label: str = "",
+    complete: bool = False,
+    failed: int = 0,
+) -> None:
+    """Record an inbound operation whose size is unknown."""
+    _add(
+        category,
+        label,
+        inbound_unmeasured=1,
+        inbound_operations=1,
+        incomplete=0 if complete else 1,
+        failed=failed,
+    )
+
+
+def mark_failed(category: str, *, label: str = "") -> None:
+    """Mark the operation already recorded for this category as failed."""
+    _add(category, label, failed=1)
+
+
+# ── flush / snapshot ────────────────────────────────────────────────────────
+
+def _sum_categories(categories: Dict[str, Dict[str, Dict[str, int]]]) -> Dict[str, int]:
+    totals = _blank()
+    for labels in categories.values():
+        for bucket in labels.values():
+            for field in _FIELDS:
+                totals[field] += int(bucket.get(field, 0))
+    return totals
+
+
+def _policy_number(policy: Any, key: str) -> Any:
+    if not isinstance(policy, dict):
+        return "-"
+    value = policy.get(key)
     if isinstance(value, bool) or not isinstance(value, int):
-        return None
-    if value < 0 or (value == 0 and not allow_zero):
-        return None
-    if value > _MAX_RECORD_BYTES:
-        return None
-    return int(value)
+        return "-"
+    return value
 
 
-def record(source: str, byte_count: Any, *, estimated: bool = False) -> bool:
-    """Record one measured payload transfer.  Never raises.
-
-    ``source`` must be one of :data:`SOURCE_ORDER`; anything else is refused so
-    no caller can create an unbounded label dimension.  ``estimated`` keeps an
-    approximation in its own counter, never mixed with exact measurements.
-    """
-    global _estimated_bytes, _estimated_ops
-    if not enabled():
-        return False
-    try:
-        if source not in _SOURCE_SET:
-            return False
-        value = _positive_int(byte_count, allow_zero=False)
-        if value is None:
-            return False
-        with _lock:
-            _ensure_month_locked(_now(None))
-            _totals[source] += value
-            _ops[source] += 1
-            if estimated:
-                _estimated_bytes += value
-                _estimated_ops += 1
-        return True
-    except Exception:  # noqa: BLE001 — measurement never breaks the caller
-        _note_failure()
-        return False
-
-
-def _record_request_bytes(source: str, byte_count: int) -> bool:
-    """Add a request body's bytes to the CURRENT operation, not a new one."""
-    if not enabled() or source not in _SOURCE_SET:
-        return False
-    value = _positive_int(byte_count, allow_zero=False)
+def _policy_text(policy: Any, key: str) -> str:
+    if not isinstance(policy, dict):
+        return "-"
+    value = policy.get(key)
+    if isinstance(value, bool):
+        return str(value).lower()
     if value is None:
+        return "-"
+    if isinstance(value, (int, str)):
+        return str(value)
+    return "-"
+
+
+def _emit_locked(window: str, policy: Any = None) -> None:
+    """Emit at most one line per (category, label) plus one totals line."""
+    totals = _blank()
+    for category in sorted(_counts):
+        for label in sorted(_counts[category]):
+            bucket = _counts[category][label]
+            if not any(bucket.values()):
+                continue
+            logger.info(
+                "[RENDER_EGRESS] window=%s category=%s label=%s "
+                "exact_payload_bytes=%d estimated_payload_bytes=%d "
+                "exact_inbound_bytes=%d operation_count=%d "
+                "inbound_operation_count=%d failed_operation_count=%d "
+                "unmeasured_operations=%d unmeasured_inbound_operations=%d "
+                "incomplete_inbound_streams=%d scope=process",
+                window,
+                category,
+                label or "-",
+                bucket["exact_payload_bytes"],
+                bucket["estimated_payload_bytes"],
+                bucket["exact_inbound_bytes"],
+                bucket["operation_count"],
+                bucket["inbound_operation_count"],
+                bucket["failed_operation_count"],
+                bucket["unmeasured_operations"],
+                bucket["unmeasured_inbound_operations"],
+                bucket["incomplete_inbound_streams"],
+            )
+            for field in _FIELDS:
+                totals[field] += bucket[field]
+    month = _sum_categories(_month_counts)
+    render = _policy_number(policy, "render_monthly_bytes")
+    measured_month = int(month["exact_payload_bytes"])
+    difference: Any = "-"
+    if isinstance(render, int):
+        difference = int(render) - measured_month
+    logger.info(
+        "[RENDER_EGRESS] window=%s totals exact_payload_bytes=%d "
+        "estimated_payload_bytes=%d exact_inbound_bytes=%d operation_count=%d "
+        "inbound_operation_count=%d failed_operation_count=%d "
+        "unmeasured_operations=%d unmeasured_inbound_operations=%d "
+        "incomplete_inbound_streams=%d month=%s "
+        "month_exact_payload_bytes=%d month_exact_inbound_bytes=%d "
+        "render_monthly_bytes=%s governor_monthly_bytes=%s policy_floor_bytes=%s "
+        "policy_tier=%s policy_trusted=%s render_partial=%s "
+        "unattributed_difference_bytes=%s "
+        "note=application_payload_only_not_render_bandwidth",
+        window,
+        totals["exact_payload_bytes"],
+        totals["estimated_payload_bytes"],
+        totals["exact_inbound_bytes"],
+        totals["operation_count"],
+        totals["inbound_operation_count"],
+        totals["failed_operation_count"],
+        totals["unmeasured_operations"],
+        totals["unmeasured_inbound_operations"],
+        totals["incomplete_inbound_streams"],
+        _month_period,
+        measured_month,
+        month["exact_inbound_bytes"],
+        render,
+        _policy_number(policy, "governor_monthly_bytes"),
+        _policy_number(policy, "policy_floor_bytes"),
+        _policy_number(policy, "tier"),
+        _policy_text(policy, "trusted"),
+        _policy_text(policy, "render_partial"),
+        difference,
+    )
+
+
+def _emit_status_locked(moment: datetime, policy: Any = None) -> None:
+    """One bounded line that proves an idle enabled process is still alive."""
+    month = _sum_categories(_month_counts)
+    logger.info(
+        "[RENDER_EGRESS] status=enabled_no_activity window=%s..%s "
+        "month=%s month_exact_payload_bytes=%d month_exact_inbound_bytes=%d "
+        "measurement_failures=%d policy_tier=%s policy_trusted=%s "
+        "render_partial=%s scope=process",
+        _iso(_window_started),
+        _iso(moment),
+        _month_period,
+        month["exact_payload_bytes"],
+        month["exact_inbound_bytes"],
+        _failures,
+        _policy_number(policy, "tier"),
+        _policy_text(policy, "trusted"),
+        _policy_text(policy, "render_partial"),
+    )
+
+
+def _reset_window_locked(moment: datetime, mono: Optional[float] = None) -> None:
+    global _counts, _window_started, _last_flush
+    _counts = {}
+    _window_started = moment
+    _last_flush = time.monotonic() if mono is None else mono
+
+
+def _maybe_flush_locked() -> bool:
+    """Flush only when the interval elapsed AND something was recorded."""
+    mono = time.monotonic()
+    if mono - _last_flush < FLUSH_INTERVAL_SECONDS:
         return False
-    try:
-        with _lock:
-            _ensure_month_locked(_now(None))
-            _totals[source] += value
-        return True
-    except Exception:  # noqa: BLE001
-        _note_failure()
-        return False
+    moment = datetime.now(timezone.utc)
+    if _counts:
+        _emit_locked(f"{_iso(_window_started)}..{_iso(moment)}")
+    _reset_window_locked(moment, mono)
+    return True
 
 
-def record_operation(source: str, byte_count: Any = 0) -> bool:
-    """Record one completed operation, including a real zero-byte response."""
-    if not enabled():
-        return False
-    try:
-        if source not in _SOURCE_SET:
-            return False
-        value = _positive_int(byte_count, allow_zero=True)
-        if value is None:
-            return False
-        with _lock:
-            _ensure_month_locked(_now(None))
-            _totals[source] += value
-            _ops[source] += 1
-        return True
-    except Exception:  # noqa: BLE001
-        _note_failure()
-        return False
+def flush(policy: Any = None) -> bool:
+    """Emit the current window now (no timer, no task) and reset it.
 
-
-def record_unmeasured(source: str) -> bool:
-    """Record an operation whose byte count could not be measured.
-
-    It is counted only in the unmeasured-operation bucket: a missing size is
-    never turned into a zero-byte measurement.
+    With no activity this intentionally emits nothing and does not reset the
+    month-to-date counters; ``heartbeat_tick`` owns the bounded idle status.
     """
     if not enabled():
         return False
     try:
-        if source not in _SOURCE_SET:
-            return False
-        with _lock:
-            _ensure_month_locked(_now(None))
-            _unmeasured_ops[source] += 1
-        return True
+        with _LOCK:
+            moment = datetime.now(timezone.utc)
+            _roll_month_locked(moment)
+            if _counts:
+                _emit_locked(f"{_iso(_window_started)}..{_iso(moment)}", policy)
+            _reset_window_locked(moment)
+            return True
     except Exception:  # noqa: BLE001
-        _note_failure()
+        record_measurement_failure()
         return False
 
 
-def record_telegram_download(payload: Any) -> bool:
-    """Record ONE Telegram download payload (a path or raw bytes).
+def flush_due() -> bool:
+    """True when the existing lifecycle boundary should call ``heartbeat_tick``."""
+    if not enabled():
+        return False
+    try:
+        mono = time.monotonic()
+        if _counts and mono - _last_flush >= FLUSH_INTERVAL_SECONDS:
+            return True
+        return not _counts and mono - _last_status >= STATUS_INTERVAL_SECONDS
+    except Exception:  # noqa: BLE001
+        return False
 
-    A missing/unreadable path is recorded as an unmeasured operation, never as
-    zero downloaded bytes.  The download itself is INBOUND traffic and is kept
-    out of outbound reconciliation.
+
+def heartbeat_tick(policy: Any = None) -> bool:
+    """Flush activity or emit one bounded idle status from the heartbeat.
+
+    This is a lifecycle hook, not a scheduler: the heartbeat already exists and
+    this call performs no network request and no blocking work.
     """
+    global _last_status
+    if not enabled():
+        return False
     try:
-        if isinstance(payload, (bytes, bytearray, memoryview)):
-            size = len(payload)
-        elif isinstance(payload, str):
-            size = os.path.getsize(payload)
-        else:
-            return record_unmeasured(SOURCE_TELEGRAM_DOWNLOAD)
-        return record_operation(SOURCE_TELEGRAM_DOWNLOAD, size)
+        with _LOCK:
+            mono = time.monotonic()
+            moment = datetime.now(timezone.utc)
+            _roll_month_locked(moment)
+            if _counts and mono - _last_flush >= FLUSH_INTERVAL_SECONDS:
+                _emit_locked(f"{_iso(_window_started)}..{_iso(moment)}", policy)
+                _reset_window_locked(moment, mono)
+                return True
+            if not _counts and mono - _last_status >= STATUS_INTERVAL_SECONDS:
+                _emit_status_locked(moment, policy)
+                _last_status = mono
+                _reset_window_locked(moment, mono)
+                return True
     except Exception:  # noqa: BLE001
-        return record_unmeasured(SOURCE_TELEGRAM_DOWNLOAD)
+        record_measurement_failure()
+    return False
 
 
-def _note_failure() -> None:
-    global _failures_since_flush
-    try:
-        with _lock:
-            _failures_since_flush += 1
-    except Exception:  # noqa: BLE001
-        pass
+def log_startup() -> None:
+    """Sanitized confirmation that attribution is enabled or disabled."""
+    active = enabled()
+    logger.info(
+        "[RENDER_EGRESS] startup enabled=%s status=%s interval_seconds=%.0f "
+        "status_interval_seconds=%.0f categories=%d counters_scope=process "
+        "flag=%s",
+        str(active).lower(),
+        "recording" if active else "disabled",
+        FLUSH_INTERVAL_SECONDS,
+        STATUS_INTERVAL_SECONDS,
+        len(CATEGORIES),
+        ENV_FLAG,
+    )
 
 
-def _coverage_locked() -> str:
-    if sum(_unmeasured_ops.values()) > 0:
-        return "partial"
-    if sum(_ops.values()) > 0:
-        return "complete"
-    return "unknown"
+def shutdown(policy: Any = None) -> bool:
+    """Flush the final window from the existing shutdown lifecycle."""
+    flushed = flush(policy=policy)
+    logger.info(
+        "[RENDER_EGRESS] shutdown flushed=%s status=%s counters_scope=process",
+        str(flushed).lower(),
+        "disabled" if not enabled() else "flushed",
+    )
+    return flushed
 
 
 def _status_locked() -> str:
     if not enabled():
         return "disabled"
-    if _failures_since_flush > 0:
+    totals = _sum_categories(_counts)
+    month = _sum_categories(_month_counts)
+    combined = {field: totals[field] + month[field] for field in _FIELDS}
+    if (
+        combined["unmeasured_operations"]
+        or combined["unmeasured_inbound_operations"]
+        or combined["incomplete_inbound_streams"]
+    ):
+        return "measurement_incomplete"
+    if _failures and not any(combined.values()):
         return "measurement_failure"
-    if sum(_ops.values()) == 0 and sum(_unmeasured_ops.values()) == 0:
-        return "enabled_idle"
-    return "enabled_recording"
+    if any(combined.values()):
+        return "recording"
+    return "enabled_no_activity"
 
 
-def snapshot(now: datetime | None = None) -> dict[str, Any]:
-    """A bounded, privacy-safe aggregate of the current UTC month."""
-    moment = _now(now)
-    if not enabled():
-        return {
-            "enabled": False,
-            "status": "disabled",
-            "coverage": "unknown",
-            "month": moment.strftime("%Y-%m"),
-            "measured_bytes": 0,
-            "measured_outbound_bytes": 0,
-            "measured_inbound_bytes": 0,
-            "estimated_bytes": 0,
-            "estimated_operations": 0,
-            "operations": 0,
-            "unmeasured_operations": 0,
-            "failures": 0,
-            "sources": {},
-            "interval_seconds": 0,
-        }
+def snapshot() -> Dict[str, Any]:
+    """The current in-memory window and UTC month (process-scoped)."""
+    captured = datetime.now(timezone.utc)
     try:
-        with _lock:
-            _ensure_month_locked(moment)
-            measured = sum(_totals.values())
-            outbound = sum(_totals[source] for source in OUTBOUND_SOURCES)
-            inbound = sum(_totals[source] for source in INBOUND_SOURCES)
-            return {
-                "enabled": True,
-                "status": _status_locked(),
-                "coverage": _coverage_locked(),
-                "month": _month_key,
-                "measured_bytes": measured,
-                "measured_outbound_bytes": outbound,
-                "measured_inbound_bytes": inbound,
-                "estimated_bytes": _estimated_bytes,
-                "estimated_operations": _estimated_ops,
-                "operations": sum(_ops.values()),
-                "unmeasured_operations": sum(_unmeasured_ops.values()),
-                "failures": _failures_since_flush,
-                "interval_seconds": int(max(0.0, time.monotonic() - _interval_started)),
-                "sources": {
-                    source: {
-                        "bytes": _totals[source],
-                        "ops": _ops[source],
-                        "unmeasured_ops": _unmeasured_ops[source],
-                    }
-                    for source in SOURCE_ORDER
-                    if _totals[source] or _ops[source] or _unmeasured_ops[source]
-                },
+        with _LOCK:
+            categories = {
+                category: {
+                    label: dict(bucket) for label, bucket in labels.items()
+                }
+                for category, labels in _counts.items()
             }
-    except Exception:  # noqa: BLE001
-        _note_failure()
-        return {
-            "enabled": True,
-            "status": "measurement_failure",
-            "coverage": "unknown",
-            "month": moment.strftime("%Y-%m"),
-            "measured_bytes": 0,
-            "measured_outbound_bytes": 0,
-            "measured_inbound_bytes": 0,
-            "estimated_bytes": 0,
-            "estimated_operations": 0,
-            "operations": 0,
-            "unmeasured_operations": 0,
-            "failures": 1,
-            "sources": {},
-            "interval_seconds": 0,
-        }
-
-
-def log_startup() -> None:
-    """Emit ONE sanitized confirmation of the attribution state at boot."""
-    global _startup_logged
-    try:
-        with _lock:
-            if _startup_logged:
-                return
-            _startup_logged = True
-            state = "enabled" if enabled() else "disabled"
-        logger.info(
-            "EGRESS_ATTRIBUTION_STARTUP status=%s flag=%s flush_s=%d "
-            "measurement=payload_level telegram_upload=true telegram_download=true "
-            "http_client=true wire_overhead=false",
-            state,
-            ENV_FLAG,
-            int(flush_interval_seconds()),
-        )
-    except Exception:  # noqa: BLE001
-        pass
-
-
-def _source_fragment_locked() -> str:
-    parts = []
-    for source in SOURCE_ORDER:
-        if _totals[source] or _ops[source] or _unmeasured_ops[source]:
-            parts.append(
-                f"{source}:{_totals[source]}/{_ops[source]}/u{_unmeasured_ops[source]}"
-            )
-    return ",".join(parts) if parts else "none"
-
-
-def _policy_line(policy: dict[str, Any]) -> str:
-    if not isinstance(policy, dict):
-        return ""
-    keys = (
-        "month",
-        "tier",
-        "effective_bytes",
-        "local_month_bytes",
-        "render_bytes",
-        "floor_bytes",
-        "render_trusted",
-        "render_coverage",
-        "render_latest_data_at",
-        "snapshot_age_s",
-        "denials",
-        "available",
-    )
-    parts = []
-    for key in keys:
-        if key in policy:
-            value = policy[key]
-            if isinstance(value, bool):
-                value = "true" if value else "false"
-            parts.append(f"{key}={value}")
-    return "BANDWIDTH_POLICY_SNAPSHOT " + " ".join(parts)
-
-
-def _reconciliation_line(policy: dict[str, Any]) -> str:
-    """One sanitized Render-vs-measured view; never claims a cause."""
-    if not isinstance(policy, dict):
-        return ""
-    render = policy.get("render_bytes")
-    if isinstance(render, bool) or not isinstance(render, int):
-        return ""
-    try:
-        rec = reconciliation(
-            render,
-            render_trusted=policy.get("render_trusted"),
-            render_coverage=policy.get("render_coverage"),
-        )
-    except Exception:  # noqa: BLE001
-        return ""
-    return (
-        "EGRESS_RECONCILIATION "
-        f"render_outbound_bytes={rec['render_outbound_bytes']} "
-        f"measured_outbound_bytes={rec['measured_outbound_bytes']} "
-        f"estimated_bytes={rec['estimated_bytes']} "
-        f"unmeasured_operations={rec['unmeasured_operations']} "
-        f"unattributed_difference={rec['unattributed_difference']} "
-        f"render_trusted={'true' if rec['render_trusted'] else 'false'} "
-        f"render_coverage={rec['render_coverage']} "
-        "difference_is_not_attribution=true"
-    )
-
-
-def flush(
-    now: datetime | None = None,
-    *,
-    policy: dict[str, Any] | None = None,
-) -> bool:
-    """Emit ONE aggregate summary and start a new interval.  Never raises."""
-    global _interval_started, _last_flush, _failures_since_flush
-    moment = _now(now)
-    try:
-        with _lock:
-            if not _month_key:
-                _ensure_month_locked(moment)
-            interval_s = int(max(0.0, time.monotonic() - _interval_started))
-            measured = sum(_totals.values())
-            outbound = sum(_totals[source] for source in OUTBOUND_SOURCES)
-            inbound = sum(_totals[source] for source in INBOUND_SOURCES)
-            operations = sum(_ops.values())
-            unmeasured = sum(_unmeasured_ops.values())
-            estimated = _estimated_bytes
-            estimated_ops = _estimated_ops
-            failures = _failures_since_flush
+            month_categories = {
+                category: {
+                    label: dict(bucket) for label, bucket in labels.items()
+                }
+                for category, labels in _month_counts.items()
+            }
+            started = _window_started
+            month = _month_period
             status = _status_locked()
-            coverage = _coverage_locked()
-            sources = _source_fragment_locked()
-            month = _month_key
-            _interval_started = time.monotonic()
-            _last_flush = _interval_started
-            _failures_since_flush = 0
-        logger.info(
-            "EGRESS_ATTRIBUTION_SUMMARY status=%s coverage=%s enabled=%s month=%s "
-            "interval_s=%d measured_bytes=%d measured_outbound_bytes=%d "
-            "measured_inbound_bytes=%d estimated_bytes=%d estimated_operations=%d "
-            "operations=%d unmeasured_operations=%d failures=%d sources=%s",
-            status,
-            coverage,
-            "true" if enabled() else "false",
-            month,
-            interval_s,
-            measured,
-            outbound,
-            inbound,
-            estimated,
-            estimated_ops,
-            operations,
-            unmeasured,
-            failures,
-            sources,
-        )
-        line = _policy_line(policy or {})
-        if line:
-            logger.info(line)
-        reconciliation_line = _reconciliation_line(policy or {})
-        if reconciliation_line:
-            logger.info(reconciliation_line)
-        return True
+            failures = _failures
     except Exception:  # noqa: BLE001
-        _note_failure()
-        return False
-
-
-def flush_due(now: datetime | None = None) -> bool:
-    """True when the aggregate summary is due (disabled attribution is never due)."""
-    if not enabled():
-        return False
-    try:
-        return (time.monotonic() - _last_flush) >= flush_interval_seconds()
-    except Exception:  # noqa: BLE001
-        return False
-
-
-def maybe_flush(
-    now: datetime | None = None,
-    *,
-    policy: dict[str, Any] | None = None,
-) -> bool:
-    """Flush only when due, so an existing 30s heartbeat creates no log spam."""
-    if not flush_due(now):
-        return False
-    return flush(now, policy=policy)
-
-
-def reconciliation(
-    render_outbound_bytes: int | None = None,
-    *,
-    render_trusted: bool | None = None,
-    render_coverage: str | None = None,
-) -> dict[str, Any]:
-    """Compare Render's service metric with measured application payload bytes.
-
-    The difference is returned as a neutral ``unattributed_difference``: it may
-    contain MTProto/framing overhead, content encoding, retransmissions,
-    response egress, traffic this process did not instrument, or an incomplete
-    Render measurement.  It is never attributed to a provider by this function.
-    """
-    snap = snapshot()
-    measured = int(snap.get("measured_outbound_bytes") or 0)
-    difference: int | None = None
-    if isinstance(render_outbound_bytes, int) and not isinstance(render_outbound_bytes, bool):
-        difference = int(render_outbound_bytes) - measured
+        record_measurement_failure()
+        return {
+            "enabled": enabled(),
+            "status": "disabled" if not enabled() else "measurement_failure",
+            "window_started_utc": _iso(captured),
+            "captured_at_utc": _iso(captured),
+            "flush_interval_seconds": FLUSH_INTERVAL_SECONDS,
+            "status_interval_seconds": STATUS_INTERVAL_SECONDS,
+            "counters_scope": "process",
+            "month": _month_period,
+            "categories": {},
+            "totals": _blank(),
+            "month_categories": {},
+            "month_totals": _blank(),
+            "measurement_failures": 0,
+        }
     return {
-        "render_outbound_bytes": render_outbound_bytes,
-        "render_trusted": render_trusted,
-        "render_coverage": render_coverage,
-        "measured_outbound_bytes": measured,
-        "measured_inbound_bytes": int(snap.get("measured_inbound_bytes") or 0),
-        "estimated_bytes": int(snap.get("estimated_bytes") or 0),
-        "unmeasured_operations": int(snap.get("unmeasured_operations") or 0),
-        "coverage": snap.get("coverage"),
-        "attribution_status": snap.get("status"),
-        "unattributed_difference": difference,
-        "difference_is_not_attribution": True,
+        "enabled": enabled(),
+        "status": status,
+        "window_started_utc": _iso(started),
+        "captured_at_utc": _iso(captured),
+        "flush_interval_seconds": FLUSH_INTERVAL_SECONDS,
+        "status_interval_seconds": STATUS_INTERVAL_SECONDS,
+        "counters_scope": "process",
+        "month": month,
+        "categories": categories,
+        "totals": _sum_categories(categories),
+        "month_categories": month_categories,
+        "month_totals": _sum_categories(month_categories),
+        "measurement_failures": failures,
     }
 
 
-# ── HTTP client instrumentation (public httpx API only) ──
-
-_AI_HOST_SUFFIXES = (
-    "openai.com",
-    "openrouter.ai",
-    "groq.com",
-    "cerebras.ai",
-    "mistral.ai",
-    "together.xyz",
-    "fireworks.ai",
-    "sambanova.ai",
-    "nvidia.com",
-    "cohere.ai",
-    "cohere.com",
-    "siliconflow.cn",
-    "z.ai",
-    "bynara.id",
-    "cloudflare.com",
-    "generativelanguage.googleapis.com",
-    "googleapis.com",
-)
-_SEARCH_HOST_SUFFIXES = ("ydc-index.io", "you.com")
-_STT_PATH_MARKERS = ("audio/transcriptions", "audio/transcribe", "/asr/", "/stt")
-_TTS_PATH_MARKERS = ("audio/speech", "/tts", "/synthesize")
-
-_supabase_host_cache: tuple[str, str] = ("", "")
-
-
-def _supabase_host() -> str:
-    global _supabase_host_cache
+def reset() -> None:
+    """Drop every counter and restart the window (tests / operator reset)."""
+    global _month_period, _month_counts, _failures, _last_status
     try:
-        raw = os.getenv("SUPABASE_URL", "") or ""
-        if raw == _supabase_host_cache[0]:
-            return _supabase_host_cache[1]
-        host = (urlparse(raw).hostname or "").lower()
-        _supabase_host_cache = (raw, host)
-        return host
+        with _LOCK:
+            moment = datetime.now(timezone.utc)
+            _reset_window_locked(moment)
+            _month_period = moment.strftime("%Y-%m")
+            _month_counts = {}
+            _failures = 0
+            _last_status = time.monotonic()
     except Exception:  # noqa: BLE001
-        return ""
+        return
 
 
-def _host_matches(host: str, suffix: str) -> bool:
-    return host == suffix or host.endswith("." + suffix)
+# ── Telegram uploads ────────────────────────────────────────────────────────
 
+class TelegramUploadTracker:
+    """Attributes ONE logical Telegram file upload from cumulative progress.
 
-def classify_request(request: Any) -> str:
-    """Map one request to a bounded source; the URL itself is never recorded."""
-    override = _source_override.get()
-    if override in _SOURCE_SET:
-        return override
-    try:
-        url = request.url
-        host = (url.host or "").lower()
-        path = (url.path or "").lower()
-    except Exception:  # noqa: BLE001
-        return SOURCE_OTHER_HTTP
+    Telethon calls ``progress_callback(current, total)`` with the running byte
+    count of the file being uploaded.  Only positive deltas are added, so the
+    payload is counted once even if a retry restarts the transfer from zero.
+    """
 
-    if _host_matches(host, "api.render.com"):
-        return SOURCE_RENDER_API
-    supabase = _supabase_host()
-    if supabase and _host_matches(host, supabase):
-        if path.startswith("/storage/v1/") or "/storage/v1/object" in path:
-            return SOURCE_SUPABASE_STORAGE
-        return SOURCE_SUPABASE_REST
-    if any(marker in path for marker in _STT_PATH_MARKERS):
-        return SOURCE_STT_PROVIDER
-    if any(marker in path for marker in _TTS_PATH_MARKERS):
-        return SOURCE_TTS_PROVIDER
-    if "tts." in host and "speechmatics" in host:
-        return SOURCE_TTS_PROVIDER
-    if "asr." in host and "speechmatics" in host:
-        return SOURCE_STT_PROVIDER
-    if any(_host_matches(host, suffix) for suffix in _SEARCH_HOST_SUFFIXES):
-        return SOURCE_AI_SEARCH
-    if any(_host_matches(host, suffix) for suffix in _AI_HOST_SUFFIXES):
-        return SOURCE_AI_PROVIDER
-    return SOURCE_OTHER_HTTP
+    __slots__ = ("_category", "_label", "_active", "_high", "_finished")
 
-
-def _request_body_size(request: Any) -> tuple[int | None, bool]:
-    """``(bytes, exact)`` for a request body already materialized by httpx."""
-    try:
-        content = request.content
-    except Exception:  # noqa: BLE001 — a streaming request has no materialized body
-        content = None
-    if content:
-        return len(content), True
-    if content is not None:
-        return 0, True
-    raw_length = request.headers.get("content-length")
-    if raw_length is not None:
-        try:
-            value = int(raw_length)
-        except (TypeError, ValueError):
-            return None, False
-        if value >= 0:
-            return value, True
-    return None, False
-
-
-class _CountingAsyncStream(httpx.AsyncByteStream):
-    """Delegate an async byte stream, counting what the CALLER consumes."""
-
-    def __init__(self, stream: Any, source: str) -> None:
-        self._stream = stream
-        self._source = source
-        self._total = 0
+    def __init__(self, category: str = TELEGRAM_SELF_UPLOAD, label: str = "") -> None:
+        self._category = category
+        self._label = label
+        self._active = enabled()
+        self._high = 0
         self._finished = False
 
-    async def __aiter__(self) -> AsyncIterator[bytes]:
-        async for chunk in self._stream:
-            if chunk:
-                self._total += len(chunk)
-            yield chunk
-        self._finish()
+    # The context manager owns the terminal outcome: no exception means the
+    # transfer succeeded; any exception (including cancellation) means it did
+    # not, and the operation is counted as failed.
+    def __enter__(self) -> "TelegramUploadTracker":
+        return self
 
-    async def aclose(self) -> None:
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        self._finish(exc_type is None)
+        return False
+
+    def callback(self, current: Any, total: Any = None) -> None:
+        """Telethon-compatible progress callback (cumulative bytes)."""
+        if not self._active:
+            return
         try:
-            close = getattr(self._stream, "aclose", None)
-            if close is not None:
-                await close()
-        finally:
-            self._finish()
+            value = int(current or 0)
+        except (TypeError, ValueError):
+            return
+        if value <= self._high:
+            # A restarted upload re-sends from zero.  The logical payload is
+            # already accounted, so the restart adds nothing.
+            return
+        delta = value - self._high
+        self._high = value
+        # Bytes only: the operation is counted ONCE, when the transfer ends.
+        _add(self._category, self._label, exact=delta)
 
-    def _finish(self) -> None:
-        if self._finished:
+    def wrap(self, inner: Optional[Callable[..., Any]]) -> Optional[Callable[..., Any]]:
+        """Compose with the caller's own callback without changing its behavior.
+
+        Returns ``inner`` unchanged when measurement is disabled, so a
+        disabled process adds no callback at all.
+        """
+        if not self._active:
+            return inner
+        if inner is None:
+            return self.callback
+
+        async def _both(current: Any, total: Any = None) -> None:
+            self.callback(current, total)
+            result = inner(current, total)
+            if inspect.isawaitable(result):
+                await result
+
+        return _both
+
+    def _finish(self, ok: bool) -> None:
+        if not self._active or self._finished:
             return
         self._finished = True
-        if self._total:
-            record_operation(self._source, self._total)
+        if not ok and self._high <= 0:
+            record_unmeasured(self._category, label=self._label, failed=1)
+            return
+        _add(self._category, self._label, operations=1, failed=0 if ok else 1)
+
+
+def telegram_upload(
+    category: str = TELEGRAM_SELF_UPLOAD, label: str = ""
+) -> TelegramUploadTracker:
+    """One tracker per logical upload."""
+    return TelegramUploadTracker(category, label)
+
+
+# ── Telegram downloads ─────────────────────────────────────────────────────
+
+def record_telegram_download(
+    payload: Any,
+    *,
+    label: str = "download",
+    failed: int = 0,
+    complete: bool = True,
+) -> None:
+    """Record one Telegram download payload as INBOUND, from a path or bytes.
+
+    Telegram sends the media to this service, so these bytes are not Render
+    egress and are never added to an outbound total.  The MTProto request and
+    acknowledgement egress remains unmeasured.  ``None``/an unavailable path
+    is unmeasured, never zero; a partially consumed download is marked
+    incomplete.  The caller invokes this once per logical download, so a
+    repeated download is a new inbound operation.
+    """
+    size: Optional[int] = None
+    try:
+        if isinstance(payload, (bytes, bytearray, memoryview)):
+            size = len(payload)
+        elif isinstance(payload, (str, os.PathLike)):
+            path = os.fspath(payload)
+            if path and os.path.isfile(path):
+                size = os.path.getsize(path)
+    except (OSError, TypeError, ValueError):
+        size = None
+    if size is None:
+        record_inbound_unmeasured(
+            TELEGRAM_DOWNLOAD,
+            label=label,
+            complete=False,
+            failed=failed,
+        )
+    else:
+        record_inbound(
+            TELEGRAM_DOWNLOAD,
+            size,
+            label=label,
+            complete=complete,
+            failed=failed,
+        )
+
+
+# ── HTTP request and response bodies ────────────────────────────────────────
+
+#: Per-request override key for a client shared by more than one category.
+_REQUEST_EXTENSION = "egress_attribution"
+
+
+def _body_size(request: Any) -> Optional[int]:
+    """The request body length httpx will send, or ``None`` when unknown.
+
+    ``Content-Length`` is exact and already computed by httpx for JSON, raw
+    bytes, form and multipart bodies; reading it never touches the body, so a
+    streamed upload is left intact.  A chunked/unknown-length body is
+    ``None`` (unmeasured), never an estimate.
+    """
+    raw = request.headers.get("content-length")
+    if raw is not None:
+        try:
+            size = int(raw)
+        except (TypeError, ValueError):
+            return None
+        return size if size >= 0 else None
+    if request.headers.get("transfer-encoding"):
+        return None
+    return 0
+
+
+def _target(request: Any, default_category: str, default_label: str) -> tuple[str, str]:
+    extensions = getattr(request, "extensions", None) or {}
+    override = extensions.get(_REQUEST_EXTENSION)
+    if isinstance(override, dict):
+        category = override.get("category") or default_category
+        label = override.get("label") or default_label
+        return category, label
+    return default_category, default_label
+
+
+def _on_request(request: Any, category: str, label: str) -> None:
+    try:
+        resolved_category, resolved_label = _target(request, category, label)
+        size = _body_size(request)
+        if size is None:
+            record_unmeasured(resolved_category, label=resolved_label)
         else:
-            # A closed-but-unconsumed stream is NOT a measured zero.
-            record_unmeasured(self._source)
+            record_exact(resolved_category, size, label=resolved_label)
+    except Exception:  # noqa: BLE001
+        record_measurement_failure()
 
 
 class _CountingSyncStream(httpx.SyncByteStream):
-    """Delegate a sync byte stream, counting what the CALLER consumes."""
+    """Count inbound bytes as a synchronous response stream is consumed."""
 
-    def __init__(self, stream: Any, source: str) -> None:
-        self._stream = stream
-        self._source = source
-        self._total = 0
-        self._finished = False
+    __slots__ = ("_inner", "_category", "_label", "_bytes", "_done")
 
-    def __iter__(self) -> Iterator[bytes]:
-        for chunk in self._stream:
-            if chunk:
-                self._total += len(chunk)
-            yield chunk
-        self._finish()
+    def __init__(self, inner: Any, category: str, label: str) -> None:
+        self._inner = inner
+        self._category = category
+        self._label = label
+        self._bytes = 0
+        self._done = False
+
+    def __iter__(self):
+        try:
+            for chunk in self._inner:
+                self._bytes += len(chunk)
+                yield chunk
+        except BaseException:
+            self._finish(False)
+            raise
+        else:
+            self._finish(True)
 
     def close(self) -> None:
-        try:
-            close = getattr(self._stream, "close", None)
-            if close is not None:
-                close()
-        finally:
-            self._finish()
+        self._finish(False)
+        close = getattr(self._inner, "close", None)
+        if callable(close):
+            close()
 
-    def _finish(self) -> None:
-        if self._finished:
+    def _finish(self, complete: bool) -> None:
+        if self._done:
             return
-        self._finished = True
-        if self._total:
-            record_operation(self._source, self._total)
+        self._done = True
+        record_inbound(
+            self._category, self._bytes, label=self._label, complete=complete
+        )
+
+
+class _CountingAsyncStream(httpx.AsyncByteStream):
+    """Count inbound bytes as an asynchronous response stream is consumed."""
+
+    __slots__ = ("_inner", "_category", "_label", "_bytes", "_done")
+
+    def __init__(self, inner: Any, category: str, label: str) -> None:
+        self._inner = inner
+        self._category = category
+        self._label = label
+        self._bytes = 0
+        self._done = False
+
+    def __aiter__(self):
+        return self._iterate()
+
+    async def _iterate(self):
+        try:
+            async for chunk in self._inner:
+                self._bytes += len(chunk)
+                yield chunk
+        except BaseException:
+            self._finish(False)
+            raise
         else:
-            record_unmeasured(self._source)
+            self._finish(True)
+
+    async def aclose(self) -> None:
+        self._finish(False)
+        aclose = getattr(self._inner, "aclose", None)
+        if callable(aclose):
+            await aclose()
+
+    def _finish(self, complete: bool) -> None:
+        if self._done:
+            return
+        self._done = True
+        record_inbound(
+            self._category, self._bytes, label=self._label, complete=complete
+        )
 
 
-def _attach_response(response: Any, source: str, *, is_async: bool) -> None:
+def _measure_response(response: Any, category: str, label: str) -> None:
+    """Measure response bytes as INBOUND; never consume a stream for it."""
     try:
-        if getattr(response, "is_stream_consumed", False):
-            try:
-                size = len(response.content)
-            except Exception:  # noqa: BLE001
-                record_unmeasured(source)
-                return
-            record_operation(source, size)
+        if getattr(response, "_egress_response_measured", False):
+            return
+        setattr(response, "_egress_response_measured", True)
+        resolved_category, resolved_label = _target(
+            response.request, category, label
+        )
+        content = getattr(response, "_content", None)
+        if getattr(response, "is_stream_consumed", False) or content is not None:
+            if isinstance(content, (bytes, bytearray, memoryview)):
+                record_inbound(
+                    resolved_category,
+                    len(content),
+                    label=resolved_label,
+                    complete=True,
+                )
+            else:
+                record_inbound_unmeasured(
+                    resolved_category, label=resolved_label, complete=False
+                )
             return
         stream = getattr(response, "stream", None)
         if stream is None:
-            record_unmeasured(source)
+            record_inbound_unmeasured(
+                resolved_category, label=resolved_label, complete=False
+            )
             return
-        if is_async and hasattr(stream, "__aiter__"):
-            response.stream = _CountingAsyncStream(stream, source)
-        elif not is_async and hasattr(stream, "__iter__"):
-            response.stream = _CountingSyncStream(stream, source)
+        if hasattr(stream, "__aiter__"):
+            response.stream = _CountingAsyncStream(
+                stream, resolved_category, resolved_label
+            )
         else:
-            record_unmeasured(source)
-    except Exception:  # noqa: BLE001
-        _note_failure()
+            response.stream = _CountingSyncStream(
+                stream, resolved_category, resolved_label
+            )
+    except Exception:  # noqa: BLE001 — never break the response
+        record_measurement_failure()
 
 
-async def _async_send(self: Any, request: Any, **kwargs: Any) -> Any:
-    source = classify_request(request)
-    size, exact = _request_body_size(request)
-    if exact and size:
-        _record_request_bytes(source, size)
-    elif not exact:
-        record_unmeasured(source)
+def _on_response(response: Any, category: str, label: str) -> None:
     try:
-        response = await _original_async_send(self, request, **kwargs)
-    except Exception:  # noqa: BLE001 — no response was received
-        record_unmeasured(source)
-        raise
-    _attach_response(response, source, is_async=True)
-    return response
-
-
-def _sync_send(self: Any, request: Any, **kwargs: Any) -> Any:
-    source = classify_request(request)
-    size, exact = _request_body_size(request)
-    if exact and size:
-        _record_request_bytes(source, size)
-    elif not exact:
-        record_unmeasured(source)
-    try:
-        response = _original_sync_send(self, request, **kwargs)
+        if response.status_code >= 400:
+            resolved_category, resolved_label = _target(
+                response.request, category, label
+            )
+            mark_failed(resolved_category, label=resolved_label)
+        _measure_response(response, category, label)
     except Exception:  # noqa: BLE001
-        record_unmeasured(source)
-        raise
-    _attach_response(response, source, is_async=False)
-    return response
+        record_measurement_failure()
 
 
-def install_httpx_instrumentation() -> bool:
-    """Install the ONE process-wide httpx hook (idempotent, enabled-only)."""
-    global _original_async_send, _original_sync_send, _installed
-    if _installed:
-        return True
+def async_event_hooks(category: str, label: str = "") -> Dict[str, list]:
+    """Request/response hooks for ``httpx.AsyncClient`` (async hooks)."""
     if not enabled():
-        return False
-    try:
-        import httpx
+        return {}
 
-        _original_async_send = httpx.AsyncClient.send
-        _original_sync_send = httpx.Client.send
-        httpx.AsyncClient.send = _async_send
-        httpx.Client.send = _sync_send
-        _installed = True
-        return True
-    except Exception:  # noqa: BLE001
-        _note_failure()
-        return False
+    async def _request_hook(request: Any) -> None:
+        _on_request(request, category, label)
+
+    async def _response_hook(response: Any) -> None:
+        _on_response(response, category, label)
+
+    return {"request": [_request_hook], "response": [_response_hook]}
 
 
-def uninstall_httpx_instrumentation() -> None:
-    """Restore httpx for tests; harmless when instrumentation is not installed."""
-    global _installed
-    if not _installed:
-        return
-    try:
-        import httpx
+def sync_event_hooks(category: str, label: str = "") -> Dict[str, list]:
+    """Request/response hooks for ``httpx.Client`` (synchronous hooks)."""
+    if not enabled():
+        return {}
 
-        httpx.AsyncClient.send = _original_async_send
-        httpx.Client.send = _original_sync_send
-    except Exception:  # noqa: BLE001
-        pass
-    finally:
-        _installed = False
+    def _request_hook(request: Any) -> None:
+        _on_request(request, category, label)
+
+    def _response_hook(response: Any) -> None:
+        _on_response(response, category, label)
+
+    return {"request": [_request_hook], "response": [_response_hook]}
 
 
-def reset_for_tests() -> None:
-    """Reset process-local counters (tests only; never called by the runtime)."""
-    global _interval_started, _last_flush, _failures_since_flush, _startup_logged
-    global _month_key, _estimated_bytes, _estimated_ops
-    with _lock:
-        _month_key = ""
-        _totals.clear()
-        _ops.clear()
-        _unmeasured_ops.clear()
-        _estimated_bytes = 0
-        _estimated_ops = 0
-        _interval_started = time.monotonic()
-        _last_flush = _interval_started
-        _failures_since_flush = 0
-        _startup_logged = False
+def async_client_kwargs(category: str, label: str = "") -> Dict[str, Any]:
+    """``httpx.AsyncClient(**kwargs)`` addition; empty when disabled."""
+    hooks = async_event_hooks(category, label)
+    return {"event_hooks": hooks} if hooks else {}
 
 
-@contextlib.contextmanager
-def source_scope(source: str):
-    """Label requests made inside this block with a known bounded source."""
-    if source not in _SOURCE_SET:
-        yield
-        return
-    token = _source_override.set(source)
-    try:
-        yield
-    finally:
-        _source_override.reset(token)
+def sync_client_kwargs(category: str, label: str = "") -> Dict[str, Any]:
+    """``httpx.Client(**kwargs)`` addition; empty when disabled."""
+    hooks = sync_event_hooks(category, label)
+    return {"event_hooks": hooks} if hooks else {}
+
+
+def request_category(category: str, label: str = "") -> Dict[str, Any]:
+    """Per-request category override for a client shared by two categories."""
+    if not enabled():
+        return {}
+    return {"extensions": {_REQUEST_EXTENSION: {"category": category, "label": label}}}

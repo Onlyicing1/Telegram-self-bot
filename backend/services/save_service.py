@@ -50,9 +50,7 @@ from backend.services import settings_service
 logger = logging.getLogger(__name__)
 
 
-async def _reserve_upload_bytes(
-    category: str, byte_count: int, *, action: str | None = None
-) -> None:
+async def _reserve_upload_bytes(category: str, byte_count: int) -> None:
     """Reserve outbound bytes BEFORE an upload transmits them (fail closed).
 
     Imported lazily and never guarded: a governor that cannot be imported has
@@ -60,7 +58,14 @@ async def _reserve_upload_bytes(
     """
     from backend.services import outbound_bandwidth_service as governor
 
-    await governor.reserve_outbound_bytes(category, byte_count, action=action)
+    await governor.reserve_outbound_bytes(category, byte_count)
+
+
+async def _ensure_media_policy(action: str, byte_count: int = 1) -> None:
+    """Apply the central staged policy before any download/upload work."""
+    from backend.services import outbound_bandwidth_service as governor
+
+    await governor.ensure_action_allowed(action, max(1, int(byte_count or 1)))
 
 _LINK_RE = re.compile(
     r"https?://(?:t|telegram)\.me/"
@@ -1508,6 +1513,19 @@ async def _deep_save_one(
         file_name = None
         file_id = None
         file_size = len(original_text.encode("utf-8"))
+    else:
+        from backend.services import outbound_bandwidth_service as _bw
+
+        try:
+            await _ensure_media_policy(
+                _bw.effective_media_action(_bw.ACTION_SINGLE_MEDIA),
+                file_size or 1,
+            )
+        except Exception as exc:  # noqa: BLE001 — policy denial is a save failure
+            return SaveOutcome(
+                f"{sym.STATE_FAILED} Deep Save refused by outbound policy: {exc}",
+                saved=False,
+            )
 
     logger.info(
         "[SAVE] owner=%s media=%s save_code=%s item=%s/%s file_name=%s mime=%s size=%s "
@@ -1591,6 +1609,7 @@ async def _deep_save_one(
                     download_kwargs["progress_callback"] = download_callback
                 await client.download_media(reply_msg, file=tmp_path, **download_kwargs)
                 record_event("save", "download_media", (asyncio.get_event_loop().time() - t0) * 1000, "SUCCESS")
+                egress.record_telegram_download(tmp_path, label="save_download")
             except asyncio.CancelledError:
                 if trace is not None:
                     trace.event(
@@ -1604,7 +1623,6 @@ async def _deep_save_one(
                 if trace is not None:
                     trace.failed("download", "download_media", exc)
                     trace.returned("deep_save", "_deep_save_one", save_trace.OUTCOME_FAILED)
-                egress.record_telegram_download(tmp_path)
                 return SaveOutcome(
                     f"{sym.STATE_FAILED} Deep Save failed: unable to download the source message ({exc})",
                     saved=False,
@@ -1636,7 +1654,6 @@ async def _deep_save_one(
                     f"{sym.STATE_FAILED} Deep Save failed: downloaded file is empty.",
                     saved=False,
                 )
-            egress.record_telegram_download(tmp_path)
 
             await _emit_progress(
                 progress,
@@ -1658,6 +1675,7 @@ async def _deep_save_one(
             upload_callback = _transfer_progress_callback(
                 progress, "upload", item_index, item_count, actual_size
             )
+            upload_egress = egress.telegram_upload("telegram_self_upload", "deep_save")
             if trace is not None:
                 trace.event(
                     "upload", save_trace.CALL_START, func="send_file",
@@ -1666,18 +1684,17 @@ async def _deep_save_one(
             try:
                 t1 = asyncio.get_event_loop().time()
                 upload_kwargs = _upload_kwargs_for_media(media, mime_type, file_name)
+                upload_callback = upload_egress.wrap(upload_callback)
                 if upload_callback is not None:
                     upload_kwargs["progress_callback"] = upload_callback
-                await _reserve_upload_bytes(
-                    "telegram_media", actual_size, action="interactive_media"
-                )
-                egress.record("telegram_upload", actual_size)
-                sent = await client.send_file(
-                    "me",
-                    tmp_path,
-                    caption=caption,
-                    **upload_kwargs,
-                )
+                await _reserve_upload_bytes("telegram_media", actual_size)
+                with upload_egress:
+                    sent = await client.send_file(
+                        "me",
+                        tmp_path,
+                        caption=caption,
+                        **upload_kwargs,
+                    )
                 record_event("save", "send_file", (asyncio.get_event_loop().time() - t1) * 1000, "SUCCESS")
             except asyncio.CancelledError:
                 if trace is not None:
@@ -1855,6 +1872,19 @@ async def _deep_save_album(
                 saved=False,
             )
 
+    from backend.services import outbound_bandwidth_service as _bw
+
+    try:
+        await _ensure_media_policy(
+            _bw.effective_media_action(_bw.ACTION_BULK_MEDIA), 1,
+        )
+    except Exception as exc:  # noqa: BLE001 — refuse the WHOLE album before transfer
+        return SaveOutcome(
+            f"{sym.STATE_FAILED} Album not saved: outbound policy refused this "
+            f"multi-item operation ({exc}). Nothing was added to Saved Messages.",
+            saved=False,
+        )
+
     save_code = await db_client.get_next_save_code()
     now = datetime.now(_get_tz(tz_str))
     sender_name, sender_id = await _resolve_sender(members[0])
@@ -1899,10 +1929,10 @@ async def _deep_save_album(
                     "save", "download_media",
                     (asyncio.get_event_loop().time() - t0) * 1000, "SUCCESS",
                 )
+                egress.record_telegram_download(tmp_path, label="album_download")
             except Exception as exc:  # noqa: BLE001 — honest per-file failure
                 logger.error("[SAVE] album download failed item=%d/%d: %s", index, total_items, exc)
                 record_event("save", "download_media", 0, "ERROR", str(exc))
-                egress.record_telegram_download(tmp_path)
                 return _album_failure(index, total_items, f"could not be downloaded ({exc})")
 
             if not os.path.exists(tmp_path):
@@ -1915,7 +1945,6 @@ async def _deep_save_album(
                     index, total_items,
                     f"is {member_size / (1024 * 1024):.1f} MB — over the {limit_mb} MB limit",
                 )
-            egress.record_telegram_download(tmp_path)
 
             await _emit_progress(
                 progress,
@@ -1937,16 +1966,16 @@ async def _deep_save_album(
             upload_callback = _transfer_progress_callback(
                 progress, "upload", index, total_items, member_size
             )
+            upload_egress = egress.telegram_upload("telegram_self_upload", "album_member")
             try:
                 t1 = asyncio.get_event_loop().time()
-                upload_kwargs = {"progress_callback": upload_callback} if upload_callback else {}
+                progress_cb = upload_egress.wrap(upload_callback)
+                upload_kwargs = {"progress_callback": progress_cb} if progress_cb else {}
                 # Each member is a REAL byte transfer here.  The grouped send
                 # below only attaches these already-uploaded handles.
-                await _reserve_upload_bytes(
-                    "telegram_media", member_size, action="album_media"
-                )
-                egress.record("telegram_upload", member_size)
-                handle = await client.upload_file(tmp_path, **upload_kwargs)
+                await _reserve_upload_bytes("telegram_media", member_size)
+                with upload_egress:
+                    handle = await client.upload_file(tmp_path, **upload_kwargs)
                 record_event(
                     "save", "upload_file",
                     (asyncio.get_event_loop().time() - t1) * 1000, "SUCCESS",

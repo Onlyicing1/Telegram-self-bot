@@ -57,6 +57,7 @@ import time
 
 import httpx
 
+from backend.observability import egress_attribution as egress
 from backend.services.tts_service import (
     FAILURE_AUTH,
     FAILURE_DEADLINE,
@@ -549,7 +550,10 @@ class GeminiSpeechEngine:
         }
         started = time.monotonic()
         try:
-            async with httpx.AsyncClient(timeout=_request_timeout(left)) as client:
+            async with httpx.AsyncClient(
+                timeout=_request_timeout(left),
+                **egress.async_client_kwargs("tts_provider", "gemini"),
+            ) as client:
                 response = await client.post(
                     self.endpoint, headers=headers, json=payload,
                 )

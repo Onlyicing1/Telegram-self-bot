@@ -181,12 +181,11 @@ class RuntimeSupervisor:
         mark_started()
 
         # Bandwidth observability is installed before the first settings read
-        # or provider client.  Both operations are idempotent and never raise.
+        # or provider client.  This operation is idempotent and never raises.
         try:
             from backend.observability import egress_attribution as egress
 
             egress.log_startup()
-            egress.install_httpx_instrumentation()
         except Exception:  # noqa: BLE001
             pass
 
@@ -1139,7 +1138,7 @@ class RuntimeSupervisor:
             from backend.observability import egress_attribution as egress
             from backend.services import outbound_bandwidth_service as governor
 
-            egress.flush(policy=governor.get_policy_snapshot_sync())
+            egress.shutdown(policy=governor.get_policy_snapshot())
         except Exception:  # noqa: BLE001
             pass
 

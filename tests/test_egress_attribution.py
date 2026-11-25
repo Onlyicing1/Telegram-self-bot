@@ -1,386 +1,721 @@
-"""Egress attribution — bounded counters, lifecycle flushing, HTTP seams.
+"""Focused tests for the opt-in outbound egress attribution layer.
 
-Covers the real defects this instrumentation must not repeat:
-
-  * no unbounded label dimension (unknown sources are refused);
-  * no per-request logging and no sensitive value in an aggregate line;
-  * enabled/disabled/idle/partial/failure states are distinguishable;
-  * exact and estimated bytes stay separate;
-  * inbound Telegram downloads never enter outbound reconciliation;
-  * request bodies, non-streaming responses and CONSUMED streaming responses
-    are measured; an unconsumed stream is unmeasured, never a fake zero.
+Everything here is offline: no Telegram, Supabase or provider request is made.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+import pathlib
+import threading
 import time
-from datetime import datetime, timezone
 
 import httpx
 import pytest
 
 from backend.observability import egress_attribution as egress
 
-UTC = timezone.utc
-NOW = datetime(2026, 11, 23, 12, 0, tzinfo=UTC)
-
 
 @pytest.fixture(autouse=True)
-def _clean(monkeypatch):
-    monkeypatch.setenv(egress.ENV_FLAG, "1")
-    egress.reset_for_tests()
-    egress.uninstall_httpx_instrumentation()
+def _clean_state(monkeypatch):
+    monkeypatch.delenv(egress.ENV_FLAG, raising=False)
+    egress.reset()
     yield
-    egress.uninstall_httpx_instrumentation()
-    egress.reset_for_tests()
+    egress.reset()
 
 
-# ── 1. closed vocabulary / disabled ──
+def _enable(monkeypatch) -> None:
+    monkeypatch.setenv(egress.ENV_FLAG, "1")
 
 
-def test_unknown_source_is_refused_and_never_becomes_a_label():
-    assert egress.record("https://example.test/?token=SECRET", 10) is False
-    assert egress.record_unmeasured("filename.pdf") is False
-    assert egress.snapshot()["sources"] == {}
+def _totals() -> dict:
+    return egress.snapshot()["totals"]
 
 
-def test_disabled_attribution_records_nothing(monkeypatch):
-    monkeypatch.delenv(egress.ENV_FLAG, raising=False)
+# ── opt-in flag ─────────────────────────────────────────────────────────────
+
+
+def test_measurement_is_disabled_by_default():
     assert egress.enabled() is False
-    assert egress.record("telegram_upload", 10) is False
-    assert egress.install_httpx_instrumentation() is False
-    snap = egress.snapshot(now=NOW)
-    assert snap["status"] == "disabled"
-    assert snap["enabled"] is False
-    assert snap["measured_bytes"] == 0
 
+    egress.record_exact("ai_provider", 100, label="openai")
+    egress.record_unmeasured("stt_provider", label="groq")
+    egress.record_estimated("tts_provider", 50, label="gemini")
 
-def test_zero_length_operation_is_not_a_byte_measurement():
-    assert egress.record("telegram_upload", 0) is False
-    assert egress.record_operation("supabase_rest", 0) is True
-    source = egress.snapshot()["sources"]["supabase_rest"]
-    assert source == {"bytes": 0, "ops": 1, "unmeasured_ops": 0}
-
-
-# ── 2. states / exactness / rollover ──
-
-
-def test_enabled_with_no_activity_is_idle():
-    assert egress.snapshot()["status"] == "enabled_idle"
-    assert egress.snapshot()["coverage"] == "unknown"
-
-
-def test_enabled_with_activity_is_recording_and_complete():
-    egress.record("telegram_upload", 100)
-    snap = egress.snapshot()
-    assert snap["status"] == "enabled_recording"
-    assert snap["coverage"] == "complete"
-    assert snap["measured_outbound_bytes"] == 100
-
-
-def test_estimated_bytes_are_kept_separate():
-    egress.record("telegram_upload", 100)
-    egress.record("telegram_upload", 50, estimated=True)
-    snap = egress.snapshot()
-    assert snap["measured_bytes"] == 150
-    assert snap["estimated_bytes"] == 50
-
-
-def test_measurement_failure_is_a_distinct_state(monkeypatch):
-    def _boom(*args, **kwargs):
-        raise RuntimeError("boom")
-
-    monkeypatch.setattr(egress, "_positive_int", _boom)
-    assert egress.record("telegram_upload", 10) is False
-    assert egress.snapshot()["status"] == "measurement_failure"
-
-
-def test_unmeasured_operation_makes_coverage_partial():
-    egress.record("telegram_upload", 10)
-    egress.record_unmeasured("telegram_transport")
-    snap = egress.snapshot()
-    assert snap["coverage"] == "partial"
-    assert snap["unmeasured_operations"] == 1
-
-
-def test_month_rollover_resets_bounded_counters():
-    egress.record("telegram_upload", 100)
-    december = datetime(2026, 12, 2, 0, 0, tzinfo=UTC)
-    snap = egress.snapshot(now=december)
-    assert snap["month"] == "2026-12"
-    assert snap["measured_bytes"] == 0
-
-
-# ── 3. flush / startup / shutdown ──
-
-
-def test_flush_emits_one_bounded_summary_and_resets_the_interval(caplog):
-    caplog.set_level(logging.INFO, logger="backend.observability.egress_attribution")
-    egress.record("telegram_upload", 1000)
-    egress.record("telegram_download", 2000)
-    assert egress.flush(now=NOW) is True
-    text = caplog.text
-    assert "EGRESS_ATTRIBUTION_SUMMARY" in text
-    assert "status=enabled_recording" in text
-    assert "measured_outbound_bytes=1000" in text
-    assert "measured_inbound_bytes=2000" in text
-    assert "telegram_upload:1000/1/u0" in text
-    assert "sources=none" not in text
-    # Counters stay month-to-date; only the interval marker resets.
-    assert egress.snapshot()["measured_bytes"] == 3000
-    assert egress.flush_due() is False
-
-
-def test_flush_due_is_time_based(monkeypatch):
-    assert egress.flush_due() is False
-    monkeypatch.setattr(egress, "_last_flush", time.monotonic() - 10_000)
-    assert egress.flush_due() is True
-
-
-def test_startup_confirmation_is_sanitized_and_once(caplog):
-    caplog.set_level(logging.INFO, logger="backend.observability.egress_attribution")
-    egress.log_startup()
-    egress.log_startup()
-    lines = [line for line in caplog.text.splitlines() if "EGRESS_ATTRIBUTION_STARTUP" in line]
-    assert len(lines) == 1
-    assert "status=enabled" in lines[0]
-    assert "wire_overhead=false" in lines[0]
-
-
-def test_startup_reports_disabled(monkeypatch, caplog):
-    monkeypatch.delenv(egress.ENV_FLAG, raising=False)
-    caplog.set_level(logging.INFO, logger="backend.observability.egress_attribution")
-    egress.log_startup()
-    assert "EGRESS_ATTRIBUTION_STARTUP status=disabled" in caplog.text
-
-
-def test_reconciliation_line_compares_render_and_measured(caplog):
-    caplog.set_level(logging.INFO, logger="backend.observability.egress_attribution")
-    egress.record("telegram_upload", 400)
-    egress.flush(
-        policy={
-            "render_bytes": 1000,
-            "render_trusted": False,
-            "render_coverage": "partial",
-        }
-    )
-    assert "EGRESS_RECONCILIATION" in caplog.text
-    assert "render_outbound_bytes=1000" in caplog.text
-    assert "measured_outbound_bytes=400" in caplog.text
-    assert "unattributed_difference=600" in caplog.text
-    assert "difference_is_not_attribution=true" in caplog.text
-
-
-def test_policy_line_carries_bounded_fields_only(caplog):
-    caplog.set_level(logging.INFO, logger="backend.observability.egress_attribution")
-    egress.flush(
-        policy={
-            "month": "2026-11",
-            "tier": 3,
-            "effective_bytes": 2_800_000_000,
-            "available": True,
-            "denials": "scheduled_media:2",
-        }
-    )
-    assert "BANDWIDTH_POLICY_SNAPSHOT" in caplog.text
-    assert "tier=3" in caplog.text
-    assert "denials=scheduled_media:2" in caplog.text
-
-
-# ── 4. reconciliation ──
-
-
-def test_reconciliation_separates_inbound_and_labels_the_difference():
-    egress.record("telegram_upload", 100)
-    egress.record("telegram_download", 500)
-    egress.record("ai_provider", 50, estimated=True)
-    result = egress.reconciliation(1000, render_trusted=False, render_coverage="partial")
-    assert result["measured_outbound_bytes"] == 150
-    assert result["measured_inbound_bytes"] == 500
-    assert result["estimated_bytes"] == 50
-    assert result["unattributed_difference"] == 850
-    assert result["difference_is_not_attribution"] is True
-
-
-def test_reconciliation_without_a_render_metric_has_no_difference():
-    egress.record("telegram_upload", 100)
-    assert egress.reconciliation(None)["unattributed_difference"] is None
-
-
-# ── 5. Telegram download boundary ──
-
-
-def test_repeated_downloads_of_the_same_payload_are_each_counted(tmp_path):
-    path = tmp_path / "media.bin"
-    path.write_bytes(b"x" * 10)
-    egress.record_telegram_download(str(path))
-    egress.record_telegram_download(str(path))
-    assert egress.snapshot()["sources"]["telegram_download"]["ops"] == 2
-    assert egress.snapshot()["sources"]["telegram_download"]["bytes"] == 20
-
-
-def test_download_path_is_measured_once(tmp_path):
-    path = tmp_path / "media.bin"
-    path.write_bytes(b"x" * 321)
-    assert egress.record_telegram_download(str(path)) is True
-    assert egress.snapshot()["sources"]["telegram_download"] == {
-        "bytes": 321, "ops": 1, "unmeasured_ops": 0,
+    assert _totals() == {
+        "exact_payload_bytes": 0,
+        "estimated_payload_bytes": 0,
+        "exact_inbound_bytes": 0,
+        "operation_count": 0,
+        "inbound_operation_count": 0,
+        "failed_operation_count": 0,
+        "unmeasured_operations": 0,
+        "unmeasured_inbound_operations": 0,
+        "incomplete_inbound_streams": 0,
     }
 
 
-def test_missing_download_path_is_unmeasured_not_zero():
-    assert egress.record_telegram_download("/nonexistent/file.bin") is True
-    snap = egress.snapshot()["sources"]["telegram_download"]
-    assert snap["bytes"] == 0
-    assert snap["unmeasured_ops"] == 1
+@pytest.mark.parametrize("value", ["", "0", "true", "TRUE", "yes", "on", " 1", "1 ", "2"])
+def test_only_exactly_one_enables_measurement(monkeypatch, value):
+    monkeypatch.setenv(egress.ENV_FLAG, value)
+
+    assert egress.enabled() is False
+    assert egress.async_client_kwargs("ai_provider", "openai") == {}
+    assert egress.sync_client_kwargs("supabase_rest", "postgrest") == {}
+    assert egress.request_category("ai_discovery", "gemini") == {}
 
 
-# ── 6. HTTP: request/response/streaming ──
+def test_exactly_one_enables_measurement(monkeypatch):
+    _enable(monkeypatch)
+
+    assert egress.enabled() is True
+    assert egress.async_client_kwargs("ai_provider", "openai")
 
 
-def _client(handler) -> httpx.AsyncClient:
-    assert egress.install_httpx_instrumentation() is True
-    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+# ── aggregation, flush interval, reset ──────────────────────────────────────
+
+
+def test_aggregation_flushes_at_most_once_per_interval(monkeypatch, caplog):
+    _enable(monkeypatch)
+    caplog.set_level(logging.INFO, logger=egress.__name__)
+
+    egress.record_exact("ai_provider", 100, label="openai")
+    egress.record_exact("ai_provider", 100, label="openai")
+
+    # Inside the interval: no summary yet, counters keep aggregating.
+    assert [r for r in caplog.records if "[RENDER_EGRESS]" in r.getMessage()] == []
+    assert _totals()["exact_payload_bytes"] == 200
+
+    # Push the window past the interval; the NEXT recorded event flushes.
+    egress._last_flush = time.monotonic() - (egress.FLUSH_INTERVAL_SECONDS + 1)
+    egress.record_exact("ai_provider", 50, label="openai")
+
+    lines = [r.getMessage() for r in caplog.records if "[RENDER_EGRESS]" in r.getMessage()]
+    assert len(lines) == 2  # one category/label line + one totals line
+    assert "category=ai_provider" in lines[0]
+    assert "label=openai" in lines[0]
+    assert "exact_payload_bytes=250" in lines[0]
+    assert "operation_count=3" in lines[0]
+    assert "totals" in lines[1]
+    assert "note=application_payload_only_not_render_bandwidth" in lines[1]
+
+    # The window was reset by the flush.
+    assert _totals()["exact_payload_bytes"] == 0
+
+
+def test_no_summary_is_emitted_without_activity(monkeypatch, caplog):
+    _enable(monkeypatch)
+    caplog.set_level(logging.INFO, logger=egress.__name__)
+    egress._last_flush = time.monotonic() - (egress.FLUSH_INTERVAL_SECONDS + 1)
+
+    assert egress.flush() is True
+
+    assert [r for r in caplog.records if "[RENDER_EGRESS]" in r.getMessage()] == []
+
+
+def test_one_line_per_category_and_label_not_per_operation(monkeypatch, caplog):
+    _enable(monkeypatch)
+    caplog.set_level(logging.INFO, logger=egress.__name__)
+
+    for _ in range(100):
+        egress.record_exact("telegram_self_upload", 10, label="deep_save")
+
+    assert egress.flush() is True
+
+    lines = [r.getMessage() for r in caplog.records if "[RENDER_EGRESS]" in r.getMessage()]
+    assert len(lines) == 2
+    assert "exact_payload_bytes=1000" in lines[0]
+    assert "operation_count=100" in lines[0]
+
+
+def test_snapshot_is_process_scoped_and_does_not_reset(monkeypatch):
+    _enable(monkeypatch)
+    egress.record_exact("supabase_rest", 7, label="postgrest")
+
+    first = egress.snapshot()
+    second = egress.snapshot()
+
+    assert first["counters_scope"] == "process"
+    assert first["flush_interval_seconds"] == 300.0
+    assert first["window_started_utc"].endswith("Z")
+    assert first["captured_at_utc"].endswith("Z")
+    assert first["categories"]["supabase_rest"]["postgrest"]["exact_payload_bytes"] == 7
+    assert second["totals"]["exact_payload_bytes"] == 7
+
+
+def test_counters_reset_on_demand(monkeypatch):
+    _enable(monkeypatch)
+    egress.record_exact("render_api", 3, label="render")
+
+    egress.reset()
+
+    assert _totals()["exact_payload_bytes"] == 0
+    assert _totals()["operation_count"] == 0
+
+
+def test_counter_updates_are_thread_safe(monkeypatch):
+    _enable(monkeypatch)
+    workers = 8
+    per_worker = 200
+
+    def _work():
+        for _ in range(per_worker):
+            egress.record_exact("telegram_self_upload", 10, label="deep_save")
+
+    threads = [threading.Thread(target=_work) for _ in range(workers)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    totals = _totals()
+    assert totals["exact_payload_bytes"] == workers * per_worker * 10
+    assert totals["operation_count"] == workers * per_worker
+
+
+def test_cardinality_is_bounded_by_a_closed_label_vocabulary(monkeypatch):
+    _enable(monkeypatch)
+
+    egress.record_exact(
+        "ai_provider", 5, label="https://api.example.com/v1?key=SECRET-CHAT-ID-42"
+    )
+    egress.record_exact("ai_provider", 5, label="../../etc/passwd")
+    egress.record_exact("not_a_category", 5, label="openai")
+
+    categories = egress.snapshot()["categories"]
+    assert set(categories) == {"ai_provider", "other_known_http"}
+    assert set(categories["ai_provider"]) == {"other"}
+    assert set(categories["other_known_http"]) == {"openai"}
+
+
+# ── Telegram uploads ────────────────────────────────────────────────────────
+
+
+def test_cumulative_progress_is_counted_once(monkeypatch):
+    _enable(monkeypatch)
+    tracker = egress.telegram_upload("telegram_self_upload", "deep_save")
+
+    with tracker:
+        tracker.callback(100, 300)
+        tracker.callback(200, 300)
+        tracker.callback(300, 300)
+
+    bucket = egress.snapshot()["categories"]["telegram_self_upload"]["deep_save"]
+    assert bucket["exact_payload_bytes"] == 300
+    assert bucket["operation_count"] == 1
+    assert bucket["failed_operation_count"] == 0
+
+
+def test_a_restarted_upload_is_not_double_counted(monkeypatch):
+    _enable(monkeypatch)
+    tracker = egress.telegram_upload("telegram_self_upload", "deep_save")
+
+    with tracker:
+        tracker.callback(100, 300)
+        tracker.callback(200, 300)
+        tracker.callback(50, 300)   # Telethon restarted the upload from zero
+        tracker.callback(300, 300)
+
+    bucket = egress.snapshot()["categories"]["telegram_self_upload"]["deep_save"]
+    assert bucket["exact_payload_bytes"] == 300
+    assert bucket["operation_count"] == 1
+
+
+def test_a_failed_upload_keeps_its_bytes_and_is_marked_failed(monkeypatch):
+    _enable(monkeypatch)
+    tracker = egress.telegram_upload("telegram_self_upload", "album_member")
+
+    with pytest.raises(RuntimeError):
+        with tracker:
+            tracker.callback(120, 1000)
+            raise RuntimeError("upload failed")
+
+    bucket = egress.snapshot()["categories"]["telegram_self_upload"]["album_member"]
+    assert bucket["exact_payload_bytes"] == 120
+    assert bucket["operation_count"] == 1
+    assert bucket["failed_operation_count"] == 1
+
+
+def test_a_cancelled_upload_is_marked_failed(monkeypatch):
+    _enable(monkeypatch)
+    tracker = egress.telegram_upload("telegram_self_upload", "voice")
+
+    with pytest.raises(asyncio.CancelledError):
+        with tracker:
+            tracker.callback(64, 128)
+            raise asyncio.CancelledError()
+
+    bucket = egress.snapshot()["categories"]["telegram_self_upload"]["voice"]
+    assert bucket["exact_payload_bytes"] == 64
+    assert bucket["failed_operation_count"] == 1
+
+
+def test_an_attempt_without_progress_is_unmeasured(monkeypatch):
+    _enable(monkeypatch)
+    tracker = egress.telegram_upload("telegram_self_upload", "rename_reupload")
+
+    with pytest.raises(OSError):
+        with tracker:
+            raise OSError("never started")
+
+    bucket = egress.snapshot()["categories"]["telegram_self_upload"]["rename_reupload"]
+    assert bucket["exact_payload_bytes"] == 0
+    assert bucket["unmeasured_operations"] == 1
+    assert bucket["failed_operation_count"] == 1
 
 
 @pytest.mark.asyncio
-async def test_non_streaming_response_body_is_measured():
-    async def handler(request):
-        return httpx.Response(200, content=b"r" * 100)
+async def test_the_tracker_composes_with_the_callers_own_callback(monkeypatch):
+    _enable(monkeypatch)
+    seen = []
 
-    async with _client(handler) as client:
-        await client.get("https://unknown.example.test/data")
-    source = egress.snapshot()["sources"]["other_http"]
-    assert source == {"bytes": 100, "ops": 1, "unmeasured_ops": 0}
+    async def inner(current, total=None):
+        seen.append((current, total))
 
+    tracker = egress.telegram_upload("telegram_self_upload", "deep_save")
+    combined = tracker.wrap(inner)
 
-@pytest.mark.asyncio
-async def test_request_body_and_response_body_are_both_measured():
-    async def handler(request):
-        return httpx.Response(200, content=b"r" * 40)
+    await combined(10, 10)
 
-    async with _client(handler) as client:
-        await client.post("https://unknown.example.test/upload", content=b"q" * 60)
-    source = egress.snapshot()["sources"]["other_http"]
-    assert source["bytes"] == 100
-    assert source["ops"] == 1
+    assert seen == [(10, 10)]
+    assert egress.snapshot()["categories"]["telegram_self_upload"]["deep_save"][
+        "exact_payload_bytes"
+    ] == 10
 
 
-@pytest.mark.asyncio
-async def test_streaming_response_is_counted_only_as_the_caller_consumes_it():
-    async def handler(request):
-        async def body():
-            yield b"a" * 10
-            yield b"b" * 20
+def test_disabled_tracking_returns_the_caller_callback_untouched():
+    async def inner(current, total=None):
+        return None
 
-        return httpx.Response(200, content=body())
+    tracker = egress.telegram_upload("telegram_self_upload", "voice")
 
-    async with _client(handler) as client:
-        async with client.stream("GET", "https://unknown.example.test/stream") as response:
-            assert egress.snapshot()["sources"].get("other_http", {}).get("bytes", 0) == 0
-            chunks = [chunk async for chunk in response.aiter_bytes()]
-    assert b"".join(chunks) == b"a" * 10 + b"b" * 20
-    source = egress.snapshot()["sources"]["other_http"]
-    assert source["bytes"] == 30
-    assert source["ops"] == 1
+    assert tracker.wrap(inner) is inner
+    assert tracker.wrap(None) is None
+
+
+# ── HTTP request bodies ─────────────────────────────────────────────────────
+
+
+def _async_transport(handler):
+    return httpx.MockTransport(handler)
 
 
 @pytest.mark.asyncio
-async def test_unconsumed_stream_is_unmeasured_never_a_fake_zero():
-    async def handler(request):
-        async def body():
-            yield b"a" * 10
+async def test_provider_request_body_is_measured_exactly(monkeypatch):
+    _enable(monkeypatch)
+    sent = {}
 
-        return httpx.Response(200, content=body())
+    def handler(request):
+        sent["body"] = request.content
+        return httpx.Response(200, json={"ok": True})
 
-    async with _client(handler) as client:
-        async with client.stream("GET", "https://unknown.example.test/stream"):
-            pass
-    source = egress.snapshot()["sources"]["other_http"]
-    assert source["bytes"] == 0
-    assert source["unmeasured_ops"] == 1
+    async with httpx.AsyncClient(
+        transport=_async_transport(handler),
+        **egress.async_client_kwargs("ai_provider", "openai"),
+    ) as client:
+        await client.post("https://provider.test/chat/completions", json={"a": 1})
 
-
-@pytest.mark.asyncio
-async def test_failed_request_counts_the_sent_body_and_no_response():
-    async def handler(request):
-        raise httpx.ConnectError("nope", request=request)
-
-    async with _client(handler) as client:
-        with pytest.raises(httpx.ConnectError):
-            await client.post("https://unknown.example.test/x", content=b"q" * 25)
-    source = egress.snapshot()["sources"]["other_http"]
-    assert source["bytes"] == 25
-    assert source["unmeasured_ops"] == 1
+    bucket = egress.snapshot()["categories"]["ai_provider"]["openai"]
+    assert sent["body"] == b'{"a": 1}'
+    assert bucket["exact_payload_bytes"] == len(sent["body"])
+    assert bucket["operation_count"] == 1
 
 
 @pytest.mark.asyncio
-async def test_classification_is_by_bounded_source_never_the_url(monkeypatch):
-    monkeypatch.setenv("SUPABASE_URL", "https://db.example.test")
+async def test_response_bytes_are_never_counted_as_outbound(monkeypatch):
+    _enable(monkeypatch)
 
-    async def handler(request):
-        return httpx.Response(200, content=b"x" * 5)
+    def handler(request):
+        return httpx.Response(200, content=b"x" * 500_000)
 
-    async with _client(handler) as client:
-        await client.get("https://db.example.test/rest/v1/saved_items?select=*")
-        await client.get("https://db.example.test/storage/v1/object/bucket/key")
-        await client.get("https://api.openai.com/v1/chat/completions")
-        await client.get("https://api.openai.com/v1/audio/transcriptions")
-        await client.get("https://ydc-index.io/v1/search")
-        await client.get("https://api.render.com/v1/metrics/bandwidth")
-    sources = egress.snapshot()["sources"]
-    assert sources["supabase_rest"]["bytes"] == 5
-    assert sources["supabase_storage"]["bytes"] == 5
-    assert sources["ai_provider"]["bytes"] == 5
-    assert sources["stt_provider"]["bytes"] == 5
-    assert sources["ai_search"]["bytes"] == 5
-    assert sources["render_api"]["bytes"] == 5
+    async with httpx.AsyncClient(
+        transport=_async_transport(handler),
+        **egress.async_client_kwargs("ai_provider", "gemini"),
+    ) as client:
+        response = await client.post("https://provider.test/generate", json={"a": 1})
+
+    bucket = egress.snapshot()["categories"]["ai_provider"]["gemini"]
+    assert len(response.content) == 500_000
+    assert bucket["exact_payload_bytes"] == 8
+    assert bucket["operation_count"] == 1
 
 
 @pytest.mark.asyncio
-async def test_unknown_length_request_body_is_unmeasured_never_zero():
-    async def handler(request):
-        return httpx.Response(200, content=b"ok")
+async def test_multipart_upload_body_length_is_measured(monkeypatch):
+    _enable(monkeypatch)
+    lengths = []
 
-    async def body():
-        yield b"a" * 10
+    def handler(request):
+        lengths.append(int(request.headers["content-length"]))
+        return httpx.Response(200, json={"ok": True})
 
-    async with _client(handler) as client:
-        await client.post("https://unknown.example.test/x", content=body())
-    source = egress.snapshot()["sources"]["other_http"]
-    assert source["unmeasured_ops"] == 1
-    assert source["bytes"] == 2
+    async with httpx.AsyncClient(
+        transport=_async_transport(handler),
+        **egress.async_client_kwargs("stt_provider", "groq"),
+    ) as client:
+        await client.post(
+            "https://provider.test/transcribe",
+            files={"file": ("audio.ogg", b"0123456789", "audio/ogg")},
+        )
 
-
-@pytest.mark.asyncio
-async def test_repeated_operations_are_counted_separately():
-    async def handler(request):
-        return httpx.Response(200, content=b"r" * 10)
-
-    async with _client(handler) as client:
-        await client.get("https://unknown.example.test/a")
-        await client.get("https://unknown.example.test/a")
-    source = egress.snapshot()["sources"]["other_http"]
-    assert source == {"bytes": 20, "ops": 2, "unmeasured_ops": 0}
+    bucket = egress.snapshot()["categories"]["stt_provider"]["groq"]
+    assert bucket["exact_payload_bytes"] == lengths[0]
+    assert bucket["unmeasured_operations"] == 0
 
 
 @pytest.mark.asyncio
-async def test_no_sensitive_value_reaches_a_log_line(caplog):
-    caplog.set_level(logging.INFO, logger="backend.observability.egress_attribution")
+async def test_a_streamed_request_body_is_preserved_and_reported_unmeasured(monkeypatch):
+    _enable(monkeypatch)
+    received = {}
 
-    async def handler(request):
-        return httpx.Response(200, content=b"SECRET-BODY")
+    class _Transport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            chunks = [chunk async for chunk in request.stream]
+            received["body"] = b"".join(chunks)
+            return httpx.Response(200, json={"ok": True})
 
-    async with _client(handler) as client:
-        await client.get("https://unknown.example.test/path?token=SECRET-TOKEN")
-    egress.flush()
-    assert "SECRET-TOKEN" not in caplog.text
-    assert "SECRET-BODY" not in caplog.text
-    assert "unknown.example.test" not in caplog.text
+    async def _body():
+        yield b"abc"
+        yield b"def"
+
+    async with httpx.AsyncClient(
+        transport=_Transport(),
+        **egress.async_client_kwargs("ai_provider", "openai"),
+    ) as client:
+        await client.post("https://provider.test/stream", content=_body())
+
+    bucket = egress.snapshot()["categories"]["ai_provider"]["openai"]
+    assert received["body"] == b"abcdef"
+    assert bucket["exact_payload_bytes"] == 0
+    assert bucket["unmeasured_operations"] == 1
+    assert bucket["operation_count"] == 1
 
 
-def test_instrumentation_is_idempotent_and_uninstallable():
-    assert egress.install_httpx_instrumentation() is True
-    assert egress.install_httpx_instrumentation() is True
-    egress.uninstall_httpx_instrumentation()
-    egress.uninstall_httpx_instrumentation()
+@pytest.mark.asyncio
+async def test_an_error_response_marks_the_operation_failed(monkeypatch):
+    _enable(monkeypatch)
+
+    def handler(request):
+        return httpx.Response(500, json={"error": "boom"})
+
+    async with httpx.AsyncClient(
+        transport=_async_transport(handler),
+        **egress.async_client_kwargs("ai_provider", "openai"),
+    ) as client:
+        await client.post("https://provider.test/chat", json={"a": 1})
+
+    bucket = egress.snapshot()["categories"]["ai_provider"]["openai"]
+    assert bucket["failed_operation_count"] == 1
+    assert bucket["operation_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_shared_client_can_override_its_category_per_request(monkeypatch):
+    _enable(monkeypatch)
+
+    def handler(request):
+        return httpx.Response(200, json={"data": []})
+
+    async with httpx.AsyncClient(
+        transport=_async_transport(handler),
+        **egress.async_client_kwargs("ai_provider", "openai"),
+    ) as client:
+        await client.post("https://provider.test/chat", json={"a": 1})
+        await client.get(
+            "https://provider.test/models",
+            **egress.request_category("ai_discovery", "openai"),
+        )
+
+    categories = egress.snapshot()["categories"]
+    assert categories["ai_provider"]["openai"]["exact_payload_bytes"] == 8
+    assert categories["ai_discovery"]["openai"]["exact_payload_bytes"] == 0
+    assert categories["ai_discovery"]["openai"]["operation_count"] == 1
+
+
+def test_supabase_postgrest_session_is_http1_with_the_egress_hooks(monkeypatch):
+    from backend.db.transport import HTTP1PostgrestClient, HTTP1Session
+
+    _enable(monkeypatch)
+    client = HTTP1PostgrestClient("http://localhost:54321", schema="public")
+    session = client.session
+
+    assert isinstance(session, HTTP1Session)
+    assert session._event_hooks["request"]
+
+    measured = {}
+
+    def handler(request):
+        measured["body"] = request.content
+        return httpx.Response(201, json=[])
+
+    session._transport = httpx.MockTransport(handler)
+    session.post("/rest/v1/saved_items", json={"a": 1})
+
+    bucket = egress.snapshot()["categories"]["supabase_rest"]["postgrest"]
+    assert measured["body"] == b'{"a": 1}'
+    assert bucket["exact_payload_bytes"] == 8
+    assert bucket["operation_count"] == 1
+
+
+def test_supabase_postgrest_session_has_no_hooks_when_disabled():
+    from backend.db.transport import HTTP1PostgrestClient
+
+    client = HTTP1PostgrestClient("http://localhost:54321", schema="public")
+
+    assert client.session._event_hooks["request"] == []
+
+
+# ── no behavior change, no lifecycle, no leakage ───────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_disabled_instrumentation_changes_nothing_about_the_request():
+    def handler(request):
+        return httpx.Response(200, json={"ok": True})
+
+    kwargs = egress.async_client_kwargs("ai_provider", "openai")
+    assert kwargs == {}
+
+    async with httpx.AsyncClient(transport=_async_transport(handler), **kwargs) as client:
+        response = await client.post("https://provider.test/chat", json={"a": 1})
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+    assert _totals()["operation_count"] == 0
+
+
+def test_no_background_task_or_persistence_is_created():
+    source = pathlib.Path(egress.__file__).read_text(encoding="utf-8").lower()
+
+    for forbidden in (
+        "asyncio",
+        "create_task",
+        "ensure_future",
+        "call_later",
+        "call_at",
+        "threading.thread",
+        "sqlite",
+    ):
+        assert forbidden not in source
+
+
+def test_no_secret_or_user_content_reaches_a_log_line(monkeypatch, caplog):
+    _enable(monkeypatch)
+    caplog.set_level(logging.INFO, logger=egress.__name__)
+
+    egress.record_exact("ai_provider", 12, label="Bearer sk-live-SECRET-TOKEN")
+    egress.record_exact("telegram_self_upload", 34, label="chat-123456789")
+    assert egress.flush() is True
+
+    text = caplog.text
+    assert "SECRET" not in text
+    assert "chat-123456789" not in text
+    assert "Bearer" not in text
+    assert text.count("label=other") == 2
+
+
+# ── downloads, inbound responses, lifecycle, month reconciliation ──────────
+
+
+def test_telegram_download_path_and_bytes_are_counted_once(monkeypatch, tmp_path):
+    _enable(monkeypatch)
+    payload = tmp_path / "media.bin"
+    payload.write_bytes(b"x" * 123)
+
+    egress.record_telegram_download(payload, label="save_download")
+    egress.record_telegram_download(b"abcde", label="download")
+
+    bucket = egress.snapshot()["categories"][egress.TELEGRAM_DOWNLOAD]
+    assert bucket["save_download"]["exact_inbound_bytes"] == 123
+    assert bucket["save_download"]["inbound_operation_count"] == 1
+    assert bucket["save_download"]["exact_payload_bytes"] == 0
+    assert bucket["download"]["exact_inbound_bytes"] == 5
+
+
+def test_a_missing_download_is_unmeasured_not_zero(monkeypatch):
+    _enable(monkeypatch)
+
+    egress.record_telegram_download(
+        "/definitely/not/a/file", label="download", failed=1
+    )
+
+    bucket = egress.snapshot()["categories"][egress.TELEGRAM_DOWNLOAD]["download"]
+    assert bucket["exact_inbound_bytes"] == 0
+    assert bucket["unmeasured_inbound_operations"] == 1
+    assert bucket["incomplete_inbound_streams"] == 1
+    assert bucket["failed_operation_count"] == 1
+
+
+def test_a_repeated_download_is_a_new_operation(monkeypatch):
+    _enable(monkeypatch)
+
+    egress.record_telegram_download(b"12345", label="download")
+    egress.record_telegram_download(b"12345", label="download")
+
+    bucket = egress.snapshot()["categories"][egress.TELEGRAM_DOWNLOAD]["download"]
+    assert bucket["exact_inbound_bytes"] == 10
+    assert bucket["inbound_operation_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_response_body_is_counted_as_inbound_not_outbound(monkeypatch):
+    _enable(monkeypatch)
+
+    def handler(request):
+        return httpx.Response(200, content=b"y" * 500_000)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        **egress.async_client_kwargs("ai_provider", "gemini"),
+    ) as client:
+        await client.post("https://provider.test/generate", json={"a": 1})
+
+    bucket = egress.snapshot()["categories"]["ai_provider"]["gemini"]
+    assert bucket["exact_payload_bytes"] == 8
+    assert bucket["exact_inbound_bytes"] == 500_000
+    assert bucket["inbound_operation_count"] == 1
+    assert bucket["incomplete_inbound_streams"] == 0
+
+
+class _ChunkedAsyncStream(httpx.AsyncByteStream):
+    async def __aiter__(self):
+        yield b"abc"
+        yield b"def"
+
+
+class _StreamingTransport(httpx.AsyncBaseTransport):
+    async def handle_async_request(self, request):
+        return httpx.Response(200, stream=_ChunkedAsyncStream())
+
+
+@pytest.mark.asyncio
+async def test_a_consumed_stream_is_measured_without_being_buffered(monkeypatch):
+    _enable(monkeypatch)
+
+    async with httpx.AsyncClient(
+        transport=_StreamingTransport(),
+        **egress.async_client_kwargs("ai_provider", "openai"),
+    ) as client:
+        async with client.stream("GET", "https://provider.test/stream") as response:
+            body = b"".join([chunk async for chunk in response.aiter_bytes()])
+
+    bucket = egress.snapshot()["categories"]["ai_provider"]["openai"]
+    assert body == b"abcdef"
+    assert bucket["exact_inbound_bytes"] == 6
+    assert bucket["incomplete_inbound_streams"] == 0
+
+
+@pytest.mark.asyncio
+async def test_an_early_closed_stream_records_only_consumed_bytes(monkeypatch):
+    _enable(monkeypatch)
+
+    async with httpx.AsyncClient(
+        transport=_StreamingTransport(),
+        **egress.async_client_kwargs("ai_provider", "openai"),
+    ) as client:
+        async with client.stream("GET", "https://provider.test/stream") as response:
+            iterator = response.aiter_bytes()
+            assert await iterator.__anext__() == b"abc"
+
+    bucket = egress.snapshot()["categories"]["ai_provider"]["openai"]
+    assert bucket["exact_inbound_bytes"] == 3
+    assert bucket["incomplete_inbound_streams"] == 1
+
+
+def test_month_totals_survive_a_window_flush(monkeypatch):
+    _enable(monkeypatch)
+
+    egress.record_exact("telegram_self_upload", 10, label="deep_save")
+    assert egress.flush() is True
+
+    snapshot = egress.snapshot()
+    assert snapshot["totals"]["exact_payload_bytes"] == 0
+    assert snapshot["month_totals"]["exact_payload_bytes"] == 10
+    assert snapshot["month"] == egress._month_period
+
+
+def test_idle_heartbeat_emits_one_bounded_status(monkeypatch, caplog):
+    _enable(monkeypatch)
+    caplog.set_level(logging.INFO, logger=egress.__name__)
+    egress._last_status = time.monotonic() - (egress.STATUS_INTERVAL_SECONDS + 1)
+
+    assert egress.heartbeat_tick() is True
+    assert egress.heartbeat_tick() is False
+
+    lines = [r.getMessage() for r in caplog.records if "[RENDER_EGRESS]" in r.getMessage()]
+    assert len(lines) == 1
+    assert "status=enabled_no_activity" in lines[0]
+    assert "scope=process" in lines[0]
+
+
+def test_heartbeat_flushes_activity_with_the_policy_snapshot(monkeypatch, caplog):
+    _enable(monkeypatch)
+    caplog.set_level(logging.INFO, logger=egress.__name__)
+    egress.record_exact("ai_provider", 42, label="openai")
+    egress._last_flush = time.monotonic() - (egress.FLUSH_INTERVAL_SECONDS + 1)
+
+    assert egress.heartbeat_tick({"tier": 50, "trusted": True}) is True
+
+    text = caplog.text
+    assert "category=ai_provider" in text
+    assert "policy_tier=50" in text
+    assert "policy_trusted=true" in text
+
+
+def test_startup_and_shutdown_logs_are_sanitized(monkeypatch, caplog):
+    caplog.set_level(logging.INFO, logger=egress.__name__)
+
+    egress.log_startup()
+    assert "startup enabled=false status=disabled" in caplog.text
+
+    _enable(monkeypatch)
+    egress.log_startup()
+    assert "startup enabled=true status=recording" in caplog.text
+
+    egress.record_exact("render_api", 3, label="render")
+    assert egress.shutdown() is True
+    assert "shutdown flushed=true" in caplog.text
+
+
+def test_snapshot_distinguishes_the_measurement_states(monkeypatch):
+    _enable(monkeypatch)
+    assert egress.snapshot()["status"] == "enabled_no_activity"
+
+    egress.record_exact("telegram_download", 5, label="download")
+    assert egress.snapshot()["status"] == "recording"
+
+    egress.reset()
+    _enable(monkeypatch)
+    egress.record_unmeasured("telegram_download", label="download")
+    assert egress.snapshot()["status"] == "measurement_incomplete"
+
+    egress.reset()
+    _enable(monkeypatch)
+    egress.record_measurement_failure()
+    assert egress.snapshot()["status"] == "measurement_failure"
+
+
+def test_flush_reports_month_reconciliation_without_claiming_a_cause(
+    monkeypatch, caplog
+):
+    _enable(monkeypatch)
+    caplog.set_level(logging.INFO, logger=egress.__name__)
+    egress.record_exact("telegram_self_upload", 100, label="deep_save")
+
+    assert egress.flush({
+        "render_monthly_bytes": 250,
+        "governor_monthly_bytes": 80,
+        "policy_floor_bytes": 0,
+        "tier": 0,
+        "trusted": True,
+        "render_partial": False,
+    }) is True
+
+    text = caplog.text
+    assert "render_monthly_bytes=250" in text
+    assert "governor_monthly_bytes=80" in text
+    assert "month_exact_payload_bytes=100" in text
+    assert "unattributed_difference_bytes=150" in text
+    assert "policy_tier=0" in text
+    assert "policy_trusted=true" in text
+    assert "render_partial=false" in text

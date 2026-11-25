@@ -47,6 +47,7 @@ import zlib
 from typing import Any
 
 from backend.helper import symbols as sym
+from backend.observability import egress_attribution as egress
 from backend.services import settings_service
 
 logger = logging.getLogger(__name__)
@@ -1078,14 +1079,22 @@ def _upload_sync(key: str, data: bytes, mime: str) -> None:
     """
     from backend.services import outbound_bandwidth_service as governor
 
-    governor.reserve_outbound_bytes_sync(
-        "storage_upload", len(data), action="storage_upload"
-    )
-    response = _db().storage.from_(bucket()).upload(
-        key, data, {"content-type": mime, "upsert": "false"}
-    )
+    governor.reserve_outbound_bytes_sync("storage_upload", len(data))
+    try:
+        response = _db().storage.from_(bucket()).upload(
+            key, data, {"content-type": mime, "upsert": "false"}
+        )
+    except BaseException:
+        egress.record_exact(
+            "supabase_storage", len(data), label="storage_upload", failed=1
+        )
+        raise
     status = getattr(response, "status_code", None)
-    if isinstance(status, int) and status >= 400:
+    refused = isinstance(status, int) and status >= 400
+    egress.record_exact(
+        "supabase_storage", len(data), label="storage_upload", failed=1 if refused else 0
+    )
+    if refused:
         raise RuntimeError(f"storage upload refused ({status})")
 
 
@@ -1337,6 +1346,9 @@ async def install_image(data: bytes, declared_mime: str = "") -> tuple[bool, str
 
         key = f"{IMAGES_PREFIX}/{uuid.uuid4().hex}.{_MIME_EXT[mime]}"
         try:
+            from backend.services import outbound_bandwidth_service as _bw
+
+            await _bw.ensure_action_allowed(_bw.ACTION_STORAGE_UPLOAD, len(data))
             await asyncio.to_thread(_upload_sync, key, data, mime)
         except asyncio.CancelledError:
             raise

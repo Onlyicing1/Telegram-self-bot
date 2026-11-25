@@ -122,6 +122,14 @@ async def main() -> None:
         except (NotImplementedError, RuntimeError):
             pass
 
+    # Temporary Tier 0 measurement: one bounded read-only Render metrics request
+    # per process startup, disabled unless its dedicated flag is exactly "1".
+    try:
+        from backend.services.render_bandwidth_sources_diagnostic import run_if_enabled
+        await run_if_enabled()
+    except Exception as exc:  # noqa: BLE001 — a diagnostic must never block startup
+        logger.warning("Bandwidth sources diagnostic skipped (%s)", type(exc).__name__)
+
     supervisor = RuntimeSupervisor(cfg)
     supervisor_placeholder[0] = supervisor
 

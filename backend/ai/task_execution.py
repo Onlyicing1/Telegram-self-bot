@@ -12,7 +12,6 @@ from typing import Any
 import re
 
 from backend.ai.database.task_repository import OccurrenceRecord, TaskRepository
-from backend.services import outbound_bandwidth_service as bandwidth_governor
 from backend.ai.task_contract import (
     ACTION_RUNS_KEY,
     ANSWER_FIELD,
@@ -587,8 +586,13 @@ class TaskExecutionCoordinator:
                 owner_match=occurrence.owner_id == self.owner_id,
                 action_count=len(occurrence.action_snapshot or []),
             )
+            from backend.services.outbound_bandwidth_service import automatic_media_scope
+
             try:
-                result = await self._execute_occurrence(occurrence, now=now)
+                # A claimed scheduled occurrence is automatic media egress:
+                # the 50% policy tier must never depend on which tool it chose.
+                with automatic_media_scope():
+                    result = await self._execute_occurrence(occurrence, now=now)
             except asyncio.CancelledError:
                 occurrence_trace("execution_cancelled", category="cancelled")
                 raise
@@ -1176,13 +1180,12 @@ class TaskExecutionCoordinator:
                     "action_started", position=position, action=name,
                     action_kind="question",
                 )
-                with bandwidth_governor.scheduled_media_scope():
-                    result = (await self.executor.execute_calls(
-                        [{"name": name, "arguments": resolved}],
-                        owner_id=self.owner_id,
-                        session_id=f"task:{occurrence.task_id}:{occurrence.occurrence_key}",
-                        context_override=execution_context,
-                    ))[0]
+                result = (await self.executor.execute_calls(
+                    [{"name": name, "arguments": resolved}],
+                    owner_id=self.owner_id,
+                    session_id=f"task:{occurrence.task_id}:{occurrence.occurrence_key}",
+                    context_override=execution_context,
+                ))[0]
                 results.append(result)
                 occurrence_trace(
                     "action_result", position=position, action=name,
@@ -1250,13 +1253,12 @@ class TaskExecutionCoordinator:
             state[position] = build_action_run(position, name, "running")
             await self._persist_runs(occurrence, state)
             occurrence_trace("action_started", position=position, action=name)
-            with bandwidth_governor.scheduled_media_scope():
-                result = (await self.executor.execute_calls(
-                    [{"name": name, "arguments": resolved}],
-                    owner_id=self.owner_id,
-                    session_id=f"task:{occurrence.task_id}:{occurrence.occurrence_key}",
-                    context_override=execution_context,
-                ))[0]
+            result = (await self.executor.execute_calls(
+                [{"name": name, "arguments": resolved}],
+                owner_id=self.owner_id,
+                session_id=f"task:{occurrence.task_id}:{occurrence.occurrence_key}",
+                context_override=execution_context,
+            ))[0]
             results.append(result)
             occurrence_trace(
                 "action_result", position=position, action=name,

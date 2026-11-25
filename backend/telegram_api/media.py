@@ -88,9 +88,6 @@ async def download_media(
 
     if result is None:
         return None
-    if isinstance(result, str) and os.path.exists(result):
-        egress.record_telegram_download(result)
-        return result
     egress.record_telegram_download(result)
     return result
 
@@ -120,9 +117,7 @@ async def _reserve_voice_bytes(byte_count: int) -> None:
             "send_voice refused: outbound bandwidth accounting is unavailable"
         ) from exc
     try:
-        await governor.reserve_outbound_bytes(
-            "telegram_media", byte_count, action="voice"
-        )
+        await governor.reserve_outbound_bytes("telegram_media", byte_count)
     except Exception as exc:  # noqa: BLE001 — exceeded/unavailable both deny
         raise TelegramAPIError(f"send_voice refused: {exc}") from exc
 
@@ -150,21 +145,35 @@ async def send_voice(
     """
     if not isinstance(audio, (bytes, bytearray)) or not audio:
         raise TelegramAPIError("send_voice needs audio bytes; nothing was sent.")
-    await _reserve_voice_bytes(len(audio))
-    egress.record("telegram_upload", len(audio))
-    effective = _effective_upload_timeout(timeout)
     try:
-        message = await guarded_await(
-            client.send_file(
-                chat_id,
-                io.BytesIO(bytes(audio)),
-                voice_note=True,
-                force_document=False,
-                mime_type=mime_type,
-            ),
-            name="telegram:send_voice",
-            timeout=effective,
+        from backend.services import outbound_bandwidth_service as _bw
+
+        await _bw.ensure_action_allowed(
+            _bw.effective_media_action(_bw.ACTION_SINGLE_MEDIA), len(audio),
         )
+    except Exception as exc:  # noqa: BLE001 — policy denial refuses the RPC
+        raise TelegramAPIError(f"send_voice refused: {exc}") from exc
+    await _reserve_voice_bytes(len(audio))
+    effective = _effective_upload_timeout(timeout)
+    upload_egress = egress.telegram_upload("telegram_self_upload", "voice")
+    upload_kwargs: dict[str, Any] = {}
+    progress_cb = upload_egress.wrap(None)
+    if progress_cb is not None:
+        upload_kwargs["progress_callback"] = progress_cb
+    try:
+        with upload_egress:
+            message = await guarded_await(
+                client.send_file(
+                    chat_id,
+                    io.BytesIO(bytes(audio)),
+                    voice_note=True,
+                    force_document=False,
+                    mime_type=mime_type,
+                    **upload_kwargs,
+                ),
+                name="telegram:send_voice",
+                timeout=effective,
+            )
     except asyncio.TimeoutError:
         logger.error(
             "TELEGRAM_VOICE_TIMEOUT timeout=%.1fs — voice note was not sent in time",

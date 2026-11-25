@@ -72,6 +72,7 @@ import time
 
 import httpx
 
+from backend.observability import egress_attribution as egress
 from backend.services import media_service
 from backend.services.gemini_media_engine import STT_MAX_PASSES
 from backend.services.media_service import MediaError
@@ -554,6 +555,18 @@ class GroqWhisperEngine:
         """
         if not audio:
             return ""
+        from backend.services import outbound_bandwidth_service as _bw
+
+        try:
+            _bw.ensure_action_allowed_sync(_bw.ACTION_PROVIDER_MEDIA, len(audio))
+            _bw.reserve_outbound_bytes_sync("stt_upload", len(audio))
+        except Exception as exc:  # noqa: BLE001 — refuse before any provider upload
+            self._last_failure_class = "bandwidth_restricted"
+            self._log_run(len(audio), 0, 0.0, failed=True)
+            raise _error(
+                f"Outbound bandwidth policy refused {PROVIDER_NAME} transcription: {exc}",
+                FAILURE_TRANSPORT,
+            ) from exc
         container = container_for(audio)
         if container is None:
             error = _error(
@@ -699,7 +712,10 @@ class GroqWhisperEngine:
         would be cross-request mutable state — the ``__slots__`` contract is
         exactly that this engine holds none.
         """
-        return httpx.Client(timeout=timeout)
+        return httpx.Client(
+            timeout=timeout,
+            **egress.sync_client_kwargs("stt_provider", "groq"),
+        )
 
     # ── Observability (bounded, never payload/credential/Telegram metadata) ──
 
