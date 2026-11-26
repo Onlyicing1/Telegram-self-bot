@@ -298,3 +298,32 @@ def test_the_gemini_provider_upload_is_denied_at_seventy_percent(monkeypatch):
 
     with pytest.raises(bw.OutboundBandwidthPolicyError):
         gemini._reserve_gemini_bandwidth("gemini_ocr", 1000)
+
+
+# ── the 4 GB hard limit reaches the real payload seams ────────────────────
+#
+# These use the production seam functions (not a private helper) and the real
+# governor decision, with only the Render observation installed at the target.
+
+
+@pytest.mark.asyncio
+async def test_a_voice_note_is_not_sent_at_the_monthly_hard_limit(monkeypatch):
+    _policy_at(monkeypatch, 4_000_000_000)
+    client = RecordingClient()
+
+    with pytest.raises(media_api.TelegramAPIError):
+        await media_api.send_voice(client, 777, b"a" * 4096)
+
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_the_deep_save_upload_seam_refuses_at_the_monthly_hard_limit(
+    monkeypatch,
+):
+    from backend.services import save_service
+
+    _policy_at(monkeypatch, 4_000_000_000)
+
+    with pytest.raises(bw.OutboundBandwidthHardLimitError):
+        await save_service._reserve_upload_bytes("telegram_media", 1)

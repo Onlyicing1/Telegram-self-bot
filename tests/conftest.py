@@ -154,6 +154,9 @@ def _policy_snapshot_for_synchronous_tests(monkeypatch):
         "monthly_period": current[:7],
         "latest_data_at": current,
         "checked_at": current,
+        "render_partial": False,
+        "measurement_status": "trusted",
+        "measurement_detail": "",
     })
 
 

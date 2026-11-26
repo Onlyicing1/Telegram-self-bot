@@ -5,8 +5,16 @@ staged monthly policy. It does not attempt to measure all Render outbound
 traffic; it accounts only for the explicit payload paths that call
 :func:`reserve_outbound_bytes` before transmission (Gemini OCR/STT, Telegram
 outbound media including Deep Save, voice notes, AI result attachments,
-file-name re-uploads and Storage uploads), and evaluates the policy against the
-higher of Render's service-scoped monthly egress and that local ledger.
+file-name re-uploads and Storage uploads), and evaluates the staged policy
+against the higher of Render's service-scoped monthly egress and that local
+ledger.
+
+The 4 GB monthly protection target is enforced separately from the staged
+policy tiers: the staged scale stops at 90%, while an explicit hard-limit
+decision refuses governed non-text payloads at or above the target and when a
+proposed reservation would reach it. That decision consumes the best available
+effective month (Render, governor ledger or persisted floor, never their sum)
+and fails closed when the measurement is missing, stale or partial.
 
 Accounting state lives in the ``panel_settings.outbound_bandwidth_state``
 JSONB column (one dedicated column on the existing singleton row) and is
@@ -50,6 +58,31 @@ logger = logging.getLogger(__name__)
 DAILY_LIMIT_BYTES: int = 150_000_000
 MONTHLY_LIMIT_BYTES: int = 4_000_000_000
 MONTHLY_TARGET_BYTES: int = 4_000_000_000
+
+#: Independent monthly egress stop. The staged policy tops out at 90%; this
+#: value is the actual 4 GB protection target and is evaluated against the best
+#: available effective monthly measurement, never against the tier alone.
+MONTHLY_HARD_LIMIT_BYTES: int = MONTHLY_TARGET_BYTES
+
+#: Structured, content-free hard-limit refusal reasons. Callers can branch on
+#: ``OutboundBandwidthHardLimitError.reason_code``.
+REFUSAL_MONTHLY_HARD_LIMIT = "monthly_egress_hard_limit_reached"
+REFUSAL_MEASUREMENT_UNAVAILABLE = "monthly_egress_measurement_unavailable"
+REFUSAL_MEASUREMENT_UNTRUSTED = "monthly_egress_measurement_untrusted"
+REFUSAL_MEASUREMENT_PARTIAL = "monthly_egress_measurement_partial"
+REFUSAL_RESERVATION_WOULD_EXCEED = "monthly_egress_reservation_would_exceed_limit"
+
+#: The only accepted values of ``snapshot["measurement_status"]``.
+_MEASUREMENT_TRUSTED = "trusted"
+_MEASUREMENT_PARTIAL = "partial"
+_MEASUREMENT_UNAVAILABLE = "unavailable"
+_MEASUREMENT_UNTRUSTED = "untrusted"
+_MEASUREMENT_STATUSES = (
+    _MEASUREMENT_TRUSTED,
+    _MEASUREMENT_PARTIAL,
+    _MEASUREMENT_UNAVAILABLE,
+    _MEASUREMENT_UNTRUSTED,
+)
 
 # Staged monthly policy. These are cumulative: a higher tier never re-enables
 # an action denied by a lower one.
@@ -211,6 +244,40 @@ class OutboundBandwidthPolicyError(OutboundBandwidthError, RuntimeError):
 # Alternate names for callers that classify the failure as a policy refusal.
 BandwidthPolicyError = OutboundBandwidthPolicyError
 OutboundPolicyError = OutboundBandwidthPolicyError
+
+
+class OutboundBandwidthHardLimitError(OutboundBandwidthPolicyError):
+    """The independent monthly egress hard limit refused a payload action.
+
+    It remains a policy-class error so existing callers keep their bounded
+    refusal path, but its type and ``reason_code`` distinguish it from an
+    ordinary staged-tier refusal.
+    """
+
+    def __init__(
+        self,
+        action: str,
+        tier: int,
+        effective_monthly_bytes: int,
+        *,
+        reason_code: str,
+        detail: str = "",
+        reserved_bytes: Optional[int] = None,
+    ) -> None:
+        self.reason_code = str(reason_code)
+        self.reserved_bytes = (
+            None if reserved_bytes is None else int(reserved_bytes)
+        )
+        self.hard_limit_bytes = MONTHLY_HARD_LIMIT_BYTES
+        super().__init__(
+            action,
+            tier,
+            effective_monthly_bytes,
+            reason=detail or self.reason_code,
+        )
+
+
+BandwidthHardLimitError = OutboundBandwidthHardLimitError
 
 
 def _utc_now(now: Optional[datetime] = None) -> datetime:
@@ -410,6 +477,8 @@ def _policy_untrusted(reason: str, *, tier: int = 0, effective: int = 0) -> Dict
         "policy_floor_bytes": None,
         "checked_at": None,
         "monthly_period": None,
+        "measurement_status": _MEASUREMENT_UNAVAILABLE,
+        "measurement_detail": reason,
     }
 
 
@@ -468,6 +537,108 @@ def _policy_tier(effective: int) -> int:
         if effective >= POLICY_THRESHOLD_BYTES[pct]:
             tier = pct
     return tier
+
+
+def _measurement_status(snapshot: Dict[str, Any]) -> str:
+    """The snapshot's explicit measurement status, with a safe legacy fallback.
+
+    Older snapshots (and focused test doubles) carry only ``trusted``; a
+    trusted one is treated as complete, an untrusted one as unavailable. New
+    snapshots always carry the explicit field.
+    """
+    status = snapshot.get("measurement_status")
+    if isinstance(status, str) and status in _MEASUREMENT_STATUSES:
+        return status
+    if snapshot.get("trusted") is not True:
+        return _MEASUREMENT_UNAVAILABLE
+    return (
+        _MEASUREMENT_PARTIAL
+        if snapshot.get("render_partial") is True
+        else _MEASUREMENT_TRUSTED
+    )
+
+
+def _log_hard_limit_refusal(
+    reason_code: str, action: str, effective: int, reserved: int,
+) -> None:
+    """One bounded, content-free line; no payload, file, chat or credential."""
+    logger.warning(
+        "OUTBOUND_MONTHLY_HARD_LIMIT_DENIED reason=%s action=%s effective=%d "
+        "reserved=%d limit=%d",
+        reason_code, action, effective, reserved, MONTHLY_HARD_LIMIT_BYTES,
+    )
+
+
+def _assert_monthly_hard_limit(
+    snapshot: Dict[str, Any],
+    action: str,
+    byte_count: int,
+    *,
+    governor_monthly_bytes: Optional[int] = None,
+) -> None:
+    """The independent 4 GB stop, evaluated BEFORE the staged tier policy.
+
+    ``effective_monthly_bytes`` is already ``max(Render, governor, floor)`` and
+    the live governor month is folded in with ``max`` as well. Values are never
+    summed, so a byte counted by both Render and the ledger cannot be counted
+    twice. The proposed reservation is not yet part of any measurement, so it
+    is the only value added.
+
+    A ledger month at or above the target is refused even when the Render
+    observation is unavailable: the local accounting alone proves the target
+    was reached. Otherwise an unavailable, untrusted or partial measurement
+    refuses non-text payloads rather than being read as zero.
+    """
+    if action == ACTION_TEXT:
+        return
+    limit = MONTHLY_HARD_LIMIT_BYTES
+    tier = int(snapshot.get("tier") or 0)
+    effective = int(snapshot.get("effective_monthly_bytes") or 0)
+    reserved = max(0, int(byte_count))
+    live = None if governor_monthly_bytes is None else int(governor_monthly_bytes)
+    baseline = effective if live is None else max(effective, live)
+    status = _measurement_status(snapshot)
+
+    if baseline >= limit:
+        _log_hard_limit_refusal(
+            REFUSAL_MONTHLY_HARD_LIMIT, action, baseline, reserved
+        )
+        raise OutboundBandwidthHardLimitError(
+            action, tier, baseline,
+            reason_code=REFUSAL_MONTHLY_HARD_LIMIT,
+            detail="the effective monthly egress reached the 4 GB hard limit.",
+            reserved_bytes=reserved,
+        )
+
+    if status != _MEASUREMENT_TRUSTED:
+        code = {
+            _MEASUREMENT_PARTIAL: REFUSAL_MEASUREMENT_PARTIAL,
+            _MEASUREMENT_UNTRUSTED: REFUSAL_MEASUREMENT_UNTRUSTED,
+            _MEASUREMENT_UNAVAILABLE: REFUSAL_MEASUREMENT_UNAVAILABLE,
+        }[status]
+        detail = str(
+            snapshot.get("measurement_detail")
+            or snapshot.get("detail")
+            or "the monthly egress measurement is not trustworthy."
+        )
+        _log_hard_limit_refusal(code, action, baseline, reserved)
+        raise OutboundBandwidthHardLimitError(
+            action, tier, baseline,
+            reason_code=code,
+            detail=detail,
+            reserved_bytes=reserved,
+        )
+
+    if baseline + reserved >= limit:
+        _log_hard_limit_refusal(
+            REFUSAL_RESERVATION_WOULD_EXCEED, action, baseline, reserved
+        )
+        raise OutboundBandwidthHardLimitError(
+            action, tier, baseline,
+            reason_code=REFUSAL_RESERVATION_WOULD_EXCEED,
+            detail="the proposed reservation would reach the 4 GB hard limit.",
+            reserved_bytes=reserved,
+        )
 
 
 def _record_policy_floor(
@@ -599,6 +770,35 @@ async def refresh_policy_snapshot(
                 trusted = False
                 reason = reason or "policy floor could not be persisted."
 
+        if not governor_available:
+            measurement_status = _MEASUREMENT_UNAVAILABLE
+            measurement_detail = str(
+                governor.get("detail") or "accounting state is unavailable."
+            )
+        elif not trusted:
+            # A validated-but-untrusted Render observation (bad shape, another
+            # month, future/stale timestamp) is distinct from an unavailable
+            # one (no key, HTTP failure, no datapoints).
+            render_reported = (
+                isinstance(render, dict) and render.get("available") is True
+            )
+            measurement_status = (
+                _MEASUREMENT_UNTRUSTED if render_reported
+                else _MEASUREMENT_UNAVAILABLE
+            )
+            measurement_detail = (
+                reason or "the monthly egress measurement is not trustworthy."
+            )
+        elif partial:
+            measurement_status = _MEASUREMENT_PARTIAL
+            measurement_detail = (
+                "Render monthly coverage is partial; the month total cannot "
+                "be established."
+            )
+        else:
+            measurement_status = _MEASUREMENT_TRUSTED
+            measurement_detail = ""
+
         snapshot = {
             "trusted": trusted,
             "state": "available" if trusted else "unavailable",
@@ -610,6 +810,8 @@ async def refresh_policy_snapshot(
             "render_available": bool(render_trusted),
             "render_latest_data_at": (render or {}).get("latest_data_at") if isinstance(render, dict) else None,
             "render_partial": bool(partial),
+            "measurement_status": measurement_status,
+            "measurement_detail": measurement_detail,
             "policy_floor_bytes": floor,
             "checked_at": current.isoformat(),
             "monthly_period": current.strftime("%Y-%m"),
@@ -639,6 +841,8 @@ def get_policy_snapshot(now: Optional[datetime] = None) -> Dict[str, Any]:
         stale["trusted"] = False
         stale["state"] = "unavailable"
         stale["detail"] = "policy snapshot is stale; waiting for a bounded refresh."
+        stale["measurement_status"] = _MEASUREMENT_UNAVAILABLE
+        stale["measurement_detail"] = stale["detail"]
         return stale
     return _policy_untrusted("policy snapshot has not been refreshed.")
 
@@ -720,12 +924,19 @@ async def ensure_action_allowed(
     byte_count: int = 1,
     *,
     now: Optional[datetime] = None,
+    governor_monthly_bytes: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Refresh if needed and enforce the staged policy for one action."""
+    """Refresh if needed and enforce the hard limit, then the staged policy."""
     action = classify_outbound_action(action, action)
     if action == ACTION_TEXT and 0 < int(byte_count) <= TEXT_EXEMPT_MAX_BYTES:
         return get_policy_snapshot(now=now)
     snapshot = await refresh_policy_snapshot(now=now)
+    _assert_monthly_hard_limit(
+        snapshot,
+        action,
+        int(byte_count),
+        governor_monthly_bytes=governor_monthly_bytes,
+    )
     _assert_policy_allows(snapshot, action, int(byte_count))
     return snapshot
 
@@ -735,12 +946,19 @@ def ensure_action_allowed_sync(
     byte_count: int = 1,
     *,
     now: Optional[datetime] = None,
+    governor_monthly_bytes: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Enforce the SAME snapshot from a worker thread without starting a loop."""
+    """Enforce the SAME hard limit and snapshot without starting a loop."""
     action = classify_outbound_action(action, action)
     if action == ACTION_TEXT and 0 < int(byte_count) <= TEXT_EXEMPT_MAX_BYTES:
         return get_policy_snapshot(now=now)
     snapshot = get_policy_snapshot(now=now)
+    _assert_monthly_hard_limit(
+        snapshot,
+        action,
+        int(byte_count),
+        governor_monthly_bytes=governor_monthly_bytes,
+    )
     _assert_policy_allows(snapshot, action, int(byte_count))
     return snapshot
 
@@ -783,6 +1001,29 @@ def _reserve_locked(
                 )
                 raise OutboundBandwidthExceededError(
                     "monthly", monthly_used, byte_count, MONTHLY_LIMIT_BYTES
+                )
+
+            # The ledger is the last line of defence: exactly reaching the
+            # protection target is a refusal, not an accepted reservation.
+            # Text reservations keep their existing exemption.
+            action = classify_outbound_action(category)
+            if (
+                action != ACTION_TEXT
+                and monthly_used + byte_count >= MONTHLY_HARD_LIMIT_BYTES
+            ):
+                _log_hard_limit_refusal(
+                    REFUSAL_RESERVATION_WOULD_EXCEED,
+                    action,
+                    monthly_used,
+                    byte_count,
+                )
+                raise OutboundBandwidthHardLimitError(
+                    action,
+                    _policy_tier(monthly_used),
+                    monthly_used,
+                    reason_code=REFUSAL_RESERVATION_WOULD_EXCEED,
+                    detail="the proposed reservation would reach the 4 GB hard limit.",
+                    reserved_bytes=byte_count,
                 )
 
             new_daily = daily_used + byte_count
@@ -833,8 +1074,12 @@ def _precheck_limits(
     byte_count: int,
     daily_period: str,
     monthly_period: str,
-) -> None:
-    """A read-only hard-limit check before policy evaluation.
+) -> tuple[int, int]:
+    """A read-only ledger check that also returns the live monthly total.
+
+    The returned monthly value is the governor's own reservation total for the
+    current UTC month; the caller folds it into the hard-limit decision with
+    ``max`` (never by addition).
 
     This preserves the existing daily/monthly error contract (and the daily hard
     limit) even when an unknown action would otherwise be denied by policy.
@@ -853,6 +1098,7 @@ def _precheck_limits(
             raise OutboundBandwidthExceededError(
                 "monthly", monthly_used, byte_count, MONTHLY_LIMIT_BYTES
             )
+        return daily_used, monthly_used
 
 
 async def reserve_outbound_bytes(
@@ -872,9 +1118,16 @@ async def reserve_outbound_bytes(
     byte_count = _validate_byte_count(byte_count)
     current = _utc_now(now)
     daily_period, monthly_period = _period_keys(current)
-    _precheck_limits(category, byte_count, daily_period, monthly_period)
+    _, monthly_used = _precheck_limits(
+        category, byte_count, daily_period, monthly_period
+    )
     action = classify_outbound_action(category)
-    await ensure_action_allowed(action, byte_count, now=current)
+    await ensure_action_allowed(
+        action,
+        byte_count,
+        now=current,
+        governor_monthly_bytes=monthly_used,
+    )
     return await asyncio.to_thread(
         _reserve_locked, category, byte_count, daily_period, monthly_period
     )
@@ -895,9 +1148,16 @@ def reserve_outbound_bytes_sync(
     byte_count = _validate_byte_count(byte_count)
     current = _utc_now(now)
     daily_period, monthly_period = _period_keys(current)
-    _precheck_limits(category, byte_count, daily_period, monthly_period)
+    _, monthly_used = _precheck_limits(
+        category, byte_count, daily_period, monthly_period
+    )
     action = classify_outbound_action(category)
-    ensure_action_allowed_sync(action, byte_count, now=current)
+    ensure_action_allowed_sync(
+        action,
+        byte_count,
+        now=current,
+        governor_monthly_bytes=monthly_used,
+    )
     return _reserve_locked(category, byte_count, daily_period, monthly_period)
 
 
