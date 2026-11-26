@@ -1,1212 +1,654 @@
-# INVESTIGATION — Forensic Outbound Bandwidth Audit
+# Render Outbound Bandwidth — Forensic Investigation
 
-> Read-only forensic investigation of every outbound network boundary in the
-> Telegram Self-Bot / LifeOS runtime. Source-verified against remote `main`
-> `65632bf65297020f63f779e0f42f662a043a3586`. No production code, tests,
-> dependencies, SQL, configuration or Render state was changed. The only
-> repository change is this file. No live Telegram, Supabase, provider or
-> Render API request was made to produce this report.
+**Date:** 2026-11-26
+
+**Repository:** LifeOS / Telegram Self-Bot
+
+**Branch investigated:** `freebuff/f5137e20b1c5761eea04f020`
+
+**Commit investigated:** `31406f7912da14dcb23e5d099a587f16413be6eb`
+
+**Scope:** read-only source investigation of the current repository, checked against the production observations supplied in the task. No production access, live Telegram/Supabase/Render calls, or web research were performed.
+
+**Evidence labels used below**
+
+- **VERIFIED FACT** — directly established from the current source, test, or supplied production observation.
+- **INFERENCE** — a conclusion derived from verified facts, with the reasoning stated.
+- **UNKNOWN / NOT MEASURABLE** — not established by the available code or telemetry.
+
+---
 
 ## 1. Executive summary
 
-The application is a single Python `asyncio` process that talks to four
-external families: **Telegram** (self client + optional helper bot),
-**Supabase** (PostgREST + Storage), **AI/STT/TTS providers** over HTTPS, and
-**Render's metrics API** on demand. Render bills *outbound* bytes only:
-HTTP/WebSocket responses plus every byte the service itself sends to the
-public internet (Telegram uploads, Supabase requests, provider prompts,
-Storage uploads). Inbound traffic is free. Therefore the relevant question is
-not "how much data does LifeOS move", but "how much does it *send*".
+**VERIFIED FACT — the reported outbound split is overwhelmingly NAT, not the HTTP server.**
 
-The existing governor (`backend/services/outbound_bandwidth_service.py`) is a
-correct, fail-closed **reservation ledger** for selected payload paths. It is
-explicitly not an egress meter (its own module docstring says so), and it
-covers neither HTTP responses nor Telegram protocol traffic, helper-bot
-traffic, Supabase request/response traffic, Groq/Speechmatics STT uploads,
-provider prompts, or the appearance image endpoint.
+The supplied Render data reports approximately `5,559.03 MB` (`5,559,025,983` bytes) of NAT traffic and approximately `9–10 MB` of HTTP traffic. Within the reported points, NAT is approximately **99.8%** of the source split. The HTTP server and dashboard therefore cannot be the primary explanation for a 5.56 GB month.
 
-The single most important quantitative fact in the supplied evidence is that
-**the six days 2026-11-07..12 account for ~3,675.8 MB of the ~4,155.1 MB
-month-to-date total (≈88.5 %)**. The governor's commit (`9d220b6`,
-"feat(bandwidth): add persistent fail-closed outbound bandwidth governor")
-is dated **2026-11-11**, so 2026-11-07..10 had no outbound cap at all. Even
-the post-governor daily figures (380.8 MB and 410.4 MB on Nov 11 and 12) are
-2.5–2.7× the governor's hard 150 MB/day ceiling, which means a material part
-of the spike was outside the governor's coverage (or predates its
-deployment — commit date is not deployment time).
+**VERIFIED FACT — the PostgREST rate is consistent with per-message database work, not a timer or retry loop.**
 
-No source-level evidence can attribute those bytes to one subsystem. Two
-measurements settle it without a code change: Render's
-`GET /v1/metrics/bandwidth-sources` endpoint (trafficSource = `http`,
-`websocket`, `nat`, `privatelink`, `total`) and the dashboard's Network
-Metrics graph, which already splits HTTP responses from service-initiated
-traffic. The report ranks the candidate families and specifies exactly which
-measurement separates them.
+Every Telegram `NewMessage` event reaches `TaskEventDispatcher.handle_event`, which unconditionally executes `list_event_tasks` before it knows whether any event-triggered task exists (`backend/bot/handlers/task_events.py:56-97`; `backend/ai/task_event_dispatcher.py:151-163`; `backend/ai/database/task_repository.py:1280-1282`). An owner-authored message additionally executes `list_waiting_answer_occurrences` even when it is not a reply (`backend/ai/task_answers.py:98-118`; `backend/ai/database/task_repository.py:1419-1422`).
 
-Highest-ranked candidates, in order:
+At `2,300–2,600` operations per five minutes, that is **7.7–8.7 requests/second**. If every operation were the per-message path, the message rate would be 7.7–8.7 messages/second when no message is owner-authored, or 3.8–4.3 messages/second if every message is owner-authored with the extra query. The scheduler, dashboard, heartbeat, and governor cache together contribute only tens of operations per five minutes, not thousands.
 
-1. **Telegram media uploads** (Deep Save, album upload, bulk re-send,
-   file-name re-upload, AI result attachments). One 10-member album at the
-   default 50 MB member limit is ~500 MB in a single operation; the same
-   album at the maximum 500 MB setting is ~5 GB. These paths are governed
-   today but were ungoverned before the Nov 11 governor.
-2. **Appearance image HTTP egress.** Every Glass panel rendered with the
-   preview active carries an `InputBotInlineResult` whose web document is
-   `/appearance/image/<version>?fmt=jpeg` (`appearance_service.py:599-619`).
-   Telegram fetches that URL from Render; the endpoint can return up to
-   `TELEGRAM_PHOTO_MAX_BYTES = 5 MB` per fetch
-   (`appearance_service.py:136`), plus a 320 px thumbnail. The response has
-   a one-year immutable cache header, but each newly created panel message is
-   a fresh web-document fetch by Telegram's servers. This is the largest
-   plausible *HTTP-response* contributor and is ungoverned.
-3. **Dashboard/API polling.** The React dashboard loads `/api/saves`,
-   `/api/bio` and `/api/logs` every 30 s (`src/App.tsx:84`). `/api/saves`
-   uses `select("*")` with a second `count=exact` query
-   (`backend/db/client.py:456-475`); `/api/logs` also uses `select("*")`
-   (`backend/db/client.py:1965-1975`). With no compression middleware and an
-   unauthenticated API, a tab left open is a continuous response-byte
-   stream. Arithmetic: at 30 s cadence there are 2,880 polls/day, so
-   100 KB per poll is ~288 MB/day; 250 KB is ~720 MB/day. Per-row sizes were
-   not measured, so this is an explicit conditional, not a measurement.
-4. **Groq/Speechmatics STT uploads** (ungoverned). Audio is bounded at
-   `MAX_STT_INPUT_BYTES = 20 MB` (`media_service.py:246`); Groq can send the
-   same audio up to three sequential passes (`groq_stt_engine.py:609-631`,
-   owner-configured 1–3), so one operation can be up to ~60 MB. Gemini is the
-   default STT engine and *is* governed; Groq/Speechmatics are opt-in.
-5. **AI provider prompt fan-out.** One user request can produce up to six
-   `ProviderManager.chat()` calls (initial, empty-response retry,
-   structured-action recovery, and up to three tool continuations,
-   `dispatcher.py:72,696,781,1052`). Each call fans out over every eligible
-   `(provider, model)` candidate, each with one same-model retry
-   (`manager.py:66,919,1083`). The durable candidate pool is bounded at 256
-   models/provider and 32 providers (`candidate_pool.py:57-59`), and a
-   restored pool contains only models a complete Test Modules run proved
-   usable. Prompts are on the order of 10–35 KB of text, so this is a
-   *multiplier* risk rather than a primary byte source; it is bounded in
-   wall-clock time by the 240 s request envelope
-   (`ai_unified.py:72`).
-6. **History summarization** (map/reduce over chunked Telegram history,
-   `history_ai_service.py:93,118-126`) — many provider calls, each ~4k tokens
-   of history, paced at 5 s; ungoverned but moderate.
-7. **Supabase request traffic** — many small outbound requests, responses
-   inbound. It is a request-count/CPU cost, not a credible GB-scale source.
-8. **Telegram RPC, keepalive, panel edits, profile cron** — small control
-   traffic.
+**VERIFIED FACT — there is also a conditional, config-gated per-message writer.**
 
-Nothing in this report claims bandwidth was reduced. The deliverable is the
-evidence-based diagnosis and the measurement/optimization plan.
+When Anti-Edit / Anti-Delete is enabled, its `NewMessage` handler calls `record_message`, which forces a full archive read and then writes the archive back for every eligible **private human** message (`backend/bot/handlers/anti_edit_delete.py:512-530`; `backend/services/anti_edit_delete_service.py:925-971`, `997-1105`). In the dedicated-table mode this is roughly one read plus an upsert and a delete; in the legacy shard mode it can be one read plus a read/write pair for each of four shards. That is potentially **3–9 PostgREST requests per eligible private message**, far more than the task-event query. It is disabled by configuration by default, and its enabled state in production was not supplied. It is therefore a conditional alternative source, not an established cause. The supplied 7–9 KB body measurement argues against a large active archive: that path would send the archive row set on every eligible message, which would be much larger than 7–9 KB.
 
-## 2. Repository pre-flight and exact inspected commit
+**VERIFIED FACT — the attribution counter is body-only, so a high operation count with almost no measured bytes is expected.**
 
-| Item | Value |
+`egress_attribution` measures HTTP request bodies using `Content-Length` (`backend/observability/egress_attribution.py:748-765`). A bodyless PostgREST `GET` is recorded as an exact **zero-byte** operation (`record_exact`, lines 234-238). Headers, TLS records, TCP/IP, MTProto framing, retransmissions, and keepalives are outside the counter by design (module doc, lines 1-35).
+
+Consequently:
+
+- `unmeasured_operations=0` means only that no instrumented request body had an unknown length. It is **not** evidence that all outbound bytes were measured.
+- `7–9 KB` of measured body per five-minute window is consistent with a stream of bodyless `GET`s. It does **not** mean the requests only cost 7–9 KB on the wire.
+- The missing bytes are mainly the HTTP request line and headers. The Supabase client is deliberately pinned to **HTTP/1.1** (`backend/db/transport.py:1-27`, `50-93`), so there is no HTTP/2 HPACK header compression across requests. Every request carries its own headers, including the deployment's Supabase API-key and bearer-token headers. Header size is deployment-specific, but it is not near zero.
+
+**INFERENCE — per-message PostgREST header overhead is the leading candidate for the NAT total, but it is not proven as the sole cause.**
+
+The arithmetic is compatible with the supplied numbers. If 2,300–2,600 requests per five minutes were sustained for a month, that would be roughly 20–22 million requests; the observed 5.56 GB month would correspond to an average of only about **250–280 bytes per request**. That is at the low end for authenticated HTTP/1.1, so the observed window rate was probably not sustained 24/7 for the entire month, or the headers are smaller than expected. Conversely, at 500 bytes of request overhead, the same rate sustained 24/7 would produce about 10–11 GB/month, roughly twice the observed total. The exact duty cycle and header size are **not measured**.
+
+The important conclusion is not a precise percentage. It is that the request count is high enough for per-request header/transport overhead to be **GB-scale**, while the attribution counter can still report almost zero bytes. The prior assumption that thousands of PostgREST calls must be “only megabytes” is not supported once the count is expressed per five minutes: 2,400 per five minutes is about **691,000 per day**, not “thousands per day.”
+
+**VERIFIED FACT — the observed `tier=90` above 4 GB is expected by the current policy code.**
+
+`_policy_tier` evaluates only `50, 60, 70, 80, 90` and caps at 90 (`backend/services/outbound_bandwidth_service.py:465-470`). `4,000,000,000` bytes explicitly maps to tier 90 in `tests/test_outbound_bandwidth_policy.py:84-105`. The 4 GB “hard limit” checks in `_reserve_locked` and `_precheck_limits` compare against the **local reservation ledger**, not `effective_monthly_bytes` from Render (`outbound_bandwidth_service.py:778-790`, `852-856`). There is no `effective >= MONTHLY_TARGET_BYTES` refusal anywhere in the governor.
+
+**VERDICT — the 100% hard limit is not a total-egress cap.**
+
+- The **local reservation ledger** does have a 4 GB monthly refusal. That part is implemented and tested.
+- The **effective Render monthly volume** does not have an independent 100% refusal. At 5.61 GB the code is designed to remain at tier 90; tier 90 denies all governed non-text uploads, but text up to 32 KiB remains exempt and, more importantly, traffic that never calls the governor is unaffected.
+- Therefore the observed `tier=90` is **not evidence that the governor is malfunctioning**. It is evidence that the governor is a **90%-style policy plus a local-ledger cap**, not a universal 100% egress stop.
+- The implementation report’s table row “`>= 100%` — hard monthly limit reservation refusal” (`IMPLEMENTATION_REPORT.md:121-137`) is **not implemented for effective Render bytes**. At the effective level, 100% and 90% are the same tier.
+
+The exact split of the 5.56 GB between PostgREST headers, Telegram/MTProto, AI/provider requests, TTS/STT, Storage, and other NAT traffic remains **UNKNOWN / NOT MEASURABLE** with the current instrumentation.
+
+---
+
+## 2. Supabase / PostgREST request-volume investigation
+
+### 2.1 The per-message path is unconditional
+
+**VERIFIED FACT — every new message, in both directions, enters the task-event handler.**
+
+`backend/bot/handlers/task_events.py:56-97` registers `events.NewMessage()` and documents “both directions; each path applies its own owner gate.” The handler:
+
+1. Calls `private_message.enforce_incoming` first.
+2. Extracts an event context.
+3. Calls `TaskAnswerResolver.handle_event` if configured.
+4. Calls `TaskEventDispatcher.handle_event` if configured.
+
+The supervisor wires both the dispatcher and the resolver at startup (`backend/runtime/supervisor.py:557-570`). The dispatcher is therefore not a no-op in normal production.
+
+**VERIFIED FACT — the dispatcher queries `ai_tasks` before checking whether any event task exists.**
+
+`TaskEventDispatcher.handle_event` validates only `chat_id` and `message_id`, then executes:
+
+```python
+tasks = await self.repository.list_event_tasks(
+    self.owner_id, MAX_EVENT_TASKS_PER_MESSAGE
+)
+```
+
+at `backend/ai/task_event_dispatcher.py:151-163`. There is no cache, no “does the owner have event tasks?” flag, and no short-circuit for messages that cannot match an event schedule. Even when `tasks` is empty, the HTTP request has already happened.
+
+The repository query is:
+
+```python
+self._client.table("ai_tasks") \
+    .select("*") \
+    .eq("owner_id", owner_id) \
+    .eq("status", "active") \
+    .eq("schedule_type", "event") \
+    .order("id") \
+    .limit(limit) \
+    .execute()
+```
+
+at `backend/ai/database/task_repository.py:1280-1282`. The result is normally empty, but the request is still one PostgREST `GET`.
+
+**VERIFIED FACT — the test suite treats this as a deliberate one-query-per-event design.**
+
+`tests/test_external_call_efficiency.py:298-315` is titled “the per-event task query is bounded (documented, unchanged)” and asserts:
+
+```python
+assert repo.event_queries == 2, "one authoritative query per event, never more"
+```
+
+after two `handle_event` calls. The behavior is therefore intentional and documented, not an accidental loop. The missing consideration is the **wire cost of the request**, which the test does not measure.
+
+### 2.2 Owner messages add a second query
+
+**VERIFIED FACT — the answer resolver queries even when there is no reply to correlate.**
+
+`TaskAnswerResolver.handle_event` checks `chat_id` and `sender_id == owner_id`, then immediately calls:
+
+```python
+parked = await self.repository.list_waiting_answer_occurrences(
+    self.owner_id, 20
+)
+```
+
+at `backend/ai/task_answers.py:98-118`. It does **not** check `reply_to_message_id` before the query. A `None` reply is rejected later, after the database round trip. The query is:
+
+```python
+self._client.table("ai_task_occurrences") \
+    .select("*") \
+    .eq("owner_id", owner_id) \
+    .eq("status", WAITING_ANSWER_STATUS) \
+    .order("updated_at") \
+    .limit(limit) \
+    .execute()
+```
+
+at `backend/ai/database/task_repository.py:1419-1422`.
+
+Thus, for a normal incoming message from someone else: **one** PostgREST call. For an owner-authored message: **two** (unless the private-message gate rejects it first).
+
+### 2.3 Quantification
+
+**VERIFIED FACT — the supplied rate is 7.7–8.7 operations/second.**
+
+| Observation | Arithmetic |
 |---|---|
-| Branch | `main` |
-| Local HEAD | `c55efcdfd1905d72df35810cb5669e9d5c66866e` |
-| Remote `main` (`git fetch` + `git ls-remote`) | `65632bf65297020f63f779e0f42f662a043a3586` |
-| Relationship | local HEAD is an ancestor of remote main (18 commits behind; 0 ahead) |
-| Inspected tree | remote `main` = `65632bf` (extracted read-only to a scratch directory and removed before delivery) |
-| Expected reference commit | `65632bf65297020f63f779e0f42f662a043a3586` — matched exactly |
+| 2,300 operations / 5 min | 460/min = 7.67/s |
+| 2,600 operations / 5 min | 520/min = 8.67/s |
+| Sustained per day | 662,400–748,800 requests |
+| Sustained per 30 days | 19.9–22.5 million requests |
 
-Pre-existing working-tree changes present **before** this task and preserved
-untouched (not staged, not committed):
+**INFERENCE — the task-event path is the only unconditional steady source large enough to explain the count.**
 
-```
- M LIFEOS_IDEAS.md
- M ROADMAP.md
- M backend/bot/handlers/retrieve.py
- M backend/bot/handlers/taskloom.py
- M backend/helper/selection_state.py
- M tests/test_retrieve_multi_select.py
-?? tests/test_taskloom_selection.py
+Let `M` be messages per five minutes and `O` the fraction that are owner-authored (each adding the waiting-answer query). Then:
+
+```text
+Q = M × (1 + O)
 ```
 
-`git diff --stat` for those files: 601 insertions / 99 deletions across six
-tracked files plus a 487-line untracked test. They overlap files that also
-changed upstream, which is why the local branch was not force-synchronised.
-
-Documents read before the source audit: `AGENTS.md`, `INVESTIGATION.md`
-(previous Phase 3B content), `IMPLEMENTATION_REPORT.md`, `ROADMAP.md`,
-`AI_MASTER_DESIGN.md`, `DATABASE_ARCHITECTURE.md` (targeted sections only),
-plus Render's published outbound-bandwidth, service-metrics, and API
-documentation. Where documentation and code disagreed, code at `65632bf`
-won.
-
-Safety: no SQL executed, no Telegram/Supabase/provider/Render request made,
-no Render shell, no environment variable read or printed, no secret in this
-document. The only repository write is this file.
-
-## 3. Confirmed network architecture
-
-Single process: `backend/main.py` → `RuntimeSupervisor`
-(`backend/runtime/supervisor.py`) which owns one Telethon self client built
-from a `StringSession` (`backend/bot/client.py::build_client`), an optional
-Telethon helper **bot** client (`backend/helper/client.py::build_helper`), a
-FastAPI/uvicorn server started in-process
-(`supervisor.py::_start_web_server`, `backend/web/app.py`), one task
-scheduler (`backend/ai/task_scheduler.py`), the profile cron, heartbeat,
-keepalive, failsafe, diagnostics and memory-cleanup loops.
-
-Destinations and directions (confirmed from code):
-
-| Destination | Protocol | Direction | Render-billed? |
-|---|---|---|---|
-| Telegram DCs (self client) | MTProto/TCP | send + receive | **send is outbound**; receive is inbound/free |
-| Telegram DCs (helper bot) | MTProto/TCP | send + receive | **send is outbound**; receive inbound |
-| Supabase PostgREST | HTTPS/1.1 | request + response | **request bytes outbound**; response inbound |
-| Supabase Storage | HTTPS | upload / download | **upload outbound**; download inbound |
-| AI providers (OpenAI-compatible, Gemini, You.com) | HTTPS | request + response | **request outbound**; response inbound |
-| STT providers (Gemini, Groq, Speechmatics) | HTTPS | upload audio + poll + transcript | **upload/poll outbound**; transcript inbound |
-| TTS providers (Gemini, OpenAI, Grok, Speechmatics) | HTTPS | request + audio response | **request outbound**; audio inbound |
-| Render metrics API | HTTPS | GET | outbound (small, on demand) |
-| Browsers/Telegram web-document fetcher → FastAPI | HTTP(S) | response | **HTTP response outbound** |
-
-Render's own documentation confirms the accounting: outbound bandwidth is
-"all network traffic sent by your services to destinations outside of
-Render", including HTTP responses, WebSocket responses and service-initiated
-traffic over any protocol; inbound bandwidth is free; the monthly included
-amount is per workspace and shared across services. That is why a Telegram
-upload and a Supabase `POST` count, while a Telegram download does not.
-
-## 4. AI provider traffic findings
-
-### 4.1 Request lifecycle
-
-`backend/bot/handlers/ai_unified.py::ai_unified_handler` (line 1014) fires on
-every outgoing text message. It calls `_load_triggers(owner_id)` (line ~1030)
-**before** deciding whether the message is an AI request, so every outgoing
-message performs one `ai_config` Supabase read. Once activated, the request
-runs through `_execute_ai` (240 s envelope, `_AI_EXECUTE_TIMEOUT`,
-`ai_unified.py:72`; a 60 s semaphore wait at line 715), which delegates to
-`backend/ai/engine/engine.py::Engine.execute` → `Dispatcher.dispatch`.
-
-The dispatcher builds the prompt once
-(`dispatcher.py::_build_messages`, line 2280) and then performs:
-
-1. one initial `ProviderManager.chat()` (line ~660);
-2. one empty-response nudge retry when a "successful" response carries no
-   text and no tool call (`AI_PROVIDER_EMPTY_RESPONSE_RETRY`, line 696);
-3. one structured-action recovery retry when prose cannot be resolved into a
-   tool call (`AI_ACTION_RECOVERY_RETRY`, line 781);
-4. up to `MAX_TOOL_ROUNDS = 3` tool rounds (line 72), each followed by a
-   continuation provider call that re-sends the original messages **plus**
-   the assistant tool-call message and the tool results
-   (`_build_continuation_messages`, line 2295; call site line 1052).
-
-So one user AI request can produce **up to six `ProviderManager.chat()`
-invocations**, and every one of them carries the full system prompt, tool
-contract, conversation state and history.
-
-### 4.2 Provider fan-out, retries and fallback
-
-`ProviderManager.chat()` (`manager.py:134`) builds a **model-level** pool: for
-each eligible provider, `_candidate_models` (line 919) returns the configured
-model first, then every discovery-fed candidate model, with no per-provider
-cap. `_attempt_with_retry` (line 1083) gives each `(provider, model)` pair at
-most `_MAX_RETRIES = 1` retry (line 66) for `network`/`timeout`/`server`, or
-for a 429 whose `Retry-After` is ≤ 5 s (`_RATE_LIMIT_MAX_WAIT_SECONDS`,
-line 70). A rate limit with unknown scope may spend one sibling-model probe
-per invocation. Any other failure advances to the next candidate.
-
-The pool is supplied from two places:
-
-* the live Test Modules run (`model_tester.py:659` → `set_model_candidates`,
-  `manager.py:977`);
-* a durable document restored once at boot (`candidate_pool.py::restore`,
-  called by the supervisor), bounded by `MAX_PROVIDERS = 32`,
-  `MAX_MODELS_PER_PROVIDER = 256`, `MAX_AGE_S = 24 h`.
-
-Consequences:
-
-* **Same prompt can be transmitted many times.** The preview/dead-model
-  paths (`model_not_found` → mark unavailable → next model) make a provider
-  outage walk the whole candidate list. Each attempt re-serialises the full
-  messages array.
-* **Fallback is cross-provider.** `_ordered_candidates(include_all=True)`
-  appends every other registered provider, so a configured fallback chain is
-  only the ordering hint, not the limit.
-* **The worst case is bounded by time, not by an attempt counter.** Each
-  provider HTTP call has a 30 s `_PROVIDER_RPC_TIMEOUT` (manager constant),
-  and the whole request has a 240 s envelope, so at most ~8 genuine 30 s
-  timeouts can fit; however, fast failures (429/404/400) return in
-  milliseconds and can walk dozens of candidates inside that envelope.
-* **No global request-level attempt cap exists.** This is the one place in
-  the runtime where a single user action can fan a full prompt out to many
-  destinations.
-
-### 4.3 HTTP clients and serialisation
-
-* `backend/ai/providers/openai_compat.py` creates one `httpx.AsyncClient` per
-  provider instance (line 97) and performs a single `POST
-  {base_url}/chat/completions` per attempt (line 138), JSON body containing
-  `model`, `messages`, `temperature`, `max_tokens`, optional `tools` and
-  `response_format`. `list_models()` (line ~319) is a separate GET.
-* `backend/ai/providers/gemini.py` uses its own `httpx.AsyncClient` (line
-  179) and posts the translated payload (line 307); model listing is a GET
-  (line 426).
-* Provider adapters do **not** retry internally — retry/cooldown/fallback is
-  owned by `ProviderManager` (comment at `openai_compat.py:126`).
-* Responses are small (text + tool-call JSON + usage counters). The large
-  response path is Gemini media (`gemini_media_engine.py`), which downloads
-  the generated file (line 1578) — inbound — after an upload that **is**
-  governed (lines 968, 970, 1052, 1221).
-
-### 4.4 Prompt size and history
-
-`backend/ai/prompt/builder.py` assembles a fixed-order package. Relevant
-bounds and facts:
-
-* `DEFAULT_MAX_TOTAL_TOKENS = 8500`, `DEFAULT_MAX_HISTORY_TOKENS = 4000`,
-  `DEFAULT_MAX_OUTPUT_TOKENS = 1000` (`prompt/budget.py:32-45`).
-* The tool contract is rendered into the prompt before the budget is computed;
-  the dispatcher states the full registry renders "~1.9k tokens"
-  (`dispatcher.py:~575`).
-* Only conversation **history** is trimmed (`_trim_history_to_budget`); system
-  rules, tool contract, reply context, Telegram window and the current request
-  are never evicted. The total estimate is reported, not enforced as a network
-  bound.
-* Token count is not byte count. `json.dumps` of the messages array, HTTP
-  headers, provider-specific wrappers (e.g. Gemini `functionDeclarations`) and
-  non-ASCII payloads all add bytes. The existing trace records
-  `request_size = sum(len(str(content)))` in **characters**
-  (`manager.py::_call_once`), not bytes.
-
-### 4.5 Discovery, health checks and model testing
-
-* `ProviderManager.health()` is **local** (API key present + enabled). It does
-  not make an HTTP request.
-* Model/provider discovery is **on demand only**, with a 600 s in-memory TTL
-  (`model_discovery.py:52`, `_CACHE_TTL`), used by the AI panel and the web
-  API (`/api/ai/providers`, `/api/ai/models`, `/api/ai/models/{provider}`).
-* `backend/ai/model_tester.py::test_all_models` is triggered by the panel or
-  `POST /api/ai/test-models`; it can send a real request to every model of
-  every configured provider. This is a burst path, not a periodic one, and it
-  is ungoverned.
-* There is **no periodic provider polling** in the supervisor, heartbeat or
-  failsafe.
-
-### 4.6 Structured answer to the section 2.A questions
-
-1. **HTTP requests per user AI request:** 1 initial + 1 empty retry + 1
-   action-recovery retry + up to 3 continuations = up to 6 engine-level
-   calls; each is multiplied by the model/provider candidate fan-out and the
-   one same-model retry. There is no single fixed number.
-2. **Failure conditions that retransmit the same prompt:** retryable
-   network/timeout/5xx (one retry), 429 with short Retry-After (one retry),
-   empty but successful response (nudge retry), unparseable prose when tools
-   are on (recovery retry), dead model (next candidate), and every tool round
-   (continuation re-sends the whole prompt).
-3. **Can fallback send a large prompt to multiple providers?** Yes — that is
-   exactly what `_ordered_candidates(include_all=True)` plus the model pool
-   do. There is no byte or attempt cap, only the 240 s envelope.
-4. **Are tool results/history unnecessarily repeated?** Yes, structurally:
-   every continuation re-sends the original system prompt, tool contract,
-   conversation state, history and the Telegram window, then appends the tool
-   results. This is the normal protocol shape, but it is the dominant
-   per-request multiplier.
-5. **Periodic discovery/health requests?** No. Both are on demand.
-6. **Which request bodies can become large?** Full prompts with a big tool
-   contract and 4k tokens of history (largest routine bodies); Gemini media
-   uploads and TTS requests (governed/limited); provider fan-out multiplies
-   the prompt body.
-7. **Which operations download large responses into Render?** Provider chat
-   responses are small. Gemini media file download, Supabase query/Storage
-   reads, Telegram media downloads and TTS audio are the large inbound paths
-   — inbound is free and is **not** part of Render outbound, but it is
-   immediately followed in several workflows by an outbound re-upload.
-
-Confidence: request counts and retry mechanics **confirmed** from source;
-byte sizes per prompt **estimated** (token/character evidence only); actual
-provider fan-out width in production **unknown** (depends on the restored
-candidate pool and provider health).
-
-## 5. Supabase and database traffic findings
-
-`backend/db/client.py` is the single Supabase singleton with an in-memory
-fallback. Heavy calls run through `_run_sync` on a bounded worker pool; the
-client is pinned to HTTP/1.1 (`backend/db/transport.py:48-96`) so concurrent
-workers do not share one multiplexed HTTP/2 socket. Every query is a
-`PostgREST` HTTPS request; **request bytes are Render egress**, response
-bytes are inbound and free.
-
-Operations by category:
-
-| Subsystem | Operation (file/function) | Direction | Size character |
-|---|---|---|---|
-| AI config | `config_store.get_config` → `ai_config select("*")` per AI request; `_load_triggers` also reads it per outgoing message | Render → Supabase | small request, row-sized response (system_prompt can be KB) |
-| Conversation | `dispatcher.restore_history`; `ConversationManager` message/session read/write | both | request small; responses history-sized (bounded) |
-| Preferences | `_load_preference_record` / `_load_preferences` per AI request | request | small |
-| Memory | `MemoryManager` long/permanent/short reads and expiry cleanup | request | row-sized |
-| Persistence | `backend/ai/persistence.py` schedules message, usage (`usage_recorder.record_usage`), tool-history and provider-stats writes; dispatcher call site ~1510-1533 | request | one insert/upsert per record |
-| Provider stats | `provider_stats_repository.py:188` upsert on `(provider_name, owner_id)` | request | small |
-| Saved items | `db_client.list_saves` → `saved_items select("*")` + exact count; `query_save` | request | response row-sized, can be large |
-| Logs | `db_client.list_logs` → `bot_logs select("*")` limit 100 | request | response up to 100 rows |
-| Settings | `panel_settings_repository.load/update_field`; `settings_service` cache-first | both | small |
-| Bandwidth ledger | one `panel_settings` JSONB read + write + confirm read per reservation | both | 3–4 round trips per governed transfer |
-| Tasks | `task_repository` queries (section 6) | both | `select("*")` rows |
-| Storage | `appearance_service._upload_sync`, `anti_edit_delete_service` upload/remove, `appearance_service.image_payload` download/list | upload = **outbound**, download = inbound | uploads governed; downloads inbound |
-
-Confirmed issues:
-
-1. **N+1 in `/api/db/stats`.** `backend/observability/db_stats.py:34-42`
-   lists up to 10,000 sessions and then calls `mgr.message.count(session_id)`
-   once per session. That is one HTTP request per session on every call to
-   the endpoint. It is response-light (counts) but request-heavy, and it is
-   reachable from an unauthenticated GET.
-2. **`select("*")` on list endpoints.** `/api/saves` selects every column of
-   50 rows and then issues a second `count=exact` query
-   (`db/client.py:456-475`); `/api/logs` selects every column of 100 rows
-   (`db/client.py:1965-1975`). Callers receive columns they do not render.
-3. **Repeated config read per outgoing message.** `ai_unified_handler` reads
-   `ai_config` before the trigger check; a non-AI message still costs one
-   Supabase request.
-4. **One extra durable read/write per governed transfer.** The governor
-   reads the row, writes it, then re-reads to confirm
-   (`outbound_bandwidth_service.py:233-300`), and the repository's `load`
-   uses `select("*")` on a JSONB-bearing row
-   (`panel_settings_repository.py:35-48`).
-5. **Retry/degradation shape.** Each repository wraps its call and falls back
-   to an in-memory store on failure; there is no retry storm, but a failing
-   database silently moves work into process memory, which can change later
-   traffic patterns (e.g. a governor read failure denies a transfer).
-
-What is **not** a credible GB-scale outbound source: PostgREST request text
-and headers are on the order of a few hundred bytes to a few KB per call.
-Even thousands of calls per day sum to megabytes, not gigabytes. A
-`select("*")` response is inbound (free). Storage **uploads** are governed;
-Storage **downloads** are inbound.
-
-Confidence: query shapes and directions **confirmed**; per-request byte
-counts **not measured**.
-
-## 6. Task scheduler and background traffic findings
-
-The real implementation is `backend/ai/task_scheduler.py` (one
-`TaskScheduler` created by `RuntimeSupervisor._start_task_scheduler`) backed
-by `backend/ai/database/task_repository.py`; execution is handed to
-`backend/ai/task_execution.py` through the existing `ToolExecutor`. There is
-no second scheduler, worker pool or task lifecycle.
-
-Confirmed loop behaviour:
-
-* Wake interval is `WAKE_INTERVAL_SECONDS = 60.0` (upper bound); the sleep is
-  shortened to the nearest known boundary (`_sleep_seconds`), floor 1 s.
-* Each wake runs `_run_due_retries` (one `list_due_retry_occurrences` query,
-  limit `MAX_RETRIES_PER_WAKE = 10`) and then `_run_due_sweeps`: up to
-  `MAX_SWEEPS_PER_WAKE = 20` calls to `list_due_tasks`
-  (`MAX_TASKS_PER_WAKE = 10`), stopping at the first sweep with no due task.
-  `_sleep_seconds` then issues `next_run_hint`. **Idle cost is therefore
-  ~2–3 Supabase queries per minute**, with no provider or Telegram traffic.
-* `list_due_tasks` and `list_due_retry_occurrences` use `select("*")`
-  (`task_repository.py:1256`, `:1409`), so each due row carries the task's
-  `actions` JSON and `ai_instruction`; `next_run_hint` correctly selects only
-  `next_run_at` (`:1260`).
-* Execution adds round trips: `create_occurrence` first reads the task and
-  the occurrence, then inserts (`task_repository.py:1343+`);
-  `claim_occurrence` reads then CAS-updates (`:1431+`);
-  `advance_next_run` is a CAS update; terminal transitions are CAS updates.
-  A due task therefore costs several small requests, not one.
-* AI-assisted tasks prepare ahead within
-  `PREPARE_AHEAD_HORIZON_SECONDS = 120` (bounded by
-  `PREPARE_AHEAD_TIMEOUT_SECONDS = 150`). Preparation is **one provider
-  call** (content generation + deterministic validation, no side effects)
-  per occurrence; the boundary re-proves and executes it. A recurring AI task
-  therefore adds one provider prompt per period, plus the execution call.
-* Retries are bounded at 3 attempts (`MAX_ATTEMPTS` in
-  `backend/ai/retry.py:6`); recovery scans at most
-  `MAX_RECOVERY_PER_START = 100` occurrences once at startup.
-* Executions run with `MAX_CONCURRENT_EXECUTIONS = 4`, so a burst of due
-  tasks can produce four simultaneous provider/Telegram operations.
-* Event-triggered tasks are read by `list_event_tasks` from the existing
-  message-update path (`task_events.py`), not by polling.
-
-No periodic operation fetches full Telegram history, calls a provider, or
-uploads media when there are no due tasks. The scheduler's contribution to
-outbound bytes is small in idle operation; it matters when AI-assisted tasks
-run (provider prompts) or when a task's tool performs a media/HTTP action.
-## 7. HTTP server and dashboard egress findings
-
-`backend/web/app.py` is the whole FastAPI application. Routes (confirmed):
-
-| Route | Handler | Notes |
-|---|---|---|
-| `GET /health` | `health` (line 34) | 17-byte JSON; Render health checks |
-| `GET /api/status` | `api_status` (39) | runtime status |
-| `GET /api/ai/stats` | `api_ai_stats` (45) | RAM metrics |
-| `GET /api/db/stats` | `api_db_stats` (51) | **N+1** count per session, up to 10k (section 5) |
-| `GET /api/health/snapshot` | (57) | small |
-| `GET /api/performance` | (63) | aggregates |
-| `GET /api/diagnostics/events` | (69) | up to `limit` events (default 50) |
-| `GET /api/maintenance` | (76) | **runs cleanup** (`run_all_maintenance`) on a GET |
-| `GET /api/saves` | `list_saves` (82) | `select("*")` 50 rows + exact count |
-| `GET /api/saves/{code}` | (92) | one full row |
-| `GET /api/bio` | (106) | state row |
-| `GET/PATCH /api/settings` | (116/125) | cache + single write |
-| `GET /api/logs` | (139) | `select("*")` 100 rows |
-| `GET /api/ai/providers` | (149) | discovery (metadata) |
-| `GET /api/ai/models` | (156) | discovery + `fetch_models` for **every configured provider**, concurrently |
-| `GET /api/ai/models/{provider}` | (188) | discovery for one provider |
-| `GET/POST /api/ai/*` | (210-291) | config, runtime selection, `test-models` |
-| `GET /appearance/preview/{version}` | (323) | Open Graph HTML |
-| `GET /appearance/image/{version}` | (333) | up to 5 MB JPEG or thumbnail, `Cache-Control: public, max-age=31536000, immutable` (352, 362) |
-| `GET /guide/*` | `mount_static` | static guide site |
-| `GET /assets/*`, `GET /{path}` | `mount_static` | SPA build + fallback |
-
-Confirmed egress characteristics:
-
-1. **No authentication on any API route.** `_owner_id` is a module global set
-   by the runtime; any client that reaches the service URL can read saved
-   items, logs, settings and diagnostics, and can trigger maintenance,
-   discovery and the model tester. This is a security finding and a
-   bandwidth-amplification amplifier (an unauthenticated caller can trigger
-   provider traffic).
-2. **No compression middleware.** There is no `GZipMiddleware` (or any
-   middleware) in `backend/web/app.py` or `backend/main.py`; JSON responses
-   and the static SPA/guide assets are sent uncompressed.
-3. **Dashboard polling.** `src/App.tsx:84` sets a 30 s interval that calls
-   `api.saves()`, `api.bio()` and `api.logs()` in parallel. `src/lib/api.ts`
-   issues `GET /api/saves?limit=50&offset=0`, `/api/bio`, `/api/logs?limit=100`.
-   The dashboard is the only browser client; there is no WebSocket.
-4. **`select("*")` responses.** `saved_items` rows carry captions, metadata
-   JSON and file fields; `bot_logs` rows carry messages. The payload is
-   proportional to stored content, not to what the page renders. Per-row
-   bytes were not measured.
-5. **Appearance image endpoint.** The stored original is up to
-   `MAX_IMAGE_BYTES = 26,214,400` (25 MB, `appearance_service.py:108`); the
-   Telegram photo rendition is capped at `TELEGRAM_PHOTO_MAX_BYTES = 5 MB`
-   (`:136`); the thumbnail is 320 px / quality 80 (`:142-143`). Every fetch
-   of the rendition performs `image_payload`/`telegram_photo`
-   (`appearance_service.py:1519,1629`), which may download the object from
-   Supabase Storage (inbound) and encode JPEG on the Render CPU, then sends
-   the bytes out (outbound). The one-year immutable cache header helps only
-   clients that honour the URL; Telegram's web-document fetcher is a
-   server-side fetcher.
-6. **Static surface.** `guide/` is ~88 KB total (`index.html` 48 KB,
-   `styles.css` 16 KB, JS ~16 KB). The built SPA bundle is not committed
-   (`dist/` is produced at deploy time). A normal page load is a few hundred
-   KB; a reload loop would be material, an idle tab is not.
-7. **`/health` is negligible** (17 bytes) even at Render's health-check
-   cadence.
-8. **`/api/ai/models` and `/api/ai/test-models` are external-traffic
-   amplifiers**: a single GET fans out to every configured provider's model
-   list; a single POST runs a real request against every model in the
-   catalogue (`model_tester.test_all_models`).
-9. **`/api/maintenance` performs writes/cleanup** (expired memory deletion,
-   diagnostics trimming, repository validation) on an unauthenticated GET.
-   It is response-light but side-effectful.
-
-HTTP responses are billed by Render 1:1. The only current per-response byte
-observability is the web server's access log (uvicorn default), which records
-status and path, not bytes.
-
-## 8. Telegram traffic findings
-
-Two Telethon clients exist: the owner's self client and the optional helper
-bot. Both use `auto_reconnect=True`, `connection_retries=5`,
-`retry_delay=2`, `flood_sleep_threshold=60`
-(`backend/bot/client.py:30-43`, `backend/helper/client.py:61-71`). Telethon's
-default `catch_up=True` means a reconnect fetches the update difference
-(inbound). Reconnect logic is centralised in `RuntimeSupervisor`
-(`_trigger_reconnect`, `_trigger_full_recovery`, `_hard_reset_runtime`) with
-a cooldown; keepalive uses `get_me` every 60 s
-(`backend/runtime/keepalive.py:28,118-121`); heartbeat (30 s) and failsafe
-(15 s) are local and make no network call.
-
-Per-message handler fan-out (confirmed registrations):
-
-| Handler | Scope | Network/database work |
-|---|---|---|
-| `backend/bot/router.py` | outgoing + all | dispatch only |
-| `ai_unified.py::ai_unified_handler` (1014) | outgoing text | `ai_config` read per message; AI path only on trigger/reply-to-AI |
-| `auto_reaction.py` (37) | outgoing | cache-first settings; one reaction RPC when eligible |
-| `emoji_replacement.py` (38) | outgoing | cache-first settings; replacement may send/delete a message |
-| `intelligent_reaction.py` (52) | outgoing | one AI request per coalesced batch when enabled (default OFF, probability 25) |
-| `anti_edit_delete.py` (512) | **all messages** | resolves peer, downloads media (inbound), uploads a bounded snapshot to Supabase Storage (governed) |
-| `task_events.py` → `private_message.enforce_incoming` (67) | incoming/private policy | per-message policy/state; AI reply when enabled (default `ai_response_enabled: False`), one CAS claim per reply |
-| `task_events.py` (62) | all | event-task matching, bounded reads |
-| `misc.py` (1136) | outgoing | `Menu` panel |
-| `tasks.py` (95) | outgoing | task panels |
-
-Direction facts:
-
-* **Media downloads are inbound** (`save_service.py` `download_media` at
-  1589/1889, `retrieve_service.py:1336`, `appearance.py:469`
-  `iter_download`, `anti_edit_delete_service.py:1621`). They are free on
-  Render but are typically followed by a governed outbound upload.
-* **Media uploads are outbound**: `save_service` `upload_file` (1936) +
-  `send_file` (1667/1980), `retrieve_service` `send_file` (1351),
-  `telegram_api/media.py` `send_file` (152, voice) and `ai/tools/delivery.py`
-  `send_file` (734). All five reserve before sending (section 10).
-* **Inline panels** are sent as inline-bot results
-  (`backend/helper/inline_sender.py::send_inline_panel`,
-  `panel_render.py:155-189`). When the appearance preview is active the
-  result is a `photo` web document pointing at the Render URL
-  (`appearance_service.py:408-460,599-619`), so Telegram's servers fetch that
-  URL from Render. This is the mechanism that turns panel usage into HTTP
-  response egress.
-* **Panel edits and timers**: `backend/helper/panel_timer.py` edits a panel
-  every `_COUNTDOWN_INTERVAL = 30` s while one is open (line 21); lifecycle
-  edits go through `_safe_edit`; the callback gate paints at most one edit
-  per message at a time. These are small MTProto/HTTP payloads but a
-  continuously open countdown panel is a steady low-rate stream.
-* **Profile cron** wakes at every minute boundary
-  (`backend/profile/scheduler.py:149-155`) and issues one `UpdateProfile`
-  RPC when Bio/Username is active. Small, but persistent.
-* **Helper bot**: optional; disabled when `BOT_TOKEN` is empty. It is a
-  Telethon client (MTProto), so every panel send/edit and callback answer is a
-  small outbound RPC — a higher request count than the self client, not a
-  separate HTTP Bot API.
-
-There is no evidence in the runtime of a media upload that bypasses
-Telegram's own upload path, no CDN download-and-reupload loop, and no
-periodic Telegram poll beyond keepalive and reconnect catch-up.
-
-## 9. Other external network findings
-
-* **You.com web search** (`backend/ai/providers/you_search.py:97-178`): one
-  HTTPS POST per `web_search` tool call. Request is the query + bounded
-  options; response is search results (inbound). Not governed; small.
-* **TTS providers** (`gemini_tts_engine.py:552`, `openai_tts_engine.py:456`,
-  `grok_tts_engine.py:465`, `speechmatics_tts_engine.py:421`): one HTTPS POST
-  per synthesis; request body is the text (bounded), response is audio
-  (inbound, `MAX_TTS_AUDIO_BYTES` enforced in `_extract_audio`). The audio is
-  then uploaded to Telegram through the governed voice path.
-* **Render metrics API** (`render_bandwidth_service.py:131-183`): one
-  `GET https://api.render.com/v1/metrics/bandwidth` with an 8 s timeout,
-  only when the Bandwidth panel is rendered/refreshed. Response is JSON
-  (inbound); request is small.
-* **Model discovery** (`backend/ai/discovery.py:402`,
-  `backend/ai/model_discovery.py:382,459`): one GET per provider, on demand,
-  600 s cache.
-* **`backend/tools/stt_benchmark.py`**: a development benchmark tool, not
-  wired into the runtime; excluded from production egress.
-* **DNS/TLS/connection setup** for every HTTPS client is unmeasured but
-  small relative to payloads.
-
-No other network library is used: the scan for `httpx`, `requests`, `aiohttp`,
-`urllib`, `websockets` and `socket` found only the files listed above (plus
-`urllib.parse` for URL parsing, which performs no I/O).
-## 10. Existing bandwidth governor coverage and gaps
-
-`backend/services/outbound_bandwidth_service.py` is the single reservation
-authority. Limits are exact and must not be changed silently:
-`DAILY_LIMIT_BYTES = 150_000_000` (line 45) and
-`MONTHLY_LIMIT_BYTES = 4_000_000_000` (line 46). State is one JSONB column,
-`panel_settings.outbound_bandwidth_state` (`_STATE_KEY`, line 48), read and
-written through `panel_settings_repository`; the module holds only a
-process-wide `threading.Lock`, so it is a single-process guarantee, not a
-distributed one. `reserve_outbound_bytes` (line 302) reads, checks both
-windows, writes, and **re-reads to confirm**; any unreadable/malformed/
-unwritable state denies the transfer (`_reserve_locked`, line 233).
-
-Governed paths (verified call sites):
-
-| Path | Call site | Category |
-|---|---|---|
-| Deep Save single upload | `save_service.py:1666` | `telegram_media` |
-| Deep Save album member | `save_service.py:1935` | `telegram_media` |
-| Link save | same `execute_link_save` pipeline | `telegram_media` |
-| Retrieve re-upload (rename) | `retrieve_service.py:57,1350` | `telegram_media` |
-| Telegram voice/media upload | `telegram_api/media.py:102,120,152` | `telegram_media` |
-| AI result attachment | `ai/tools/delivery.py:716-734` | `telegram_media` |
-| Gemini OCR/STT upload | `gemini_media_engine.py:749,968,970,1052,1221` | `gemini_ocr` / `gemini_stt` |
-| Appearance Storage upload | `appearance_service.py:1079-1082` | `storage_upload` |
-| Anti-edit/delete Storage upload | `anti_edit_delete_service.py:1632-1635` | `storage_upload` |
-
-Every one of these is fail-closed: the reservation is awaited **before** the
-transfer, and the governor is imported without a fallback.
-
-Confirmed gaps (the governor's own docstring lists the first four):
-
-1. **HTTP response egress** — `/health`, every `/api/*` response, the SPA and
-   guide assets, and `/appearance/image/*`. Not counted.
-2. **Telegram protocol traffic** — update dispatch, RPC calls, keepalive,
-   panel edits, profile updates, reactions. Not counted.
-3. **Helper-bot traffic** — every helper-bot RPC. Not counted.
-4. **Supabase request/response traffic** — not counted (responses are
-   inbound/free, but requests are outbound bytes).
-5. **Groq STT uploads** (`groq_stt_engine.py:676`) and **Speechmatics STT**
-   submit/poll (`speechmatics_stt_engine.py` `_submit`/`_wait_for_job`) —
-   no reservation. These are the only media-sized outbound paths that are
-   still ungoverned.
-6. **Provider prompts** (all AI calls, including History map/reduce and task
-   preparation) — no reservation.
-7. **Model discovery and model testing** — no reservation.
-8. **TTS provider requests** — no reservation (bodies are text-sized).
-9. **Render metrics API** — no reservation (tiny).
-
-The governor therefore caps *governed payload uploads* at 150 MB/day and
-4 GB/month; it does **not** cap total Render egress. Both statements are
-true simultaneously and the difference is what this investigation exists to
-expose.
-
-A second, subtle gap: the governor counts **reservations**, not actual
-transmitted bytes. A failed upload still consumes its reservation (there is
-no refund; `release_reservation` is a documented no-op). Over a month, the
-ledger can therefore report more than the wire sent — it never reports less,
-which is the safe direction for enforcement but makes it unsuitable as a
-usage meter.
-
-## 11. November 7–12 spike analysis
-
-### 11.1 The supplied evidence
-
-Metric: Render `bandwidth_usage` for the account-1 `Self_bot` service only;
-period 2026-11-01 00:00 UTC → 2026-11-23 16:30 UTC; 3,600 s resolution; 338
-hourly points; total ≈ 4,155.126 MB.
-
-Daily values supplied: Nov 7 ≈ 560.5 MB, Nov 8 ≈ 793.7 MB, Nov 9 ≈ 771.4 MB,
-Nov 10 ≈ 759.0 MB, Nov 11 ≈ 380.8 MB, Nov 12 ≈ 410.4 MB, Nov 23 ≈ 199.1 MB
-(partial day). Maximum hourly point ≈ 54.9 MB.
-
-### 11.2 Arithmetic (from the supplied numbers, no new estimates)
-
-* Nov 7–12 sum = **3,675.8 MB**, i.e. **88.5 %** of the 4,155.1 MB
-  month-to-date total.
-* Nov 7–10 sum (before the governor commit) = **2,884.6 MB**.
-* Day-by-day multiple of the governor's 150 MB/day cap:
-  Nov 7 **3.7×**, Nov 8 **5.3×**, Nov 9 **5.1×**, Nov 10 **5.1×**,
-  Nov 11 **2.5×**, Nov 12 **2.7×**.
-* Six-day sum is **92 %** of the governor's 4 GB monthly cap, in six days.
-* Excluding Nov 7–12 and the partial Nov 23, the remaining ~16 days account
-  for ≈ 280 MB, i.e. ≈ 17.5 MB/day. That baseline is consistent with
-  control traffic + occasional AI/media use, not with a runaway loop.
-* 338 hourly points cover ~545 elapsed hours (22 days 16.5 h). The series is
-  therefore incomplete (missing/zero-suppressed points); Render documents
-  that points below 1 MB may display as 0. The month total is a sum of the
-  returned points, so genuine sub-1 MB hours are absent and interior gaps are
-  not detected by the current parser.
-
-### 11.3 Timeline evidence (repository, not timestamps alone)
-
-| Date | Commit | Relevance |
-|---|---|---|
-| 2026-11-06 | `0d07dc1` repair tool-call continuation, prompt schemas | more continuation rounds possible |
-| 2026-11-06 | `fa2dfd0` probe one sibling model on ambiguous 429 | model-level fan-out |
-| 2026-11-08 | `8ecccf9`, `d3aa5a1`, `c8e5e90`, `15bc401` Delete/Glass fixes | heavy panel testing; Delete itself does not upload |
-| 2026-11-09 | `a301e64`, `c693014`, `9b66750`, `98c8f36`, `f687e60`, `1d0ed3a` Appearance | appearance image upload + **panel photo web document** introduced |
-| 2026-11-09 | `15a7d8d` model tester caption/reachability | model testing exercised |
-| 2026-11-11 | **`9d220b6` outbound bandwidth governor** | first outbound cap exists |
-| 2026-11-11 | `1836dfd` bandwidth usage panel | operator visibility added |
-| 2026-11-12 | `c43c5fa`, `5701aed`, `dcad23c` Intelligent Reaction | one AI call per outgoing message when enabled |
-| 2026-11-13 | `3a2e8ab` coalesce reaction requests; History work | reaction request count reduced |
-
-The governor commit is dated **2026-11-11**, after the four largest days.
-Commit date is not deployment time, so the exact hour the cap became
-effective is unknown; the two post-commit days still exceed the cap by
-2.5–2.7×, which is the part that needs the measurement below.
-
-### 11.4 What the spike is consistent with
-
-Three families can produce hundreds of MB/day of **outbound** traffic from
-this service:
-
-* **Telegram media uploads** — Deep Save / album / bulk re-send / AI
-  attachments. A single 10-member album at the default 50 MB setting is
-  ~500 MB; at the maximum 500 MB setting it is ~5 GB. Before Nov 11 nothing
-  stopped it. This is the only application feature that routinely moves
-  hundreds of megabytes per operation.
-* **Appearance image HTTP fetches** — up to 5 MB per panel web-document
-  fetch. Appearance shipped Nov 9. Panel usage during feature testing was
-  necessarily high. This is the only feature that can turn *opening panels*
-  into hundreds of MB of HTTP egress.
-* **Dashboard/API polling** — 2,880 polls/day per open tab; 100 KB/poll =
-  288 MB/day. The API is unauthenticated and uncompressed, and `/api/saves`
-  selects every column. If a browser tab was left open during the same
-  window, this alone can reach the observed order of magnitude.
-
-Groq/Speechmatics STT (20 MB × up to 3 passes) and provider fan-out are
-plausible secondary contributors; Supabase and Telegram RPC are not
-credible GB-scale sources.
-
-### 11.5 The decisive measurement (no code change)
-
-Render exposes `GET https://api.render.com/v1/metrics/bandwidth-sources`
-with `startTime`, `endTime`, `resource` (max 30 resources) and hourly points,
-returning `labels.trafficSource` in `{total, http, websocket, nat,
-privatelink}`. Traffic-source data exists from 2025-03-09. Querying
-2026-11-07..12 for `RENDER_SERVICE_ID` splits the spike into:
-
-* **`http` high** → dashboard/API polling and/or the appearance image (and
-  the `/guide`/SPA assets). Then the fix is response size/caching/auth, not
-  media governance.
-* **`nat` high** → service-initiated traffic: Telegram uploads, Gemini/STT
-  uploads, Supabase requests, provider prompts. Then the fix is media
-  preflight/governance and STT/provider accounting.
-* **both** → quantify each; the report's ranked candidates already map to the
-  two buckets.
-
-The same split is visible without the API in the Render dashboard's Network
-Metrics graph (HTTP Responses vs Service-Initiated). This is an operator
-read-only action; no repository change and no new instrumentation is needed.
-
-### 11.6 What cannot be concluded
-
-The supplied evidence is for **one service in one account**. It does not
-represent the owner's other three/four Render accounts or any preview
-service. No causal claim is made from timestamps alone; the timeline above
-establishes *what shipped*, not *what was used*. Byte attribution to a
-specific feature remains unmeasured until the traffic-source split (and,
-ideally, the in-app counters in section 15) exist.
-
-## 12. Ranked root-cause candidates
-
-Ranking is by plausible contribution to Render **outbound** bytes, with the
-evidence and the missing measurement stated. "Frequency" and "byte size" are
-marked confirmed/estimated/unknown per candidate.
-
-| # | Candidate | Why it can consume bandwidth | Frequency | Byte size | Evidence | Confidence | Needed measurement |
-|---|---|---|---|---|---|---|---|
-| 1 | **Telegram media uploads** (Deep Save, albums, bulk re-send, renames, AI attachments) | Full media bytes are uploaded to Telegram DCs; albums multiply by member count up to ~5 GB; no cap before 2026-11-11 | Per save/send action; unknown production count | Confirmed formula: member size × members; default album ~500 MB | `save_service.py:1666,1935,1980`; `retrieve_service.py:1350`; `telegram_api/media.py:102`; `delivery.py:716`; governor commit `9d220b6` | **High** (family); per-day volume unknown | `nat` trafficSource on Nov 7–12; governor reservation logs (`OUTBOUND_BANDWIDTH_RESERVED`) and their `bytes` |
-| 2 | **Appearance image HTTP egress** | Telegram fetches `/appearance/image/<version>?fmt=jpeg` for every photo panel; up to 5 MB + thumbnail per fetch | Every newly created panel message with preview active | Up to 5 MB confirmed per fetch | `appearance_service.py:136,408-460,599-619`; `web/app.py:333-362` | **High plausibility**, volume unknown | `http` trafficSource; count panel messages/day; add a per-response byte log |
-| 3 | **Dashboard/API polling** | 3 GETs every 30 s; `/api/saves` select("*") 50 rows + count; `/api/logs` 100 rows; no gzip; unauthenticated | 2,880 polls/day per open tab | Row-size dependent; conditional formula: 100 KB/poll ≈ 288 MB/day | `src/App.tsx:84`; `src/lib/api.ts:146-158`; `db/client.py:456-475,1965-1975`; `web/app.py:82,139` | **Medium** (depends on an open tab) | `http` split; web access-log byte counters; per-row payload size |
-| 4 | **Groq/Speechmatics STT uploads** | Audio is uploaded with no governor; Groq may send it up to 3 passes | Per transcription, only when those engines are selected (Gemini is default) | ≤20 MB per pass; ≤60 MB per Groq operation | `groq_stt_engine.py:609-631,676`; `speechmatics_stt_engine.py` submit/poll; `media_service.py:246`; `stt_control_plane.py:78` | **Medium/Low** | Config: selected STT candidate and passes; add `len(audio)` accounting |
-| 5 | **AI provider prompt fan-out** | Up to 6 engine calls per request × model/provider candidates × full prompt | Per AI request, amplified on provider outage | Prompt order 10–35 KB (estimated from token budget, not measured); worst-case fan-out large | `dispatcher.py:72,696,781,1052`; `manager.py:66,134,919,1083`; `candidate_pool.py:57-59`; `openai_compat.py:138` | **Medium** (amplifier, not primary bytes) | Count provider attempts per request; sum serialized request bytes |
-| 6 | **History summarization** | Chunked map + reduce over up to 1,000 messages, each chunk ~4k tokens, paced 5 s | Per History request/task occurrence | ~16 KB per chunk (estimated); chunk count bounded by capacity | `history_ai_service.py:93,118-126`; `history_service.py:58` | **Low/Medium** | Count chunks and provider bytes per History run |
-| 7 | **Supabase request traffic** | Every query is an outbound HTTPS request; N+1 in `/api/db/stats`; config read per outgoing message | High request count | Per request hundreds of bytes to a few KB | `db/client.py`; `db_stats.py:34-42`; `ai_unified.py:1030` | **Low** | Request-count/byte counter at the transport |
-| 8 | **Telegram RPC / panel edits / keepalive** | Persistent control traffic, panel countdown edits every 30 s, minute profile cron | Continuous | Small | `keepalive.py:28`; `panel_timer.py:21`; `profile/scheduler.py:149-155` | **Low** | Protocol-level byte counters (not currently available) |
-| 9 | **Model discovery / model tester** | One GET per provider on panel open; a full real-model test on demand | On demand only | Request-count burst; responses inbound | `web/app.py:156-208,286`; `model_tester.py:684,861` | **Low** (spiky) | Count tests and provider calls |
-| 10 | **Gemini media / TTS / governed uploads** | Real bytes, but already capped by the governor (Gemini) or bounded by audio limits | Per operation | Governed | `gemini_media_engine.py:749-762`; governor calls | **Low** (capped) | Existing governor ledger |
-
-The ranking deliberately keeps **request count** and **byte volume** separate.
-Supabase and Telegram RPC are high-count/low-byte; media uploads and the
-appearance image are low-count/high-byte. A high AI token count does not
-prove high egress, and a large database response is inbound/free.
-## 13. Confirmed facts vs hypotheses
-
-### Confirmed from code (source-verified at `65632bf`)
-
-* Render bills outbound only: HTTP/WebSocket responses + all service-initiated
-  traffic; inbound is free (Render documentation).
-* The governor limits are 150,000,000 bytes/day and 4,000,000,000 bytes/month,
-  are fail-closed, and are a reservation ledger rather than an egress meter
-  (`outbound_bandwidth_service.py:45-46,233-300`).
-* The governed call sites are exactly the nine groups in section 10.
-* Groq and Speechmatics STT uploads have **no** governor call
-  (`groq_stt_engine.py:676`; `speechmatics_stt_engine.py` submit/poll).
-* HTTP responses, Telegram protocol traffic, helper-bot traffic, Supabase
-  request/response traffic, provider prompts and discovery are ungoverned.
-* `/appearance/image/{version}` can return up to 5 MB per fetch and sets a
-  one-year immutable cache header (`appearance_service.py:136`;
-  `web/app.py:333-362`).
-* Every Glass panel with the appearance preview active is a `photo` inline
-  result whose document URL is the Render appearance endpoint
-  (`appearance_service.py:408-460,599-619`).
-* The dashboard polls three endpoints every 30 s (`src/App.tsx:84`), and
-  `/api/saves` / `/api/logs` use `select("*")` (`db/client.py:456-475`,
-  `:1965-1975`). The API has no authentication and no compression middleware.
-* One user AI request can produce up to six `ProviderManager.chat()` calls,
-  and each can fan out across model/provider candidates with one retry per
-  candidate (`dispatcher.py:72,696,781,1052`; `manager.py:66,919,1083`).
-* The durable candidate pool is bounded at 32 providers × 256 models per
-  provider and is restored only from a complete Test Modules run
-  (`candidate_pool.py:57-59`).
-* Provider health checks are local; discovery is on demand with a 600 s cache;
-  there is no periodic provider poll.
-* The task scheduler wakes at most every 60 s, performs ~2–3 queries when
-  idle, and does no provider/Telegram work when nothing is due
-  (`task_scheduler.py:15-23,470-480`).
-* Telegram media downloads are inbound; uploads are outbound and governed on
-  the five verified paths.
-* Keepalive is one `get_me` per 60 s; heartbeat and failsafe are local.
-
-### Hypotheses (supported by code, not proven by measurement)
-
-* **H1.** Telecom media uploads (especially album Deep Save) dominate the
-  Nov 7–12 outbound spike, because the governor did not exist until Nov 11
-  and albums can reach hundreds of MB per operation.
-* **H2.** The appearance panel photo causes one Telegram web-document fetch of
-  up to 5 MB per created panel message, producing large `http` egress during
-  the Appearance release window.
-* **H3.** A dashboard tab left open during these days contributed materially
-  through uncompressed `select("*")` polling.
-* **H4.** Provider fan-out on an unhealthy provider multiplied prompt egress
-  beyond the normal one-request-per-turn baseline.
-* **H5.** Groq/Speechmatics multi-pass STT contributed for the periods when
-  those engines were selected.
-
-None of H1–H5 can be confirmed or ranked definitively from source alone. Each
-has a named measurement in sections 11.5 and 15.
-
-### Explicitly not concluded
-
-* That total workspace usage is 4.155 GB — that figure is one service in one
-  account. The owner's other accounts/services are out of scope of the
-  supplied metric.
-* That the 338 points are complete — they are not (551 elapsed hours).
-* That any feature "caused" the spike from its commit date alone.
-* That bandwidth was reduced by this task — nothing was changed.
-* That the governor is ineffective — it is effective inside its declared
-  scope; the point is that its scope is smaller than total Render egress.
-
-## 14. Current observability gaps
-
-| Gap | Consequence |
+For `Q = 2,300–2,600` (assuming the observed count is task-event traffic; Anti-Edit can add more):
+
+| Owner-authored share `O` | Implied messages / 5 min | Implied messages / s |
+|---:|---:|---:|
+| 0% | 2,300–2,600 | 7.7–8.7 |
+| 25% | 1,840–2,080 | 6.1–6.9 |
+| 50% | 1,533–1,733 | 5.1–5.8 |
+| 100% | 1,150–1,300 | 3.8–4.3 |
+
+This is a derived range, not a measured message rate. The production message rate and owner share were not supplied.
+
+**VERIFIED FACT — the periodic background baseline is far too small.**
+
+| Source | Queries per five minutes | Evidence |
+|---|---:|---|
+| Task scheduler idle | ~15 | 3 queries per wake at a 60 s ceiling: `list_due_retry_occurrences`, `list_due_tasks`, `next_run_hint` (`backend/ai/task_scheduler.py:21-23`, `443-447`, `452-475`; repository queries at `task_repository.py:1258`, `1263`, `1411`) |
+| Dashboard polling (one open tab) | 40 | 4 queries per 30 s: `api.saves` performs 2 (`backend/db/client.py:454-472`), `api.bio` 1, `api.logs` 1 (`src/App.tsx:62-85`) |
+| Governor policy refresh | ~2 (one `panel_settings` read + one Render API request per 5 min cache) | `backend/services/outbound_bandwidth_service.py:428-436`, `550-616` |
+| Heartbeat/attribution | ~1 | `backend/runtime/heartbeat.py:181-203` |
+| AI trigger config | at most 1 per 30 s on an AI-triggered message | `backend/bot/handlers/ai_unified.py:61-62`, `263-268` |
+
+Even adding all of these, the non-message baseline is on the order of **50–60 operations per five minutes**, roughly **2–3%** of the observed window. It cannot produce 2,300–2,600 by itself.
+
+### 2.4 Conditional per-message writer: Anti-Edit / Anti-Delete
+
+**VERIFIED FACT — the Anti-Edit / Anti-Delete handler can add multiple PostgREST calls per eligible private message.**
+
+The handler is registered on `events.NewMessage()` (`backend/bot/handlers/anti_edit_delete.py:512-530`). It awaits `service.ensure_loaded_async()`, returns immediately if the feature is disabled, and otherwise resolves the peer identity and calls `service.record_message`. `record_message` then:
+
+1. calls `load_rows_async(force=True)`, which reads the archive from the dedicated `aed_archive_entries` table or the legacy `bot_settings` shards (`backend/services/anti_edit_delete_service.py:925-956`);
+2. builds the row and calls `_save_rows(rows)` (`:1050-1105`);
+3. in dedicated mode, `_save_aed_entries_sync` performs an `upsert` of the complete bounded row set and a delete of rows no longer present (`backend/db/client.py:3221-3248`);
+4. in legacy mode, `_aed_save_shards_sync` performs a `select` and an `update`/`insert` for each of four shards (`backend/db/client.py:2957-2980`).
+
+That is approximately **3 requests** per eligible private message in dedicated mode (one load, one upsert, one delete), or **9 requests** in legacy mode (one load plus four select/write pairs). The archive is bounded, but the write payload is the whole bounded row set, not one row.
+
+**UNKNOWN — whether the feature was enabled and populated in production.**
+
+No configuration value was supplied. The 7–9 KB measured request-body rate is evidence against a large active archive, because an active archive would write the whole row set on every eligible message. A disabled feature, an empty archive, or a small archive could remain compatible with 7–9 KB. In the small-archive case, its 3–9 requests per eligible private message could dominate the observed count while still producing little body traffic. This path must be ruled in or out from configuration/feature state before attributing the entire PostgREST count to task events.
+
+### 2.5 Retries, concurrency, and duplication
+
+**VERIFIED FACT — the per-message read path has no request retry.**
+
+`TaskRepository._run` dispatches one synchronous call through `run_sync_db` and returns or raises (`backend/ai/database/task_repository.py:1179-1188`; `backend/db/client.py:223-243`). There is no loop around `list_event_tasks` or `list_waiting_answer_occurrences`. The governor’s `_MAX_CONFIRM_ATTEMPTS = 3` applies only to a state write/confirm, not to these reads (`outbound_bandwidth_service.py:137`, `769-840`).
+
+**INFERENCE — the count is not amplified by retries in normal operation.**
+
+A transient Supabase failure would produce one failed request and a fallback, not an automatic retry storm. A reconnect replay of Telegram updates is a possible duplicate source, but no deduplication or replay measurement exists in this path; its size is **UNKNOWN**.
+
+**VERIFIED FACT — each event is handled independently; there is no request coalescing.**
+
+Two messages arriving close together produce two `list_event_tasks` calls. There is no per-chat debounce, no batch endpoint, and no shared future. The bounded DB executor controls concurrency but does not deduplicate work (`backend/db/client.py:223-243`).
+
+### 2.6 Correction: `/api/db/stats` is not a PostgREST N+1
+
+**VERIFIED FACT — the previously suspected `/api/db/stats` N+1 does not issue one PostgREST request per session.**
+
+`backend/observability/db_stats.py:32-43` does loop over up to 10,000 sessions and calls `mgr.message.count(session_id)` once per session. However, `RepositoryManager` constructs:
+
+```python
+self._session = InMemorySessionRepository()
+self._message = InMemoryMessageRepository()
+```
+
+unconditionally, even when Supabase is available (`backend/ai/database/manager.py:64-68`). Only the task repository, memory repository, usage repository, and provider-stats repository are Supabase-backed. The session/message loop is therefore an **in-memory loop**, not a PostgREST fan-out.
+
+The endpoint still makes a small number of Supabase calls for memory/provider counts, but it is not a credible source of 2,300–2,600 PostgREST operations. This correction matters because the endpoint is unauthenticated and easy to misidentify as the cause.
+
+### 2.7 Request count versus measured bytes
+
+**VERIFIED FACT — measured body bytes are tiny compared with the Render total.**
+
+The supplied attribution window reports `7–9 KB` of `exact_payload_bytes` per five minutes. If that body rate were sustained for a month, it would be only:
+
+```text
+7–9 KB / 5 min × 288 windows/day × 30 days ≈ 60–78 MB/month
+```
+
+That is roughly **1.1–1.4%** of 5.56 GB even under an unrealistic sustained assumption. Body bytes alone cannot explain the overage.
+
+**VERIFIED FACT — the body-only counter cannot see the bytes that a `GET` actually sends.**
+
+A PostgREST `GET` has no request body. `_body_size` returns `0` when neither `Content-Length` nor `Transfer-Encoding` is present (`egress_attribution.py:748-765`), and `record_exact` records that zero plus one operation (`egress_attribution.py:234-238`). The request line and every header are excluded. The module doc says so explicitly:
+
+> “an `httpx` event hook reading the request's `Content-Length` … excludes TCP/IP, TLS and HTTP headers.”
+
+The same doc says the sum is “not expected to equal” Render (`egress_attribution.py:1-35`).
+
+**INFERENCE — a 2,400-per-five-minute stream of bodyless `GET`s can be GB-scale while measuring 7–9 KB of body.**
+
+The request overhead per call is the only necessary explanation. At the observed rate, the monthly total corresponds to roughly **250–280 bytes per request** if the rate were sustained 24/7. If the real header block is 500 bytes, the same rate would produce about **10–11 GB/month**, so the actual rate must have been lower on average or limited to active hours. The exact per-request size is **UNKNOWN / NOT MEASURABLE** from the current counter.
+
+The HTTP/1.1 pin makes this more consequential, not less: unlike HTTP/2, HTTP/1.1 has no HPACK compression of repeated headers. The Supabase client passes the deployment key into the client (`backend/db/transport.py:108-124`), so each request carries its own authentication headers. Header length is deployment-specific and was not inspected.
+
+---
+
+## 3. Telegram / Telethon traffic investigation
+
+### 3.1 The per-message handler does not make a Telegram RPC
+
+**VERIFIED FACT — the task-event handler itself does not make a Telegram RPC.**
+
+`task_events.py:56-97` receives the update from Telethon and performs database work. It does not call `send_message`, `get_messages`, `get_entity`, or `get_me`. The private-message gate it calls first may resolve an entity for a private chat (`backend/bot/handlers/private_message.py:431-475`), but the task-event path itself is database work. The observed 2,300–2,600 PostgREST operations are therefore **not** Telegram RPC operations; they are database requests caused by Telegram events.
+
+This distinction is central: the message rate can drive PostgREST egress without a corresponding per-message Telegram upload.
+
+### 3.2 Telegram RPC categories and repeated patterns
+
+**VERIFIED FACT — Telegram calls are scattered across handlers and services, with a central retry helper.**
+
+Representative categories found:
+
+| Category | Call sites / behavior |
 |---|---|
-| Render metric is hourly, service-total, ~60 min delayed, and sub-1 MB hours may read as 0 | Cannot attribute a spike to a subsystem or see short bursts |
-| The app never queries `/metrics/bandwidth-sources` | No HTTP vs service-initiated split inside LifeOS |
-| Governor counts reservations, not transmitted bytes, and never refunds | Ledger ≠ wire; over-reports failed transfers |
-| No HTTP response byte counter | `/api/*`, `/guide`, appearance image egress is invisible |
-| No provider request/response **byte** counter | `task_trace` records `request_size` and `response_length` in characters only (`manager.py::_call_once`); not aggregated, not persisted |
-| No STT/TTS upload byte counter | Groq/Speechmatics egress is invisible (Gemini logs sizes via the governor) |
-| No Supabase request byte counter | Request-count and request-size attribution impossible |
-| No Telegram protocol byte counter | RPC/panel/keepalive traffic is invisible (and likely small) |
-| `monthly_is_partial` only checks the 29-day window clamp | Interior gaps and missing zero-hours are not detected (`render_bandwidth_service.py:181-182`) |
-| `_parse_payload` rejects an empty `values` list as unavailable | A genuinely zero-usage service is reported as unmeasurable (`render_bandwidth_service.py:87-89`) |
-| Render HTTP request-count metric returned no data for the same query | The request-count signal the operator tried to use is unavailable/renamed; do not infer request volume from it |
-| No per-endpoint access log with bytes | `/health` vs `/api/saves` vs `/appearance/image` indistinguishable |
+| Send text/panels | `client.send_message` / edit paths in handlers; text is not governed by the bandwidth reservation ledger |
+| Upload media | `client.send_file` / `upload_file` in Deep Save, album members, rename re-upload, voice notes, AI attachments |
+| Download media | `client.download_media` in save/retrieve/appearance/anti-edit paths; recorded as inbound payload, not egress |
+| Entity resolution | `get_entity` / `get_input_entity` for peers and private-message senders |
+| Message reads | `get_messages` for replies, history, and verification |
+| Keepalive | `client.get_me()` every 60 s (`backend/runtime/keepalive.py:23-24`, `83`) |
+| Recovery | `get_me()` verification during supervisor recovery (`backend/runtime/supervisor.py:1012-1023`) |
+| Retry | `tg_rpc` supports up to 4 total attempts (3 retries) for factories on `FloodWait`/transient errors (`backend/runtime/tg_retry.py:59-120`) |
 
-Existing partial instrumentation worth reusing (not duplicating):
+**VERIFIED FACT — no periodic Telegram media transfer or history poll was found.**
 
-* `task_trace` events `provider_request_start` (request_size chars),
-  `provider_response` (response_length chars), `provider_selection`,
-  `provider_fallback` (`backend/ai/task_trace.py`, emitted from
-  `manager.py::_call_once`).
-* Governor log line `OUTBOUND_BANDWIDTH_RESERVED category=... bytes=...
-  daily_used=... monthly_used=...`.
-* STT/TTS engines' bounded `_log_run(byte_count, chars, ...)` lines.
-* The diagnostics ring (`backend/diagnostics.py`,
-  `GET /api/diagnostics/events`).
-* uvicorn access logs (path/status, no bytes).
-* Render's own dashboard Network Metrics breakdown.
+The only fixed Telegram cadence found is the 60 s `get_me` keepalive. The task scheduler is a local wake loop with database queries, not a Telegram poll. Telethon itself receives updates over the existing connection; no application-level per-message `getUpdates` loop exists.
 
-## 15. Minimal future instrumentation design
+**INFERENCE — `tg_rpc` can amplify traffic during instability, but not in the normal path.**
 
-The design is deliberately compatible with the existing architecture: **no
-second scheduler, no second HTTP client, no second Telegram client, no second
-executor, no second task lifecycle, no new table or migration.**
+A FloodWait or transport failure can cause up to four attempts of the same RPC. That is bounded and only occurs on failure. It cannot explain a steady 2,300–2,600 PostgREST reads, which do not go through `tg_rpc` at all.
 
-### Tier 0 — zero code (available now)
+### 3.3 Governed upload seams
 
-1. `GET https://api.render.com/v1/metrics/bandwidth-sources` for
-   `RENDER_SERVICE_ID`, `startTime=2026-11-07T00:00:00Z`,
-   `endTime=2026-11-13T00:00:00Z`. Read `labels.trafficSource` and the
-   `values[]`. This splits `http` from `nat` and settles H2/H3 vs H1/H5.
-2. The Render dashboard's Network Metrics graph for the same range. The
-   operator can read it without any credential handling by the agent.
-3. Optional: query the same endpoint for the other accounts/services to
-   establish the workspace total (the supplied 4.155 GB is one service).
+**VERIFIED FACT — the main new-payload Telegram uploads reserve before transmitting.**
 
-### Tier 1 — in-process bounded counters (recommended next phase, RAM only)
+| Path | Reservation / evidence |
+|---|---|
+| Deep Save single | `backend/services/save_service.py:1678-1692` (`_reserve_upload_bytes("telegram_media", actual_size)` immediately before `send_file`) |
+| Deep Save album member | `backend/services/save_service.py:1969-1980` (per-member reservation before `upload_file`; grouped send attaches existing handles at `2018-2022`) |
+| Rename re-upload | `backend/services/retrieve_service.py:1374-1411` (policy then download then reservation/upload) |
+| Voice note | `backend/telegram_api/media.py:117-166` (policy then reservation then `send_file`) |
+| AI attachment | `backend/ai/tools/delivery.py:725-747` (reservation then policy then `send_file`) |
 
-One small module, e.g. `backend/observability/egress_counters.py`, with a
-bounded dict of `{category: bytes}` plus `{category: count}`, an hourly
-bucket, and a hard cap on categories (e.g. 12). It exposes
-`add(category, n)` and `snapshot()`. It performs no I/O and never logs
-payloads, headers or secrets. Call sites are the **existing boundaries**:
+The album path is especially large by configuration: `max_deep_save_mb` defaults to 50 MB and is validated up to 500 MB (`backend/services/settings_service.py:39`, `79`, `176`). A multi-file album can therefore represent multiple GB in one operation, although the per-member reservations and the bulk policy gate are applied before each transfer.
 
-| Boundary | Where to count | What to count |
-|---|---|---|
-| Provider attempts | `ProviderManager._call_once` (already computes `request_size`) | `len(json.dumps(payload))` is not visible there; count `len(json.dumps(messages))` + `len(tools)` as an upper bound, and `len(response.text)` for responses. Category `provider:<name>` |
-| Telegram uploads | the five governed helpers, plus `telegram_api/media.py` voice | payload bytes already passed to the governor |
-| STT uploads | `groq_stt_engine._request`, `speechmatics_stt_engine._submit` | `len(audio)` |
-| TTS requests | each engine's request builder | `len(text.encode())` |
-| FastAPI responses | one `@app.middleware("http")` | `len(response.body)` (or `Content-Length`) + path class (`/api/saves`, `/appearance/image`, static, health) |
-| Supabase | `backend/db/transport.py` `HTTP1Session.send` override | `len(request.content or b"")` + path class |
-| Render metrics | `render_bandwidth_service` | request/response size |
+**VERIFIED FACT — these reservations are payload-level, not wire-level.**
 
-Bounding rules: aggregate per category and per hour; keep a ring of 24
-buckets; never store URLs with query strings, bodies, headers or tokens; one
-log line per hour (reuse the existing heartbeat/diagnostics pattern rather
-than a new loop). Expose the snapshot through the existing
-`/api/status`/`runtime_status()` payload or the diagnostics ring — not a new
-endpoint if avoidable.
+`egress_attribution` counts Telethon's cumulative `progress_callback(current, total)` deltas for one file and documents that RPC frames, TL/encryption overhead, keepalives, panel edits, and connection setup stay unmeasured (`backend/observability/egress_attribution.py:8-20`). A reserved byte count is the file size, not the MTProto wire size. TLS/TCP retransmissions are not represented.
 
-This is enough to answer "which subsystem sent the bytes" at the same
-resolution as the Render metric, without a schema change and without
-touching enforcement.
+**INFERENCE — a small number of large media operations could dominate a 5.56 GB month, but the supplied evidence does not show that they occurred.**
 
-### Tier 2 — optional persistence (requires explicit approval)
+The governor snapshot’s `governor_monthly_bytes` was not supplied. The effective value alone (`5.61 B`) cannot tell whether the local ledger contained a large media total or only a small one. The exact media contribution is **UNKNOWN**. At the current tier 90, the governed media seams would deny new non-text transfers, so historical media is the only relevant question; it cannot be answered from the snapshot fields provided.
 
-If counters must survive restarts, write the hourly snapshot into the
-  existing `bot_settings` JSON document (the same `bot_settings` document
-  mechanism `candidate_pool.publish`/`load` uses) or the existing
-  `panel_settings` JSONB.
-That is still no new table/migration. Persist at most once per hour, bounded
-payload, no request bodies. Any schema change is explicitly out of scope for
-this task.
+### 3.4 What Telegram traffic is measurable
 
-### What the instrumentation must not do
+**VERIFIED FACT — the current instrumentation can measure only completed payload boundaries.**
 
-* No second HTTP client manager or connection pool.
-* No new scheduler/worker; piggyback on an existing tick.
-* No new table, migration or SQL.
-* No logging of prompts, messages, media, credentials or full URLs with
-  tokens.
-* No change to the governor's enforcement semantics; counters observe, they
-  do not reserve.
+- Upload: completed file bytes via progress deltas, one logical transfer per file.
+- Download: payload path/bytes returned by the supported download boundary.
+- Unmeasured: MTProto frames, TL serialization, encryption, keepalives, ACKs, retransmissions, failed transfers without a completed payload, entity/RPC calls, and connection setup.
 
-## 16. Prioritized optimization opportunities
+**UNKNOWN / NOT MEASURABLE — raw MTProto wire bytes.**
 
-Ordered by expected egress reduction per unit of risk. None is implemented
-here.
+The repository does not instrument Telethon's transport or the MTProto connection. No statement in this report claims to measure raw Telegram wire bytes. Any estimate of Telegram's share of the 5.56 GB would be an estimate, not a measurement.
 
-1. **Album/save preflight against remaining budget.** Today
-   `_deep_save_album` reserves per member (`save_service.py:1935`); a
-   10 × 50 MB album starts uploading and can fail mid-way after reserving
-   hundreds of MB. Compute the total album size first and refuse the whole
-   operation if it exceeds the remaining daily/monthly budget. This prevents
-   the largest single-operation egress and avoids wasted uploads.
-2. **Make the appearance photo cheap.** Serve a small dedicated JPEG (e.g.
-   ≤100–200 KB, or the 320 px thumbnail) as the inline photo document instead
-   of a rendition that can reach 5 MB; keep the full-resolution image behind
-   the existing versioned URL only for explicit viewing. If Telegram's fetch
-   behaviour is confirmed as the main `http` contributor, this is the single
-   largest HTTP lever. Alternative: upload the preview once through the helper
-   bot and reuse Telegram's `file_id`, eliminating Render-served image bytes
-   entirely.
-3. **Shrink and authenticate the dashboard API.** Select only rendered
-   columns (drop `select("*")`), add `ETag`/`Last-Modified` + `304`, add
-   gzip, reduce default limits, and require the owner session. A closed tab
-   is free; an open tab should not stream full rows every 30 s.
-4. **Govern Groq/Speechmatics STT uploads.** Reserve `len(audio)` (× passes)
-   before the multipart POST, exactly as the Gemini path does. This closes the
-   last media-sized ungoverned upload class.
-5. **Bound provider fan-out.** Add a per-request attempt cap (e.g. 2–3 model
-   candidates, or a byte/attempt budget) and avoid re-sending the full prompt
-   to every model of a provider already proved unhealthy in this request.
-   Keep the existing retry/cooldown semantics; only cap the breadth.
-6. **Trim continuation payloads.** The engine already caps rounds at 3; the
-   continuation messages still repeat the entire prompt. A bounded,
-   explicitly-versioned continuation shape (or sending only the new tool
-   results plus a compact instruction) would cut per-round bytes, but it
-   changes the provider contract and needs its own correctness work.
-7. **Avoid re-uploads on rename.** `do_change_file_name` downloads and
-   re-uploads (`retrieve_service.py:1336-1351`). Telegram's server-side copy
-   or an in-place caption edit (when only the name changes) avoids the bytes.
-   This needs a product decision about message identity.
-8. **Make the model tester and discovery deliberate.** Confirm before a full
-   test (it can call every model), cache aggressively, and never run it from
-   an unauthenticated request.
-9. **Compress and cache static/guide assets.** Add gzip/brotli for text
-   responses and long-lived `Cache-Control` for hashed SPA assets; the guide
-   site can carry an ETag. Small but free.
-10. **De-duplicate per-message config reads.** `ai_unified_handler` reads
-    `ai_config` before knowing whether the message is a request. A short-TTL
-    in-process cache (the settings service already uses this pattern) would
-    remove one Supabase request per outgoing message.
-11. **Keep the governor fail-closed and visible.** When a reservation is
-    denied, tell the owner in the existing panel/notice path; do not add a
-    second accounting system.
-## 17. Explicitly deferred work
+---
 
-Not done, by design or by lack of authorization:
+## 4. Outbound governor and 100% hard-limit audit
 
-* Any code change, refactor, dependency change, test change or new module.
-* Any database schema/migration/SQL, including adding counters or tables.
-* Any Render configuration change: plan, instance count, health-check path,
-  environment variables, preview services, suspend/resume/delete.
-* Any live Telegram, Supabase, AI provider or Render API call; no Render shell.
-* Any measurement on the owner's other Render accounts or preview services.
-* Implementing the instrumentation in section 15 or any optimization in
-  section 16.
-* Changing the governor's limits (150 MB/day, 4 GB/month) or its fail-closed
-  semantics.
-* Deciding whether previews should be disabled, whether the plan should
-  change, or whether the appearance feature should drop its photo.
-* Deleting or rewriting any existing documentation.
+### 4.1 Enforcement flow
 
-The next phase needs an explicit instruction to implement, plus the Tier 0
-traffic-source measurement so the first optimization targets the right
-bucket.
+**VERIFIED FACT — the policy snapshot is a max of Render, the local ledger, and the persisted floor.**
 
-## 18. Exact files/functions inspected
+`refresh_policy_snapshot`:
 
-Repository root: `AGENTS.md`, `INVESTIGATION.md`, `IMPLEMENTATION_REPORT.md`,
-`ROADMAP.md`, `AI_MASTER_DESIGN.md`, `DATABASE_ARCHITECTURE.md` (targeted),
-`render.yaml`, `Procfile`, `Dockerfile`, `guide/*`, `src/*`.
+1. Reads Render's monthly metric (`render_bandwidth_service.get_render_bandwidth_usage`).
+2. Reads the local governor state (`_current_governor_monthly`).
+3. Reads the persisted monthly `policy_floor`.
+4. Computes `effective = max(render_bytes or 0, governor_bytes or 0, floor)`.
+5. Sets `trusted = render_trusted and governor_available`, with fail-closed reasons for untrusted Render or governor.
+6. Computes `tier = _policy_tier(effective)`.
+7. Persists a new floor when `effective > floor`.
 
-### Bandwidth / governor
-* `backend/services/outbound_bandwidth_service.py` — module docstring,
-  `DAILY_LIMIT_BYTES`, `MONTHLY_LIMIT_BYTES`, `_STATE_KEY`, `_lock`,
-  `_normalize_state`, `_read_row_state`, `_persist_state`, `_reserve_locked`,
-  `reserve_outbound_bytes`, `reserve_outbound_bytes_sync`, `usage_state`,
-  `_usage_snapshot`, `get_outbound_usage`, `release_reservation`.
-* `backend/services/render_bandwidth_service.py` — `_parse_payload`,
-  `_series_matches_service`, `get_render_bandwidth_usage`,
-  `monthly_is_partial` handling.
-* `backend/services/panel_settings_repository.py` — `load`, `update_field`,
-  `update_fields`, `reload`.
-* `backend/bot/handlers/misc.py` — `_format_bandwidth_bytes`,
-  `_bandwidth_unavailable_body`, `_bandwidth_body`,
-  `_render_platform_bandwidth_body`, `_bandwidth_render`,
-  `_bandwidth_panel_handler`, `_bandwidth_refresh_action`, `_register_panels`.
-* Thin alias modules: `outbound_bandwidth.py`, `bandwidth_service.py`,
-  `bandwidth_governor.py`, `outbound_bandwidth_governor.py`.
+Evidence: `backend/services/outbound_bandwidth_service.py:550-616`. The Render metric is trusted only when it is available, belongs to the current UTC month, has a trustworthy `latest_data_at` no more than 3 hours old, and is not in the future (`:452-462`). A partial Render month may still be trusted; the floor prevents a lower partial reading from lowering the tier (`tests/test_outbound_bandwidth_policy.py:413-444`).
 
-### AI request path
-* `backend/bot/handlers/ai_unified.py` — `ai_unified_handler` (1014),
-  `_load_triggers` (~1030), `_execute_ai`, `_AI_TIMEOUT`, `_AI_EXECUTE_TIMEOUT`.
-* `backend/ai/engine/engine.py` — `Engine.__init__`, `execute`,
-  `engine_health`, `attach_tools`, `apply_persisted_config`,
-  `_heal_phantom_config`.
-* `backend/ai/engine/dispatcher.py` — `MAX_TOOL_ROUNDS`, `dispatch`, initial
-  provider call, `AI_PROVIDER_EMPTY_RESPONSE_RETRY`,
-  `AI_ACTION_RECOVERY_RETRY`, tool loop, `_build_continuation_messages`,
-  `_build_messages`, usage accumulation, rate limiter.
-* `backend/ai/providers/manager/manager.py` — `chat`, `_ordered_candidates`,
-  `_skip_reason`, `_score`, `_candidate_models`, `set_model_candidates`,
-  `_attempt_with_retry`, `_call_once`, `_apply_failure`,
-  `_escalate_if_provider_wide`, `_fallback`, health snapshot.
-* `backend/ai/providers/manager/health.py` — state machine, penalties,
-  cooldowns, quarantine, model-scope classification.
-* `backend/ai/providers/openai_compat.py` — client creation, `chat`, error
-  fields, `list_models`.
-* `backend/ai/providers/gemini.py` — client creation, `chat`, model list.
-* `backend/ai/providers/you_search.py` — search request.
-* `backend/ai/discovery.py` — `discover_providers`, provider GETs.
-* `backend/ai/model_discovery.py` — `_CACHE_TTL`, `fetch_models`,
-  `get_cached_models`, pagination.
-* `backend/ai/model_tester.py` — `test_all_models`, `test_all_models_streaming`,
-  candidate publication.
-* `backend/ai/candidate_pool.py` — bounds, `build_document`, `publish`,
-  `load`, `restore`.
-* `backend/ai/retry.py` — `MAX_ATTEMPTS`, `retry_delay`, `can_retry`.
-* `backend/ai/prompt/builder.py` — `build`, `_render_sections`,
-  `_merge_system`, `_trim_history_to_budget`.
-* `backend/ai/prompt/budget.py` — token defaults.
-* `backend/ai/prompt/template.py` — fixed system/platform/runtime/output text.
-* `backend/ai/conversation/context_builder.py`, `conversation/*`,
-  `runtime/manager.py`, `runtime/history.py`, `session/request.py`.
-* `backend/ai/memory/*`.
-* `backend/ai/persistence.py` — session/message/memory/tool-history
-  persistence, in-flight bound.
-* `backend/ai/database/usage_recorder.py`, `usage_repository.py`,
-  `usage_reader.py`, `provider_stats_repository.py`, `message_repository.py`,
-  `session_repository.py`, `preferences_repository.py`,
-  `tool_history_repository.py`, `memory_repository.py`.
-* `backend/ai/tools/executor.py` — `MAX_TOOLS_PER_TURN`, execution semantics.
-* `backend/ai/tools/delivery.py` — attachment reservation and send.
-* `backend/services/media_service.py` — `MAX_STT_INPUT_BYTES`,
-  `MAX_OCR_INPUT_BYTES`, `MAX_EXTRACTED_CHARS`, chunking.
-* `backend/services/gemini_media_engine.py` — `_reserve_gemini_bandwidth`,
-  upload/download/delete, `_client`.
-* `backend/services/groq_stt_engine.py` — `_run_passes`, `_request`,
-  `_client`.
-* `backend/services/speechmatics_stt_engine.py` — `_submit`,
-  `_wait_for_job`, `_job_status`, `_fetch_transcript`, `_send`, `_client`.
-* `backend/ai/stt_control_plane.py` — candidates, default Gemini, passes.
-* TTS engines: `gemini_tts_engine.py`, `openai_tts_engine.py`,
-  `grok_tts_engine.py`, `speechmatics_tts_engine.py`.
+**VERIFIED FACT — reservations fail closed, except for the explicit text exemption.**
 
-### Save / retrieve / storage
-* `backend/services/save_service.py` — `_reserve_upload_bytes`,
-  `_deep_save_one`, `_deep_save_album`, `execute_save`, `execute_link_save`,
-  `_fetch_linked_message`, album upload/send.
-* `backend/services/retrieve_service.py` — `_reserve_reupload_bytes`,
-  `do_retrieve` (`forward_messages`), `do_change_file_name`, `do_bulk_send`,
-  `do_bulk_delete`, `_send_single`.
-* `backend/services/anti_edit_delete_service.py` — `store_media_snapshot`,
-  Storage upload/remove.
-* `backend/services/appearance_service.py` — limits, `_upload_sync`,
-  `image_payload`, `telegram_photo`, `telegram_thumb`, photo result builders,
-  URL builders.
-* `backend/bot/handlers/appearance.py` — `iter_download` path.
-* `backend/telegram_api/media.py` — `_reserve_voice_bytes`, `send_voice`,
-  `send_file`.
-* `backend/telegram_api/api.py`, `backend/telegram_api/__init__.py`.
+`_read_row_state` raises `OutboundBandwidthUnavailableError` when durable accounting is unconfigured, unreadable, missing, or malformed (`outbound_bandwidth_service.py:340-362`). `_persist_state` raises when the write fails or is refused (`:364-385`), and `_reserve_locked` retries the read/check/write/confirm sequence at most `_MAX_CONFIRM_ATTEMPTS = 3` times before denying (`:137`, `769-840`). `_assert_policy_allows` denies every non-text action when the snapshot is untrusted (`:690-715`). The deliberate exception is text up to 32 KiB, which remains available even when the policy is untrusted. That is a fail-open by design for availability, not an accidental bypass.
 
-### Tasks / scheduling
-* `backend/ai/task_scheduler.py` — constants, `recover`,
-  `_execute_claimed`, `_run_due_retries`, `_process_due_task`,
-  `_run_due_sweeps`, `run_once`, `_sleep_seconds`, `run`, `_prepare_next_ahead`.
-* `backend/ai/task_execution.py` — coordinator/preparation paths.
-* `backend/ai/task_trigger.py`, `task_events.py`, `task_answers.py`,
-  `task_contract.py`, `task_candidate.py`, `task_creation.py`,
-  `task_management.py`, `task_notifications.py`, `scheduling.py`.
-* `backend/ai/database/task_repository.py` — `list_due_tasks`,
-  `next_run_hint`, `list_due_retry_occurrences`, `list_recoverable_occurrences`,
-  `create_occurrence`, `claim_occurrence`, `transition_occurrence`,
-  `advance_next_run`, `delete_task`.
-* `backend/runtime/supervisor.py` — `_start_task_scheduler`, background loop
-  startup, recovery.
-* `backend/services/history_ai_service.py`, `history_service.py` —
-  `MAX_HISTORY_MESSAGES`, chunk budgets, pacing.
+### 4.2 Exact tier behavior
 
-### HTTP / dashboard
-* `backend/web/app.py` — every route, `mount_static`, appearance handlers.
-* `backend/observability/*` — `runtime_status`, `ai_stats`, `db_stats`,
-  `health_snapshot`, `performance`, `maintenance`, `crash_report`.
-* `src/App.tsx`, `src/lib/api.ts`, `src/components/*`, `guide/*`.
+**VERIFIED FACT — the tiers are cumulative and stop at 90.**
 
-### Runtime / Telegram
-* `backend/main.py`, `backend/config.py`.
-* `backend/bot/client.py` — `build_client` options.
-* `backend/helper/client.py` — helper options.
-* `backend/runtime/keepalive.py`, `heartbeat.py`, `failsafe.py`,
-  `diagnostics.py`, `memory_cleanup.py`, `task_guard.py`,
-  `operation_watchdog.py`, `tg_retry.py`.
-* `backend/profile/scheduler.py` — `_cron_loop`.
-* `backend/helper/panel_timer.py`, `inline_sender.py`, `inline_engine.py`,
-  `panel_render.py`, `lifecycle.py`, `callback_gate.py`, `panel_edit.py`,
-  `rpc_timeout.py`.
-* `backend/bot/router.py`; handlers `auto_reaction.py`,
-  `emoji_replacement.py`, `intelligent_reaction.py`, `private_message.py`,
-  `task_events.py`, `tasks.py`, `anti_edit_delete.py`, `save.py`,
-  `retrieve.py`, `misc.py`.
-* `backend/services/intelligent_reaction_service.py`,
-  `auto_reaction_service.py`, `emoji_replacement_service.py`,
-  `private_message_service.py`, `settings_service.py`.
-* `backend/db/client.py` — singleton, `_run_sync`, `list_saves`,
-  `list_logs`, state/document helpers, Storage call sites.
-* `backend/db/transport.py` — HTTP/1.1 pin.
-* `backend/ai/database/manager.py` — repository manager.
-* `tests/` — existing coverage names only; no test was executed.
+`_policy_tier` iterates `(50, 60, 70, 80, 90)` and returns the highest reached (`outbound_bandwidth_service.py:465-470`). There is no 100 entry. `POLICY_THRESHOLD_BYTES` is:
 
-## 19. Validation and Git delivery status
-
-### 19.1 Repository scope validation (performed before commit)
-
-Commands and expected results:
-
-```
-git status --short
-git diff --name-only
-git diff --check
+```text
+50% = 2,000,000,000
+60% = 2,400,000,000
+70% = 2,800,000,000
+80% = 3,200,000,000
+90% = 3,600,000,000
 ```
 
-Required outcome: `INVESTIGATION.md` is the only task-related path; the
-seven pre-existing entries in section 2 remain exactly as they were; no
-production code, test, dependency, SQL, configuration, `ROADMAP.md`,
-`AGENTS.md`, `IMPLEMENTATION_REPORT.md` or `DATABASE_ARCHITECTURE.md` is
-modified; `git diff --check` reports no whitespace errors.
+(`outbound_bandwidth_service.py:63-69`). `4,000,000,000` is explicitly tested to return 90 (`tests/test_outbound_bandwidth_policy.py:84-105`).
 
-### 19.2 Delivery procedure (performed)
+The action minimums (`_ACTION_MIN_TIER`, `outbound_bandwidth_service.py:100-125`) produce:
 
-1. The report was written from the exact tree at `65632bf` into
-   `INVESTIGATION.md`.
-2. Only that path was included: a temporary index was built from `65632bf`
-   plus this file, so no other path could enter the commit.
-3. The first commit was created with `65632bf` as its parent and the
-   wording-correction commit as its child, so the delivered history remains a
-   normal fast-forward of remote `main` (no rebase, no force, no history
-   rewrite).
-4. Both commits were pushed normally to `origin/main`.
-5. Verification: `git fetch origin`; `git rev-parse origin/main`; then
-   `git merge-base --is-ancestor <delivered> origin/main` (exit 0) and
-   `git ls-remote origin refs/heads/main` equals the delivered SHA.
+| Tier | Denied governed classes | Still allowed governed class |
+|---:|---|---|
+| 0–49% | none | all, including unknown at 0–49% |
+| 50% | automatic/scheduled media, unknown | single media, bulk, provider, file, reupload, storage, forward, text |
+| 60% | + bulk/album media | single media, provider, file, reupload, storage, forward, text |
+| 70% | + provider media (OCR/STT/AI media) | single media, file, reupload, storage, forward, text |
+| 80% | + file upload, reupload, storage upload, media forward | single media, text |
+| 90% | + single/interactive media; every governed non-text class | text ≤ 32 KiB only |
+| ≥100% | no distinct tier; same as 90 for governed classes | text ≤ 32 KiB; all ungoverned traffic unaffected |
 
-### 19.3 Known local-worktree limitation (reported honestly)
+The 90% strict-text behavior is directly tested in `tests/test_outbound_bandwidth_policy.py:151-171`: every listed non-text action raises `OutboundBandwidthPolicyError`, and `ACTION_TEXT` is allowed.
 
-The chat worktree's local branch was 18 commits behind remote `main` and
-carried seven pre-existing unrelated modifications (section 2). Six of those
-files also changed upstream, so a fast-forward of the local branch would
-require overwriting them. The report therefore preserves them in place and
-does not move the local branch, reset, stash or rebase anything. The
-delivered commit is built directly on `65632bf` and pushed to `origin/main`;
-the delivered SHA and the remote verification are reported in the final
-response. No unrelated file was staged or committed.
+### 4.3 Is the 100% hard limit independent of the tier?
 
-This limitation is a property of the pre-existing worktree, not of the
-delivered change: `origin/main` receives two documentation commits (the report
-and a follow-up wording correction), each of which touches only
-`INVESTIGATION.md`; the cumulative diff against `65632bf` is still only
-`INVESTIGATION.md`.
+**VERIFIED FACT — no.**
 
-### 19.4 What was not validated
+`_assert_policy_allows` uses the snapshot’s `tier` and `trusted` fields; it never compares `effective_monthly_bytes` to `MONTHLY_TARGET_BYTES` (`outbound_bandwidth_service.py:690-715`). The only 4 GB monthly checks are in `_reserve_locked` and `_precheck_limits`:
 
-* No test suite, build, typecheck or linter was run: this is a documentation
-  change and running project code was outside the read-only boundary.
-* No live Render/Telegram/Supabase/provider call was made; the 4.155 GB figure
-  is the operator-supplied measurement, not re-queried here.
-* No byte attribution was measured; section 11.5 defines the first
-  measurement to run in the next phase.
+```python
+if monthly_used + byte_count > MONTHLY_LIMIT_BYTES:
+    raise OutboundBandwidthExceededError(...)
+```
+
+(`outbound_bandwidth_service.py:778-790`, `852-856`). Here `monthly_used` comes from `_normalize_state(_read_row_state(), ...)`, i.e. the **local reservation ledger**. It is not `effective_monthly_bytes`, not Render's reading, and not the policy floor.
+
+**VERIFIED FACT — `MONTHLY_TARGET_BYTES` is used only as a reported limit/error field, not as an effective-volume gate.**
+
+A repository-wide search finds `MONTHLY_TARGET_BYTES` at the constant, the `OutboundBandwidthPolicyError.limit_bytes` field, the snapshot’s `monthly_limit_bytes`, and the error text. It is never used in a comparison against `effective`. The same is true of `MONTHLY_LIMIT_BYTES` outside the local-ledger checks and the local `usage_state`.
+
+### 4.4 The observed `tier=90` at 5.61 GB
+
+**VERIFIED FACT — it is expected, not a malfunction.**
+
+At `effective=5.61 B`, the loop has passed `3.6 B` (90%) and stops at 90. Nothing in the code maps 100% to a higher tier. The snapshot’s `trusted=true` and `partial=false` are consistent with a fresh Render reading whose 30-day query covers the month; `partial=false` does not prove that every hourly point is present, and `trusted` does not change the tier calculation.
+
+**INFERENCE — the reported “100% hard limit” expectation is a specification/documentation mismatch, not an observed code regression.**
+
+`IMPLEMENTATION_REPORT.md:121-137` states:
+
+> “Thresholds remain exactly 50/60/70/80/90% … with the hard monthly limit at 4,000,000,000 bytes …”
+>
+> “| ≥ 100% | hard monthly limit reservation refusal |”
+
+The code does have a 4 GB **local-ledger** refusal, and it is tested (`tests/test_outbound_bandwidth_governor.py:155-173`). But the table’s “≥100%” row reads as if it applies to the effective/Render percentage. It does not. At 5.61 B effective with a low local ledger, no `OutboundBandwidthExceededError` is raised by the monthly check; the policy simply remains at 90.
+
+### 4.5 Possible bypasses and gaps
+
+**VERIFIED FACT — all governed non-text paths are blocked at tier 90; the bypass is traffic that never calls the governor.**
+
+- **Unclassified actions:** `classify_outbound_action` maps unknown actions to `ACTION_UNKNOWN`, whose minimum tier is 50, so they are denied at 90 (`outbound_bandwidth_service.py:100-125`). This is conservative and is not a 90 bypass. At tier 0–49, unknown is allowed; that is by design.
+- **Scheduled operations:** `automatic_media_scope()` maps scheduled media to `ACTION_AUTOMATIC_MEDIA`, denied from 50 (`outbound_bandwidth_service.py:631-658`; test at `tests/test_outbound_bandwidth_policy.py:195-205`). Not a 90 bypass.
+- **Async/sync paths:** both `reserve_outbound_bytes` and `reserve_outbound_bytes_sync` call the same `_assert_policy_allows` and the same local lock (`:858-900`; parity test at `tests/test_outbound_bandwidth_policy.py:397-410`). Not a bypass.
+- **Stale snapshots:** the async path refreshes at most every 5 minutes (`RENDER_CACHE_TTL_SECONDS = 300`, `:74`, `428-436`); the sync path deliberately uses the cached snapshot without refreshing (`:733-745`). A threshold crossing can therefore take up to 5 minutes to affect a later upload. That is a bounded lag, not an indefinite bypass.
+- **Untrusted/partial metrics:** untrusted media is denied (`_assert_policy_allows` checks `trusted`); text within 32 KiB is still allowed. A fresh but partial Render month can be trusted; the floor prevents downward movement, but if the process has no floor yet and the partial reading omits traffic, the effective value can be understated. The supplied observation says `partial=false`, so this particular snapshot is not in that state.
+- **Text:** `ACTION_TEXT` with `0 < byte_count <= 32 KiB` is allowed at every tier, even when untrusted (`outbound_bandwidth_service.py:690-700`). This is an intentional availability exception. It cannot explain GB-scale egress by itself, but it is a real hole in any “stop all egress” interpretation.
+- **Direct service calls:** any code path that calls `client.send_file`/`upload_file` or an HTTP client without `reserve_outbound_bytes`/`ensure_action_allowed` bypasses the governor. The main upload seams are governed, but there is no global interception at the Telethon or httpx layer.
+- **Media processing / STT:** Groq and Speechmatics reserve once with `len(audio)` before transcription (`backend/services/groq_stt_engine.py:558-562`; `speechmatics_stt_engine.py:550-554`). Groq's `_run_passes` then makes up to `self._passes` sequential uploads of the same audio (`groq_stt_engine.py:620-654`) without a new reservation per pass. At tier 90, provider media is denied before any pass, so this is not a 90 bypass; at lower tiers it is a ledger undercount.
+- **Appearance Storage preview:** `backend/services/appearance_service.py:1351` calls `ensure_action_allowed(ACTION_STORAGE_UPLOAD, len(data))` but does not call `reserve_outbound_bytes` for that upload. At tier 80+ the policy denies it; below 80 the bytes are not added to the local ledger. This is a policy-gated but ledger-unaccounted path.
+- **PostgREST reads and Telethon RPCs:** these never call the governor at all. The per-message `ai_tasks` GET, `get_me` keepalive, entity resolution, and other reads continue at tier 90. This is the largest conceptual bypass: the governor is an **upload-payload governor**, not a network-egress governor.
+
+### 4.6 Test coverage for the hard-limit behavior
+
+**VERIFIED FACT — the local-ledger hard limit is tested; the effective 100% cap is not.**
+
+- `tests/test_outbound_bandwidth_governor.py:155-173` sets the local monthly state to `MONTHLY_LIMIT_BYTES - 9` and asserts a 10-byte reservation raises `OutboundBandwidthExceededError("monthly")` with no write.
+- `tests/test_outbound_bandwidth_policy.py:84-105` asserts `4,000,000,000` maps to tier 90, not 100.
+- `tests/test_outbound_bandwidth_policy.py:151-171` asserts tier 90 denies every governed non-text class and allows text.
+- `tests/test_outbound_bandwidth_policy.py:397-410` asserts async/sync parity.
+- No test asserts that a reservation is refused when `effective_monthly_bytes >= MONTHLY_TARGET_BYTES` while the local ledger is below the limit.
+
+---
+
+## 5. NAT / HTTP / application attribution reconciliation
+
+### 5.1 What the supplied numbers support
+
+**VERIFIED FACT — the reported split is dominated by NAT.**
+
+| Reported source | Bytes | Share of reported split |
+|---|---:|---:|
+| NAT | 5,559,025,983 | ≈99.8% |
+| HTTP | ≈9–10 MB | ≈0.2% |
+| Total | ≈5.56 GB | 100% of the reported points |
+
+The HTTP server, dashboard responses, and static assets cannot account for the 5.56 GB. They are bounded by the HTTP series, which is three orders of magnitude smaller. Any explanation that places the dashboard at the center is inconsistent with this split.
+
+**VERIFIED FACT — estimation is not attribution.**
+
+The source diagnostic reports `225` points and `368` missing hours for the current-month window. `_window_for` bounds the window to Render's 30-day lookback (`backend/services/render_bandwidth_sources_diagnostic.py:454-463`), and `missing_hours` is computed as `expected_hours - hours_with_any_data` without filling zeros (`:324-341`). The diagnostic therefore cannot distinguish:
+
+- an hour with genuinely zero traffic, and
+- an hour for which Render published no point.
+
+It also reports `parts_match_total` only when total and parts are both present and units agree (`:315-322`). That field was not supplied. The exact source split is therefore **not fully reconciled**.
+
+**VERIFIED FACT — the diagnostic's own HTTP request is outside attribution.**
+
+`_fetch` constructs `httpx.AsyncClient(timeout=_TIMEOUT)` without `egress.async_client_kwargs` (`render_bandwidth_sources_diagnostic.py:354`). The diagnostic's request therefore does not appear in the `[RENDER_EGRESS]` counters. This is a small 6-hourly request, not a GB source, but it proves that “all HTTP clients are instrumented” is false.
+
+### 5.2 What cannot be reconciled
+
+**UNKNOWN / NOT MEASURABLE — the byte split inside NAT.**
+
+NAT is measured at the network boundary, so it includes every outbound request from the service and may include transport-level bytes that the application counter does not. The known client categories are:
+
+- PostgREST HTTP/1.1 requests and their headers;
+- Telethon/MTProto RPCs, framing, encryption, and keepalives;
+- AI provider chat/completion requests;
+- TTS/STT provider uploads;
+- Supabase Storage uploads;
+- Render API requests;
+- any other outbound client traffic.
+
+The current application counters measure request bodies and selected Telegram payloads only. They cannot divide NAT into those categories, and they do not measure TCP/IP or TLS overhead.
+
+**VERIFIED FACT — the `unattributed_difference_bytes` log field is not a true residual.**
+
+`_emit_flush_locked` computes `difference = render_monthly_bytes - measured_month`, where `measured_month` is the sum of `exact_payload_bytes` (`egress_attribution.py:358-364`). That subtraction compares a service-level NAT total with a body-only, process-local application counter. It is useful as a warning that a large gap exists; it is not an attribution of the gap to a protocol.
+
+**VERIFIED FACT — the attribution counters are process-local and restart-scoped.**
+
+The counters are module globals with `scope=process` in their logs (`egress_attribution.py:136-143`, `364-395`). They do not persist to a database, do not aggregate across processes, and start when the process starts. The supplied logs were captured after attribution was enabled, not from the beginning of the month. They cannot be used as a November baseline.
+
+**VERIFIED FACT — missing hours are not zero-filled by either Render reader.**
+
+`render_bandwidth_service._parse_payload` counts distinct hours and reports `missing_hours`, but it sums only the points that exist (`render_bandwidth_service.py:100-148`). It marks a month partial when the 30-day query starts after the month start (`:166-213`). A fresh but partial reading can be trusted for policy, with the floor protecting against a lower value; that does not make the source split complete.
+
+### 5.3 The defensible quantitative statement
+
+The evidence supports only these quantitative statements:
+
+1. NAT is approximately **99.8%** of the reported source split; HTTP is approximately **0.2%**.
+2. The PostgREST operation rate is **7.7–8.7 requests/second**, or **2,300–2,600 per five minutes**.
+3. The measured request-body rate is **7–9 KB per five minutes**, which is too small to explain the total by itself.
+4. If the observed request rate were sustained for a month, the monthly total would imply roughly **250–280 bytes per request**; at 500 bytes of request overhead, the same rate would produce about **10–11 GB/month**, above 5.56 GB, so the actual duty cycle must be lower or bursty. This is an order-of-magnitude consistency check, not a measurement.
+5. The exact split of the 5.56 GB among PostgREST headers, Telegram/MTProto, and other NAT clients is **not measurable** with the current code.
+
+No precise “PostgREST caused X%” or “Telegram caused Y%” figure is justified.
+
+---
+
+## 6. Findings table
+
+| Finding | Evidence | Severity | Confidence | Code location |
+|---|---|---|---|---|
+| Every Telegram `NewMessage` causes one PostgREST `ai_tasks` read, even with zero event tasks | Unconditional `list_event_tasks` before any task check; 2,300–2,600 ops/5 min is 7.7–8.7/s | **HIGH** | **HIGH** | `backend/bot/handlers/task_events.py:56-97`; `backend/ai/task_event_dispatcher.py:151-163`; `backend/ai/database/task_repository.py:1280-1282` |
+| Every owner-authored message adds a waiting-answer read, even without a reply | `sender_id == owner` check followed immediately by the query; `reply_to` is not checked first | **MEDIUM** | **HIGH** | `backend/ai/task_answers.py:98-118`; `backend/ai/database/task_repository.py:1419-1422` |
+| The per-message query is intentional and documented, not a runaway loop | Test asserts one query per event; comment says “documented, unchanged” | **INFORMATIONAL** | **HIGH** | `tests/test_external_call_efficiency.py:298-315` |
+| Anti-Edit can add 3–9 PostgREST calls per eligible private message when enabled | Full archive read plus whole-set upsert/delete in dedicated mode; four select/write pairs in legacy mode | **HIGH** (if enabled) | **HIGH** for code; **UNKNOWN** for production state | `backend/bot/handlers/anti_edit_delete.py:512-530`; `backend/services/anti_edit_delete_service.py:925-971`, `997-1105`; `backend/db/client.py:2957-2980`, `3221-3248` |
+| The periodic scheduler/dashboard/heartbeat baseline is far too small to explain the rate | ~15 scheduler + ~40 dashboard + ~1 heartbeat + ~2 governor per 5 min | **INFORMATIONAL** | **HIGH** | `backend/ai/task_scheduler.py:21-23`, `443-475`; `src/App.tsx:62-85`; `backend/db/client.py:454-472` |
+| The per-message read path has no retry amplification | `_run` dispatches one `run_sync_db` call; no loop around the read | **INFORMATIONAL** | **HIGH** | `backend/ai/database/task_repository.py:1179-1188`; `backend/db/client.py:223-243` |
+| `/api/db/stats` is not a PostgREST N+1 | Session/message repositories are in-memory even with Supabase; only memory/provider counts are remote | **INFORMATIONAL** | **HIGH** | `backend/ai/database/manager.py:64-68`; `backend/observability/db_stats.py:32-43` |
+| Attribution measures request bodies only; headers, TLS, TCP, and MTProto are excluded | `_body_size` reads `Content-Length`; module doc states exclusions | **HIGH** | **HIGH** | `backend/observability/egress_attribution.py:1-35`, `748-765` |
+| `unmeasured_operations=0` does not mean all bytes were measured | Bodyless `GET` is `record_exact(0)` plus one operation; no header field exists | **MEDIUM** | **HIGH** | `backend/observability/egress_attribution.py:234-238`, `748-765` |
+| PostgREST is pinned to HTTP/1.1, so repeated auth headers are not HPACK-compressed | `http2=False`; transport doc says “same headers” and HTTP/1.1 | **MEDIUM** | **HIGH** (transport fact); **INFERENCE** for volume | `backend/db/transport.py:1-27`, `50-93`, `108-124` |
+| The observed `tier=90` at 5.61 GB is expected by design | `_policy_tier` caps at 90; 4,000,000,000 explicitly maps to 90 | **INFORMATIONAL** | **HIGH** | `backend/services/outbound_bandwidth_service.py:465-470`; `tests/test_outbound_bandwidth_policy.py:84-105` |
+| There is no independent 100%-of-effective hard cap | The only 4 GB checks use the local ledger; no `effective >= MONTHLY_TARGET` refusal exists | **HIGH** | **HIGH** | `backend/services/outbound_bandwidth_service.py:778-790`, `852-856` |
+| The implementation report claims a ≥100% reservation refusal that the effective path does not implement | Table row “≥ 100% — hard monthly limit reservation refusal” | **HIGH** | **HIGH** | `IMPLEMENTATION_REPORT.md:121-137`; contrast `outbound_bandwidth_service.py:465-470` |
+| The governor is an upload-payload governor, not a total-egress governor | Module doc: accounts only explicit payload paths; Render used for policy | **HIGH** | **HIGH** | `backend/services/outbound_bandwidth_service.py:1-30` |
+| NAT is ~99.8% of the reported split; HTTP is ~0.2% | Supplied Render source diagnostic: 5,559.03 MB NAT vs ~9–10 MB HTTP | **INFORMATIONAL** | **HIGH** (within reported points) | Production observation supplied in task |
+| The source split has 225 points and 368 missing hours and does not zero-fill | Diagnostic computes missing hours from union of buckets; no synthetic zeros | **MEDIUM** | **HIGH** | `backend/services/render_bandwidth_sources_diagnostic.py:324-341`, `454-463` |
+| The diagnostic’s own HTTP request is outside attribution | `httpx.AsyncClient(timeout=_TIMEOUT)` without egress hooks | **LOW** | **HIGH** | `backend/services/render_bandwidth_sources_diagnostic.py:354` |
+| The 5-minute policy cache can delay a tier crossing | `RENDER_CACHE_TTL_SECONDS = 300`; sync path uses cached snapshot | **LOW** | **HIGH** | `backend/services/outbound_bandwidth_service.py:74`, `428-436`, `733-745` |
+| Telegram upload attribution is payload-level only | Progress callback counts file bytes; doc excludes RPC/TL/encryption/keepalives | **MEDIUM** | **HIGH** | `backend/observability/egress_attribution.py:8-20` |
+| STT reserves once but can upload the same audio multiple times | Reservation before `_run_passes`; pass loop performs sequential requests | **MEDIUM** | **HIGH** | `backend/services/groq_stt_engine.py:558-562`, `620-654`; `speechmatics_stt_engine.py:550-554` |
+| Appearance preview Storage upload is policy-gated but not ledger-reserved | `ensure_action_allowed` only; no `reserve_outbound_bytes` at that seam | **LOW** | **HIGH** | `backend/services/appearance_service.py:1351` |
+| Telegram keepalive sends `get_me` every 60 s | `_INTERVAL = 60.0`; `client.get_me()` in `_probe` | **INFORMATIONAL** | **HIGH** | `backend/runtime/keepalive.py:23-24`, `83` |
+| A meaningful Telegram media operation can be large but is currently blocked at tier 90 | `max_deep_save_mb` default 50, max 500; governed seams reserve per member | **INFORMATIONAL** | **HIGH** (limits); **UNKNOWN** whether used | `backend/services/settings_service.py:39`, `79`, `176`; `backend/services/save_service.py:1969-1980` |
+
+---
+
+## 7. Prioritized next investigations or fixes
+
+These are recommendations only. None was implemented in this read-only investigation.
+
+1. **Measure on-wire request bytes for one PostgREST read, then for the per-message path.** The decisive experiment is to count the full serialized request (request line + headers + body + TLS record overhead) at the `httpx` transport, not just `Content-Length`, for a short controlled window. Compare that count with Render NAT for the same window. This directly tests the leading inference and does not require guessing header sizes. The current counter cannot answer it.
+
+2. **Correlate hourly Render NAT deltas with hourly Telegram `NewMessage` counts and PostgREST operation counts.** The existing logs already carry operation counts and message traffic. If NAT rises with message/query count and not with media events, the per-message header path is confirmed. If NAT spikes align with Deep Save/album operations, the media path is confirmed instead. This is the cheapest way to split the two hypotheses without new production instrumentation.
+
+3. **Add a call-site label to the PostgREST attribution category.** Today all PostgREST requests are one `supabase_rest/postgrest` bucket. A bounded label for `task_event`, `task_answer`, `dashboard`, `governor`, and similar call sites would make the 2,300–2,600 count attributable without logging URLs or payloads. This is an observability change, not a behavior change.
+
+4. **Correct the governor’s public semantics and documentation.** Either:
+   - document that the 4 GB hard limit is a local reservation-ledger cap and that the effective Render policy caps at 90%, or
+   - add an explicit `effective >= MONTHLY_TARGET_BYTES` refusal if a true 100% policy is required.
+
+   An explicit 100% policy still would not stop ungoverned PostgREST/Telegram traffic; it would only stop paths that call the governor. The documentation must say that.
+
+5. **Evaluate caching or precomputing the event-task lookup.** `list_event_tasks` is one `GET` per message even when the owner has no event tasks. A bounded cache with correct invalidation on task create/update/delete, or a cheap “has any event task” flag, would remove most of the request volume. This is a fix candidate, but it should be measured first because freshness semantics are deliberate.
+
+6. **Resolve the source diagnostic’s coverage gap.** Determine whether the 368 missing hours are zero-traffic hours or unpublished points, and whether `parts_match_total` is true. Do not treat the source split as a complete month until that is known. This affects any future claim about NAT/HTTP percentages.
+
+7. **Determine the Anti-Edit enabled/populated state and its per-message request count.** The feature can add 3–9 PostgREST calls per eligible private message, but its configuration was not supplied. A single bounded log of `enabled`, archive row count, and requests per captured message would rule this source in or out before optimizing the task-event query.
+
+8. **If PostgREST does not reconcile, instrument Telegram at the connection boundary.** A transport-level byte count (without logging content) is the only way to separate MTProto wire bytes from application payload. Do not infer raw MTProto bytes from `progress_callback` values.
+
+9. **Fix the STT reservation multiplier and the appearance preview reservation gap.** At lower tiers, Groq/Speechmatics can upload the same audio multiple times against one reservation, and the appearance preview upload is not in the ledger. These are accounting gaps, not the observed 90% behavior, but they weaken the ledger’s meaning.
+
+---
+
+## 8. Files inspected
+
+**Documentation and repository state**
+
+- `AGENTS.md`
+- `IMPLEMENTATION_REPORT.md`
+- `INVESTIGATION.md` (the previous, stale report; replaced by this file)
+
+**Telegram event and task paths**
+
+- `backend/bot/handlers/task_events.py`
+- `backend/bot/handlers/anti_edit_delete.py`
+- `backend/services/anti_edit_delete_service.py`
+- `backend/ai/task_event_dispatcher.py`
+- `backend/ai/task_answers.py`
+- `backend/ai/database/task_repository.py`
+- `backend/runtime/supervisor.py`
+- `backend/ai/task_scheduler.py`
+- `backend/runtime/heartbeat.py`
+- `backend/runtime/keepalive.py`
+- `backend/runtime/tg_retry.py`
+- `backend/bot/handlers/ai_unified.py`
+- `backend/bot/handlers/misc.py`
+
+**Database and attribution**
+
+- `backend/db/transport.py`
+- `backend/db/client.py`
+- `backend/observability/egress_attribution.py`
+- `backend/observability/db_stats.py`
+- `backend/ai/database/manager.py`
+- `backend/ai/database/session_repository.py`
+- `backend/ai/database/message_repository.py`
+
+**Bandwidth, Render, and upload seams**
+
+- `backend/services/outbound_bandwidth_service.py`
+- `backend/services/render_bandwidth_service.py`
+- `backend/services/render_bandwidth_sources_diagnostic.py`
+- `backend/services/save_service.py`
+- `backend/services/retrieve_service.py`
+- `backend/services/appearance_service.py`
+- `backend/services/groq_stt_engine.py`
+- `backend/services/speechmatics_stt_engine.py`
+- `backend/services/settings_service.py`
+- `backend/telegram_api/media.py`
+- `backend/ai/tools/delivery.py`
+
+**Web and dashboard**
+
+- `backend/web/app.py`
+- `src/App.tsx`
+
+**Tests**
+
+- `tests/test_external_call_efficiency.py`
+- `tests/test_outbound_bandwidth_policy.py`
+- `tests/test_outbound_bandwidth_governor.py`
+- `tests/test_outbound_upload_governance.py`
+
+---
+
+## 9. Files changed
+
+**Only `INVESTIGATION.md`.**
+
+No production code, test, configuration, dependency, database, or deployment file was modified. The investigation was read-only; no live Render, Telegram, Supabase, or provider request was made.
+
+---
+
+## 10. Unknowns and limitations
+
+1. **Production deployment commit is unknown.** The code at repository HEAD `31406f7` predicts tier 90 at 4 GB, but the running Render commit was not verified from this workspace.
+2. **No live Render logs or credentials.** The supplied observations are treated as evidence; the source diagnostic’s raw points and `parts_match_total` were not re-fetched.
+3. **No per-request byte measurement.** Header sizes, TLS record overhead, retransmissions, and TCP/IP overhead are not measured.
+4. **No Telegram wire-level measurement.** MTProto framing, encryption, ACKs, keepalives, and retransmissions are not measured.
+5. **No production message rate or owner share.** The 7.7–8.7 messages/second figure is derived from the operation count, not observed directly. The Anti-Edit enabled/populated state is also unknown, so its conditional 3–9 calls per eligible private message cannot be ruled in or out from telemetry alone.
+6. **No `governor_monthly_bytes` or `policy_floor_bytes` values.** The effective 5.61 B cannot be decomposed into Render, local ledger, and floor from the supplied snapshot.
+7. **Attribution is process-local and post-enable.** It cannot serve as a month-to-date November baseline and does not aggregate across processes.
+8. **The source split is incomplete.** 225 points and 368 missing hours; missing hours are not zero-filled and may be zero-traffic or unpublished.
+9. **The code is authoritative.** The implementation report’s “≥100%” row conflicts with the current effective-policy code; this report follows the code.
