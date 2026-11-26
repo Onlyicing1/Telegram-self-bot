@@ -54,7 +54,7 @@ treated as a complete, trusted measurement.
 | File | Change |
 |---|---|
 | `backend/services/outbound_bandwidth_service.py` | Independent hard-limit decision, explicit measurement status, live-ledger reservation check, structured refusal error/codes |
-| `tests/test_outbound_bandwidth_policy.py` | 29 focused hard-limit, trust, tier-distinction, text and entry-point tests |
+| `tests/test_outbound_bandwidth_policy.py` | 31 focused hard-limit, trust, tier-distinction, text and entry-point tests |
 | `tests/test_outbound_upload_governance.py` | 2 real-seam tests (voice send, Deep Save upload seam) |
 | `tests/conftest.py` | Suite snapshot declares the new `measurement_status` metadata explicitly |
 | `IMPLEMENTATION_REPORT.md` | This report (full replacement) |
@@ -336,9 +336,9 @@ owner to inspect the bounded `OUTBOUND_MONTHLY_HARD_LIMIT_DENIED` and existing
 - Cumulative diff of that commit against the base: the four implementation/test
   files listed in section 3, nothing else.
 
-This report is delivered in the immediate child commit of
-`c140f92d571a733efe6ff338744f1e8e6a7d48b3`; the final remote HEAD after that
-report commit is reported in the delivery summary.
+This report is delivered in the documentation commits immediately following
+`c140f92d571a733efe6ff338744f1e8e6a7d48b3`; the final remote HEAD is reported
+in the delivery summary.
 
 The shared chat worktree's local branch remains at its pre-existing
 `c55efcdfd1905d72df35810cb5669e9d5c66866e` with unrelated modifications
