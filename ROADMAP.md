@@ -1,5 +1,72 @@
 # ROADMAP
 
+## Current objective: resource optimization and runtime stability
+
+Status: **CURRENT OBJECTIVE — recorded 2026-11-27; this entry claims no new
+optimization, restriction, runtime behavior or quota change.** It is a narrow
+resource-optimization and runtime-stability objective, not a new
+resource-management platform, personalized profile system, AI advisor or
+automation-learning system. It is separate from the deferred future roadmap
+items, which are unchanged.
+
+### Priority 1 — Protect runtime availability
+
+Keeping the Self-Bot operational is the highest priority. Render resource or
+quota exhaustion must not be allowed to suspend the service or make it
+unavailable. Critical runtime and Telegram connectivity must not be treated as
+ordinary optional workload.
+
+Continued uptime is not guaranteed: Render itself may suspend the service,
+network connectivity may fail, Telegram may become unavailable, or the
+platform quota may be exhausted.
+
+### Priority 2 — Reduce actual Egress consumption first
+
+Optimization is preferred over disabling features. Investigation should
+identify and reduce unnecessary outbound traffic wherever source evidence
+supports it, including unnecessary or repeated Telegram requests, excessive
+database requests, duplicate polling/reads/checks, inefficient request
+patterns, redundant background operations, avoidable retries, excessive media
+or payload transfers, and other measurable sources.
+
+The source of Egress must not be assumed. Implementation must be based on
+source inspection, actual attribution and measured results.
+
+### Priority 3 — Preserve existing functionality
+
+The existing Self-Bot capabilities should remain usable under controlled
+resource consumption. Globally disabling AI, Media Processing, automations,
+Telegram functionality, database functionality or other features is not the
+default optimization solution.
+
+Preferred directions: reduce the cost of existing operations, make operations
+more efficient, avoid unnecessary work, use bounded execution where
+appropriate, apply targeted restrictions only when resource limits require
+them, and keep useful functionality available in lighter modes where
+technically feasible.
+
+### Priority 4 — Selective restriction under resource pressure
+
+When optimization alone cannot keep consumption within safe limits, the
+direction is to selectively restrict noncritical, resource-intensive
+operations. Restrictions should be gradual and targeted according to actual
+resource impact and importance. Critical runtime functionality must be
+protected from ordinary controllable workloads.
+
+This is a design objective, not authorization to introduce new architecture or
+to make arbitrary feature changes.
+
+### Priority 5 — Respect existing resource limits and quota policies
+
+The existing Render monthly Egress quota context and the already documented
+resource-limiting work remain in force, including the staged outbound-bandwidth
+policy and the independent monthly Egress hard limit in
+`backend/services/outbound_bandwidth_service.py`. This objective does
+not define new quotas, thresholds, percentages or policies, and does not
+silently replace or reinterpret existing limits. Any future change to limits
+or resource policy must be based on verified platform data and the actual
+project implementation.
+
 ## Current delivery: G4-A / F1 — Single-source evidence foundation
 
 Status: **G4-A/F1 database schema and privilege hardening are applied to the
