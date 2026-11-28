@@ -1,261 +1,349 @@
 # IMPLEMENTATION REPORT
 
-**Reporting date:** 2026-11-25
-**Delivery:** Outbound-bandwidth attribution, Render coverage validation, and
-staged monthly enforcement
-**Branch:** `freebuff/f5137e20b1c5761eea04f020`
-**Delivery commit:** the merge commit created from this worktree (`git log -1`)
-**Remote parent:** `origin/main` at `b8f99af3bbbad3f43b3ba13e68a722402a9aeca9`
-**Status:** **IMPLEMENTED · TESTED OFFLINE · NOT DEPLOYED · NOT LIVE VERIFIED.**
+**Reporting date:** 2026-11-26
 
-No SQL was executed, no Supabase row or schema was modified, no Render action
-was taken, and no live Telegram/provider request was made from this workspace.
+**Task:** Real, independent 4 GB monthly outbound-egress hard limit
+
+**Branch:** `main`
+
+**Base commit:** `0ae8434bed4ffa65ce7c5f94a7b8b75b49d5e0c9`
+
+**Implementation + tests commit:** `c140f92d571a733efe6ff338744f1e8e6a7d48b3`
+
+**Status:** **IMPLEMENTED · TESTED OFFLINE · PUSHED · NOT LIVE VERIFIED.**
+
+No live Render, Supabase, Telegram or AI-provider request was made from this
+workspace. No SQL was executed and no schema, environment variable or Render
+setting was changed.
 
 ---
 
-## 1. What happened
+## 1. Objective
 
-A parallel delivery landed on `origin/main` while this worktree was based on
-`a3bc59f...`. That delivery already contained the staged 50/60/70/80/90% policy
-and a first attribution pass. It was not overwritten. The two histories were
-merged (`merge --no-ff`); the canonical remote implementation is the base and
-this delivery adds the missing correctness work below. The merge preserves both
-parents and does not rebase, reset, force-push, or rewrite either history.
+Add a genuine 4 GB monthly egress stop to the existing outbound governor. The
+stop had to be independent of the staged 50/60/70/80/90 % policy, had to use the
+effective monthly measurement rather than only the local reservation ledger,
+had to work when a proposed reservation would cross the target, and had to fail
+closed when Render telemetry is missing, stale or partial.
 
-The resulting delta against `origin/main` is 18 files: the attribution module,
-the Render metric/source diagnostic, lifecycle wiring, download call sites, STT
-reservations, focused tests, and this report.
+PostgREST request-volume work and Anti-Edit optimisation were explicitly out of
+scope and were not touched.
 
-## 2. Verified gaps fixed
+## 2. Root cause
 
-| Gap in the canonical implementation | Fix |
+At `0ae8434` the governor enforced two different things:
+
+1. A durable reservation ledger with a 4 GB monthly refusal
+   (`_precheck_limits`, `_reserve_locked`), which only counts payloads that
+   already call `reserve_outbound_bytes` / `reserve_outbound_bytes_sync`.
+2. A staged monthly policy whose `_policy_tier()` stops at 90 %
+   (`3_600_000_000` bytes). `4_000_000_000` bytes therefore reported tier 90,
+   exactly like any larger value.
+
+`ensure_action_allowed()` denied non-text actions when the active tier reached
+their minimum, so tier 90 happened to deny governed non-text payloads. But
+there was no independent decision that read the effective monthly egress and
+refused at `>= MONTHLY_TARGET_BYTES`; a ledger below 4 GB could not be
+distinguished from a Render month above it, and tier 90 was the only reason an
+upload stopped. There was also no reservation-aware check that a proposed
+reservation would reach the target, and a partial Render month was still
+treated as a complete, trusted measurement.
+
+## 3. Exact files changed
+
+| File | Change |
 |---|---|
-| Aggregate summaries were emitted only by the **next recorded event**; an idle enabled process emitted nothing after its window | `heartbeat_tick()` runs on the existing 30s heartbeat: activity flushes at most every 5 minutes, and an idle enabled process emits one bounded `status=enabled_no_activity` line per hour |
-| No startup confirmation and no shutdown flush | `RuntimeSupervisor.start()` calls `log_startup()`; `stop()` calls `shutdown()` before the DB executor is released |
-| Only request `Content-Length` was measured; response bodies were intentionally ignored | Response hooks now measure bytes **consumed by the application as inbound**. Non-streaming bodies are counted once; streaming bodies are wrapped and counted only as consumed. Early close records consumed bytes plus `incomplete_inbound_streams` |
-| Telegram downloads were not attributed | `record_telegram_download()` is wired at the Telegram API wrapper, Deep Save single/album downloads, rename, anti-edit snapshot, and appearance `iter_download` |
-| Download payloads risked being reported as outbound | Downloads are recorded in `exact_inbound_bytes`, never `exact_payload_bytes`; MTProto request/ack egress remains unmeasured |
-| No month-to-date application total to compare with Render | Process-local UTC month counters survive window flushes; the totals line reports `month_exact_payload_bytes`, `month_exact_inbound_bytes`, Render bytes, governor bytes, persisted floor, tier, trust, partial coverage, and a signed `unattributed_difference_bytes` |
-| No explicit measurement state | `snapshot()["status"]` distinguishes `disabled`, `enabled_no_activity`, `recording`, `measurement_incomplete`, and `measurement_failure` |
-| Render metric coverage/duplicates were not checked | Duplicate timestamps are rejected; `latest_age_seconds`, `distinct_hours`, `expected_hours`, `missing_hours`, `coverage_complete`, `monthly_days_covered`, and `monthly_month_days` are reported |
-| Source diagnostic had a hardcoded past week and ran once | It retains the fixed forensic window for the original investigation but the heartbeat runs a **current UTC month-to-date** window at most once every six hours. Hourly output is capped to the latest 24 points |
-| STT provider uploads checked the policy but did not reserve bytes | Both Groq and Speechmatics reserve `stt_upload` bytes after the provider-media policy check |
-| Sample tests accepted an `action=` keyword that the canonical governor does not use | Unneeded fake changes were reverted; call sites use the existing category-based classification |
+| `backend/services/outbound_bandwidth_service.py` | Independent hard-limit decision, explicit measurement status, live-ledger reservation check, structured refusal error/codes |
+| `tests/test_outbound_bandwidth_policy.py` | 31 focused hard-limit, trust, tier-distinction, text and entry-point tests |
+| `tests/test_outbound_upload_governance.py` | 2 real-seam tests (voice send, Deep Save upload seam) |
+| `tests/conftest.py` | Suite snapshot declares the new `measurement_status` metadata explicitly |
+| `IMPLEMENTATION_REPORT.md` | This report (full replacement) |
 
-No new table, column, migration, scheduler, executor, update loop, hosted
-telemetry, external account, or dependency was added. `httpx` was already a
-project dependency and is used by the existing HTTP clients.
+No other file was modified. The staged policy thresholds, `_policy_tier`, the
+daily limit, the panel, render service, migrations, `render.yaml` and
+`DATABASE_ARCHITECTURE.md` are unchanged.
 
-## 3. Attribution coverage
+## 4. Hard-limit decision semantics
 
-Closed category vocabulary, all process-local and content-free:
+The new decision lives in `_assert_monthly_hard_limit()` and runs **before**
+`_assert_policy_allows()` in both the async and sync action paths. It is not a
+new tier and does not read or modify `_policy_tier()`.
 
-`telegram_self_upload`, `telegram_download`, `telegram_helper`,
-`supabase_rest`, `supabase_storage`, `ai_provider`, `ai_discovery`,
-`stt_provider`, `tts_provider`, `render_api`, `other_known_http`.
-
-Measured outbound payload channels:
-
-- Telegram uploads (`upload_file` / `send_file`) via Telethon's cumulative
-  progress callback, counted once per logical payload. This is **payload-level,
-  not MTProto wire bytes**.
-- HTTP request bodies via `Content-Length` (JSON, raw bytes, form and multipart
-  framing included) on the instrumented clients.
-- Supabase Storage uploads at the two upload seams, recorded explicitly.
-- AI provider, discovery, STT, TTS, Supabase REST, and Render API clients carry
-  fixed category/label hooks.
-
-Measured inbound channels (never added to outbound):
-
-- Telegram download payloads, from a returned path or bytes.
-- HTTP response bodies consumed by the application, including partial streams.
-
-Unmeasured or only partially measured:
-
-- MTProto framing, TL/encryption overhead, retransmissions, keepalives, update
-  traffic, helper transport, and Telegram RPCs.
-- HTTP headers, TLS/TCP, connection setup, and chunked/streamed request bodies
-  whose length is unknown (counted as unmeasured operations, never guessed).
-- Server-side FastAPI responses (`/health`, dashboard, guide, `/api/*`) and
-  other traffic outside the instrumented service clients.
-- Supabase Storage downloads/lists through the SDK's own internal client.
-- A failed transfer may have sent bytes that never produced a completed
-  payload; those retransmissions are not represented.
-- The Render source diagnostic's own response is not attributed (inbound).
-
-`exact_payload_bytes` and `estimated_payload_bytes` are separate channels and
-are never summed. The estimate channel remains zero because no path currently
-uses it. The reconciliation difference is explicitly **unattributed**: it can
-contain transport overhead, retransmissions, instrumented gaps, or traffic from
-another measured path. It is not claimed to be Telegram traffic or any provider.
-
-## 4. Render monthly metric and source diagnostic
-
-`backend/services/render_bandwidth_service.py` queries only the
-Render-injected `RENDER_SERVICE_ID` with the workspace-scoped `RENDER_API_KEY`.
-It reads the documented array of series (`labels`, `values`, `unit`), validates
-the service label, units, finite non-negative values, timestamps with timezones,
-duplicates, and the requested window. The supported lookback is 30 days; a
-30/31-day calendar month can therefore be partial. `monthly_is_partial`,
-coverage start/end, month days, and covered days are returned, and policy
-reports `render_partial`.
-
-A partial or stale reading cannot lower a previously persisted tier: the
-governor evaluates `max(Render month, governor month, persisted floor)`, and a
-floor write that cannot be confirmed makes media fail closed. A monthly metric
-older than three hours or from another UTC month is not trusted. A partial
-reading is reported as partial, not complete; the durable floor persists the
-highest effective reading for the current UTC month. There is no second ledger
-and no schema change; the floor is a `policy_floor` key inside the existing
-`panel_settings.outbound_bandwidth_state` JSONB.
-
-The temporary source diagnostic (`RENDER_BANDWIDTH_SOURCES_DIAGNOSTIC=1`) now
-accepts both documented top-level shapes (`[...]` and `{"data": [...]}`), which
-fixes the previous HTTP-200 `unexpected_payload` failure. It validates units,
-duplicate timestamps, missing hours, unexpected sources, and part-vs-total
-agreement without assuming the parts must equal the total. It is retained
-rather than deleted because a hardcoded past week becomes ineffective after
-Render's lookback; the heartbeat runs the current UTC month at most every six
-hours, while the startup forensic call keeps the fixed investigation window.
-No credentials, URLs, raw bodies, filenames, IDs, or user content are logged.
-
-## 5. Staged policy verification
-
-Thresholds remain exactly `50/60/70/80/90%` = `2.0/2.4/2.8/3.2/3.6 GB`, with
-the hard monthly limit at `4,000,000,000` bytes and daily limit at
-`150,000,000` bytes.
-
-| Tier | Action classes denied |
-|---|---|
-| ≥ 50% | automatic media, scheduled media, unknown payloads |
-| ≥ 60% | bulk/album/batch media |
-| ≥ 70% | provider media (OCR/STT/AI media) |
-| ≥ 80% | file uploads, reuploads, Storage uploads, media forwards |
-| ≥ 90% | single/interactive media and files |
-| ≥ 100% | hard monthly limit reservation refusal |
-
-Restrictions are cumulative via `_ACTION_MIN_TIER`; a higher tier never
-re-enables a lower-tier action. Interactive owner text remains available with a
-32 KiB explicit text exemption; a larger text payload does not inherit it.
-Unknown actions are never treated as text and are denied from 50%. A scheduled
-occurrence is wrapped centrally in `automatic_media_scope()` around
-`execute_calls`, so the 50% tier applies regardless of which tool runs. The
-sync and async reservation paths use the same snapshot and lock. A stale or
-untrusted snapshot denies media; text within the bound remains available. The
-persisted floor prevents a restart or delayed/lower Render reading from lowering
-the tier within the UTC month. Reservations are confirmed by re-reading the
-stored state and fail closed on read/write/confirmation failure.
-
-Verified upload seams: Deep Save single and album (per member), rename
-re-upload, AI attachment, voice, Gemini OCR/STT, anti-edit Storage snapshot,
-appearance Storage upload, and Groq/Speechmatics STT provider uploads. Telegram
-forwards and metadata edits remain ungoverned because they do not create a new
-local payload.
-
-## 6. Tests and exact results
-
-Focused suites (attribution, Render metric/source, policy, upload governance):
+For a governed non-text action with proposed `byte_count`:
 
 ```
-.venv/bin/python -m pytest -q tests/test_egress_attribution.py \
-  tests/test_render_bandwidth_service.py \
-  tests/test_render_bandwidth_sources_diagnostic.py \
+baseline = max(snapshot.effective_monthly_bytes, live_governor_month)
+if baseline >= 4_000_000_000:              refuse hard_limit_reached
+elif measurement_status != trusted:        refuse the matching measurement code
+elif baseline + byte_count >= 4_000_000_000:
+                                           refuse reservation_would_exceed_limit
+else:                                      continue to the staged tier policy
+```
+
+Consequences:
+
+- At exactly 4 GB and above, a governed non-text payload is refused even when
+  the local ledger is at zero. Tier 90 is not consulted as permission.
+- At 3.6–3.999… GB, an ordinary tier-90 refusal still occurs; at 4 GB the
+  hard-limit refusal wins. The two decisions are separate and separately
+  testable.
+- At 3.999999999 GB, a one-byte reservation is refused because it would reach
+  the target. The comparison is `>=`, not `>`.
+- Text up to the existing 32 KiB exemption returns before the decision and is
+  unchanged, including a `text` reservation at the target. Text larger than
+  the exemption keeps its existing policy refusal.
+- `_reserve_locked()` repeats a ledger-side `>=` check as the last line of
+  defence and keeps text exempt. A ledger reservation that exceeds 4 GB still
+  raises the pre-existing `OutboundBandwidthExceededError`, preserving that
+  error contract.
+
+## 5. Effective monthly usage and reservation interaction
+
+`refresh_policy_snapshot()` already computes:
+
+```
+effective = max(render_monthly_bytes, governor_monthly_bytes, policy_floor_bytes)
+```
+
+Render and the governor ledger are **never added**. They overlap: a payload
+counted by the governor may later appear in Render's service metric. The
+persisted floor only prevents a delayed/lower reading from lowering the tier.
+
+The hard limit preserves that rule. `_precheck_limits()` now also returns the
+live ledger month, and the decision folds it in with `max`, not addition:
+
+```
+baseline = max(effective_snapshot, live_governor_month)
+refuse if baseline + proposed_reservation >= 4_000_000_000
+```
+
+The proposed reservation is the only value added because it is not yet part of
+either measurement. Bytes already reserved earlier in the month are already in
+the governor month; bytes already transmitted may also be in Render. Taking the
+maximum avoids counting the same byte twice while still refusing when either
+source proves the target is reached.
+
+The reservation ledger is deliberately conservative: reservations are never
+refunded, so a failed upload can keep the governor month higher than actual
+wire traffic. That can refuse a later reservation earlier than the wire total
+would, which is the safe direction for a protection target.
+
+## 6. Telemetry trust, missing, stale and partial behavior
+
+Snapshots now carry `measurement_status` and `measurement_detail`:
+
+| Status | Produced when | Hard-limit behavior for non-text |
+|---|---|---|
+| `trusted` | Render validated (available, current month, finite bytes, fresh `latest_data_at`), governor readable, floor persisted, `monthly_is_partial` false | Normal target/reservation check |
+| `partial` | Same as trusted but Render's 30-day lookback cannot cover the whole calendar month (`monthly_is_partial`) | Refused with `monthly_egress_measurement_partial` |
+| `untrusted` | Render reported data but it is stale (>3 h), from another month, future-dated, malformed, or the floor write could not be confirmed | Refused with `monthly_egress_measurement_untrusted` |
+| `unavailable` | No API key/service id, HTTP/parse failure, no datapoints, or the governor ledger is unreadable | Refused with `monthly_egress_measurement_unavailable` |
+
+A stale cached snapshot (`get_policy_snapshot`) becomes `unavailable`. Missing
+telemetry is never converted to zero: the refusal carries
+`effective_monthly_bytes = 0` only as a diagnostic value, and the operation is
+still denied. Partial is never reported as complete; `trusted` and
+`render_partial` keep their previous meanings for display and the staged
+policy.
+
+Text up to 32 KiB remains available under every status above. No new polling
+loop, scheduler, collector or per-operation Render request was added: the
+decision consumes the existing five-minute snapshot and the existing fresh
+ledger read.
+
+If the Render series has internal hourly gaps, the service already reports
+`missing_hours`/`coverage_complete`, but the authority remains Render's own
+monthly total and the existing three-hour freshness bound. `coverage_complete`
+is routinely false for the in-progress hour, so it is not a usable hard-limit
+gate without an arbitrary gap threshold; that limitation is recorded in
+section 12 rather than hidden.
+
+## 7. Refusal reasons and observability
+
+`OutboundBandwidthHardLimitError` extends `OutboundBandwidthPolicyError` (so
+existing callers keep their bounded refusal path) and adds:
+
+- `reason_code`: one of
+  `monthly_egress_hard_limit_reached`,
+  `monthly_egress_measurement_unavailable`,
+  `monthly_egress_measurement_untrusted`,
+  `monthly_egress_measurement_partial`,
+  `monthly_egress_reservation_would_exceed_limit`
+- `reserved_bytes` (when applicable), `effective_monthly_bytes`, `tier`,
+  `hard_limit_bytes`
+
+One warning line is emitted per refusal:
+
+```
+OUTBOUND_MONTHLY_HARD_LIMIT_DENIED reason=... action=... effective=... reserved=... limit=...
+```
+
+It contains no message text, media, filename, chat id, credential, token or
+session data, and it does not claim the value is an exact wire-byte
+measurement.
+
+## 8. Enforcement coverage
+
+All four public governor entry points enforce the decision:
+
+- `reserve_outbound_bytes()` (async)
+- `reserve_outbound_bytes_sync()` (worker-thread path)
+- `ensure_action_allowed()` (async preflight / action path)
+- `ensure_action_allowed_sync()` (sync preflight / action path)
+
+The private `_reserve_locked()` path repeats the ledger-side check. Verified
+production seams that reach one or both entry points:
+
+| Seam | Entry point |
+|---|---|
+| Deep Save single upload and album member uploads | `reserve_outbound_bytes` |
+| Rename / re-upload | `ensure_action_allowed` + `reserve_outbound_bytes` |
+| Voice notes | `ensure_action_allowed` + `reserve_outbound_bytes` |
+| AI result attachments | `ensure_action_allowed` + `reserve_outbound_bytes` |
+| Gemini OCR/STT (including base64-size upper bound) | `reserve_outbound_bytes_sync` |
+| Groq / Speechmatics STT | `ensure_action_allowed_sync` + `reserve_outbound_bytes_sync` |
+| Anti-Edit Storage snapshot | `reserve_outbound_bytes` |
+| Appearance Storage upload | `ensure_action_allowed` + `reserve_outbound_bytes_sync` |
+| Scheduled/automatic media | same paths, classified `automatic_media` |
+
+Album operations are checked before transfer and per member; a hard-limit
+refusal therefore refuses the whole operation before the first upload. No
+alternative governor entry point was found that performs a governed non-text
+payload without passing through one of the four functions above.
+
+## 9. Tests actually executed and results
+
+Focused governor suites (all passed):
+
+```
+.venv/bin/python -m pytest -q \
   tests/test_outbound_bandwidth_policy.py \
-  tests/test_outbound_upload_governance.py
-→ 159 passed
+  tests/test_outbound_bandwidth_governor.py \
+  tests/test_outbound_upload_governance.py \
+  tests/test_render_bandwidth_service.py
+→ 133 passed
 ```
 
-Affected subsystem run (runtime wiring, save/retrieve/media/appearance/STT,
-governor, panel, task execution):
+Per file: policy 73, governor 35, upload governance 18, Render service 7.
+
+The new tests cover: below-limit permission and a recorded reservation; exactly
+4 GB and above; Render above 4 GB with the ledger below; ledger plus proposed
+reservation reaching 4 GB; below-limit usage with a crossing reservation; all
+governed action classes; all four public entry points; the locked reservation
+path; missing, stale, untrusted and partial telemetry; missing data not read as
+zero; text availability under every status; tier-90 versus hard-limit
+distinction; and two real seams (voice send and Deep Save).
+
+Relevant attribution/reservation suites:
 
 ```
-.venv/bin/python -m pytest -q [20 affected suites]
-→ 893 passed
+.venv/bin/python -m pytest -q \
+  tests/test_egress_attribution.py tests/test_bandwidth_panel.py \
+  tests/test_render_bandwidth_panel.py tests/test_save_album_view_once_progress.py \
+  tests/test_save_v2_telegram_sync.py tests/test_12_save_engine.py \
+  tests/test_render_bandwidth_sources_diagnostic.py
+→ 254 passed, 1 failed
 ```
+
+The single failure is
+`test_render_bandwidth_sources_diagnostic.py::test_maybe_run_is_bounded_to_six_hours`.
 
 Full suite:
 
 ```
 .venv/bin/python -m pytest -q
-→ 8189 passed, 27 skipped, 4 failed (154.08s)
+→ 8221 passed, 27 skipped, 5 failed in 180.49s
 ```
 
-The four failures are pre-existing and were reproduced on untouched
-`origin/main` (`b8f99af...`):
+The five failures are pre-existing and were reproduced on an untouched
+extraction of `origin/main` (`0ae8434`) before this delivery's changes:
 
-- `tests/test_database_architecture_doc.py::test_every_migration_file_is_classified_in_the_audit_section`
-- `tests/test_database_setup_order.py::test_the_audited_order_is_recorded_in_the_audit_table`
-- `tests/test_private_message_db_security.py::test_the_documented_counts_match_the_repository`
-- `tests/test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`
+1. `tests/test_database_architecture_doc.py::test_every_migration_file_is_classified_in_the_audit_section`
+2. `tests/test_database_setup_order.py::test_the_audited_order_is_recorded_in_the_audit_table`
+3. `tests/test_private_message_db_security.py::test_the_documented_counts_match_the_repository`
+4. `tests/test_task_scheduler.py::test_recovered_interrupted_occurrence_is_picked_up_by_run_once`
+5. `tests/test_render_bandwidth_sources_diagnostic.py::test_maybe_run_is_bounded_to_six_hours`
 
-Compilation and diff checks:
+None of them touches the governor, and the same five fail on the pristine base.
+
+## 10. Compilation and diff checks
 
 ```
 .venv/bin/python -m compileall -q backend   → exit 0
-git diff --check                            → exit 0
+git diff --check <base> <commit>            → exit 0 (no whitespace errors)
 ```
 
-New coverage includes download path/bytes, repeated and missing downloads,
-response bodies as inbound, full and early-closed streams, month totals after a
-window flush, idle/activity heartbeat flushing, startup/shutdown sanitization,
-measurement states, reconciliation fields, duplicate Render timestamps, coverage
-reporting, partial-month floor preservation, and current-month/30-day source
-windows.
+`py_compile` was also run on the modified test files during development.
 
-## 7. Deployment and live verification
+## 11. Files intentionally left untouched
 
-**NOT DEPLOYED. NOT LIVE VERIFIED.** This workspace has no Render credentials
-or shell access:
+- `backend/services/render_bandwidth_service.py` (metric ingestion unchanged)
+- `backend/observability/egress_attribution.py`
+- All Telegram, Supabase, provider and Render integration code
+- `backend/bot/handlers/misc.py` and the bandwidth panel
+- `render.yaml`, `Procfile`, `Dockerfile`, environment configuration
+- Supabase migrations, SQL and `DATABASE_ARCHITECTURE.md`
+- `INVESTIGATION.md`, `AGENTS.md`, `ROADMAP.md`, `LIFEOS_IDEAS.md`
+- All other services, handlers, tests and documentation
 
-- `RENDER_API_KEY` is not set here.
-- `RENDER_SERVICE_ID` is not set here.
-- `RENDER_EGRESS_ATTRIBUTION` is not set here.
+## 12. Limitations and unresolved issues
 
-Therefore the actual Render response shape, unit, timestamp density, monthly
-lookback behavior, deployed commit, and live policy denials could not be
-confirmed. No claim is made that the deployment is running this commit or that
-the staged restrictions executed in production. The evidence above is offline
-code, tests, and static review. Production confirmation requires the Render
-deployment to pick up this commit and the owner to inspect the sanitized
-`[RENDER_EGRESS]`, `OUTBOUND_POLICY_SNAPSHOT`, and `[BANDWIDTH_SOURCES]` lines;
-those observations are not available in this workspace.
+1. **Not an exact wire-byte meter.** The target is enforced against Render's
+   service metric and the governor's payload ledger. HTTP headers, TLS/TCP,
+   MTProto framing, retransmissions, ungoverned PostgREST/Telegram/helper
+   traffic and other egress are not measured by the governor.
+2. **Out-of-scope traffic remains out of scope.** The hard limit refuses
+   governed non-text payload operations only. It does not block PostgREST,
+   ordinary Telegram RPCs, HTTP responses or other traffic; the task explicitly
+   excluded them.
+3. **Partial months block governed media.** Render's lookback cannot cover the
+   first day(s) of a 31-day month. During that window the month total cannot be
+   established, so non-text payloads are refused with
+   `monthly_egress_measurement_partial`. Text remains available. This is
+   intentional and deterministic, not a claim that the missing day was large.
+4. **Missing telemetry blocks governed media.** Without a Render key/service id
+   or a readable ledger, the governor already failed closed; the new decision
+   keeps that behavior with an explicit reason.
+5. **Internal hourly gaps are not separately gated.** `missing_hours` and
+   `coverage_complete` are reported by the Render service, but the in-progress
+   hour makes `coverage_complete` routinely false, so the hard limit relies on
+   Render's monthly total and the existing three-hour freshness bound.
+6. **The ledger is conservative.** Failed reservations are never refunded, so
+   the effective value can exceed actual wire bytes. Refusing early is the safe
+   direction.
+7. **The persisted floor is still a high-water mark.** It prevents a delayed or
+   lower reading from lowering enforcement within the UTC month; it is not a
+   second byte ledger.
 
-## 8. Remaining risks and limitations
+## 13. Live Render verification
 
-1. Attribution is application-payload-level. Render's metric includes transport
-   and traffic this instrumentation does not measure; the difference is not
-   evidence of a specific source.
-2. Telethon's progress callback is not a wire meter. Retransmissions and
-   failed-attempt bytes may be undercounted; this is documented, not estimated.
-3. HTTP response bodies are inbound and do not explain outbound usage. They are
-   reported separately to avoid overstating egress.
-4. Streamed request bodies without `Content-Length` are unmeasured, and
-   server-side FastAPI responses are outside the instrumented clients.
-5. A 30/31-day calendar month exceeds Render's 30-day lookback. `monthly_is_partial`
-   and the durable floor prevent a partial reading from lowering a tier, but a
-   fresh process with no prior floor cannot recover the missing first day(s).
-6. Source part-vs-total reconciliation is reported, not assumed; unknown sources
-   and missing hours remain visible.
-7. The production flag and Render key configuration were not verifiable here.
-   The implementation is disabled unless `RENDER_EGRESS_ATTRIBUTION` is exactly
-   `1`, and media fails closed when the authoritative policy snapshot is
-   unavailable.
-8. The four full-suite failures are unrelated documentation inventory and
-   time-dependent scheduler tests; they are not caused by this delivery.
+**NOT PERFORMED.** This workspace has no `RENDER_API_KEY`, no
+`RENDER_SERVICE_ID` and no Render shell/API access. The actual deployed metric
+shape, the deployed commit and a live hard-limit refusal were not observed.
+Production verification requires the deployment to pick up this commit and the
+owner to inspect the bounded `OUTBOUND_MONTHLY_HARD_LIMIT_DENIED` and existing
+`OUTBOUND_POLICY_SNAPSHOT` lines.
 
-## 9. Git delivery
+## 14. Git delivery
 
-The merge preserves the local attribution commit and the remote staged-policy
-history. After this report is committed, delivery is verified with:
+- Base: `0ae8434bed4ffa65ce7c5f94a7b8b75b49d5e0c9`
+- Implementation + tests commit: `c140f92d571a733efe6ff338744f1e8e6a7d48b3`
+- Push result: `0ae8434..c140f92  HEAD -> main` (normal fast-forward; no force,
+  no rebase, no history rewrite)
+- Verified remote `origin/main`: `c140f92d571a733efe6ff338744f1e8e6a7d48b3`
+  (`git ls-remote` and a fresh fetch both returned it; `git merge-base
+  --is-ancestor c140f92 origin/main` exited 0)
+- Cumulative diff of that commit against the base: the four implementation/test
+  files listed in section 3, nothing else.
 
-```
-git rev-parse HEAD
-git fetch origin main:refs/remotes/origin/main
-git rev-parse origin/main
-git merge-base --is-ancestor HEAD origin/main
-git status --porcelain
-```
+This report is delivered in the documentation commits immediately following
+`c140f92d571a733efe6ff338744f1e8e6a7d48b3`; the final remote HEAD is reported
+in the delivery summary.
 
-Push is normal (no force, no rebase, no reset). If `origin/main` advanced again,
-the new commits are inspected before integration; remote work is never
-overwritten.
+The shared chat worktree's local branch remains at its pre-existing
+`c55efcdfd1905d72df35810cb5669e9d5c66866e` with unrelated modifications
+(`INVESTIGATION.md`, `LIFEOS_IDEAS.md`, `ROADMAP.md`, three handler/service
+files and two test files). Those changes overlap newer upstream content, so
+they were preserved untouched and the delivery was built and tested from an
+isolated extraction of `origin/main`. No unrelated file was staged, committed,
+stashed, reset or discarded.
